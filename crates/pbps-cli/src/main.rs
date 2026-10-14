@@ -2915,9 +2915,9 @@ fn refuse_aliased_outputs(
         }
     }
     for profile in project.config.resolvers.values() {
-        let (pbps_config::resolver::ResolverProfile::Docker { baseline, .. }
-        | pbps_config::resolver::ResolverProfile::Server { baseline, .. }) = profile;
-        if let Some(path) = baseline {
+        let (pbps_config::resolver::ResolverProfile::Docker { externals, .. }
+        | pbps_config::resolver::ResolverProfile::Server { externals, .. }) = profile;
+        if let Some(path) = externals {
             inputs.push(project.root.join(path));
         }
     }

@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 44;
+pub const SCHEMA_VERSION: u32 = 45;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -58,6 +58,7 @@ pub const SCHEMA_VERSION: u32 = 44;
 // 42: a connected plan's `resolver_assessment` need `resolved` (issue #1516).
 // 43: a connected plan's `time_zone` (issue #1916).
 // 44: `explain`'s `resolver`: a resolved plan's sealed evidence (issue #1517).
+// 45: a resolver entry's `externals:`, formerly `baseline:` (issue #2007).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).
@@ -431,25 +432,30 @@ mod tests {
                 serde_json::json!({"kind": "server", "url_env": "S", "standard": {"public": {"grants": [{"to": "r", "privileges": []}]}}}),
                 false,
             ),
-            // A baseline file, in both (#1673).
+            // An externals file, in both (#1673, #2007).
             (
-                serde_json::json!({"kind": "server", "url_env": "S", "baseline": "db/baseline.sql"}),
+                serde_json::json!({"kind": "server", "url_env": "S", "externals": "db/externals.sql"}),
                 true,
             ),
             (
-                serde_json::json!({"kind": "server", "url_env": "S", "baseline": ""}),
+                serde_json::json!({"kind": "server", "url_env": "S", "externals": ""}),
                 false,
             ),
-            // Null is an omitted baseline, in both (#1673 review).
+            // Null is an omitted externals file, in both (#1673 review).
             (
-                serde_json::json!({"kind": "server", "url_env": "S", "baseline": null}),
+                serde_json::json!({"kind": "server", "url_env": "S", "externals": null}),
                 true,
             ),
             (
-                serde_json::json!({"kind": "docker", "image": "pg:18", "baseline": "db/baseline.sql"}),
+                serde_json::json!({"kind": "docker", "image": "pg:18", "externals": "db/externals.sql"}),
                 true,
             ),
-            // A baseline's outside-write choice, on either kind (#1674).
+            // The field's former name, refused by both (#2007).
+            (
+                serde_json::json!({"kind": "server", "url_env": "S", "baseline": "db/baseline.sql"}),
+                false,
+            ),
+            // An externals file's outside-write choice, on either kind (#1674).
             (
                 serde_json::json!({"kind": "docker", "image": "pg:18", "outside_writes": "allow"}),
                 true,

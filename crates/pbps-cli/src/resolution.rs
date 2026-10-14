@@ -185,7 +185,7 @@ fn unresolved(request: &Request<'_>, why: impl std::fmt::Display) -> Refused {
         )
         .remedy(
             "Repair the declaration so its bindings are unambiguous, add what the target \
-             retains to the resolver's baseline, or select no resolver and keep the existing \
+             retains to the resolver's externals file, or select no resolver and keep the existing \
              protection.",
         ),
     )
@@ -281,26 +281,28 @@ pub async fn resolve(
     producer::produce(request, driver, &bootstrap).await
 }
 
-/// A resolver's baseline file, read only from under the project root.
+/// A resolver's externals file, read only from under the project root.
 ///
-/// The baseline is reviewed history like the declarations (SPEC §9.3.2), so
+/// The externals file is reviewed history like the declarations (SPEC §9.3.2), so
 /// it is never a file elsewhere on the planning machine: an absolute path, a
 /// `..` or a symlink that leads outside the root is refused. Judged on the
 /// resolved path, not lexically, because a symlink inside the root can point
 /// anywhere. The file read is the one judged.
-fn read_baseline(root: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
+fn read_externals(root: &std::path::Path, path: &std::path::Path) -> Result<String, String> {
     let unreadable = |error: std::io::Error| format!("could not be read: {error}");
     // Relative, as the configuration says: an absolute path would work from
     // one checkout only, even one inside the root (`join` replaces the root
     // with it).
     if path.has_root() {
-        return Err("is an absolute path; name the baseline relative to the project root".into());
+        return Err(
+            "is an absolute path; name the externals file relative to the project root".into(),
+        );
     }
     let root = root.canonicalize().map_err(unreadable)?;
     let file = root.join(path).canonicalize().map_err(unreadable)?;
     if !file.starts_with(&root) {
         return Err(format!(
-            "lies outside the project root {}; a baseline is a file in the project",
+            "lies outside the project root {}; an externals file is a file in the project",
             root.display()
         ));
     }
@@ -334,24 +336,24 @@ mod producer {
                 "the planning read recorded no cluster identity for the resolver to bind"
             )));
         };
-        let (baseline, outside_writes) = match &request.selection.profile {
+        let (externals, outside_writes) = match &request.selection.profile {
             ResolverProfile::Server {
-                baseline,
+                externals,
                 outside_writes,
                 ..
             }
             | ResolverProfile::Docker {
-                baseline,
+                externals,
                 outside_writes,
                 ..
-            } => (baseline, *outside_writes),
+            } => (externals, *outside_writes),
         };
-        let baseline = baseline
+        let externals = externals
             .as_ref()
             .map(|path| {
-                super::read_baseline(request.project.root(), path).map_err(|why| {
+                super::read_externals(request.project.root(), path).map_err(|why| {
                     Refused::Unanswerable(anyhow::anyhow!(
-                        "the resolver `{}` names the baseline {}, which {why}",
+                        "the resolver `{}` names the externals file {}, which {why}",
                         request.selection.name,
                         path.display()
                     ))
@@ -384,7 +386,7 @@ mod producer {
                 request.project,
                 request.target.environment(),
                 standard,
-                baseline.as_deref(),
+                externals.as_deref(),
                 &provenance,
             )
             .await
@@ -485,9 +487,9 @@ mod producer {
             | Error::Scope(_)
             | Error::Read(_)
             // A scratch that cannot be used as configured answered nothing,
-            // nor did one whose baseline is not the target's.
+            // nor did one whose externals file is not the target's.
             | Error::Unusable(_)
-            | Error::Baseline(_) => false,
+            | Error::Externals(_) => false,
         }
     }
 }
@@ -500,10 +502,10 @@ mod tests {
     // Unix only: the fixture makes Unix symlinks.
     #[test]
     #[cfg(unix)]
-    fn a_baseline_is_read_only_from_under_the_project_root() {
+    fn an_externals_file_is_read_only_from_under_the_project_root() {
         use std::path::{Path, PathBuf};
         let dir = std::env::temp_dir().join(format!(
-            "pbps-baseline-root-{}-{}",
+            "pbps-externals-root-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -512,28 +514,28 @@ mod tests {
         ));
         let root = dir.join("project");
         std::fs::create_dir_all(root.join("db")).unwrap();
-        std::fs::write(root.join("db/baseline.sql"), "CREATE SCHEMA ext;").unwrap();
+        std::fs::write(root.join("db/externals.sql"), "CREATE SCHEMA ext;").unwrap();
         std::fs::write(dir.join("outside.sql"), "CREATE SCHEMA other;").unwrap();
         std::os::unix::fs::symlink(dir.join("outside.sql"), root.join("db/link.sql")).unwrap();
-        std::os::unix::fs::symlink(root.join("db/baseline.sql"), root.join("inside.sql")).unwrap();
+        std::os::unix::fs::symlink(root.join("db/externals.sql"), root.join("inside.sql")).unwrap();
 
         assert_eq!(
-            read_baseline(&root, Path::new("db/baseline.sql")).as_deref(),
+            read_externals(&root, Path::new("db/externals.sql")).as_deref(),
             Ok("CREATE SCHEMA ext;")
         );
         // A symlink that stays inside the project is the file it names.
         assert_eq!(
-            read_baseline(&root, Path::new("inside.sql")).as_deref(),
+            read_externals(&root, Path::new("inside.sql")).as_deref(),
             Ok("CREATE SCHEMA ext;")
         );
         // A parent step that comes back inside the root is still relative.
         assert_eq!(
-            read_baseline(&root, Path::new("db/../db/baseline.sql")).as_deref(),
+            read_externals(&root, Path::new("db/../db/externals.sql")).as_deref(),
             Ok("CREATE SCHEMA ext;")
         );
         // Negative: an absolute path is refused even inside the root.
-        for path in [root.join("db/baseline.sql"), dir.join("outside.sql")] {
-            let refused = read_baseline(&root, &path).unwrap_err();
+        for path in [root.join("db/externals.sql"), dir.join("outside.sql")] {
+            let refused = read_externals(&root, &path).unwrap_err();
             assert!(refused.starts_with("is an absolute path"), "{refused}");
         }
         // Negative: a parent step and a symlink each lead outside the
@@ -542,7 +544,7 @@ mod tests {
             PathBuf::from("../outside.sql"),
             PathBuf::from("db/link.sql"),
         ] {
-            let refused = read_baseline(&root, &path).unwrap_err();
+            let refused = read_externals(&root, &path).unwrap_err();
             assert!(
                 refused.starts_with("lies outside the project root"),
                 "{}: {refused}",
@@ -551,7 +553,7 @@ mod tests {
         }
         // Negative: a missing file is unreadable, not empty.
         assert!(
-            read_baseline(&root, Path::new("db/missing.sql"))
+            read_externals(&root, Path::new("db/missing.sql"))
                 .unwrap_err()
                 .starts_with("could not be read")
         );
@@ -576,13 +578,13 @@ mod tests {
         let docker = selection(ResolverProfile::Docker {
             image: "postgres:18".into(),
             pull: Default::default(),
-            baseline: None,
+            externals: None,
             outside_writes: Default::default(),
         });
         let server = selection(ResolverProfile::Server {
             url_env: "PBPS_UNUSED".into(),
             standard: None,
-            baseline: None,
+            externals: None,
             outside_writes: Default::default(),
         });
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -683,7 +685,7 @@ mod tests {
             profile: pbps_config::resolver::ResolverProfile::Server {
                 url_env: "PBPS_RESOLVER_UNSET_1515".into(),
                 standard: None,
-                baseline: None,
+                externals: None,
                 outside_writes: Default::default(),
             },
             status: pbps_config::resolver::SelectionStatus::NotAcquired,

@@ -126,7 +126,7 @@ pub(crate) async fn capture_desired_for_plan(
             let first = capture::capture(connection, &capture::managed_scope(desired))
                 .await
                 .map_err(catalog_read_failed)?;
-            // What a baseline staged is read and sealed on both sides, so
+            // What an externals file staged is read and sealed on both sides, so
             // the recheck compares the target's complete fingerprints of it
             // (#1673).
             let mut scope = capture::scope(&first, &[base, desired], paths);

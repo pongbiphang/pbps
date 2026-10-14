@@ -37,10 +37,10 @@ pub enum Error {
     /// empty (#1667, #1672). Nothing was written on it.
     #[error("the resolver's scratch cannot be used: {0}")]
     Unusable(String),
-    /// The resolver's baseline failed on scratch, or what it staged is not
+    /// The resolver's externals file failed on scratch, or what it staged is not
     /// the target's (#1673). Each finding names the object or statement.
-    #[error("the resolver's baseline was refused: {}", .0.join("; "))]
-    Baseline(Vec<String>),
+    #[error("the resolver's externals file was refused: {}", .0.join("; "))]
+    Externals(Vec<String>),
     /// The publication recheck found the target other than the run read
     /// it: another cluster, or a changed fact, authorization or captured
     /// object, each named (#1516). Nothing is published.

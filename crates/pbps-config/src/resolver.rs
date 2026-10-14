@@ -26,7 +26,7 @@ pub enum PullPolicy {
     IfMissing,
 }
 
-/// What a baseline may change outside the scratch database (#1674).
+/// What an externals file may change outside the scratch database (#1674).
 #[derive(
     Debug,
     Clone,
@@ -40,7 +40,7 @@ pub enum PullPolicy {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum OutsideWrites {
-    /// A baseline that changes catalog state outside the scratch database
+    /// An externals file that changes catalog state outside the scratch database
     /// (a role, another database's settings) is rolled back and refused
     /// (DEC-1673.1).
     #[default]
@@ -75,14 +75,14 @@ pub enum ResolverProfile {
         #[serde(default)]
         pull: PullPolicy,
         /// As a server entry's: the SQL file that stages the objects outside
-        /// the managed set (#1673).
+        /// the managed set (#1673, named `externals` since #2007).
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            deserialize_with = "baseline_path"
+            deserialize_with = "externals_path"
         )]
         #[schemars(length(min = 1))]
-        baseline: Option<std::path::PathBuf>,
+        externals: Option<std::path::PathBuf>,
         #[serde(default, skip_serializing_if = "OutsideWrites::is_refuse")]
         outside_writes: OutsideWrites,
     },
@@ -100,14 +100,15 @@ pub enum ResolverProfile {
         /// A SQL file, relative to the project root, that creates on scratch
         /// the objects outside the managed set that managed objects reference
         /// (#1673). It runs on scratch only, before any managed object, and
-        /// each object it creates is compared with the target.
+        /// each object it creates is compared with the target. Named
+        /// `baseline` until #2007, a word the ledger's state reset also uses.
         #[serde(
             default,
             skip_serializing_if = "Option::is_none",
-            deserialize_with = "baseline_path"
+            deserialize_with = "externals_path"
         )]
         #[schemars(length(min = 1))]
-        baseline: Option<std::path::PathBuf>,
+        externals: Option<std::path::PathBuf>,
         #[serde(default, skip_serializing_if = "OutsideWrites::is_refuse")]
         outside_writes: OutsideWrites,
     },
@@ -292,13 +293,13 @@ fn settings<'de, D: serde::Deserializer<'de>>(
     Ok(settings)
 }
 
-fn baseline_path<'de, D: serde::Deserializer<'de>>(
+fn externals_path<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<std::path::PathBuf>, D::Error> {
-    // `null` is what the published schema allows for an omitted baseline.
+    // `null` is what the published schema allows for an omitted file.
     match Option::<String>::deserialize(d)? {
         Some(value) if value.is_empty() => {
-            Err(serde::de::Error::custom("a baseline names its SQL file"))
+            Err(serde::de::Error::custom("externals names its SQL file"))
         }
         value => Ok(value.map(Into::into)),
     }
@@ -350,9 +351,10 @@ const REMOVED_PROFILES: [&str; 3] = [
     "linux-dedicated-pg16-v1",
 ];
 
-/// The first resolver entry that carries a `profile` field, read loosely
-/// from a configuration the typed parse refused.
-pub(super) fn entry_naming_a_profile(yaml: &str) -> Option<String> {
+/// The first resolver entry that carries `field`, read loosely from a
+/// configuration the typed parse refused: a field pbps removed (`profile`,
+/// #1636) or renamed (`baseline`, #2007).
+pub(super) fn entry_carrying(yaml: &str, field: &str) -> Option<String> {
     let value: serde_json::Value = serde_saphyr::from_str(yaml).ok()?;
     value
         .get("resolvers")?
@@ -360,7 +362,7 @@ pub(super) fn entry_naming_a_profile(yaml: &str) -> Option<String> {
         .iter()
         // A name the loader would refuse is not echoed: the plain parse
         // error reports that entry instead.
-        .find(|(name, entry)| entry.get("profile").is_some() && valid_profile_name(name))
+        .find(|(name, entry)| entry.get(field).is_some() && valid_profile_name(name))
         .map(|(name, _)| name.clone())
 }
 
@@ -563,7 +565,7 @@ mod tests {
             ResolverProfile::Docker {
                 image: "postgres:18".into(),
                 pull: PullPolicy::Never,
-                baseline: None,
+                externals: None,
                 outside_writes: OutsideWrites::Refuse,
             }
         );
@@ -590,7 +592,7 @@ mod tests {
             "{kind: unknown}",
             "{kind: docker, image: postgres:18, standard: {comment: c}}",
             "{kind: docker, image: postgres:18, outside_writes: sometimes}",
-            "{kind: server, url_env: S, baseline: ''}",
+            "{kind: server, url_env: S, externals: ''}",
         ] {
             assert!(
                 Config::parse(
@@ -604,24 +606,24 @@ mod tests {
     }
 
     #[test]
-    fn either_kind_takes_a_baseline_and_an_outside_write_choice() {
+    fn either_kind_takes_an_externals_file_and_an_outside_write_choice() {
         let config = Config::parse(
             "dialect: postgres\nresolvers:\n  \
-             d: {kind: docker, image: postgres:18, baseline: db/b.sql, outside_writes: allow}\n  \
+             d: {kind: docker, image: postgres:18, externals: db/x.sql, outside_writes: allow}\n  \
              s: {kind: server, url_env: S, outside_writes: allow}\n  \
              plain: {kind: server, url_env: S}\n",
             Path::new("pbps.yml"),
         )
         .unwrap();
         let ResolverProfile::Docker {
-            baseline,
+            externals,
             outside_writes,
             ..
         } = &config.resolvers["d"]
         else {
             panic!("a docker entry");
         };
-        assert_eq!(baseline.as_deref(), Some(Path::new("db/b.sql")));
+        assert_eq!(externals.as_deref(), Some(Path::new("db/x.sql")));
         assert_eq!(*outside_writes, OutsideWrites::Allow);
         assert!(matches!(
             config.resolvers["s"],
@@ -630,7 +632,7 @@ mod tests {
                 ..
             }
         ));
-        // Negative: omitted, a baseline's outside writes are refused.
+        // Negative: omitted, an externals file's outside writes are refused.
         assert!(matches!(
             config.resolvers["plain"],
             ResolverProfile::Server {
@@ -641,20 +643,20 @@ mod tests {
     }
 
     #[test]
-    fn a_server_entry_names_its_baseline_file_relative_to_the_project() {
+    fn a_server_entry_names_its_externals_file_relative_to_the_project() {
         let config = Config::parse(
-            "dialect: postgres\nresolvers:\n  s: {kind: server, url_env: S, baseline: db/baseline.sql}\n",
+            "dialect: postgres\nresolvers:\n  s: {kind: server, url_env: S, externals: db/externals.sql}\n",
             Path::new("pbps.yml"),
         )
         .unwrap();
-        let ResolverProfile::Server { baseline, .. } = &config.resolvers["s"] else {
+        let ResolverProfile::Server { externals, .. } = &config.resolvers["s"] else {
             panic!("a server profile");
         };
-        assert_eq!(baseline.as_deref(), Some(Path::new("db/baseline.sql")));
+        assert_eq!(externals.as_deref(), Some(Path::new("db/externals.sql")));
         // Negative: omitted or null, there is none.
         for entry in [
             "{kind: server, url_env: S}",
-            "{kind: server, url_env: S, baseline: null}",
+            "{kind: server, url_env: S, externals: null}",
         ] {
             let config = Config::parse(
                 &format!("dialect: postgres\nresolvers:\n  s: {entry}\n"),
@@ -664,11 +666,42 @@ mod tests {
             assert!(
                 matches!(
                     &config.resolvers["s"],
-                    ResolverProfile::Server { baseline: None, .. }
+                    ResolverProfile::Server {
+                        externals: None,
+                        ..
+                    }
                 ),
                 "{entry}"
             );
         }
+    }
+
+    /// #2007: an entry still naming `baseline:` is refused by name, with the
+    /// field it became, on either kind.
+    #[test]
+    fn an_entry_naming_baseline_is_refused_with_its_new_name() {
+        for entry in [
+            "{kind: server, url_env: S, baseline: db/b.sql}",
+            "{kind: docker, image: postgres:18, baseline: db/b.sql}",
+        ] {
+            let error = Config::parse(
+                &format!("dialect: postgres\nresolvers:\n  r: {entry}\n"),
+                Path::new("pbps.yml"),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&error, crate::ConfigError::RenamedResolverBaseline { resolver, .. } if resolver == "r"),
+                "{entry}: {error}"
+            );
+            assert!(error.to_string().contains("now `externals:`"), "{error}");
+        }
+        // Negative: another unknown field keeps the plain parse error.
+        let error = Config::parse(
+            "dialect: postgres\nresolvers:\n  r: {kind: server, url_env: S, stage: db/b.sql}\n",
+            Path::new("pbps.yml"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, crate::ConfigError::Parse { .. }), "{error}");
     }
 
     #[test]

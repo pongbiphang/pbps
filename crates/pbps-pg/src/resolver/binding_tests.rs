@@ -1755,14 +1755,14 @@ async fn a_shared_identity_the_target_did_not_get_from_a_managed_object_is_unres
 }
 
 /// Unresolved because the target holds a candidate scratch did not: by
-/// name when it is an external object the baseline does not stage (#1517),
+/// name when it is an external object the externals file does not stage (#1517),
 /// generically when scratch reproduced it differently.
 fn unreproduced(verdict: &Verdict) -> bool {
     matches!(
         verdict,
         Verdict::Unresolved { condition }
             if condition.contains("not reconstructed")
-                || condition.contains("is not in the resolver's baseline")
+                || condition.contains("is not in the resolver's externals file")
     )
 }
 
@@ -2685,7 +2685,7 @@ async fn the_scratch_compiles_in_the_targets_zone_or_not_at_all() {
 }
 
 /// A retained external object on the target that scratch did not hold is
-/// refused by name, whatever its candidate class, and with no baseline at
+/// refused by name, whatever its candidate class, and with no externals file at
 /// all: the object, the declaration that could bind it, and the remedy
 /// (#1517). The resolver sends no target source, so only the operator can
 /// stage it.
@@ -2778,8 +2778,8 @@ async fn an_unstaged_external_object_of_any_class_is_refused_by_name() {
                     };
                     assert!(
                         condition.starts_with(&format!(
-                            "{named} on the target is not in the resolver's baseline, and \
-                             relation app.v could bind it; add it to the baseline"
+                            "{named} on the target is not in the resolver's externals file, and \
+                             relation app.v could bind it; add it to the externals file"
                         )),
                         "{variable} {tag}: {condition}"
                     );
@@ -2828,7 +2828,7 @@ async fn an_unstaged_external_object_of_any_class_is_refused_by_name() {
         assert!(
             conditions.iter().any(|condition| condition.starts_with(
                 "routine util.f(pg_catalog.int4) on the target is not in the resolver's \
-                 baseline, and routine app.g(pg_catalog.int4) could bind it"
+                 externals file, and routine app.g(pg_catalog.int4) could bind it"
             )),
             "{variable}: {assessment:#?}"
         );

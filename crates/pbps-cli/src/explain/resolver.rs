@@ -22,7 +22,7 @@ pub struct ResolverDetail {
     /// `run-owned`: a login and database the run created and dropped.
     /// `supplied`: the database the entry names, emptied after the run.
     pub layout: &'static str,
-    /// Whether the baseline's writes outside the scratch database were
+    /// Whether the externals file's writes outside the scratch database were
     /// `refused` or `allowed` (and then not checked).
     pub outside_writes: &'static str,
     /// The compatibility rule the scratch was qualified under.
@@ -240,7 +240,7 @@ pub fn line(detail: &ResolverDetail) -> String {
     }
     if detail.outside_writes == "allowed" {
         out.push_str(
-            "; the baseline's writes outside the scratch database were allowed, not checked",
+            "; the externals file's writes outside the scratch database were allowed, not checked",
         );
     }
     out
@@ -435,7 +435,7 @@ mod tests {
     }
 
     /// A reviewer reads which entry ran, its kind of scratch and its
-    /// layout, and whether a baseline's writes outside it went unchecked
+    /// layout, and whether an externals file's writes outside it went unchecked
     /// (#1674, #1517).
     #[test]
     fn the_runtime_line_names_the_entry_its_scratch_and_layout() {

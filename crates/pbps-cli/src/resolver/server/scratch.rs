@@ -30,8 +30,8 @@ use pbps_db::resolver::environment::{CatalogFacts, Verdict};
 use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, ScratchSource};
-use pbps_pg::resolver::baseline;
 use pbps_pg::resolver::capture::{StageError, Staged};
+use pbps_pg::resolver::externals;
 use pbps_pg::resolver::scratch::{self as sql, Placement};
 use pbps_pg::resolver::standard::{self, Standard};
 use std::collections::BTreeSet;
@@ -54,7 +54,7 @@ pub async fn produce(
     project: &pbps_config::Project,
     environment: Option<&str>,
     standard: &Standard,
-    baseline: Option<&str>,
+    externals: Option<&str>,
     provenance: &Provenance,
 ) -> Result<ResolvedPlan, ProduceError> {
     let unsealed = produce_unsealed(
@@ -70,7 +70,7 @@ pub async fn produce(
         project,
         environment,
         standard,
-        baseline,
+        externals,
         provenance,
     )
     .await?;
@@ -107,7 +107,7 @@ pub async fn produce_unsealed(
     project: &pbps_config::Project,
     environment: Option<&str>,
     standard: &Standard,
-    baseline: Option<&str>,
+    externals: Option<&str>,
     provenance: &Provenance,
 ) -> Result<Unsealed, ProduceError> {
     if driver != Driver::Postgres {
@@ -170,7 +170,7 @@ pub async fn produce_unsealed(
         tokens: &tokens,
         backend: &backend,
         standard,
-        baseline,
+        externals,
         provenance,
         created: Created::Nothing,
     };
@@ -209,7 +209,7 @@ pub struct Provenance {
 }
 
 impl Provenance {
-    /// A server entry named `scratch`, its baseline's outside writes refused.
+    /// A server entry named `scratch`, its externals file's outside writes refused.
     #[cfg(test)]
     pub fn server() -> Self {
         Self {
@@ -389,10 +389,10 @@ struct Run<'a> {
     backend: &'a sql::Backend,
     /// The state the scratch database is put into (#1708).
     standard: &'a Standard,
-    /// The resolver's baseline, as its file holds it (#1673). It is cut
+    /// The resolver's externals file, as its file holds it (#1673). It is cut
     /// into statements as it runs, since a statement can change how the
     /// next is read.
-    baseline: Option<&'a str>,
+    externals: Option<&'a str>,
     provenance: &'a Provenance,
     created: Created,
 }
@@ -409,9 +409,9 @@ struct Prepared {
     map: scope::Principals,
     /// Authorization keys the reproduction did not reproduce.
     differences: Vec<String>,
-    /// What the baseline created (#1673).
-    created: baseline::Created,
-    /// The role a run-owned layout gives USAGE on a schema the baseline
+    /// What the externals file created (#1673).
+    created: externals::Created,
+    /// The role a run-owned layout gives USAGE on a schema the externals file
     /// created; `None` where the scratch account compiles as itself.
     grantee: Option<String>,
 }
@@ -503,19 +503,19 @@ impl Run<'_> {
         let base_managed = engine::Managed::from_schema(binding.base);
         let desired_managed = engine::Managed::from_schema(binding.desired);
         // Read before anything compiles: a chain through the boundary fails
-        // the compile on an object no baseline can stage, and that failure
+        // the compile on an object no externals file can stage, and that failure
         // is then named as the chain (SPEC §9.3.2). Only a failure refuses:
         // the target's dependencies are the current declarations', and a
         // desired one may no longer read through the chain (#1754 review).
-        let links = baseline::links(target)
+        let links = externals::links(target)
             .await
             .map_err(db("the target's recorded dependencies"))?;
         let kept = self.routine_oids(target, binding.desired).await?;
         let mut any = self.routine_oids(target, binding.base).await?;
         any.extend(kept.iter().copied());
-        let routines = baseline::ManagedRoutines { desired: kept, any };
-        let chains = baseline::chains(&links, &desired_managed, &base_managed, &routines);
-        let staged = match self.baseline {
+        let routines = externals::ManagedRoutines { desired: kept, any };
+        let chains = externals::chains(&links, &desired_managed, &base_managed, &routines);
+        let staged = match self.externals {
             Some(_) => {
                 self.stage(
                     provisioning,
@@ -551,7 +551,7 @@ impl Run<'_> {
                 if let Error::Binding(reason) = &error
                     && !chains.is_empty()
                 {
-                    return Error::Baseline(
+                    return Error::Externals(
                         chains.iter().cloned().chain([reason.clone()]).collect(),
                     );
                 }
@@ -618,12 +618,12 @@ impl Run<'_> {
         )
         .await
         .map_err(engine::catalog_read_failed)?;
-        // The shapes the baseline was compared with must be the ones this
+        // The shapes the externals file was compared with must be the ones this
         // capture seals: a target written between the two reads refuses.
         let changed = staged.changed_since(&current);
         if !changed.is_empty() {
             return Err(Error::Read(format!(
-                "the target changed while the run read it, after the baseline was compared \
+                "the target changed while the run read it, after the externals file was compared \
                  with it: {}; run again",
                 changed.join("; ")
             )));
@@ -765,21 +765,21 @@ impl Run<'_> {
         // After the reproduction, which drops and recreates each in-scope
         // schema, and before any managed object (DEC-1673.1). Its own
         // session, so its `SET`s reach nothing after it.
-        let created = match self.baseline {
+        let created = match self.externals {
             Some(statements) => {
                 let before = inventory(&mut owner).await?;
                 let mut setup = Conn::connect_with(driver, self.scratch, names.database(), None)
                     .await
-                    .map_err(db("the baseline's session"))?;
+                    .map_err(db("the externals file's session"))?;
                 setup
                     .execute("SET ROLE NONE")
                     .await
-                    .map_err(db("the baseline session's role"))?;
-                run_baseline(&mut setup, statements, self.provenance.outside_writes).await?;
+                    .map_err(db("the externals file session's role"))?;
+                run_externals(&mut setup, statements, self.provenance.outside_writes).await?;
                 drop(setup);
-                baseline::created(&before, &inventory(&mut owner).await?)
+                externals::created(&before, &inventory(&mut owner).await?)
             }
-            None => baseline::Created::default(),
+            None => externals::Created::default(),
         };
         // Opened after the reproduction, so the login defaults it stored
         // load into this session as they load on the target's.
@@ -896,17 +896,17 @@ impl Run<'_> {
         // any usage, on the checked connection like every write here
         // (DEC-1673.1). `DISCARD ALL` then keeps its `SET`s from the
         // compile that follows on this same session.
-        let created = match self.baseline {
+        let created = match self.externals {
             Some(statements) => {
                 let before = inventory(admin).await?;
-                run_baseline(admin, statements, self.provenance.outside_writes).await?;
+                run_externals(admin, statements, self.provenance.outside_writes).await?;
                 admin
                     .execute("SET ROLE NONE")
                     .await
                     .map_err(db("the scratch session's role"))?;
-                // An allowed baseline may change the login's own defaults
+                // An allowed externals file may change the login's own defaults
                 // (#1674). Those are kept, so the release compares the
-                // compile's changes with what the baseline left.
+                // compile's changes with what the externals file left.
                 if self.provenance.outside_writes == OutsideWrites::Allowed
                     && let Created::Supplied { defaults, .. } = &mut self.created
                 {
@@ -915,9 +915,9 @@ impl Run<'_> {
                         .map_err(db("the scratch account's own defaults"))?;
                 }
                 pinned(admin, self.backend).await?;
-                baseline::created(&before, &inventory(admin).await?)
+                externals::created(&before, &inventory(admin).await?)
             }
-            None => baseline::Created::default(),
+            None => externals::Created::default(),
         };
         let unusable = authorization
             .unusable_schemas(&request.planned)
@@ -1241,12 +1241,12 @@ impl Run<'_> {
                 .into_iter()
                 .filter_map(|(_, signature)| signature)
                 .collect();
-        baseline::routine_oids(target, &signatures)
+        externals::routine_oids(target, &signatures)
             .await
             .map_err(|error| Error::Read(format!("the target's managed routines: {error}")))
     }
 
-    /// Compares what the baseline created with the target, and reproduces
+    /// Compares what the externals file created with the target, and reproduces
     /// the target deployer's USAGE on each schema it created (#1673).
     async fn stage(
         &self,
@@ -1268,29 +1268,29 @@ impl Run<'_> {
                 .await
                 .map_err(|error| match error {
                     StageError::Capture(error) => engine::catalog_read_failed(error),
-                    StageError::Refused(findings) => Error::Baseline(findings),
+                    StageError::Refused(findings) => Error::Externals(findings),
                 })?;
-        // Every schema the baseline created, an extension's member too
+        // Every schema the externals file created, an extension's member too
         // (`pg_cron`'s `cron`): a member is no root, but the deployer's
         // calls into it need USAGE all the same.
-        let schemas = baseline::schema_names(capture, &prepared.created.schemas)
+        let schemas = externals::schema_names(capture, &prepared.created.schemas)
             .await
-            .map_err(db("the schemas the baseline created"))?;
+            .map_err(db("the schemas the externals file created"))?;
         if schemas.is_empty() {
             return Ok(staged);
         }
         // The deployer's answer, read on the target as the deployer.
-        let wanted = baseline::usage(target, &schemas)
-            .await
-            .map_err(db("the target deployer's usage of the baseline's schemas"))?;
+        let wanted = externals::usage(target, &schemas).await.map_err(db(
+            "the target deployer's usage of the externals file's schemas",
+        ))?;
         match (provisioning, &prepared.grantee, prepared.capture.as_mut()) {
             (Provisioning::RunOwned, Some(grantee), Some(owner)) => {
-                baseline::reproduce_usage(owner, grantee, &wanted)
+                externals::reproduce_usage(owner, grantee, &wanted)
                     .await
-                    .map_err(db("the deployer's usage of the baseline's schemas"))?;
+                    .map_err(db("the deployer's usage of the externals file's schemas"))?;
             }
             (Provisioning::Supplied, None, None) => {
-                // The account owns what its baseline created, so it already
+                // The account owns what its externals file created, so it already
                 // has USAGE; it gives up what the deployer lacks.
                 let unusable: Vec<String> = wanted
                     .iter()
@@ -1299,7 +1299,7 @@ impl Run<'_> {
                     .collect();
                 let kept = sql::revoke_usage(admin, &unusable)
                     .await
-                    .map_err(db("the baseline's schemas the deployer cannot use"))?;
+                    .map_err(db("the externals file's schemas the deployer cannot use"))?;
                 if !kept.is_empty() {
                     return Err(Error::Unusable(format!(
                         "the scratch account keeps USAGE on a schema the target's deployer \
@@ -1318,9 +1318,9 @@ impl Run<'_> {
             Some(compile) => compile,
             None => &mut *admin,
         };
-        let reproduced = baseline::usage(compile, &schemas)
+        let reproduced = externals::usage(compile, &schemas)
             .await
-            .map_err(db("the reproduced usage of the baseline's schemas"))?;
+            .map_err(db("the reproduced usage of the externals file's schemas"))?;
         let differences: Vec<String> = wanted
             .iter()
             .filter(|(schema, usable)| reproduced.get(*schema) != Some(usable))
@@ -1335,12 +1335,12 @@ impl Run<'_> {
         if differences.is_empty() {
             Ok(staged)
         } else {
-            Err(Error::Baseline(differences))
+            Err(Error::Externals(differences))
         }
     }
 }
 
-/// A compile that failed writing through a view the baseline staged names
+/// A compile that failed writing through a view the externals file staged names
 /// the remedy: a shape view reads like the target's, but no statement can
 /// write through it, and a routine's body is checked against it when it is
 /// created (measured on 18: `cannot insert into view`, SQLSTATE 55000).
@@ -1363,30 +1363,30 @@ fn through_shape_view(error: Error, staged: &Staged) -> Error {
     });
     match staged_view {
         Some(view) => Error::Binding(format!(
-            "{reason}; the baseline stages {view} as a view no statement can write through: \
-             stage its real definition in the baseline instead, with what it reads"
+            "{reason}; the externals file stages {view} as a view no statement can write through: \
+             stage its real definition in the externals file instead, with what it reads"
         )),
         None => Error::Binding(reason),
     }
 }
 
 /// Every object in the scratch database initdb did not create.
-async fn inventory(conn: &mut Conn) -> Result<baseline::Inventory, Error> {
-    baseline::inventory(conn)
+async fn inventory(conn: &mut Conn) -> Result<externals::Inventory, Error> {
+    externals::inventory(conn)
         .await
         .map_err(|error| Error::Read(format!("the scratch database's objects: {error}")))
 }
 
-/// Runs the baseline on `session` as one script (#1769), and refuses with
-/// the engine's error when the engine refuses it. Runs the baseline inside one `REPEATABLE READ` transaction pbps opens,
+/// Runs the externals file on `session` as one script (#1769), and refuses with
+/// the engine's error when the engine refuses it. Runs the externals file inside one `REPEATABLE READ` transaction pbps opens,
 /// and refuses it, rolled back so it leaves nothing, when it changed the
 /// cluster outside the scratch database (#1783). One snapshot serves both
 /// reads of the shared state, so another session's writes during the
 /// script are in neither. The script cannot end the transaction itself:
-/// [`baseline::run`] refuses transaction control before it runs.
+/// [`externals::run`] refuses transaction control before it runs.
 /// Under [`OutsideWrites::Allowed`] the shared state is not read: what the
 /// file changes outside the database is kept, and is the operator's (#1674).
-async fn run_baseline(
+async fn run_externals(
     session: &mut Conn,
     sql: &str,
     outside_writes: OutsideWrites,
@@ -1397,16 +1397,16 @@ async fn run_baseline(
     session
         .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
         .await
-        .map_err(read("the baseline's transaction"))?;
+        .map_err(read("the externals file's transaction"))?;
     let outcome = async {
         let before = if checked {
-            baseline::shared_state(session)
+            externals::shared_state(session)
                 .await
                 .map_err(read("the cluster's shared state"))?
         } else {
-            baseline::SharedState::new()
+            externals::SharedState::new()
         };
-        if let Err(failed) = baseline::run(session, sql).await {
+        if let Err(failed) = externals::run(session, sql).await {
             let mut finding = format!("the engine refused it: {}", failed.error);
             if failed.no_schema() {
                 finding.push_str(
@@ -1417,23 +1417,23 @@ async fn run_baseline(
             if failed.unsupported() {
                 finding.push_str(
                     "; if it controls its transaction, leave out BEGIN, COMMIT and ROLLBACK: \
-                     pbps runs the whole baseline as one transaction",
+                     pbps runs the whole externals file as one transaction",
                 );
             }
             if failed.names_something_missing() {
                 finding.push_str(
-                    "; the baseline runs before any managed object, so a statement that names \
+                    "; the externals file runs before any managed object, so a statement that names \
                      one fails: write such an object as a shape view (a view of typed NULLs \
-                     that returns no row), or leave it out of the baseline",
+                     that returns no row), or leave it out of the externals file",
                 );
             }
-            return Err(Error::Baseline(vec![finding]));
+            return Err(Error::Externals(vec![finding]));
         }
         // Under the settings the first read had, not the script's: its
         // `SET`s last on this session until `DISCARD ALL`, and a time zone
         // renders a role's expiry differently, a timeout can cancel the
         // read. Every setting is reset rather than the ones known to matter,
-        // so one no one listed cannot refuse a valid baseline. The path is
+        // so one no one listed cannot refuse a valid externals file. The path is
         // pinned again, empty as every pbps session's (DEC-1564.1), since a
         // type the script creates may be named `text`.
         if !checked {
@@ -1442,24 +1442,24 @@ async fn run_baseline(
         session
             .execute("RESET ALL")
             .await
-            .map_err(read("the baseline session's settings"))?;
+            .map_err(read("the externals file session's settings"))?;
         session
             .execute("SELECT pg_catalog.set_config('search_path', '', true)")
             .await
-            .map_err(read("the baseline session's path"))?;
-        let after = baseline::shared_state(session)
+            .map_err(read("the externals file session's path"))?;
+        let after = externals::shared_state(session)
             .await
             .map_err(read("the cluster's shared state"))?;
-        let changed = baseline::shared_changes(&before, &after);
+        let changed = externals::shared_changes(&before, &after);
         if changed.is_empty() {
             Ok(())
         } else {
-            Err(Error::Baseline(
+            Err(Error::Externals(
                 changed
                     .into_iter()
                     .map(|name| {
                         format!(
-                            "it changed {name}, outside the scratch database; a baseline \
+                            "it changed {name}, outside the scratch database; an externals file \
                              creates only objects in the database, unless the resolver \
                              sets `outside_writes: allow`"
                         )
@@ -1476,13 +1476,13 @@ async fn run_baseline(
     session
         .execute("COMMIT")
         .await
-        .map_err(read("the baseline's transaction"))?;
+        .map_err(read("the externals file's transaction"))?;
     // Its `SET`s outlast the transaction; the supplied layout compiles on
     // this same session next.
     session
         .execute("DISCARD ALL")
         .await
-        .map_err(read("the baseline session's settings"))?;
+        .map_err(read("the externals file session's settings"))?;
     Ok(())
 }
 
@@ -1545,7 +1545,7 @@ fn reported_build(
 
 #[cfg(test)]
 tokio::task_local! {
-    /// SQL a test runs on the target between the baseline's comparison and
+    /// SQL a test runs on the target between the externals file's comparison and
     /// the opening capture: a writer the run cannot otherwise be timed
     /// against (#1755).
     static AFTER_STAGING: Option<String>;

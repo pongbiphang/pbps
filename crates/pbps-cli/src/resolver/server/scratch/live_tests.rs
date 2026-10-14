@@ -1557,10 +1557,10 @@ async fn resolver_run_owned_compiles_under_the_declared_standard() {
     );
 }
 
-// ---- The baseline (#1673) ----------------------------------------------
+// ---- The externals file (#1673) ----------------------------------------------
 //
 // A managed schema and an external one. The target holds external objects
-// the managed views bind; the baseline stages them on scratch.
+// the managed views bind; the externals file stages them on scratch.
 
 const MANAGED: &str = "pbps_v1673";
 const EXTERNAL: &str = "pbps_x1673";
@@ -1604,7 +1604,7 @@ async fn produce_staged(
     target: &str,
     inputs: &Inputs,
     key: &ProjectKey,
-    baseline: &str,
+    externals: &str,
 ) -> Result<ResolvedPlan, ProduceError> {
     let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
     let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
@@ -1623,13 +1623,13 @@ async fn produce_staged(
         &key.project,
         Some(ENVIRONMENT),
         &Standard::default(),
-        Some(baseline),
+        Some(externals),
         &super::Provenance::server(),
     )
     .await
 }
 
-/// `produce_staged`, with `sql` run on the target after the baseline was
+/// `produce_staged`, with `sql` run on the target after the externals file was
 /// compared with it and before the opening capture.
 async fn produce_staged_then(
     sql: &str,
@@ -1637,27 +1637,27 @@ async fn produce_staged_then(
     target: &str,
     inputs: &Inputs,
     key: &ProjectKey,
-    baseline: &str,
+    externals: &str,
 ) -> Result<ResolvedPlan, ProduceError> {
     super::AFTER_STAGING
         .scope(
             Some(sql.to_owned()),
-            produce_staged(scratch, target, inputs, key, baseline),
+            produce_staged(scratch, target, inputs, key, externals),
         )
         .await
 }
 
-/// The baseline's refusal, or what came instead. Never panics, so the
+/// The externals file's refusal, or what came instead. Never panics, so the
 /// caller can drop its fixture first.
-fn baseline_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
+fn externals_refusal(result: Result<ResolvedPlan, ProduceError>) -> String {
     match result {
-        Err(ProduceError::Run(Error::Baseline(findings))) => findings.join("; "),
-        Err(other) => format!("not a baseline refusal: {other}"),
-        Ok(_) => "not a baseline refusal: a plan".into(),
+        Err(ProduceError::Run(Error::Externals(findings))) => findings.join("; "),
+        Err(other) => format!("not an externals file refusal: {other}"),
+        Ok(_) => "not an externals file refusal: a plan".into(),
     }
 }
 
-/// The plan answered, and what the baseline staged was sealed on the
+/// The plan answered, and what the externals file staged was sealed on the
 /// target's side.
 fn assert_staged(result: Result<ResolvedPlan, ProduceError>, staged: &str, context: &str) {
     let plan = match result {
@@ -1705,8 +1705,8 @@ fn guarded_target() -> Vec<String> {
     ]
 }
 
-/// The table as a baseline writes it: its shape, nothing that guards it.
-fn plain_baseline(id_type: &str) -> String {
+/// The table as an externals file writes it: its shape, nothing that guards it.
+fn plain_externals(id_type: &str) -> String {
     format!(
         "-- The external table the managed views read.\n\
          CREATE SCHEMA {EXTERNAL};\n\
@@ -1727,7 +1727,7 @@ fn reading(column: &str, relation: &str) -> String {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_compiles_a_managed_view_over_a_baseline_table() {
+async fn resolver_compiles_a_managed_view_over_an_externals_table() {
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
     // Run-owned: a superuser scratch on another cluster.
@@ -1740,7 +1740,7 @@ async fn resolver_compiles_a_managed_view_over_a_baseline_table() {
         &target.on(&target_db),
         &inputs,
         &key,
-        &plain_baseline("integer"),
+        &plain_externals("integer"),
     )
     .await;
     let after = scratch.inventory().await;
@@ -1757,7 +1757,7 @@ async fn resolver_compiles_a_managed_view_over_a_baseline_table() {
             &fixture.on(&target_db),
             &inputs,
             &key,
-            &plain_baseline("integer"),
+            &plain_externals("integer"),
         )
         .await;
         let left = fixture.foreign_objects(&scratch_db).await;
@@ -1765,7 +1765,7 @@ async fn resolver_compiles_a_managed_view_over_a_baseline_table() {
         assert_staged(result, "t", server);
         assert_eq!(
             left.1, 0,
-            "{server}: the baseline's objects are dropped too"
+            "{server}: the externals file's objects are dropped too"
         );
     }
 }
@@ -1773,7 +1773,7 @@ async fn resolver_compiles_a_managed_view_over_a_baseline_table() {
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn resolver_compares_an_external_table_without_its_foreign_keys_and_triggers() {
-    // The baseline leaves out the referenced table, the CHECK, the default,
+    // The externals file leaves out the referenced table, the CHECK, the default,
     // the trigger and its function, and the plain index.
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
@@ -1786,7 +1786,7 @@ async fn resolver_compares_an_external_table_without_its_foreign_keys_and_trigge
             &fixture.on(&target_db),
             &inputs,
             &key,
-            &plain_baseline("integer"),
+            &plain_externals("integer"),
         )
         .await;
         fixture.drop().await;
@@ -1796,7 +1796,7 @@ async fn resolver_compares_an_external_table_without_its_foreign_keys_and_trigge
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_refuses_a_baseline_that_differs_from_the_target() {
+async fn resolver_refuses_an_externals_file_that_differs_from_the_target() {
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let mut setup = guarded_target();
@@ -1809,18 +1809,18 @@ async fn resolver_refuses_a_baseline_that_differs_from_the_target() {
         let key = ProjectKey::new(true);
         // A column of another type, a unique key left out, and a composite
         // type's attributes in another order.
-        let baseline = format!(
+        let externals = format!(
             "CREATE SCHEMA {EXTERNAL};\n\
              CREATE TABLE {EXTERNAL}.t (id bigint PRIMARY KEY, name text, p integer, n integer);\n\
              CREATE TYPE {EXTERNAL}.pair AS (b text, a integer);"
         );
-        let refused = baseline_refusal(
+        let refused = externals_refusal(
             produce_staged(
                 &fixture.as_login(&scratch_db, &login),
                 &fixture.on(&target_db),
                 &inputs,
                 &key,
-                &baseline,
+                &externals,
             )
             .await,
         );
@@ -1828,7 +1828,7 @@ async fn resolver_refuses_a_baseline_that_differs_from_the_target() {
         fixture.drop().await;
         assert!(
             refused.contains(&format!(
-                "the baseline's column id of relation {EXTERNAL}.t differs from the target's in"
+                "the externals file's column id of relation {EXTERNAL}.t differs from the target's in"
             )) && refused.contains("atttypid"),
             "{server}: {refused}"
         );
@@ -1838,7 +1838,7 @@ async fn resolver_refuses_a_baseline_that_differs_from_the_target() {
         );
         assert!(
             refused.contains(&format!(
-                "the baseline's relation {EXTERNAL}.pair differs from the target's in column_order"
+                "the externals file's relation {EXTERNAL}.pair differs from the target's in column_order"
             )),
             "{server}: {refused}"
         );
@@ -1848,30 +1848,30 @@ async fn resolver_refuses_a_baseline_that_differs_from_the_target() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_refuses_a_baseline_that_creates_a_managed_object() {
+async fn resolver_refuses_an_externals_file_that_creates_a_managed_object() {
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = staging_target(&mut target, &guarded_target()).await;
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
-    let baseline = format!(
+    let externals = format!(
         "{}CREATE VIEW {MANAGED}.b AS SELECT NULL::text AS name WHERE false;",
-        plain_baseline("integer")
+        plain_externals("integer")
     );
-    let refused = baseline_refusal(
+    let refused = externals_refusal(
         produce_staged(
             &scratch.server,
             &target.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await,
     );
     target.drop().await;
     assert!(
         refused.contains(&format!(
-            "the baseline created view {MANAGED}.b, which is in the managed set"
+            "the externals file created view {MANAGED}.b, which is in the managed set"
         )),
         "{refused}"
     );
@@ -1879,7 +1879,7 @@ async fn resolver_refuses_a_baseline_that_creates_a_managed_object() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_runs_the_baseline_before_any_managed_object() {
+async fn resolver_runs_the_externals_file_before_any_managed_object() {
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
     // A statement naming a managed object fails: nothing managed exists yet.
@@ -1888,9 +1888,9 @@ async fn resolver_runs_the_baseline_before_any_managed_object() {
     let target_db = staging_target(&mut target, &guarded_target()).await;
     let naming = format!(
         "{}CREATE VIEW {EXTERNAL}.w AS SELECT id FROM {MANAGED}.a;",
-        plain_baseline("integer")
+        plain_externals("integer")
     );
-    let refused = baseline_refusal(
+    let refused = externals_refusal(
         produce_staged(
             &scratch.server,
             &target.on(&target_db),
@@ -1900,12 +1900,12 @@ async fn resolver_runs_the_baseline_before_any_managed_object() {
         )
         .await,
     );
-    // A database default the baseline changes is read by the compatibility
+    // A database default the externals file changes is read by the compatibility
     // qualification, as the target's is.
     let defaulting = format!(
         "{}DO $$BEGIN EXECUTE format('ALTER DATABASE %I SET search_path = {EXTERNAL}', \
          current_database()); END$$;",
-        plain_baseline("integer")
+        plain_externals("integer")
     );
     let incompatible = produce_staged(
         &scratch.server,
@@ -1933,7 +1933,7 @@ async fn resolver_runs_the_baseline_before_any_managed_object() {
         let mut fixture = Fixture::new(server);
         let target_db = staging_target(&mut fixture, &guarded_target()).await;
         let (login, scratch_db) = fixture.confined().await;
-        let baseline = format!(
+        let externals = format!(
             "CREATE SCHEMA {EXTERNAL};\n\
              SET search_path = {EXTERNAL};\n\
              CREATE TABLE t (id integer PRIMARY KEY, name text UNIQUE, p integer, n integer);\n\
@@ -1944,7 +1944,7 @@ async fn resolver_runs_the_baseline_before_any_managed_object() {
             &fixture.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await;
         fixture.drop().await;
@@ -1954,7 +1954,7 @@ async fn resolver_runs_the_baseline_before_any_managed_object() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_refuses_a_baseline_object_left_uncompared() {
+async fn resolver_refuses_an_externals_file_object_left_uncompared() {
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let mut setup = guarded_target();
@@ -1964,25 +1964,25 @@ async fn resolver_refuses_a_baseline_object_left_uncompared() {
     let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
-    let baseline = format!(
+    let externals = format!(
         "{}CREATE CONVERSION {EXTERNAL}.words FOR 'LATIN1' TO 'UTF8' \
          FROM pg_catalog.iso8859_1_to_utf8;",
-        plain_baseline("integer")
+        plain_externals("integer")
     );
-    let refused = baseline_refusal(
+    let refused = externals_refusal(
         produce_staged(
             &scratch.server,
             &target.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await,
     );
     target.drop().await;
     assert!(
         refused.contains(&format!(
-            "the baseline created conversion {EXTERNAL}.words, which the \
+            "the externals file created conversion {EXTERNAL}.words, which the \
              comparison with the target does not cover"
         )),
         "{refused}"
@@ -2004,7 +2004,7 @@ async fn resolver_refuses_a_chain_through_an_external_object_naming_it() {
     let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(&reading("id", "e"), &reading("m", "e"), &["m"]);
     let key = ProjectKey::new(true);
-    let refused = baseline_refusal(
+    let refused = externals_refusal(
         produce_staged(
             &scratch.server,
             &target.on(&target_db),
@@ -2045,7 +2045,7 @@ async fn resolver_compiles_a_managed_view_over_an_external_view_staged_as_a_shap
     let inputs = staging_inputs(&reading("id", "v"), &reading("name", "v"), &[]);
     let key = ProjectKey::new(true);
     // Only the view, as its output columns over typed NULLs.
-    let baseline = format!(
+    let externals = format!(
         "CREATE SCHEMA {EXTERNAL};\n\
          CREATE VIEW {EXTERNAL}.v AS SELECT NULL::integer AS id, NULL::text AS name WHERE false;"
     );
@@ -2054,7 +2054,7 @@ async fn resolver_compiles_a_managed_view_over_an_external_view_staged_as_a_shap
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
@@ -2069,22 +2069,22 @@ async fn resolver_refuses_an_external_view_staged_as_a_table() {
     let target_db = staging_target(&mut target, &view_target()).await;
     let inputs = staging_inputs(&reading("id", "v"), &reading("name", "v"), &[]);
     let key = ProjectKey::new(true);
-    let baseline =
+    let externals =
         format!("CREATE SCHEMA {EXTERNAL};\nCREATE TABLE {EXTERNAL}.v (id integer, name text);");
-    let refused = baseline_refusal(
+    let refused = externals_refusal(
         produce_staged(
             &scratch.server,
             &target.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await,
     );
     target.drop().await;
     assert!(
         refused.contains(&format!(
-            "the baseline's table {EXTERNAL}.v differs from the target's in"
+            "the externals file's table {EXTERNAL}.v differs from the target's in"
         )) && refused.contains("relkind"),
         "{refused}"
     );
@@ -2114,7 +2114,7 @@ async fn resolver_reports_a_write_through_a_shape_view_with_the_real_definition_
         .remove(&format!("{MANAGED}.w()").parse().unwrap());
     let inputs = Inputs::from_pair((base, desired));
     let key = ProjectKey::new(true);
-    let baseline = format!(
+    let externals = format!(
         "CREATE SCHEMA {EXTERNAL};\n\
          CREATE VIEW {EXTERNAL}.v AS SELECT NULL::integer AS id, NULL::text AS name WHERE false;"
     );
@@ -2123,7 +2123,7 @@ async fn resolver_reports_a_write_through_a_shape_view_with_the_real_definition_
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
@@ -2136,7 +2136,7 @@ async fn resolver_reports_a_write_through_a_shape_view_with_the_real_definition_
     };
     assert!(
         reason.contains(&format!(
-            "the baseline stages {EXTERNAL}.v as a view no statement can write through: stage \
+            "the externals file stages {EXTERNAL}.v as a view no statement can write through: stage \
              its real definition"
         )),
         "{reason}"
@@ -2145,7 +2145,7 @@ async fn resolver_reports_a_write_through_a_shape_view_with_the_real_definition_
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_refuses_a_question_that_needs_routine_source_the_baseline_lacks() {
+async fn resolver_refuses_a_question_that_needs_routine_source_the_externals_file_lacks() {
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let setup = vec![
@@ -2164,7 +2164,7 @@ async fn resolver_refuses_a_question_that_needs_routine_source_the_baseline_lack
     let inputs = staging_inputs(&call, &call, &[]);
     let key = ProjectKey::new(true);
     // The integer overload the target's call binds is not staged.
-    let baseline = format!(
+    let externals = format!(
         "CREATE SCHEMA {EXTERNAL};\n\
          CREATE FUNCTION {EXTERNAL}.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;"
     );
@@ -2173,7 +2173,7 @@ async fn resolver_refuses_a_question_that_needs_routine_source_the_baseline_lack
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
@@ -2187,8 +2187,8 @@ async fn resolver_refuses_a_question_that_needs_routine_source_the_baseline_lack
     assert!(
         reason.contains(&format!(
             "routine {EXTERNAL}.f(pg_catalog.int4) on the target is not in the resolver's \
-             baseline, and \
-             relation {MANAGED}.a could bind it; add it to the baseline"
+             externals file, and \
+             relation {MANAGED}.a could bind it; add it to the externals file"
         )) && reason.contains("select no resolver"),
         "{reason}"
     );
@@ -2196,9 +2196,9 @@ async fn resolver_refuses_a_question_that_needs_routine_source_the_baseline_lack
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_compares_what_the_baseline_adds_to_an_extension_it_did_not_create() {
-    // `plpgsql` is there before the baseline runs, so a routine the
-    // baseline adds to it is compared on its own, not skipped as covered by
+async fn resolver_compares_what_the_externals_file_adds_to_an_extension_it_did_not_create() {
+    // `plpgsql` is there before the externals file runs, so a routine the
+    // externals file adds to it is compared on its own, not skipped as covered by
     // an extension version nobody compared.
     let external = [
         format!("CREATE SCHEMA {EXTERNAL}"),
@@ -2216,7 +2216,7 @@ async fn resolver_compares_what_the_baseline_adds_to_an_extension_it_did_not_cre
     let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(&call, &call, &[]);
     let key = ProjectKey::new(true);
-    let baseline = external
+    let externals = external
         .iter()
         .map(|s| format!("{s};\n"))
         .collect::<String>();
@@ -2225,7 +2225,7 @@ async fn resolver_compares_what_the_baseline_adds_to_an_extension_it_did_not_cre
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
@@ -2241,7 +2241,7 @@ async fn resolver_compares_what_the_baseline_adds_to_an_extension_it_did_not_cre
 async fn resolver_stages_a_routine_in_a_system_schema_by_its_header() {
     // A superuser may create a routine in `information_schema` (measured on
     // 16 and 18). Staged there, it is compared by its header like any staged
-    // routine: the baseline need not repeat the target's body (SPEC §9.3.2).
+    // routine: the externals file need not repeat the target's body (SPEC §9.3.2).
     let routine = "information_schema.pbps_staged_1754";
     let call = format!("SELECT {routine}(1) AS r");
     let setup = vec![
@@ -2256,7 +2256,7 @@ async fn resolver_stages_a_routine_in_a_system_schema_by_its_header() {
     let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(&call, &call, &[]);
     let key = ProjectKey::new(true);
-    let baseline = format!(
+    let externals = format!(
         "CREATE FUNCTION {routine}(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 0;"
     );
     let result = produce_staged(
@@ -2264,7 +2264,7 @@ async fn resolver_stages_a_routine_in_a_system_schema_by_its_header() {
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
@@ -2282,7 +2282,7 @@ async fn resolver_stages_a_routine_in_a_system_schema_by_its_header() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_stages_a_cast_and_an_operator_over_external_types_in_the_baseline() {
+async fn resolver_stages_a_cast_and_an_operator_over_external_types_in_the_externals_file() {
     let external = [
         format!("CREATE SCHEMA {EXTERNAL}"),
         format!("CREATE TYPE {EXTERNAL}.pair AS (a integer, b integer)"),
@@ -2315,7 +2315,7 @@ async fn resolver_stages_a_cast_and_an_operator_over_external_types_in_the_basel
         let target_db = staging_target(&mut target, &setup).await;
         let inputs = staging_inputs(&a, &b, &[]);
         let key = ProjectKey::new(true);
-        let baseline = external
+        let externals = external
             .iter()
             .map(|s| format!("{s};\n"))
             .collect::<String>();
@@ -2324,7 +2324,7 @@ async fn resolver_stages_a_cast_and_an_operator_over_external_types_in_the_basel
             &target.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await;
         target.drop().await;
@@ -2338,7 +2338,7 @@ async fn resolver_compares_each_extension_member_with_the_target() {
     // The extension's version matches; one member the target altered in
     // place does not, and is named (#1766, #1783).
     let call = format!("SELECT {EXTERNAL}.soundex('pbps') AS r");
-    let baseline =
+    let externals =
         format!("CREATE SCHEMA {EXTERNAL};\nCREATE EXTENSION fuzzystrmatch SCHEMA {EXTERNAL};");
     for altered in [true, false] {
         let mut setup = vec![
@@ -2360,12 +2360,12 @@ async fn resolver_compares_each_extension_member_with_the_target() {
             &target.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await;
         target.drop().await;
         if altered {
-            let refused = baseline_refusal(result);
+            let refused = externals_refusal(result);
             assert!(
                 refused.contains(&format!(
                     "{EXTERNAL}.soundex(text) differs from the target's in provolatile"
@@ -2387,7 +2387,7 @@ async fn resolver_refuses_an_extension_with_a_member_no_capture_identifies() {
     // no identity for. Sealing a plan that reads the extension would need
     // it, so the comparison names it first.
     let call = format!("SELECT {EXTERNAL}.postgres_fdw_disconnect_all() AS r");
-    let baseline =
+    let externals =
         format!("CREATE SCHEMA {EXTERNAL};\nCREATE EXTENSION postgres_fdw SCHEMA {EXTERNAL};");
     let setup = vec![
         format!("CREATE SCHEMA {MANAGED}"),
@@ -2405,11 +2405,11 @@ async fn resolver_refuses_an_extension_with_a_member_no_capture_identifies() {
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
-    let refused = baseline_refusal(result);
+    let refused = externals_refusal(result);
     assert!(
         refused.contains("foreign-data wrapper postgres_fdw")
             && refused.contains("no plan can seal its extension"),
@@ -2423,7 +2423,7 @@ async fn resolver_stages_an_extension_that_brings_text_search_objects() {
     // `unaccent` brings a text search dictionary and template, which the
     // capture identifies and the comparison reads like any member (#1786).
     let call = format!("SELECT {EXTERNAL}.unaccent('pbps') AS r");
-    let baseline =
+    let externals =
         format!("CREATE SCHEMA {EXTERNAL};\nCREATE EXTENSION unaccent SCHEMA {EXTERNAL};");
     let setup = vec![
         format!("CREATE SCHEMA {MANAGED}"),
@@ -2441,7 +2441,7 @@ async fn resolver_stages_an_extension_that_brings_text_search_objects() {
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
@@ -2473,9 +2473,9 @@ async fn resolver_compares_a_text_search_dictionary_with_the_target() {
         let target_db = staging_target(&mut target, &setup).await;
         let inputs = staging_inputs(&reading("id", "t"), &call, &[]);
         let key = ProjectKey::new(true);
-        let baseline = format!(
+        let externals = format!(
             "{}{};\n",
-            plain_baseline("integer"),
+            plain_externals("integer"),
             dictionary(staged_options)
         );
         let result = produce_staged(
@@ -2483,12 +2483,12 @@ async fn resolver_compares_a_text_search_dictionary_with_the_target() {
             &target.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await;
         target.drop().await;
         if staged_options.is_empty() {
-            let refused = baseline_refusal(result);
+            let refused = externals_refusal(result);
             assert!(
                 refused.contains(&format!("text search dictionary {EXTERNAL}.words"))
                     && refused.contains("dictinitoption"),
@@ -2535,7 +2535,7 @@ async fn resolver_compares_an_operator_familys_members_with_the_target() {
         let target_db = staging_target(&mut target, &setup).await;
         let inputs = staging_inputs(&call, &call, &[]);
         let key = ProjectKey::new(true);
-        let baseline = family(staged_strategy)
+        let externals = family(staged_strategy)
             .iter()
             .map(|s| format!("{s};\n"))
             .collect::<String>();
@@ -2544,7 +2544,7 @@ async fn resolver_compares_an_operator_familys_members_with_the_target() {
             &target.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await;
         target.drop().await;
@@ -2553,9 +2553,10 @@ async fn resolver_compares_an_operator_familys_members_with_the_target() {
             let plan = result.unwrap_or_else(|error| panic!("an identical family: {error}"));
             plan.evidence.validate(&plan.changes).unwrap();
         } else {
-            let refused = baseline_refusal(result);
+            let refused = externals_refusal(result);
             assert!(
-                refused.contains("the target has") && refused.contains("the baseline does not"),
+                refused.contains("the target has")
+                    && refused.contains("the externals file does not"),
                 "{refused}"
             );
         }
@@ -2590,11 +2591,11 @@ async fn resolver_takes_a_routine_over_a_staged_type_as_no_part_of_it() {
     let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(&call, &call, &[]);
     let key = ProjectKey::new(true);
-    let mut baseline = external
+    let mut externals = external
         .iter()
         .map(|s| format!("{s};\n"))
         .collect::<String>();
-    baseline.push_str(&format!(
+    externals.push_str(&format!(
         "CREATE VIEW {EXTERNAL}.v AS SELECT NULL::integer AS s WHERE false;\n"
     ));
     let result = produce_staged(
@@ -2602,7 +2603,7 @@ async fn resolver_takes_a_routine_over_a_staged_type_as_no_part_of_it() {
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
@@ -2613,7 +2614,7 @@ async fn resolver_takes_a_routine_over_a_staged_type_as_no_part_of_it() {
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn resolver_refuses_a_staged_shape_that_changes_before_the_opening_capture() {
-    // A writer between the baseline's comparison and the capture the plan
+    // A writer between the externals file's comparison and the capture the plan
     // seals: scratch compiled `SELECT *` against the compared table, and
     // the evidence would seal the table with another column (#1755).
     let inputs = staging_inputs(&reading("id", "t"), &reading("*", "t"), &[]);
@@ -2623,7 +2624,7 @@ async fn resolver_refuses_a_staged_shape_that_changes_before_the_opening_capture
             format!("ALTER TABLE {EXTERNAL}.t ADD COLUMN extra integer"),
             true,
         ),
-        // Negative: a write to nothing the baseline staged.
+        // Negative: a write to nothing the externals file staged.
         (
             format!("CREATE TABLE {EXTERNAL}.unrelated (x integer)"),
             false,
@@ -2638,7 +2639,7 @@ async fn resolver_refuses_a_staged_shape_that_changes_before_the_opening_capture
             &target.on(&target_db),
             &inputs,
             &key,
-            &plain_baseline("integer"),
+            &plain_externals("integer"),
         )
         .await;
         target.drop().await;
@@ -2649,7 +2650,9 @@ async fn resolver_refuses_a_staged_shape_that_changes_before_the_opening_capture
                     assert!(reason.contains("extra"), "{reason}");
                 }
                 Err(other) => panic!("not a changed-target refusal: {other}"),
-                Ok(_) => panic!("a plan sealed over a shape the baseline was not compared with"),
+                Ok(_) => {
+                    panic!("a plan sealed over a shape the externals file was not compared with")
+                }
             }
         } else {
             assert_staged(result, "t", "an unrelated write");
@@ -2683,18 +2686,18 @@ async fn resolver_compares_a_sequence_its_table_owns() {
         let scratch = Fixture::new(SCRATCH_SERVER);
         let target_db = staging_target(&mut target, &setup).await;
         let key = ProjectKey::new(true);
-        let baseline = table.iter().map(|s| format!("{s};\n")).collect::<String>();
+        let externals = table.iter().map(|s| format!("{s};\n")).collect::<String>();
         let result = produce_staged(
             &scratch.server,
             &target.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await;
         target.drop().await;
         if altered {
-            let refused = baseline_refusal(result);
+            let refused = externals_refusal(result);
             assert!(refused.contains("seqincrement"), "{refused}");
         } else {
             // Negative: the same sequence is staged.
@@ -2729,7 +2732,7 @@ async fn resolver_compares_an_operator_class_with_its_family() {
         let target_db = staging_target(&mut target, &setup).await;
         let inputs = staging_inputs(&call, &call, &[]);
         let key = ProjectKey::new(true);
-        let baseline = class(staged_default)
+        let externals = class(staged_default)
             .iter()
             .map(|s| format!("{s};\n"))
             .collect::<String>();
@@ -2738,7 +2741,7 @@ async fn resolver_compares_an_operator_class_with_its_family() {
             &target.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await;
         target.drop().await;
@@ -2747,7 +2750,7 @@ async fn resolver_compares_an_operator_class_with_its_family() {
             let plan = result.unwrap_or_else(|error| panic!("an identical class: {error}"));
             plan.evidence.validate(&plan.changes).unwrap();
         } else {
-            let refused = baseline_refusal(result);
+            let refused = externals_refusal(result);
             assert!(refused.contains("opcdefault"), "{refused}");
         }
     }
@@ -2755,10 +2758,10 @@ async fn resolver_compares_an_operator_class_with_its_family() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_refuses_a_baseline_that_writes_outside_the_scratch_database() {
+async fn resolver_refuses_an_externals_file_that_writes_outside_the_scratch_database() {
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
-    // Run-owned: the baseline runs as the scratch superuser.
+    // Run-owned: the externals file runs as the scratch superuser.
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = staging_target(&mut target, &guarded_target()).await;
@@ -2792,14 +2795,14 @@ async fn resolver_refuses_a_baseline_that_writes_outside_the_scratch_database() 
         ),
     ];
     for (statements, named) in &cases {
-        let baseline = format!("{}{statements}\n", plain_baseline("integer"));
-        let refused = baseline_refusal(
+        let externals = format!("{}{statements}\n", plain_externals("integer"));
+        let refused = externals_refusal(
             produce_staged(
                 &scratch.server,
                 &target.on(&target_db),
                 &inputs,
                 &key,
-                &baseline,
+                &externals,
             )
             .await,
         );
@@ -2816,17 +2819,17 @@ async fn resolver_refuses_a_baseline_that_writes_outside_the_scratch_database() 
         let mut fixture = Fixture::new(server);
         let target_db = staging_target(&mut fixture, &guarded_target()).await;
         let (login, scratch_db) = fixture.confined().await;
-        let baseline = format!(
+        let externals = format!(
             "{}ALTER ROLE CURRENT_USER SET work_mem = '5MB';\n",
-            plain_baseline("integer")
+            plain_externals("integer")
         );
-        let refused = baseline_refusal(
+        let refused = externals_refusal(
             produce_staged(
                 &fixture.as_login(&scratch_db, &login),
                 &fixture.on(&target_db),
                 &inputs,
                 &key,
-                &baseline,
+                &externals,
             )
             .await,
         );
@@ -2855,8 +2858,8 @@ async fn resolver_refuses_a_baseline_that_writes_outside_the_scratch_database() 
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_runs_the_baseline_on_the_empty_path_every_session_pins() {
-    // Every pbps session pins an empty path (DEC-1564.1), the baseline's
+async fn resolver_runs_the_externals_file_on_the_empty_path_every_session_pins() {
+    // Every pbps session pins an empty path (DEC-1564.1), the externals file's
     // too: a file written for `psql` names its schemas or sets the path, as
     // `pg_dump` output does, and one that does neither is told so.
     let call = "SELECT public.soundex('pbps') AS r";
@@ -2865,7 +2868,7 @@ async fn resolver_runs_the_baseline_on_the_empty_path_every_session_pins() {
         "CREATE EXTENSION fuzzystrmatch SCHEMA public".to_owned(),
         format!("CREATE VIEW {MANAGED}.a AS {call}"),
     ];
-    for (baseline, staged) in [
+    for (externals, staged) in [
         (
             "SET search_path = public;\nCREATE EXTENSION fuzzystrmatch;",
             true,
@@ -2882,16 +2885,16 @@ async fn resolver_runs_the_baseline_on_the_empty_path_every_session_pins() {
             &target.on(&target_db),
             &inputs,
             &key,
-            baseline,
+            externals,
         )
         .await;
         target.drop().await;
         if staged {
-            let plan = result.unwrap_or_else(|error| panic!("{baseline}: {error}"));
+            let plan = result.unwrap_or_else(|error| panic!("{externals}: {error}"));
             plan.evidence.validate(&plan.changes).unwrap();
         } else {
             // Negative: no schema on the path, and the refusal says why.
-            let refused = baseline_refusal(result);
+            let refused = externals_refusal(result);
             assert!(
                 refused.contains("it runs on an empty search_path"),
                 "{refused}"
@@ -2902,8 +2905,8 @@ async fn resolver_runs_the_baseline_on_the_empty_path_every_session_pins() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_checks_a_baseline_whose_path_shadows_a_built_in_type() {
-    // The baseline's `SET`s last on its session until `DISCARD ALL`, and the
+async fn resolver_checks_an_externals_file_whose_path_shadows_a_built_in_type() {
+    // The externals file's `SET`s last on its session until `DISCARD ALL`, and the
     // checks after it run there: a type it names `text`, first on its path,
     // must not change what they read.
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
@@ -2913,16 +2916,16 @@ async fn resolver_checks_a_baseline_whose_path_shadows_a_built_in_type() {
     let mut setup = guarded_target();
     setup.push(format!("CREATE TYPE {EXTERNAL}.text AS ENUM ('a')"));
     let target_db = staging_target(&mut target, &setup).await;
-    let baseline = format!(
+    let externals = format!(
         "{}CREATE TYPE {EXTERNAL}.text AS ENUM ('a');\nSET search_path = {EXTERNAL}, pg_catalog;\n",
-        plain_baseline("integer")
+        plain_externals("integer")
     );
     let result = produce_staged(
         &scratch.server,
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
@@ -2956,22 +2959,22 @@ async fn resolver_compares_every_attribute_of_another_database() {
                 .await
                 .unwrap();
         }
-        let baseline = format!(
+        let externals = format!(
             "{}ALTER DATABASE {other} REFRESH COLLATION VERSION;\n",
-            plain_baseline("integer")
+            plain_externals("integer")
         );
         let result = produce_staged(
             &scratch.server,
             &target.on(&target_db),
             &inputs,
             &key,
-            &baseline,
+            &externals,
         )
         .await;
         target.drop().await;
         scratch.drop().await;
         if stale {
-            let refused = baseline_refusal(result);
+            let refused = externals_refusal(result);
             assert!(refused.contains(&format!("database {other}")), "{refused}");
         } else {
             // Negative: a refresh that changes nothing is no change.
@@ -2982,10 +2985,10 @@ async fn resolver_compares_every_attribute_of_another_database() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_reads_the_shared_state_under_its_own_settings_not_the_baselines() {
-    // A baseline's `SET TimeZone` renders a role's expiry with another
+async fn resolver_reads_the_shared_state_under_its_own_settings_not_the_externals_files() {
+    // An externals file's `SET TimeZone` renders a role's expiry with another
     // offset; read under it, the second read of the shared state would
-    // differ from the first and refuse a baseline that changed nothing.
+    // differ from the first and refuse an externals file that changed nothing.
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
@@ -3001,42 +3004,42 @@ async fn resolver_reads_the_shared_state_under_its_own_settings_not_the_baseline
         .await
         .unwrap();
     scratch.roles.push(expiring);
-    let baseline = format!(
+    let externals = format!(
         "{}SET TimeZone = 'Pacific/Kiritimati';\nSET statement_timeout = '1ms';\n",
-        plain_baseline("integer")
+        plain_externals("integer")
     );
     let result = produce_staged(
         &scratch.server,
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
     scratch.drop().await;
-    assert_staged(result, "t", "a baseline that sets its own time zone");
+    assert_staged(result, "t", "an externals file that sets its own time zone");
 }
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_ignores_another_sessions_cluster_writes_during_the_baseline() {
+async fn resolver_ignores_another_sessions_cluster_writes_during_the_externals_file() {
     // Other runs share the scratch cluster: a role one creates while this
-    // baseline runs is in neither of its reads, so nothing is refused.
+    // externals file runs is in neither of its reads, so nothing is refused.
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
     let mut scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = staging_target(&mut target, &guarded_target()).await;
     let marker = format!("pbps_v1783_marker_{}", scratch.token);
-    let baseline = format!(
+    let externals = format!(
         "{}SELECT pg_catalog.pg_sleep(3) AS {marker};\n",
-        plain_baseline("integer")
+        plain_externals("integer")
     );
     let other = format!("pbps_v1783_other_{}", scratch.token);
     let mut admin = scratch.admin().await;
     let concurrent = async {
-        // Once the baseline is running, another session creates a role.
+        // Once the externals file is running, another session creates a role.
         loop {
             let running = admin
                 .query(&format!(
@@ -3057,7 +3060,7 @@ async fn resolver_ignores_another_sessions_cluster_writes_during_the_baseline() 
     };
     let target_url = target.on(&target_db);
     let (result, ()) = tokio::join!(
-        produce_staged(&scratch.server, &target_url, &inputs, &key, &baseline),
+        produce_staged(&scratch.server, &target_url, &inputs, &key, &externals),
         concurrent
     );
     scratch.roles.push(other);
@@ -3084,7 +3087,7 @@ async fn resolver_compares_an_extension_member_in_a_system_schema_in_full() {
     let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(call, call, &[]);
     let key = ProjectKey::new(true);
-    let refused = baseline_refusal(
+    let refused = externals_refusal(
         produce_staged(
             &scratch.server,
             &target.on(&target_db),
@@ -3103,7 +3106,7 @@ async fn resolver_compares_an_extension_member_in_a_system_schema_in_full() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_stages_an_operator_over_built_in_types_in_the_baseline() {
+async fn resolver_stages_an_operator_over_built_in_types_in_the_externals_file() {
     // An operator's identity hangs off its operand types; over built-in
     // types those are not staged, so the operator itself is.
     let external = [
@@ -3126,7 +3129,7 @@ async fn resolver_stages_an_operator_over_built_in_types_in_the_baseline() {
     let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(&a, &a, &[]);
     let key = ProjectKey::new(true);
-    let baseline = external
+    let externals = external
         .iter()
         .map(|s| format!("{s};\n"))
         .collect::<String>();
@@ -3135,7 +3138,7 @@ async fn resolver_stages_an_operator_over_built_in_types_in_the_baseline() {
         &target.on(&target_db),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
@@ -3153,7 +3156,7 @@ async fn resolver_stages_an_operator_over_built_in_types_in_the_baseline() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates() {
+async fn resolver_reproduces_the_deployers_usage_of_a_schema_the_externals_file_creates() {
     // A deployer that is no superuser: without its USAGE on the external
     // schema reproduced, its views there would not compile on scratch.
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
@@ -3190,7 +3193,7 @@ async fn resolver_reproduces_the_deployers_usage_of_a_schema_the_baseline_create
         &target.as_login(&target_db, &deployer),
         &inputs,
         &key,
-        &plain_baseline("integer"),
+        &plain_externals("integer"),
     )
     .await;
     target.drop().await;
@@ -3238,7 +3241,7 @@ async fn resolver_reproduces_the_deployers_usage_of_a_schema_an_extension_carrie
     drop(as_deployer);
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
-    let baseline = carried
+    let externals = carried
         .iter()
         .map(|s| format!("{s};\n"))
         .collect::<String>();
@@ -3247,7 +3250,7 @@ async fn resolver_reproduces_the_deployers_usage_of_a_schema_an_extension_carrie
         &target.as_login(&target_db, &deployer),
         &inputs,
         &key,
-        &baseline,
+        &externals,
     )
     .await;
     target.drop().await;
@@ -3425,7 +3428,7 @@ async fn produce_in_docker(
     planned: Option<&str>,
     inputs: &Inputs,
     key: &ProjectKey,
-    baseline: Option<&str>,
+    externals: Option<&str>,
     outside_writes: pbps_model::resolver::OutsideWrites,
 ) -> Result<ResolvedPlan, ProduceError> {
     let identity = match planned {
@@ -3459,7 +3462,7 @@ async fn produce_in_docker(
                 &key.project,
                 Some(ENVIRONMENT),
                 &Standard::default(),
-                baseline,
+                externals,
                 &provenance,
             )
             .await
@@ -3793,9 +3796,9 @@ async fn resolver_docker_refuses_a_missing_image_it_may_not_pull() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn resolver_docker_stages_its_baseline() {
-    // A managed view over a baseline table compiles on a Docker scratch.
-    // Negative: a baseline table that differs from the target refuses.
+async fn resolver_docker_stages_its_externals_file() {
+    // A managed view over a table the externals file stages compiles on a Docker scratch.
+    // Negative: a table the externals file stages that differs from the target refuses.
     for (target_var, image) in DOCKER_PAIRS {
         let image = setting(image);
         for id_type in ["integer", "bigint"] {
@@ -3808,7 +3811,7 @@ async fn resolver_docker_stages_its_baseline() {
                 None,
                 &staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]),
                 &ProjectKey::new(true),
-                Some(&plain_baseline(id_type)),
+                Some(&plain_externals(id_type)),
                 pbps_model::resolver::OutsideWrites::Refused,
             )
             .await;
@@ -3816,7 +3819,7 @@ async fn resolver_docker_stages_its_baseline() {
             if id_type == "integer" {
                 assert_staged(result, "t", target_var);
             } else {
-                let refused = baseline_refusal(result);
+                let refused = externals_refusal(result);
                 assert!(refused.contains("atttypid"), "{target_var}: {refused}");
             }
         }
@@ -3825,12 +3828,15 @@ async fn resolver_docker_stages_its_baseline() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers and a container runtime"]
-async fn resolver_baseline_outside_writes_allow_keeps_a_created_role() {
-    // Under `outside_writes: allow` a baseline that creates a role stages,
+async fn resolver_externals_outside_writes_allow_keeps_a_created_role() {
+    // Under `outside_writes: allow` an externals file that creates a role stages,
     // and the evidence records the choice. Negative: under the default the
-    // same baseline refuses, rolled back, so it leaves no role.
+    // same externals file refuses, rolled back, so it leaves no role.
     let role = format!("pbps_v1674_role_{}", std::process::id());
-    let baseline = format!("{}CREATE ROLE {role} NOLOGIN;\n", plain_baseline("integer"));
+    let externals = format!(
+        "{}CREATE ROLE {role} NOLOGIN;\n",
+        plain_externals("integer")
+    );
     let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
     let key = ProjectKey::new(true);
     // A Docker scratch: the role goes with the container.
@@ -3847,7 +3853,7 @@ async fn resolver_baseline_outside_writes_allow_keeps_a_created_role() {
             None,
             &inputs,
             &key,
-            Some(&baseline),
+            Some(&externals),
             outside_writes,
         )
         .await;
@@ -3878,7 +3884,7 @@ async fn resolver_baseline_outside_writes_allow_keeps_a_created_role() {
             &key.project,
             Some(ENVIRONMENT),
             &Standard::default(),
-            Some(&baseline),
+            Some(&externals),
             &super::Provenance {
                 entry: "scratch".into(),
                 scratch: pbps_model::resolver::ScratchSource::Server {},
@@ -3912,11 +3918,11 @@ async fn resolver_baseline_outside_writes_allow_keeps_a_created_role() {
 
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_supplied_baseline_outside_writes_allow_keeps_the_logins_own_default() {
-    // A supplied account's allowed baseline changes the login's own
+async fn resolver_supplied_externals_outside_writes_allow_keeps_the_logins_own_default() {
+    // A supplied account's allowed externals file changes the login's own
     // default. It is kept, and the release compares the compile's changes
-    // with what the baseline left, not with what was there before it.
-    // Negative: under the default the same baseline refuses.
+    // with what the externals file left, not with what was there before it.
+    // Negative: under the default the same externals file refuses.
     for outside_writes in [
         pbps_model::resolver::OutsideWrites::Allowed,
         pbps_model::resolver::OutsideWrites::Refused,
@@ -3924,9 +3930,9 @@ async fn resolver_supplied_baseline_outside_writes_allow_keeps_the_logins_own_de
         let mut fixture = Fixture::new("PBPS_TEST_PG_DB");
         let target_db = staging_target(&mut fixture, &guarded_target()).await;
         let (login, scratch_db) = fixture.confined().await;
-        let baseline = format!(
+        let externals = format!(
             "{}ALTER ROLE CURRENT_USER SET work_mem = '5MB';\n",
-            plain_baseline("integer")
+            plain_externals("integer")
         );
         let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
         let key = ProjectKey::new(true);
@@ -3945,7 +3951,7 @@ async fn resolver_supplied_baseline_outside_writes_allow_keeps_the_logins_own_de
             &key.project,
             Some(ENVIRONMENT),
             &Standard::default(),
-            Some(&baseline),
+            Some(&externals),
             &super::Provenance {
                 entry: "scratch".into(),
                 scratch: pbps_model::resolver::ScratchSource::Server {},
@@ -3975,7 +3981,7 @@ fn assert_outside_writes(
             ));
         }
         pbps_model::resolver::OutsideWrites::Refused => {
-            let refused = baseline_refusal(result);
+            let refused = externals_refusal(result);
             assert!(
                 refused.contains(role) && refused.contains("outside_writes: allow"),
                 "{refused}"
@@ -3991,7 +3997,7 @@ async fn produce_unsealed(
     target: &str,
     inputs: &Inputs,
     key: &ProjectKey,
-    baseline: Option<&str>,
+    externals: Option<&str>,
 ) -> (Result<super::super::Unsealed, ProduceError>, String) {
     let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
     let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
@@ -4010,7 +4016,7 @@ async fn produce_unsealed(
         &key.project,
         Some(ENVIRONMENT),
         &Standard::default(),
-        baseline,
+        externals,
         &super::Provenance::server(),
     )
     .await;
@@ -4182,13 +4188,13 @@ async fn resolver_recheck_refuses_an_external_shape_changed_after_planning() {
             let key = ProjectKey::new(true);
             let target_db = staging_target(&mut fixture, &guarded_target()).await;
             let (login, scratch_db) = fixture.confined().await;
-            let baseline = plain_baseline("integer");
+            let externals = plain_externals("integer");
             let (result, _) = produce_unsealed(
                 &fixture.as_login(&scratch_db, &login),
                 &fixture.on(&target_db),
                 &inputs,
                 &key,
-                Some(&baseline),
+                Some(&externals),
             )
             .await;
             let outcome = match result {

@@ -51,6 +51,13 @@ pub enum ConfigError {
     )]
     RemovedResolverProfileField { path: PathBuf, resolver: String },
 
+    /// A resolver entry naming its externals file by the field's old name:
+    /// "baseline" is also the ledger's state reset, `pbps baseline` (#2007).
+    #[error(
+        "`{path}` is malformed: resolver `{resolver}` names `baseline:`, which is now `externals:` (#2007). The file is unchanged: it stages the external objects the declarations read. Rename the field"
+    )]
+    RenamedResolverBaseline { path: PathBuf, resolver: String },
+
     #[error(
         "resolver profile names must start with an ASCII letter or digit and contain only letters, digits, dots, underscores or hyphens"
     )]
@@ -406,15 +413,21 @@ impl Config {
         let config: Self = serde_saphyr::from_str(yaml).map_err(|e| {
             // Read again only on failure, so every other error keeps the
             // typed parse's own position.
-            match resolver::entry_naming_a_profile(yaml) {
-                Some(resolver) => ConfigError::RemovedResolverProfileField {
+            if let Some(resolver) = resolver::entry_carrying(yaml, "profile") {
+                ConfigError::RemovedResolverProfileField {
                     path: path.to_owned(),
                     resolver,
-                },
-                None => ConfigError::Parse {
+                }
+            } else if let Some(resolver) = resolver::entry_carrying(yaml, "baseline") {
+                ConfigError::RenamedResolverBaseline {
+                    path: path.to_owned(),
+                    resolver,
+                }
+            } else {
+                ConfigError::Parse {
                     path: path.to_owned(),
                     message: e.to_string(),
-                },
+                }
             }
         })?;
         if config

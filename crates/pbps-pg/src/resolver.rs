@@ -1,10 +1,10 @@
 //! Advisory environment observations, never resolver qualification (ADR-0016).
 
 pub mod authorization;
-pub mod baseline;
 pub mod capture;
 pub mod compatibility;
 pub mod environment;
+pub mod externals;
 pub mod reconstruct;
 pub mod scratch;
 pub mod standard;
