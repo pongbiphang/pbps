@@ -964,7 +964,9 @@ command that reads the date against one that does not.
   which makes a rerun a no-op, byte for byte, but only for a frontier on the grid: one off it
   is refused first, whatever `--until` is, and a fraction of a second is off every grid and
   orders by its magnitude, so a frontier a fraction short of `--until` is not "already
-  there" (#1912).
+  there" (#1912). For an integer key, a nearest value the key type cannot hold (a 20-digit
+  step past a `bigint`'s maximum) is left out of the refusal, which says no larger value fits
+  the type, since a proposal the column could not store is no proposal (#1905).
 - **The spelling is what the engine prints, nothing else.** Measured on 16.15 and 18.6 under
   the pins (`TimeZone` UTC, ISO dates, DEC-1170.1): `date` is `2027-01-01`, `timestamp`
   `2027-01-01 00:00:00`, `timestamptz` `2027-01-01 00:00:00+00`, an integer its decimal text
