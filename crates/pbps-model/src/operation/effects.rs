@@ -410,7 +410,7 @@ impl Cx<'_> {
                 self.nullability_moves(&key, *from_nullable, *to_nullable, false);
                 // A default written for the old type blocks the retype, and
                 // one written for the new type follows it (DEC-1168.1).
-                if self.default_goes(&owner, &column.name) {
+                if self.default_goes(&owner, &key) {
                     self.requires(Requirement::Absent(ObjectKey::Default(key)));
                 }
             }
@@ -451,7 +451,7 @@ impl Cx<'_> {
                 // A recomputed value may be NULL where the column stood NOT
                 // NULL: a relaxation goes first, a tightening after
                 // (DEC-1168.1).
-                if self.relaxes(&owner, &column.name) {
+                if self.relaxes(&owner, &key) {
                     self.requires(Requirement::Absent(Self::not_null(key)));
                 }
             }
@@ -540,10 +540,7 @@ impl Cx<'_> {
                     table: owner.clone(),
                     column: column.clone(),
                 };
-                self.rewrites(Resource::Object(
-                    ObjectKey::Column(key.clone()),
-                    Incarnation::Final,
-                ));
+                self.exists(ObjectKey::Column(key.clone()));
                 if let Some((_, own)) = self.final_of(&owner)
                     && let Some(of) = &own.partition_of
                 {
@@ -1174,25 +1171,42 @@ impl Cx<'_> {
         }
     }
 
+    /// A column's names on the two sides: the plan may rename it, and a
+    /// comparison by one name would read a rename as a drop.
+    fn names_of(&self, column: &ColumnKey) -> Option<(String, String)> {
+        let ColumnKey::Recorded(Recorded(uid)) = column else {
+            return None;
+        };
+        let was = self.before.ids.columns.get(uid)?;
+        let will = self.after.ids.columns.get(uid)?;
+        Some((was.name.clone(), will.name.clone()))
+    }
+
     /// Whether the plan takes the column's default away: the baseline has one
     /// and the desired state has a different one or none.
-    fn default_goes(&self, owner: &Recorded, column: &str) -> bool {
+    fn default_goes(&self, owner: &Recorded, column: &ColumnKey) -> bool {
         let (Some((_, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner)) else {
             return false;
         };
-        let default = |t: &Table| match t.columns.get(column).map(|c| &c.value_source) {
+        let Some((was_name, will_name)) = self.names_of(column) else {
+            return false;
+        };
+        let default = |t: &Table, name: &str| match t.columns.get(name).map(|c| &c.value_source) {
             Some(ValueSource::Default(d)) => Some(d.clone()),
             _ => None,
         };
-        default(was).is_some() && default(was) != default(will)
+        default(was, &was_name).is_some() && default(was, &was_name) != default(will, &will_name)
     }
 
     /// Whether the plan relaxes the column from NOT NULL.
-    fn relaxes(&self, owner: &Recorded, column: &str) -> bool {
+    fn relaxes(&self, owner: &Recorded, column: &ColumnKey) -> bool {
         let (Some((_, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner)) else {
             return false;
         };
-        match (was.columns.get(column), will.columns.get(column)) {
+        let Some((was_name, will_name)) = self.names_of(column) else {
+            return false;
+        };
+        match (was.columns.get(&was_name), will.columns.get(&will_name)) {
             (Some(a), Some(b)) => !a.nullable && b.nullable,
             _ => false,
         }
@@ -1247,14 +1261,20 @@ impl Cx<'_> {
                 continue;
             }
             if matches!(column.value_source, ValueSource::Default(_))
-                && !matches!(
-                    will.columns.get(name).map(|c| &c.value_source),
-                    Some(ValueSource::Default(_))
-                )
                 && let Some((tname, _)) = self.base_of(owner)
                 && let Some(key) = self.base_column(&tname.column(name.as_str()))
             {
-                gone.push(ObjectKey::Default(key));
+                // By the column's name on the desired side: a rename keeps
+                // its default, and only another default or none takes it away.
+                let kept = self.names_of(&key).is_some_and(|(_, now)| {
+                    matches!(
+                        will.columns.get(&now).map(|c| &c.value_source),
+                        Some(ValueSource::Default(_))
+                    )
+                });
+                if !kept {
+                    gone.push(ObjectKey::Default(key));
+                }
             }
         }
         for key in gone {
@@ -1265,9 +1285,9 @@ impl Cx<'_> {
     /// A row that holds NULL needs the column relaxed first, when the plan
     /// relaxes it.
     fn row_needs_nullable(&mut self, owner: &Recorded, _table: &TableName, column: &str) {
-        if self.relaxes(owner, column)
-            && let Some((name, _)) = self.final_of(owner)
+        if let Some((name, _)) = self.final_of(owner)
             && let Some(key) = self.final_column(&name.column(column))
+            && self.relaxes(owner, &key)
         {
             self.requires(Requirement::Absent(Self::not_null(key)));
         }

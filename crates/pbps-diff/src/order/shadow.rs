@@ -3,7 +3,7 @@
 use pbps_dialect::Dialect;
 use pbps_model::ModuleDeps;
 use pbps_model::operation::{
-    Effects, Operation, OperationId, Operations, OwnerError, Owners, Snapshot, effects,
+    Effects, Operation, OperationId, Operations, OwnerError, Owners, Requirement, Snapshot, effects,
 };
 
 use super::edges::{Baseline, Checks, Graph, graph};
@@ -184,7 +184,7 @@ pub(crate) fn judge(ops: &[Operation], report: &Report) -> (Vec<String>, bool) {
     // cannot be met by any order: the input disagrees with itself (for example
     // an identity file naming a column the base declarations lack). It is
     // recorded, but only an order that could be wrong fails the run.
-    let unprovided = |operation: OperationId, requirement: &pbps_model::operation::Requirement| {
+    let unprovided = |operation: OperationId, requirement: &Requirement| {
         report.graph.unmet.iter().any(|u| {
             ops.get(u.operation).is_some_and(|o| o.id() == operation)
                 && &u.requirement == requirement
@@ -204,6 +204,11 @@ pub(crate) fn judge(ops: &[Operation], report: &Report) -> (Vec<String>, bool) {
                 operation,
                 requirement,
             } => format!("unmet {} needs {requirement:?}", name(*operation)),
+            Violation::StillPresent { operation, key }
+                if unprovided(*operation, &Requirement::Absent(key.clone())) =>
+            {
+                format!("unprovided {} needs {key:?} gone", name(*operation))
+            }
             Violation::StillPresent { operation, key } => {
                 format!("present {} needs {key:?} gone", name(*operation))
             }

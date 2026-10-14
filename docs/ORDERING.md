@@ -180,7 +180,7 @@ steps:
      `sys.sql_expression_dependencies`) at plan time, so it is exact, not
      positional.
 
-## What each change requires, in code
+## How the code states what a change requires
 
 The table below is executable. `pbps_model::operation::effects` reports, for
 each operation, what it creates, removes and rewrites (objects, by key and
@@ -224,7 +224,7 @@ requirement is common to all of them, so it is listed once,
 | `AlterColumnNullability` | 9 | Tightening: the values non-null | Accepts or refuses NULL | Exists, Reads, creates, removes |
 | `AlterColumnDefault` | 9 | Functions the default calls: *content* | The default | Exists, Is, creates, removes |
 | `SetPartitionDefault` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Functions the default calls: *content*. P: after its parent's default set by the plan (`after_their_parents_defaults`); one split from a create beside a DEFAULT, right after the last function its text may call (`split_moving_defaults`, DEC-1547.1) | One partition's default: its own, or its parent's again (DEC-1581.1) | Exists, Is, creates |
-| `SetPartitionNotNull` | 9; (9, 4) after its parent's default or NOT NULL change on the column; a DEFAULT's tightening (9, 6) in a plan that moves rows out of it | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) | Exists, Reads, rewrites |
+| `SetPartitionNotNull` | 9; (9, 4) after its parent's default or NOT NULL change on the column; a DEFAULT's tightening (9, 6) in a plan that moves rows out of it | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) | Exists, Reads |
 | `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values | Absent, Exists, creates, removes, rewrites |
 | `AlterColumnNumbering` | 9; −3 giving up a source or an identity, +2 otherwise; (6, 1 + chain depth) giving up, renaming, or turning into an identity an owned sequence on a column it neither tightens nor retypes; (12, 3) putting a source on a table whose rows it updates or deletes and does not only insert | Putting an identity on: the column `NOT NULL`. Putting a source on: the column in its final type. Giving up an identity: the column still `NOT NULL`. P: no value too near the type's bound to continue past (pre-flight) | The column's identity or owned sequence put on, taken off, retuned or converted; one put on continues past the column's values (DEC-1889.1) | PLACEHOLDER |
 | `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) | Exists, creates |

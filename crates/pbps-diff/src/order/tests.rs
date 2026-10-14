@@ -565,3 +565,93 @@ fn an_obligation_some_order_could_meet_but_this_one_meets_too_late_fails_the_run
     assert!(fails, "{lines:?}");
     assert!(lines.iter().any(|l| l.starts_with("unmet ")), "{lines:?}");
 }
+
+#[test]
+fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_fails() {
+    use super::shadow::{Shadowed, judge};
+    // Only the parent is dropped: the child's key into it stands in the
+    // baseline and nothing removes it, so no order could satisfy the drop.
+    let mut standing = two_dropped_tables();
+    standing.logical.remove(0);
+    let (ops, fx, baseline) = standing.analysed(ModuleEdits::InPlace);
+    let report = Shadowed {
+        effects: fx,
+        unowned: Vec::new(),
+    }
+    .report(&ops, &baseline, &ModuleDeps::new());
+    assert!(!report.violations.is_empty(), "the replay still sees it");
+    let (lines, fails) = judge(ops.as_slice(), &report);
+    assert!(!fails, "{lines:?}");
+    assert!(
+        lines.iter().all(|l| l.starts_with("unprovided ")),
+        "{lines:?}"
+    );
+    // The same drop with the child's own drop after it is an order that could
+    // have been right.
+    let both = two_dropped_tables();
+    let (ops, fx, baseline) = both.analysed(ModuleEdits::InPlace);
+    let swapped = ops.reordered(&[1, 0]);
+    let report = Shadowed {
+        effects: vec![fx[1].clone(), fx[0].clone()],
+        unowned: Vec::new(),
+    }
+    .report(&swapped, &baseline, &ModuleDeps::new());
+    let (lines, fails) = judge(swapped.as_slice(), &report);
+    assert!(fails, "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("present ")), "{lines:?}");
+}
+
+/// `t` with `id` and one more column, the plan renaming it from `a` to `b`;
+/// the column keeps its identity across the two names.
+fn renamed_default(after_default: Option<&str>) -> Plan {
+    use pbps_model::ValueSource;
+    let table = |name: &str, default: Option<&str>| {
+        let mut table = table_with(&["id"]);
+        let mut column = Column::new(int());
+        if let Some(text) = default {
+            column.value_source = ValueSource::Default(text.into());
+        }
+        table.columns.insert(name.into(), column);
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table("a", Some("1")));
+    after.tables.insert(t("t"), table("b", after_default));
+    let moved = uid(UidKind::Column, "t.a");
+    let named = |column: &str| {
+        let mut ids = Plan::ids(&["t"], &[("t", "id")]);
+        ids.columns.insert(moved.clone(), t("t").column(column));
+        ids
+    };
+    Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("t"),
+                from: "a".into(),
+                to: "b".into(),
+                table_was: None,
+            }),
+            row("t", "1"),
+        ],
+        before,
+        after,
+        before_ids: named("a"),
+        after_ids: named("b"),
+    }
+}
+
+#[test]
+fn a_renamed_column_keeps_its_default_so_a_row_insert_waits_for_nothing() {
+    let default_must_go = |plan: &Plan| {
+        let (_, fx, _) = plan.analysed(ModuleEdits::InPlace);
+        fx[1]
+            .requires
+            .iter()
+            .any(|r| matches!(r, Requirement::Absent(ObjectKey::Default(_))))
+    };
+    assert!(!default_must_go(&renamed_default(Some("1"))));
+    // Negative: the same rename that also drops the default does make the
+    // row wait for the drop.
+    assert!(default_must_go(&renamed_default(None)));
+}

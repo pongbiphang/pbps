@@ -5319,7 +5319,8 @@ effects because partitions are in the model, not an engine's. Attach ends the
 table's own columns and produces the partition's entries; detach ends the
 entries and produces the table's own columns, so what releases one runs before
 the move and what restores one after. The partition's own alterations keep
-their order after an attach as writes of the same entry (DEC-1545.1).
+their order after an attach as writes of the same entry (DEC-1545.1). The partition's default and its NOT NULL are separate attributes of
+the entry: setting one does not order the other.
 
 <a id="dec-1954-6"></a>
 
@@ -5329,8 +5330,11 @@ and debug builds; a violation fails the test that made the order.**
 requirement not satisfied at its step, an `Absent` dependency still present, a
 broken `depends_on:` annotation, and an edge the effects imply that the order
 runs the other way. A requirement nothing in the plan provides and the baseline lacks (an identity
-file naming a column the base declarations lack) is recorded as `unprovided`
-and does not fail: no order could meet it, so it says nothing about the order. They run where an order is made: the differ's, and the
+file naming a column the base declarations lack), or a dependent that stands
+throughout and that no operation removes (a check the lowering rebuilds around
+a retype, a computed column the catalog judges by its own collation, #1460), is
+recorded as `unprovided` and does not fail: no order could meet it, so it says
+nothing about the order. They run where an order is made: the differ's, and the
 resolver's. The resolver's intermediate ordinary plan is not observed, because
 it is not an order anything runs. With `PBPS_ORDER_SHADOW` set to a file they
 write their findings and never fail, which is how the go/no-go report is
