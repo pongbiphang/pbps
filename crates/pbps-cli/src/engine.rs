@@ -2989,21 +2989,49 @@ async fn module_dependents(
 /// `check_module_rebuilds`, so that a view the plan now drops and recreates is
 /// held to the same bar as one the declarations edit.
 ///
+/// It is where a connected plan is scheduled, on either engine: SQL Server
+/// has no module dependents to read, and its plan goes through the schedule
+/// with the members of the roles it drops, `role_members`, which the caller
+/// read when there were any.
+///
 /// `rediff` plans the same revision again with the given unchanged modules
 /// rebuilt (`pbps_diff::diff_rebuilding`): a module dependent the plan does
 /// not touch has to be rebuilt around the module under it, and a rebuild is
 /// its grants and its `PUBLIC` execute as well as its two statements, which
 /// only the differ's own passes write.
+// The eighth argument is the role members the caller read: the schedule
+// takes every fact in one call (#1955).
+#[allow(clippy::too_many_arguments)]
 pub async fn account_for_module_dependents(
     conn: &mut Conn,
     changes: &mut ChangeSet,
     declared: &pbps_model::Schema,
     sources: crate::dependents::Sources<'_>,
     deps: &pbps_model::ModuleDeps,
+    role_members: Option<&crate::dependents::schedule::RoleMembers>,
     dialect: &dyn pbps_dialect::Dialect,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<ChangeSet>,
 ) -> anyhow::Result<ConnectedCheck> {
+    let declarations = crate::dependents::schedule::Declarations {
+        schema: declared,
+        sources,
+        module_deps: deps,
+    };
+    // The members of the roles this plan drops, which the caller read when
+    // there were any: every connected plan goes through the schedule once,
+    // whichever facts its engine supplies (#1955 review).
+    let read = match role_members {
+        Some(members) => crate::dependents::schedule::Facts::default().with_role_members(members),
+        None => crate::dependents::schedule::Facts::default(),
+    };
     if conn.driver() != Driver::Postgres {
+        let scheduled = crate::dependents::schedule::schedule(
+            std::mem::take(changes),
+            &declarations,
+            &read,
+            dialect,
+        )?;
+        *changes = scheduled.changes;
         return Ok(ConnectedCheck {
             name: "module_dependents",
             engine: "SQL Server",
@@ -3020,14 +3048,10 @@ pub async fn account_for_module_dependents(
     // Every reordering pass, in one place (#1955): `weave` over what the
     // catalog just said depends on the modules this plan drops, then the
     // passes that read nothing.
-    let facts = crate::dependents::schedule::Facts::default().with_module_dependents(&found);
+    let facts = read.with_module_dependents(&found);
     let scheduled = crate::dependents::schedule::schedule(
         std::mem::take(changes),
-        &crate::dependents::schedule::Declarations {
-            schema: declared,
-            sources,
-            module_deps: deps,
-        },
+        &declarations,
         &facts,
         dialect,
     )?;

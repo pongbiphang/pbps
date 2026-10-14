@@ -242,7 +242,7 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
                 let sources = Sources { before: pbps_diff::Side { schema: &before, ids: &before_ids }, after: &after_ids };
                 assert!(crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.is_err());
                 crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
-                    &ModuleDeps::default(), &pg, &|_| panic!("the plan already rebuilds its sole module"))
+                    &ModuleDeps::default(), None, &pg, &|_| panic!("the plan already rebuilds its sole module"))
                     .await.unwrap();
                 assert_owner(&cs, transition.is_none() || if rebuild_first { detach } else { !detach });
                 crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.unwrap();
@@ -272,7 +272,7 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
         conn.begin(&framing).await.unwrap();
         assert!(crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.is_err());
         crate::engine::account_for_module_dependents(&mut conn, &mut cs, &after, sources,
-            &ModuleDeps::default(), &pg, &|_| panic!("the plan already drops its sole module"))
+            &ModuleDeps::default(), None, &pg, &|_| panic!("the plan already drops its sole module"))
             .await.unwrap();
         assert_parent_release(&cs);
         crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.unwrap();
@@ -493,6 +493,7 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
         &after,
         sources,
         &ModuleDeps::default(),
+        None,
         &pg,
         &|_| panic!("the plan already rebuilds the function"),
     )

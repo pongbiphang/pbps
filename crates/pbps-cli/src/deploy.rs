@@ -5997,6 +5997,25 @@ pub fn cmd_plan_db(
             )
             .await?
             .check;
+            // A role this plan drops still has this environment's members,
+            // which the engine will not drop it over. They are read here, for
+            // the schedule to write into the plan by name, so the artifact the
+            // gate approves lists exactly who is removed (ADR-0005) — never
+            // found again at apply time, where nobody would have reviewed
+            // them. Without a role drop there is nothing to ask.
+            let role_members = if cs
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
+            {
+                Some(
+                    crate::engine::role_members(&mut conn)
+                        .await
+                        .context("cannot read the role memberships")?,
+                )
+            } else {
+                None
+            };
             // First, so that what it adds is held to every check after it: a
             // view this plan now drops and recreates takes `before_a_rebuild`
             // like one the declarations edit (#314, ADR-0009 §4).
@@ -6029,6 +6048,7 @@ pub fn cmd_plan_db(
                     after: &resolved.ids,
                 },
                 &hints.module_deps,
+                role_members.as_ref(),
                 dialect.as_ref(),
                 &rediff,
             )
@@ -6116,19 +6136,13 @@ pub fn cmd_plan_db(
         let (wanted, vacated) = role_name_expectations(&cs, dialect.as_ref(), 0)?;
         refuse_taken_role_names(&mut conn, &wanted, &vacated).await?;
 
-        // A role this plan drops still has this environment's members, which
-        // the engine will not drop it over. They are read here and written
-        // into the plan by name, so the artifact the gate approves lists
-        // exactly who is removed (ADR-0005) — never found again at apply
-        // time, where nobody would have reviewed them.
+        // A role this plan drops, its members already written into it by the
+        // schedule (above, in the planning transaction).
         if cs
             .changes
             .iter()
             .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
         {
-            let members = crate::engine::role_members(&mut conn)
-                .await
-                .context("cannot read the role memberships")?;
             // Ownership is refused, not planned around: the engine will not
             // drop an owning role, and moving ownership is a decision about
             // who owns a securable, not a consequence of a drop. Said here,
@@ -6153,29 +6167,6 @@ pub fn cmd_plan_db(
                     );
                 }
             }
-            // The differ sorted the drops before it could know who holds
-            // whom. The schedule writes the members just read into the drops
-            // and orders them, so a role holding another dropped role goes
-            // first, or its `DROP MEMBER` names a principal already gone
-            // (DECISIONS 127, 139). On SQL Server, the only engine that reads
-            // them, this is the whole of what it runs.
-            cs = crate::dependents::schedule::schedule(
-                cs,
-                &crate::dependents::schedule::Declarations {
-                    schema: &loaded.schema,
-                    sources: crate::dependents::Sources {
-                        before: pbps_diff::Side {
-                            schema: &recorded_snapshot.schema,
-                            ids: &recorded_ids,
-                        },
-                        after: &resolved.ids,
-                    },
-                    module_deps: &hints.module_deps,
-                },
-                &crate::dependents::schedule::Facts::default().with_role_members(&members),
-                dialect.as_ref(),
-            )?
-            .changes;
         }
 
         // The plan rules (ADR-0008), the connected ones included: this is the
