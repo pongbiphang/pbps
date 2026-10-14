@@ -793,19 +793,24 @@ fn compiled_early(
         })
 }
 
-/// An object as a refusal names it, a routine with its argument types: the
-/// set holds every overload of the name, so the name alone would not say
-/// which one the operator has to stage (#1517).
+/// A candidate as a refusal names it, with its signature, whatever its
+/// class: a set holds every member of a name (a routine's or an operator's
+/// overloads, an operator class per access method), and a cast has no name
+/// at all, its two types are its identity. The name alone would not say
+/// which one the operator has to stage (#1517, #1945 review).
 fn overload(member: &ObjectIdentity) -> String {
-    let name = super::staged::named(member);
-    if member.class != "pg_proc" {
-        return name;
-    }
     let arguments: Vec<String> = member
         .signature
         .iter()
         .map(|argument| argument.name.join("."))
         .collect();
+    if let ("pg_cast", [source, target]) = (member.class.as_str(), arguments.as_slice()) {
+        return format!("cast ({source} AS {target})");
+    }
+    let name = super::staged::named(member);
+    if arguments.is_empty() {
+        return name;
+    }
     format!("{name}({})", arguments.join(", "))
 }
 

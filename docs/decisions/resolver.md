@@ -2616,8 +2616,9 @@ the evidence came from or what it sealed.
     routine was named, and only when the entry had a baseline. Now an object
     of any candidate class is named, with or without a baseline, together
     with the declaration that could bind it and the remedy, add it to the
-    baseline. A routine is named with its argument types, and only an
-    overload the declaration's call could reach is named. The resolver transfers no target source, so only the operator
+    baseline. A candidate is named with its signature, a routine with its
+    argument types and a cast by its two types, and only an overload the
+    declaration's call could reach is named. The resolver transfers no target source, so only the operator
     can stage it.
 
 **Pinned by** `a_resolved_plan_explains_its_provenance_and_sealed_qualification`

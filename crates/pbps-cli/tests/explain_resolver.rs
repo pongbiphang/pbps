@@ -474,7 +474,11 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
   nav.find(button => button.dataset.view === "plan").fire("click");
   elements["selection-value"].value = "plan.json";
   for (const item of CASES) {
-    RESPONSES.plan = item.response;
+    // A record standing for the captured scope: counted, never listed, in
+    // the evidence panel and the plan details alike (#1945 review).
+    const response = JSON.parse(item.response);
+    if (response.data.resolver) response.data.resolver.prerequisites = [{object: {class: "pg_proc", name: ["sentinel", "p"], signature: []}, fingerprinted: true}];
+    RESPONSES.plan = JSON.stringify(response);
     elements.selection.fire("submit");
     await settle();
     const titles = [...elements.content.walk()].filter(e => e.tagName === "h2").map(e => e.textContent);
@@ -486,6 +490,8 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
     assert(titles.includes("Resolver evidence") === resolved, JSON.stringify(titles));
     const lines = [...elements.content.walk()].filter(e => e.tagName === "p").map(e => e.textContent);
     assert(lines.includes("scratch (server scratch, supplied)") === resolved, JSON.stringify(lines));
+    const shown = [...elements.content.walk()].map(e => e.textContent).join("\n");
+    assert(!shown.includes("sentinel"), shown);
   }
 })().catch(error => { console.error(error); process.exit(1); });
 "#).unwrap();

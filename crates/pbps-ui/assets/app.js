@@ -99,11 +99,13 @@
         const stat = node("div", undefined, "stat"); stat.append(node("strong", data[key]), node("span", text)); stats.append(stat);
       }
       summary.append(stats); content.append(summary);
-      if (data.resolver) {
-        // Where a resolved plan's evidence came from, read from the plan (#1517).
-        // Its prerequisites are counted: the full list is the JSON's.
-        const {prerequisites, ...resolver} = data.resolver, box = panel("Resolver evidence");
-        box.append(node("p", `${resolver.entry} (${resolver.scratch} scratch, ${resolver.layout})`), fields({...resolver, prerequisites: prerequisites.length}));
+      // Where a resolved plan's evidence came from, read from the plan (#1517).
+      // Its prerequisites are counted wherever it is shown: the whole captured
+      // scope, thousands of records, is the JSON's.
+      const resolver = data.resolver && {...data.resolver, prerequisites: data.resolver.prerequisites.length};
+      if (resolver) {
+        const box = panel("Resolver evidence");
+        box.append(node("p", `${resolver.entry} (${resolver.scratch} scratch, ${resolver.layout})`), fields(resolver));
         content.append(box);
       }
       for (const risk of data.risks) {
@@ -111,7 +113,7 @@
         const list = node("ul"); for (const change of risk.changes) list.append(node("li", change));
         box.append(list); content.append(box);
       }
-      const all = panel("Plan details"); all.append(fields(data)); content.append(all);
+      const all = panel("Plan details"); all.append(fields(resolver ? {...data, resolver} : data)); content.append(all);
     } else if (current === "timeline") {
       const summary = panel(data.environment);
       summary.append(fields({initialized:data.initialized, limit:data.limit})); content.append(summary);

@@ -2734,6 +2734,14 @@ async fn an_unstaged_external_object_of_any_class_is_refused_by_name() {
                     .view("app.v", "SELECT x FROM t"),
                 Some("relation app.t"),
             ),
+            // A cast has no name: its two types are what the operator stages.
+            (
+                "cast",
+                "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                 CREATE CAST (date AS money) WITH INOUT;",
+                numeric_f().view("app.v", "SELECT f(1) AS x"),
+                Some("cast (pg_catalog.date AS pg_catalog.money)"),
+            ),
             // Negative: nothing retained beside the declarations.
             (
                 "faithful",
@@ -2743,7 +2751,7 @@ async fn an_unstaged_external_object_of_any_class_is_refused_by_name() {
             ),
         ] {
             let base = match tag {
-                "routine" | "faithful" => numeric_f(),
+                "routine" | "cast" | "faithful" => numeric_f(),
                 "reachable" => Declared::default().view("app.v", "SELECT int4('1'::text) AS x"),
                 _ => Declared::default()
                     .table("util.t", column())
