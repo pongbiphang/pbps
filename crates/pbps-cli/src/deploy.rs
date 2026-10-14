@@ -3770,7 +3770,6 @@ fn refuse_pinned_movement(
     let implied = table_changes.implied(before, after, &objects);
     objects.extend(implied.names());
 
-    let mut renamed_roles: BTreeMap<&str, &str> = BTreeMap::new();
     // Row scope remains keyed by each statement's table spelling. The table
     // expectations below carry that scope to the surviving identity.
     let mut written: BTreeMap<&TableName, BTreeSet<&pbps_model::RowKey>> = BTreeMap::new();
@@ -3791,9 +3790,6 @@ fn refuse_pinned_movement(
     let mut columns: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
     let mut gone: BTreeSet<pbps_model::Dropped> = BTreeSet::new();
     for p in &changes.changes {
-        if let pbps_model::Change::RenameRole { from, to, .. } = &p.change {
-            renamed_roles.insert(from, to);
-        }
         if let Some((table, key, _)) = p.change.row() {
             written.entry(table).or_default().insert(key);
         }
@@ -4280,30 +4276,49 @@ fn refuse_pinned_movement(
     // tables above are: a loop over the baseline never visits a name that was
     // not there, so a grant that arrived on a role this plan had just created
     // was checked by nothing at all (DECISIONS 163). Its existence alone was.
-    let carried_roles: BTreeSet<&str> = before_roles
-        .keys()
-        .map(|name| renamed_roles.get(name.as_str()).copied().unwrap_or(name))
+    use pbps_model::plan_names::{At, Holder};
+    let carried: Vec<_> = before_roles
+        .iter()
+        .filter_map(|(name, was)| {
+            let now_name = match names.role_holder(name, At::Start) {
+                Holder::Tracked(uid) => match names.role_at(uid, At::End) {
+                    Some(to) => to,
+                    // The retired principal's grants are not the incoming
+                    // holder's baseline. An unrefilled name stays compared:
+                    // staged membership removal can leave DROP ROLE pending.
+                    None if matches!(names.role_holder(name, At::End), Holder::Tracked(_)) => {
+                        return None;
+                    }
+                    None => name,
+                },
+                // A staged closing baseline may already use the final name.
+                // Its observed grants are still held, not reset to empty.
+                Holder::Vacant | Holder::Unmanaged => name,
+            };
+            Some((now_name, was))
+        })
         .collect();
+    // Keep the pairs, not a map keyed by their destination: two observed
+    // baseline names must not silently overwrite one grant comparison.
+    let carried_roles: BTreeSet<&str> = carried.iter().map(|(name, _)| *name).collect();
     let no_grants = pbps_model::Role {
         description: None,
         grants: BTreeMap::new(),
     };
-    let touched_roles = before_roles.iter().chain(
+    let touched_roles = carried.iter().copied().chain(
         after
             .roles
             .keys()
             .filter(|name| named_role(name) && !carried_roles.contains(name.as_str()))
-            .map(|name| (name, &no_grants)),
+            .map(|name| (name.as_str(), &no_grants)),
     );
-    for (name, was) in touched_roles {
-        if !named_role(name) {
+    for (now_name, was) in touched_roles {
+        if !roles.contains(now_name) {
             // Already compared whole, grants included.
             continue;
         }
-        // `ALTER ROLE ... WITH NAME` keeps the membership and the grants, so
-        // the two ends of a rename are one role's before and after; the
-        // grant changes beside it name the role as it will be (`order_key`).
-        let now_name = renamed_roles.get(name.as_str()).copied().unwrap_or(name);
+        // Every pair already uses its destination. A new role under a vacated
+        // source name must not follow the old holder's rename (DEC-1988.1).
         let Some(now) = after.roles.get(now_name) else {
             // Created or dropped: named by the change that does it, and there
             // is no pair of grant sets to compare.

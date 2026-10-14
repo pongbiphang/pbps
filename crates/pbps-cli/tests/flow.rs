@@ -14380,6 +14380,87 @@ fn renaming_a_role_needs_intent_and_rename_role_records_it() {
     assert!(ids.contains("SEC-9 retired"), "{ids}");
 }
 
+/// Two committed intent revisions can retire a role's name and reuse it before
+/// either revision is deployed. Grants belong to the surviving/new principal.
+#[test]
+#[ignore = "needs live mssql"]
+fn role_name_reuse_compares_the_grants_of_the_final_principal() {
+    let server = std::env::var("PBPS_TEST_DB").unwrap();
+    for replacement in [false, true] {
+        let own = OwnDatabase::new(
+            &server,
+            if replacement {
+                "role1988new"
+            } else {
+                "role1988rename"
+            },
+        );
+        let connection = own.connection();
+        let d = Demo::new(if replacement {
+            "role1988-new"
+        } else {
+            "role1988-rename"
+        });
+        d.table("table: dbo.t\ncolumns:\n  id: {type: int, nullable: false}\nprimary_key: [id]\n");
+        let role = |name: &str, grant: &str| format!("role: {name}\ngrants:\n  dbo.t: [{grant}]\n");
+        d.files(&[("a.role.yml", &role("a", "insert"))]);
+        if !replacement {
+            d.files(&[("b.role.yml", &role("b", "select"))]);
+        }
+        let success = |args: &[&str]| {
+            let out = d.run(args);
+            assert_eq!(code(&out), 0, "{args:?}: {}{}", stdout(&out), stderr(&out));
+        };
+        success(&["plan", "--no-dev"]);
+        d.commit();
+        success(&["bootstrap", "--db", connection]);
+
+        // Commit the explicit drop before reusing the spelling. A rename onto
+        // a still-declared identity is intentionally refused by intent.
+        std::fs::remove_file(d.dir.join("schema/a.role.yml")).unwrap();
+        success(&["drop-role", "a", "--reason", "old access retired"]);
+        d.commit();
+        if !replacement {
+            std::fs::remove_file(d.dir.join("schema/b.role.yml")).unwrap();
+        }
+        d.files(&[("a.role.yml", &role("a", "select"))]);
+        if replacement {
+            success(&["plan", "--no-dev"]);
+        } else {
+            success(&["rename-role", "b", "a"]);
+        }
+        d.commit();
+        let plan = d.dir.join("role.plan.json");
+        success(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+        let steps: Vec<_> = saved.changes.changes.iter().map(|p| &p.change).collect();
+        assert!(matches!(steps[0], pbps_model::Change::DropRole { name, .. } if name == "a"));
+        assert!(steps.iter().any(|step| if replacement {
+            matches!(step, pbps_model::Change::CreateRole { name, .. } if name == "a")
+        } else {
+            matches!(step, pbps_model::Change::RenameRole { from, to, .. } if from == "b" && to == "a")
+        }));
+        success(&[
+            "apply",
+            "--db",
+            connection,
+            "--plan",
+            plan.to_str().unwrap(),
+            "--checksum",
+            &plan_checksum(&plan),
+            "--allow",
+            "rename,revoke",
+        ]);
+        success(&["verify", "--db", connection]);
+        // The next plan also agrees with the declarations, rather than merely
+        // agreeing with a mistaken snapshot recorded by the previous apply.
+        let out = d.run(&["plan", "--db", connection]);
+        assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
+        assert!(stdout(&out).contains("No changes"), "{}", stdout(&out));
+    }
+}
+
 /// The permission set is the union of the engines' (ADR-0010 §6): `usage` is a
 /// word the loader accepts, and on SQL Server it is the dialect's finding —
 /// named, with the words this engine takes — so a PostgreSQL role file fails

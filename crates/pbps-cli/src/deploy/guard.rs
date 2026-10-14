@@ -94,6 +94,8 @@ impl<T: PartialEq> Req<T> {
 }
 
 #[cfg(test)]
+mod roles_tests;
+#[cfg(test)]
 mod tests;
 
 /// Both inputs are pinned by the saved plan; observations supply no identity intent.
