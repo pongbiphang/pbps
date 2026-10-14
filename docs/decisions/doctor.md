@@ -1309,3 +1309,48 @@ Pinned by the unit test
 `future_grants_share_one_schema_gap_without_hiding_existing_or_unresolved_targets`,
 the SQL Server live `future_grants_tests` module, and the CLI reproduction
 `doctor_accepts_future_table_and_view_grants_before_a_db_owner_bootstrap`.
+
+<a id="dec-1925-1"></a>
+
+**DEC-1925.1. `doctor` does not read a partitioned parent's occupancy as an
+account that row-level security filters: the runway and the DEFAULT's rows are
+each `…-unknown`, never "no row" (#1925).** Both questions (DEC-1789.2) are an
+`EXISTS` through the parent, and row-level security filters a `SELECT`: a policy
+that hides the newest rows makes the series look longer than it is, and one that
+hides them all makes it look empty. Either reads as good news from a read that
+could not see. This is the shape PITFALLS records as "a filtered count read as a
+count of what is there", in a `doctor` warning and not a delete's guard.
+
+- **`row_security_active(parent)`, not `relrowsecurity`.** The switch is on for
+  the owner too, who bypasses it, so asking the switch would call a complete
+  read unreadable (DECISIONS 329, 333). **Measured on 16.15 and 18.6**, one
+  parent per case, the same `count(*)` through it: the owner reads `f` and sees
+  every row; a login with `SELECT` and no `BYPASSRLS` reads `t` and sees none
+  (a policy of `false`, or none at all); a `BYPASSRLS` role and a superuser read
+  `f`; the owner of a `FORCE ROW LEVEL SECURITY` table reads `t` and sees none.
+  With `row_security = off`, a table a policy applies to reads `t` and the
+  `SELECT` itself fails, so an account that turned it off is no case of
+  "not filtered".
+- **The parent alone, not its partitions.** **Measured on 16.15 and 18.6**, a
+  policy on one partition does not filter a read through the partitioned parent
+  (`row_security_active` is `t` for that partition and the parent's count is
+  complete), as DECISIONS 346 found for a delete's count. Both questions read
+  through the parent, so the parent is the relation that is asked. Asking every
+  partition would call a complete read unreadable, and refuse a valid check.
+- **At the read, not at the lookup.** The answer is carried in `Found`, and
+  `held`, through which every `EXISTS` goes, refuses when it is set. A parent
+  the question does not apply to, one with no DEFAULT, a declared range the
+  database has already, a series with no upper end: none of these reads a row,
+  and none is turned into a finding by the account's policy. NULL from the
+  function (the parent dropped under the read) is a failure to answer, not
+  "not active".
+- **The reason says what to do.** "row-level security is active for this account,
+  so occupancy cannot be read", and that the check be run as a role the policies
+  do not apply to; the remedy stays the re-run `doctor` has for every
+  `…-unknown`.
+
+Pinned by the unit test
+`a_parent_row_level_security_filters_is_refused_before_any_row_is_read` and the
+live `doctor_does_not_read_partition_occupancy_through_row_level_security` on 18
+and 16: six parents, read as a superuser, a login that owns none of them, their
+owner and a `BYPASSRLS` role.

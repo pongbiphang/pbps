@@ -8618,6 +8618,20 @@ fn doctor_keeps_fractions_of_a_second_in_a_partition_runway() {
     }
 }
 
+/// `doctor` does not read a partitioned table's occupancy through a parent
+/// that row-level security filters for the account it runs as: the runway and
+/// the DEFAULT's rows are each `…-unknown`, never "no row", while the owner, a
+/// `BYPASSRLS` role and a table with a policy only on a partition are read as
+/// before (#1925, DEC-1925.1). On 16 and 18.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn doctor_does_not_read_partition_occupancy_through_row_level_security() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        partition_runway::row_security(server, &format!("runway-rls-1925-{k}"));
+    }
+}
+
 fn generated_series_flow(server: &str, slug: &str) {
     let own = OwnDatabase::new(server, slug);
     let conn = own.connection().to_owned();
