@@ -27,12 +27,15 @@
 //!   exists to take. The `narrowing` class still flags it for approval.
 
 use pbps_model::ValueSource;
+use std::cell::LazyCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
 
+use pbps_dialect::plan_rows::{Event, PlanFacts, Removal, RowWrites, View, WrittenCell};
 use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
 #[cfg(test)]
 use pbps_model::ChangeSet;
-use pbps_model::plan_names::{At, Holder, PlanNames};
+use pbps_model::plan_names::PlanNames;
 use pbps_model::{Cell, Change, ColumnRef, ColumnType, RowKey, TableName, TypeArg, Uid, Value};
 
 use crate::emit::{qualified, verbatim};
@@ -44,9 +47,10 @@ use crate::types;
 /// A question that cannot be built stays in the report as unchecked; it
 /// never becomes an executable query or a successful answer.
 pub fn probes(plan_names: &PlanNames<'_>) -> Preflight {
-    let names = AsStored::of(plan_names);
+    let facts = PlanFacts::of(plan_names);
     let mut report = Preflight::default();
-    for p in plan_names.changes() {
+    for (step, p) in plan_names.changes().iter().enumerate() {
+        let names = LazyCell::new(|| AsStored::of(facts.before(step)));
         match build(&p.change, &names, &mut report.unchecked) {
             Ok(probes) => report.probes.extend(probes),
             Err(error) => report
@@ -93,8 +97,8 @@ enum Added {
 /// column that does not exist yet — silently skipping the very check that
 /// mattered.
 #[derive(Debug)]
-struct AsStored<'a> {
-    plan_names: &'a PlanNames<'a>,
+struct AsStored<'v, 'p> {
+    view: View<'v, 'p>,
     /// Retained engine policy: SQL Server's catalog collation may identify
     /// different spellings, so raw predicates exclude other relinquishing UIDs.
     vacated: BTreeMap<TableName, BTreeSet<Option<Uid>>>,
@@ -130,12 +134,6 @@ struct AsStored<'a> {
     /// collation, not under the database default a probe's projected values
     /// otherwise carry (#1175, #1247 review).
     recollated: BTreeMap<ColumnRef, Option<pbps_model::Collation>>,
-    /// The foreign keys this plan takes away before the deletes run: a
-    /// `DropForeignKey`, and every key into the table a `DropTable` removes.
-    /// Both sort before `DeleteRow` (`order_key`), so counting a child
-    /// through a constraint that will be gone refuses a delete the engine
-    /// would have accepted (DECISIONS 128).
-    removed: BTreeSet<Removed>,
 }
 
 /// The rows of one table a plan writes, as the pre-delete probe has to see
@@ -147,119 +145,13 @@ struct AsStored<'a> {
 /// record counted a child on the surviving parent `(1, 2)` against deleting
 /// `(1, 1)`, and could not tell an update that sets two columns of one key
 /// from two updates.
+type Moved = RowWrites<String, AssignmentMetadata>;
+
+/// SQL Server needs the assignment type even for a default absent from old
+/// saved plans; typed omissions also distinguish NULL from engine assignment.
 #[derive(Debug, Default)]
-struct Moved {
-    key_column: String,
-    /// Deleted: gone whatever they referenced.
-    deleted: BTreeSet<RowKey>,
-    /// Updated row -> column set by its update -> the value it is set to,
-    /// as the SQL the engine compares (a literal, or the expression the
-    /// catalog spells a literal default in: `(1)`, `('old')`). Explicit NULL
-    /// stays a literal; defaults not retained by `constant_default` are `None`.
-    ///
-    /// An update that sets a *referencing* column to a value that is not the
-    /// deleted key moves the row off the parent; one that sets any other
-    /// column, or sets it to the same key under another spelling (`01` for
-    /// `1`, `OLD` for `old` under a case-insensitive collation), leaves it
-    /// pointing where it was, and with `ON DELETE CASCADE` the engine would
-    /// then delete it silently. Whether two spellings are one key is the
-    /// engine's call, so the probe asks it. A row that moves *onto* the
-    /// parent is an arrival, counted the same way (see [`Moved::inserted`]).
-    updated: BTreeMap<RowKey, BTreeMap<String, Option<String>>>,
-    /// Inserted row -> column -> the value it arrives with, as the SQL the
-    /// engine compares: spelled by the row, or the literal default of a
-    /// column it omits. NULL stays explicit; a default that is not a literal
-    /// is absent.
-    ///
-    /// `COUNT(*)` over the child sees only what is stored, and a row
-    /// arriving on the parent is either not in the table yet (an insert) or
-    /// stored somewhere else (an update). Both run before the deletes
-    /// (`order_key`), so the probe passes, the insert or update commits, and
-    /// then `ON DELETE CASCADE` takes the row straight back out — or `SET
-    /// NULL` unpicks its reference — with the apply succeeding and recording
-    /// the result, so the next plan proposes the same row again. Counted
-    /// here instead, with the engine deciding whether the value and the
-    /// deleted key are one key, exactly as it decides for `updated`.
-    ///
-    /// A column an insert omits, or an update sets to `DEFAULT`, arrives at
-    /// the column's default — which the plan carries (`InsertRow::defaults`,
-    /// `Cell::Default`) and which, when it is a literal, is rendered for the
-    /// engine to compare like any other value. A default that is not a
-    /// literal (`NEXT VALUE FOR`, `NEWID()`) has no value before it runs
-    /// and is the one arrival no probe can ask about (DECISIONS 117).
-    inserted: BTreeMap<RowKey, BTreeMap<String, String>>,
-    /// Column -> the rows this plan writes to a default the probe cannot
-    /// evaluate: one that is not a literal (`CONVERT(int, 1)`, `NEXT VALUE
-    /// FOR`), left by an insert that omits the column or set by an update to
-    /// `DEFAULT`. No arrival can be counted for such a write, and treating it
-    /// as absent let a default that names the deleted row arrive unseen —
-    /// so where the catalog says a foreign key to the deleted row spans the
-    /// column, the write is refused instead (DECISIONS 124).
-    unprobeable: BTreeMap<String, BTreeSet<RowKey>>,
-    /// Per inserted row, the columns its change gives a type for.
-    ///
-    /// Read for what is *missing* from it. `InsertRow::types` names every
-    /// non-key column of the declared table **except** the `IDENTITY` ones,
-    /// which `pbps_diff`'s `omitted_defaults` leaves out because the engine
-    /// owns them (DECISIONS 94, 117). So for a column that is neither the key
-    /// nor spelled by the row, absent here means the engine assigns the value
-    /// — the one case where a column an insert omits does not arrive at NULL.
-    ///
-    /// Derived rather than carried as its own field because the plan already
-    /// says it, and a second field would be a second thing to keep true. The
-    /// invariant it rests on is pinned by a test in `pbps-diff`, so narrowing
-    /// `types` fails there rather than quietly turning identity columns back
-    /// into NULLs here.
-    typed: BTreeMap<RowKey, BTreeSet<String>>,
-    /// Defaults in legacy plans without destination type metadata. The live
-    /// FK supplies that missing assignment type in the delete probe.
+struct AssignmentMetadata {
     untyped_defaults: BTreeMap<RowKey, BTreeSet<String>>,
-    /// Unchanged NULL cells still decide their row's foreign-key tuple,
-    /// including beside an unevaluable default (DEC-1771.1).
-    held_null: BTreeMap<RowKey, BTreeSet<String>>,
-}
-
-impl Moved {
-    fn nulls_of(
-        &self,
-        row: &RowKey,
-        stored_name: &impl Fn(&str) -> Option<String>,
-    ) -> BTreeSet<String> {
-        let mut out = BTreeSet::new();
-        if let Some(columns) = self.updated.get(row) {
-            for (column, sql) in columns {
-                if sql.as_deref().is_some_and(is_null_default)
-                    && let Some(name) = stored_name(column)
-                {
-                    out.insert(name);
-                }
-            }
-        }
-        if let Some(columns) = self.inserted.get(row) {
-            for (column, sql) in columns {
-                if is_null_default(sql)
-                    && let Some(name) = stored_name(column)
-                {
-                    out.insert(name);
-                }
-            }
-        }
-        if let Some(columns) = self.held_null.get(row) {
-            out.extend(columns.iter().filter_map(|c| stored_name(c)));
-        }
-        out
-    }
-}
-
-/// A foreign key this plan removes before its deletes run: the constraint,
-/// under the table that holds it. Both are named as the database has them —
-/// a dropped constraint is one the base side read from the catalog.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Removed {
-    /// Resolved when the removal is visited, before a later rename can give
-    /// this address to another table (DEC-1770.1).
-    stored_table: TableName,
-    constraint: Option<String>,
 }
 
 /// The SQL the engine compares a written cell by: the literal, or `None` for
@@ -336,26 +228,29 @@ fn unwrapped(default: &str) -> &str {
     d
 }
 
-impl<'a> AsStored<'a> {
-    fn of(plan_names: &'a PlanNames<'a>) -> Self {
+impl<'v, 'p> AsStored<'v, 'p> {
+    fn view(&self) -> View<'v, 'p> {
+        self.view
+    }
+
+    fn of(view: View<'v, 'p>) -> Self {
         let mut this = Self {
-            plan_names,
+            view,
             vacated: Default::default(),
             moved: Default::default(),
             types: Default::default(),
             added: Default::default(),
             recollated: Default::default(),
-            removed: Default::default(),
         };
-        // Every collation this plan gives a column, first: a row change may
+        // Every collation this prefix gives a column, first: a row change may
         // precede the change that creates or recollates its column, and its
         // defaults are assigned under that collation (#1247 review).
-        for p in plan_names.changes() {
-            match &p.change {
+        for (_, event) in view.events() {
+            match event {
                 // A table this plan creates has exactly the collations it
                 // declares, and none of them is what the database default
                 // would give a literal.
-                Change::CreateTable { name, table, .. } => {
+                Event::CreateTable { name, table, .. } => {
                     for (column, spec) in &table.columns {
                         if spec.collation.is_some() {
                             this.recollated
@@ -363,7 +258,7 @@ impl<'a> AsStored<'a> {
                         }
                     }
                 }
-                Change::AddColumn {
+                Event::AddColumn {
                     table,
                     name,
                     column,
@@ -372,7 +267,7 @@ impl<'a> AsStored<'a> {
                     this.recollated
                         .insert(table.column(name), column.collation.clone());
                 }
-                Change::AlterColumnType {
+                Event::AlterColumnType {
                     column,
                     to,
                     from_collation,
@@ -395,72 +290,44 @@ impl<'a> AsStored<'a> {
                         this.recollated.insert(column.clone(), to_collation.clone());
                     }
                 }
-                // Exhaustive rather than `_`, as below: a change added later
-                // that gives a column a collation has to be counted here.
-                Change::AddColumn { .. }
-                | Change::DropTable { .. }
-                | Change::RenameTable { .. }
-                | Change::DropColumn { .. }
-                | Change::RenameColumn { .. }
-                | Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::AlterColumnExpression { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::SetIndexStorageParameters { .. }
-                | Change::SetTablePersistence { .. }
-                | Change::SetStorageParameters { .. }
-                | Change::SetReplicaIdentity { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::AddComputedColumn { .. }
-                | Change::DropComputedColumn { .. }
-                | Change::DropIndex { .. }
-                | Change::InsertRow { .. }
-                | Change::UpdateRow { .. }
-                | Change::DeleteRow { .. }
-                | Change::SetDataMode { .. }
-                | Change::SetEnsureKeys { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::DetachPartition { .. }
-                | Change::AttachPartition { .. }
-                | Change::SetPartitionDefault { .. }
-                | Change::SetPartitionNotNull { .. }
-                | Change::PublicExecution { .. } => {}
+                Event::DropTable { .. }
+                | Event::RenameColumn { .. }
+                | Event::DropColumn { .. }
+                | Event::AddColumn { .. }
+                | Event::AlterColumnExpression { .. }
+                | Event::AddComputedColumn { .. }
+                | Event::DropComputedColumn { .. }
+                | Event::AddForeignKey { .. }
+                | Event::DropForeignKey { .. }
+                | Event::AttachPartition { .. }
+                | Event::InsertRow { .. }
+                | Event::UpdateRow { .. }
+                | Event::DeleteRow { .. } => {}
             }
         }
-        for (at, p) in plan_names.changes().iter().enumerate() {
-            match &p.change {
-                Change::RenameTable { .. } => {}
-                Change::RenameColumn {
-                    uid, table, ..
-                } => {
-                    this.vacated.entry(table.clone()).or_default().insert(Some(uid.clone()));
+        for (_, event) in view.events().collect::<Vec<_>>() {
+            match event {
+                Event::RenameColumn { uid, table, .. } => {
+                    this.vacated
+                        .entry(table.clone())
+                        .or_default()
+                        .insert(Some(uid.clone()));
                 }
-                Change::DropColumn { uid, column } => {
-                    this.vacated.entry(column.table.clone()).or_default().insert(Some(uid.clone()));
+                Event::DropColumn { uid, column } => {
+                    this.vacated
+                        .entry(column.table.clone())
+                        .or_default()
+                        .insert(Some(uid.clone()));
                 }
-                Change::DropComputedColumn { table, .. } => {
+                Event::DropComputedColumn { table, .. } => {
                     this.vacated.entry(table.clone()).or_default().insert(None);
                 }
-                Change::CreateTable { name, table, .. } => {
+                Event::CreateTable { name, table, .. } => {
                     for (column, spec) in &table.columns {
                         this.types.insert(name.column(column), spec.ty.clone());
                     }
                 }
-                Change::AddColumn {
+                Event::AddColumn {
                     table,
                     name,
                     column,
@@ -473,7 +340,15 @@ impl<'a> AsStored<'a> {
                     let added = if column.nullable {
                         Added::Null
                     } else {
-                        match (match &column.value_source { ValueSource::Default(value) => Some(value.as_str()), ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) | ValueSource::Generated(_) => None }).and_then(constant_default).and_then(|e| {
+                        match (match &column.value_source {
+                            ValueSource::Default(value) => Some(value.as_str()),
+                            ValueSource::None
+                            | ValueSource::Identity(_)
+                            | ValueSource::Sequence(_)
+                            | ValueSource::Generated(_) => None,
+                        })
+                        .and_then(constant_default)
+                        .and_then(|e| {
                             assigned_default(e, Some(&column.ty), column.collation.as_ref())
                         }) {
                             Some(sql) => Added::Backfilled(sql),
@@ -482,7 +357,7 @@ impl<'a> AsStored<'a> {
                     };
                     this.added.insert(table.column(name), added);
                 }
-                Change::AlterColumnType { column, to, .. } => {
+                Event::AlterColumnType { column, to, .. } => {
                     this.types.insert(column.clone(), to.clone());
                 }
                 // A computed column's values are its expression over each row,
@@ -490,186 +365,45 @@ impl<'a> AsStored<'a> {
                 // plan adds, or re-adds with another expression, is unchecked
                 // rather than counted over the values the old one stored
                 // (#1174).
-                Change::AddComputedColumn { table, name, .. } => {
+                Event::AddComputedColumn { table, name, .. } => {
                     this.added.insert(table.column(name), Added::Unspellable);
                 }
-                // Both run before the deletes, so a child counted through
-                // either would refuse a delete that will be valid by then.
-                Change::DropForeignKey { table, name } => {
-                    this.removed.insert(Removed {
-                        stored_table: this.table_at(table, At::Before(at)).unwrap_or_else(|| table.clone()),
-                        constraint: Some(name.clone()),
-                    });
-                }
-                Change::DropTable { name, .. } => {
-                    this.removed.insert(Removed {
-                        stored_table: this.table_at(name, At::Before(at)).unwrap_or_else(|| name.clone()),
-                        // Every key the table holds goes with it.
-                        constraint: None,
-                    });
-                }
-                Change::UpdateRow {
-                    table,
-                    key_column,
-                    key,
-                    columns,
-                    unchanged,
-                    types,
-                    after_types,
-                    ..
-                } => {
-                    let moved = this.moved.entry(table.clone()).or_default();
-                    moved.key_column = key_column.clone();
-                    for (column, cell) in unchanged {
-                        let null = match cell {
-                            Cell::Value(value) => matches!(value, Value::Null),
-                            Cell::Default(default) => is_null_default(default),
-                        };
-                        if null {
-                            moved.held_null.entry(key.clone()).or_default().insert(column.clone());
-                        }
-                    }
-                    let updated = moved.updated.entry(key.clone()).or_default();
-                    for (column, (_, after)) in columns {
-                        let sql = match after {
-                            Cell::Value(v) => written(v),
-                            Cell::Default(d) => {
-                                let constant = constant_default(d);
-                                if constant.is_none() {
-                                    moved
-                                        .unprobeable
-                                        .entry(column.clone())
-                                        .or_default()
-                                        .insert(key.clone());
-                                }
-                                let ty = after_types.get(column).or_else(|| types.get(column));
-                                if constant.is_some() && ty.is_none() {
-                                    moved.untyped_defaults.entry(key.clone()).or_default().insert(column.clone());
-                                }
-                                let collation = this
-                                    .recollated
-                                    .get(&table.column(column))
-                                    .and_then(Option::as_ref);
-                                let assigned = constant.and_then(|e| assigned_default(e, ty, collation));
-                                if constant.is_some() && assigned.is_none() {
-                                    moved
-                                        .unprobeable
-                                        .entry(column.clone())
-                                        .or_default()
-                                        .insert(key.clone());
-                                }
-                                assigned
-                            }
-                        };
-                        updated.insert(column.clone(), sql);
-                    }
-                }
-                Change::InsertRow {
-                    table,
-                    key_column,
-                    key,
-                    row,
-                    defaults,
-                    types,
-                    ..
-                } => {
-                    let moved = this.moved.entry(table.clone()).or_default();
-                    moved.key_column = key_column.clone();
-                    let inserted = moved.inserted.entry(key.clone()).or_default();
-                    moved
-                        .typed
-                        .insert(key.clone(), types.keys().cloned().collect());
-                    // The key is written like any other column, and may be
-                    // one column of a composite foreign key.
-                    inserted.insert(key_column.clone(), literal(key.as_str()));
-                    for (column, default) in defaults {
-                        if let Some(expr) = constant_default(default) {
-                            let ty = types.get(column);
-                            if ty.is_none() {
-                                moved.untyped_defaults.entry(key.clone()).or_default().insert(column.clone());
-                            }
-                            let collation = this
-                                .recollated
-                                .get(&table.column(column))
-                                .and_then(Option::as_ref);
-                            match assigned_default(expr, ty, collation) {
-                                Some(sql) => {
-                                    inserted.insert(column.clone(), sql);
-                                }
-                                None => {
-                                    moved
-                                        .unprobeable
-                                        .entry(column.clone())
-                                        .or_default()
-                                        .insert(key.clone());
-                                }
-                            }
-                        } else {
-                            moved
-                                .unprobeable
-                                .entry(column.clone())
-                                .or_default()
-                                .insert(key.clone());
-                        }
-                    }
-                    for (column, value) in &row.0 {
-                        if let Some(sql) = written(value) {
-                            inserted.insert(column.clone(), sql);
-                        }
-                    }
-                }
-                Change::DeleteRow {
-                    table,
-                    key_column,
-                    key,
-                    ..
-                } => {
-                    let moved = this.moved.entry(table.clone()).or_default();
-                    moved.key_column = key_column.clone();
-                    moved.deleted.insert(key.clone());
-                }
-                // Exhaustive rather than `_`: a change added later that moves a
-                // name has to be reflected here, or every probe downstream of
-                // it would quietly query the wrong object.
-                Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::AlterColumnExpression { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddForeignKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                // A module carries no data and no identity, so nothing here
-                // applies to one.
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                // Setting the mode emits nothing and names nothing.
-                | Change::SetDataMode { .. }
-                | Change::SetEnsureKeys { .. }
-                // A role is a principal, not an object: nothing here names a
-                // table or a column, and nothing here moves a name a probe
-                // could ask about.
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::SetIndexStorageParameters { .. }
-                | Change::SetTablePersistence { .. }
-                | Change::SetStorageParameters { .. }
-                | Change::SetReplicaIdentity { .. }
-                | Change::DetachPartition { .. }
-                | Change::AttachPartition { .. }
-                | Change::SetPartitionDefault { .. }
-                | Change::SetPartitionNotNull { .. }
-                | Change::PublicExecution { .. } => {}
+                Event::InsertRow { .. }
+                | Event::UpdateRow { .. }
+                | Event::DeleteRow { .. }
+                | Event::AlterColumnExpression { .. }
+                | Event::AddForeignKey { .. }
+                | Event::DropForeignKey { .. }
+                | Event::DropTable { .. }
+                | Event::AttachPartition { .. } => {}
             }
         }
+        this.moved = view.writes(
+            |assignment, metadata: &mut AssignmentMetadata| match assignment.cell {
+                WrittenCell::Value(value) => written(value),
+                WrittenCell::Default(default) => constant_default(default).and_then(|expr| {
+                    if assignment.ty.is_none() {
+                        metadata
+                            .untyped_defaults
+                            .entry(assignment.key.clone())
+                            .or_default()
+                            .insert(assignment.column.to_owned());
+                    }
+                    let collation = this
+                        .recollated
+                        .get(&assignment.table.column(assignment.column))
+                        .and_then(Option::as_ref);
+                    assigned_default(expr, assignment.ty, collation)
+                }),
+                // Omitted NULLs are projected through the shared typed-column
+                // inventory; engine-assigned cells must remain unknown.
+                WrittenCell::OmittedNull | WrittenCell::EngineAssigned => None,
+            },
+            |cell| match cell {
+                Cell::Value(value) => matches!(value, Value::Null),
+                Cell::Default(default) => is_null_default(default),
+            },
+        );
         this
     }
 
@@ -684,32 +418,10 @@ impl<'a> AsStored<'a> {
         vacated.iter().any(|owner| {
             added
                 || self
-                    .plan_names
+                    .view()
                     .renamed_columns(table)
                     .any(|(uid, _, _)| owner.as_ref() != Some(uid))
         })
-    }
-
-    fn table(&self, name: &TableName) -> Option<TableName> {
-        self.table_at(name, At::End)
-    }
-
-    fn table_at(&self, name: &TableName, at: At) -> Option<TableName> {
-        match self.plan_names.holder(name, at) {
-            Holder::Tracked(uid) => self.plan_names.table_at(uid, At::Start).cloned(),
-            Holder::Unmanaged => Some(name.clone()),
-            Holder::Vacant => None,
-        }
-    }
-
-    fn column(&self, column: &ColumnRef) -> Option<ColumnRef> {
-        let table = self.table(&column.table)?;
-        let stored = self
-            .plan_names
-            .renamed_columns(&column.table)
-            .find(|(_, _, to)| *to == column.name)
-            .map_or(column.name.as_str(), |(_, from, _)| from);
-        Some(table.column(stored))
     }
 
     /// How a row already in the table reads in this column: `stored` where the
@@ -730,9 +442,9 @@ impl<'a> AsStored<'a> {
     }
 }
 
-fn build(
+fn build<'v, 'p: 'v>(
     change: &Change,
-    names: &AsStored,
+    names: &impl Deref<Target = AsStored<'v, 'p>>,
     unchecked: &mut Vec<Unchecked>,
 ) -> Result<Vec<Probe>, DialectError> {
     match change {
@@ -742,7 +454,7 @@ fn build(
             column,
             ..
         } if !column.nullable && !column.has_required_add_value_source() => {
-            let Some(stored) = names.table(table) else {
+            let Some(stored) = names.view().table(table) else {
                 return Ok(Vec::new());
             };
             // The model's marker is lexical and deliberately conservative: it
@@ -775,15 +487,14 @@ fn build(
             )])
         }
 
-        // A tightening of a table whose rows this plan writes or deletes runs
-        // after them (#1367), so it meets the rows they leave, which may have
-        // filled or removed the NULLs the table holds now: the same relation
-        // the key probes read (DECISIONS 335).
+        // The preceding writes may fill or remove stored NULLs. Using the
+        // same relation as key probes also handles a tightening before those
+        // writes, without copying the planner's sort predicate (DEC-1775.1).
         Change::AlterColumnNullability {
             column,
             to_nullable: false,
             ..
-        } if names.moved.contains_key(&column.table) => {
+        } => {
             let Some(rows) = rows_after(
                 names,
                 &column.table,
@@ -797,19 +508,6 @@ fn build(
             };
             Ok(vec![null_probe(column, &format!("(\n{rows}\n) AS r"), "r.k0")?])
         }
-        Change::AlterColumnNullability {
-            column,
-            to_nullable: false,
-            ..
-        } => match names.column(column) {
-            Some(stored) => Ok(vec![null_probe(
-                column,
-                &qualified(&stored.table)?,
-                &quote(&stored.name)?,
-            )?]),
-            None => Ok(skip(change, "the column does not exist before apply", unchecked)),
-        },
-
         Change::AlterColumnType {
             column,
             from,
@@ -819,7 +517,7 @@ fn build(
             to_collation,
             ..
         } => {
-            let Some(stored) = names.column(column) else {
+            let Some(stored) = names.view().column(column) else {
                 return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
             let mut out = Vec::new();
@@ -863,23 +561,22 @@ fn build(
             name,
             constraint,
         } => {
-            let Some(stored) = names.table(table) else {
+            let Some(stored) = names.view().table(table) else {
                 return Ok(skip(change, "the table does not exist before apply", unchecked));
             };
             if names.passes_a_name(table) {
                 return Ok(skip(change, "a column name in the check's table changes owner before apply", unchecked));
             }
             // The rows the statement will meet, not the rows standing now.
-            // `order_key` runs every row change (11, 12) before every
-            // constraint this plan adds (13), which is what makes the two
-            // different (DECISIONS 174).
+            // Only preceding row changes contribute to this check's
+            // projection (DECISIONS 174, DEC-1775.1).
             let moved = names.moved.get(table);
             // A row this plan writes cannot be spelled against an arbitrary
             // predicate: evaluating it needs every column of the row, and the
             // plan carries only the ones it sets. Unlike a foreign key, whose
             // columns *are* the constraint, so `rows_after` can build them.
             // No answer, as everywhere else one cannot be given.
-            if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty()) {
+            if moved.is_some_and(|m| m.has_writes()) {
                 return Ok(skip(change, "the check predicate cannot be evaluated over planned row writes", unchecked));
             }
             let mut sql = format!(
@@ -901,7 +598,7 @@ fn build(
             if let Some(m) = moved
                 && !m.deleted.is_empty()
             {
-                let Some(key_column) = names.column(&table.column(&m.key_column)) else {
+                let Some(key_column) = names.view().column(&table.column(&m.key_column)) else {
                     return Ok(skip(change, "the deleted row key does not exist before apply", unchecked));
                 };
                 let gone: BTreeSet<String> =
@@ -948,7 +645,7 @@ fn build(
             ..
         } => {
             // The same relation the unique above is built over, and for the
-            // same reason: a primary key sorts after every row change, so the
+            // same reason: a primary key follows these row changes, so the
             // rows it will meet are the ones the plan leaves (DECISIONS 175).
             // It subsumes 171's substitution of a column this plan adds —
             // `rows_after` spells one, and a derived table's column can be
@@ -1031,7 +728,7 @@ fn build(
             constraint,
         } => {
             // Both sides as the plan will leave them, not as they stand:
-            // `AddForeignKey` sorts after every row change, so a plan that
+            // An `AddForeignKey` after the row changes of a plan that
             // supplies the missing parent rows, or repairs the orphaned
             // children, is a plan this constraint will accept (DECISIONS 151).
             let Some(child) = rows_after(
@@ -1181,7 +878,7 @@ fn build(
             key_column,
             key,
             ..
-        } => match names.column(&table.column(key_column)) {
+        } => match names.view().column(&table.column(key_column)) {
             Some(stored) => {
                 let mut probes = vec![delete_probe(table, key, &stored, names)?];
                 // And, per table this plan writes to a default the probe
@@ -1197,34 +894,6 @@ fn build(
             }
             None => Ok(skip(change, "the deleted row key does not exist before apply", unchecked)),
         },
-    }
-}
-
-/// What a plan takes away from one child table before its deletes run.
-enum Removal {
-    /// The table itself: every key it holds goes with it.
-    Table,
-    /// The named constraints, and nothing else.
-    Keys(Vec<String>),
-}
-
-impl AsStored<'_> {
-    /// The keys this plan removes from `stored_child` before the deletes,
-    /// under the names the catalog has now. Read by both probes over foreign
-    /// keys: a constraint that will be gone must count nothing (DECISIONS
-    /// 128).
-    fn removed_from(&self, stored_child: &TableName) -> Removal {
-        let mut keys = Vec::new();
-        for removed in &self.removed {
-            if &removed.stored_table != stored_child {
-                continue;
-            }
-            match &removed.constraint {
-                Some(constraint) => keys.push(constraint.clone()),
-                None => return Removal::Table,
-            }
-        }
-        Removal::Keys(keys)
     }
 }
 
@@ -1295,17 +964,17 @@ fn delete_probe(
     let mut exclusions = Vec::new();
     let mut arrivals = Vec::new();
     for (child, moved) in &names.moved {
-        let Some(stored_child) = names.table(child) else {
+        let Some(stored_child) = names.view().table(child) else {
             continue;
         };
-        let Some(stored_key) = names.column(&child.column(&moved.key_column)) else {
+        let Some(stored_key) = names.view().column(&child.column(&moved.key_column)) else {
             continue;
         };
         let key_sql = format!("ch.{}", quote(&stored_key.name)?);
         let child_sql = qualified(&stored_child)?;
         // A column the database does not have yet cannot be in a foreign
         // key it has; one it names differently is asked about by that name.
-        let stored_name = |column: &str| names.column(&child.column(column)).map(|r| r.name);
+        let stored_name = |column: &str| names.view().column(&child.column(column)).map(|r| r.name);
         // A quoted identifier may itself hold a `'` — `quote` escapes `]`,
         // not quotes — so every fragment carrying one into the generated
         // statement goes through `literal`, never straight into the outer
@@ -1346,6 +1015,7 @@ fn delete_probe(
             // for a key the update sets a cell of to something the probe
             // cannot compare, which is the direction to be wrong in.
             let untyped = moved
+                .metadata
                 .untyped_defaults
                 .get(row_key)
                 .into_iter()
@@ -1395,6 +1065,7 @@ fn delete_probe(
             // insert leaves to NULL, or to a default that is not a literal,
             // is not one the probe can ask about (117).
             let untyped = moved
+                .metadata
                 .untyped_defaults
                 .get(row_key)
                 .into_iter()
@@ -1436,6 +1107,16 @@ fn delete_probe(
     } else {
         format!("CASE {} ELSE N'' END", exclusions.join(" "))
     };
+    // The statement removes its target's self-reference at the same time.
+    // This is the current DELETE's effect, not a later plan mutation.
+    let exclusion = format!(
+        "{exclusion} + CASE WHEN fk.parent_object_id = fk.referenced_object_id THEN {} ELSE N'' END",
+        literal(&format!(
+            " AND ch.{} NOT IN ({})",
+            quote(&stored.name)?,
+            literal(key.as_str())
+        ))
+    );
     let arrival = if arrivals.is_empty() {
         "N''".to_owned()
     } else {
@@ -1447,7 +1128,7 @@ fn delete_probe(
     // Named with its table, because two schemas may each hold a constraint
     // of the same name (DECISIONS 128).
     let mut gone = Vec::new();
-    for removed in &names.removed {
+    for removed in names.view().removed() {
         let table = &removed.stored_table;
         let of_table = format!(
             "s.name = {} AND t.name = {}",
@@ -1579,8 +1260,8 @@ fn counting_statement(r: &Referencing<'_>) -> String {
 /// that a child row committed between the preflight probe and the delete
 /// cannot be cascaded away unseen (DECISIONS 129).
 ///
-/// It is not the probe: by the time this runs, every insert, update and child
-/// delete of the plan has run (`order_key`), so a surviving row referencing
+/// It is not the probe: this statement sees the effects of the preceding
+/// inserts, updates and child deletes, so a surviving row referencing
 /// the parent is one the probe did not account for. The row being deleted
 /// does not survive, even if it references itself (DECISIONS 470).
 /// The probe reports the number before anything runs, which is what a human
@@ -1748,17 +1429,17 @@ fn unprobeable_probe(
     moved: &Moved,
     names: &AsStored,
 ) -> Result<Option<Probe>, DialectError> {
-    let Some(stored_child) = names.table(child) else {
+    let Some(stored_child) = names.view().table(child) else {
         return Ok(None);
     };
     // The same filtering `delete_probe` does: a key this plan removes before
     // the deletes cannot carry a default onto the deleted row, and refusing
     // the write for it refuses a plan the engine would accept (DECISIONS 128).
-    let removed = match names.removed_from(&stored_child) {
+    let removed = match names.view().removed_from(&stored_child) {
         Removal::Table => return Ok(None),
         Removal::Keys(keys) => keys,
     };
-    let stored_name = |column: &str| names.column(&child.column(column)).map(|r| r.name);
+    let stored_name = |column: &str| names.view().column(&child.column(column)).map(|r| r.name);
     let mut rows: BTreeMap<&RowKey, BTreeSet<String>> = BTreeMap::new();
     let mut described = Vec::new();
     for (column, keys) in &moved.unprobeable {
@@ -1790,7 +1471,11 @@ fn unprobeable_probe(
                     .map(|c| literal(c))
                     .collect::<Vec<_>>()
                     .join(", "),
-                touches(moved.nulls_of(row, &stored_name).iter())
+                touches(
+                    moved
+                        .nulls_of(row, &stored_name, |sql| is_null_default(sql))
+                        .iter()
+                )
             )
         })
         .collect();
@@ -1843,8 +1528,8 @@ enum Applies<'a> {
 /// One table's rows in `columns`, as the plan will have left them by the time
 /// the change that asks runs — a derived table whose columns are `k0`..`kn`.
 ///
-/// `AddForeignKey` sorts after every row change (`order_key`), so a probe
-/// built from what is stored answers about a table that no longer exists in
+/// After earlier row changes, a probe built only from the stored rows answers
+/// about a table that no longer exists in
 /// that shape: a plan that inserts the missing parent rows, or repairs the
 /// orphaned children, is refused for a violation it was written to remove,
 /// and a child row the plan itself inserts is not counted at all. Both were
@@ -1926,8 +1611,8 @@ fn rows_after(
             // engine accepts is the worse direction (PITFALLS #5), and it is
             // symmetric — `<>` in place of `=` misses a collision instead — so
             // the answer is the same as for the other three: no probe.
-            if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
-                || names.plan_names.renamed_columns(table).next().is_some()
+            if moved.is_some_and(|m| m.has_writes())
+                || names.view().renamed_columns(table).next().is_some()
                 || names.added.keys().any(|c| c.table == *table)
                 || names.types.keys().any(|c| c.table == *table)
             {
@@ -2021,18 +1706,12 @@ fn rows_after(
                 // A set, so the list is sorted and a key named by both halves is
                 // named once: serialization is deterministic here as everywhere.
                 let gone: BTreeSet<String> = m
-                    .deleted
-                    .iter()
-                    .chain(
-                        m.updated
-                            .iter()
-                            .filter(|(_, cells)| cells.keys().any(|c| columns.contains(c)))
-                            .map(|(key, _)| key),
-                    )
+                    .gone_keys(columns)
+                    .into_iter()
                     .map(|k| literal(k.as_str()))
                     .collect();
                 if !gone.is_empty() {
-                    let Some(key_column) = names.column(&table.column(&m.key_column)) else {
+                    let Some(key_column) = names.view().column(&table.column(&m.key_column)) else {
                         return Ok(None);
                     };
                     where_clauses.push(format!(
@@ -2056,7 +1735,7 @@ fn rows_after(
                 .get(column)
                 .is_some_and(|rows| rows.contains(key))
         };
-        // A column the engine fills in: `IDENTITY`. See `Moved::typed` for why
+        // A column the engine fills in: `IDENTITY`. See `RowWrites::typed` for why
         // absence is the signal. The key column is excluded because an insert
         // always spells it — including into an identity key, which ADR-0004
         // writes under `SET IDENTITY_INSERT`, so its value *is* known.
@@ -2105,7 +1784,7 @@ fn rows_after(
             let Some((stored, stored_columns)) = stored_columns(names, table, columns) else {
                 continue;
             };
-            let Some(key_column) = names.column(&table.column(&m.key_column)) else {
+            let Some(key_column) = names.view().column(&table.column(&m.key_column)) else {
                 continue;
             };
             let mut values = Vec::new();
@@ -2224,10 +1903,10 @@ fn stored_columns(
     table: &TableName,
     columns: &[String],
 ) -> Option<(TableName, Vec<String>)> {
-    let stored = names.table(table)?;
+    let stored = names.view().table(table)?;
     let columns = columns
         .iter()
-        .map(|c| names.column(&table.column(c)).map(|r| r.name))
+        .map(|c| names.view().column(&table.column(c)).map(|r| r.name))
         .collect::<Option<Vec<_>>>()?;
     Some((stored, columns))
 }
@@ -2272,8 +1951,7 @@ fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Result<Probe, Dial
 
 /// `from` is the relation the constraint's statement will meet and `columns`
 /// are its key expressions within it — for a key a plan adds, the derived
-/// table [`rows_after`] builds, because `order_key` runs every row change
-/// before every constraint (DECISIONS 175).
+/// table [`rows_after`] builds from the preceding changes (DECISIONS 175).
 fn duplicate_probe(
     from: &str,
     columns: &[String],
@@ -2499,7 +2177,9 @@ mod tests {
         });
         assert_eq!(
             sql,
-            ["SELECT COUNT(*) AS n FROM [dbo].[customer] WHERE [email] IS NULL;"]
+            [
+                "SELECT COUNT(*) AS n FROM (\nSELECT c.[email] AS k0 FROM [dbo].[customer] AS c\n) AS r WHERE r.k0 IS NULL;"
+            ]
         );
     }
 
@@ -3700,7 +3380,7 @@ mod tests {
         );
     }
 
-    /// The two siblings of the check probe, at the same rank in `order_key`
+    /// The two siblings of the check probe, after the same preceding writes
     /// and with the same staleness — and the opposite fix, because their
     /// columns *are* the constraint, so `rows_after` can build the relation
     /// the statement will meet instead of giving no answer (DECISIONS 175).
@@ -3956,8 +3636,7 @@ mod tests {
         assert_eq!(probed(vec![retype, index(&["email"], true, None)]), 1);
     }
 
-    /// `order_key` runs every row change (11, 12) before every constraint
-    /// this plan adds (13), so the rows an `ADD CHECK` will meet are not the
+    /// Preceding row changes mean the rows an `ADD CHECK` meets are not the
     /// rows standing now. Counting the current ones blocked a plan that
     /// deletes its own violations first, and said nothing about the rows the
     /// plan is about to write (DECISIONS 174).
@@ -4438,7 +4117,7 @@ mod tests {
         // row pointing at itself is gone with the delete, not orphaned by it.
         assert!(
             sql.contains(
-                "WHEN s.name = N'dbo' AND t.name = N'status' THEN N' AND ch.[code] NOT IN (N''old'')'"
+                "WHEN fk.parent_object_id = fk.referenced_object_id THEN N' AND ch.[code] NOT IN (N''old'')'"
             ),
             "{sql}"
         );
@@ -4600,13 +4279,14 @@ mod tests {
         let changes = plan(vec![update]);
         let ids = plan_fixture::ids(&changes);
         let index = PlanNames::of(&changes.changes, &ids).unwrap();
-        let names = AsStored::of(&index);
+        let facts = PlanFacts::of(&index);
+        let names = AsStored::of(facts.end());
         assert!(names.types.is_empty());
         assert_eq!(
             names.moved[&table].updated[&key]["k"].as_deref(),
             Some("CONVERT(varchar(10), (-CAST('01' AS int)\n))")
         );
-        assert!(names.moved[&table].untyped_defaults.is_empty());
+        assert!(names.moved[&table].metadata.untyped_defaults.is_empty());
         assert_eq!(
             assigned_default("1.25", Some(&ty("numeric(8,2)")), None).as_deref(),
             Some("CONVERT(decimal(8, 2), (1.25\n))")
@@ -5001,7 +4681,11 @@ mod tests {
         ]);
         let p = probes(&cs);
         assert_eq!(p.len(), 1);
-        assert!(p[0].sql.contains("[email] IS NULL"), "{:?}", p[0]);
+        assert!(
+            p[0].sql.contains("c.[email] AS k0") && p[0].sql.contains("r.k0 IS NULL"),
+            "{:?}",
+            p[0]
+        );
         assert!(!p[0].sql.contains("contact_email"), "{:?}", p[0]);
         // The message names it as the plan does; the reader is looking at the
         // plan, not at the catalog.
@@ -5080,7 +4764,7 @@ mod tests {
         assert!(!p[0].sql.contains("brand_new"), "{:?}", p[0].sql);
 
         // Two declared rows under one key: the constraint would refuse them,
-        // and `order_key` inserts before it adds — so the probe can say so
+        // and this insert precedes the addition — so the probe can say so
         // before anything runs.
         let p = probes(&plan(vec![create, row("a", 1), row("b", 1), unique]));
         assert_eq!(p.len(), 1, "{p:?}");

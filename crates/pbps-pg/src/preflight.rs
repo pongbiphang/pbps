@@ -11,15 +11,10 @@
 //! offline (§7.2); these run at apply time, where a connection is guaranteed
 //! and reading the data is the job.
 //!
-//! # Two groups, because `order_key` reads the table twice
-//!
-//! A type change and a nullability change run at **rank 9**, before every row
-//! change, so their probes meet exactly the rows that are stored now. Every
-//! constraint this plan adds runs at **rank 13**, after them, so those probes
-//! meet the rows [`rows_after`] projects — what is stored, minus what the plan
-//! deletes and rewrites, plus what it writes. Built from the stored rows alone
-//! they would refuse the ordinary ADR-0004 plan, which declares the parent rows
-//! and the key that references them together.
+//! A probe reads the prefix before its own statement (DEC-1775.1). Stored
+//! rows are projected through the earlier column and row changes; a later
+//! write, removal or attach cannot affect an earlier check. The common walk
+//! records raw facts, while casts, defaults and partition reach stay here.
 //!
 //! # Where a probe is deliberately absent
 //!
@@ -49,9 +44,8 @@
 //!   not a literal, which has no value until it runs (DECISIONS 124), and a key
 //!   spanning a column this plan *narrows*, whose projection would be a `CAST`
 //!   that can raise (DECISIONS 392).
-//! - **A check on a table this plan retypes a column of.** The conversion runs
-//!   at rank 9 and the check is added at rank 13, so the engine tests the
-//!   converted value while a probe tests the stored one. Measured, a
+//! - **A check after a column retype.** The engine tests the converted value
+//!   while an untranslated predicate tests the stored one. Measured, a
 //!   `numeric(10,2)` holding `1.50` converted to `numeric(10,0)` and then given
 //!   `CHECK (v = round(v))` is accepted by the engine and counted as a
 //!   violation by a probe over the stored value — a valid plan refused. The
@@ -135,12 +129,15 @@
 //! counted and the apply stops the same way.
 
 use pbps_model::ValueSource;
+use std::cell::LazyCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
 
+use pbps_dialect::plan_rows::{Event, PlanFacts, Removal, RowWrites, View, WrittenCell};
 use pbps_dialect::{DialectError, Preflight, Probe, Unchecked};
 #[cfg(test)]
 use pbps_model::ChangeSet;
-use pbps_model::plan_names::{At, Holder, PlanNames};
+use pbps_model::plan_names::PlanNames;
 use pbps_model::{Cell, Change, ColumnRef, RowKey, TableName, Value};
 
 use crate::emit::{qualified, value_literal};
@@ -393,90 +390,7 @@ fn guarded(
 ///
 /// Per row, not per column: a foreign key is a tuple, and the probe compares a
 /// row's whole tuple against the parent row's (DECISIONS 121).
-#[derive(Debug, Default)]
-struct Moved {
-    key_column: String,
-    /// Deleted: gone whatever they referenced.
-    deleted: BTreeSet<RowKey>,
-    /// Updated row -> column set by its update -> the value it is set to, as
-    /// the SQL the engine compares. `None` for a default that is not a
-    /// literal, which no probe can compare; a NULL is written and compared
-    /// like any other value (DECISIONS 329).
-    updated: BTreeMap<RowKey, BTreeMap<String, Option<String>>>,
-    /// Inserted row -> column -> the value it arrives with. `count(*)` over the
-    /// child sees only what is stored, and a row arriving on the parent is
-    /// either not in the table yet (an insert) or stored somewhere else (an
-    /// update); both run before the deletes, so without this the probe passes
-    /// and `ON DELETE CASCADE` then takes the row straight back out.
-    inserted: BTreeMap<RowKey, BTreeMap<String, String>>,
-    /// Column -> the rows this plan writes to a default no probe can evaluate.
-    /// Which key of the parent such a default names is decided when it runs,
-    /// so the arrival cannot be counted and the write is refused instead
-    /// (DECISIONS 124).
-    unprobeable: BTreeMap<String, BTreeSet<RowKey>>,
-    /// Updated row -> the columns its update leaves alone at NULL. The
-    /// statement holds the row to its unchanged declared cells before and
-    /// after it runs (DECISIONS 136), so a NULL among them is a NULL the
-    /// row's tuple holds after the update, as surely as one the update
-    /// writes (DECISIONS 349).
-    held_null: BTreeMap<RowKey, BTreeSet<String>>,
-}
-
-impl Moved {
-    /// The columns this plan writes to a NULL in `row`, under the names the
-    /// catalog has now.
-    ///
-    /// A NULL is a value the probe compares (DECISIONS 329), and it is the one
-    /// value that makes a whole tuple reference nothing: `MATCH SIMPLE` is
-    /// this engine's default, so a key with a NULL in any of its columns is
-    /// not checked at all. Read by the refusal over unprobeable defaults,
-    /// which has nothing to refuse when the tuple cannot match any parent row
-    /// however the default evaluates (DECISIONS 334).
-    fn nulls_of(
-        &self,
-        row: &RowKey,
-        stored_name: &impl Fn(&str) -> Option<String>,
-    ) -> BTreeSet<String> {
-        // `NULL`, `(NULL)` and `(NULL::text)` all reach here — a cell written
-        // NULL, and a column left to a default that is NULL — and they are one
-        // value to the engine.
-        let written_null = |sql: &str| crate::rows::unwrapped(sql).eq_ignore_ascii_case("null");
-        let mut out = BTreeSet::new();
-        if let Some(columns) = self.updated.get(row) {
-            for (column, sql) in columns {
-                if sql.as_deref().is_some_and(written_null)
-                    && let Some(name) = stored_name(column)
-                {
-                    out.insert(name);
-                }
-            }
-        }
-        if let Some(columns) = self.inserted.get(row) {
-            for (column, sql) in columns {
-                if written_null(sql)
-                    && let Some(name) = stored_name(column)
-                {
-                    out.insert(name);
-                }
-            }
-        }
-        if let Some(columns) = self.held_null.get(row) {
-            out.extend(columns.iter().filter_map(|c| stored_name(c)));
-        }
-        out
-    }
-}
-
-/// A foreign key this plan removes before its deletes run: the constraint,
-/// under the table that holds it. `None` for the constraint means every key
-/// the table holds, because the table itself is going.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Removed {
-    /// Resolved when the removal is visited, before a later rename can give
-    /// this address to another table (DEC-1770.1).
-    stored_table: TableName,
-    constraint: Option<String>,
-}
+type Moved = RowWrites<String>;
 
 /// Translates the names a plan uses into the names the database still has, and
 /// records the rows the plan itself moves.
@@ -486,20 +400,18 @@ struct Removed {
 /// deletes a row from it describes the table by its new name, and a probe built
 /// from the change alone would ask about a table that does not exist yet.
 #[derive(Debug)]
-struct AsStored<'a> {
-    plan_names: &'a PlanNames<'a>,
+struct AsStored<'v, 'p> {
+    view: View<'v, 'p>,
     partitions: pbps_model::Partitions,
     moved: BTreeMap<TableName, Moved>,
-    removed: BTreeSet<Removed>,
-    /// Foreign keys this plan adds, which the catalog does not hold yet and
-    /// the engine will validate after the deletes have run (DECISIONS 335).
+    /// Foreign keys already added by this prefix but absent from the stored
+    /// catalog. A subsequent delete must include them (DECISIONS 335).
     added: Vec<Added>,
     /// Columns this plan adds, each as it is added: what every stored row of
     /// the table holds in it once `ADD COLUMN` has run (DECISIONS 336, 339).
     columns_added: BTreeMap<ColumnRef, AddedColumn>,
-    /// Columns this plan retypes, with the type they will have: the
-    /// `ALTER COLUMN … TYPE` runs at rank 9, before the deletes, so a key
-    /// spanning one compares converted values (DECISIONS 340).
+    /// Columns already retyped by this prefix. A later key compares their
+    /// converted values (DECISIONS 340).
     retyped: BTreeMap<ColumnRef, pbps_model::ColumnType>,
     /// The same columns, with the type they have **now**. A probe that
     /// projects a stored value through the new type has to know whether that
@@ -516,10 +428,8 @@ struct AsStored<'a> {
     /// new values cannot be computed here without running the operator's
     /// expression before approval (DEC-1168.1).
     recomputed: BTreeSet<ColumnRef>,
-    /// Tables this plan attaches, by the parent they are attached to. The
-    /// attach runs before every row change and key addition a probe stands
-    /// for, so the parent's rows are its own and these tables' together
-    /// (DEC-1545.1).
+    /// Tables attached by this prefix, by their parent. Only a preceding
+    /// attach contributes rows to the parent's projection (DEC-1545.1).
     attached: BTreeMap<TableName, Vec<TableName>>,
     /// The names this plan takes off a column: the columns it drops, and the
     /// old name of each it renames. A name among them that the plan gives a
@@ -613,13 +523,16 @@ fn constant_default(default: &str) -> Option<&str> {
     crate::rows::is_constant(d).then_some(d)
 }
 
-impl<'a> AsStored<'a> {
-    fn of(plan_names: &'a PlanNames<'a>, partitions: &pbps_model::Partitions) -> Self {
+impl<'v, 'p> AsStored<'v, 'p> {
+    fn view(&self) -> View<'v, 'p> {
+        self.view
+    }
+
+    fn of(view: View<'v, 'p>, partitions: &pbps_model::Partitions) -> Self {
         let mut this = Self {
-            plan_names,
+            view,
             partitions: partitions.clone(),
             moved: Default::default(),
-            removed: Default::default(),
             added: Default::default(),
             columns_added: Default::default(),
             retyped: Default::default(),
@@ -629,13 +542,12 @@ impl<'a> AsStored<'a> {
             attached: Default::default(),
             vacated: Default::default(),
         };
-        for (at, p) in plan_names.changes().iter().enumerate() {
-            match &p.change {
-                Change::RenameTable { .. } => {}
-                Change::RenameColumn { table, from, .. } => {
+        for (_, event) in view.events().collect::<Vec<_>>() {
+            match event {
+                Event::RenameColumn { table, from, .. } => {
                     this.vacated.insert(table.column(from));
                 }
-                Change::CreateTable { name, table, .. } => {
+                Event::CreateTable { name, table, .. } => {
                     // A created table's columns are entirely in the plan, so
                     // its **key** has a type here where a stored table's has
                     // none: `InsertRow` carries the type of every non-key
@@ -663,10 +575,9 @@ impl<'a> AsStored<'a> {
                             .insert(name.column(column), declared.ty.clone());
                     }
                 }
-                // Both run before the deletes (`order_key`), so a child
-                // counted through either would refuse a delete that will be
-                // valid by then (DECISIONS 128).
-                Change::AddForeignKey {
+                // A preceding key addition must participate in the delete's
+                // count even though the catalog does not hold it yet.
+                Event::AddForeignKey {
                     table, constraint, ..
                 } => {
                     this.added.push(Added {
@@ -676,140 +587,25 @@ impl<'a> AsStored<'a> {
                         referenced: constraint.references_columns.clone(),
                     });
                 }
-                Change::DropForeignKey { table, name } => {
-                    this.removed.insert(Removed {
-                        stored_table: this
-                            .table_at(table, At::Before(at))
-                            .unwrap_or_else(|| table.clone()),
-                        constraint: Some(name.clone()),
-                    });
-                }
-                Change::DropTable { name, .. } => {
-                    this.removed.insert(Removed {
-                        stored_table: this
-                            .table_at(name, At::Before(at))
-                            .unwrap_or_else(|| name.clone()),
-                        constraint: None,
-                    });
-                }
-                Change::UpdateRow {
+                Event::UpdateRow {
                     table,
-                    key_column,
-                    key,
-                    columns,
-                    unchanged,
                     types,
                     after_types,
-                    // The key's type matters to the apply's `WHERE` alone;
-                    // the probes run on the session's empty path.
-                    key_type: _,
-                } => {
-                    this.remember_types(table, types);
-                    this.remember_types(table, after_types);
-                    let moved = this.moved.entry(table.clone()).or_default();
-                    moved.key_column = key_column.clone();
-                    // A cell the update leaves alone at NULL — declared NULL,
-                    // or left to a default that is NULL — is a NULL of the
-                    // row's tuple after the update (DECISIONS 349).
-                    let is_null =
-                        |sql: &str| crate::rows::unwrapped(sql).eq_ignore_ascii_case("null");
-                    for (column, cell) in unchanged {
-                        let null = match cell {
-                            Cell::Value(v) => written(v).as_deref().is_some_and(is_null),
-                            Cell::Default(d) => constant_default(d).is_some_and(is_null),
-                        };
-                        if null {
-                            moved
-                                .held_null
-                                .entry(key.clone())
-                                .or_default()
-                                .insert(column.clone());
-                        }
-                    }
-                    let updated = moved.updated.entry(key.clone()).or_default();
-                    for (column, (_, after)) in columns {
-                        let sql = match after {
-                            Cell::Value(v) => written(v),
-                            Cell::Default(d) => {
-                                let constant = constant_default(d);
-                                // A default that is not a literal and is not
-                                // NULL may evaluate to the deleted row's key,
-                                // and nothing can say so before it runs
-                                // (DECISIONS 124).
-                                if constant.is_none() {
-                                    moved
-                                        .unprobeable
-                                        .entry(column.clone())
-                                        .or_default()
-                                        .insert(key.clone());
-                                }
-                                constant.map(|e| format!("({e})"))
-                            }
-                        };
-                        updated.insert(column.clone(), sql);
-                    }
-                }
-                Change::InsertRow {
-                    table,
-                    key_column,
-                    key,
-                    row,
-                    defaults,
-                    types,
                     ..
-                } => {
-                    this.remember_types(table, types);
-                    let moved = this.moved.entry(table.clone()).or_default();
-                    moved.key_column = key_column.clone();
-                    let inserted = moved.inserted.entry(key.clone()).or_default();
-                    // The key is written like any other column, and may be one
-                    // column of a composite foreign key.
-                    inserted.insert(key_column.clone(), value_literal(key.as_str()));
-                    for (column, default) in defaults {
-                        if let Some(expr) = constant_default(default) {
-                            inserted.insert(column.clone(), format!("({expr})"));
-                        } else {
-                            moved
-                                .unprobeable
-                                .entry(column.clone())
-                                .or_default()
-                                .insert(key.clone());
-                        }
-                    }
-                    for (column, value) in &row.0 {
-                        if let Some(sql) = written(value) {
-                            inserted.insert(column.clone(), sql);
-                        }
-                    }
-                    // A column the row omits and the table gives no default
-                    // is inserted at NULL, and the plan carries every such
-                    // column in `types` (DECISIONS 136). A NULL is a value
-                    // the probe compares, and the one that makes a whole
-                    // tuple reference nothing — left out, it was neither, and
-                    // an insert leaving a sibling column of the key to an
-                    // unevaluable default was refused for a tuple the engine
-                    // never checks (DECISIONS 337).
-                    for column in types.keys() {
-                        if !inserted.contains_key(column) && !defaults.contains_key(column) {
-                            inserted.insert(column.clone(), "NULL".to_owned());
-                        }
-                    }
                 }
-                Change::DeleteRow {
+                | Event::DeleteRow {
                     table,
-                    key_column,
-                    key,
                     types,
                     after_types,
                     ..
                 } => {
                     this.remember_types(table, types);
                     this.remember_types(table, after_types);
-                    let moved = this.moved.entry(table.clone()).or_default();
-                    moved.key_column = key_column.clone();
-                    moved.deleted.insert(key.clone());
                 }
-                Change::AddColumn {
+                Event::InsertRow { table, types, .. } => {
+                    this.remember_types(table, types);
+                }
+                Event::AddColumn {
                     table,
                     name,
                     column,
@@ -833,52 +629,23 @@ impl<'a> AsStored<'a> {
                         },
                     );
                 }
-                Change::AlterColumnType {
+                Event::AlterColumnType {
                     column, from, to, ..
                 } => {
                     this.retyped.insert(column.clone(), to.clone());
                     this.retyped_from.insert(column.clone(), from.clone());
                 }
-                // Exhaustive rather than `_`: a change added later that moves a
-                // name has to be reflected here, or every probe downstream of
-                // it would quietly query the wrong object.
-                Change::AlterColumnExpression { column, .. } => {
+                Event::AlterColumnExpression { column, .. } => {
                     this.recomputed.insert(column.clone());
                 }
-                Change::DropColumn { column, .. } => {
+                Event::DropColumn { column, .. } => {
                     this.vacated.insert(column.clone());
                 }
-                Change::AlterColumnNullability { .. }
-                | Change::AlterColumnDefault { .. }
-                | Change::SetColumnDeprecated { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddIndex { .. }
-                | Change::AddComputedColumn { .. }
-                | Change::DropComputedColumn { .. }
-                | Change::DropIndex { .. }
-                | Change::CreateModule { .. }
-                | Change::AlterModule { .. }
-                | Change::DropModule { .. }
-                | Change::SetDataMode { .. }
-                | Change::SetEnsureKeys { .. }
-                | Change::CreateRole { .. }
-                | Change::DropRole { .. }
-                | Change::RenameRole { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::SetIndexStorageParameters { .. }
-                | Change::SetTablePersistence { .. }
-                | Change::SetPartitionDefault { .. }
-                | Change::SetPartitionNotNull { .. }
-                | Change::SetStorageParameters { .. }
-                | Change::SetReplicaIdentity { .. }
-                | Change::DetachPartition { .. }
-                | Change::PublicExecution { .. } => {}
-                Change::AttachPartition { table, parent, .. } => {
+                Event::AddComputedColumn { .. }
+                | Event::DropComputedColumn { .. }
+                | Event::DropForeignKey { .. }
+                | Event::DropTable { .. } => {}
+                Event::AttachPartition { table, parent, .. } => {
                     this.attached
                         .entry(parent.clone())
                         .or_default()
@@ -886,6 +653,21 @@ impl<'a> AsStored<'a> {
                 }
             }
         }
+        this.moved = view.writes(
+            |assignment, _: &mut ()| match assignment.cell {
+                WrittenCell::Value(value) => written(value),
+                WrittenCell::Default(default) => {
+                    constant_default(default).map(|e| format!("({e})"))
+                }
+                WrittenCell::OmittedNull => Some("NULL".to_owned()),
+                WrittenCell::EngineAssigned => None,
+            },
+            |cell| match cell {
+                Cell::Value(value) => matches!(value, Value::Null),
+                Cell::Default(default) => constant_default(default)
+                    .is_some_and(|d| crate::rows::unwrapped(d).eq_ignore_ascii_case("null")),
+            },
+        );
         this
     }
 
@@ -964,74 +746,9 @@ impl<'a> AsStored<'a> {
         self.retyped.keys().any(|c| c.table == *table)
     }
 
-    /// Whether a change's probe would read a generated column this plan
-    /// recomputes, and so judge the values the old expression stored. A
-    /// predicate is arbitrary SQL this module does not parse, so a check or
-    /// a filtered index counts any recomputed column of its table; a key
-    /// counts its own columns, on either side of a foreign key.
-    #[allow(clippy::wildcard_enum_match_arm)]
-    fn reads_recomputed(&self, change: &Change) -> bool {
-        let named = |table: &TableName, columns: &[String]| {
-            columns
-                .iter()
-                .any(|c| self.recomputed.contains(&table.column(c)))
-        };
-        let anywhere = |table: &TableName| self.recomputed.iter().any(|c| c.table == *table);
-        match change {
-            Change::AlterColumnNullability {
-                column,
-                to_nullable: false,
-                ..
-            } => self.recomputed.contains(column),
-            Change::AddCheck { table, .. } => anywhere(table),
-            Change::AddIndex { table, index, .. } => {
-                (index.holds_expression() && anywhere(table))
-                    || index.column_keys().is_some_and(|keys| named(table, &keys))
-            }
-            Change::AddUnique {
-                table, constraint, ..
-            } => named(table, &constraint.columns),
-            Change::SetPrimaryKey {
-                table,
-                to: Some(pk),
-                ..
-            } => named(table, &pk.columns),
-            Change::AddForeignKey {
-                table, constraint, ..
-            } => {
-                named(table, &constraint.columns)
-                    || named(&constraint.references_table, &constraint.references_columns)
-            }
-            _ => false,
-        }
-    }
-
-    /// The name the catalog has for a table this plan names, or `None` where
-    /// the plan creates it — a table that does not exist yet holds no rows and
-    /// carries no foreign key, and probing it would only produce an error
-    /// about a missing relation.
-    fn table(&self, name: &TableName) -> Option<TableName> {
-        self.table_at(name, At::End)
-    }
-
-    fn table_at(&self, name: &TableName, at: At) -> Option<TableName> {
-        match self.plan_names.holder(name, at) {
-            Holder::Tracked(uid) => self.plan_names.table_at(uid, At::Start).cloned(),
-            Holder::Unmanaged => Some(name.clone()),
-            Holder::Vacant => None,
-        }
-    }
-
-    fn created(&self, table: &TableName) -> bool {
-        match self.plan_names.holder(table, At::End) {
-            Holder::Tracked(uid) => self.plan_names.table_at(uid, At::Start).is_none(),
-            Holder::Unmanaged | Holder::Vacant => false,
-        }
-    }
-
     fn renamed_column(&self, column: &ColumnRef) -> Option<&str> {
         let source = self.partitions.column(column);
-        self.plan_names
+        self.view()
             .renamed_columns(&source.table)
             .find(|(_, _, to)| *to == source.name)
             .map(|(_, from, _)| from)
@@ -1039,12 +756,13 @@ impl<'a> AsStored<'a> {
 
     fn renames_in(&self, table: &TableName) -> bool {
         let source = self.partitions.parent(table).unwrap_or(table);
-        self.plan_names.renamed_columns(source).next().is_some()
+        self.view().renamed_columns(source).next().is_some()
     }
 
     fn column(&self, r: &ColumnRef) -> Option<ColumnRef> {
         Some(
-            self.table(&r.table)?
+            self.view()
+                .table(&r.table)?
                 .column(self.renamed_column(r).unwrap_or(&r.name)),
         )
     }
@@ -1122,7 +840,7 @@ fn counting_expression(r: &Referencing<'_>) -> String {
 /// probes over `pg_constraint` do.
 fn gone_keys(names: &AsStored) -> String {
     let mut gone = Vec::new();
-    for removed in &names.removed {
+    for removed in names.view().removed() {
         let table = &removed.stored_table;
         let of_table = format!(
             "ns.nspname = {} AND cl.relname = {}",
@@ -1173,7 +891,7 @@ fn delete_probe(
     let mut exclusions = Vec::new();
     let mut arrivals = Vec::new();
     for (child, moved) in &names.moved {
-        let Some(stored_child) = names.table(child) else {
+        let Some(stored_child) = names.view().table(child) else {
             continue;
         };
         let Some(stored_key) = names.column(&child.column(&moved.key_column)) else {
@@ -1299,6 +1017,9 @@ fn delete_probe(
     } else {
         format!("CASE {} ELSE '' END", exclusions.join(" "))
     };
+    // The statement removes its target's self-reference at the same time.
+    // This is the current DELETE's effect, not a later plan mutation.
+    let exclusion = format!("{exclusion} || {}", self_reference(&stored.name, key)?);
     let arrival = if arrivals.is_empty() {
         "''".to_owned()
     } else {
@@ -1346,8 +1067,8 @@ fn delete_probe(
 /// and the lock is one row wide rather than SQL Server's range over the child
 /// (DECISIONS 326).
 ///
-/// It is not the probe: by the time this runs, every insert, update and child
-/// delete of the plan has run (`order_key`), so *any* row still referencing the
+/// It is not the probe: this statement sees the effects of the preceding
+/// inserts, updates and child deletes, so *any* row still referencing the
 /// parent is one the probe did not account for. The probe stays where it is —
 /// it reports the number before anything runs, which is what a human approves;
 /// this refuses what changed underneath it.
@@ -1485,27 +1206,14 @@ fn a_hidden_child(parent: &str) -> String {
     )
 }
 
-/// The keys this plan removes from `stored_child` before the deletes run,
-/// under the names the catalog holds now.
-///
-/// Read by both probes over foreign keys: a constraint that will be gone by
-/// the time the delete runs must count nothing, or the probe refuses a delete
-/// the engine would accept (DECISIONS 128).
-enum Removal {
-    /// The table itself: every key it holds goes with it.
-    Table,
-    /// The named constraints, and nothing else.
-    Keys(Vec<String>),
-}
-
-impl AsStored<'_> {
+impl AsStored<'_, '_> {
     /// The stored children whose key into `parent` this plan adds, under the
     /// names the catalog holds now (DECISIONS 336, 345).
     fn planned_children(&self, parent: &TableName) -> Vec<TableName> {
         self.added
             .iter()
             .filter(|a| a.parent == *parent)
-            .filter_map(|a| self.table(&a.child))
+            .filter_map(|a| self.view().table(&a.child))
             .collect()
     }
 
@@ -1515,7 +1223,7 @@ impl AsStored<'_> {
     fn planned_reads(&self, parent: &TableName, stored_child: &TableName) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for a in self.added.iter().filter(|a| a.parent == *parent) {
-            if self.table(&a.child).as_ref() != Some(stored_child) {
+            if self.view().table(&a.child).as_ref() != Some(stored_child) {
                 continue;
             }
             for c in &a.columns {
@@ -1652,20 +1360,6 @@ impl AsStored<'_> {
         let from = crate::types::normalize(from).ok()?;
         crate::types::cannot_become(&from, &to, expr)
     }
-
-    fn removed_from(&self, stored_child: &TableName) -> Removal {
-        let mut keys = Vec::new();
-        for removed in &self.removed {
-            if &removed.stored_table != stored_child {
-                continue;
-            }
-            match &removed.constraint {
-                None => return Removal::Table,
-                Some(constraint) => keys.push(constraint.clone()),
-            }
-        }
-        Removal::Keys(keys)
-    }
 }
 
 /// The refusal that goes with the count: the tables whose referencing rows
@@ -1736,7 +1430,8 @@ fn hidden_children_probe(
     // child whose rows this plan deletes or updates.
     let mut row_keys = Vec::new();
     for child in names.moved.keys() {
-        let (Some(stored_child), Some(key)) = (names.table(child), names.row_key_read(child))
+        let (Some(stored_child), Some(key)) =
+            (names.view().table(child), names.row_key_read(child))
         else {
             continue;
         };
@@ -1861,10 +1556,10 @@ fn unprobeable_probe(
     moved: &Moved,
     names: &AsStored,
 ) -> Result<Option<Probe>, DialectError> {
-    let Some(stored_child) = names.table(child) else {
+    let Some(stored_child) = names.view().table(child) else {
         return Ok(None);
     };
-    let removed = match names.removed_from(&stored_child) {
+    let removed = match names.view().removed_from(&stored_child) {
         Removal::Table => return Ok(None),
         Removal::Keys(keys) => keys,
     };
@@ -1891,7 +1586,9 @@ fn unprobeable_probe(
         ));
     }
     for (row, unprobeable) in &rows {
-        let nulls = moved.nulls_of(row, &stored_name);
+        let nulls = moved.nulls_of(row, &stored_name, |sql| {
+            crate::rows::unwrapped(sql).eq_ignore_ascii_case("null")
+        });
         arms.push(if nulls.is_empty() {
             format!("({})", touches(unprobeable.iter()))
         } else {
@@ -1919,7 +1616,9 @@ fn unprobeable_probe(
                 recorded.insert(name);
             }
         }
-        let nulls = moved.nulls_of(row, &stored_name);
+        let nulls = moved.nulls_of(row, &stored_name, |sql| {
+            crate::rows::unwrapped(sql).eq_ignore_ascii_case("null")
+        });
         let beyond = reaches_beyond(recorded.iter());
         arms.push(if nulls.is_empty() {
             format!("({beyond})")
@@ -1973,11 +1672,10 @@ fn unprobeable_probe(
 /// The count and the refusal for every key this plan adds, asked from the
 /// plan alone (DECISIONS 345).
 ///
-/// `DeleteRow` runs at rank 12 and `AddForeignKey` at 13 (`order_key`), so
-/// the delete runs against a catalog that does not hold the key, and the
-/// `ALTER` that follows validates every child row and fails on the one the
-/// delete just orphaned — measured; in a staged apply the delete has
-/// committed by then. The first answer (335) was a synthetic `pg_constraint`
+/// A planned key is absent from the baseline catalog. A key added before
+/// this delete needs its planned definition here; a key added later is
+/// checked by its own constraint probe, after this delete's effects.
+/// The first answer (335) was a synthetic `pg_constraint`
 /// row beside the stored ones, so that every rule for a catalog row would
 /// reach it. Five rounds of review found what a catalog row cannot say — a
 /// column this plan adds, one it retypes, a child it creates, a survivor the
@@ -1989,9 +1687,9 @@ fn unprobeable_probe(
 /// default — **measured on 18.6**, and in the plan's own order:
 ///
 /// ```text
-/// ALTER TABLE child ADD COLUMN parent text DEFAULT 'old';   -- rank 8
+/// ALTER TABLE child ADD COLUMN parent text DEFAULT 'old';
 /// SELECT parent FROM child;                                  -- 'old', every row
-/// DELETE FROM parent WHERE code = 'old';                     -- rank 12, succeeded
+/// DELETE FROM parent WHERE code = 'old';                     -- succeeded
 /// ALTER TABLE child ADD FOREIGN KEY (parent) REFERENCES parent(code);
 ///   ERROR 23503: Key (parent)=(old) is not present in table "parent"
 /// ```
@@ -2044,11 +1742,11 @@ fn planned_key_probes(
     for a in names.added.iter().filter(|a| a.parent == *table) {
         // A child this plan creates is named as the plan names it, and holds
         // no stored rows: only its arrivals are counted (DECISIONS 343).
-        let created = names.created(&a.child);
+        let created = names.view().created(&a.child);
         let stored_child = if created {
             a.child.clone()
         } else {
-            match names.table(&a.child) {
+            match names.view().table(&a.child) {
                 Some(t) => t,
                 None => continue,
             }
@@ -2377,8 +2075,7 @@ fn planned_key_probes(
         // `AlterColumnType` conversion probe, over the whole parent table,
         // whether or not this specific row is the one a delete targets — the
         // `ALTER` this key's probe is asked about runs before the delete,
-        // so every stored row still has to survive it (rank 9 precedes the
-        // delete's own rank).
+        // so every stored row still has to survive that earlier conversion.
         let excluded_p: String = parent_guards_p
             .iter()
             .map(|g| format!(" AND NOT ({g})"))
@@ -2747,8 +2444,7 @@ enum Applies<'a> {
 /// the change that asks runs — a derived table whose columns are `k0`..`kn`.
 ///
 /// Not "what is stored", and that is the difference between a probe that works
-/// and one that refuses the ordinary plan. `order_key` runs every row change
-/// before every constraint this plan adds, so a plan that inserts the parent
+/// and one that refuses the ordinary plan. A plan that inserts the parent
 /// rows and *then* adds the foreign key is a plan the constraint will accept —
 /// and a probe built from the stored rows alone counts every child as an
 /// orphan and refuses it. The same for a plan that deletes the duplicates
@@ -2802,7 +2498,7 @@ fn rows_after(
             // counts collisions among the very rows the index exempts and
             // refuses a plan the engine accepts (the other dialect's
             // DECISIONS 236).
-            if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
+            if moved.is_some_and(|m| m.has_writes())
                 || names.renames_in(table)
                 || names.columns_added.keys().any(|c| c.table == *table)
                 || names.retypes_in(table)
@@ -2840,7 +2536,7 @@ fn rows_after(
     // spell", and the tail of this function treats those two very differently.
     let mut unspellable = false;
 
-    if let Some(stored) = names.table(table) {
+    if let Some(stored) = names.view().table(table) {
         let mut selected = Vec::new();
         let mut wheres = Vec::new();
         for (i, column) in columns.iter().enumerate() {
@@ -2897,14 +2593,8 @@ fn rows_after(
             // plan will leave it.
             if let Some(m) = moved {
                 let gone: BTreeSet<String> = m
-                    .deleted
-                    .iter()
-                    .chain(
-                        m.updated
-                            .iter()
-                            .filter(|(_, cells)| cells.keys().any(|c| columns.contains(c)))
-                            .map(|(key, _)| key),
-                    )
+                    .gone_keys(columns)
+                    .into_iter()
                     .map(|k| value_literal(k.as_str()))
                     .collect();
                 if !gone.is_empty() {
@@ -2981,7 +2671,7 @@ fn rows_after(
                 continue;
             }
             let (Some(stored), Some(key_column)) = (
-                names.table(table),
+                names.view().table(table),
                 names.column(&table.column(&m.key_column)),
             ) else {
                 continue;
@@ -3172,20 +2862,58 @@ fn duplicate_probe(from: &str, columns: &[String], description: &str) -> Probe {
     )
 }
 
-/// The probes one change implies, in the names the database still has.
-///
-/// The ordering the arms rely on is `order_key`'s, and it is the reason two
-/// groups of probes read the table differently. A type change and a
-/// nullability change run at rank 9, **before** every row change, so their
-/// probes meet exactly the rows that are stored now. Every constraint this plan
-/// adds runs at rank 13, **after** them, so those probes meet the rows
-/// [`rows_after`] projects.
-fn build(
+/// Whether a change's probe would read a generated column this plan
+/// recomputes, and so judge the values the old expression stored. A
+/// predicate is arbitrary SQL this module does not parse, so a check or
+/// a filtered index counts any recomputed column of its table; a key
+/// counts its own columns, on either side of a foreign key.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn reads_recomputed<'v, 'p: 'v>(
+    names: &impl Deref<Target = AsStored<'v, 'p>>,
     change: &Change,
-    names: &AsStored,
+) -> bool {
+    let named = |table: &TableName, columns: &[String]| {
+        columns
+            .iter()
+            .any(|c| names.recomputed.contains(&table.column(c)))
+    };
+    let anywhere = |table: &TableName| names.recomputed.iter().any(|c| c.table == *table);
+    match change {
+        Change::AlterColumnNullability {
+            column,
+            to_nullable: false,
+            ..
+        } => names.recomputed.contains(column),
+        Change::AddCheck { table, .. } => anywhere(table),
+        Change::AddIndex { table, index, .. } => {
+            (index.holds_expression() && anywhere(table))
+                || index.column_keys().is_some_and(|keys| named(table, &keys))
+        }
+        Change::AddUnique {
+            table, constraint, ..
+        } => named(table, &constraint.columns),
+        Change::SetPrimaryKey {
+            table,
+            to: Some(pk),
+            ..
+        } => named(table, &pk.columns),
+        Change::AddForeignKey {
+            table, constraint, ..
+        } => {
+            named(table, &constraint.columns)
+                || named(&constraint.references_table, &constraint.references_columns)
+        }
+        _ => false,
+    }
+}
+
+/// The probes one change implies, using facts before that statement.
+fn build<'v, 'p: 'v>(
+    change: &Change,
+    names: &impl Deref<Target = AsStored<'v, 'p>>,
     unchecked: &mut Vec<Unchecked>,
 ) -> Result<Vec<Probe>, DialectError> {
-    if names.reads_recomputed(change) {
+    if reads_recomputed(names, change) {
         return Ok(skip(
             change,
             "a generated column this plan recomputes cannot be evaluated before apply",
@@ -3214,7 +2942,7 @@ fn build(
         } if !column.nullable
             && !column.has_required_add_value_source_with(crate::LEXICON.identifier_continues) =>
         {
-            let Some(stored) = names.table(table) else {
+            let Some(stored) = names.view().table(table) else {
                 return Ok(Vec::new());
             };
             // The model's marker is lexical and deliberately conservative: it
@@ -3264,15 +2992,14 @@ fn build(
             )])
         }
 
-        // A tightening of a table whose rows this plan writes or deletes runs
-        // after them (#1367), so it meets the rows they leave, which may have
-        // filled or removed the NULLs the table holds now: the same relation
-        // the key probes read (DECISIONS 335).
+        // The preceding writes may fill or remove stored NULLs. Using the
+        // same relation as key probes also handles a tightening before those
+        // writes, without copying the planner's sort predicate (DEC-1775.1).
         Change::AlterColumnNullability {
             column,
             to_nullable: false,
             ..
-        } if names.moved.contains_key(&column.table) => {
+        } => {
             let Some(rows) = rows_after(
                 names,
                 &column.table,
@@ -3308,19 +3035,6 @@ fn build(
                 None => Ok(skip(change, "the column does not exist before apply", unchecked)),
             }
         }
-        Change::AlterColumnNullability {
-            column,
-            to_nullable: false,
-            ..
-        } => match names.column(column) {
-            Some(stored) => Ok(vec![null_probe(
-                column,
-                &qualified(&stored.table)?,
-                &quote(&stored.name)?,
-            )]),
-            None => Ok(skip(change, "the column does not exist before apply", unchecked)),
-        },
-
         Change::AlterColumnType {
             column,
             from,
@@ -3367,7 +3081,7 @@ fn build(
             name,
             constraint,
         } => {
-            let Some(stored) = names.table(table) else {
+            let Some(stored) = names.view().table(table) else {
                 return Ok(skip(change, "the table does not exist before apply", unchecked));
             };
             let moved = names.moved.get(table);
@@ -3377,7 +3091,7 @@ fn build(
             // columns *are* the constraint, so [`rows_after`] can build them.
             //
             // And a column this plan **retypes** takes the probe with it. The
-            // conversion runs at rank 9 and the check is added at rank 13, so
+            // conversion precedes this check in the projected prefix, so
             // the engine tests the converted value and a probe over the stored
             // one tests a different value. **Measured on 18.6**: a
             // `numeric(10,2)` holding `1.50` and `2.25`, converted to
@@ -3394,7 +3108,7 @@ fn build(
             // those make the probe *fail to run*, and the runner says so by
             // name. A retype leaves the probe able to run and quietly wrong,
             // which is the one outcome no report can catch (DECISIONS 410).
-            if moved.is_some_and(|m| !m.inserted.is_empty() || !m.updated.is_empty())
+            if moved.is_some_and(|m| m.has_writes())
                 || names.retypes_in(table)
             {
                 return Ok(skip(change, "the check predicate cannot be evaluated over planned row writes or retyped columns", unchecked));
@@ -3611,7 +3325,7 @@ fn build(
 /// The child rows a new foreign key would have no parent for.
 ///
 /// Both sides as this plan will leave them ([`rows_after`]): the key sorts
-/// after every row change, so a plan that supplies the missing parent rows, or
+/// after the preceding row changes, so a plan that supplies the missing parent rows, or
 /// repairs the orphaned children, is a plan this constraint will accept.
 ///
 /// # The collation the comparison is made under
@@ -3662,7 +3376,7 @@ fn orphan_probe(
         let reference = parent_table.column(referenced);
         let spelled_by_the_plan = names.columns_added.contains_key(&reference)
             || names.retyped.contains_key(&reference)
-            || names.table(parent_table).is_none();
+            || names.view().table(parent_table).is_none();
         let mark = match names.column(&reference) {
             Some(stored) if !spelled_by_the_plan => {
                 let clause = collation_clause(
@@ -3710,6 +3424,7 @@ fn planned_collation(names: &AsStored, column: &ColumnRef) -> Result<String, Dia
         .or_else(|| names.columns_added.get(column).map(|added| &added.ty))
         .or_else(|| {
             names
+                .view()
                 .created(&column.table)
                 .then(|| names.column_types.get(column))
                 .flatten()
@@ -3789,14 +3504,18 @@ fn key_collation_probe(
 /// A probe that cannot be built is reported as unchecked, keeping it distinct
 /// from a change that needs no data question at all.
 pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partitions) -> Preflight {
-    let mut names = AsStored::of(plan_names, partitions);
-    names.reach_partitions(partitions);
+    let facts = PlanFacts::of(plan_names);
     let mut out = Vec::new();
     let mut unchecked = Vec::new();
     // DEFAULT partitions a create earlier in the plan moves rows out of, in
     // the plan's names (#1547).
     let mut moved_out: Vec<&TableName> = Vec::new();
-    for p in plan_names.changes() {
+    for (step, p) in plan_names.changes().iter().enumerate() {
+        let names = LazyCell::new(|| {
+            let mut names = AsStored::of(facts.before(step), partitions);
+            names.reach_partitions(partitions);
+            names
+        });
         match build(&p.change, &names, &mut unchecked) {
             // A probe of a DEFAULT partition's own rows, after a move out of
             // it, counts rows that are gone by then: a check the moved rows
@@ -3883,10 +3602,19 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             | Change::AttachPartition { .. }
             | Change::PublicExecution { .. } => Vec::new(),
         };
-        for (table, name, constraint) in keys {
-            match key_collation_probe(&names, table, name, constraint) {
-                Ok(probe) => out.push(probe),
-                Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
+        if !keys.is_empty() {
+            // Inline keys see the columns defined by their own CREATE. Row
+            // probes still use only the statements preceding this one.
+            let created_names = matches!(&p.change, Change::CreateTable { .. })
+                .then(|| AsStored::of(facts.before(step + 1), partitions));
+            let key_names = created_names.as_ref().unwrap_or(&names);
+            for (table, name, constraint) in keys {
+                match key_collation_probe(key_names, table, name, constraint) {
+                    Ok(probe) => out.push(probe),
+                    Err(error) => {
+                        unchecked.push(Unchecked::for_change(&p.change, error.to_string()))
+                    }
+                }
             }
         }
         if let Change::DeleteRow {
@@ -3906,7 +3634,7 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             };
             // A recomputed generated column may be a referencing column of a
             // foreign key the probe finds in the catalog, and its new values
-            // are written at rank 9, before the delete. Which keys read it is
+            // were written by the prefix before this delete. Which keys read it is
             // the catalog's to say at run time, so any recomputation in the
             // plan leaves the delete unchecked rather than counted against
             // the old expression's values (DEC-1168.1).
@@ -3947,7 +3675,13 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             }
         }
     }
-    partition_probes(plan_names.changes(), &names, &mut out, &mut unchecked);
+    partition_probes(
+        plan_names.changes(),
+        &facts,
+        partitions,
+        &mut out,
+        &mut unchecked,
+    );
     Preflight {
         probes: out,
         unchecked,
@@ -3958,47 +3692,49 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
 /// DEC-1171.1): whether a range added under a standing parent covers rows
 /// that sit in its DEFAULT partition now, which the engine refuses to split;
 /// and whether rows elsewhere still reference a partition about to be
-/// dropped, which the engine refuses to detach. Both are asked of the whole
-/// plan, because a partition the same plan drops takes its rows with it.
+/// dropped, which the engine refuses to detach. Both are asked of the current
+/// prefix, because a partition already dropped has taken its rows with it.
 fn partition_probes(
     changes: &[pbps_model::PlannedChange],
-    names: &AsStored,
+    facts: &PlanFacts,
+    partitions: &pbps_model::Partitions,
     out: &mut Vec<Probe>,
     unchecked: &mut Vec<Unchecked>,
 ) {
-    let created: BTreeSet<&TableName> = changes
-        .iter()
-        .filter_map(|p| {
-            if let Change::CreateTable { name, .. } = &p.change {
-                Some(name)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let dropped: BTreeMap<&TableName, Vec<&TableName>> =
-        changes.iter().fold(BTreeMap::new(), |mut by_parent, p| {
-            // A detached partition's rows leave the parent as a dropped
-            // one's do (#1544).
-            if let Change::DropTable {
-                name,
-                detach_from: Some(parent),
-                ..
-            }
-            | Change::DetachPartition {
-                table: name,
-                parent,
-                ..
-            } = &p.change
-            {
-                by_parent.entry(parent).or_insert_with(Vec::new).push(name);
-            }
-            by_parent
-        });
     // Partitions dropped so far, in plan order: by a partition's own drop,
     // their rows are gone, and so are their references.
     let mut dropped_before: Vec<&TableName> = Vec::new();
-    for p in changes {
+    for (step, p) in changes.iter().enumerate() {
+        let projection = LazyCell::new(|| {
+            let mut names = AsStored::of(facts.before(step), partitions);
+            names.reach_partitions(partitions);
+            names
+        });
+        let names = &projection;
+        // Only completed detach/drop statements remove rows from a range
+        // check. A later removal cannot make this statement valid.
+        let leaving = |of: &TableName| {
+            changes[..step]
+                .iter()
+                .filter_map(|p| {
+                    if let Change::DropTable {
+                        name,
+                        detach_from: Some(parent),
+                        ..
+                    }
+                    | Change::DetachPartition {
+                        table: name,
+                        parent,
+                        ..
+                    } = &p.change
+                    {
+                        (parent == of).then_some(name)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
         let probe = if let Change::CreateTable {
             name,
             table,
@@ -4013,15 +3749,15 @@ fn partition_probes(
             // set off what a delete from the DEFAULT sets off. Both are read
             // under the names the catalog has before the plan runs: a parent
             // renamed in the same plan is found under its old one.
-            let (Some(stored), Some(parent)) = (names.table(default), names.table(&of.parent))
+            let (Some(stored), Some(parent)) =
+                (names.view().table(default), names.view().table(&of.parent))
             else {
                 continue;
             };
-            let gone = dropped_triggers(changes, &stored, &parent);
+            let gone = dropped_triggers(&changes[..step], &stored, &parent);
             // A column this plan retypes or recomputes may be a referencing
             // column of a key the count finds in the catalog, and its new
-            // values may be written before the move (a create at (9, 5)
-            // follows the alterations of class 9): the count is unchecked
+            // values have changed before this move: the count is unchecked
             // rather than taken over the old values, as a deleted row's is
             // for a recomputation (DEC-1168.1). Which keys read the column is
             // the catalog's to say when the move runs, and the moving
@@ -4079,12 +3815,15 @@ fn partition_probes(
         } else if let Change::CreateTable { name, table, .. } = &p.change
             && let Some(of) = &table.partition_of
             && let pbps_model::PartitionBound::Range { from, to } = &of.bound
-            && !created.contains(&of.parent)
+            && !names.view().created(&of.parent)
         {
             // Under the parent's name before the plan's renames, as above.
-            let leaving = dropped.get(&of.parent).map_or(&[][..], Vec::as_slice);
-            let parent = names.table(&of.parent).unwrap_or_else(|| of.parent.clone());
-            partition_range_probe(name, &parent, from, to, leaving, "create a partition")
+            let leaving = leaving(&of.parent);
+            let parent = names
+                .view()
+                .table(&of.parent)
+                .unwrap_or_else(|| of.parent.clone());
+            partition_range_probe(name, &parent, from, to, &leaving, "create a partition")
         } else if let Change::DropTable {
             name,
             detach_from: Some(parent),
@@ -4112,7 +3851,7 @@ fn partition_probes(
             // attach over; its triggers and its column grants, which it does
             // not refuse and the reader does; and the DEFAULT partition's
             // rows inside it (#1545).
-            let leaving = dropped.get(parent).map_or(&[][..], Vec::as_slice);
+            let leaving = leaving(parent);
             for probe in [
                 attach_range_probe(table, parent, from, to),
                 attach_trigger_probe(table),
@@ -4125,7 +3864,7 @@ fn partition_probes(
                     }
                 }
             }
-            partition_range_probe(table, parent, from, to, leaving, "attach a table")
+            partition_range_probe(table, parent, from, to, &leaving, "attach a table")
         } else {
             continue;
         };
@@ -4209,7 +3948,7 @@ fn range_end(data: &[pbps_model::BoundDatum], lower: bool) -> String {
 }
 
 /// The rows of `parent` inside the new partition's range, other than those
-/// of partitions this plan drops. A range cannot overlap another partition's
+/// of partitions already dropped or detached by the prefix. A range cannot overlap another partition's
 /// (the engine refuses the `CREATE`), so every one of them is in the DEFAULT
 /// partition, and the engine refuses the `CREATE` over them. A row with a NULL
 /// in any key column is never in a range. Measured on 16 and 18 (#1171).

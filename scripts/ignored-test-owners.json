@@ -1045,7 +1045,8 @@
         "future_grants_tests::future_grants_match_real_creation_authority_for_admin_and_narrow_logins",
         "future_grants_tests::hidden_denied_recorded_and_undeclared_grant_targets_keep_object_gaps",
         "future_grants_tests::future_grant_proof_respects_collation_missing_schemas_and_recorded_modules",
-        "future_grants_tests::existing_unrecorded_modules_use_object_authority_and_preserve_denials"
+        "future_grants_tests::existing_unrecorded_modules_use_object_authority_and_preserve_denials",
+        "positional_preflight_tests::tightening_reads_prior_writes_and_never_future_writes"
       ]
     },
     {
@@ -1504,7 +1505,10 @@
         "plan_names_tests::a_detached_columns_estimate_keeps_its_catalog_spelling_after_rename",
         "physical_sources::a_detached_column_removes_its_existing_foreign_key_before_the_referenced_table",
         "alias_batches::ten_thousand_aliases_keep_every_requested_row_at_the_default_stack_limit",
-        "alias_batches::aliases_in_different_batches_still_refuse_a_collision"
+        "alias_batches::aliases_in_different_batches_still_refuse_a_collision",
+        "positional_preflight_tests::tightening_reads_prior_writes_and_never_future_writes",
+        "positional_preflight_tests::tightening_sees_an_attached_child_only_after_the_attach",
+        "positional_preflight_tests::an_attach_cannot_borrow_a_later_detachs_empty_range"
       ]
     },
     {
