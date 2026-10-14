@@ -57,6 +57,7 @@ pub(crate) fn ids(changes: &ChangeSet, before: &Schema) -> IdsFile {
             | Change::AlterColumnNullability { uid, column, .. }
             | Change::AlterColumnDefault { uid, column, .. }
             | Change::AlterColumnExpression { uid, column, .. }
+            | Change::AlterColumnNumbering { uid, column, .. }
             | Change::SetColumnDeprecated { uid, column, .. } => {
                 columns.push((i, uid.clone(), Some(column.clone()), Some(column.clone())))
             }

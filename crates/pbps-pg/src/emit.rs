@@ -793,16 +793,233 @@ fn sequence_to_table_owner(
     sequence: &TableName,
 ) -> Result<String, DialectError> {
     let body = format!(
-        "BEGIN\n\
-         \x20 EXECUTE pg_catalog.format('ALTER SEQUENCE %s OWNER TO %I', {}, \
-         (SELECT pg_catalog.pg_get_userbyid(c.relowner) FROM pg_catalog.pg_class c \
-         WHERE c.oid OPERATOR(pg_catalog.=) {}::pg_catalog.regclass::pg_catalog.oid));\n\
-         END",
-        literal(&qualified(sequence)?),
-        literal(&qualified(table)?),
+        "BEGIN\n\x20 {}\nEND",
+        give_to_table_owner(&literal(&qualified(sequence)?), table)?
     );
     let tag = dollar_tag(&body);
     Ok(format!("DO {tag}\n{body}\n{tag};"))
+}
+
+/// The plpgsql statement that gives `sequence`, an expression for its name,
+/// to `table`'s owner (`sequence_to_table_owner`).
+fn give_to_table_owner(sequence: &str, table: &TableName) -> Result<String, DialectError> {
+    Ok(format!(
+        "EXECUTE pg_catalog.format('ALTER SEQUENCE %s OWNER TO %I', {sequence}, \
+         (SELECT pg_catalog.pg_get_userbyid(c.relowner) FROM pg_catalog.pg_class c \
+         WHERE c.oid OPERATOR(pg_catalog.=) {}::pg_catalog.regclass::pg_catalog.oid));",
+        literal(&qualified(table)?),
+    ))
+}
+
+/// A column's numbering source changed (#1889, DEC-1889.1), as one block:
+/// a staged apply checkpoints between statements, and a checkpoint between
+/// giving up the old source and installing the new one, or between
+/// installing it and moving it past the column's values, leaves a column
+/// that numbers into the rows it holds.
+///
+/// A source put on the column continues past what the column holds, from
+/// the greatest of the declared start, the column's greatest value plus the
+/// increment (least, counting down), and, for a conversion, the old source's
+/// next number. All of it is read under the table's `ACCESS EXCLUSIVE`
+/// lock, taken first, so no row arrives between the read and the source.
+/// The sequence moved is always one this block created, so a rollback takes
+/// the move with it: `setval` is not transactional, and on a sequence that
+/// outlived the block it would survive one (ADR-0013 section 2,
+/// DECISIONS 321).
+///
+/// The block runs on the table's write path, for a plain default the column
+/// takes, and every read of pbps's own is moved onto the empty one
+/// (DEC-1564.1). The sequence a column already has is found by its
+/// dependency on the column, not by a name the plan holds, which the base may
+/// not know (#1631).
+fn numbering(
+    pg: &Postgres,
+    column: &pbps_model::ColumnRef,
+    ty: &ColumnType,
+    from: &pbps_model::ValueSource,
+    to: &pbps_model::ValueSource,
+) -> Sql {
+    use pbps_model::{NumberingKind, ValueSource};
+    for source in [from, to] {
+        if let ValueSource::Generated(_) = source {
+            return Err(invalid(format!(
+                "{column}: a generated column has no numbering source to change"
+            )));
+        }
+    }
+    let table = &column.table;
+    let t = qualified(table)?;
+    let c = quote(&column.name)?;
+    let alter = format!("ALTER TABLE {t} ALTER COLUMN {c}");
+    // `pg_get_serial_sequence` parses its first argument as a name and takes
+    // its second as written: the qualified table, and the column's own text.
+    let owned = format!(
+        "pg_catalog.pg_get_serial_sequence({}, {})",
+        literal(&t),
+        literal(&column.name)
+    );
+    let found = format!(
+        "pbps.pbps_seq := {owned};\n\
+         IF pbps.pbps_seq IS NULL THEN\n    {}\nEND IF;",
+        refuse(&format!(
+            "{column} is not numbered by a sequence it owns, as this plan expected; nothing \
+             was applied"
+        ))
+    );
+    let block = |body: &[String], variables: &[(&str, &str)]| {
+        one(
+            pg,
+            table,
+            atomically(&with_variables(variables, &body.join("\n"))),
+        )
+    };
+
+    // Kept: the same source, retuned. Neither moves a number already issued,
+    // since neither restarts (DEC-1889.1).
+    match (from, to) {
+        (ValueSource::Identity(_), ValueSource::Identity(id)) => {
+            return one(
+                pg,
+                table,
+                format!(
+                    "{alter} SET START WITH {} SET INCREMENT BY {};",
+                    id.seed, id.increment
+                ),
+            );
+        }
+        (ValueSource::Sequence(was), ValueSource::Sequence(sequence)) => {
+            let mut steps = format!(
+                "{found}\n\
+                 EXECUTE pg_catalog.format('ALTER SEQUENCE %s AS {} START WITH {} INCREMENT BY \
+                 {}', pbps.pbps_seq);",
+                types::normalize(ty)?,
+                sequence.start,
+                sequence.increment
+            );
+            // A name compared on both sides (`OwnedSequence::declares`), and
+            // changed: the new one, in the table's schema. Not where the base
+            // did not know the old one, which it then took to be this one.
+            if let Some(name) = &sequence.name
+                && was.name.as_ref().is_some_and(|was| was != name)
+            {
+                steps.push_str(&format!(
+                    "\nIF pg_catalog.parse_ident(pbps.pbps_seq) OPERATOR(pg_catalog.<>) \
+                     ARRAY[{}, {}] THEN\n    \
+                     EXECUTE pg_catalog.format('ALTER SEQUENCE %s RENAME TO %I', pbps.pbps_seq, \
+                     {});\n\
+                     END IF;",
+                    literal(&table.schema),
+                    literal(name),
+                    literal(name)
+                ));
+            }
+            return block(
+                &[on_catalog_path(&steps)],
+                &[("pbps_path", "text"), ("pbps_seq", "text")],
+            );
+        }
+        _ => {}
+    }
+
+    // Converted, given up or put on: one kind of source for another, under
+    // the lock every read below is taken under.
+    let mut body = vec![format!("LOCK TABLE {t} IN ACCESS EXCLUSIVE MODE;")];
+    let mut variables = vec![("pbps_path", "text"), ("pbps_seq", "text")];
+    let increment_of = |source: &ValueSource| match source {
+        ValueSource::Identity(id) => Some(id.increment),
+        ValueSource::Sequence(sequence) => Some(sequence.increment),
+        ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => None,
+    };
+    if NumberingKind::of(from).is_some() {
+        // The old source, before it goes: the sequence to drop, and, for a
+        // conversion that counts the same way, the next number it would have
+        // given. One counting the other way says nothing of where the new
+        // one goes, and one step past an exhausted counter is past its type
+        // (#1930 review).
+        let mut steps = found.clone();
+        if let (Some(was), Some(now)) = (increment_of(from), increment_of(to))
+            && (was < 0) == (now < 0)
+        {
+            variables.push(("pbps_counter", "bigint"));
+            steps.push_str(
+                "\nEXECUTE pg_catalog.format('SELECT CASE WHEN s.is_called THEN s.last_value \
+                 OPERATOR(pg_catalog.+) q.seqincrement ELSE s.last_value END FROM %s AS s, \
+                 pg_catalog.pg_sequence AS q WHERE q.seqrelid OPERATOR(pg_catalog.=) \
+                 %L::pg_catalog.regclass', pbps.pbps_seq, pbps.pbps_seq) INTO pbps.pbps_counter;",
+            );
+        }
+        body.push(on_catalog_path(&steps));
+    }
+    // Give up what the column had. The engine refuses an identity on a
+    // column with a default ("already has a default value"), and an
+    // identity's sequence goes with it.
+    match (from, to) {
+        (ValueSource::Identity(_), _) => body.push(format!("{alter} DROP IDENTITY;")),
+        (ValueSource::Default(_) | ValueSource::Sequence(_), ValueSource::Identity(_))
+        | (ValueSource::Sequence(_), ValueSource::None) => {
+            body.push(format!("{alter} DROP DEFAULT;"));
+        }
+        _ => {}
+    }
+    if let ValueSource::Default(expression) = to {
+        body.push(format!("{alter} SET DEFAULT {};", verbatim(expression)));
+    }
+    if let ValueSource::Sequence(_) = from {
+        // After the default that called it is gone or replaced.
+        body.push(on_catalog_path(
+            "EXECUTE pg_catalog.format('DROP SEQUENCE %s', pbps.pbps_seq);",
+        ));
+    }
+    // Put on the new one.
+    let (start, increment) = match to {
+        ValueSource::Sequence(sequence) => {
+            let q = qualified(&owned_sequence(table, &column.name, sequence))?;
+            body.push(format!(
+                "CREATE SEQUENCE {q} AS {} START WITH {} INCREMENT BY {};",
+                types::normalize(ty)?,
+                sequence.start,
+                sequence.increment
+            ));
+            body.push(on_catalog_path(&give_to_table_owner(&literal(&q), table)?));
+            body.push(format!("ALTER SEQUENCE {q} OWNED BY {t}.{c};"));
+            body.push(format!(
+                "{alter} SET DEFAULT pg_catalog.nextval({}::regclass);",
+                literal(&q)
+            ));
+            (sequence.start, sequence.increment)
+        }
+        ValueSource::Identity(id) => {
+            body.push(format!(
+                "{alter} ADD GENERATED ALWAYS AS IDENTITY (START WITH {} INCREMENT BY {});",
+                id.seed, id.increment
+            ));
+            (id.seed, id.increment)
+        }
+        ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
+            return block(&body, &variables);
+        }
+    };
+    // Past the column's values and the old counter, from the declared start
+    // at least. `GREATEST` and `LEAST` pass over a NULL: an empty column, or
+    // no old source.
+    let (edge, pick) = if increment < 0 {
+        ("min", "LEAST")
+    } else {
+        ("max", "GREATEST")
+    };
+    let counter = if variables.contains(&("pbps_counter", "bigint")) {
+        ", pbps.pbps_counter"
+    } else {
+        ""
+    };
+    variables.extend([("pbps_edge", "bigint"), ("pbps_next", "bigint")]);
+    body.push(on_catalog_path(&format!(
+        "SELECT pg_catalog.{edge}(r.{c}) INTO pbps.pbps_edge FROM {t} AS r;\n\
+         pbps.pbps_next := {pick}({start}::pg_catalog.int8, pbps.pbps_edge \
+         OPERATOR(pg_catalog.+) {increment}::pg_catalog.int8{counter});\n\
+         PERFORM pg_catalog.setval({owned}::pg_catalog.regclass, pbps.pbps_next, false);"
+    )));
+    block(&body, &variables)
 }
 
 /// One line of a `CREATE TABLE` column list, or the body of an `ALTER TABLE ADD`.
@@ -2762,6 +2979,14 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // A default is not a named object here — it is a property of the column
         // — so there is nothing to drop by name and no generated constraint
         // name to guess. `SET DEFAULT` replaces whatever was there.
+        Change::AlterColumnNumbering {
+            column,
+            ty,
+            from,
+            to,
+            ..
+        } => numbering(pg, column, ty, from, to),
+
         Change::AlterColumnDefault { column, to, .. } => one(
             pg,
             &column.table,

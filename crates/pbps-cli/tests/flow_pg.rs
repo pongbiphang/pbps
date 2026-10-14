@@ -90,13 +90,15 @@ fn connected_diff_refusals_keep_each_column_reason_and_existing_artifacts() {
     for name in ["products", "suppliers"] {
         let path = d.dir.join(format!("schema/app.{name}.yml"));
         let original = std::fs::read_to_string(&path).unwrap();
+        // A plain column made generated has no in-place form (DEC-1168.1).
+        // An identity put on one did, until #1889 made it a change.
         let edited = original.replace(
-            "    type: bigint\n",
-            "    type: bigint\n    identity: [1, 1]\n",
+            "    type: text\n",
+            "    type: text\n    generated: {expression: '''x''', stored: true}\n",
         );
         assert_ne!(edited, original, "{original}");
         std::fs::write(path, edited).unwrap();
-        changed.push(format!("app.{name}.id"));
+        changed.push(format!("app.{name}.name"));
         let objects: Vec<_> = changed.iter().map(String::as_str).collect();
         unexpressible::check(&d, own.connection(), &objects);
     }
@@ -104,8 +106,8 @@ fn connected_diff_refusals_keep_each_column_reason_and_existing_artifacts() {
         own.connection(),
         "DO $$ BEGIN
         IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid IN ('app.products'::regclass,
-            'app.suppliers'::regclass) AND attname = 'id' AND attidentity <> '') THEN
-            RAISE EXCEPTION 'refusal changed identity';
+            'app.suppliers'::regclass) AND attname = 'name' AND attgenerated <> '') THEN
+            RAISE EXCEPTION 'refusal changed generation';
         END IF;
     END $$;",
     );
@@ -1333,6 +1335,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::RenameColumn { .. }
             | change @ pbps_model::Change::AlterColumnDefault { .. }
             | change @ pbps_model::Change::AlterColumnExpression { .. }
+            | change @ pbps_model::Change::AlterColumnNumbering { .. }
             | change @ pbps_model::Change::SetColumnDeprecated { .. }
             | change @ pbps_model::Change::SetPrimaryKey { .. }
             | change @ pbps_model::Change::SetIndexStorageParameters { .. }
@@ -2273,10 +2276,10 @@ fn a_new_column_calling_a_function_that_reads_it_is_refused_by_name() {
 }
 
 /// A connected plan's base is a read, which knows the name the engine
-/// generated for a `serial`'s sequence: a declaration naming another one is
-/// a change pbps does not make, refused before the plan. The same name a
-/// git baseline leaves out is not known, so the offline plan accepts a
-/// later declaration naming it (#1631).
+/// generated for a `serial`'s sequence: a declaration naming another one
+/// renames it, gated as `rename` (#1889). The same name a git baseline
+/// leaves out is not known, so the offline plan takes a later declaration
+/// naming it for the one it has, and plans nothing (#1631).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_connected_plan_knows_a_serials_generated_sequence_name() {
@@ -2303,13 +2306,19 @@ fn a_connected_plan_knows_a_serials_generated_sequence_name() {
     )
     .unwrap();
     // Offline, against the pulled declaration, the name is not known.
-    succeeds(d.run(&["plan"]));
-    let refused = d.run(&["plan", "--db", connection]);
-    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    let offline = succeeds(d.run(&["plan"]));
     assert!(
-        stderr(&refused).contains("sequence"),
+        stdout(&offline).contains("No changes"),
         "{}",
-        stderr(&refused)
+        stdout(&offline)
+    );
+    let renamed = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(
+        stdout(&renamed).contains("its sequence t_id_seq")
+            && stdout(&renamed).contains("its sequence other_seq")
+            && stdout(&renamed).contains("--allow rename"),
+        "{}",
+        stdout(&renamed)
     );
     // The negative case: the declaration as pulled plans nothing.
     std::fs::write(&file, &pulled).unwrap();
@@ -2319,8 +2328,9 @@ fn a_connected_plan_knows_a_serials_generated_sequence_name() {
 
 /// `verify` compares two reads, and each knows the sequence name it leaves
 /// out: a `serial`'s sequence renamed by hand since the baseline is drift
-/// that names its column, not one the model cannot see. The negative case:
-/// with nothing renamed there is no drift (#1631).
+/// that names its column (#1631), and one a plan can express, as the
+/// numbering change that renames it (#1889). The negative case: with
+/// nothing renamed there is no drift.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn verify_names_a_serials_renamed_sequence() {
@@ -2344,8 +2354,181 @@ fn verify_names_a_serials_renamed_sequence() {
     assert_ne!(code(&drifted), 0, "{}", stdout(&drifted));
     let report = stdout(&drifted);
     assert!(
-        report.contains("state.drift-unexpressible") && report.contains("column app.t.id"),
+        report.contains("\"op\": \"alter_column_numbering\"")
+            && report.contains("\"column\": \"app.t.id\"")
+            && report.contains("\"name\": \"renamed_seq\"")
+            && !report.contains("state.drift-unexpressible"),
         "{report}"
+    );
+}
+
+/// An identity put on a column whose NULLs, and whose value at the type's
+/// bound, only the rows an `exact` data block deletes hold: the deletes run
+/// first, then the tightening, then the identity, which continues past the
+/// row kept, and then the row the block inserts, which takes the next
+/// number. The bound probe does not count a row the plan deletes first
+/// (#1930 review).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_identity_put_on_follows_the_deletes_that_remove_its_nulls() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "identity-deletes");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.k (code text PRIMARY KEY, id integer, label text); \
+         INSERT INTO app.k VALUES ('a', 7, 'A'), ('b', NULL, 'B'), ('c', NULL, 'C'), \
+         ('e', 2147483647, 'E'); \
+         CREATE TABLE app.m (code text PRIMARY KEY, n integer NOT NULL); \
+         INSERT INTO app.m VALUES ('a', 3), ('z', 2147483647)",
+    );
+    let d = Demo::new("identity-deletes");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::write(
+        d.dir.join("schema/app.k.yml"),
+        "table: app.k\ncolumns:\n  code: {type: text, nullable: false}\n  \
+         id: {type: integer, nullable: false, identity: [1, 1]}\n  label: {type: text}\n\
+         primary_key: {name: k_pkey, columns: [code]}\n\
+         data:\n  mode: exact\n  rows:\n    a: {label: A}\n    f: {label: F}\n",
+    )
+    .unwrap();
+    // A `serial` put on likewise follows the delete of its greatest value.
+    std::fs::write(
+        d.dir.join("schema/app.m.yml"),
+        "table: app.m\ncolumns:\n  code: {type: text, nullable: false}\n  n: {type: serial}\n\
+         primary_key: {name: m_pkey, columns: [code]}\n\
+         data:\n  mode: exact\n  rows:\n    a: {}\n",
+    )
+    .unwrap();
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "not-null,data-delete,numbering"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(connection, "SELECT id::bigint FROM app.k WHERE code = 'f'"),
+        8
+    );
+    on_server(connection, "INSERT INTO app.k (code) VALUES ('g')");
+    assert_eq!(
+        scalar(connection, "SELECT id::bigint FROM app.k WHERE code = 'g'"),
+        9
+    );
+    on_server(connection, "INSERT INTO app.m (code) VALUES ('b')");
+    assert_eq!(
+        scalar(connection, "SELECT n::bigint FROM app.m WHERE code = 'b'"),
+        4
+    );
+}
+
+/// A `serial` turned into an identity frees its sequence's name before the
+/// tables the plan creates, so a new table may take it, past both the
+/// connected plan's occupancy check and the engine (#1930 review).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_serial_turned_identity_frees_its_name_for_a_new_table() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "serial-frees");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.w (id serial PRIMARY KEY); \
+         ALTER SEQUENCE app.w_id_seq RENAME TO numbers; \
+         INSERT INTO app.w DEFAULT VALUES",
+    );
+    let d = Demo::new("serial-frees");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::write(
+        d.dir.join("schema/app.w.yml"),
+        "table: app.w\ncolumns:\n  id: {type: integer, nullable: false, identity: [1, 1]}\n\
+         primary_key: {name: w_pkey, columns: [id]}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.numbers.yml"),
+        "table: app.numbers\ncolumns:\n  n: {type: integer}\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "numbering"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    on_server(connection, "INSERT INTO app.w DEFAULT VALUES");
+    assert_eq!(scalar(connection, "SELECT max(id)::bigint FROM app.w"), 2);
+}
+
+/// A connected plan that puts an identity and a `serial` on a table's two
+/// columns, which hold rows: the identity is gated as `numbering` and the
+/// `serial` is not, the apply holds the result it planned, `verify` agrees,
+/// and both continue past the rows (#1889, DEC-1889.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_numbering_change_applies_behind_its_gate_and_verifies() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "numbering");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.t (id integer PRIMARY KEY, n integer NOT NULL); \
+         INSERT INTO app.t VALUES (1, 1), (5, 5), (500, 500)",
+    );
+    let d = Demo::new("numbering");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    std::fs::write(
+        d.dir.join("schema/app.t.yml"),
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false, identity: [1, 1]}\n  \
+         n: {type: serial}\nprimary_key: {name: t_pkey, columns: [id]}\n",
+    )
+    .unwrap();
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    let refused = approved_apply(&d, connection, &plan, &[]);
+    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+    assert!(
+        format!("{}{}", stdout(&refused), stderr(&refused)).contains("numbering"),
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "numbering"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    on_server(connection, "INSERT INTO app.t DEFAULT VALUES");
+    assert_eq!(
+        scalar(connection, "SELECT (max(id) + max(n))::bigint FROM app.t"),
+        1002
     );
 }
 

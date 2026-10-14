@@ -493,6 +493,19 @@ impl Declared {
                             .insert(column.clone(), default.clone());
                     }
                 }
+                // A plain default given up or taken, as `AlterColumnDefault`
+                // records one; a numbering source is no text (#1889).
+                Change::AlterColumnNumbering { column, to, .. } => {
+                    remove_nested(&mut self.expressions.defaults, &column.table, &column.name);
+                    remove_nested(&mut self.bindings.defaults, &column.table, &column.name);
+                    if let crate::ValueSource::Default(default) = to {
+                        self.expressions
+                            .defaults
+                            .entry(column.table.clone())
+                            .or_default()
+                            .insert(column.name.clone(), default.clone());
+                    }
+                }
                 Change::AlterColumnExpression { column, to, .. } => {
                     self.expressions
                         .generated

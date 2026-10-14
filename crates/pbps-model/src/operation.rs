@@ -523,6 +523,7 @@ impl Operation {
             | Change::RenameColumn { uid, .. }
             | Change::AlterColumnType { uid, .. }
             | Change::AlterColumnNullability { uid, .. }
+            | Change::AlterColumnNumbering { uid, .. }
             | Change::SetColumnDeprecated { uid, .. } => column(uid),
             Change::AlterColumnDefault { uid, .. } | Change::AlterColumnExpression { uid, .. } => {
                 ObjectKey::Default(ColumnKey::Recorded(recorded(uid)))
@@ -730,6 +731,9 @@ impl Operation {
             | Change::RenameColumn { .. }
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
+            // An identity's or a `serial`'s sequence is the engine's, not
+            // an instance the declaration holds (#1889).
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }

@@ -436,6 +436,10 @@ struct AsStored<'v, 'p> {
     /// column again is held by the catalog for another column, so a probe
     /// spelling it reads the wrong one (DEC-1699.1).
     vacated: BTreeSet<ColumnRef>,
+    /// The tables this plan deletes declared rows from. A numbering source
+    /// put on such a table may be ordered after the deletes, so the values
+    /// it continues past are not all the ones stored now (#1930 review).
+    deleted_from: BTreeSet<TableName>,
 }
 
 /// A column this plan adds, as the pre-delete probe needs it.
@@ -554,8 +558,12 @@ impl<'v, 'p> AsStored<'v, 'p> {
             recomputed: Default::default(),
             attached: Default::default(),
             vacated: Default::default(),
+            deleted_from: Default::default(),
         };
         for (_, event) in view.events().collect::<Vec<_>>() {
+            if let Event::DeleteRow { table, .. } = &event {
+                this.deleted_from.insert((*table).clone());
+            }
             match event {
                 Event::RenameColumn { table, from, .. } => {
                     this.vacated.insert(table.column(from));
@@ -3283,6 +3291,65 @@ fn build<'v, 'p: 'v>(
             unchecked,
         )),
 
+        // A source put on a column that holds values continues past them
+        // (DEC-1889.1), and a value too near the type's bound leaves no
+        // number to continue at: the block's `setval` is then refused
+        // mid-apply. Counted here, the values that leave no room.
+        Change::AlterColumnNumbering {
+            column, ty, from, to, ..
+        } if pbps_model::NumberingKind::installed(from, to) => {
+            let increment = match to {
+                ValueSource::Identity(id) => id.increment,
+                ValueSource::Sequence(sequence) => sequence.increment,
+                ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
+                    return Ok(Vec::new());
+                }
+            };
+            let Some(bounds) = crate::types::identity_range(ty) else {
+                return Ok(Vec::new());
+            };
+            let Some(stored) = names.column(column) else {
+                return Ok(skip(change, "the column does not exist before apply", unchecked));
+            };
+            // Read before a retype this plan makes first, a value is not yet
+            // the one the numbering continues past (#1930 review).
+            if names.retyped.contains_key(column) {
+                return Ok(skip(
+                    change,
+                    "the column's values are converted by this plan before numbering reads them",
+                    unchecked,
+                ));
+            }
+            // Nor, where the plan deletes rows of the table, are the values
+            // stored now all the ones it reads (#1930 review).
+            if names.deleted_from.contains(&column.table) {
+                return Ok(skip(
+                    change,
+                    "this plan deletes rows of the table, which may be gone before numbering reads it",
+                    unchecked,
+                ));
+            }
+            // The last value from which one more step stays in the type.
+            let (operator, last) = if increment < 0 {
+                ("<", i128::from(*bounds.start()) - i128::from(increment))
+            } else {
+                (">", i128::from(*bounds.end()) - i128::from(increment))
+            };
+            Ok(vec![Probe::new(
+                format!(
+                    "values in {column} too near its type's bound for numbering to continue \
+                     past them"
+                ),
+                format!(
+                    "SELECT {} AS n FROM {} WHERE {} OPERATOR(pg_catalog.{operator}) \
+                     {last}::pg_catalog.numeric;",
+                    saturated_count("count(*)"),
+                    qualified(&stored.table)?,
+                    quote(&stored.name)?
+                ),
+            )])
+        }
+
         // Everything else either cannot fail on the data or cannot be counted.
         Change::CreateTable { .. }
         | Change::DropTable { .. }
@@ -3294,6 +3361,7 @@ fn build<'v, 'p: 'v>(
             to_nullable: true, ..
         }
         | Change::AlterColumnDefault { .. }
+        | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { to: None, .. }
         | Change::DropUnique { .. }
@@ -3600,6 +3668,7 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }

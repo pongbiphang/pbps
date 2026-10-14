@@ -207,6 +207,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
                 | Change::AlterColumnExpression { .. }
+                | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::SetIndexStorageParameters { .. }
@@ -303,6 +304,7 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::RenameColumn { .. }
                 | Change::AlterColumnDefault { .. }
                 | Change::AlterColumnExpression { .. }
+                | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::SetIndexStorageParameters { .. }

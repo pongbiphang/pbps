@@ -295,6 +295,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         | Change::AlterColumnNullability { uid, column, .. }
         | Change::AlterColumnDefault { uid, column, .. }
         | Change::AlterColumnExpression { uid, column, .. }
+        | Change::AlterColumnNumbering { uid, column, .. }
         | Change::SetColumnDeprecated { uid, column, .. } => {
             Column(Transition::new(step, uid, kept(column), kept(column)))
         }

@@ -202,6 +202,9 @@ pub async fn drop_blockers(
             Change::DropIndex { table, name } => {
                 Some((index, format!("index `{name}` on {table}")))
             }
+            Change::AlterColumnNumbering {
+                column, from, to, ..
+            } if gives_up(from, to) => Some((index, format!("numbering source of {column}"))),
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -212,6 +215,7 @@ pub async fn drop_blockers(
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -282,6 +286,19 @@ pub async fn drop_blockers(
                     detached.insert(clone);
                 }
             }
+            // An owned sequence given up goes with the default that calls
+            // it, which the same statement drops first: read as standing,
+            // the default blocked every such change (#1930 review).
+            if let Change::AlterColumnNumbering {
+                column,
+                from: pbps_model::ValueSource::Sequence(_),
+                ..
+            } = &cs[index].change
+                && let Some(default) =
+                    default_row(conn, &classes, sources, index, &column.table, &column.name).await?
+            {
+                removals.push((index, default));
+            }
         } else if let Change::SetPrimaryKey {
             table,
             from: Some(_),
@@ -300,9 +317,20 @@ pub async fn drop_blockers(
     let roots: BTreeSet<_> = removals.iter().map(|(_, a)| *a).collect();
     // A clone the detach removes promotes nothing either: its internal owner
     // is the foreign key on its own table, which stays (#1171).
+    // Nor does an identity's sequence given up: `DROP IDENTITY` drops it and
+    // leaves the column, which owns it internally (#1930 review).
     let replaced: BTreeSet<Address> = removals
         .iter()
-        .filter(|(i, _)| matches!(cs[*i].change, Change::AlterColumnExpression { .. }))
+        .filter(|(i, _)| {
+            matches!(
+                cs[*i].change,
+                Change::AlterColumnExpression { .. }
+                    | Change::AlterColumnNumbering {
+                        from: pbps_model::ValueSource::Identity(_),
+                        ..
+                    }
+            )
+        })
         .map(|(_, a)| *a)
         .chain(detached)
         .collect();
@@ -452,7 +480,20 @@ async fn removal(
     sources: &PhysicalSources<'_>,
     index: usize,
 ) -> Result<Option<Address>, ImpactError> {
-    match removal_part(&sources.names().changes()[index].change) {
+    let change = &sources.names().changes()[index].change;
+    // What a numbering change gives up (#1889): the sequence an owned
+    // sequence or an identity numbered from, which no part the model
+    // projects names. An owned sequence's default goes with it, added beside
+    // it in `drop_blockers`.
+    if let Change::AlterColumnNumbering {
+        column, from, to, ..
+    } = change
+        && gives_up(from, to)
+    {
+        return numbering_sequence(conn, classes, sources, index, &column.table, &column.name)
+            .await;
+    }
+    match removal_part(change) {
         Some(Removal::Table(name)) => {
             let Some((table, _)) = stored(sources, index, name, None)? else {
                 return Ok(None);
@@ -520,6 +561,60 @@ async fn default_row(
         .map(|row| {
             Ok::<Address, DbError>(Address {
                 class: classes.default,
+                object: required(row, "oid")?,
+                part: 0,
+            })
+        })
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// Whether a numbering change drops the sequence its column was numbered
+/// by: an owned sequence's or an identity's the column stops having. A
+/// start, increment or name changed keeps it. A plain default given up
+/// beside it is an `AlterColumnDefault` of its own.
+fn gives_up(from: &pbps_model::ValueSource, to: &pbps_model::ValueSource) -> bool {
+    use pbps_model::ValueSource;
+    match from {
+        ValueSource::Sequence(_) => !matches!(to, ValueSource::Sequence(_)),
+        ValueSource::Identity(_) => !matches!(to, ValueSource::Identity(_)),
+        ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => false,
+    }
+}
+
+/// The sequence a column is numbered from: an owned sequence's (`a`) or an
+/// identity's (`i`), found by its dependency on the column, as
+/// `pg_get_serial_sequence` finds it. By name it would be the base's, which
+/// a read that never saw the sequence renamed does not hold (#1631).
+async fn numbering_sequence(
+    conn: &mut Conn,
+    classes: &Classes,
+    sources: &PhysicalSources<'_>,
+    index: usize,
+    table: &TableName,
+    column: &str,
+) -> Result<Option<Address>, ImpactError> {
+    let Some((table, name)) = stored(sources, index, table, Some(column))? else {
+        return Ok(None);
+    };
+    let Some(on) = relation(conn, classes, &table, name.as_deref()).await? else {
+        return Ok(None);
+    };
+    let rows = conn
+        .query_with(
+            "SELECT d.objid::int8 AS oid FROM pg_catalog.pg_depend d
+              JOIN pg_catalog.pg_class s ON s.oid=d.objid AND s.relkind='S'
+             WHERE d.classid='pg_catalog.pg_class'::pg_catalog.regclass
+               AND d.refclassid='pg_catalog.pg_class'::pg_catalog.regclass
+               AND d.refobjid=($1::int8)::oid AND d.refobjsubid=$2::int8
+               AND d.deptype IN ('a','i')",
+            &[Param::I64(on.object), Param::I64(on.part)],
+        )
+        .await?;
+    rows.first()
+        .map(|row| {
+            Ok::<Address, DbError>(Address {
+                class: classes.relation,
                 object: required(row, "oid")?,
                 part: 0,
             })

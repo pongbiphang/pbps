@@ -553,6 +553,14 @@ fn name_clashes(
     for (at, p) in changes.iter().enumerate() {
         present.retain(|o| !o.freed_by(&p.change));
         held.retain(|(name, _)| !relation_freed_by(&p.change, name));
+        if let pbps_model::Change::RenameColumn {
+            table, from, to, ..
+        } = &p.change
+        {
+            for o in &mut present {
+                o.column_renamed(table, from, to);
+            }
+        }
         if let pbps_model::Change::RenameTable { from, to, .. } = &p.change {
             let moved: Vec<usize> = (0..present.len())
                 .filter(|&k| present[k].moved(from, to))
@@ -699,6 +707,9 @@ struct Occupant<'a> {
     found: &'a pbps_pg::catalog::NameOccupant,
     name: TableName,
     owner: Option<TableName>,
+    /// The column of its owner it belongs to, an owned sequence's, under
+    /// the name the changes replayed so far give it (#1930 review).
+    owner_column: Option<String>,
     /// The cross-schema rename that last carried it, by its two names.
     carried: Option<(TableName, TableName)>,
 }
@@ -712,6 +723,7 @@ impl<'a> Occupant<'a> {
                 found,
                 name: found.name.clone(),
                 owner: found.owner.clone(),
+                owner_column: found.owner_column.clone(),
                 carried: None,
             })
             .collect()
@@ -753,9 +765,37 @@ impl<'a> Occupant<'a> {
             Change::DropTable { name, .. } => owned_by(name),
             Change::DropColumn { column, .. } => {
                 owned_by(&column.table)
-                    && self.found.owner_column.as_deref() == Some(column.name.as_str())
+                    && self.owner_column.as_deref() == Some(column.name.as_str())
+            }
+            // A numbering change that drops its column's sequence, or renames
+            // it, frees the name it had (#1930 review).
+            Change::AlterColumnNumbering {
+                column, from, to, ..
+            } => {
+                use pbps_model::ValueSource;
+                let frees = match (from, to) {
+                    (ValueSource::Identity(_), ValueSource::Identity(_)) => false,
+                    (ValueSource::Sequence(was), ValueSource::Sequence(now)) => {
+                        was.name.is_some() && now.name.is_some() && was.name != now.name
+                    }
+                    (ValueSource::Identity(_) | ValueSource::Sequence(_), _) => true,
+                    (
+                        ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_),
+                        _,
+                    ) => false,
+                };
+                frees
+                    && owned_by(&column.table)
+                    && self.owner_column.as_deref() == Some(column.name.as_str())
             }
             _ => false,
+        }
+    }
+
+    /// Follows the rename of its owning column.
+    fn column_renamed(&mut self, table: &TableName, from: &str, to: &str) {
+        if self.owner.as_ref() == Some(table) && self.owner_column.as_deref() == Some(from) {
+            self.owner_column = Some(to.to_owned());
         }
     }
 
@@ -10512,6 +10552,91 @@ mod tests {
             "{e}"
         );
 
+        // A numbering change that drops the column's sequence, or renames
+        // it, frees its name; a retune keeps it (#1930 review).
+        let numbered = NameOccupant {
+            name: TableName::new("archive", "t_n_seq"),
+            kind: "sequence",
+            owner: Some(t.clone()),
+            owner_column: Some("n".into()),
+        };
+        let serial = |name: Option<&str>, start| {
+            pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
+                start,
+                increment: 1,
+                name: name.map(str::to_owned),
+            })
+        };
+        let numbering = |from, to| {
+            PlannedChange::new(Change::AlterColumnNumbering {
+                uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "archive.t.n", 0),
+                column: pbps_model::ColumnRef::new(t.clone(), "n"),
+                ty: "integer".parse().unwrap(),
+                from,
+                to,
+            })
+        };
+        for to in [
+            pbps_model::ValueSource::None,
+            serial(Some("other_seq"), 1),
+            pbps_model::ValueSource::Identity(pbps_model::Identity {
+                seed: 1,
+                increment: 1,
+            }),
+        ] {
+            refused(
+                vec![
+                    numbering(serial(Some("t_n_seq"), 1), to),
+                    add_index("t_n_seq"),
+                ],
+                &numbered,
+            )
+            .unwrap();
+        }
+        let e = refused(
+            vec![
+                numbering(serial(Some("t_n_seq"), 1), serial(None, 5)),
+                add_index("t_n_seq"),
+            ],
+            &numbered,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("`archive.t_n_seq`"),
+            "a retune keeps the name: {e}"
+        );
+        // Under a column this plan renames first, the sequence follows it.
+        let renamed = PlannedChange::new(Change::RenameColumn {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "archive.t.n", 0),
+            table: t.clone(),
+            from: "n".into(),
+            to: "m".into(),
+            table_was: None,
+        });
+        let numbering_m = PlannedChange::new(Change::AlterColumnNumbering {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "archive.t.n", 0),
+            column: pbps_model::ColumnRef::new(t.clone(), "m"),
+            ty: "integer".parse().unwrap(),
+            from: serial(Some("t_n_seq"), 1),
+            to: pbps_model::ValueSource::None,
+        });
+        refused(
+            vec![renamed.clone(), numbering_m, add_index("t_n_seq")],
+            &numbered,
+        )
+        .unwrap();
+        // Negative: the old column name, after the rename, frees nothing.
+        let e = refused(
+            vec![
+                renamed,
+                numbering(serial(Some("t_n_seq"), 1), pbps_model::ValueSource::None),
+                add_index("t_n_seq"),
+            ],
+            &numbered,
+        )
+        .unwrap_err();
+        assert!(e.contains("`archive.t_n_seq`"), "{e}");
+
         // Negatives: a free name, an index dropped first, an unnamed key.
         refused(vec![add_index("free")], &held).unwrap();
         refused(vec![to_archive, add_index("free")], &carried).unwrap();
@@ -12534,6 +12659,90 @@ mod tests {
         assert!(e.contains("dbo.t is gone"), "{e}");
         let e = refuse(&changes(vec![]), &gone, &before).expect_err("the table arrived");
         assert!(e.contains("dbo.t is there"), "{e}");
+    }
+
+    /// A numbering change is held to the source it gives the column, start
+    /// and increment included, not to its kind alone: a retune another
+    /// session undoes before the read-back leaves the kind as the plan made
+    /// it, and is still found (SPEC §7.6, #1930 review). And a source the
+    /// plan does not touch is compared as before.
+    #[test]
+    fn a_numbering_change_is_held_to_the_source_it_gives() {
+        use pbps_model::{Identity, ValueSource};
+        let identity = |seed, increment| ValueSource::Identity(Identity { seed, increment });
+        let schema = |source: ValueSource| {
+            let mut c = pbps_model::Column::new("integer".parse().unwrap()).not_null();
+            c.value_source = source;
+            let mut t = pbps_model::Table::default();
+            t.columns.insert(
+                "a".to_owned(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            t.columns.insert("id".to_owned(), c);
+            let mut s = Schema::default();
+            s.tables.insert("app.t".parse().unwrap(), t);
+            s
+        };
+        let changes = |c: Vec<pbps_model::Change>| pbps_model::ChangeSet {
+            changes: c.into_iter().map(pbps_model::PlannedChange::new).collect(),
+        };
+        let refuse = |cs: &pbps_model::ChangeSet, before: &Schema, after: &Schema| {
+            refuse_unplanned_movement(
+                &pbps_pg::Postgres::new(),
+                cs,
+                before,
+                after,
+                "prod",
+                Settled::Whole,
+            )
+            .map_err(|e| format!("{e:#}"))
+        };
+        let retune = changes(vec![pbps_model::Change::AlterColumnNumbering {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "id"),
+            ty: "integer".parse().unwrap(),
+            from: identity(1, 1),
+            to: identity(5, 2),
+        }]);
+        let before = schema(identity(1, 1));
+        refuse(&retune, &before, &schema(identity(5, 2))).expect("the plan's own change");
+        let e = refuse(&retune, &before, &schema(identity(5, 3))).expect_err("undone");
+        assert!(
+            e.contains("column `id` does not have the numbering source this plan gives it"),
+            "{e}"
+        );
+        let e = refuse(&retune, &before, &schema(ValueSource::None)).expect_err("removed");
+        assert!(e.contains("numbering source"), "{e}");
+        // A kept sequence retuned under a declaration that names none keeps
+        // the name it had, which another session renaming it moves.
+        let serial = |start, name: &str| {
+            ValueSource::Sequence(pbps_model::OwnedSequence {
+                start,
+                increment: 1,
+                name: (!name.is_empty()).then(|| name.to_owned()),
+            })
+        };
+        let unnamed = changes(vec![pbps_model::Change::AlterColumnNumbering {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "id"),
+            ty: "integer".parse().unwrap(),
+            from: serial(1, "t_id_seq"),
+            to: serial(5, ""),
+        }]);
+        let before = schema(serial(1, "t_id_seq"));
+        refuse(&unnamed, &before, &schema(serial(5, "t_id_seq"))).expect("kept");
+        let e = refuse(&unnamed, &before, &schema(serial(5, "other_seq"))).expect_err("renamed");
+        assert!(e.contains("numbering source"), "{e}");
+        let before = schema(identity(1, 1));
+        // Negative: a plan that touches only another column excuses nothing.
+        let elsewhere = changes(vec![pbps_model::Change::AlterColumnDefault {
+            uid: "c_bbbbbb".parse().unwrap(),
+            column: pbps_model::ColumnRef::new("app.t".parse().unwrap(), "a"),
+            from: None,
+            to: Some("1".to_owned()),
+        }]);
+        let e = refuse(&elsewhere, &before, &schema(identity(5, 2))).expect_err("unplanned");
+        assert!(e.contains("column `id` has a different identity"), "{e}");
     }
 
     /// A generated column's generation is compared across an apply like its

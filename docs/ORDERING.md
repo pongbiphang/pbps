@@ -25,10 +25,10 @@ The differ sorts every planned change by, in order:
    | 3 | `RenameColumn` |
    | 4 | `Revoke` |
    | 5 | `DropColumn` |
-   | 6 | `DropTable` |
+   | 6 | `DropTable`; an `AlterColumnNumbering` giving up, renaming, or (on a column neither tightened nor retyped) turning into an identity an owned sequence, at (6, 1 + its depth in the chain of names they free) |
    | 7 | `CreateTable` |
    | 8 | `AddColumn` |
-   | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`, `SetPartitionDefault`, `SetPartitionNotNull`; `AddComputedColumn` at the class's end (9, 3); P: `SetTablePersistence` after it, by the foreign-key graph |
+   | 9 (`COLUMN_ALTERATIONS`) | `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`, `AlterColumnNumbering`, `SetPartitionDefault`, `SetPartitionNotNull`; `AddComputedColumn` at the class's end (9, 3); P: `SetTablePersistence` after it, by the foreign-key graph |
    | 10 | `SetColumnDeprecated`; P: `SetStorageParameters`, `SetIndexStorageParameters` |
    | 11 | `InsertRow`, `UpdateRow` |
    | 12 | `DeleteRow` |
@@ -46,7 +46,9 @@ The differ sorts every planned change by, in order:
      added after every in-place alteration of class 9 (DEC-1168.1);
    - inside class 9, an old default is dropped before a retype, and a new one
      set after it. Nullability is relaxed before an expression change and
-     tightened after it (DEC-1168.1);
+     tightened after it (DEC-1168.1). A numbering source given up, or an
+     identity turned into a sequence, goes first, at −3, and any other
+     numbering change last, at +2 (DEC-1889.1);
    - modules are ranked by `creation_order_with` (DECISIONS 311, 315);
    - reference rows by the foreign keys between their tables;
    - role drops by membership, holder before member (`member_depth`,
@@ -190,6 +192,7 @@ requirement is common to all of them, so it is listed once,
 | `SetPartitionDefault` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Functions the default calls: *content*. P: after its parent's default set by the plan (`after_their_parents_defaults`); one split from a create beside a DEFAULT, right after the last function its text may call (`split_moving_defaults`, DEC-1547.1) | One partition's default: its own, or its parent's again (DEC-1581.1) |
 | `SetPartitionNotNull` | 9; (9, 4) after its parent's default or NOT NULL change on the column; a DEFAULT's tightening (9, 6) in a plan that moves rows out of it | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) |
 | `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values |
+| `AlterColumnNumbering` | 9; −3 giving up a source or an identity, +2 otherwise; (6, 1 + chain depth) giving up, renaming, or turning into an identity an owned sequence on a column it neither tightens nor retypes; (12, 3) putting a source on a table whose rows it updates or deletes and does not only insert | Putting an identity on: the column `NOT NULL`. Putting a source on: the column in its final type. Giving up an identity: the column still `NOT NULL`. P: no value too near the type's bound to continue past (pre-flight) | The column's identity or owned sequence put on, taken off, retuned or converted; one put on continues past the column's values (DEC-1889.1) |
 | `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) |
 | `SetColumnDeprecated` | 10 | Nothing | Metadata only |
 | `SetTablePersistence` | 9 (9, 10 + depth) | P: the foreign keys that stand: to logged, the tables it references logged first; to unlogged, the tables referencing it unlogged first (refused the other way round, measured) | Rewrites the table and its indexes under `AccessExclusiveLock` (DEC-1443.1) |
@@ -256,6 +259,8 @@ rows below list each.
 | A column rename cycle (a swap) | — | refused at diff time, `ColumnRenameCycle` | ✓ refused by design, DEC-541.1 |
 | A table rename chain | fixed | `rename_order` | ✓ DEC-536.1 |
 | A table rename cycle (a swap, a rotation, or a cycle through a cross-schema move's intermediate name) | — | left out of `rename_order`'s graph; refused at diff time, `TableRenameCycle` | ✓ refused by design, DEC-1966.1 |
+| An owned sequence rename chain | fixed | (6, 1 + chain depth), `sequence_release_depths` | ✓ DEC-1889.1 |
+| An owned sequence rename cycle (a swap or a rotation) | — | refused at diff time, `SequenceRenameCycle` | ✓ refused by design, DEC-1889.1 |
 | A catalog-only holder (adopted or fallback default, unrecorded object, collation pair) → `RenameTable` into its name | engine-sourced | `object_order` on a connected SQL Server plan | ✓ DEC-1366.1 |
 | A later table rename moving a holder away (P) → a cross-schema rename carrying an index or owned sequence onto the held name | engine-sourced | on a connected PostgreSQL plan, the later rename is hoisted ahead where one hoist clears; refused at `plan --db` with the remedy otherwise | ✓ DEC-1767.1 |
 | `RenameColumn` or another later class freeing a default name → `RenameTable` into it | — | refused at `plan --db` with the remedy | ✓ refused by design, DEC-1366.2 |
@@ -342,6 +347,7 @@ one class and the dependents a class cannot see.
 | Catalog dependents of a dropped or rebuilt module | engine | `weave` | ✓ DECISIONS 311, DEC-942.1 |
 | `DropModule` → `DropModule` of a module it names | fixed | `drop_rank`, deepest first inside class 0, from the base's lexed names | ✓ DECISIONS 311, 315 |
 | Generated column's release (expression change, column or table drop) → drop of the function it calls | engine | `after_its_release`, after the drops of dependent modules too | ✓ DEC-1168.1 |
+| An identity given up → its column's nullability relaxed | fixed | rank −3 before −1. Measured on 16 and 18, `DROP NOT NULL` on an identity column is refused ("is an identity column") | ✓ DEC-1889.1 |
 | Function drop moved after its release ← a column its own body reads, dropped or retyped earlier | content | the drop stays after the release | ⧗ #1350 |
 | Foreign key → the key it references | fixed | rank inside class 2 | ✓ |
 | Constraint, index or key drop → `DropColumn`, `RenameColumn` (S) | fixed | class 2 before 3 and 5 | ✓ DECISIONS 474 |
@@ -383,6 +389,12 @@ one class and the dependents a class cannot see.
 | Default set → a row that takes it | value | the default goes first; it stays ahead of a rebuild | ✓ #1030 |
 | Parent's default set → a partition's own default on that column | value | `after_their_parents_defaults`: the partition's after the parent's, which overwrites it | ✓ DEC-1581.1 |
 | Nullability relaxed → expression recomputing a NULL | value | rank −1 before 0 | ✓ DEC-1168.1 |
+| Nullability tightened → an identity put on the column | fixed | rank +1 before +2. Measured on 16 and 18, the engine refuses an identity on a nullable column ("must be declared NOT NULL"). Where the plan inserts rows into the table, both stay in class 9 ahead of the inserts, the tightening folded into a retype; where it only updates or deletes them, both follow the deletes, at (12, 2) and (12, 3); where it deletes and inserts both, the table's inserts follow the identity at (12, 4), and another table's rows referencing it are refused (#1367) | ✓ DEC-1889.1 |
+| Retype → a numbering source put on, or an owned sequence kept, on the column | fixed | rank −1 before +2: a sequence is created or moved `AS` the final type, and the column's values are read in it | ✓ DEC-1889.1 |
+| A plain default dropped → a numbering source put on the column | fixed | rank −2 before +2. Measured on 16 and 18, the engine refuses an identity on a column with a default ("already has a default value"), and a `serial`'s default would replace it unseen | ✓ DEC-1889.1 |
+| A numbering source given up → a plain default set in its place | fixed | rank −3 before 0: the block that gives up an owned sequence drops its default, which would take the new one with it, and the new default may need the retype at −1 | ✓ DEC-1889.1 |
+| An owned sequence given up or renamed → a created table or added column whose sequence takes its name | fixed | class 6 before 7 and 8: the name is free before `CREATE SEQUENCE` claims it. Neither the drop nor the rename needs a class-9 change first | ✓ DEC-1889.1 |
+| A numbering source put on → rows the plan writes into its table | fixed | class 9 before 11: a row that leaves the column out takes the new source. A key it numbers takes no declared rows (ADR-0013 §2) | ✓ DEC-1889.1 |
 | Expression recomputed → nullability tightened | value | rank 0 before +1; split from a retype | ✓ DEC-1168.1 |
 
 ### Rows among themselves

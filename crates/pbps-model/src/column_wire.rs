@@ -111,3 +111,111 @@ impl<'de> Deserialize<'de> for Column {
         })
     }
 }
+
+/// A source on its own, as a change carries one (#1889): the column's keys
+/// for it, at most one of them, and an empty map for none.
+#[derive(Serialize)]
+struct SourceRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity: Option<&'a Identity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence: Option<&'a OwnedSequence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generated: Option<&'a Generated>,
+}
+
+impl Serialize for ValueSource {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut wire = SourceRef {
+            default: None,
+            identity: None,
+            sequence: None,
+            generated: None,
+        };
+        match self {
+            ValueSource::None => {}
+            ValueSource::Default(text) => wire.default = Some(text.as_str()),
+            ValueSource::Identity(i) => wire.identity = Some(i),
+            ValueSource::Sequence(s) => wire.sequence = Some(s),
+            ValueSource::Generated(g) => wire.generated = Some(g),
+        }
+        wire.serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceWire {
+    #[serde(default, deserialize_with = "present")]
+    default: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    identity: Option<Option<Identity>>,
+    #[serde(default, deserialize_with = "present")]
+    sequence: Option<Option<OwnedSequence>>,
+    #[serde(default, deserialize_with = "present")]
+    generated: Option<Option<Generated>>,
+}
+
+impl<'de> Deserialize<'de> for ValueSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = SourceWire::deserialize(deserializer)?;
+        let mut sources = [
+            raw.default.flatten().map(ValueSource::Default),
+            raw.identity.flatten().map(ValueSource::Identity),
+            raw.sequence.flatten().map(ValueSource::Sequence),
+            raw.generated.flatten().map(ValueSource::Generated),
+        ]
+        .into_iter()
+        .flatten();
+        match (sources.next(), sources.next()) {
+            (None, _) => Ok(ValueSource::None),
+            (Some(source), None) => Ok(source),
+            (Some(_), Some(_)) => Err(serde::de::Error::custom(
+                "a value source is only one of default, identity, sequence or generated",
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Identity, OwnedSequence, ValueSource};
+
+    /// A numbering change carries both sources in the saved plan (#1889):
+    /// each round-trips in the column's own spelling, none as an empty map,
+    /// and two at once are refused rather than one silently kept.
+    #[test]
+    fn a_value_source_round_trips_alone_and_refuses_two() {
+        for source in [
+            ValueSource::None,
+            ValueSource::Default("0".into()),
+            ValueSource::Identity(Identity {
+                seed: 5,
+                increment: -1,
+            }),
+            ValueSource::Sequence(OwnedSequence {
+                start: 9,
+                increment: 3,
+                name: Some("numbers".into()),
+            }),
+            ValueSource::Generated(crate::Generated {
+                expression: "n * 2".into(),
+                stored: true,
+            }),
+        ] {
+            let text = serde_json::to_string(&source).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ValueSource>(&text).unwrap(),
+                source,
+                "{text}"
+            );
+        }
+        assert_eq!(serde_json::to_string(&ValueSource::None).unwrap(), "{}");
+        let two = r#"{"default": "0", "identity": {"seed": 1, "increment": 1}}"#;
+        let err = serde_json::from_str::<ValueSource>(two).unwrap_err();
+        assert!(err.to_string().contains("only one of"), "{err}");
+        assert!(serde_json::from_str::<ValueSource>(r#"{"extra": 1}"#).is_err());
+    }
+}

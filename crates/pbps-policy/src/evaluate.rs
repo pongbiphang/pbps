@@ -342,6 +342,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
                 | Change::AlterColumnExpression { .. }
+                | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::SetIndexStorageParameters { .. }

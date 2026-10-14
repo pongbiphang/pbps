@@ -611,6 +611,7 @@ fn role_of(change: &Change) -> Option<&str> {
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnDefault { .. }
         | Change::AlterColumnExpression { .. }
+        | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }
@@ -1001,6 +1002,14 @@ pub fn describe(c: &Change) -> String {
         Change::AlterColumnExpression { column, to, .. } => {
             format!("~ {} generated as {to}", column.name)
         }
+        Change::AlterColumnNumbering {
+            column, from, to, ..
+        } => format!(
+            "~ {} numbered by {} -> {}",
+            column.name,
+            numbering_source(from),
+            numbering_source(to)
+        ),
         Change::AddComputedColumn { name, computed, .. } => format!(
             "+ add computed column {name} as ({}){}{}",
             computed.expression,
@@ -1276,6 +1285,29 @@ pub(crate) fn has_bare_placeholder(text: &str) -> bool {
 /// completed by hand.
 pub fn env_arg(name: &str) -> String {
     shell_arg(name).unwrap_or_else(|| placeholder("environment"))
+}
+
+/// A value source as a numbering change's line names it (#1889).
+fn numbering_source(source: &pbps_model::ValueSource) -> String {
+    use pbps_model::ValueSource;
+    match source {
+        ValueSource::None => "nothing".to_owned(),
+        ValueSource::Default(text) => format!("the default {text}"),
+        ValueSource::Identity(id) => format!(
+            "an identity (start {}, increment {})",
+            id.seed, id.increment
+        ),
+        ValueSource::Sequence(sequence) => format!(
+            "{} (start {}, increment {})",
+            sequence.name.as_ref().map_or_else(
+                || "its own sequence".to_owned(),
+                |n| format!("its sequence {n}")
+            ),
+            sequence.start,
+            sequence.increment
+        ),
+        ValueSource::Generated(generated) => format!("the expression {}", generated.expression),
+    }
 }
 
 #[cfg(test)]

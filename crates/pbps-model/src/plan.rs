@@ -234,7 +234,10 @@ use crate::zone::SessionZone;
 /// Bumped to 38 for the target's session time zone (DEC-1916.1): a
 /// baseline's `time_zone`, which an older build cannot read and would apply
 /// under UTC pins, storing every offset-less value at another instant.
-pub const CURRENT_VERSION: u32 = 38;
+///
+/// Bumped to 39 for `AlterColumnNumbering` (DEC-1889.1), a change an older
+/// build cannot read.
+pub const CURRENT_VERSION: u32 = 39;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -703,7 +706,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 38);
+        assert_eq!(CURRENT_VERSION, 39);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

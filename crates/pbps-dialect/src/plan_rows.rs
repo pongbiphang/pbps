@@ -205,6 +205,7 @@ impl<'p> PlanFacts<'p> {
                 | Change::DetachPartition { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
+                | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::AddUnique { .. }

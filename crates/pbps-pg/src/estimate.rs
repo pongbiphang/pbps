@@ -148,6 +148,19 @@ pub struct Estimate {
     pub rows: Option<Rows>,
     /// Why [`rows`](Self::rows) is absent after [`against`] has run.
     pub rows_unknown: Option<String>,
+    /// A numbering source put on the column: where it starts, by what it
+    /// counts, and whether an old source's counter carries on into it, for
+    /// [`against`] to say where numbering continues (DEC-1889.1).
+    continues: Option<Continues>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Continues {
+    start: i64,
+    increment: i64,
+    /// Converted from an old source counting the same way, whose counter
+    /// the new one continues past.
+    converted: bool,
 }
 
 /// A new table cannot carry a queryable catalog name. The column belongs to
@@ -177,6 +190,7 @@ impl Estimate {
             also_locks: Vec::new(),
             rows: None,
             rows_unknown: None,
+            continues: None,
         }
     }
 
@@ -412,7 +426,8 @@ fn estimates_with(
                 ..
             } = &mut e.source
                 && let Change::AlterColumnType { uid, column, .. }
-                | Change::AlterColumnNullability { uid, column, .. } = &p.change
+                | Change::AlterColumnNullability { uid, column, .. }
+                | Change::AlterColumnNumbering { uid, column, .. } = &p.change
             {
                 // Preserve the first spelling even when ordinary ownership
                 // begins at DETACH. Managed scope starting later does not
@@ -766,6 +781,64 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             Lock::AccessExclusive,
         ),
 
+        // A sequence retuned is the sequence's own change, and reads and
+        // locks no row of the table. Anything else is an `ALTER TABLE`, and
+        // a source put on the column reads its greatest value (its least,
+        // counting down) under that lock, to continue past it (DEC-1889.1):
+        // one index probe where an index leads with the column, every row
+        // where none does, which only the catalog can say.
+        Change::AlterColumnNumbering {
+            from: pbps_model::ValueSource::Sequence(_),
+            to: pbps_model::ValueSource::Sequence(_),
+            ..
+        } => None,
+        Change::AlterColumnNumbering {
+            column, from, to, ..
+        } => {
+            let installed = pbps_model::NumberingKind::installed(from, to);
+            let mut estimate = e(
+                format!("changing how {column} is numbered"),
+                &column.table,
+                Rewrite::No,
+                if installed {
+                    Reads::Unknown(format!(
+                        "the greatest value of {column}: one index probe where an index leads \
+                         with it, every row where none does"
+                    ))
+                } else {
+                    Reads::Nothing
+                },
+                Lock::AccessExclusive,
+            )?;
+            let (start, increment) = match to {
+                pbps_model::ValueSource::Identity(id) => (id.seed, id.increment),
+                pbps_model::ValueSource::Sequence(sequence) => (sequence.start, sequence.increment),
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Generated(_) => (0, 0),
+            };
+            if installed {
+                estimate.continues = Some(Continues {
+                    start,
+                    increment,
+                    // Only an old source counting the same way, as the
+                    // emitter carries it (#1930 review).
+                    converted: match from {
+                        pbps_model::ValueSource::Identity(id) => {
+                            (id.increment < 0) == (increment < 0)
+                        }
+                        pbps_model::ValueSource::Sequence(sequence) => {
+                            (sequence.increment < 0) == (increment < 0)
+                        }
+                        pbps_model::ValueSource::None
+                        | pbps_model::ValueSource::Default(_)
+                        | pbps_model::ValueSource::Generated(_) => false,
+                    },
+                });
+            }
+            Some(estimate)
+        }
+
         Change::RenameColumn { table, from, .. } => e(
             format!("renaming {}", table.column(from)),
             table,
@@ -943,6 +1016,7 @@ SELECT c.relkind::text AS relkind,
 /// change may rebuild the index too; a validated check on a tightened column
 /// may avoid a scan, but parsing its expression would violate SPEC §8.2.
 pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbError> {
+    continues_at(conn, estimate).await?;
     let CatalogSource::Stored { table, column } = &estimate.source else {
         // The plan may insert rows before this statement, so a new identity
         // has no measured row count, not an assumed zero. Never ask a current
@@ -1031,6 +1105,113 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
             "validated check constraint {name} refers to this column; the engine may use it \
              to skip the NOT NULL scan, but this tool does not parse its expression"
         ));
+    }
+    Ok(())
+}
+
+/// Where a numbering source put on a column continues, said in the change's
+/// own words (DEC-1889.1): past the column's greatest value (least, counting
+/// down) and an old source's counter, from the declared start at least, as
+/// the apply's block computes it under its lock. Read here only where an
+/// index leads with the column, so the read is one index probe; without one
+/// it would scan every row, and the apply reads it anyway. An old counter is
+/// read only where this session may read the sequence, so a refusal cannot
+/// abort the read-only transaction this runs in.
+async fn continues_at(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbError> {
+    let (
+        Some(continues),
+        CatalogSource::Stored {
+            table,
+            column: Some(column),
+        },
+    ) = (estimate.continues, &estimate.source)
+    else {
+        return Ok(());
+    };
+    let (Ok(relation), Ok(quoted)) = (crate::emit::qualified(table), crate::quote(column)) else {
+        return Ok(());
+    };
+    let led = conn
+        .query_with(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_index i
+                JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) i.indrelid
+                 AND a.attnum OPERATOR(pg_catalog.=) i.indkey[0]
+                JOIN pg_catalog.pg_class x ON x.oid OPERATOR(pg_catalog.=) i.indexrelid
+                JOIN pg_catalog.pg_am m ON m.oid OPERATOR(pg_catalog.=) x.relam
+               WHERE i.indrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass($1)
+                 AND m.amname OPERATOR(pg_catalog.=) 'btree'
+                 AND a.attname OPERATOR(pg_catalog.=) $2 AND i.indpred IS NULL
+                 AND i.indisvalid) AS led",
+            &[relation.as_str().into(), column.as_str().into()],
+        )
+        .await?
+        .first()
+        .and_then(|row| row.try_get::<bool>("led").ok().flatten())
+        .unwrap_or(false);
+    if !led {
+        estimate.about.push_str(&format!(
+            "; no b-tree index leads with {column}, so its greatest value is read at apply, under the \
+             lock, and not here, where it would scan every row"
+        ));
+        return Ok(());
+    }
+    let down = continues.increment < 0;
+    let edge = conn
+        .query(&format!(
+            "SELECT pg_catalog.{}(r.{quoted})::pg_catalog.int8 AS edge FROM {relation} AS r",
+            if down { "min" } else { "max" }
+        ))
+        .await?
+        .first()
+        .and_then(|row| row.try_get::<i64>("edge").ok().flatten());
+    let mut counter = None;
+    if continues.converted {
+        let sequence = conn
+            .query_with(
+                "SELECT s FROM pg_catalog.pg_get_serial_sequence($1, $2) AS s
+                  WHERE s IS NOT NULL AND pg_catalog.has_sequence_privilege(s, 'SELECT')",
+                &[relation.as_str().into(), column.as_str().into()],
+            )
+            .await?
+            .first()
+            .and_then(|row| row.try_get::<&str>("s").ok().flatten().map(str::to_owned));
+        if let Some(sequence) = sequence {
+            counter = conn
+                .query(&format!(
+                    "SELECT CASE WHEN s.is_called THEN s.last_value OPERATOR(pg_catalog.+) \
+                     q.seqincrement ELSE s.last_value END AS next FROM {sequence} AS s, \
+                     pg_catalog.pg_sequence AS q WHERE q.seqrelid OPERATOR(pg_catalog.=) \
+                     '{}'::pg_catalog.regclass",
+                    sequence.replace('\'', "''")
+                ))
+                .await?
+                .first()
+                .and_then(|row| row.try_get::<i64>("next").ok().flatten());
+        }
+    }
+    let past = edge.map(|v| i128::from(v) + i128::from(continues.increment));
+    let candidates = [
+        Some(i128::from(continues.start)),
+        past,
+        counter.map(i128::from),
+    ];
+    let next = if down {
+        candidates.into_iter().flatten().min()
+    } else {
+        candidates.into_iter().flatten().max()
+    };
+    let greatest = if down { "least" } else { "greatest" };
+    estimate.about.push_str(&match (edge, next) {
+        (Some(edge), Some(next)) => {
+            format!("; its {greatest} value is {edge} now, so numbering continues at {next}")
+        }
+        (None, Some(next)) => format!("; it holds no value now, so numbering starts at {next}"),
+        (_, None) => String::new(),
+    });
+    if continues.converted && counter.is_none() {
+        estimate
+            .about
+            .push_str(", or past the old source's counter, which this session may not read");
     }
     Ok(())
 }

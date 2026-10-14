@@ -406,6 +406,15 @@ pub(super) fn derive(
                 true,
                 None,
             ),
+            // The column's identity, its default and the sequence it owns,
+            // which are the column's children (#1889).
+            Change::AlterColumnNumbering { uid, column, .. } => (
+                Surface::Column(final_column(uid, column, desired)),
+                true,
+                true,
+                true,
+                None,
+            ),
             Change::AlterColumnDefault {
                 uid,
                 column,

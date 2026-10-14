@@ -85,6 +85,7 @@ pub async fn key_drop_blockers(
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
                 | Change::AlterColumnExpression { .. }
+                | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
                 | Change::SetIndexStorageParameters { .. }
@@ -248,6 +249,7 @@ pub async fn key_drop_blockers(
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
