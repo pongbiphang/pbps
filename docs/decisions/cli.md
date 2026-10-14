@@ -966,7 +966,12 @@ command that reads the date against one that does not.
   orders by its magnitude, so a frontier a fraction short of `--until` is not "already
   there" (#1912). For an integer key, a nearest value the key type cannot hold (a 20-digit
   step past a `bigint`'s maximum) is left out of the refusal, which says no larger value fits
-  the type, since a proposal the column could not store is no proposal (#1905).
+  the type, since a proposal the column could not store is no proposal (#1905). A temporal
+  key is the same at the calendar's end: a nearest value in a year past 9999, which the
+  bound parser and so `--until` itself refuse, is left out, and the refusal says no later
+  value fits the calendar. That covers the off-grid frontier and the `--until` that does not
+  tile alike, for `date`, `timestamp` and `timestamptz`; the value below always stays in
+  years 1 to 9999, being the floor of a value that was read (#1996).
 - **The spelling is what the engine prints, nothing else.** Measured on 16.15 and 18.6 under
   the pins (`TimeZone` UTC, ISO dates, DEC-1170.1): `date` is `2027-01-01`, `timestamp`
   `2027-01-01 00:00:00`, `timestamptz` `2027-01-01 00:00:00+00`, an integer its decimal text

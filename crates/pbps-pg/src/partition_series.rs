@@ -37,8 +37,10 @@
 //! calendar from the start, never stepped one after another.
 //!
 //! A refusal names the nearest values that would tile, because "your end is
-//! wrong" without the right one is a second round trip. An integer key's
-//! nearest value above its type's maximum is left out and said so (#1905).
+//! wrong" without the right one is a second round trip. A nearest value above
+//! what the key can hold is left out and said so: an integer key's above its
+//! type's maximum (#1905), a temporal key's past year 9999, the last year a
+//! bound is read or written in (#1996).
 //!
 //! # Limits, each a refusal rather than a guess
 //!
@@ -437,12 +439,17 @@ fn position(mode: Mode, c: &Civil) -> Position {
     }
 }
 
-/// The value at the start of unit `floor`, spelled as `key` prints it.
-fn spell(key: Key, mode: Mode, floor: i64) -> String {
-    let (y, m, d) = match mode {
+/// The calendar date at the start of unit `floor`.
+fn ymd(mode: Mode, floor: i64) -> (i64, i64, i64) {
+    match mode {
         Mode::Days => civil_from_days(floor),
         Mode::Months => (floor.div_euclid(12), floor.rem_euclid(12) + 1, 1),
-    };
+    }
+}
+
+/// The value at the start of unit `floor`, spelled as `key` prints it.
+fn spell(key: Key, mode: Mode, floor: i64) -> String {
+    let (y, m, d) = ymd(mode, floor);
     let date = format!("{y:04}-{m:02}-{d:02}");
     match key {
         Key::Date | Key::Integer(_) => date,
@@ -451,13 +458,41 @@ fn spell(key: Key, mode: Mode, floor: i64) -> String {
     }
 }
 
+/// The last year a bound is read or written in (`parse_civil`).
+const LAST_YEAR: i64 = 9999;
+
+/// What a refusal says when the value above the nearest one lies past
+/// [`LAST_YEAR`] (#1996). A proposal `--until` itself would refuse is no
+/// proposal, as an integer key's past its type is none (#1905).
+const NO_LATER: &str = "no later value fits the calendar, which ends in year 9999";
+
+/// The two values nearest a request that would tile: the unit `lower` and the
+/// unit above it, `lower + 1` for an off-grid frontier, `lower + len` for an
+/// `--until`. `lead` is the sentence's opening for two values and for one, so
+/// that its verb agrees with the count.
+///
+/// Only the value above can leave the calendar. `lower` is the floor of a
+/// value that `parse_civil` read, or of one between two of them (the frontier
+/// and `--until`, with `--until` above the frontier), so its year is in 1 to
+/// 9999 and needs no guard. The value above is that plus a step, which can be
+/// `MAX_STEP` years, and is left out when its year is past [`LAST_YEAR`].
+fn nearest_values(key: Key, mode: Mode, lower: i64, upper: i64, lead: [&str; 2]) -> String {
+    let [both, one] = lead;
+    if ymd(mode, upper).0 <= LAST_YEAR {
+        format!(
+            "{both} `{}` and `{}`",
+            spell(key, mode, lower),
+            spell(key, mode, upper)
+        )
+    } else {
+        format!("{one} `{}`; {NO_LATER}", spell(key, mode, lower))
+    }
+}
+
 /// A partition's name from its lower bound: the year for a yearly step, the
 /// month for a monthly one, the day for a daily or weekly one.
 fn suffix(unit: Unit, mode: Mode, floor: i64) -> String {
-    let (y, m, d) = match mode {
-        Mode::Days => civil_from_days(floor),
-        Mode::Months => (floor.div_euclid(12), floor.rem_euclid(12) + 1, 1),
-    };
+    let (y, m, d) = ymd(mode, floor);
     match unit {
         Unit::Year => format!("{y:04}"),
         Unit::Month => format!("{y:04}_{m:02}"),
@@ -668,11 +703,16 @@ fn temporal(
     };
     if from.above {
         let step_unit = if mode == Mode::Days { "day" } else { "month" };
+        let nearest = nearest_values(
+            key,
+            mode,
+            from.floor,
+            from.floor + 1,
+            ["The nearest that do are", "The nearest that does is"],
+        );
         return Err(invalid(format!(
             "{origin}, which is not at {unit_name}, so a series of {step_unit}s from it would \
-             not tile. The nearest that do are `{}` and `{}`",
-            spell(key, mode, from.floor),
-            spell(key, mode, from.floor + 1)
+             not tile. {nearest}"
         )));
     }
     if until <= start {
@@ -685,13 +725,18 @@ fn temporal(
     let diff = to.floor - from.floor;
     let lower = from.floor + diff.div_euclid(len) * len;
     if to.above || lower != to.floor {
+        let nearest = nearest_values(
+            key,
+            mode,
+            lower,
+            lower + len,
+            ["The nearest that tile are", "The nearest that tiles is"],
+        );
         return Err(invalid(format!(
             "--until `{}` is not a whole number of `{}` steps after `{start_text}`, so the last \
-             partition would end short of it or past it. The nearest that tile are `{}` and `{}`",
+             partition would end short of it or past it. {nearest}",
             req.until,
-            req.every.trim(),
-            spell(key, mode, lower),
-            spell(key, mode, lower + len)
+            req.every.trim()
         )));
     }
     let count = i128::from(diff / len);
@@ -1407,6 +1452,178 @@ mod tests {
         let said = refusal(ask(&s, "70000", "-1", None));
         assert!(
             said.ends_with("The nearest that tiles is `-32768`; no larger value fits a smallint"),
+            "{said}"
+        );
+    }
+
+    /// The value above is left out when it names a year past 9999 (#1996), at
+    /// both refusal sites and for every temporal key: the `--until` that does
+    /// not tile (`lower + len`) and the off-grid frontier (`from.floor + 1`).
+    /// A value `--until` itself would refuse is no proposal.
+    #[test]
+    fn a_nearest_value_past_year_9999_is_left_out() {
+        for (ty, tz) in [
+            ("date", None),
+            ("timestamp", Some("")),
+            ("timestamptz", Some("+00")),
+        ] {
+            let at = |date: &str| match tz {
+                None => date.to_owned(),
+                Some(tz) => format!("{date} 00:00:00{tz}"),
+            };
+            // (frontier, every, until, the one value named, its verb)
+            let mut cases = vec![
+                // --until: lower + len is 10000-01-01, 10000-01-01, 10004-01-01
+                // and 10000-01-06.
+                (
+                    "9999-01-01",
+                    "1year",
+                    "9999-06-15",
+                    "9999-01-01",
+                    "tiles is",
+                ),
+                (
+                    "9999-12-01",
+                    "1month",
+                    "9999-12-15",
+                    "9999-12-01",
+                    "tiles is",
+                ),
+                (
+                    "9999-01-01",
+                    "5year",
+                    "9999-12-01",
+                    "9999-01-01",
+                    "tiles is",
+                ),
+                ("9999-12-30", "7day", "9999-12-31", "9999-12-30", "tiles is"),
+                // The off-grid frontier: floor + 1 is 10000-01-01.
+                (
+                    "9999-12-15",
+                    "1month",
+                    "9999-12-31",
+                    "9999-12-01",
+                    "does is",
+                ),
+            ];
+            let noon = tz.map(|tz| format!("9999-12-31 12:00:00{tz}"));
+            if let Some(noon) = &noon {
+                cases.push((noon, "1day", noon, "9999-12-31", "does is"));
+            }
+            for (end, every, until, lower, verb) in cases {
+                let end = if end.len() > 10 {
+                    end.to_owned()
+                } else {
+                    at(end)
+                };
+                let until = if until.len() > 10 {
+                    until.to_owned()
+                } else {
+                    at(until)
+                };
+                let lower = at(lower);
+                let s = schema(ty, &[("ev_x", &at("0001-01-01"), &end)]);
+                let said = refusal(ask(&s, every, &until, None));
+                assert!(
+                    said.ends_with(&format!(
+                        "The nearest that {verb} `{lower}`; no later value fits the calendar, \
+                         which ends in year 9999"
+                    )),
+                    "{ty} {end} {every}: {said}"
+                );
+                assert!(
+                    numbers(proposed(&said)).iter().all(|n| *n <= 9999),
+                    "{ty} {end} {every}: {said}"
+                );
+            }
+        }
+    }
+
+    /// A value in year 9999 fits, so it is still named, up to the last day
+    /// the calendar has; the first value past it is the one left out.
+    #[test]
+    fn a_nearest_value_in_year_9999_is_still_named() {
+        for (ty, end, every, until, pair) in [
+            // --until: lower + len is 9999-01-01, 9999-12-01 and 9999-12-31.
+            (
+                "date",
+                "9998-01-01",
+                "1year",
+                "9998-06-15",
+                "`9998-01-01` and `9999-01-01`",
+            ),
+            (
+                "date",
+                "9999-11-01",
+                "1month",
+                "9999-11-15",
+                "`9999-11-01` and `9999-12-01`",
+            ),
+            (
+                "timestamp",
+                "9999-12-30 00:00:00",
+                "1day",
+                "9999-12-30 12:00:00",
+                "`9999-12-30 00:00:00` and `9999-12-31 00:00:00`",
+            ),
+            (
+                "timestamptz",
+                "9999-12-30 00:00:00+00",
+                "1day",
+                "9999-12-30 12:00:00+00",
+                "`9999-12-30 00:00:00+00` and `9999-12-31 00:00:00+00`",
+            ),
+            // The off-grid frontier: floor + 1 is 9999-12-01 and 9999-12-31.
+            (
+                "date",
+                "9999-11-15",
+                "1month",
+                "9999-12-01",
+                "`9999-11-01` and `9999-12-01`",
+            ),
+            (
+                "timestamp",
+                "9999-12-30 12:00:00",
+                "1day",
+                "9999-12-31 00:00:00",
+                "`9999-12-30 00:00:00` and `9999-12-31 00:00:00`",
+            ),
+        ] {
+            let s = schema(ty, &[("ev_x", "0001-01-01", end)]);
+            let said = refusal(ask(&s, every, until, None));
+            assert!(
+                said.ends_with(pair) && !said.contains("no later value"),
+                "{ty} {end}: {said}"
+            );
+        }
+    }
+
+    /// The value below cannot leave the calendar the other way: it is the
+    /// floor of the frontier or of a value between the frontier and
+    /// `--until`, so a start in year 1 and a step of `MAX_STEP` years still
+    /// names year 1 (#1996).
+    #[test]
+    fn a_nearest_value_below_is_always_inside_the_calendar() {
+        let s = schema("date", &[]);
+        let said = refusal(ask(&s, "100000year", "0001-06-15", Some("0001-01-01")));
+        assert!(
+            said.ends_with(
+                "The nearest that tiles is `0001-01-01`; no later value fits the calendar, which \
+                 ends in year 9999"
+            ),
+            "{said}"
+        );
+        let said = refusal(ask(&s, "1month", "0001-03-01", Some("0001-01-15")));
+        assert!(said.ends_with("`0001-01-01` and `0001-02-01`"), "{said}");
+        let s = schema("timestamp", &[]);
+        let said = refusal(ask(
+            &s,
+            "100000day",
+            "0001-01-01 00:00:01",
+            Some("0001-01-01 00:00:00"),
+        ));
+        assert!(
+            said.ends_with("`0001-01-01 00:00:00` and `0274-10-17 00:00:00`"),
             "{said}"
         );
     }
