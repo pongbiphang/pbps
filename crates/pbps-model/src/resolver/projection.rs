@@ -648,6 +648,11 @@ fn changed_owners(change: &Change) -> Option<(Vec<OwnerScope>, bool, bool)> {
         Change::AlterColumnNullability { column, .. } => {
             (Exact(Surface::Column(column.clone())), true, true)
         }
+        // The column's identity, its default, and the sequence either one
+        // numbers it from, which the column owns (#1889).
+        Change::AlterColumnNumbering { column, .. } => {
+            (WithChildren(Surface::Column(column.clone())), true, true)
+        }
         Change::AlterColumnDefault {
             column, from, to, ..
         } => (
@@ -796,7 +801,9 @@ fn covers_change(c: &Change, surface: &Surface) -> bool {
             }
             Surface::Default(_) => matches!(
                 c,
-                Change::AlterColumnDefault { .. } | Change::AlterColumnExpression { .. }
+                Change::AlterColumnDefault { .. }
+                    | Change::AlterColumnExpression { .. }
+                    | Change::AlterColumnNumbering { .. }
             ),
             Surface::Namespace(_)
             | Surface::Table(_)
@@ -831,7 +838,7 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
                 || matches!(c, Change::CreateTable { name, .. } | Change::DropTable { name, .. } if name == &column.table)
         }
         Surface::Default(column) => {
-            matches!(c, Change::AlterColumnDefault { column: r, .. } | Change::AlterColumnExpression { column: r, .. } if r == column)
+            matches!(c, Change::AlterColumnDefault { column: r, .. } | Change::AlterColumnExpression { column: r, .. } | Change::AlterColumnNumbering { column: r, .. } if r == column)
                 || matches!(c, Change::CreateTable { name, .. } | Change::DropTable { name, .. } if name == &column.table)
                 || matches!(c, Change::AddColumn { table, name, .. } if &table.column(name) == column)
         }

@@ -835,6 +835,7 @@ fn build<'v, 'p: 'v>(
         }
         | Change::AlterColumnDefault { .. }
         | Change::AlterColumnExpression { .. }
+        | Change::AlterColumnNumbering { .. }
         // A module holds no rows. A definition the engine will not compile
         // fails inside the plan's transaction, where the rollback is total.
         | Change::CreateModule { .. }

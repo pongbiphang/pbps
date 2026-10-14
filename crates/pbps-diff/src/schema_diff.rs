@@ -43,18 +43,51 @@ pub enum DiffError {
     )]
     IdentityChangeUnsupported { column: ColumnRef },
 
-    /// A column whose owned sequence (`serial`) is added, removed, or given
-    /// another start, increment or name, or which is retyped under one, or a
-    /// `serial` added to an `UNLOGGED` table (#1631, DEC-1631.1). None is
-    /// planned yet: a sequence added to a column that holds values starts
-    /// where it may meet them, and one left behind by a retype keeps its old
-    /// type's bounds.
+    /// A `serial` put on a column of an `UNLOGGED` table, added with it or
+    /// given to it (#1631, DEC-1631.1): its sequence is created logged, and
+    /// the reader holds a `serial` only where the two agree. Or an owned
+    /// sequence changed on an engine without one (#1889).
     #[error(
-        "column {column}: its `serial` sequence is added, removed or changed, the column is \
-         retyped under it, or it is added to an UNLOGGED table, none of which is planned yet. \
-         Make the change by hand, then pull."
+        "column {column}: a `serial` put on an UNLOGGED table, or an owned sequence changed \
+         where this engine has none, is not planned yet. Make the change by hand, then pull."
     )]
     SequenceChangeUnsupported { column: ColumnRef },
+
+    /// A numbering source, an identity or an owned sequence, added, removed,
+    /// retuned or converted on a partitioned table or a partition (#1889):
+    /// each partition carries its parent's source, which this model does not
+    /// hold yet (#1681, #1893).
+    #[error(
+        "column {column}: its identity or `serial` sequence changes on a partitioned table or a \
+         partition, which is not planned yet (issues #1681, #1893). Make the change by hand, \
+         then pull."
+    )]
+    NumberingChangeOnPartitionedTable { column: ColumnRef },
+
+    /// An identity or owned sequence kept, whose increment changes sign
+    /// (#1889): the sequence keeps the bounds of the direction it was made
+    /// for, so a start in the other is refused, and continuing "past" the
+    /// numbers issued has no meaning once they run the other way.
+    #[error(
+        "column {column}: its identity or `serial` sequence changes direction, from counting up \
+         to counting down or back, which is not planned. Give the column a new source in two \
+         steps, removing the old one first, or make the change by hand, then pull."
+    )]
+    NumberingDirectionChange { column: ColumnRef },
+
+    /// Rows of a table referencing one whose declared inserts follow an
+    /// identity put on it, after the deletes that may clear its NULLs
+    /// (#1930 review): written first, they would reference rows not yet
+    /// there.
+    #[error(
+        "rows of {table} reference {referenced}, whose rows this plan inserts after putting a \
+         numbering source on it, once its deleted rows are gone; {table}'s rows would be \
+         written first. Apply the row changes of {referenced} in a plan of their own first."
+    )]
+    RowsReferenceLateIdentityRows {
+        table: TableName,
+        referenced: TableName,
+    },
 
     /// A column that becomes generated, stops being generated, or changes
     /// its generation kind (DEC-1168.1). The engine has no in-place form for
@@ -242,6 +275,21 @@ pub enum DiffError {
         renames.iter().map(|(from, to)| format!("`{from} -> {to}`")).collect::<Vec<_>>().join(", ")
     )]
     TableRenameCycle {
+        renames: Vec<(TableName, TableName)>,
+    },
+
+    /// Owned sequences renamed into each other's names, in a cycle (#1930
+    /// review). As for tables and columns, no order of the renames is one
+    /// the engine performs, and the temporary name is the deployer's to
+    /// choose (DEC-541.1, DEC-1966.1): refused here rather than by the
+    /// engine mid-apply.
+    #[error(
+        "the sequence renames {} each need a name another of them still holds, in a cycle, and \
+         no order of those renames is one the engine performs. Apply the revisions that form it \
+         in separate deployments, or rename one of the sequences through a temporary name first",
+        renames.iter().map(|(from, to)| format!("`{from} -> {to}`")).collect::<Vec<_>>().join(", ")
+    )]
+    SequenceRenameCycle {
         renames: Vec<(TableName, TableName)>,
     },
 
@@ -928,6 +976,7 @@ fn diff_partial_rebuilding(
         &mut errs,
     );
     refuse_temporal_changes(base, declared, &changes, &mut errs);
+    refuse_rows_referencing_late_inserts(declared, &changes, &mut errs);
     refuse_partition_changes(base, declared, &index, hints, &changes, &mut errs);
     // A module declaration can stay byte-for-byte identical while a new
     // overload or shadow changes what it should bind to. Ask the dialect
@@ -948,6 +997,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -999,6 +1049,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -1186,6 +1237,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -1239,6 +1291,7 @@ fn diff_partial_rebuilding(
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -1423,6 +1476,34 @@ fn diff_partial_rebuilding(
         .iter()
         .filter_map(|p| row_table(&p.change).cloned())
         .collect();
+    let identified = identities_put_on(planned.iter().map(|p| &p.change));
+    let inserted = tables_with_inserts(planned.iter().map(|p| &p.change));
+    let late = numbering_after_deletes(planned.iter().map(|p| &p.change));
+    let installed = numbering_put_on(planned.iter().map(|p| &p.change));
+    // A column this plan tightens or retypes: a conversion to an identity
+    // waits for both, since the identity is made `NOT NULL`-only and in the
+    // column's type at the time (#1930 review).
+    let held_back: BTreeSet<ColumnRef> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::AlterColumnNullability {
+                column,
+                to_nullable: false,
+                ..
+            }
+            | Change::AlterColumnType { column, .. } = &p.change
+            {
+                Some(column.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let (early_release, sequence_cycles) =
+        sequence_release_depths(planned.iter().map(|p| &p.change), &held_back);
+    for renames in sequence_cycles {
+        errs.push(DiffError::SequenceRenameCycle { renames });
+    }
     // An attach validates its parent's foreign keys over the rows it brings,
     // as `ADD FOREIGN KEY` does, so one whose parent references a table this
     // plan writes rows into, or attaches a table to, waits for them: among
@@ -1597,14 +1678,56 @@ fn diff_partial_rebuilding(
         // fills or removes its NULLs, and no row change needs the column NOT
         // NULL first. Still before the additions of class 13, a primary key
         // among them, which SQL Server refuses over a nullable column (#1367).
+        //
+        // An identity this plan puts on follows its tightening there, since
+        // the engine refuses one on a nullable column: after the deletes,
+        // which may remove the rows holding NULL. Any source put on follows
+        // them too, since it continues past the values left, and those a
+        // delete removes may be the greatest. The table's own inserts follow
+        // the source, since a declared row leaves the numbered column out to
+        // take its number. Where the plan inserts rows into the table and
+        // deletes none, the source, and an identity's tightening, stay in
+        // class 9 ahead of the inserts, where a referencing table's rows can
+        // still follow them (#1930 review).
+        let early =
+            |column: &ColumnRef| inserted.contains(&column.table) && !late.contains(&column.table);
         if let Change::AlterColumnNullability {
             column,
             to_nullable: false,
             ..
         } = c
             && row_tables.contains(&column.table)
+            && !(identified.contains(column) && early(column))
         {
             return (ROW_DELETIONS, 2);
+        }
+        if let Change::AlterColumnNumbering { column, .. } = c
+            && installed.contains(column)
+            && row_tables.contains(&column.table)
+            && !early(column)
+        {
+            return (ROW_DELETIONS, 3);
+        }
+        if let Change::InsertRow { table, .. } = c
+            && late.contains(table)
+        {
+            return (ROW_DELETIONS, 4);
+        }
+        // An owned sequence given up, or renamed, frees its name before the
+        // tables and columns this plan creates, one of which may take it:
+        // after the drops of class 6, which free names too, and before
+        // `CreateTable` (#1930 review). None needs anything class 9 does
+        // first: giving one up drops a default and a sequence, a rename keeps
+        // the sequence, and a conversion to an identity needs the column
+        // `NOT NULL`, which a column this plan does not tighten already is.
+        // An identity put on a column retyped after it moves with it.
+        //
+        // Among them, a rename to a name another of them frees follows it,
+        // down the chain (#1930 review).
+        if let Change::AlterColumnNumbering { column, .. } = c
+            && let Some(depth) = early_release.get(column)
+        {
+            return (6, 1 + depth);
         }
         // A generated column is dropped before the ordinary columns of its
         // class, and added after every column change of the class beyond:
@@ -1807,19 +1930,87 @@ fn diff_columns(
             continue;
         };
 
+        let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
+        let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
         let mut recomputed = false;
+        // A numbering source changed in place (#1889, DEC-1889.1), where the
+        // engine has an `ALTER` for it and the table takes it. A partitioned
+        // table carries the source on every partition, which this model does
+        // not hold (#1681, #1893), and an owned sequence is created logged,
+        // which an `UNLOGGED` table's would not be (#1631).
+        //
+        // A plain default on either side is not the change's: one given up
+        // or taken is an `AlterColumnDefault` beside it, from or to nothing,
+        // so it is ordered as every default is, around a retype and after
+        // the functions it calls (#1930 review).
+        let numbering = |from: &ValueSource,
+                         to: &ValueSource,
+                         errs: &mut Vec<DiffError>,
+                         changes: &mut Vec<Change>| {
+            let identity =
+                matches!(from, ValueSource::Identity(_)) || matches!(to, ValueSource::Identity(_));
+            if !dialect.changes_numbering() {
+                errs.push(if identity {
+                    DiffError::IdentityChangeUnsupported {
+                        column: declared_ref.clone(),
+                    }
+                } else {
+                    DiffError::SequenceChangeUnsupported {
+                        column: declared_ref.clone(),
+                    }
+                });
+            } else if [base_table, declared_table]
+                .iter()
+                .any(|t| t.partition_by.is_some() || t.partition_of.is_some())
+            {
+                errs.push(DiffError::NumberingChangeOnPartitionedTable {
+                    column: declared_ref.clone(),
+                });
+            } else if matches!(to, ValueSource::Sequence(_))
+                && !matches!(from, ValueSource::Sequence(_))
+                && (base_table.unlogged || declared_table.unlogged)
+            {
+                errs.push(DiffError::SequenceChangeUnsupported {
+                    column: declared_ref.clone(),
+                });
+            } else if let (
+                ValueSource::Identity(pbps_model::Identity { increment: was, .. }),
+                ValueSource::Identity(pbps_model::Identity { increment: now, .. }),
+            )
+            | (
+                ValueSource::Sequence(pbps_model::OwnedSequence { increment: was, .. }),
+                ValueSource::Sequence(pbps_model::OwnedSequence { increment: now, .. }),
+            ) = (from, to)
+                && (*was < 0) != (*now < 0)
+            {
+                // The sequence keeps the bounds of the direction it was
+                // made for, which a start in the other refuses (#1930 review).
+                errs.push(DiffError::NumberingDirectionChange {
+                    column: declared_ref.clone(),
+                });
+            } else {
+                changes.push(Change::AlterColumnNumbering {
+                    uid: uid.clone(),
+                    column: declared_ref.clone(),
+                    ty: to_ty.clone(),
+                    from: from.clone(),
+                    to: to.clone(),
+                });
+            }
+        };
         // Compare the source as one property: ordinary defaults may change,
-        // generated text may change in place, and identity/kind changes refuse.
+        // generated text may change in place, a numbering source changes as
+        // one change, and a change to or from generated refuses.
         let (old_default, new_default) = match (&base_col.value_source, &col.value_source) {
             (ValueSource::None, ValueSource::None) => (None, None),
             (ValueSource::Default(old), ValueSource::Default(new)) => (Some(old), Some(new)),
             (ValueSource::None, ValueSource::Default(new)) => (None, Some(new)),
             (ValueSource::Default(old), ValueSource::None) => (Some(old), None),
             (ValueSource::Identity(old), ValueSource::Identity(new)) => {
+                // The engine moves an identity's sequence to a new type on
+                // its own (measured on 16 and 18).
                 if old != new {
-                    errs.push(DiffError::IdentityChangeUnsupported {
-                        column: declared_ref.clone(),
-                    });
+                    numbering(&base_col.value_source, &col.value_source, errs, changes);
                 }
                 (None, None)
             }
@@ -1839,13 +2030,6 @@ fn diff_columns(
                 }
                 (None, None)
             }
-            (ValueSource::Identity(_), ValueSource::None | ValueSource::Default(_))
-            | (ValueSource::None | ValueSource::Default(_), ValueSource::Identity(_)) => {
-                errs.push(DiffError::IdentityChangeUnsupported {
-                    column: declared_ref.clone(),
-                });
-                (None, None)
-            }
             (ValueSource::Generated(_), ValueSource::None | ValueSource::Default(_))
             | (ValueSource::None | ValueSource::Default(_), ValueSource::Generated(_)) => {
                 errs.push(DiffError::GenerationChangeUnsupported {
@@ -1860,44 +2044,38 @@ fn diff_columns(
             // and column it was declared on then, and a rename keeps the
             // sequence's. So a renamed table may name the sequence it kept,
             // and a later pull's name for it is no change. The apply's own
-            // read compares the name the engine holds. Any other change to a
-            // `serial`'s sequence, or to or from one, is #1889's (#1631).
+            // read compares the name the engine holds. A retype moves the
+            // sequence to the new type, which the engine does not do for an
+            // owned sequence (measured on 16 and 18), and which the reader
+            // holds a `serial` to (#1631).
             (ValueSource::Sequence(from), ValueSource::Sequence(to)) => {
                 let from = pbps_model::OwnedSequence {
                     name: from.name.clone().or_else(|| to.name.clone()),
                     ..from.clone()
                 };
-                if !to.declares(&from) {
-                    errs.push(DiffError::SequenceChangeUnsupported {
-                        column: declared_ref.clone(),
-                    });
+                if !to.declares(&from) || from_ty != to_ty {
+                    numbering(&base_col.value_source, &col.value_source, errs, changes);
                 }
                 (None, None)
             }
             (
-                ValueSource::Sequence(_),
-                ValueSource::None
-                | ValueSource::Default(_)
-                | ValueSource::Identity(_)
-                | ValueSource::Generated(_),
+                ValueSource::Identity(_) | ValueSource::Sequence(_),
+                ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_),
             )
-            | (
-                ValueSource::None
-                | ValueSource::Default(_)
-                | ValueSource::Identity(_)
-                | ValueSource::Generated(_),
-                ValueSource::Sequence(_),
-            ) => {
-                errs.push(DiffError::SequenceChangeUnsupported {
-                    column: declared_ref.clone(),
-                });
+            | (ValueSource::None, ValueSource::Identity(_) | ValueSource::Sequence(_)) => {
+                numbering(&base_col.value_source, &col.value_source, errs, changes);
                 (None, None)
             }
-            (ValueSource::Identity(_), ValueSource::Generated(_))
-            | (ValueSource::Generated(_), ValueSource::Identity(_)) => {
-                errs.push(DiffError::IdentityChangeUnsupported {
-                    column: declared_ref.clone(),
-                });
+            (ValueSource::Identity(_) | ValueSource::Sequence(_), ValueSource::Default(new)) => {
+                numbering(&base_col.value_source, &ValueSource::None, errs, changes);
+                (None, Some(new))
+            }
+            (ValueSource::Default(old), ValueSource::Identity(_) | ValueSource::Sequence(_)) => {
+                numbering(&ValueSource::None, &col.value_source, errs, changes);
+                (Some(old), None)
+            }
+            (ValueSource::Identity(_) | ValueSource::Sequence(_), ValueSource::Generated(_))
+            | (ValueSource::Generated(_), ValueSource::Identity(_) | ValueSource::Sequence(_)) => {
                 errs.push(DiffError::GenerationChangeUnsupported {
                     column: declared_ref.clone(),
                 });
@@ -1905,17 +2083,6 @@ fn diff_columns(
             }
         };
 
-        let norm = |t: &ColumnType| dialect.normalize_type(t).unwrap_or_else(|_| t.clone());
-        let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
-        // A retype leaves the sequence `AS` the old type (#1631).
-        if let (ValueSource::Sequence(_), ValueSource::Sequence(_)) =
-            (&base_col.value_source, &col.value_source)
-            && from_ty != to_ty
-        {
-            errs.push(DiffError::SequenceChangeUnsupported {
-                column: declared_ref.clone(),
-            });
-        }
         // A collation change is the same `ALTER COLUMN` as a type change, and
         // takes down the same dependents (#1175), so it is carried by the
         // same change with the type restated.
@@ -2125,6 +2292,7 @@ fn recreate_referenced_foreign_keys(
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }
@@ -2258,6 +2426,215 @@ fn tables_with_row_changes(changes: &[Change]) -> BTreeSet<TableName> {
         .collect()
 }
 
+/// The columns a plan puts an identity on that had none (#1889).
+fn identities_put_on<'a>(changes: impl Iterator<Item = &'a Change>) -> BTreeSet<ColumnRef> {
+    changes
+        .filter_map(|c| {
+            if let Change::AlterColumnNumbering {
+                column,
+                from: ValueSource::None | ValueSource::Default(_) | ValueSource::Sequence(_),
+                to: ValueSource::Identity(_),
+                ..
+            } = c
+            {
+                Some(column.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Renames, from and to, that wait on each other's names.
+type RenameCycle = Vec<(TableName, TableName)>;
+
+/// The owned sequences a plan gives up, renames, or turns into an identity
+/// on a column it neither tightens nor retypes, each with its place in the
+/// chain of names they free: zero for one that takes no name another frees,
+/// and one more than the change freeing the name it takes otherwise. A cycle
+/// of renames has no order in which each name is free when taken, so each
+/// cycle is returned too, as its renames, to be refused by name (#1930
+/// review).
+fn sequence_release_depths<'a>(
+    changes: impl Iterator<Item = &'a Change>,
+    held_back: &BTreeSet<ColumnRef>,
+) -> (BTreeMap<ColumnRef, usize>, BTreeSet<RenameCycle>) {
+    let mut released: BTreeMap<(String, String), ColumnRef> = BTreeMap::new();
+    let mut claims: BTreeMap<ColumnRef, Option<(String, String)>> = BTreeMap::new();
+    let mut renamed: BTreeMap<ColumnRef, (TableName, TableName)> = BTreeMap::new();
+    for c in changes {
+        let Change::AlterColumnNumbering {
+            column,
+            from: ValueSource::Sequence(was),
+            to,
+            ..
+        } = c
+        else {
+            continue;
+        };
+        let at = |name: &String| (column.table.schema.clone(), name.clone());
+        let claim = match to {
+            ValueSource::None => None,
+            ValueSource::Sequence(now)
+                if was.name.is_some() && now.name.is_some() && was.name != now.name =>
+            {
+                now.name.as_ref().map(at)
+            }
+            ValueSource::Identity(_) if !held_back.contains(column) => None,
+            ValueSource::Sequence(_)
+            | ValueSource::Identity(_)
+            | ValueSource::Default(_)
+            | ValueSource::Generated(_) => continue,
+        };
+        if let Some(name) = &was.name {
+            released.insert(at(name), column.clone());
+            if let Some((schema, to)) = &claim {
+                renamed.insert(
+                    column.clone(),
+                    (TableName::new(schema, name), TableName::new(schema, to)),
+                );
+            }
+        }
+        claims.insert(column.clone(), claim);
+    }
+    let mut depths = BTreeMap::new();
+    let mut cycles = BTreeSet::new();
+    for start in claims.keys() {
+        let mut depth = 0;
+        let mut path = vec![start];
+        let mut at = start;
+        while let Some(Some(name)) = claims.get(at)
+            && let Some(next) = released.get(name)
+        {
+            if let Some(from) = path.iter().position(|seen| *seen == next) {
+                // Back to a member already walked: the renames from there
+                // on wait on each other. Sorted, so each cycle is one entry
+                // whichever member the walk started from.
+                let mut cycle: Vec<_> = path[from..]
+                    .iter()
+                    .filter_map(|c| renamed.get(*c).cloned())
+                    .collect();
+                cycle.sort();
+                cycles.insert(cycle);
+                break;
+            }
+            depth += 1;
+            path.push(next);
+            at = next;
+        }
+        depths.insert(start.clone(), depth);
+    }
+    (depths, cycles)
+}
+
+/// The columns a plan puts a numbering source on, an identity or an owned
+/// sequence they were not numbered by (#1889).
+fn numbering_put_on<'a>(changes: impl Iterator<Item = &'a Change>) -> BTreeSet<ColumnRef> {
+    changes
+        .filter_map(|c| {
+            if let Change::AlterColumnNumbering {
+                column, from, to, ..
+            } = c
+                && pbps_model::NumberingKind::installed(from, to)
+            {
+                Some(column.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The tables a plan puts a numbering source on and both deletes and
+/// inserts rows of: the deletes may remove the rows holding NULL, or the
+/// greatest value, which must go before the source is put on, and the
+/// inserts leave the numbered column out, so they follow it (#1930 review).
+fn numbering_after_deletes<'a>(
+    changes: impl Iterator<Item = &'a Change> + Clone,
+) -> BTreeSet<TableName> {
+    let inserted = tables_with_inserts(changes.clone());
+    let deleted: BTreeSet<TableName> = changes
+        .clone()
+        .filter_map(|c| {
+            if let Change::DeleteRow { table, .. } = c {
+                Some(table.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    numbering_put_on(changes)
+        .into_iter()
+        .map(|column| column.table)
+        .filter(|t| inserted.contains(t) && deleted.contains(t))
+        .collect()
+}
+
+/// The rows of another table that reference one whose inserts follow an
+/// identity put on it, at the end of the deletes' class: they are written in
+/// class 11, before the rows they may reference exist, and the foreign key
+/// refuses them. Refused by name; the row changes go in a plan of their own
+/// first (#1930 review).
+fn refuse_rows_referencing_late_inserts(
+    declared: Side<'_>,
+    changes: &[Change],
+    errs: &mut Vec<DiffError>,
+) {
+    let late = numbering_after_deletes(changes.iter());
+    if late.is_empty() {
+        return;
+    }
+    // A key the plan adds, a created table's among them, is added in class
+    // 13, after every row: nothing enforces it while they are written
+    // (#1930 review).
+    let added: BTreeSet<(&TableName, &str)> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::AddForeignKey { table, name, .. } = c {
+                Some((table, name.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut seen = BTreeSet::new();
+    for change in changes {
+        let (Change::InsertRow { table, .. } | Change::UpdateRow { table, .. }) = change else {
+            continue;
+        };
+        let Some(t) = declared.schema.tables.get(table) else {
+            continue;
+        };
+        for (name, fk) in &t.foreign_keys {
+            if added.contains(&(table, name.as_str())) {
+                continue;
+            }
+            if fk.references_table != *table
+                && late.contains(&fk.references_table)
+                && seen.insert((table.clone(), fk.references_table.clone()))
+            {
+                errs.push(DiffError::RowsReferenceLateIdentityRows {
+                    table: table.clone(),
+                    referenced: fk.references_table.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// The tables a plan inserts declared rows into.
+fn tables_with_inserts<'a>(changes: impl Iterator<Item = &'a Change>) -> BTreeSet<TableName> {
+    changes
+        .filter_map(|c| {
+            if let Change::InsertRow { table, .. } = c {
+                Some(table.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// The table a row change writes or deletes in.
 fn row_table(change: &Change) -> Option<&TableName> {
     if let Change::InsertRow { table, .. }
@@ -2309,8 +2686,15 @@ fn clear_external_partitions_after_loosening(declared: &Schema, changes: &mut [C
     }
 }
 
+///
+/// Not on a column the plan puts an identity on in a table it inserts rows
+/// into: the column must be NOT NULL before the identity, and the identity
+/// on before the rows (#1930 review).
 fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
     let rows = tables_with_row_changes(changes);
+    let identified = identities_put_on(changes.iter());
+    let inserted = tables_with_inserts(changes.iter());
+    let late = numbering_after_deletes(changes.iter());
     let mut split = Vec::new();
     for change in changes.iter_mut() {
         if let Change::AlterColumnType {
@@ -2324,6 +2708,9 @@ fn split_tightenings_from_retypes(changes: &mut Vec<Change>) {
         } = change
             && !*to_nullable
             && rows.contains(&column.table)
+            && !(identified.contains(column)
+                && inserted.contains(&column.table)
+                && !late.contains(&column.table))
         {
             *to_nullable = true;
             split.push(Change::AlterColumnNullability {
@@ -2449,6 +2836,7 @@ fn recreate_retyped_dependents(
         | Change::RenameColumn { .. }
         | Change::AlterColumnDefault { .. }
         | Change::AlterColumnExpression { .. }
+        | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
         | Change::SetIndexStorageParameters { .. }
@@ -4326,6 +4714,7 @@ fn refuse_computed_dependencies(
                     | Change::AlterColumnNullability { .. }
                     | Change::AlterColumnDefault { .. }
                     | Change::AlterColumnExpression { .. }
+                    | Change::AlterColumnNumbering { .. }
                     | Change::AddComputedColumn { .. }
                     | Change::DropComputedColumn { .. }
                     | Change::SetColumnDeprecated { .. }
@@ -5504,6 +5893,28 @@ fn dependency_rank(
         // After any type change, as a new default is: the expression is
         // recomputed under the column's final type (DEC-1168.1).
         Change::AlterColumnExpression { .. } => 0,
+        // A numbering source (#1889, DEC-1889.1). One given up, and an
+        // identity turned into a sequence, go first: ahead of the relaxation
+        // its column may also take, since measured on 16 and 18 `DROP NOT
+        // NULL` on an identity column is refused ("is an identity column"),
+        // and ahead of the plain default it may give way to, which is set at
+        // 0 and which giving up a sequence's default would drop (#1930
+        // review). Anything else goes last: an identity
+        // is added only to a column already `NOT NULL` ("must be declared
+        // NOT NULL before identity can be added"), so after the tightening,
+        // and a sequence is moved past the column's values in the type the
+        // column ends with, so after the retype.
+        Change::AlterColumnNumbering {
+            from: ValueSource::Identity(_) | ValueSource::Sequence(_),
+            to: ValueSource::None,
+            ..
+        }
+        | Change::AlterColumnNumbering {
+            from: ValueSource::Identity(_),
+            to: ValueSource::Sequence(_),
+            ..
+        } => -3,
+        Change::AlterColumnNumbering { .. } => 2,
         // A recomputation is checked against the column's nullability as it
         // stands, so a relaxation goes before one and a tightening after it.
         // Measured on 17.11, `SET EXPRESSION` that yields a NULL is refused
@@ -6066,6 +6477,7 @@ fn order_key(c: &Change) -> u8 {
         Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnDefault { .. }
+        | Change::AlterColumnNumbering { .. }
         | Change::AlterColumnExpression { .. }
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. } => COLUMN_ALTERATIONS,

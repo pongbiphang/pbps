@@ -214,6 +214,10 @@ fn moves_bindings(
         // PostgreSQL's alone, where an index's name is a relation's.
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
+        // Creates, renames or drops a sequence, a relation in its schema's
+        // namespace that an unqualified relation lookup on the path finds
+        // (#1889). PostgreSQL's alone.
+        | Change::AlterColumnNumbering { .. }
         // A routine's identity, a view's columns, a type's existence.
         | Change::CreateModule { .. }
         | Change::DropModule { .. } => true,

@@ -7,6 +7,10 @@ How a difference becomes an ordered list of changes and statements. Part of the
 
 5. **IDENTITY changes are blocked** (cannot be done with ALTER).
 
+*Amended by [DEC-1889.1](types-and-probes.md#dec-1889-1): on PostgreSQL, an
+identity is put on, taken off, retuned or converted in place, by one change.
+SQL Server still has no `ALTER` for one, and there this stands.*
+
 <a id="decision-12"></a>
 
 12. **`ALTER COLUMN` restates the whole definition**, and an omitted

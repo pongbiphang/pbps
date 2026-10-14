@@ -1834,6 +1834,9 @@ connected plan's to claim (#1899).
   kept `serial`. These are #1889's: a sequence added to a column that holds
   values starts where it may meet them, and one left behind by a retype keeps
   its old type's bounds. Creating a table and adding a column are supported.
+
+  *Amended by [DEC-1889.1](#dec-1889-1): each is planned now, as one
+  change that continues past the column's values.*
 - A `serial` added to an `UNLOGGED` table, whose persistence the change does
   not carry.
 - A `data:` block keyed by a `serial`, for DECISIONS 321's reason: a pinned
@@ -2044,3 +2047,141 @@ live `inet_into_cidr_is_a_narrowing_whose_probe_counts_the_rows_with_host_bits`,
 `inet_cidr_macaddr_tsvector_and_xml_columns_pull_recreate_and_repull_to_an_empty_plan`,
 `a_declared_xml_or_network_value_is_read_under_the_pins_and_not_the_sessions_xmloption`
 and the extended matrix, spelling, estimate and key tests.
+
+
+<a id="dec-1889-1"></a>
+
+**DEC-1889.1. A PostgreSQL column's numbering source, an identity or an owned
+sequence, is put on, taken off, retuned or converted in place by one change,
+and one put on continues past the values the column holds (#1889).**
+
+Amends DECISIONS 5 and DEC-1631.1 on PostgreSQL. SQL Server has no `ALTER`
+for an identity, and there DECISIONS 5 stands.
+
+`AlterColumnNumbering` carries the column's source before and after: an
+identity or an owned sequence on at least one side, and on the other one of
+them or nothing. A plain default given up for a number, or taken in place of
+one, is an `AlterColumnDefault` beside it, so it is ordered as every default
+is: set after a retype to a type only the new one holds, and after the
+functions it calls (#1930 review). To or from generated still has no
+in-place form (DEC-1168.1). Neither has a kept source whose increment changes
+sign: its sequence keeps the bounds of the direction it was made for, which
+a start in the other refuses, and is refused by name
+(`NumberingDirectionChange`). The change is one statement, a `DO` block, because a
+staged apply checkpoints between statements, and a checkpoint between giving
+up the old source and installing the new one, or between installing it and
+moving it past the column's values, leaves a column that numbers into the
+rows it holds.
+
+**Where it continues.** Measured on 16 and 18, a source put on a column that
+holds values starts at its declared start, where it meets them; and neither
+`RESTART`-free form of a retune moves the counter. So a source put on, alone
+or by conversion, is set (`setval`) to the greatest of the declared start,
+the column's greatest value plus the increment, and for a conversion that
+counts the same way the old source's next number; for a negative increment,
+the least of the mirror values. An old source counting the other way says
+nothing of where the new one goes, and one step past its exhausted counter
+is past its type (#1930 review). The declared start stays the sequence's `START WITH`, so the next
+plan reads the start it declared and is empty: the start is a floor, and a
+start above the column's values is honoured exactly. Moving the sequence by
+hand after the change, as the obvious alternative leaves it, has a gap in
+which a row can arrive and collide, and a step that can be forgotten.
+
+This is not what ADR-0013 §2 refused. DECISIONS 321 found six obstacles to
+advancing a sequence past rows a plan pinned, and they are the obstacles of
+a sequence that outlives the statement: a `nextval` walks past any lock, an
+allocation cannot be recalled, an advance survives a rollback. Here the
+table is locked `ACCESS EXCLUSIVE` first, so every value read is in the
+table or rolled back, and the sequence moved is always one the block itself
+created, so a rollback takes the move with it. No `CYCLE` sequence is held
+(DEC-1631.1).
+
+**The plan text does not depend on the data.** The block computes the
+continuation at apply time, so an offline `plan` and `plan --db` give the
+same plan. A connected plan's cost report says where numbering continues
+where a b-tree index leads with the column, in one index probe (a hash or
+BRIN index gives no ordered probe); without one it
+says the apply reads it, since the read would scan every row. The pre-flight
+counts the values too near the type's bound for numbering to continue past
+them, which would otherwise refuse the `setval` mid-apply.
+
+**The gate**, `numbering`, asks only for the changes that can make a writer
+working today fail:
+
+| Change | Gated | Why |
+|---|---|---|
+| An owned sequence put on | no | A writer supplying its own value still can, and the sequence starts past it. A writer leaving the column out needs `USAGE` on the new sequence (ADR-0010 §7). On a column with no source, no such writer works today. One relying on a plain default the sequence replaces is that default's change, ungated as every default dropped is, and its grant is #1892's. |
+| An identity put on | yes | pbps's identity is `GENERATED ALWAYS`: an insert supplying a value is refused (measured: "cannot insert a non-DEFAULT value"). |
+| Owned sequence → identity | yes | The same refusal, and the sequence's name goes, so `nextval('<seq>')` and a grant on it break. |
+| Identity → owned sequence | yes | A writer leaving the column to the identity needed no privilege. The sequence is a grantable object the identity was not, and without `USAGE` on it that insert fails (ADR-0010 §7, #1930 review). |
+| A source given up | yes | An insert relying on the source fails `NOT NULL`. |
+| Start or increment changed | no | Without `RESTART`, no number already issued is issued again; a changed start affects only a rebuilt table. |
+| A known sequence name changed | `rename` | The default reaches it by oid, but a caller by name loses it, as a renamed table's do. |
+
+A conversion is one change, not a removal and an addition: the counter has
+to cross from the old source to the new inside one statement.
+
+An identity put on always follows its column's tightening, which the engine
+requires. Where the plan inserts rows into the table, both stay in class 9,
+ahead of the inserts, instead of the tightening following the rows as it
+otherwise would (#1367): a declared row never writes an identity column, so
+it takes its number once the identity is on. Where the plan only updates or
+deletes the table's rows, both follow them, at the end of the deletes'
+class, because a delete may remove the rows holding NULL (#1930 review).
+Where it both deletes and inserts them, the deletes, the tightening, the
+identity and then the table's inserts run in that order, all at the end of
+the deletes' class. Another table's rows referencing that table would then
+be written before the rows they may reference, so they are refused by name
+(`RowsReferenceLateIdentityRows`), and the row changes go in a plan of
+their own first. A key the plan adds itself, a created table's among them,
+is added after every row, so it refuses nothing.
+
+An owned sequence given up, renamed, or turned into an identity on a column
+the plan neither tightens (so already `NOT NULL`) nor retypes (the identity
+takes the column's type when added), goes at the end of class 6, before the
+tables and columns this plan creates, one of which may take its name; none
+needs a class-9 change first. Among them, a rename to a name another frees
+follows it, down the chain. A cycle of renames has no such order and is
+refused by name at diff time (`SequenceRenameCycle`), as a table or column
+rename cycle is (DEC-541.1, DEC-1966.1), not left to the engine mid-apply
+(#1930 review).
+
+A `serial` put on follows the table's deletes as an identity does, without
+the tightening: it continues past the values left, and the greatest may be
+one a delete removes (#1930 review). The bound probe is reported unchecked for a table whose
+rows the plan deletes, since the values stored now are not all the ones
+the numbering reads.
+
+**Order.** In class 9, a source given up, and an identity turned into a
+sequence, go first, at −3: measured, `DROP NOT NULL` on an identity column
+is refused ("is an identity column"), and a plain default taking a
+sequence's place is set at 0, after the statement that drops the old one.
+Every other numbering change goes last, at +2: an identity is put only on a
+column already `NOT NULL` ("must be declared NOT NULL before identity can be
+added"), and a sequence is created or moved `AS` the type the column ends
+with, so after the tightening and the retype (ORDERING.md).
+
+**A retype under a kept `serial`** moves its sequence with `ALTER SEQUENCE
+… AS`: measured, the engine moves an identity's sequence with its column and
+leaves an owned sequence's at the old type, which the reader then no longer
+holds as a `serial`.
+
+**Found, not named.** The sequence a column has is found by its dependency on
+the column (`pg_get_serial_sequence`), not by a name the plan holds, which a
+base that never saw the sequence renamed does not know (DEC-1631.1). A name
+changes only where both sides give one. Every read of pbps's own runs on the
+empty path under the catalog's operators (DEC-1564.1), and a sequence put on
+a table another role owns is given to that role first, as an added `serial`'s
+is (DEC-1631.1).
+
+**Refused, each by name:** a numbering change on a partitioned table or a
+partition, whose partitions each carry their parent's source (#1681, #1893);
+an owned sequence put on an `UNLOGGED` table, since it is created logged
+(DEC-1631.1); a nullable identity or `serial`, by validation; and a
+sequence's min, max, cycle or cache, which stay named limitations (#1921).
+
+The live `numbering_sources_change_in_place_and_continue_past_the_rows`
+pins every kind on 16 and 18, the continuation from values, from a
+conversion's counter and counting down, the gate, and the cost report;
+`a_serial_added_to_another_roles_table_is_that_roles` pins the owner and
+the operators.

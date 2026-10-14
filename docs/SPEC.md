@@ -383,9 +383,17 @@ indexes:
   that is shared, not owned, cached, bounded or cycling stays a named
   limitation, as does one on a partitioned table (#1893). A role inserting
   into it needs a grant on the sequence, which is not declared yet (#1892).
-  Adding, removing or changing a kept column's sequence is refused (#1889),
-  as is a `data:` block keyed by one. SQL Server refuses it: its form is
+  A `data:` block keyed by one is refused. SQL Server refuses it: its form is
   `identity:` (DEC-1631.1).
+- **A PostgreSQL column's numbering source changes in place**: a `serial` or
+  an identity put on a column, taken off, retuned, or one turned into the
+  other, as one change (DEC-1889.1). One put on a column that holds values
+  continues past them, and past the old source's counter, from its declared
+  start at least; a retune never restarts. An identity put on, an identity
+  turned into a `serial`, and a source taken off, are gated as `numbering`. A plain default given up or taken
+  beside it is its own default change. A partitioned table's source, and a
+  kept source whose increment changes sign, are refused (#1681, #1893). SQL Server refuses every identity change
+  (DECISIONS 5).
 - **A SQL Server computed column is declared under `computed:`**, beside
   `columns:` and not among them: `{expression: "a * 2"}`, with `persisted:
   true` for a stored value and `not_null: true` for `PERSISTED NOT NULL`. It
@@ -957,7 +965,7 @@ exists is never consulted, since no plan creates it again.
 
 | Class | Trigger | Risk |
 |---|---|---|
-| `rename` | A column, table or role is renamed | Dependent objects break (see 7.4); a role's old name is gone to `IS_ROLEMEMBER` and its kin |
+| `rename` | A column, table or role is renamed, or a column's owned sequence (DEC-1889.1) | Dependent objects break (see 7.4); a role's old name is gone to `IS_ROLEMEMBER` and its kin |
 | `destructive` | DROP COLUMN / DROP TABLE / DROP INDEX / DROP UNIQUE constraint / DROP of a computed column, which a computed column's expression change includes | Data loss or loss of a uniqueness guarantee; a computed column's values are derived, but it is an object gone |
 | `narrowing` | Type narrowing, a value-changing or incompatible conversion, or a changed generation expression | Changed values (including binary padding, or every row recomputed), truncation, failed conversion |
 | `not-null` | nullable → NOT NULL with no DEFAULT | Existing NULLs violate it |
@@ -966,6 +974,7 @@ exists is never consulted, since no plan creates it again.
 | `data-delete` | A reference row leaves the table | Rows elsewhere that point at it fail, or lose what they pointed at |
 | `revoke` | A permission is revoked, or a role dropped (4.7) | A running application loses access mid-flight |
 | `grant-widen` | A permission is granted (4.7) | Access widens. Labelled, **not gated**: the merge request reviews the grant |
+| `numbering` | A PostgreSQL identity put on a column, a `serial` turned into one, or a numbering source taken off (DEC-1889.1) | An insert supplying its own value, calling the old sequence by name, or leaving the column to the source now gone fails |
 
 The criterion is **whether this kind of change can fail or change stored values**; data is not read
 to decide whether this particular run happens to be safe. Data-level validation is

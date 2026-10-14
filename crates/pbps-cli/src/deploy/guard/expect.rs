@@ -18,8 +18,8 @@ pub(crate) struct ColumnExpected<'a> {
     pub(super) collation: Req<Option<&'a pbps_model::Collation>>,
     pub(super) generated_kind: Option<bool>,
     pub(super) generated_expression: Expr<'a>,
-    pub(super) identity: Option<&'a pbps_model::Identity>,
-    pub(super) sequence: Option<&'a pbps_model::OwnedSequence>,
+    pub(super) identity: Req<Option<&'a pbps_model::Identity>>,
+    pub(super) sequence: Req<Option<&'a pbps_model::OwnedSequence>>,
     pub(super) description: Option<&'a str>,
 }
 
@@ -69,8 +69,10 @@ impl<'a> ColumnExpected<'a> {
                 source.generated.map(|g| g.expression.as_str()),
                 ColumnField::Generated,
             ),
-            identity: source.identity,
-            sequence: source.sequence,
+            // A numbering change moves either (#1889); its promise holds the
+            // source it gives the column at the close.
+            identity: kept(source.identity, changed.contains(&ColumnField::Numbering)),
+            sequence: kept(source.sequence, changed.contains(&ColumnField::Numbering)),
             description: description.as_deref(),
         }
     }
@@ -248,6 +250,7 @@ impl<'a> TableChanges<'a> {
                 | Change::AttachPartition { .. }
                 | Change::AddColumn { .. }
                 | Change::AlterColumnExpression { .. }
+                | Change::AlterColumnNumbering { .. }
                 | Change::AddComputedColumn { .. }
                 | Change::DropComputedColumn { .. }
                 | Change::SetColumnDeprecated { .. }

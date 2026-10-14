@@ -120,8 +120,8 @@ pub(crate) fn column(expected: &ColumnExpected<'_>, now: &pbps_model::Column) ->
         moved.push("generation expression");
     }
     for (kept, name) in [
-        (expected.identity == source.identity, "identity"),
-        (expected.sequence == source.sequence, "sequence"),
+        (expected.identity.accepts(&source.identity), "identity"),
+        (expected.sequence.accepts(&source.sequence), "sequence"),
         (
             expected.description == description.as_deref(),
             "description",
@@ -336,6 +336,7 @@ pub(crate) fn columns_after(
                 *has == Source::of(&now.value_source).generated.is_some(),
                 "generation expression",
             ),
+            ColumnPromise::Numbering { from, to } => (numbering(from, to, now), "numbering source"),
             ColumnPromise::Collation(c) => (now.collation.as_ref() == *c, "collation"),
         };
         if !kept {
@@ -343,6 +344,33 @@ pub(crate) fn columns_after(
                 "{} column `{}` does not have the {what} this plan gives it",
                 column.table, column.name
             ));
+        }
+    }
+}
+
+/// Whether `now` has the numbering source a numbering change gives it (#1889):
+/// start and increment included, not its kind alone, so a retune another
+/// session undoes is found.
+fn numbering(
+    from: &pbps_model::ValueSource,
+    to: &pbps_model::ValueSource,
+    now: &pbps_model::Column,
+) -> bool {
+    use pbps_model::ValueSource;
+    match (to, &now.value_source) {
+        (ValueSource::Identity(a), ValueSource::Identity(b)) => a == b,
+        // A name the declaration leaves out is the one the sequence kept,
+        // where it was known.
+        (ValueSource::Sequence(a), ValueSource::Sequence(b)) => {
+            let kept = match (&a.name, from) {
+                (None, ValueSource::Sequence(was)) => was.name.as_ref(),
+                (None | Some(_), _) => None,
+            };
+            a.declares(b) && kept.is_none_or(|name| b.name.as_ref() == Some(name))
+        }
+        (ValueSource::Identity(_) | ValueSource::Sequence(_), _) => false,
+        (ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_), now) => {
+            pbps_model::NumberingKind::of(now).is_none()
         }
     }
 }

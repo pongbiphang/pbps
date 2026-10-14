@@ -3548,6 +3548,344 @@ async fn a_declared_xml_or_network_value_is_read_under_the_pins_and_not_the_sess
         .expect("drop");
 }
 
+/// Every numbering-source change a column can take, applied to tables that
+/// hold rows, read back, and planned again to nothing (#1889, DEC-1889.1).
+/// A source put on a column continues past what it holds and past the old
+/// source's counter, from the declared start at least; a retune moves no
+/// number already issued; and only the changes that can fail a writer
+/// working today face the `numbering` gate.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn numbering_sources_change_in_place_and_continue_past_the_rows() {
+    use pbps_model::{Identity, OwnedSequence, RiskClass, ValueSource};
+    let s = emit_schema("num1889");
+    let mut db = TestDb::create("num1889").await;
+    fresh(&mut db, &s).await;
+    db.execute(&format!(
+        "CREATE TABLE {s}.a (id integer NOT NULL); INSERT INTO {s}.a VALUES (1), (5), (500);
+         CREATE INDEX a_hash ON {s}.a USING hash (id);
+         CREATE TABLE {s}.b (id integer PRIMARY KEY); INSERT INTO {s}.b VALUES (1), (5), (500);
+         CREATE TABLE {s}.c (id serial PRIMARY KEY, v int);
+         INSERT INTO {s}.c (v) VALUES (1), (2), (3);
+         SELECT setval(pg_get_serial_sequence('{s}.c', 'id'), 1000);
+         CREATE TABLE {s}.d (id integer GENERATED ALWAYS AS IDENTITY, v int);
+         INSERT INTO {s}.d (v) VALUES (1), (2), (3);
+         CREATE TABLE {s}.e (id serial, v int); INSERT INTO {s}.e (v) VALUES (1);
+         CREATE TABLE {s}.f (id integer GENERATED ALWAYS AS IDENTITY, v int);
+         INSERT INTO {s}.f (v) VALUES (1);
+         CREATE TABLE {s}.g (id serial, v int); INSERT INTO {s}.g (v) VALUES (1), (2), (3);
+         CREATE TABLE {s}.h (id integer GENERATED ALWAYS AS IDENTITY, v int);
+         INSERT INTO {s}.h (v) VALUES (1), (2), (3);
+         CREATE TABLE {s}.i (id serial);
+         CREATE TABLE {s}.j (id integer NOT NULL); INSERT INTO {s}.j VALUES (-5), (10);
+         CREATE TABLE {s}.k (id serial);
+         CREATE TABLE {s}.l (id serial);
+         CREATE TABLE {s}.m (id integer NOT NULL DEFAULT 0); INSERT INTO {s}.m VALUES (1), (7);
+         CREATE TABLE {s}.n (id integer); INSERT INTO {s}.n VALUES (1), (2);
+         CREATE TABLE {s}.o (id serial);
+         CREATE VIEW {s}.o_next AS SELECT nextval('{s}.o_id_seq') AS n;
+         CREATE TABLE {s}.p (id integer GENERATED ALWAYS AS IDENTITY);
+         CREATE TABLE {s}.q (id numeric(8, 1) NOT NULL); INSERT INTO {s}.q VALUES (32766.2);
+         CREATE TABLE {s}.r (id bigserial PRIMARY KEY);
+         SELECT setval(pg_get_serial_sequence('{s}.r', 'id'), 9223372036854775807);
+         CREATE TABLE {s}.s (id serial); ALTER SEQUENCE {s}.s_id_seq RENAME TO numbers;
+         CREATE TABLE {s}.u (id serial);
+         CREATE TABLE {s}.x (id serial); INSERT INTO {s}.x VALUES (2147483647);
+         CREATE TABLE {s}.y1 (id serial); ALTER SEQUENCE {s}.y1_id_seq RENAME TO ya;
+         CREATE TABLE {s}.y2 (id serial); ALTER SEQUENCE {s}.y2_id_seq RENAME TO yb;"
+    ))
+    .await
+    .expect("the tables");
+    let mut base = ours_only(&pull(&mut db).await, &s);
+    pbps_dialect::name_read_sequences(&mut base, &Postgres::new());
+    let mut ids = mint_ids(&base, &IdsFile::default(), &[]);
+
+    let serial = |start, increment, name: Option<&str>| {
+        ValueSource::Sequence(OwnedSequence {
+            start,
+            increment,
+            name: name.map(str::to_owned),
+        })
+    };
+    let identity = |seed, increment| ValueSource::Identity(Identity { seed, increment });
+    let mut declared = base.clone();
+    for (table, source, nullable, gated) in [
+        ("a", serial(1, 1, None), false, false),
+        ("b", identity(1, 1), false, true),
+        ("c", identity(1, 1), false, true),
+        ("d", serial(1, 1, None), false, true),
+        ("e", ValueSource::None, false, true),
+        ("f", ValueSource::None, true, true),
+        ("g", serial(50, 3, None), false, false),
+        ("h", identity(50, 3), false, false),
+        ("i", serial(1, 1, None), false, false),
+        ("j", identity(-1, -1), false, true),
+        ("k", serial(1, 1, Some("renamed_seq")), false, false),
+        ("l", ValueSource::Default("0".into()), false, true),
+        ("m", identity(1, 1), false, true),
+        ("n", identity(1, 1), false, true),
+        // Given up for a default only the column's new type takes, which is
+        // set after the retype (#1930 review).
+        (
+            "p",
+            ValueSource::Default("'2147483648'::bigint".into()),
+            false,
+            true,
+        ),
+        // Retyped from a value the retype rounds, which the bound probe
+        // must not read first (#1930 review).
+        ("q", serial(1, 1, None), false, false),
+        // An exhausted counter, turned the other way: passed over, not added
+        // to past its type (#1930 review).
+        ("r", identity(-1, -1), false, true),
+        // Renamed, and given up, each freeing a name a column added below
+        // takes (#1930 review).
+        ("s", serial(1, 1, Some("renamed_numbers")), false, false),
+        ("u", ValueSource::None, false, true),
+        // Widened and converted: the identity follows the retype, and
+        // continues past a value only the new type holds (#1930 review).
+        ("x", identity(1, 1), false, true),
+        // A chain: `y1` takes the name `y2` frees, so `y2` goes first.
+        ("y1", serial(1, 1, Some("yb")), false, false),
+        ("y2", serial(1, 1, Some("yc")), false, false),
+    ] {
+        let column = declared
+            .tables
+            .get_mut(&TableName::new(&s, table))
+            .unwrap()
+            .columns
+            .get_mut("id")
+            .unwrap();
+        column.value_source = source;
+        column.nullable = nullable;
+        match table {
+            "i" | "p" | "r" | "x" => column.ty = ty("bigint"),
+            "q" => column.ty = ty("smallint"),
+            _ => {}
+        }
+        let _ = gated;
+    }
+    for (table, name) in [("s", "numbers"), ("u", "u_id_seq")] {
+        let mut added = pbps_model::Column::new(ty("integer")).not_null();
+        added.value_source = serial(1, 1, Some(name));
+        declared
+            .tables
+            .get_mut(&TableName::new(&s, table))
+            .unwrap()
+            .columns
+            .insert("n".into(), added);
+    }
+    let declared_ids = mint_ids(&declared, &ids, &[]);
+    let cs = plan(&base, &ids, &declared, &declared_ids);
+    let base_ids = std::mem::replace(&mut ids, declared_ids);
+    let gated: std::collections::BTreeSet<String> = cs
+        .changes
+        .iter()
+        .filter(|p| p.risks.contains(&RiskClass::Numbering))
+        .filter_map(|p| p.change.table().map(|t| t.name.clone()))
+        .collect();
+    assert_eq!(
+        gated,
+        [
+            "b", "c", "d", "e", "f", "j", "l", "m", "n", "p", "r", "u", "x"
+        ]
+        .map(str::to_owned)
+        .into(),
+        "{cs:#?}"
+    );
+    // A connected plan says where numbering continues, where an index lets
+    // it read that in one probe; without one it says the apply reads it.
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
+    let mut about = std::collections::BTreeMap::new();
+    for (index, mut e) in pbps_pg::estimate::planned_estimates(&names) {
+        pbps_pg::estimate::against(&mut db, &mut e).await.unwrap();
+        about.insert(
+            cs.changes[index].change.table().unwrap().name.clone(),
+            e.about,
+        );
+    }
+    // A hash index gives no ordered probe for the greatest value.
+    assert!(
+        about["a"].contains("no b-tree index leads with id"),
+        "{about:#?}"
+    );
+    assert!(
+        about["b"].ends_with("its greatest value is 500 now, so numbering continues at 501"),
+        "{about:#?}"
+    );
+    assert!(
+        about["c"].ends_with("its greatest value is 3 now, so numbering continues at 1001"),
+        "{about:#?}"
+    );
+    let at = |table: &str| {
+        cs.changes
+            .iter()
+            .position(|p| p.change.table().is_some_and(|t| t.name == table))
+            .unwrap()
+    };
+    assert!(at("y2") < at("y1"), "{cs:#?}");
+    // The pre-flight finds nothing in the way: no value too near its type's
+    // bound, and none read before the retype that rounds it.
+    for probe in Postgres::new().preflight(&names).probes {
+        assert_eq!(
+            counted(&mut db, &probe.sql).await,
+            0,
+            "{}",
+            probe.description
+        );
+    }
+    // Nor does any catalog dependent block what the changes give up: an
+    // identity's sequence is its column's own, and an owned sequence goes
+    // with the default that calls it (#1930 review).
+    in_a_transaction(&mut db).await;
+    let sources = pbps_model::physical_sources::PhysicalSources::of(
+        pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap(),
+        &base,
+        &base_ids,
+    )
+    .unwrap();
+    let blockers = pbps_pg::impact::drop_blockers(&mut db, &sources)
+        .await
+        .expect("read the blockers");
+    rollback(&mut db).await;
+    assert!(
+        blockers.iter().all(|b| b.blocking.is_empty()),
+        "{blockers:?}"
+    );
+    apply(&mut db, &Postgres::new(), &cs).await;
+
+    // Negative: a view calling a sequence given up is in its way, named.
+    let mut without = declared.clone();
+    without
+        .tables
+        .get_mut(&TableName::new(&s, "o"))
+        .unwrap()
+        .columns
+        .get_mut("id")
+        .unwrap()
+        .value_source = ValueSource::None;
+    let removing = plan(&declared, &ids, &without, &ids);
+    in_a_transaction(&mut db).await;
+    let sources = pbps_model::physical_sources::PhysicalSources::of(
+        pbps_model::plan_names::PlanNames::of(&removing.changes, &ids).unwrap(),
+        &declared,
+        &ids,
+    )
+    .unwrap();
+    let blockers = pbps_pg::impact::drop_blockers(&mut db, &sources)
+        .await
+        .expect("read the blockers");
+    rollback(&mut db).await;
+    assert!(
+        blockers
+            .iter()
+            .any(|b| b.blocking.iter().any(|n| n.contains("o_next"))),
+        "{blockers:?}"
+    );
+
+    let mut after = ours_only(&pull(&mut db).await, &s);
+    pbps_dialect::name_read_sequences(&mut after, &Postgres::new());
+    let again = plan(&after, &ids, &declared, &ids);
+    assert!(again.is_empty(), "{again:#?}");
+
+    let next = |table: &str| format!("INSERT INTO {s}.{table} DEFAULT VALUES RETURNING id");
+    // Put on: past the values, from the declared start at least.
+    assert_eq!(number(&mut db, &next("a")).await, 501);
+    assert_eq!(number(&mut db, &next("b")).await, 501);
+    // Converted: past the old counter too, which stood past the values.
+    assert_eq!(number(&mut db, &next("c")).await, 1001);
+    assert_eq!(number(&mut db, &next("d")).await, 4);
+    assert_eq!(
+        text(
+            &mut db,
+            &format!("SELECT pg_get_serial_sequence('{s}.d', 'id')")
+        )
+        .await,
+        format!("{s}.d_id_seq")
+    );
+    // Retuned: the counter carries on by the new increment.
+    assert_eq!(number(&mut db, &next("g")).await, 6);
+    assert_eq!(number(&mut db, &next("h")).await, 6);
+    // Counting down: below the least value.
+    assert_eq!(number(&mut db, &next("j")).await, -6);
+    assert_eq!(number(&mut db, &next("m")).await, 8);
+    assert_eq!(number(&mut db, &next("n")).await, 3);
+    assert_eq!(number(&mut db, &next("l")).await, 0);
+    assert_eq!(
+        text(
+            &mut db,
+            &format!("INSERT INTO {s}.x DEFAULT VALUES RETURNING id::text")
+        )
+        .await,
+        "2147483648"
+    );
+    assert_eq!(
+        text(
+            &mut db,
+            &format!("INSERT INTO {s}.r DEFAULT VALUES RETURNING id::text")
+        )
+        .await,
+        "-1"
+    );
+    assert_eq!(
+        text(
+            &mut db,
+            &format!("INSERT INTO {s}.p DEFAULT VALUES RETURNING id::text")
+        )
+        .await,
+        "2147483648"
+    );
+    assert_eq!(
+        number(
+            &mut db,
+            &format!("INSERT INTO {s}.q DEFAULT VALUES RETURNING id::int4")
+        )
+        .await,
+        32767
+    );
+    assert_eq!(
+        text(
+            &mut db,
+            &format!(
+                "SELECT seqtypid::regtype::text FROM pg_sequence \
+                 WHERE seqrelid = pg_get_serial_sequence('{s}.i', 'id')::regclass"
+            )
+        )
+        .await,
+        "bigint"
+    );
+    assert_eq!(
+        text(
+            &mut db,
+            &format!("SELECT pg_get_serial_sequence('{s}.k', 'id')")
+        )
+        .await,
+        format!("{s}.renamed_seq")
+    );
+    // An identity refuses a supplied value, which is why putting one on is
+    // gated; a source given up leaves no sequence behind. (`c`'s identity
+    // made a sequence of its own under the name the old one had.)
+    assert!(
+        db.execute(&format!("INSERT INTO {s}.b VALUES (9999)"))
+            .await
+            .is_err()
+    );
+    let left: i64 = text(
+        &mut db,
+        &format!(
+            "SELECT count(*)::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = '{s}' AND c.relkind = 'S' AND c.relname IN \
+             ('e_id_seq', 'l_id_seq', 'k_id_seq')"
+        ),
+    )
+    .await
+    .parse()
+    .unwrap();
+    assert_eq!(left, 0);
+    drop_schema(&mut db, &s).await;
+    db.drop().await;
+}
+
 /// A `serial` added to a table another role owns, applied by a superuser:
 /// `CREATE SEQUENCE` gives the sequence to the superuser, and `OWNED BY`
 /// refuses a sequence whose owner is not the table's. Measured on 16 and 18,
@@ -3556,7 +3894,9 @@ async fn a_declared_xml_or_network_value_is_read_under_the_pins_and_not_the_sess
 /// does, and the rows are numbered (#1631). The owner is found on the
 /// table's write path, where an `=(oid, regclass)` a schema user added would
 /// match a bare `=` more exactly than the catalog's: it is never called
-/// (DEC-1564.1).
+/// (DEC-1564.1). So is a `serial` given to a column the table already has,
+/// which also reads the column's values past an `+(int8, int8)` of the
+/// schema's, never called either (#1889).
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn a_serial_added_to_another_roles_table_is_that_roles() {
@@ -3575,10 +3915,14 @@ async fn a_serial_added_to_another_roles_table_is_that_roles() {
          CREATE TABLE {s}.called (op text);
          CREATE FUNCTION {s}.eq(oid, regclass) RETURNS boolean LANGUAGE plpgsql AS $$
              BEGIN INSERT INTO {s}.called VALUES ('='); RETURN $1 = $2::oid; END $$;
-         CREATE OPERATOR {s}.= (leftarg = oid, rightarg = regclass, function = {s}.eq);"
+         CREATE OPERATOR {s}.= (leftarg = oid, rightarg = regclass, function = {s}.eq);
+         CREATE FUNCTION {s}.plus(int8, int8) RETURNS int8 LANGUAGE plpgsql AS $$
+             BEGIN INSERT INTO {s}.called VALUES ('+'); RETURN $1 OPERATOR(pg_catalog.+) $2;
+             END $$;
+         CREATE OPERATOR {s}.+ (leftarg = int8, rightarg = int8, function = {s}.plus);"
     ))
     .await
-    .expect("a table another role owns, and an operator a schema user added");
+    .expect("a table another role owns, and operators a schema user added");
     let read = ours_only(&pull(&mut db).await, &s);
     let ids = mint_ids(&read, &IdsFile::default(), &[]);
     let mut changed = read.clone();
@@ -3590,6 +3934,15 @@ async fn a_serial_added_to_another_roles_table_is_that_roles() {
         .unwrap()
         .columns
         .insert("n".into(), added);
+    // And the column it has, given one, past the rows it holds (#1889).
+    changed
+        .tables
+        .get_mut(&t)
+        .unwrap()
+        .columns
+        .get_mut("id")
+        .unwrap()
+        .value_source = pbps_model::ValueSource::Sequence(OwnedSequence::serial());
     let changed_ids = mint_ids(&changed, &ids, &[]);
     apply(
         &mut db,
@@ -3600,14 +3953,20 @@ async fn a_serial_added_to_another_roles_table_is_that_roles() {
     let sequence_owner = text(
         &mut db,
         &format!(
-            "SELECT pg_get_userbyid(relowner)::text FROM pg_class \
-             WHERE oid = pg_get_serial_sequence('{s}.t', 'n')::regclass"
+            "SELECT string_agg(DISTINCT pg_get_userbyid(relowner)::text, ',') FROM pg_class \
+             WHERE oid IN (pg_get_serial_sequence('{s}.t', 'n')::regclass, \
+             pg_get_serial_sequence('{s}.t', 'id')::regclass)"
         ),
     )
     .await;
     let numbered = text(
         &mut db,
         &format!("SELECT string_agg(n::text, ',' ORDER BY n) FROM {s}.t"),
+    )
+    .await;
+    let next_id = number(
+        &mut db,
+        &format!("INSERT INTO {s}.t DEFAULT VALUES RETURNING id"),
     )
     .await;
     let called = number(&mut db, &format!("SELECT count(*)::int4 FROM {s}.called")).await;
@@ -3622,6 +3981,7 @@ async fn a_serial_added_to_another_roles_table_is_that_roles() {
     assert_eq!(called, 0, "the schema user's operator ran");
     assert_eq!(sequence_owner, owner);
     assert_eq!(numbered, "1,2");
+    assert_eq!(next_id, 3);
     assert!(plan(&after, &changed_ids, &changed, &changed_ids).is_empty());
 }
 

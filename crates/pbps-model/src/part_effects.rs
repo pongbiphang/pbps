@@ -248,6 +248,10 @@ impl Change {
             | Change::AttachPartition { .. }
             | Change::AlterColumnType { .. }
             | Change::AlterColumnNullability { .. }
+            // A numbering source's sequence is no part this projection
+            // names; PostgreSQL's drop impact finds it by its dependency on
+            // the column (#1889).
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::AddComputedColumn { .. }
             | Change::DropComputedColumn { .. }

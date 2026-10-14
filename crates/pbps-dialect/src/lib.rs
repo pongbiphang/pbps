@@ -424,6 +424,9 @@ impl Unchecked {
             Change::AlterColumnExpression { column, .. } => {
                 format!("recomputed generated column {column}")
             }
+            Change::AlterColumnNumbering { column, .. } => {
+                format!("numbering source of {column}")
+            }
             Change::DeleteRow { table, key, .. } => format!("references to row {key} in {table}"),
             Change::DetachPartition { table, parent, .. } => {
                 format!("references to the partition {table}, detached from {parent}")
@@ -2569,6 +2572,14 @@ pub trait Dialect {
     /// way: this is about the principal, not what it holds.
     fn manages_roles(&self) -> bool {
         true
+    }
+
+    /// Whether a column's numbering source, an identity or an owned
+    /// sequence, is added, removed, retuned or converted in place (#1889,
+    /// DEC-1889.1). SQL Server has no `ALTER` for an identity, and a change
+    /// to one is refused there (DECISIONS 5).
+    fn changes_numbering(&self) -> bool {
+        false
     }
 
     /// Whether an `AlterModule` on this engine takes the object's existing

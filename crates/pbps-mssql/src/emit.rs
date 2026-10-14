@@ -652,6 +652,16 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             ),
         }),
 
+        // PostgreSQL only (#1889): the differ refuses an identity change on
+        // this engine, which has no `ALTER` for one.
+        Change::AlterColumnNumbering { column, .. } => Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: format!(
+                "{column}: a change to its identity has no ALTER on SQL Server, and this model \
+                 changes one on PostgreSQL only"
+            ),
+        }),
+
         Change::AlterColumnDefault {
             column, from, to, ..
         } => {

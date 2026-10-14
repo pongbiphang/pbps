@@ -23,7 +23,7 @@ use crate::name::{ColumnRef, TableName};
 use crate::role::{GrantTarget, Permission};
 use crate::schema::{
     CheckConstraint, Collation, Column, ComputedColumn, ForeignKey, Index, IndexMethod, PrimaryKey,
-    ReplicaIdentity, Table, UniqueConstraint,
+    ReplicaIdentity, Table, UniqueConstraint, ValueSource,
 };
 use crate::strategy::Strategy;
 use crate::types::ColumnType;
@@ -68,6 +68,12 @@ pub enum RiskClass {
     /// case, the merge request reviews the YAML diff and the gate approves the
     /// pinned plan, and a flag for it would add friction without safety.
     GrantWiden,
+    /// A column's numbering source changed so that a writer working today
+    /// can fail (#1889, DEC-1889.1): an identity added, which refuses a
+    /// supplied value; an owned sequence turned into one, which also takes
+    /// the sequence's name away; or the source removed, so an insert that
+    /// left the column to it fails `NOT NULL`.
+    Numbering,
 }
 
 impl RiskClass {
@@ -83,6 +89,7 @@ impl RiskClass {
             RiskClass::DataDelete => "data-delete",
             RiskClass::Revoke => "revoke",
             RiskClass::GrantWiden => "grant-widen",
+            RiskClass::Numbering => "numbering",
         }
     }
 
@@ -130,10 +137,13 @@ impl RiskClass {
             RiskClass::GrantWiden => {
                 "access widens: a role can do more than before, which the merge request should have reviewed"
             }
+            RiskClass::Numbering => {
+                "how the column is numbered changes: an insert that supplies its own value, calls the old sequence by name, or leaves the column to a source now gone fails"
+            }
         }
     }
 
-    pub const ALL: [RiskClass; 9] = [
+    pub const ALL: [RiskClass; 10] = [
         RiskClass::Rename,
         RiskClass::Destructive,
         RiskClass::Narrowing,
@@ -143,6 +153,7 @@ impl RiskClass {
         RiskClass::DataDelete,
         RiskClass::Revoke,
         RiskClass::GrantWiden,
+        RiskClass::Numbering,
     ];
 }
 
@@ -369,6 +380,26 @@ pub enum Change {
         column: ColumnRef,
         from: String,
         to: String,
+    },
+    /// A PostgreSQL column's numbering source added, removed, retuned or
+    /// converted (#1889, DEC-1889.1): an identity or an owned sequence
+    /// (`serial`) on at least one side, and on the other one of them, a
+    /// plain default or nothing. Never a generated column.
+    ///
+    /// No number already issued is renumbered or reissued: a source put on a
+    /// column that holds values continues past them, from the greater of its
+    /// declared start, the column's values and, for a conversion, the old
+    /// source's counter. Its start and increment change in place without
+    /// `RESTART`.
+    AlterColumnNumbering {
+        uid: Uid,
+        column: ColumnRef,
+        /// The column's type once the plan has run. A sequence is created
+        /// `AS` it, and an owned sequence kept through a retype is moved to
+        /// it, which the engine does for an identity's on its own.
+        ty: ColumnType,
+        from: ValueSource,
+        to: ValueSource,
     },
     /// A SQL Server computed column created (#1174, DEC-1174.1), at the end
     /// of its table. An expression or persisted change is this after a
@@ -931,6 +962,9 @@ pub enum ColumnField {
     Default,
     /// The generation expression (DEC-1168.1).
     Generated,
+    /// The numbering source: an identity or an owned sequence, with its
+    /// start, increment and name (#1889).
+    Numbering,
     /// The explicit collation (#1175).
     Collation,
     /// Named for exhaustiveness rather than because a comparison turns on it:
@@ -1104,6 +1138,16 @@ pub enum ColumnPromise<'a> {
     Default(bool),
     /// Whether the column is generated at all (DEC-1168.1).
     Generated(bool),
+    /// The numbering source the column has after the change, with its
+    /// start, increment and any name it declares, or none (#1889). Held to
+    /// all of them, not to the kind alone: a retune another session undoes
+    /// leaves the kind as it was (#1930 review). The source it had comes
+    /// along: a kept sequence whose declaration names none keeps the name
+    /// it had, which is then held too (#1930 review).
+    Numbering {
+        from: &'a ValueSource,
+        to: &'a ValueSource,
+    },
     /// The explicit collation the column has after the change, `None` being
     /// the database default (#1175).
     Collation(Option<&'a Collation>),
@@ -1127,8 +1171,35 @@ impl ColumnPromise<'_> {
             ColumnPromise::Nullable(_) => ColumnField::Nullable,
             ColumnPromise::Default(_) => ColumnField::Default,
             ColumnPromise::Generated(_) => ColumnField::Generated,
+            ColumnPromise::Numbering { .. } => ColumnField::Numbering,
             ColumnPromise::Collation(_) => ColumnField::Collation,
         }
+    }
+}
+
+/// A numbering source by kind, as [`ColumnPromise::Numbering`] holds it: the
+/// read is held to the kind, as a default is to being there, and not to its
+/// parameters (#1889).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberingKind {
+    Identity,
+    Sequence,
+}
+
+impl NumberingKind {
+    /// The numbering source a value source is, if any.
+    pub fn of(source: &ValueSource) -> Option<NumberingKind> {
+        match source {
+            ValueSource::Identity(_) => Some(NumberingKind::Identity),
+            ValueSource::Sequence(_) => Some(NumberingKind::Sequence),
+            ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => None,
+        }
+    }
+    /// Whether a change from `from` to `to` puts a numbering source on the
+    /// column that it was not numbered by: a new sequence or identity, which
+    /// continues past the values the column holds (DEC-1889.1).
+    pub fn installed(from: &ValueSource, to: &ValueSource) -> bool {
+        matches!(Self::of(to), Some(kind) if Self::of(from) != Some(kind))
     }
 }
 
@@ -1278,6 +1349,7 @@ impl Change {
             | Change::AlterColumnNullability { column, .. }
             | Change::AlterColumnDefault { column, .. }
             | Change::AlterColumnExpression { column, .. }
+            | Change::AlterColumnNumbering { column, .. }
             | Change::SetColumnDeprecated { column, .. } => &column.table,
             Change::CreateModule { .. }
             | Change::AlterModule { .. }
@@ -1333,6 +1405,7 @@ impl Change {
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -1452,6 +1525,7 @@ impl Change {
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -1515,7 +1589,8 @@ impl Change {
             Change::DropColumn { column, .. }
             | Change::AlterColumnType { column, .. }
             | Change::AlterColumnDefault { column, .. }
-            | Change::AlterColumnExpression { column, .. } => vec![column.clone()],
+            | Change::AlterColumnExpression { column, .. }
+            | Change::AlterColumnNumbering { column, .. } => vec![column.clone()],
             Change::AlterColumnNullability { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::CreateTable { .. }
@@ -1626,6 +1701,11 @@ impl Change {
             Change::AlterColumnExpression { column, .. } => {
                 vec![(column.clone(), ColumnField::Generated)]
             }
+            // A plain default given up or taken beside it is an
+            // `AlterColumnDefault` of its own.
+            Change::AlterColumnNumbering { column, .. } => {
+                vec![(column.clone(), ColumnField::Numbering)]
+            }
             Change::SetColumnDeprecated { column, .. } => {
                 vec![(column.clone(), ColumnField::Deprecated)]
             }
@@ -1698,6 +1778,7 @@ impl Change {
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -1781,6 +1862,7 @@ impl Change {
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -1841,6 +1923,7 @@ impl Change {
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -1899,6 +1982,7 @@ impl Change {
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -1989,6 +2073,11 @@ impl Change {
             Change::AlterColumnExpression { column, .. } => {
                 vec![(column.clone(), ColumnPromise::Generated(true))]
             }
+            Change::AlterColumnNumbering {
+                column, from, to, ..
+            } => {
+                vec![(column.clone(), ColumnPromise::Numbering { from, to })]
+            }
             Change::RenameColumn { .. }
             | Change::DropColumn { .. }
             | Change::SetColumnDeprecated { .. }
@@ -2056,6 +2145,7 @@ impl Change {
             | Change::AlterColumnNullability { column, .. }
             | Change::AlterColumnDefault { column, .. }
             | Change::AlterColumnExpression { column, .. }
+            | Change::AlterColumnNumbering { column, .. }
             | Change::SetColumnDeprecated { column, .. } => {
                 vec![(column.clone(), Presence::Present)]
             }
@@ -2202,6 +2292,7 @@ impl Change {
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::InsertRow { .. }
             | Change::UpdateRow { .. }
@@ -2249,6 +2340,7 @@ impl Change {
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -2311,6 +2403,7 @@ impl Change {
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -2361,6 +2454,7 @@ impl Change {
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }
@@ -2496,6 +2590,38 @@ impl Change {
             // name (SPEC §7.2, DEC-1168.1).
             Change::AlterColumnExpression { .. } => {
                 r.insert(RiskClass::Narrowing);
+            }
+            // Only where a writer working today can fail (DEC-1889.1): an
+            // identity is `GENERATED ALWAYS`, so one put on the column
+            // refuses a supplied value, and one replacing an owned sequence
+            // also takes away the name an application may call; a source
+            // removed leaves an insert that relied on it to fail `NOT NULL`.
+            // An owned sequence replacing an identity is a grantable object
+            // the identity was not: a writer that left the column to the
+            // identity needs `USAGE` on it, measured in ADR-0010 section 7
+            // (#1930 review). An owned sequence put on a column without a
+            // source, or a start or increment changed, fails no insert that
+            // works now.
+            Change::AlterColumnNumbering { from, to, .. } => {
+                let removed = NumberingKind::of(to).is_none();
+                let identity_added = matches!(to, ValueSource::Identity(_))
+                    && !matches!(from, ValueSource::Identity(_));
+                let identity_loosened = matches!(from, ValueSource::Identity(_))
+                    && matches!(to, ValueSource::Sequence(_));
+                if removed || identity_added || identity_loosened {
+                    r.insert(RiskClass::Numbering);
+                }
+                // A sequence renamed is reached from its default by oid, but
+                // an application calling it by name loses it, as a renamed
+                // table's callers do. Only where both names are given, as the
+                // emitter renames only then (#1930 review).
+                if let (ValueSource::Sequence(was), ValueSource::Sequence(now)) = (from, to)
+                    && was.name.is_some()
+                    && now.name.is_some()
+                    && was.name != now.name
+                {
+                    r.insert(RiskClass::Rename);
+                }
             }
             // A unique index and a UNIQUE constraint ask the data the same
             // question, and in SQL Server they *are* the same object: the

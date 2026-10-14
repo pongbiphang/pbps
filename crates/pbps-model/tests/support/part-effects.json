@@ -239,6 +239,43 @@
     }
   },
   {
+    "name": "AlterColumnNumbering",
+    "change": {
+      "op": "alter_column_numbering",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "ty": "integer",
+      "from": {
+        "sequence": {
+          "start": 1,
+          "increment": 1
+        }
+      },
+      "to": {
+        "identity": {
+          "seed": 1,
+          "increment": 1
+        }
+      }
+    }
+  },
+  {
+    "name": "AlterColumnNumbering/removed",
+    "change": {
+      "op": "alter_column_numbering",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "ty": "integer",
+      "from": {
+        "identity": {
+          "seed": 1,
+          "increment": 1
+        }
+      },
+      "to": {}
+    }
+  },
+  {
     "name": "AddComputedColumn",
     "change": {
       "op": "add_computed_column",

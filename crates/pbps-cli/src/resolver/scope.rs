@@ -256,6 +256,7 @@ pub(crate) fn planned_schema_grants(
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::AddUnique { .. }

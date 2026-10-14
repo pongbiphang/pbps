@@ -133,6 +133,10 @@ pub fn rename_targets(
             | Change::AlterColumnNullability { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
+            // A sequence it renames is reached from a default or a view by
+            // its oid, which the rename keeps; only text names it, and no
+            // catalog lists that (#1889).
+            | Change::AlterColumnNumbering { .. }
             | Change::SetColumnDeprecated { .. }
             | Change::SetPrimaryKey { .. }
             | Change::SetIndexStorageParameters { .. }

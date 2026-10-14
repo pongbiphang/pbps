@@ -42,6 +42,7 @@ fn chain(column: bool, intermediate: bool, rename_table: bool) -> (ChangeSet, Re
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnDefault { .. }
         | Change::AlterColumnExpression { .. }
+        | Change::AlterColumnNumbering { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { .. }
         | Change::AddUnique { .. }

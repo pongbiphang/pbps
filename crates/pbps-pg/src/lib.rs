@@ -1612,6 +1612,13 @@ impl Dialect for Postgres {
         false
     }
 
+    /// **Yes** (#1889): an identity's start and increment are `SET` in place,
+    /// an owned sequence's are `ALTER SEQUENCE`, and either is put on or
+    /// taken off a column with `ALTER COLUMN`, measured on 16 and 18.
+    fn changes_numbering(&self) -> bool {
+        true
+    }
+
     /// **Yes.** Every module edit on this engine is a `DROP` and a `CREATE`
     /// (ADR-0009 §3), so an object about to be rebuilt has no ACL until the
     /// declared grants on it are re-emitted after the `CREATE` — the same
@@ -2996,10 +3003,11 @@ mod tests {
     }
 
     /// A table's rename keeps its `serial`'s sequence under the name the old
-    /// table generated. Against a read, which knows that name, the renamed
-    /// table may declare it and no other. Against a git baseline, which is a
-    /// declaration and does not know it, a later pull's name for it is no
-    /// change; one the baseline does name is still compared (#1631).
+    /// table generated. Against a read, which knows that name, declaring it
+    /// is no change and another renames the sequence. Against a git
+    /// baseline, which is a declaration and does not know it, a later pull's
+    /// name for it is no change; one the baseline does name is still
+    /// compared (#1631), and renamed where it differs (#1889).
     #[test]
     fn a_renamed_tables_serial_may_name_the_sequence_it_kept() {
         use pbps_model::{Column, Hints, IdsFile, Intent, Schema, Table, TableName};
@@ -3044,11 +3052,17 @@ mod tests {
                 &Hints::default(),
             )
         };
-        let refused = |result: Result<pbps_model::ChangeSet, Vec<pbps_diff::DiffError>>| {
-            matches!(
-                result.as_ref().map_err(Vec::as_slice),
-                Err([pbps_diff::DiffError::SequenceChangeUnsupported { .. }])
-            )
+        let renamed = |result: Result<pbps_model::ChangeSet, Vec<pbps_diff::DiffError>>,
+                       to: &str| {
+            result.expect("a rename").changes.iter().any(|p| {
+                matches!(
+                    &p.change,
+                    pbps_model::Change::AlterColumnNumbering {
+                        to: pbps_model::ValueSource::Sequence(s),
+                        ..
+                    } if s.name.as_deref() == Some(to)
+                )
+            })
         };
 
         // Against a read of `app.t` before the rename.
@@ -3068,22 +3082,702 @@ mod tests {
             "{kept:#?}"
         );
         diff(&read, &schema("app.u", serial(None)), &rename).expect("no name declared");
-        assert!(refused(diff(
-            &read,
-            &schema("app.u", serial(Some("other_seq"))),
-            &rename
-        )));
+        assert!(renamed(
+            diff(&read, &schema("app.u", serial(Some("other_seq"))), &rename),
+            "other_seq"
+        ));
 
         // Against a git baseline declaring `app.u` after that rename, without
         // the name, and the name a later pull wrote.
         let declared = schema("app.u", serial(None));
         diff(&declared, &schema("app.u", serial(Some("t_id_seq"))), &[])
             .expect("a pulled name against an unnamed declaration");
-        assert!(refused(diff(
-            &schema("app.u", serial(Some("numbers"))),
-            &schema("app.u", serial(Some("t_id_seq"))),
-            &[]
-        )));
+        assert!(renamed(
+            diff(
+                &schema("app.u", serial(Some("numbers"))),
+                &schema("app.u", serial(Some("t_id_seq"))),
+                &[]
+            ),
+            "t_id_seq"
+        ));
+    }
+
+    /// An identity put on a nullable column of a table whose declared rows
+    /// the plan writes: the column is made NOT NULL first, as the engine
+    /// requires, and the rows after, which leave the identity column out and
+    /// take its numbers. The tightening is not moved after the rows, nor
+    /// split out of a retype, as it is for a column without one (#1367,
+    /// #1930 review). A plan that only deletes rows moves both after the
+    /// deletes, which may remove the rows holding NULL.
+    #[test]
+    fn an_identity_put_on_keeps_its_tightening_ahead_of_the_rows() {
+        use pbps_model::{
+            Change, Column, DataMode, Hints, Identity, IdsFile, PrimaryKey, Row, RowKey, Schema,
+            Table, TableData, TableName, Value, ValueSource,
+        };
+        let shaped = |ty: &str, identity: bool, rows: &[&str]| {
+            let mut table = Table::default();
+            table.columns.insert(
+                "code".into(),
+                Column::new("text".parse().unwrap()).not_null(),
+            );
+            let mut id = Column::new(ty.parse().unwrap());
+            if identity {
+                id = id.not_null();
+                id.value_source = ValueSource::Identity(Identity {
+                    seed: 1,
+                    increment: 1,
+                });
+            }
+            table.columns.insert("id".into(), id);
+            table
+                .columns
+                .insert("label".into(), Column::new("text".parse().unwrap()));
+            table.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["code".into()],
+                storage_parameters: Default::default(),
+            });
+            table.data = Some(TableData {
+                mode: DataMode::Ensure,
+                rows: rows
+                    .iter()
+                    .map(|k| {
+                        (
+                            RowKey::from(*k),
+                            [("label".to_owned(), Value::Text((*k).to_owned()))]
+                                .into_iter()
+                                .collect::<Row>(),
+                        )
+                    })
+                    .collect(),
+            });
+            let mut s = Schema::default();
+            s.tables.insert(TableName::new("app", "t"), table);
+            s
+        };
+        let context = pbps_diff::Context {
+            operator: "test".into(),
+            today: "2026-10-13".into(),
+        };
+        let planned = |base: &Schema, declared: &Schema| {
+            let ids = pbps_diff::resolve(base, &IdsFile::default(), &[], &context)
+                .unwrap()
+                .ids;
+            let side = |schema| pbps_diff::Side { schema, ids: &ids };
+            pbps_diff::diff(
+                side(base),
+                side(declared),
+                &super::Postgres::new(),
+                &Hints::default(),
+            )
+        };
+        let order = |base: &Schema, declared: &Schema| -> Vec<String> {
+            planned(base, declared)
+                .unwrap()
+                .changes
+                .iter()
+                .filter_map(|p| {
+                    if let Change::AlterColumnNullability { .. } = &p.change {
+                        Some("tighten".to_owned())
+                    } else if let Change::AlterColumnType { to_nullable, .. } = &p.change {
+                        Some(format!("retype nullable={to_nullable}"))
+                    } else if let Change::AlterColumnNumbering { .. } = &p.change {
+                        Some("identity".to_owned())
+                    } else if let Change::InsertRow { .. } = &p.change {
+                        Some("insert".to_owned())
+                    } else if let Change::DeleteRow { .. } = &p.change {
+                        Some("delete".to_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let base = shaped("integer", false, &[]);
+        assert_eq!(
+            order(&base, &shaped("integer", true, &["a"])),
+            ["tighten", "identity", "insert"]
+        );
+        assert_eq!(
+            order(&base, &shaped("bigint", true, &["a"])),
+            ["retype nullable=false", "identity", "insert"]
+        );
+        // A plan that only deletes rows may delete the ones holding NULL:
+        // the tightening follows the deletes, and the identity follows it.
+        let exact = |mut s: Schema| {
+            for t in s.tables.values_mut() {
+                t.data.as_mut().unwrap().mode = DataMode::Exact;
+            }
+            s
+        };
+        let held = exact(shaped("integer", false, &["a", "b"]));
+        assert_eq!(
+            order(&held, &exact(shaped("integer", true, &["a"]))),
+            ["delete", "tighten", "identity"]
+        );
+        assert_eq!(
+            order(&held, &exact(shaped("bigint", true, &["a"]))),
+            ["retype nullable=true", "delete", "tighten", "identity"]
+        );
+        // Deleting and inserting both: the deletes, the tightening, the
+        // identity, then the inserts that take its numbers.
+        assert_eq!(
+            order(&held, &exact(shaped("integer", true, &["a", "c"]))),
+            ["delete", "tighten", "identity", "insert"]
+        );
+        // Then another table's rows referencing it would be written before
+        // the rows they may reference, and are refused by name.
+        let referencing = |mut s: Schema| {
+            let mut r = Table::default();
+            r.columns.insert(
+                "code".into(),
+                Column::new("text".parse().unwrap()).not_null(),
+            );
+            r.columns
+                .insert("t_code".into(), Column::new("text".parse().unwrap()));
+            r.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["code".into()],
+                storage_parameters: Default::default(),
+            });
+            r.foreign_keys.insert(
+                "r_t".into(),
+                pbps_model::ForeignKey {
+                    columns: vec!["t_code".into()],
+                    references_table: TableName::new("app", "t"),
+                    references_columns: vec!["code".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                },
+            );
+            r.data = Some(TableData {
+                mode: DataMode::Ensure,
+                rows: [(
+                    RowKey::from("x"),
+                    [("t_code".to_owned(), Value::Text("c".into()))]
+                        .into_iter()
+                        .collect::<Row>(),
+                )]
+                .into_iter()
+                .collect(),
+            });
+            s.tables.insert(TableName::new("app", "r"), r);
+            s
+        };
+        let mut held_r = referencing(held.clone());
+        held_r
+            .tables
+            .get_mut(&TableName::new("app", "r"))
+            .unwrap()
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .clear();
+        let errors = planned(
+            &held_r,
+            &referencing(exact(shaped("integer", true, &["a", "c"]))),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [pbps_diff::DiffError::RowsReferenceLateIdentityRows { .. }]
+            ),
+            "{errors:?}"
+        );
+        // Negative: a referencing table this plan creates gets its key in
+        // class 13, after every row, so nothing refuses its rows.
+        planned(
+            &held,
+            &referencing(exact(shaped("integer", true, &["a", "c"]))),
+        )
+        .expect("the key is added after the rows");
+        // Nor a key this plan adds to a table it has.
+        let mut unkeyed = held_r.clone();
+        unkeyed
+            .tables
+            .get_mut(&TableName::new("app", "r"))
+            .unwrap()
+            .foreign_keys
+            .clear();
+        planned(
+            &unkeyed,
+            &referencing(exact(shaped("integer", true, &["a", "c"]))),
+        )
+        .expect("the key is added after the rows");
+        // Negative: inserting without deleting keeps both in class 9, where
+        // the referencing rows follow, and plans.
+        let mut kept = held_r.clone();
+        for t in kept.tables.values_mut() {
+            if let Some(d) = t.data.as_mut() {
+                d.mode = DataMode::Ensure;
+            }
+        }
+        let declared = referencing(shaped("integer", true, &["a", "b", "c"]));
+        planned(&kept, &declared).expect("no delete, so the identity stays ahead");
+        // Negative: without the identity the tightening follows the rows,
+        // and comes out of the retype to do so.
+        let mut plain = shaped("integer", true, &["a"]);
+        let mut bigint = shaped("bigint", true, &["a"]);
+        for s in [&mut plain, &mut bigint] {
+            s.tables
+                .get_mut(&TableName::new("app", "t"))
+                .unwrap()
+                .columns
+                .get_mut("id")
+                .unwrap()
+                .value_source = ValueSource::None;
+        }
+        assert_eq!(order(&base, &plain), ["insert", "tighten"]);
+        assert_eq!(
+            order(&base, &bigint),
+            ["retype nullable=true", "insert", "tighten"]
+        );
+    }
+
+    /// Each numbering change is one change carrying both sources, gated only
+    /// where a writer working today can fail (#1889, DEC-1889.1): an identity
+    /// put on, a source given up. Put on, loosened or retuned, it is not; a
+    /// known sequence name changed is a rename. Where the table cannot take
+    /// one it is refused by name: partitioned, or a sequence created logged
+    /// for an `UNLOGGED` table. To or from generated has no in-place form.
+    #[test]
+    fn a_numbering_change_is_one_change_gated_only_where_a_writer_can_fail() {
+        use pbps_model::{
+            Change, Column, Hints, Identity, IdsFile, OwnedSequence, RiskClass, Schema, Table,
+            TableName, ValueSource,
+        };
+        let column = |ty: &str, source: ValueSource| {
+            let mut c = Column::new(ty.parse().unwrap()).not_null();
+            c.value_source = source;
+            c
+        };
+        let schema = |c: Column, shape: &dyn Fn(&mut Table)| {
+            let mut table = Table::default();
+            table.columns.insert("id".into(), c);
+            shape(&mut table);
+            let mut s = Schema::default();
+            s.tables.insert(TableName::new("app", "t"), table);
+            s
+        };
+        let context = pbps_diff::Context {
+            operator: "test".into(),
+            today: "2026-10-13".into(),
+        };
+        let diff = |base: &Schema, declared: &Schema| {
+            let ids = pbps_diff::resolve(base, &IdsFile::default(), &[], &context)
+                .unwrap()
+                .ids;
+            pbps_diff::diff(
+                pbps_diff::Side {
+                    schema: base,
+                    ids: &ids,
+                },
+                pbps_diff::Side {
+                    schema: declared,
+                    ids: &ids,
+                },
+                &super::Postgres::new(),
+                &Hints::default(),
+            )
+        };
+        let plain = |_: &mut Table| {};
+        let serial = |start, increment, name: Option<&str>| {
+            ValueSource::Sequence(OwnedSequence {
+                start,
+                increment,
+                name: name.map(str::to_owned),
+            })
+        };
+        let identity = ValueSource::Identity(Identity {
+            seed: 1,
+            increment: 1,
+        });
+        let none = ValueSource::None;
+        for (from, to, risks) in [
+            (none.clone(), identity.clone(), vec![RiskClass::Numbering]),
+            (none.clone(), serial(1, 1, None), vec![]),
+            (
+                identity.clone(),
+                serial(1, 1, None),
+                vec![RiskClass::Numbering],
+            ),
+            (
+                serial(1, 1, None),
+                identity.clone(),
+                vec![RiskClass::Numbering],
+            ),
+            (serial(1, 1, None), none.clone(), vec![RiskClass::Numbering]),
+            (serial(1, 1, None), serial(9, 3, None), vec![]),
+            // A name the declaration leaves out is the one the base has.
+            (serial(1, 1, Some("old_seq")), serial(9, 3, None), vec![]),
+            (
+                ValueSource::Identity(Identity {
+                    seed: 9,
+                    increment: 3,
+                }),
+                identity.clone(),
+                vec![],
+            ),
+            (
+                serial(1, 1, Some("old_seq")),
+                serial(1, 1, Some("new_seq")),
+                vec![RiskClass::Rename],
+            ),
+        ] {
+            let planned = diff(
+                &schema(column("integer", from.clone()), &plain),
+                &schema(column("integer", to.clone()), &plain),
+            )
+            .unwrap_or_else(|e| panic!("{from:?} -> {to:?}: {e:?}"));
+            let [p] = planned.changes.as_slice() else {
+                panic!("{from:?} -> {to:?}: {planned:#?}");
+            };
+            assert!(
+                matches!(&p.change, Change::AlterColumnNumbering { from: f, to: t, .. }
+                    if *f == from && *t == to),
+                "{p:#?}"
+            );
+            assert_eq!(p.risks, risks.into_iter().collect(), "{from:?} -> {to:?}");
+        }
+
+        // A plain default on either side is an `AlterColumnDefault` beside
+        // the change, ordered as every default is: given up after a source
+        // is taken on, taken after a source is given up (#1930 review).
+        let default = ValueSource::Default("0".into());
+        for (from, to) in [
+            (serial(1, 1, None), default.clone()),
+            (identity.clone(), default.clone()),
+            (default.clone(), identity.clone()),
+            (default.clone(), serial(1, 1, None)),
+        ] {
+            let planned = diff(
+                &schema(column("integer", from.clone()), &plain),
+                &schema(column("integer", to.clone()), &plain),
+            )
+            .unwrap();
+            let kinds: Vec<_> = planned
+                .changes
+                .iter()
+                .map(|p| {
+                    if let Change::AlterColumnNumbering { from, to, .. } = &p.change {
+                        assert!(
+                            !matches!(from, ValueSource::Default(_))
+                                && !matches!(to, ValueSource::Default(_)),
+                            "{p:#?}"
+                        );
+                        "numbering"
+                    } else if let Change::AlterColumnDefault { .. } = &p.change {
+                        "default"
+                    } else {
+                        panic!("{p:?}")
+                    }
+                })
+                .collect();
+            let expected = if matches!(to, ValueSource::Default(_)) {
+                ["numbering", "default"]
+            } else {
+                ["default", "numbering"]
+            };
+            assert_eq!(kinds, expected, "{from:?} -> {to:?}");
+        }
+
+        // A retype under a kept `serial` moves its sequence with it.
+        let retyped = diff(
+            &schema(column("integer", serial(1, 1, None)), &plain),
+            &schema(column("bigint", serial(1, 1, None)), &plain),
+        )
+        .unwrap();
+        assert!(
+            retyped.changes.iter().any(|p| matches!(
+                &p.change,
+                Change::AlterColumnNumbering { ty, .. } if ty.to_string() == "bigint"
+            )),
+            "{retyped:#?}"
+        );
+        // Negative: the same source unchanged is no change.
+        assert!(
+            diff(
+                &schema(column("integer", serial(1, 1, None)), &plain),
+                &schema(column("integer", serial(1, 1, None)), &plain),
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        let partitioned = |t: &mut Table| {
+            t.partition_by = Some(pbps_model::PartitionBy {
+                columns: vec!["id".into()],
+                external: false,
+            });
+        };
+        let unlogged = |t: &mut Table| t.unlogged = true;
+        for (base, declared, refused) in [
+            (
+                schema(column("integer", identity.clone()), &plain),
+                schema(
+                    column(
+                        "integer",
+                        ValueSource::Identity(Identity {
+                            seed: -1,
+                            increment: -1,
+                        }),
+                    ),
+                    &plain,
+                ),
+                "direction",
+            ),
+            (
+                schema(column("integer", serial(1, 1, None)), &plain),
+                schema(column("integer", serial(-1, -1, None)), &plain),
+                "direction",
+            ),
+            (
+                schema(column("integer", none.clone()), &partitioned),
+                schema(column("integer", identity.clone()), &partitioned),
+                "partitioned",
+            ),
+            (
+                schema(column("integer", none.clone()), &unlogged),
+                schema(column("integer", serial(1, 1, None)), &unlogged),
+                "unlogged",
+            ),
+            (
+                schema(column("integer", identity.clone()), &plain),
+                schema(
+                    column(
+                        "integer",
+                        ValueSource::Generated(pbps_model::Generated {
+                            expression: "1".into(),
+                            stored: true,
+                        }),
+                    ),
+                    &plain,
+                ),
+                "generated",
+            ),
+        ] {
+            let errs = diff(&base, &declared).expect_err(refused);
+            assert!(
+                matches!(
+                    (refused, errs.as_slice()),
+                    (
+                        "partitioned",
+                        [pbps_diff::DiffError::NumberingChangeOnPartitionedTable { .. }]
+                    ) | (
+                        "unlogged",
+                        [pbps_diff::DiffError::SequenceChangeUnsupported { .. }]
+                    ) | (
+                        "generated",
+                        [pbps_diff::DiffError::GenerationChangeUnsupported { .. }]
+                    ) | (
+                        "direction",
+                        [pbps_diff::DiffError::NumberingDirectionChange { .. }]
+                    )
+                ),
+                "{refused}: {errs:?}"
+            );
+        }
+        // An identity on an unlogged table takes the table's persistence:
+        // not refused.
+        assert!(
+            diff(
+                &schema(column("integer", none.clone()), &unlogged),
+                &schema(column("integer", identity.clone()), &unlogged),
+            )
+            .is_ok()
+        );
+    }
+
+    /// Owned sequences renamed into each other's names are refused by name
+    /// at diff time, as table and column rename cycles are (DEC-541.1,
+    /// DEC-1966.1): no order of the renames is one the engine performs
+    /// (#1930 review). A chain, where each name is freed before it is
+    /// taken, is ordered and not refused.
+    #[test]
+    fn a_sequence_rename_cycle_is_refused_by_name() {
+        use pbps_diff::DiffError;
+        use pbps_model::{
+            Column, Hints, IdsFile, OwnedSequence, Schema, Table, TableName, ValueSource,
+        };
+        let schema = |names: &[(&str, &str)]| {
+            let mut s = Schema::default();
+            for (table, sequence) in names {
+                let mut c = Column::new("integer".parse().unwrap()).not_null();
+                c.value_source = ValueSource::Sequence(OwnedSequence {
+                    start: 1,
+                    increment: 1,
+                    name: Some((*sequence).to_owned()),
+                });
+                let mut t = Table::default();
+                t.columns.insert("id".into(), c);
+                s.tables.insert(TableName::new("app", *table), t);
+            }
+            s
+        };
+        let context = pbps_diff::Context {
+            operator: "test".into(),
+            today: "2026-10-14".into(),
+        };
+        let diff = |base: &Schema, declared: &Schema| {
+            let ids = pbps_diff::resolve(base, &IdsFile::default(), &[], &context)
+                .unwrap()
+                .ids;
+            pbps_diff::diff(
+                pbps_diff::Side {
+                    schema: base,
+                    ids: &ids,
+                },
+                pbps_diff::Side {
+                    schema: declared,
+                    ids: &ids,
+                },
+                &super::Postgres::new(),
+                &Hints::default(),
+            )
+        };
+        let cycles = |base: &Schema, declared: &Schema| -> Vec<Vec<String>> {
+            diff(base, declared)
+                .err()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|e| {
+                    if let DiffError::SequenceRenameCycle { renames } = e {
+                        Some(
+                            renames
+                                .iter()
+                                .map(|(from, to)| format!("{from} -> {to}"))
+                                .collect(),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        // Two sequences trading names.
+        let base = schema(&[("a", "a_seq"), ("b", "b_seq")]);
+        let swap = schema(&[("a", "b_seq"), ("b", "a_seq")]);
+        assert_eq!(
+            cycles(&base, &swap),
+            [vec!["app.a_seq -> app.b_seq", "app.b_seq -> app.a_seq"]]
+        );
+        let message = diff(&base, &swap)
+            .unwrap_err()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<String>();
+        assert!(message.contains("separate deployments"), "{message}");
+        assert!(message.contains("temporary name"), "{message}");
+        // Three rotating.
+        let base3 = schema(&[("a", "x"), ("b", "y"), ("c", "z")]);
+        let rotated = schema(&[("a", "y"), ("b", "z"), ("c", "x")]);
+        assert_eq!(cycles(&base3, &rotated).len(), 1, "one cycle, listed once");
+        assert_eq!(cycles(&base3, &rotated)[0].len(), 3);
+        // Negative: a chain is ordered, not refused.
+        let chain = schema(&[("a", "b_seq"), ("b", "c_seq")]);
+        let renames = diff(&base, &chain).expect("a chain is planned");
+        assert_eq!(renames.changes.len(), 2, "{renames:?}");
+    }
+
+    /// What the block a numbering change runs says, for the parts a live run
+    /// cannot see go wrong (#1889): pbps's own reads on the empty path under
+    /// the catalog's operators (DEC-1564.1), the table locked before any of
+    /// them, and no `RESTART` anywhere, which would reissue numbers.
+    #[test]
+    fn a_numbering_change_reads_under_the_lock_on_the_catalogs_operators() {
+        use pbps_dialect::Dialect;
+        use pbps_model::{Change, Identity, OwnedSequence, Strategy, TableName, ValueSource};
+        let column = TableName::new("app", "t").column("id");
+        let emit = |from: ValueSource, to: ValueSource| {
+            super::Postgres::new()
+                .emit(
+                    &Change::AlterColumnNumbering {
+                        uid: "c_a1b2c3".parse().unwrap(),
+                        column: column.clone(),
+                        ty: "integer".parse().unwrap(),
+                        from,
+                        to,
+                    },
+                    Strategy::default(),
+                )
+                .unwrap()
+                .into_iter()
+                .map(|s| s.sql)
+                .collect::<Vec<_>>()
+        };
+        let serial = ValueSource::Sequence(OwnedSequence::serial());
+        let identity = ValueSource::Identity(Identity {
+            seed: 1,
+            increment: 1,
+        });
+        // One statement, so no checkpoint falls inside it.
+        let [converted] = emit(serial.clone(), identity.clone()).try_into().unwrap();
+        let lock = converted
+            .find("LOCK TABLE \"app\".\"t\" IN ACCESS EXCLUSIVE MODE;")
+            .unwrap();
+        let counter = converted.find("pbps.pbps_counter;").unwrap();
+        let identity_on = converted.find("ADD GENERATED ALWAYS AS IDENTITY").unwrap();
+        let read = converted.find("pg_catalog.max(r.\"id\")").unwrap();
+        assert!(
+            lock < counter && counter < identity_on && identity_on < read,
+            "{converted}"
+        );
+        assert!(converted.contains("OPERATOR(pg_catalog.+)"), "{converted}");
+        assert!(!converted.contains(" + "), "{converted}");
+        assert!(converted.contains("PERFORM pg_catalog.set_config('search_path', '', true);"));
+        let down = emit(
+            ValueSource::None,
+            ValueSource::Identity(Identity {
+                seed: -1,
+                increment: -1,
+            }),
+        )
+        .concat();
+        assert!(
+            down.contains("pg_catalog.min(r.\"id\")") && down.contains("LEAST("),
+            "{down}"
+        );
+        for retuned in [
+            emit(
+                serial.clone(),
+                ValueSource::Sequence(OwnedSequence {
+                    start: 5,
+                    increment: 2,
+                    name: None,
+                }),
+            ),
+            emit(
+                identity.clone(),
+                ValueSource::Identity(Identity {
+                    seed: 5,
+                    increment: 2,
+                }),
+            ),
+        ] {
+            let sql = retuned.concat();
+            assert!(!sql.contains("RESTART") && !sql.contains("setval"), "{sql}");
+        }
+        // Negative: generated is refused, never emitted.
+        assert!(
+            super::Postgres::new()
+                .emit(
+                    &Change::AlterColumnNumbering {
+                        uid: "c_a1b2c3".parse().unwrap(),
+                        column: column.clone(),
+                        ty: "integer".parse().unwrap(),
+                        from: ValueSource::Generated(pbps_model::Generated {
+                            expression: "1".into(),
+                            stored: true,
+                        }),
+                        to: identity,
+                    },
+                    Strategy::default(),
+                )
+                .is_err()
+        );
     }
 
     #[test]
