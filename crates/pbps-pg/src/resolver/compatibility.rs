@@ -37,13 +37,26 @@ const OBSERVATIONS: &[&str] = &[
 const OPTIONAL_OBSERVATIONS: &[&str] = &["database_locale", "database_icu_rules"];
 
 /// Effective settings the rule compares: the ambient settings that change
-/// binding or loaded code and that no pin covers. The nine the dialect pins
-/// before every deployment statement (`session_pins!`, DECISIONS 458) are
-/// not among them: a deployment statement never runs under a server's own
-/// default for `TimeZone` or `DateStyle`, so two servers whose defaults
+/// binding or loaded code and that no pin covers. Every setting the dialect
+/// pins before a deployment statement (`session_pins` in `lib.rs`, DECISIONS
+/// 458) is absent from it: a deployment statement never runs under a server's
+/// own default for `TimeZone` or `DateStyle`, so two servers whose defaults
 /// differ deploy identically, and comparing those defaults refused scopes
 /// whose deployments were the same (finding on #688; DECISIONS 520 compares
-/// what the dialect does not pin).
+/// what the dialect does not pin). The list is not a count to keep in step
+/// with the pins: `no_setting_the_dialect_or_the_capture_pins_is_compared`
+/// derives the pins from the dialect and refuses an overlap.
+///
+/// `xmloption` left this list when DEC-1634.1 pinned it (#1997), and for two
+/// reasons, both measured on 16 and 18 with a target whose value was
+/// `document`. The compile and the captures run under `content`, so the
+/// reconstruction never sees the target's value and the comparison refused a
+/// scope whose deployments were the same. And the capture sets it for its own
+/// transaction (`catalog::capture_path`), so observing it as a session input
+/// reads `content` inside the read and the database's value after it, and
+/// every read on such a target ended as "session inputs changed during target
+/// capture" — a database default, of which the scratch is given a copy, was
+/// refused as surely as a server-level value, of which it is not.
 pub(crate) const SETTINGS: &[&str] = &[
     "server_encoding",
     "client_encoding",
@@ -51,7 +64,6 @@ pub(crate) const SETTINGS: &[&str] = &[
     "lc_monetary",
     "lc_time",
     "array_nulls",
-    "xmloption",
     "default_text_search_config",
     "row_security",
     "shared_preload_libraries",
@@ -633,6 +645,58 @@ mod tests {
             report
                 .limitations
                 .contains_key("collation:default:recorded-version")
+        );
+    }
+
+    #[test]
+    fn no_setting_the_dialect_or_the_capture_pins_is_compared() {
+        // The pins are read from the dialect, not copied: a setting pinned
+        // later leaves the compared list by failing here, which is how
+        // `xmloption` stayed in it after DEC-1634.1 pinned it (#1997).
+        let write = crate::session_pins(&pbps_model::SessionZone::utc());
+        let read = crate::catalog::capture_path();
+        let mut pinned: std::collections::BTreeSet<String> = write
+            .split(';')
+            .filter_map(|statement| statement.trim().strip_prefix("SET "))
+            .filter_map(|statement| statement.split_whitespace().next())
+            .map(str::to_lowercase)
+            .collect();
+        pinned.extend(
+            read.split("set_config('")
+                .skip(1)
+                .filter_map(|call| call.split('\'').next())
+                .map(str::to_lowercase),
+        );
+        // Not vacuous: the parsers found what they are known to carry.
+        for known in ["timezone", "datestyle", "xmloption", "search_path", "jit"] {
+            assert!(pinned.contains(known), "{known} in {pinned:?}");
+        }
+        for name in SETTINGS.iter().chain(OPTIONAL_SETTINGS) {
+            assert!(
+                !pinned.contains(&name.to_lowercase()),
+                "{name} is pinned by the dialect or the capture, so it is not compared"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_whose_xmloption_differs_is_not_refused_for_it() {
+        // Not compared, so not a fact either, whatever either side reports
+        // (#1997); a compared setting beside it still counts.
+        let document = SettingFact {
+            value: "document".into(),
+            source: "configuration file".into(),
+            context: "user".into(),
+        };
+        let mut target = side("180006");
+        target.settings.insert("xmloption".into(), document);
+        let report = compare_reported(&target, &side("180006"));
+        assert_eq!(report.verdict(), Verdict::Verified, "{report:?}");
+        assert!(!report.facts.contains_key("setting:xmloption"));
+        target.settings.get_mut("array_nulls").unwrap().value = "off".into();
+        assert_eq!(
+            compare_reported(&target, &side("180006")).verdict(),
+            Verdict::Mismatch(vec!["setting:array_nulls".into()])
         );
     }
 

@@ -101,6 +101,35 @@ pub(crate) fn pair_with_cross_kind_surfaces() -> (Schema, Schema) {
     (base, desired)
 }
 
+/// [`pair_with_cross_kind_surfaces`], and the plan also creates a view, a
+/// function and a column default that each carry an `xml` fragment, which
+/// `xmloption = document` refuses to read and `content` reads (#1997,
+/// DEC-1634.1). The reconstruction compiles the first two on scratch; all
+/// three are the declarations a deployment under the dialect's pins accepts.
+pub(crate) fn pair_with_xml_fragments() -> (Schema, Schema) {
+    let (base, mut desired) = pair_with_cross_kind_surfaces();
+    module(
+        &mut desired,
+        "pbps_evidence1274.xv",
+        ModuleKind::View,
+        "SELECT '<a/><b/>'::xml AS x",
+    );
+    module(
+        &mut desired,
+        "pbps_evidence1274.xf()",
+        ModuleKind::Function,
+        "() RETURNS xml LANGUAGE sql IMMUTABLE RETURN '<a/><b/>'::xml",
+    );
+    let table = desired
+        .tables
+        .get_mut(&"pbps_evidence1274.t".parse().unwrap())
+        .expect("the pair declares t");
+    let mut column = Column::new("xml".parse().unwrap());
+    column.value_source = pbps_model::ValueSource::Default("'<a/><b/>'::xml".into());
+    table.columns.insert("x".into(), column);
+    (base, desired)
+}
+
 pub(crate) const ENVIRONMENT: &str = "fixture";
 
 pub(crate) struct ProjectKey {
