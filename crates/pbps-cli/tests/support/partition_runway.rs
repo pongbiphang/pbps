@@ -684,3 +684,155 @@ pub fn locked(server: &str, slug: &str) {
         "{json}"
     );
 }
+
+/// `doctor` on parents whose bounds carry fractions of a second (#1923): the
+/// newest partition is the one ending last inside its second, the reach it
+/// asks for keeps its fraction, and a series ending a microsecond short of
+/// that reach is short.
+///
+/// Four parents, each with a row in each of its first two partitions, and a
+/// horizon of `1day` in `pbps.yml`:
+///
+/// | parent | key | the series ends at | what `doctor` says |
+/// |---|---|---|---|
+/// | `ts` | `timestamp` | `…-02 00:00:00.9` | short: the reach is `…-03 00:00:00.1` |
+/// | `tz` | `timestamptz` | `…-02 00:00:00.9+00` | short, in `+00` |
+/// | `meets` | `timestamp` | `…-03 00:00:00.1` | nothing: it is exactly the reach |
+/// | `misses` | `timestamp` | `…-03 00:00:00.099999` | short by one microsecond |
+///
+/// Were the partition ending at `.1` taken for the newest (the two ends read
+/// as equal), the rows of `ts` would be measured from the first partition,
+/// whose day on is `…-02 00:00:00.5`, and the series would read as covered.
+pub fn fractions(server: &str, slug: &str) {
+    let own = OwnDatabase::new(server, slug);
+    let conn = own.connection().to_owned();
+    on_server(&conn, "CREATE SCHEMA app");
+    let d = Demo::new(slug);
+    let parent = |name: &str, key: &str, zone: &str, last: Option<&str>| {
+        let last = last
+            .map(|end| {
+                format!(
+                    "  {name}_c: {{from: ['2026-01-02 00:00:00.9{zone}'], to: ['{end}{zone}']}}\n"
+                )
+            })
+            .unwrap_or_default();
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!(
+                "table: app.{name}\ncolumns:\n  id: {{type: bigint, nullable: false}}\n  \
+                 k: {{type: {key}, nullable: false}}\nprimary_key: [id, k]\n\
+                 partition_by: [k]\npartitions:\n  \
+                 {name}_a: {{from: ['2026-01-01 00:00:00.5{zone}'], \
+                 to: ['2026-01-02 00:00:00.1{zone}']}}\n  \
+                 {name}_b: {{from: ['2026-01-02 00:00:00.1{zone}'], \
+                 to: ['2026-01-02 00:00:00.9{zone}']}}\n{last}"
+            ),
+        )
+        .unwrap();
+    };
+    parent("ts", "timestamp", "", None);
+    parent("tz", "timestamptz", "+00", None);
+    parent("meets", "timestamp", "", Some("2026-01-03 00:00:00.1"));
+    parent(
+        "misses",
+        "timestamp",
+        "",
+        Some("2026-01-03 00:00:00.099999"),
+    );
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\npartition_runway: 1day\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["fmt"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &conn]));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let rows: String = ["ts", "meets", "misses"]
+        .iter()
+        .map(|t| {
+            format!(
+                "INSERT INTO app.{t} VALUES (1, '2026-01-01 12:00:00'), \
+                 (2, '2026-01-02 00:00:00.5'); "
+            )
+        })
+        .collect();
+    on_server(
+        &conn,
+        &format!(
+            "{rows}INSERT INTO app.tz VALUES (1, '2026-01-01 12:00:00+00'), \
+             (2, '2026-01-02 00:00:00.5+00')"
+        ),
+    );
+    // The engine prints the bounds as the scenario writes them, which is what
+    // the reader is asked to take.
+    assert_eq!(
+        text_of(
+            &conn,
+            "SELECT string_agg(pg_get_expr(c.relpartbound, c.oid), ' ' ORDER BY c.relname) \
+             FROM pg_class c WHERE c.relname IN ('ts_a', 'ts_b')"
+        ),
+        "FOR VALUES FROM ('2026-01-01 00:00:00.5') TO ('2026-01-02 00:00:00.1') \
+         FOR VALUES FROM ('2026-01-02 00:00:00.1') TO ('2026-01-02 00:00:00.9')"
+    );
+
+    let o = d.run(&["doctor", "--db", &conn, "--format", "json"]);
+    assert_eq!(code(&o), 0, "warnings leave doctor green: {}", stdout(&o));
+    let json = json_of(&o);
+    let findings = json["findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{json}"));
+    assert!(
+        findings
+            .iter()
+            .all(|f| f["id"] != "doctor.partition-runway-unknown"),
+        "a fraction of a second is a bound the reader takes: {json}"
+    );
+    let of = |parent: &str| -> Vec<&serde_json::Value> {
+        findings
+            .iter()
+            .filter(|f| {
+                f["id"] == "doctor.partition-runway"
+                    && f["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("app.{parent}'s"))
+            })
+            .collect()
+    };
+    for (parent, zone) in [("ts", ""), ("tz", "+00")] {
+        let found = of(parent);
+        assert_eq!(found.len(), 1, "{parent}: {json}");
+        let message = found[0]["message"].as_str().unwrap();
+        for said in [
+            format!("end at `2026-01-02 00:00:00.9{zone}`"),
+            format!("the partition from `2026-01-02 00:00:00.1{zone}`"),
+            format!("to `2026-01-03 00:00:00.1{zone}` at least"),
+        ] {
+            assert!(message.contains(&said), "{said}: {message}");
+        }
+        // Fractions are off the generator's whole-second grid: the remedy
+        // keeps its placeholder rather than naming a step it could not write.
+        assert!(
+            found[0]["remedy"]
+                .as_str()
+                .unwrap()
+                .contains("--every \"<step>\""),
+            "{}",
+            found[0]
+        );
+    }
+    assert!(
+        of("meets").is_empty(),
+        "a series ending exactly at the reach is covered: {json}"
+    );
+    let found = of("misses");
+    assert_eq!(found.len(), 1, "{json}");
+    let message = found[0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("end at `2026-01-03 00:00:00.099999`")
+            && message.contains("to `2026-01-03 00:00:00.1` at least"),
+        "{message}"
+    );
+}
