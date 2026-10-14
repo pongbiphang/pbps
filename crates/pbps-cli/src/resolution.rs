@@ -193,23 +193,31 @@ fn unresolved(request: &Request<'_>, why: impl std::fmt::Display) -> Refused {
 
 /// A case the resolver does not answer, refused by name before it runs
 /// (#1517): the gate and what to do instead, as `resolver.unresolved`.
-fn gated(request: &Request<'_>, gate: &str, remedy: &str) -> crate::output::Finding {
+fn gated(
+    selection: &ResolverSelection,
+    assessment: &Assessment,
+    gate: &str,
+    remedy: &str,
+) -> crate::output::Finding {
     crate::output::Finding::error(
         "resolver.unresolved",
         format!(
             "the selected resolver `{}` cannot answer the binding questions of {}: {gate}.",
-            request.selection.name,
-            named(request.assessment)
+            selection.name,
+            named(assessment)
         ),
     )
     .remedy(remedy)
 }
 
 /// `--staged` with a plan that needs the resolver: its evidence describes
-/// one transaction (#1516), so the gate refuses before the resolver runs.
-pub fn staged(request: &Request<'_>) -> crate::output::Finding {
+/// one transaction (#1516), so the gate refuses before the resolver runs,
+/// and before any target read a gate does not need, which the deployment
+/// role might not be allowed (#1945 review).
+pub fn staged(selection: &ResolverSelection, assessment: &Assessment) -> crate::output::Finding {
     gated(
-        request,
+        selection,
+        assessment,
         "--staged cannot carry its answer, because a resolver-backed plan applies in one \
          transaction",
         "Plan this change without --staged.",
@@ -233,7 +241,8 @@ pub async fn resolve(
     let driver = request.target.driver();
     if driver != pbps_db::Driver::Postgres {
         return Err(Refused::Finding(gated(
-            request,
+            request.selection,
+            request.assessment,
             "the resolver answers for PostgreSQL only; SQL Server resolution is not built yet \
              (#619, #620)",
             "Select no resolver for this environment: without one, the existing protection \

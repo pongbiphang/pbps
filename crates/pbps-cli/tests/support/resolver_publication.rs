@@ -101,6 +101,46 @@ pub fn published(server: &str) {
     );
     assert_prior(&artifact, &sql);
 
+    // A deployment role that may not read the cluster's identity meets the
+    // same gate by name: `--staged` refuses before that read (#1945 review).
+    let reader = format!("pbps_cli_r1517_{}", std::process::id());
+    let _roles = ClusterRoles {
+        server: connection.to_owned(),
+        names: vec![reader.clone()],
+    };
+    on_server(
+        connection,
+        &format!(
+            "CREATE ROLE {reader} LOGIN NOSUPERUSER PASSWORD 'trigger-test'; \
+             GRANT pg_read_all_data TO {reader}; \
+             REVOKE EXECUTE ON FUNCTION pg_catalog.pg_control_system() FROM PUBLIC"
+        ),
+    );
+    let limited = as_role(connection, &reader);
+    let as_reader = Targets {
+        target: &limited,
+        scratch: &scratch.connection,
+    };
+    let mut args = plan_args(&artifact, &sql);
+    args.push("--staged");
+    let gated = run(&d, &args, Some(&as_reader));
+    // Negative: without `--staged` the same role stops at the identity read,
+    // so the gate above was reached before it.
+    let unread = run(&d, &plan_args(&artifact, &sql), Some(&as_reader));
+    on_server(
+        connection,
+        "GRANT EXECUTE ON FUNCTION pg_catalog.pg_control_system() TO PUBLIC",
+    );
+    for (output, id) in [
+        (&gated, "resolver.unresolved"),
+        (&unread, "resolver.identity"),
+    ] {
+        assert_eq!(code(output), 2, "{}{}", stdout(output), stderr(output));
+        let value: serde_json::Value = serde_json::from_str(&stdout(output)).unwrap();
+        assert_eq!(value["findings"][0]["id"], id, "{value}");
+    }
+    assert_prior(&artifact, &sql);
+
     // Without either, the plan is published.
     let output = successful(run(&d, &plan_args(&artifact, &sql), Some(&targets)));
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();

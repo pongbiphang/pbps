@@ -5919,6 +5919,14 @@ pub fn cmd_plan_db(
                 selection,
                 assessment,
             } => {
+                // A resolved plan is sealed transactional: its evidence
+                // describes one atomic change (`SavedPlan::with_resolution`).
+                // Refused before the cluster identity is read, so the gate
+                // names itself to a role that may not read it.
+                if staged {
+                    let finding = crate::resolution::staged(selection, &assessment);
+                    return Ok(Connected::Refused { finding, findings });
+                }
                 // The cluster this plan was read from: the resolver checks its
                 // own target connection against it (#1685).
                 let identity =
@@ -5939,12 +5947,6 @@ pub fn cmd_plan_db(
                     hints: &hints,
                     target_identity: identity.as_deref(),
                 };
-                // A resolved plan is sealed transactional: its evidence
-                // describes one atomic change (`SavedPlan::with_resolution`).
-                if staged {
-                    let finding = crate::resolution::staged(&request);
-                    return Ok(Connected::Refused { finding, findings });
-                }
                 let asked = crate::resolution::named(&assessment);
                 match crate::resolution::resolve(&request).await {
                     Ok(unsealed) => {
