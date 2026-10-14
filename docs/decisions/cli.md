@@ -1136,3 +1136,25 @@ make about rules it could not run. Pinned by the cases in
 `tests/partitions_extend.rs` (an invalid block refused with every problem named and the
 files unchanged; the same command written once the block is valid; a refusal even when
 there is nothing to add; an engine refusal still said first).
+
+<a id="dec-1943-1"></a>
+
+**DEC-1943.1. A command that compares two policy evaluations asks both at one instant,
+which is an argument of the shared function, not a clock it reads.** `partitions extend`
+refuses an error-severity finding the extended tree has and the tree before did not
+(DEC-1789.1). Each call of `declaration_policy_findings` read the clock for the policy
+context, and a suppression's `until` is compared with that date, so two reads could
+straddle the instant one expires: the finding was suppressed in the first set, live in the
+second, and counted as added by a series that did not touch it. The window was a few
+milliseconds, and in it the finding genuinely was unsuppressed, so nothing was recorded
+wrongly and a rerun answered on the then-current rule; it is closed because a delta is
+only meaningful between two sets that differ in nothing but the tree. The clock is now an
+argument (`now`, Unix seconds) of `declaration_policy_findings` and of
+`policy_context_at`, which `policy_context` calls with `unix_seconds()` for a command that
+evaluates once (`validate`, `plan`, `pull`). `partitions extend` reads it once, in
+`errors_the_series_adds`, and passes it to both trees. The generated file still depends on
+no clock; only the decision to refuse can, as it could since #1904. Pinned by the unit
+tests in `partitions.rs`: a suppression expiring between two instants leaves the delta
+empty at every instant asked of both trees, the shared function's answer changes across the
+expiry (the hazard is real and `now` is honoured), and a partition that does break the rule
+is named at any instant.
