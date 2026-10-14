@@ -507,12 +507,26 @@ impl Cx<'_> {
                 // identity stays on the one index the plan rebuilds, the
                 // switch is the later `Is(Final)` above, and the old
                 // incarnation is not one to read.
-                let stands = self.base_of(&owner).is_some_and(|(_, t)| match &target {
-                    Some(PartKey::PrimaryKey) => t.primary_key.is_some(),
-                    Some(PartKey::Unique(n)) => t.unique.contains_key(n),
-                    Some(PartKey::Index(n)) => t.indexes.contains_key(n),
+                // "Stands" is the differ's own test: the target is usable in
+                // the baseline as it is (a key over nullable columns is not,
+                // and the identity then goes through FULL and is set last),
+                // and the plan leaves it as it is.
+                let stands = match (self.base_of(&owner), self.final_of(&owner), &target) {
+                    (Some((_, was)), Some((_, will)), Some(part)) => {
+                        let mut probe = was.clone();
+                        probe.replica_identity.clone_from(to);
+                        let same = match part {
+                            PartKey::PrimaryKey => was.primary_key == will.primary_key,
+                            PartKey::Unique(n) => was.unique.get(n) == will.unique.get(n),
+                            PartKey::Index(n) => was.indexes.get(n) == will.indexes.get(n),
+                            PartKey::ForeignKey(_) | PartKey::Check(_) | PartKey::Computed(_) => {
+                                false
+                            }
+                        };
+                        same && probe.replica_identity_problems().is_empty()
+                    }
                     _ => false,
-                });
+                };
                 if let Some(part) = old
                     && stands
                     && target.as_ref() != Some(&part)
@@ -814,6 +828,12 @@ impl Cx<'_> {
         if let Some(target) = self.target(target) {
             if gives {
                 self.requires(Requirement::Is(target, Incarnation::Final));
+            } else if matches!(&target, ObjectKey::Module(id) if self.before.schema.modules.contains_key(id))
+            {
+                // A revoke reads the module that stands: it is not ordered
+                // after an in-place alteration of its definition, which an
+                // `Exists` would do, and it leaves before a rebuild ends it.
+                self.requires(Requirement::Is(target, Incarnation::Base));
             } else {
                 self.exists(target);
             }
@@ -1313,12 +1333,20 @@ impl Cx<'_> {
     /// A row that references a parent row needs it to stand; a row that stops
     /// referencing one leaves before it goes.
     fn row_references(&mut self, owner: &Recorded, cells: &[(&str, &Value)], _adds: bool) {
-        let Some((_, table)) = self.final_of(owner).or_else(|| self.base_of(owner)) else {
+        // Only a key that stands throughout constrains the row: one the plan
+        // adds is installed after the rows it checks, one it drops is gone
+        // before them.
+        let (Some((_, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner)) else {
             return;
         };
         let mut wanted = Vec::new();
-        for fk in table.foreign_keys.values() {
-            let ([column], [_]) = (fk.columns.as_slice(), fk.references_columns.as_slice()) else {
+        for (name, fk) in &will.foreign_keys {
+            if was.foreign_keys.get(name) != Some(fk) {
+                continue;
+            }
+            let ([column], [referenced]) =
+                (fk.columns.as_slice(), fk.references_columns.as_slice())
+            else {
                 continue;
             };
             let Some((_, value)) = cells.iter().find(|(c, _)| c == column) else {
@@ -1336,6 +1364,19 @@ impl Cx<'_> {
             else {
                 continue;
             };
+            // A row is keyed by its primary key: a value of any other
+            // referenced column does not name a row this plan writes.
+            let keyed = self
+                .final_of(&parent)
+                .or_else(|| self.base_of(&parent))
+                .is_some_and(|(_, t)| {
+                    t.primary_key
+                        .as_ref()
+                        .is_some_and(|pk| pk.columns.as_slice() == std::slice::from_ref(referenced))
+                });
+            if !keyed {
+                continue;
+            }
             wanted.push(ObjectKey::Row {
                 table: parent,
                 key: RowKey(key),

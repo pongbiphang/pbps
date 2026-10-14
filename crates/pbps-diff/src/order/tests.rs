@@ -893,7 +893,10 @@ fn a_replica_identity_moves_to_a_standing_index_before_the_old_one_is_dropped() 
         method: IndexMethod::Btree,
         storage_parameters: Default::default(),
     };
-    let mut was = table_with(&["a"]);
+    let mut was = table_with(&[]);
+    let mut a = Column::new(int());
+    a.nullable = false;
+    was.columns.insert("a".into(), a);
     was.indexes.insert("ix_old".into(), index());
     was.indexes.insert("ix_new".into(), index());
     was.replica_identity = Some(ReplicaIdentity::Index("ix_old".into()));
@@ -926,4 +929,280 @@ fn a_replica_identity_moves_to_a_standing_index_before_the_old_one_is_dropped() 
     // Negative: the old index is dropped under the identity that still
     // binds it.
     assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
+
+fn permissions() -> std::collections::BTreeSet<pbps_model::Permission> {
+    Default::default()
+}
+
+#[test]
+fn a_revoke_reads_the_module_that_stands_so_it_may_precede_an_in_place_alteration() {
+    let (id, module) = view("v");
+    let mut changed = module.clone();
+    changed.definition = "SELECT 2 AS id".into();
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.modules.insert(id.clone(), module);
+    after.modules.insert(id.clone(), changed.clone());
+    let plan = Plan {
+        logical: vec![
+            p(Change::Revoke {
+                role: "r".into(),
+                target: pbps_model::GrantTarget::Object(t("v")),
+                permissions: permissions(),
+            }),
+            p(Change::AlterModule {
+                id,
+                module: Box::new(changed),
+            }),
+        ],
+        before,
+        after,
+        before_ids: IdsFile::default(),
+        after_ids: IdsFile::default(),
+    };
+    let none = ModuleDeps::new();
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    for order in [[0, 1], [1, 0]] {
+        assert_eq!(
+            run(&ops, &fx, &baseline, &order, &none, Checks::ALL),
+            [],
+            "{order:?}"
+        );
+    }
+    // Negative: a module the plan drops is gone before a revoke that runs
+    // after it.
+    let (id, module) = view("v");
+    let mut before = Schema::default();
+    before.modules.insert(id.clone(), module);
+    let dropped = Plan {
+        logical: vec![
+            p(Change::Revoke {
+                role: "r".into(),
+                target: pbps_model::GrantTarget::Object(t("v")),
+                permissions: permissions(),
+            }),
+            p(Change::DropModule {
+                id,
+                kind: ModuleKind::View,
+            }),
+        ],
+        before,
+        after: Schema::default(),
+        before_ids: IdsFile::default(),
+        after_ids: IdsFile::default(),
+    };
+    let (ops, fx, baseline) = dropped.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
+
+/// `c(id, pid)` keyed by `id`, optionally with `pid -> id` on itself.
+fn self_referencing(with_key: bool) -> Table {
+    let mut table = table_with(&["id", "pid"]);
+    table.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    });
+    if with_key {
+        table.foreign_keys.insert(
+            "fk".into(),
+            ForeignKey {
+                columns: vec!["pid".into()],
+                references_table: t("c"),
+                references_columns: vec!["id".into()],
+                on_delete: ReferentialAction::default(),
+                on_update: ReferentialAction::default(),
+            },
+        );
+    }
+    table
+}
+
+fn child_row(id: i64, parent: Option<i64>) -> PlannedChange {
+    p(Change::InsertRow {
+        table: t("c"),
+        key_column: "id".into(),
+        identity_key: false,
+        key: RowKey::from(id.to_string().as_str()),
+        row: [
+            ("id".to_owned(), Value::Int(id)),
+            ("pid".to_owned(), parent.map_or(Value::Null, Value::Int)),
+        ]
+        .into_iter()
+        .collect::<Row>(),
+        defaults: Default::default(),
+        types: Default::default(),
+    })
+}
+
+fn rows_of_c(before_key: bool, after_key: bool, logical: Vec<PlannedChange>) -> Plan {
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("c"), self_referencing(before_key));
+    after.tables.insert(t("c"), self_referencing(after_key));
+    let ids = Plan::ids(&["c"], &[("c", "id"), ("c", "pid")]);
+    Plan {
+        logical,
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    }
+}
+
+#[test]
+fn rows_wait_only_for_a_key_that_stands_when_they_are_written() {
+    let none = ModuleDeps::new();
+    // The key is added after the rows it checks: 1 -> 2 and 2 -> NULL, the
+    // child first, as the ids give it.
+    let adds = rows_of_c(
+        false,
+        true,
+        vec![
+            child_row(1, Some(2)),
+            child_row(2, None),
+            p(Change::AddForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+                constraint: Box::new(self_referencing(true).foreign_keys["fk"].clone()),
+            }),
+        ],
+    );
+    let (ops, fx, baseline) = adds.analysed(ModuleEdits::InPlace);
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
+    // Negative: a key that stands throughout wants the parent row first.
+    let stands = rows_of_c(true, true, vec![child_row(2, None), child_row(1, Some(2))]);
+    let (ops, fx, baseline) = stands.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
+
+#[test]
+fn a_row_value_names_a_row_only_through_the_referenced_primary_key() {
+    // `code` is unique but is not the key rows are named by: the referenced
+    // value 2 need not be the row keyed 2.
+    let mut table = self_referencing(false);
+    table.columns.insert("code".into(), Column::new(int()));
+    table.unique.insert(
+        "uq_code".into(),
+        pbps_model::UniqueConstraint {
+            columns: vec!["code".into()],
+            storage_parameters: Default::default(),
+        },
+    );
+    table.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: vec!["pid".into()],
+            references_table: t("c"),
+            references_columns: vec!["code".into()],
+            on_delete: ReferentialAction::default(),
+            on_update: ReferentialAction::default(),
+        },
+    );
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("c"), table.clone());
+    after.tables.insert(t("c"), table);
+    let ids = Plan::ids(&["c"], &[("c", "id"), ("c", "pid"), ("c", "code")]);
+    let plan = Plan {
+        logical: vec![child_row(1, Some(2)), child_row(2, None)],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert_eq!(
+        run(
+            &ops,
+            &fx,
+            &baseline,
+            &[0, 1],
+            &ModuleDeps::new(),
+            Checks::ALL
+        ),
+        []
+    );
+}
+
+#[test]
+fn a_replica_identity_target_made_usable_by_the_plan_is_switched_to_last() {
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod, ReplicaIdentity};
+    let index = |column: &str| Index {
+        columns: vec![IndexColumn {
+            key: IndexKey::Column(column.into()),
+            descending: false,
+            opclass: None,
+        }],
+        include: vec![],
+        unique: true,
+        filter: None,
+        method: IndexMethod::Btree,
+        storage_parameters: Default::default(),
+    };
+    let nullable = |not_null: bool| {
+        let mut table = table_with(&[]);
+        let mut a = Column::new(int());
+        a.nullable = !not_null;
+        let mut b = Column::new(int());
+        b.nullable = false;
+        table.columns.insert("a".into(), a);
+        table.columns.insert("b".into(), b);
+        table.indexes.insert("ix_new".into(), index("a"));
+        table
+    };
+    let mut was = nullable(false);
+    was.indexes.insert("ix_old".into(), index("b"));
+    was.replica_identity = Some(ReplicaIdentity::Index("ix_old".into()));
+    let mut will = nullable(true);
+    will.replica_identity = Some(ReplicaIdentity::Index("ix_new".into()));
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), was);
+    after.tables.insert(t("t"), will);
+    let tid = uid(UidKind::Table, "t");
+    let switch = |to| {
+        p(Change::SetReplicaIdentity {
+            uid: tid.clone(),
+            table: t("t"),
+            to: Some(to),
+        })
+    };
+    let plan = Plan {
+        // The differ's order: FULL, drop the old index, tighten, then switch.
+        logical: vec![
+            switch(ReplicaIdentity::Full),
+            p(Change::DropIndex {
+                table: t("t"),
+                name: "ix_old".into(),
+            }),
+            p(Change::AlterColumnNullability {
+                uid: uid(UidKind::Column, "t.a"),
+                column: t("t").column("a"),
+                ty: int(),
+                to_nullable: false,
+                collation: None,
+                through_external_partitions: false,
+            }),
+            switch(ReplicaIdentity::Index("ix_new".into())),
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(&["t"], &[("t", "a"), ("t", "b")]),
+        after_ids: Plan::ids(&["t"], &[("t", "a"), ("t", "b")]),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert_eq!(
+        run(
+            &ops,
+            &fx,
+            &baseline,
+            &[0, 1, 2, 3],
+            &ModuleDeps::new(),
+            Checks::ALL
+        ),
+        []
+    );
 }

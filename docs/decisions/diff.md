@@ -5259,6 +5259,13 @@ rewrite of it, and a replica identity moving to an index that already stands rea
 its old index as it stands (`Is` of the base incarnation) instead of rewriting
 it: a rewrite orders every
 reader of the object after the step, which refused valid plans.
+A revoke reads the module that stands (`Is` of the base incarnation), so it
+may precede an in-place alteration of it. A replica identity reads its old
+index only when the target is usable in the baseline as it is and the plan
+leaves it as it is, which is the differ's own test for switching early. A row
+waits only for a foreign key that stands throughout, since one the plan adds
+is installed after the rows it checks, and names a parent row only through the
+referenced primary key.
 
 <a id="dec-1954-2"></a>
 
