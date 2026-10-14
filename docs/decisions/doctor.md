@@ -1215,7 +1215,9 @@ question about a live database, and the maintainer settled where it is asked
   DEFAULT is read once however many ranges are declared. When it answers yes, one
   more read says which declared partitions hold rows, so the remedy names a partition
   that does; if that read cannot be had, the finding stands and names those it might
-  be. **A row outside every declared range is not a finding.** Whether the series is
+  be, and the remedy leaves the partition a `"<partition>"` placeholder rather than
+  name one of them, since the first candidate may hold no row and the command records
+  intent for the partition it is given. **A row outside every declared range is not a finding.** Whether the series is
   long enough is the runway's question, and a DEFAULT is allowed to hold what no
   partition is meant to take.
 - **Privileges are the parent's.** Both questions read through the parent and filter
