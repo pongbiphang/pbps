@@ -49,7 +49,7 @@ checksum-pinned, and state lives in the database itself.
   and `scripts/live-tests-pg.sh`. Run it on every head that can be queued:
   before the first push of the branch, before marking the PR ready, before
   every push in the ready phase, and before pushing a rebase — except a
-  docs-only rebase (below). All green, then push (DEC-1838.1).
+  docs-only rebase (below, DEC-2000.1). All green, then push (DEC-1838.1).
 - Every other push (a draft-phase review round's fixes) runs the **round
   gate**: the two decision checks, `fmt`, warning-free `clippy`, and the tests
   that pin the round's fixes, live ones included when a fix is engine-facing.
@@ -183,8 +183,8 @@ checksum-pinned, and state lives in the database itself.
   unchanged. Confirm that with `git range-diff`: the branch's own commits may
   differ only in documentation. Then run only the two decision checks, push
   with `git push --force-with-lease`, and approve the CI run on the resulting
-  head — no full gate and no new code review. A rebase for an interaction the
-  merge group confirmed is never docs-only.
+  head — no full gate and no new code review (DEC-2000.1). A rebase for an
+  interaction the merge group confirmed is never docs-only.
 - Before **enqueueing**, the primary agent independently verifies the
   issue-to-diff match, architecture, local-test evidence, review counts and
   heads, thread dispositions, dependency order, and required CI checks. That

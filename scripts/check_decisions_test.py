@@ -91,20 +91,33 @@ class TheRecord(unittest.TestCase):
         self.assertIn("row 5 extends the closed sequence, which ends at 4", " ".join(errors))
 
     def test_a_dec_row_in_the_index_is_refused_and_named(self):
-        # Every spacing Markdown accepts around the first cell is the same row.
+        # Every spelling GitHub renders as the same row: spacing, no leading
+        # pipe, and markup around the identifier.
         for row in (
             "| DEC-9.1 | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
             "|  DEC-9.1 | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
             "|DEC-9.1|[ledger](decisions/ledger.md#dec-9-1)|Nine|",
             "DEC-9.1 | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
+            "| **DEC-9.1** | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
+            "| `DEC-9.1` | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
+            "| [DEC-9.1](decisions/ledger.md#dec-9-1) | ledger | Nine |",
         ):
             with self.subTest(row=row):
+                lines = INDEX.count("\n") + 1
                 errors = run(index=INDEX + row + "\n")
                 self.assertEqual(
                     errors,
-                    ["docs/DECISIONS.md: row DEC-9.1 does not belong in the index; "
-                     "a DEC entry is listed only in its topic file"],
+                    [f"docs/DECISIONS.md:{lines}: `{row}` is neither a topic file nor an "
+                     "entry of the closed sequence; a DEC entry is listed only in its topic file"],
                 )
+
+    def test_the_topic_table_and_a_dec_citation_inside_an_entry_row_are_clean(self):
+        topics = (
+            "| File | Scope |\n| --- | --- |\n"
+            "| [ledger](decisions/ledger.md) | The tables pbps keeps. |\n"
+        )
+        cites = INDEX.replace("| Four |", "| Four, amended by DEC-9.1 |")
+        self.assertEqual(run(index=topics + cites), [])
 
     def test_an_index_of_only_numeric_rows_is_clean(self):
         self.assertEqual(run(), [])

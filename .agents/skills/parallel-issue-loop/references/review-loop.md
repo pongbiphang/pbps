@@ -17,7 +17,7 @@ them before advancing a PR.
 5. Run and observe the **full gate** on every head that can be queued: before
    the first push of the branch, before marking the PR ready, before every
    push in the ready phase, and before pushing a rebase other than a
-   docs-only one (`AGENTS.md`, DEC-1838.1):
+   docs-only one (`AGENTS.md`, DEC-1838.1, DEC-2000.1):
 
    ```bash
    python3 scripts/check_decisions_test.py

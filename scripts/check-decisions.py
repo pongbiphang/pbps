@@ -39,9 +39,13 @@ NOT_CITATIONS = {INDEX, "scripts/check-decisions.py", "scripts/check_decisions_t
 LEGACY_ENTRY = re.compile(r"^(\d+)\. \*\*")
 NEW_ENTRY = re.compile(r"^\*\*DEC-(\d+)\.(\d+)\. ")
 ANCHOR = re.compile(r'^<a id="(decision-(\d+)|dec-(\d+)-(\d+))"></a>$')
-# Any spelling of the first cell GitHub's tables accept: spacing around it, and
-# the leading pipe itself, are optional (`DEC-9.1 | ... |` is the same row).
-DEC_INDEX_ROW = re.compile(r"^\s*\|?\s*(DEC-\d+\.\d+)\s*\|")
+# The index holds two tables and nothing else that has a pipe: the topic files
+# and the closed sequence. A row is checked against those shapes, not against a
+# list of ways to spell a DEC row: GitHub's tables take the first cell with any
+# spacing, without the leading pipe, in bold, in code or as a link, so every
+# spelling a deny-list misses would be a row that passes.
+TABLE_FRAME = re.compile(r"^\|(?:\s*(?::?-+:?|#|Topic|Decision|File|Scope)\s*\|)+$")
+TOPIC_ROW = re.compile(r"^\| \[[^\]]+\]\(decisions/[^)#]+\.md\) \| .+ \|$")
 INDEX_ROW = re.compile(r"^\| (\d+) \| \[[^\]]+\]\(decisions/([^)#]+)#decision-(\d+)\) \|")
 # The last number of the closed sequence. Fixed here rather than read from the
 # index, which is an ordinary file a branch could extend along with its entry.
@@ -154,14 +158,13 @@ def check(topic_files, index_text, cited_in, closed=CLOSED):
                 where[ident] = f"{path}:{line}"
 
     indexed = {}
-    for line in index_text.split("\n"):
-        dec_row = DEC_INDEX_ROW.match(line)
-        if dec_row:
-            errors.append(
-                f"{INDEX}: row {dec_row[1]} does not belong in the index; "
-                "a DEC entry is listed only in its topic file"
-            )
+    for number, line in enumerate(index_text.split("\n"), 1):
         row = INDEX_ROW.match(line)
+        if "|" in line and not (row or TOPIC_ROW.match(line) or TABLE_FRAME.match(line)):
+            errors.append(
+                f"{INDEX}:{number}: `{line.strip()}` is neither a topic file nor an entry "
+                "of the closed sequence; a DEC entry is listed only in its topic file"
+            )
         if row:
             if row[1] != row[3]:
                 errors.append(f"{INDEX}: row {row[1]} links to decision-{row[3]}")
