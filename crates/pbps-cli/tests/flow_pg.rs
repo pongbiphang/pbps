@@ -8416,6 +8416,19 @@ fn doctor_reads_a_runway_in_utc_on_a_database_in_another_zone() {
     }
 }
 
+/// Bounds that carry fractions of a second are ordered, compared and printed
+/// with them (#1923): `doctor` measures from the partition ending last inside
+/// its second, and names the reach to the microsecond. On 16 and 18. The whole
+/// scenario is `support/partition_runway.rs`'s.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn doctor_keeps_fractions_of_a_second_in_a_partition_runway() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        partition_runway::fractions(server, &format!("runway-frac-1923-{k}"));
+    }
+}
+
 fn generated_series_flow(server: &str, slug: &str) {
     let own = OwnDatabase::new(server, slug);
     let conn = own.connection().to_owned();

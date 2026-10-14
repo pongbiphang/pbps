@@ -256,10 +256,23 @@ enum Need {
     Until(Val),
 }
 
+/// `c` as `key` prints a bound, which is the spelling [`parse_civil`] reads
+/// back: `parse_civil(key, &fmt_civil(key, c)) == c` for every value a
+/// `timestamp` or `timestamptz` bound holds.
+///
+/// The fraction of a second is the engine's own: up to six digits with the
+/// trailing zeros trimmed, and no point at all when there is none. A reach
+/// that dropped it would name a point earlier than the one the horizon asks
+/// for, and a remedy that reached only that far would still be short (#1923).
 fn fmt_civil(key: Key, c: &Civil) -> String {
     let date = format!("{:04}-{:02}-{:02}", c.y, c.m, c.d);
+    let fraction = if c.micros == 0 {
+        String::new()
+    } else {
+        format!(".{:06}", c.micros).trim_end_matches('0').to_owned()
+    };
     let clock = format!(
-        "{date} {:02}:{:02}:{:02}",
+        "{date} {:02}:{:02}:{:02}{fraction}",
         c.secs / 3600,
         c.secs % 3600 / 60,
         c.secs % 60
@@ -754,6 +767,224 @@ mod tests {
             ("2026-01-01", "2026-02-01"),
         ]);
         assert_eq!(newest_first(&ranges), vec![1, 0, 2]);
+    }
+
+    fn stamp(key: Key, lo: &str, hi: &str) -> Range {
+        Range {
+            lo: Some(end(key, lo).unwrap()),
+            hi: Some(end(key, hi).unwrap()),
+        }
+    }
+
+    /// The values a `timestamp` or `timestamptz` bound holds, in the
+    /// engine's spelling: no fraction, and fractions of every length that
+    /// does not end in a zero, at both ends of the supported years.
+    const STAMPS: [&str; 10] = [
+        "2026-01-02 00:00:00",
+        "2026-01-02 00:00:00.1",
+        "2026-01-02 00:00:00.000001",
+        "2026-01-02 00:00:00.123456",
+        "2026-01-02 00:00:00.5",
+        "2026-01-02 00:00:00.999999",
+        "2026-01-02 23:59:59.01",
+        "2026-01-02 12:30:45.00001",
+        "0001-01-01 00:00:00.000001",
+        "9999-12-31 23:59:59.999999",
+    ];
+
+    #[test]
+    fn a_printed_bound_reads_back_as_the_value_it_was_printed_from() {
+        for key in [Key::Timestamp, Key::TimestampTz] {
+            for text in STAMPS {
+                let spelled = if key == Key::TimestampTz {
+                    format!("{text}+00")
+                } else {
+                    text.to_owned()
+                };
+                let c = parse_civil(key, &spelled).ok().unwrap();
+                // The engine's spelling is the one fmt_civil writes.
+                assert_eq!(fmt_civil(key, &c), spelled, "{key:?}");
+                assert_eq!(
+                    parse_civil(key, &fmt_civil(key, &c)).ok(),
+                    Some(c),
+                    "{spelled}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_printed_fraction_is_trimmed_and_never_a_bare_point() {
+        let micros = |micros: i64| {
+            let c = Civil {
+                y: 2026,
+                m: 1,
+                d: 2,
+                secs: 0,
+                micros,
+            };
+            fmt_civil(Key::Timestamp, &c)
+        };
+        assert_eq!(micros(0), "2026-01-02 00:00:00");
+        assert_eq!(micros(100_000), "2026-01-02 00:00:00.1");
+        assert_eq!(micros(120_000), "2026-01-02 00:00:00.12");
+        assert_eq!(micros(1), "2026-01-02 00:00:00.000001");
+        assert_eq!(micros(10), "2026-01-02 00:00:00.00001");
+        assert_eq!(micros(999_999), "2026-01-02 00:00:00.999999");
+        // Whatever it prints, the reader takes: no spelling here is one the
+        // generator would refuse as not the engine's.
+        for m in [0, 1, 10, 100, 1_000, 10_000, 100_000, 500_000, 999_999] {
+            assert!(
+                parse_civil(Key::Timestamp, &micros(m)).is_ok(),
+                "{}",
+                micros(m)
+            );
+        }
+        // The zone follows the fraction, as the engine writes it.
+        let c = parse_civil(Key::TimestampTz, "2026-01-02 00:00:00.5+00")
+            .ok()
+            .unwrap();
+        assert_eq!(fmt_civil(Key::TimestampTz, &c), "2026-01-02 00:00:00.5+00");
+    }
+
+    #[test]
+    fn a_date_or_an_integer_key_prints_no_clock_and_no_fraction() {
+        // A date holds no clock, so a stray fraction on the value cannot
+        // reach the text.
+        let c = Civil {
+            y: 2026,
+            m: 1,
+            d: 2,
+            secs: 3_661,
+            micros: 500_000,
+        };
+        assert_eq!(fmt_civil(Key::Date, &c), "2026-01-02");
+        assert_eq!(
+            fmt_civil(
+                Key::Integer(crate::partition_series::Int {
+                    name: "bigint",
+                    min: i64::MIN as i128,
+                    max: i64::MAX as i128,
+                }),
+                &c
+            ),
+            "2026-01-02"
+        );
+        let whole = parse_civil(Key::Date, "2026-01-02").ok().unwrap();
+        assert_eq!(fmt_civil(Key::Date, &whole), "2026-01-02");
+        // And a date bound with a clock is not a date bound at all.
+        assert!(parse_civil(Key::Date, "2026-01-02 00:00:00.5").is_err());
+        assert!(parse_civil(Key::Date, "2026-01-02 00:00:00").is_err());
+    }
+
+    /// Two bounds inside one second are two bounds (#1923): the probe that
+    /// looks for the newest rows must try the later one first.
+    #[test]
+    fn partitions_ending_inside_one_second_are_searched_newest_first() {
+        let early = stamp(
+            Key::Timestamp,
+            "2026-01-01 00:00:00",
+            "2026-01-02 00:00:00.1",
+        );
+        let late = stamp(
+            Key::Timestamp,
+            "2026-01-02 00:00:00.1",
+            "2026-01-02 00:00:00.9",
+        );
+        assert_eq!(
+            newest_first(&[early.clone(), late.clone()]),
+            vec![1, 0],
+            "the .9 end is after the .1 end"
+        );
+        assert_eq!(newest_first(&[late, early]), vec![0, 1]);
+        // The same on a timestamptz, whose zone suffix sits after the fraction.
+        let early = stamp(
+            Key::TimestampTz,
+            "2026-01-01 00:00:00+00",
+            "2026-01-02 00:00:00.1+00",
+        );
+        let late = stamp(
+            Key::TimestampTz,
+            "2026-01-02 00:00:00.1+00",
+            "2026-01-02 00:00:00.9+00",
+        );
+        assert_eq!(newest_first(&[early, late]), vec![1, 0]);
+    }
+
+    /// A frontier a fraction of a second early does not reach a width that
+    /// lands later in that second, and the reach says where it lands.
+    #[test]
+    fn a_width_landing_inside_a_second_is_judged_by_its_fraction() {
+        let one_day = Horizon::parse(Some("1day")).unwrap();
+        // Rows from 2026-01-01 00:00:00.5, so a day on is 2026-01-02 00:00:00.5.
+        let held = stamp(
+            Key::Timestamp,
+            "2026-01-01 00:00:00.5",
+            "2026-01-02 00:00:00.1",
+        );
+        // The series ends at .1, before the .5 the horizon asks for.
+        let ranges = [held.clone()];
+        let s = short(assess(Key::Timestamp, &ranges, &[], &held, &one_day));
+        assert_eq!(s.frontier, "2026-01-02 00:00:00.1");
+        assert_eq!(s.held_from, "2026-01-01 00:00:00.5");
+        assert_eq!(s.reach, Reach::Until("2026-01-02 00:00:00.5".into()));
+        // The same on a timestamptz: the zone follows the fraction.
+        let held_tz = stamp(
+            Key::TimestampTz,
+            "2026-01-01 00:00:00.5+00",
+            "2026-01-02 00:00:00.1+00",
+        );
+        let s = short(assess(
+            Key::TimestampTz,
+            std::slice::from_ref(&held_tz),
+            &[],
+            &held_tz,
+            &one_day,
+        ));
+        assert_eq!(s.reach, Reach::Until("2026-01-02 00:00:00.5+00".into()));
+
+        // A partition that ends at .9 does reach it, whichever order the
+        // catalog lists the two in: .9 is after .5.
+        let next = stamp(
+            Key::Timestamp,
+            "2026-01-02 00:00:00.1",
+            "2026-01-02 00:00:00.9",
+        );
+        for ranges in [[held.clone(), next.clone()], [next.clone(), held.clone()]] {
+            assert_eq!(
+                assess(Key::Timestamp, &ranges, &[], &held, &one_day),
+                Ok(Verdict::Covered)
+            );
+        }
+
+        // And a width that lands past .9, at .95, is not reached by it. The
+        // frontier named is the later of the two, in either order.
+        let held_late = stamp(
+            Key::Timestamp,
+            "2026-01-01 00:00:00.95",
+            "2026-01-02 00:00:00.1",
+        );
+        for ranges in [
+            [held_late.clone(), next.clone()],
+            [next.clone(), held_late.clone()],
+        ] {
+            let s = short(assess(Key::Timestamp, &ranges, &[], &held_late, &one_day));
+            assert_eq!(s.frontier, "2026-01-02 00:00:00.9");
+            assert_eq!(s.reach, Reach::Until("2026-01-02 00:00:00.95".into()));
+        }
+
+        // Negative: a whole-second horizon from a whole-second row prints no
+        // fraction, and a fraction elsewhere in the series does not add one.
+        let whole = stamp(Key::Timestamp, "2026-01-01 00:00:00", "2026-01-02 00:00:00");
+        let two_days = Horizon::parse(Some("2day")).unwrap();
+        let s = short(assess(
+            Key::Timestamp,
+            std::slice::from_ref(&whole),
+            &[],
+            &whole,
+            &two_days,
+        ));
+        assert_eq!(s.reach, Reach::Until("2026-01-03 00:00:00".into()));
     }
 
     #[test]

@@ -716,6 +716,7 @@
         "an_ambiguous_date_or_time_literal_is_refused_with_both_readings",
         "an_offset_less_value_is_read_in_the_target_databases_own_zone",
         "doctor_reads_a_runway_in_utc_on_a_database_in_another_zone",
+        "doctor_keeps_fractions_of_a_second_in_a_partition_runway",
         "a_date_or_time_is_taken_as_the_value_the_engine_reads",
         "blank_baseline_reasons_leave_the_live_ledger_unchanged",
         "forced_pull_with_multiple_decisions_provides_a_complete_batch_remedy",
