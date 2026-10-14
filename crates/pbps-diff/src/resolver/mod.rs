@@ -5,6 +5,18 @@ mod assess;
 mod graph;
 mod prepare;
 
+#[cfg(test)]
+mod part_effect_tests;
+
+// Count actual classifier calls in tests, including a caller that accidentally
+// bypasses a pass cache, rather than measuring a synthetic cache-only loop.
+#[inline]
+fn part_effects(change: &pbps_model::Change) -> Vec<pbps_model::part_effects::PartEffect<'_>> {
+    #[cfg(test)]
+    part_effect_tests::record_projection();
+    change.part_effects()
+}
+
 pub use assess::{Answer, Assessment, assess};
 
 use pbps_dialect::Dialect;

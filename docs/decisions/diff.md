@@ -5017,3 +5017,27 @@ are serialized in a schema or plan, and the classifier does not choose
 ordering edges. The old and new predicates are compared over every kind
 and the matrix's field-dependent cases before the old predicates are
 deleted.
+
+
+<a id="dec-1981-1"></a>
+
+**DEC-1981.1. Dependency-part facts are materialized once per change in each
+immutable planning pass, not once per input comparison.** DEC-1773.1's
+exhaustive classifier remains the source of facts. Resolver rebuild selection,
+lightweight assessment and prepared-graph construction each borrow their own
+change slice and reuse its facts. CLI dependent lookups reuse the facts beside
+each physical-source view; splitting, inserting or moving a change ends that
+view, and the next one derives its facts again. No cache crosses preparation
+or survives a mutation, and no fact is serialized. A UID-keyed cache across
+passes would be wrong: the same identity can have different effects after a
+rewrite is split. PostgreSQL catalog removal already classifies once per
+change and needs no cache.
+
+The trade-off is retaining one vector per change and its part addresses until
+the pass ends, instead of repeatedly allocating them in nested comparisons.
+Consumer policies are unchanged; they filter borrowed facts. Tests count
+actual classifier invocations through production planning, assessment and
+saved-plan dependent checks, rather than imposing a host-dependent timing
+threshold. The prepared-graph regression verifies that a split default's
+removal and creation get their own facts and restoration edge. Runtime
+reversions of each repeated-projection site make the count regressions fail.

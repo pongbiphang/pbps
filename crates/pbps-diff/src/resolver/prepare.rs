@@ -1,7 +1,7 @@
 use super::Error;
 use pbps_dialect::Dialect;
 use pbps_model::operation::{Origin, Source};
-use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart};
+use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart, PartEffect};
 use pbps_model::resolver::{Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, IdsFile, IdsIndex, PlannedChange, Schema, ValueSource};
 use std::collections::BTreeSet;
@@ -99,6 +99,14 @@ pub(super) fn rebuilds(
     before_ids: &IdsFile,
     after_ids: &IdsFile,
 ) -> BTreeSet<Surface> {
+    // The ordinary slice does not change during fixed-point propagation.
+    // Reclassifying it for each input repeats the same owned-address work
+    // (DEC-1981.1).
+    let parts: Vec<_> = ordinary
+        .changes
+        .iter()
+        .map(|p| super::part_effects(&p.change))
+        .collect();
     let before_names = before_ids.index();
     let desired_for = |o: &SurfaceResolution| {
         let surface = forward(&o.surface, &before_names, after_ids);
@@ -116,8 +124,8 @@ pub(super) fn rebuilds(
             if let (Some(current), Some(_)) = (&o.current, desired_for(o))
                 && current.managed_inputs.iter().any(|input| {
                     result.contains(&forward(input, &before_names, after_ids))
-                        || ordinary.changes.iter().any(|p| {
-                            invalidates(&p.change, input)
+                        || ordinary.changes.iter().zip(&parts).any(|(p, facts)| {
+                            invalidates(facts, input)
                                 || (rebuilds_modules && matches!((&p.change, input),
                                     (Change::AlterModule { id, .. }, Surface::Module(m)) if id == m))
                         })
@@ -161,8 +169,8 @@ pub(super) fn forward(surface: &Surface, from: &IdsIndex<'_>, to: &IdsFile) -> S
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(super) fn invalidates(change: &Change, surface: &Surface) -> bool {
-    change.part_effects().iter().any(|fact| match (&fact.part, fact.effect, surface) {
+pub(super) fn invalidates(parts: &[PartEffect<'_>], surface: &Surface) -> bool {
+    parts.iter().any(|fact| match (&fact.part, fact.effect, surface) {
         (DependencyPart::Module { id, .. }, Effect::Removed, Surface::Module(module)) => *id == module,
         (DependencyPart::Table(table), Effect::Removed | Effect::Renamed, Surface::Table(target)) => *table == target,
         (DependencyPart::Column(column), Effect::Redefined(field), Surface::Column(target)) => column == target && field != pbps_model::ColumnField::Deprecated,
