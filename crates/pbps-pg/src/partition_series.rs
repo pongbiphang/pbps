@@ -196,8 +196,11 @@ pub(crate) struct Civil {
     pub(crate) d: i64,
     /// Whole seconds into the day.
     pub(crate) secs: i64,
-    /// A fraction of a second that is not zero.
-    pub(crate) frac: bool,
+    /// The fraction of a second, in microseconds. It is a magnitude, not a
+    /// flag: two bounds that differ only inside one second are two bounds,
+    /// and ordered as such (#1912). The engine keeps microseconds and no
+    /// finer, and `parse_civil` refuses a longer fraction.
+    pub(crate) micros: i64,
 }
 
 /// Why a text is not a bound of the key's type.
@@ -240,7 +243,7 @@ pub(crate) fn parse_civil(key: Key, text: &str) -> Result<Civil, Reject> {
         m,
         d,
         secs: 0,
-        frac: false,
+        micros: 0,
     };
     if key == Key::Date {
         return if rest.is_empty() {
@@ -277,7 +280,11 @@ pub(crate) fn parse_civil(key: Key, text: &str) -> Result<Civil, Reject> {
         if n == 0 || shown.ends_with('0') {
             return Err(Reject::Spelling);
         }
-        civil.frac = true;
+        // At most six digits and the last one not a zero: scaled to
+        // microseconds it is a whole number above zero, and its order is the
+        // order of the fractions.
+        let count = digits(shown, n).ok_or(Reject::Spelling)?;
+        civil.micros = count * 10_i64.pow(u32::try_from(6 - n).unwrap_or(0));
         after = &fraction[n..];
     }
     match (key, after) {
@@ -416,7 +423,7 @@ struct Position {
 }
 
 fn position(mode: Mode, c: &Civil) -> Position {
-    let timed = c.secs > 0 || c.frac;
+    let timed = c.secs > 0 || c.micros > 0;
     match mode {
         Mode::Days => Position {
             floor: days_from_civil(c.y, c.m, c.d),
@@ -641,19 +648,18 @@ fn temporal(
         }
     };
 
-    if until <= start {
-        if declared.ends.is_empty() {
-            return Err(invalid(format!(
-                "--until `{}` is not after --from `{start_text}`",
-                req.until
-            )));
-        }
-        return Ok(RangeSeries {
-            start: start_text,
-            partitions: Vec::new(),
-        });
+    if until <= start && declared.ends.is_empty() {
+        return Err(invalid(format!(
+            "--until `{}` is not after --from `{start_text}`",
+            req.until
+        )));
     }
 
+    // The frontier is checked before the answer "nothing to add", not after
+    // it: a frontier off the grid is not one a series can continue from, and
+    // saying the series already reaches --until would pass it as if it were
+    // (#1912). Equal to --until or past it, an on-grid frontier is still a
+    // no-op, which is what makes a rerun one.
     let from = position(mode, &start);
     let unit_name = match mode {
         Mode::Days => "midnight",
@@ -667,6 +673,12 @@ fn temporal(
             spell(key, mode, from.floor),
             spell(key, mode, from.floor + 1)
         )));
+    }
+    if until <= start {
+        return Ok(RangeSeries {
+            start: start_text,
+            partitions: Vec::new(),
+        });
     }
     let to = position(mode, &until);
     let diff = to.floor - from.floor;
@@ -1164,6 +1176,118 @@ mod tests {
             &[("ev_x", "2026-01-01 00:00:00", "2026-01-02 00:00:00.5")],
         );
         assert!(refusal(ask(&s, "1day", "2026-01-05 00:00:00", None)).contains("not at midnight"));
+    }
+
+    /// A fraction is a magnitude: bounds that differ only inside one second
+    /// are two bounds, so the frontier below --until is not "already there"
+    /// and the off-grid frontier is refused (#1912).
+    #[test]
+    fn a_frontier_differing_from_until_only_in_its_fraction_is_refused_as_off_the_grid() {
+        for ty in ["timestamp", "timestamptz"] {
+            let tz = if ty == "timestamptz" { "+00" } else { "" };
+            let s = schema(
+                ty,
+                &[(
+                    "ev_x",
+                    &format!("2026-01-01 00:00:00{tz}"),
+                    &format!("2026-01-02 00:00:00.1{tz}"),
+                )],
+            );
+            let said = refusal(ask(&s, "1day", &format!("2026-01-02 00:00:00.9{tz}"), None));
+            assert!(
+                said.contains("partition app.ev_x ends at")
+                    && said.contains("not at midnight")
+                    && said.contains(&format!("`2026-01-02 00:00:00{tz}` and")),
+                "{ty}: {said}"
+            );
+        }
+    }
+
+    /// The off-grid refusal comes before "nothing to add": a frontier that is
+    /// off the grid is refused whether --until is above it, equal to it or
+    /// below it, and only a frontier on the grid is a no-op rerun.
+    #[test]
+    fn an_off_grid_frontier_is_refused_before_nothing_to_add() {
+        let off = schema(
+            "timestamp",
+            &[("ev_x", "2026-01-01 00:00:00", "2026-01-02 00:00:00.5")],
+        );
+        for until in [
+            "2026-01-02 00:00:00.5", // equal fraction on both sides
+            "2026-01-02 00:00:00.1", // below the frontier, inside the second
+            "2026-01-01 00:00:00",   // below it by a day
+            "2026-01-05 00:00:00",   // above it
+        ] {
+            let said = refusal(ask(&off, "1day", until, None));
+            assert!(
+                said.contains("not at midnight")
+                    && said.contains("`2026-01-02 00:00:00` and `2026-01-03 00:00:00`"),
+                "{until}: {said}"
+            );
+        }
+        // A frontier past --until by a fraction of a second, on a month grid.
+        let off = schema(
+            "timestamp",
+            &[("ev_x", "2026-01-01 00:00:00", "2026-02-01 00:00:00.000001")],
+        );
+        assert!(
+            refusal(ask(&off, "1month", "2026-02-01 00:00:00", None))
+                .contains("the first of a month at midnight")
+        );
+        // On the grid, the same asks are the no-op they always were, with
+        // --until equal to the frontier or short of it by less than a second.
+        let on = schema(
+            "timestamp",
+            &[("ev_x", "2026-01-01 00:00:00", "2026-01-02 00:00:00")],
+        );
+        for until in ["2026-01-02 00:00:00", "2026-01-01 23:59:59.9"] {
+            let got = ask(&on, "1day", until, None).unwrap();
+            assert!(got.partitions.is_empty(), "{until}");
+            assert_eq!(got.start, "2026-01-02 00:00:00");
+        }
+        // And an --until a fraction past an on-grid frontier does not tile.
+        let said = refusal(ask(&on, "1day", "2026-01-02 00:00:00.1", None));
+        assert!(
+            said.contains("is not a whole number of `1day` steps"),
+            "{said}"
+        );
+    }
+
+    /// A date frontier has no time of day to carry a fraction; its refusal
+    /// still precedes "nothing to add".
+    #[test]
+    fn an_off_grid_date_frontier_below_until_is_refused_not_passed() {
+        let s = schema("date", &[("ev_x", "2026-01-01", "2026-01-15")]);
+        let said = refusal(ask(&s, "1month", "2026-01-10", None));
+        assert!(said.contains("`2026-01-01` and `2026-02-01`"), "{said}");
+    }
+
+    #[test]
+    fn a_fraction_orders_by_magnitude_not_by_presence() {
+        let t = |text: &str| parse_civil(Key::Timestamp, text).ok().unwrap();
+        let at = |frac: &str| t(&format!("2026-01-02 00:00:00{frac}"));
+        // Digits, not a flag: .000001 < .1 < .12 < .5 < .9, and a whole
+        // second is below every fraction of it.
+        let order = [
+            "", ".000001", ".00001", ".1", ".12", ".123456", ".5", ".9", ".999999",
+        ];
+        for pair in order.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{} < {}", pair[0], pair[1]);
+        }
+        assert_eq!(at(".5").micros, 500_000);
+        assert_eq!(at(".000001").micros, 1);
+        assert_eq!(at(".123456").micros, 123_456);
+        // A fraction does not outrank the second it is in.
+        assert!(at(".999999") < t("2026-01-02 00:00:01"));
+        // Negative: the spellings the engine does not print stay refused.
+        for bad in [
+            "2026-01-02 00:00:00.", // no digits
+            "2026-01-02 00:00:00.0",
+            "2026-01-02 00:00:00.10",      // trailing zero
+            "2026-01-02 00:00:00.1234567", // beyond microseconds
+        ] {
+            assert!(parse_civil(Key::Timestamp, bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

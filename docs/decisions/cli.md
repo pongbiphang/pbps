@@ -961,7 +961,10 @@ command that reads the date against one that does not.
   midnight, a year from the first of a month (so a fiscal year from July is `1year` from
   `2026-07-01`). Dates are counted on the calendar from the start, not stepped one after
   another. A run that finds the frontier at or past `--until` writes nothing and says so,
-  which makes a rerun a no-op, byte for byte.
+  which makes a rerun a no-op, byte for byte, but only for a frontier on the grid: one off it
+  is refused first, whatever `--until` is, and a fraction of a second is off every grid and
+  orders by its magnitude, so a frontier a fraction short of `--until` is not "already
+  there" (#1912).
 - **The spelling is what the engine prints, nothing else.** Measured on 16.15 and 18.6 under
   the pins (`TimeZone` UTC, ISO dates, DEC-1170.1): `date` is `2027-01-01`, `timestamp`
   `2027-01-01 00:00:00`, `timestamptz` `2027-01-01 00:00:00+00`, an integer its decimal text

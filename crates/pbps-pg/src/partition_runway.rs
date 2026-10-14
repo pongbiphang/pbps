@@ -204,7 +204,7 @@ fn add(c: &Civil, width: Width, times: i64) -> Civil {
                 m,
                 d,
                 secs: total.rem_euclid(86_400),
-                frac: c.frac,
+                micros: c.micros,
             }
         }
     }
@@ -218,11 +218,11 @@ fn width_between(a: &Civil, b: &Civil) -> Option<Width> {
     if b <= a {
         return None;
     }
-    let aligned = |c: &Civil| c.d == 1 && c.secs == 0 && !c.frac;
+    let aligned = |c: &Civil| c.d == 1 && c.secs == 0 && c.micros == 0;
     if aligned(a) && aligned(b) {
         return Some(Width::Months((b.y * 12 + b.m) - (a.y * 12 + a.m)));
     }
-    if a.frac || b.frac {
+    if a.micros != 0 || b.micros != 0 {
         return None;
     }
     let seconds = |c: &Civil| days_from_civil(c.y, c.m, c.d) * 86_400 + c.secs;
