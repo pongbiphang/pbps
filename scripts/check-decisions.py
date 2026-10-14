@@ -13,6 +13,9 @@ It refuses:
   - an entry numbered past the closed sequence's fixed end, even with an index
     row for it (a stale branch appending "N+1."), one the index does not list,
     or one the index places in another file;
+  - a `DEC-<issue>.<k>` row in the index: the closed table lists only the
+    numbered sequence, and a new entry is listed only in its topic file, so a
+    row would be unchecked and a conflict for every branch that adds one;
   - an entry without the anchor its citations link to, or with the wrong one;
   - a number of the closed sequence whose entry or index row is gone — the
     sequence is complete except for the four numbers it never used (523–526),
@@ -36,6 +39,7 @@ NOT_CITATIONS = {INDEX, "scripts/check-decisions.py", "scripts/check_decisions_t
 LEGACY_ENTRY = re.compile(r"^(\d+)\. \*\*")
 NEW_ENTRY = re.compile(r"^\*\*DEC-(\d+)\.(\d+)\. ")
 ANCHOR = re.compile(r'^<a id="(decision-(\d+)|dec-(\d+)-(\d+))"></a>$')
+DEC_INDEX_ROW = re.compile(r"^\| (DEC-\d+\.\d+)\b")
 INDEX_ROW = re.compile(r"^\| (\d+) \| \[[^\]]+\]\(decisions/([^)#]+)#decision-(\d+)\) \|")
 # The last number of the closed sequence. Fixed here rather than read from the
 # index, which is an ordinary file a branch could extend along with its entry.
@@ -149,6 +153,12 @@ def check(topic_files, index_text, cited_in, closed=CLOSED):
 
     indexed = {}
     for line in index_text.split("\n"):
+        dec_row = DEC_INDEX_ROW.match(line)
+        if dec_row:
+            errors.append(
+                f"{INDEX}: row {dec_row[1]} does not belong in the index; "
+                "a DEC entry is listed only in its topic file"
+            )
         row = INDEX_ROW.match(line)
         if row:
             if row[1] != row[3]:

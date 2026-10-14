@@ -27,6 +27,8 @@ hard way, [STATUS.md](STATUS.md) for where the product currently stands,
   sequential numbers below are closed: a branch that takes the "next" one
   collides silently with every other branch that does, in another file,
   where git reports no conflict.
+- A new entry adds no row to this file: the table of numbered entries is
+  closed, and a `DEC-<issue>.<k>` entry is listed only in its topic file.
 - Write it as an anchor and a paragraph that opens with the identifier and a
   bold one-sentence title:
 
@@ -38,7 +40,8 @@ hard way, [STATUS.md](STATUS.md) for where the product currently stands,
   ```
 
 - Cite it as `DEC-1234.1`. `scripts/check-decisions.py` runs in CI; it refuses
-  a duplicate identifier, an entry numbered in the closed sequence, and a
+  a duplicate identifier, an entry numbered in the closed sequence, a `DEC-` row
+  in this index, and a
   citation of either form that names no entry.
 
 Entries 1–11 changed the original spec; SPEC is in sync with all of them.
@@ -622,55 +625,3 @@ other numbers before landing. Some records still mention them as proposals.
 | 541 | [compose-and-ui](decisions/compose-and-ui.md#decision-541) | A compose destination is a credential-free identity; authentication is reacquired per invocation, and an endpoint that cannot be represented without a secret is refused. |
 | 542 | [resolver](decisions/resolver.md#decision-542) | The resolver qualifies inherited seccomp behavior before releasing its fixed bootstrap, without tracing processes (#633). |
 | 543 | [connection](decisions/connection.md#decision-543) | A PostgreSQL connection string that names no `sslmode` is connected with verified TLS, not the driver's `prefer`. |
-| DEC-614.1 | [resolver](decisions/resolver.md#dec-614-1) | Resolver evidence and its final typed order are required, versioned and separate from Schema; closing inputs derive from approved changes. |
-| DEC-1274.1 | [resolver](decisions/resolver.md#dec-1274-1) | The resolved producer binds its key before fresh reads and records separate raw opening and approved closing target facts. |
-| DEC-1498.1 | [resolver](decisions/resolver.md#dec-1498-1) | The resolver graph tells tables apart by recorded UID; an observation keeps each side under its own spelling. |
-| DEC-1514.1 | [resolver](decisions/resolver.md#dec-1514-1) | A connected plan finds the target's engine service from its own connection; no PID is configured. |
-| DEC-1540.1 | [resolver](decisions/resolver.md#dec-1540-1) | The daemon socket check reads the descriptor that held the socket last time first; only its still naming the socket answers yes. |
-| DEC-1550.1 | [resolver](decisions/resolver.md#dec-1550-1) | A native run checks the attach stream before each write, the target's sole holder once per check, and the scope once per resolution. |
-| DEC-1515.1 | [resolver](decisions/resolver.md#dec-1515-1) | A selected resolver runs only when the coarse typed-plan assessment needs it; with none selected ADR-0013 decides; evidence replaces the candidate rebuild. |
-| DEC-1274.2 | [modules](decisions/modules.md#dec-1274-2) | A new table whose generated column calls a function the plan creates follows that create whole, in the plan and on scratch. |
-| DEC-1402.1 | [diff](decisions/diff.md#dec-1402-1) | A column has one exhaustive value source while valid persisted bytes and checksums stay unchanged. |
-| DEC-1402.2 | [cli](decisions/cli.md#dec-1402-2) | Diagnostic recovery retains conflicting YAML sources without admitting them through checked loading. |
-| DEC-1885.1 | [cli](decisions/cli.md#dec-1885-1) | Every source-dependent diagnostic reads supplied sources through one recovery view. |
-| DEC-1901.1 | [apply-guard](decisions/apply-guard.md#dec-1901-1) | Table scalar requirements are derived before their read-back comparison. |
-| DEC-1910.1 | [apply-guard](decisions/apply-guard.md#dec-1910-1) | Partition requirements follow planned effects and hold created placement from the first read. |
-| DEC-1402.3 | [data/declared](decisions/data/declared.md#dec-1402-3) | Generated map keys refuse supplied rows while empty reference-data scopes retain their existing meaning. |
-| DEC-1576.1 | [modules](decisions/modules.md#dec-1576-1) | A connected PostgreSQL plan whose expression names, in a literal, a relation the plan creates later is refused with a two-plan remedy, not reordered. |
-| DEC-1528.1 | [resolver](decisions/resolver.md#dec-1528-1) | Selecting a resolver gives the operator-vouched resolver: two separation checks plus the shared compatibility qualification, and a reviewed baseline, run first and compared with the target; the measured profiles are frozen. |
-| DEC-822.1 | [doctor](decisions/doctor.md#dec-822-1) | A refused lock read is remedied with the one statement for the gap a fresh session can see, or a recheck when it sees none. |
-| DEC-1629.1 | [connection](decisions/connection.md#dec-1629-1) | The statement text pbps itself writes for PostgreSQL is ASCII, so every server encoding holds it; the database's encoding is not narrowed to UTF8. |
-| DEC-1633.1 | [pull](decisions/pull.md#dec-1633-1) | A foreign key's `RESTRICT` is held as `restrict`, never mapped to `NO ACTION`; SQL Server refuses it. |
-| DEC-829.1 | [connection](decisions/connection.md#dec-829-1) | A defaulted PostgreSQL TLS failure is classified from the driver's typed cause chain: a certificate failure is never told to disable TLS. |
-| DEC-1644.1 | [doctor](decisions/doctor.md#dec-1644-1) | SQL Server reads dependencies through the per-object functions under the managed-schema grant; only the hidden-referrer proof, and a rename on SQL Server 2008 to 2012, need database `VIEW DEFINITION`, which `doctor` advises. |
-| DEC-1645.1 | [modules](decisions/modules.md#dec-1645-1) | A connected PostgreSQL plan tells the name an unnamed key's index takes by walking the plan from the target's holders of its candidates, relations and constraints, instead of asking whether `<table>_pkey` is held now. |
-| DEC-1672.1 | [resolver](decisions/resolver.md#dec-1672-1) | The operator-vouched resolver tells its scratch from the target by session marks both engines report, needs a confined account on the target's cluster, and lets the account decide between a run-owned and a supplied scratch database. |
-| DEC-1673.1 | [resolver](decisions/resolver.md#dec-1673-1) | The resolver's baseline runs after the authorization reproduction and before any managed object, in both layouts; what it created is the difference around it, and the deployer's USAGE on its schemas is reproduced from the target. |
-| DEC-1674.1 | [resolver](decisions/resolver.md#dec-1674-1) | A Docker resolver entry is the operator-vouched resolver on a container pbps starts from the configured image and removes after the run, bound to the target by its cluster identity; either kind's baseline may be allowed to write outside the scratch database, and the evidence records the choice. |
-| DEC-1685.1 | [resolver](decisions/resolver.md#dec-1685-1) | The resolver binds the target by the `system_identifier` the planning read recorded, treats a scratch reporting it as the target's cluster, and refuses when it is unreadable; a scratch connection's session pinning is operator-vouched. |
-| DEC-1704.1 | [doctor](decisions/doctor.md#dec-1704-1) | `doctor` requires `SELECT` on each SQL Server dependency function the server's reads ask, which `public` holds in `master` until a `DENY` there takes it away. |
-| DEC-1708.1 | [resolver](decisions/resolver.md#dec-1708-1) | A supplied scratch database is put into a declared standard state at the start of each run and back into it at release, re-read both times; its own ACL is kept as the run found it, and the run-owned database gets the same declared state. |
-| DEC-1717.1 | [doctor](decisions/doctor.md#dec-1717-1) | `SELECT` on SQL Server's referencing-entities function is advice; an apply that renames refuses by name, before its first statement, a login denied it. |
-| DEC-1734.1 | [cli](decisions/cli.md#dec-1734-1) | Until the first tagged release the envelope's wire version stays 1; a change DEC-997.1 would count as moving it is recorded by the schema-set version and raises DEC-1038.1's archive floor to its own set, and DEC-997.1 applies from that release on. |
-| DEC-1720.1 | [connection](decisions/connection.md#dec-1720-1) | A target connection reaches one cluster for its whole life; a proxy that hands its transactions to different clusters is unsupported. |
-| DEC-1133.1 | [process](decisions/process.md#dec-1133-1) | Release qualification executes the hashed artifact in a native, source-free consumer. |
-| DEC-1767.1 | [diff](decisions/diff.md#dec-1767-1) | A connected PostgreSQL plan hoists the one later table rename that moves a carried name's holder away ahead of the move carrying an object onto it; a holder one hoist does not clear is still refused. |
-| DEC-1770.1 | [data/pre-delete](decisions/data/pre-delete.md#dec-1770-1) | Preflight removals retain the stored table name resolved through earlier renames at their own step, so later name reuse cannot move a removal onto another table. |
-| DEC-1547.1 | [diff](decisions/diff.md#dec-1547-1) | A range partition added beside a standing DEFAULT partition is made as a plain table of its parent's shape, filled with the DEFAULT's rows of its range, and attached, whether or not any row moves. |
-| DEC-1788.1 | [diff](decisions/diff.md#dec-1788-1) | A DEFAULT partition's rows move into a new range partition only as far as a human allowed: `pbps move-rows` records a bound and a reason in the identity file, and the apply refuses any row of a move nobody allowed, and more rows than the bound. |
-| DEC-1771.1 | [data/pre-delete](decisions/data/pre-delete.md#dec-1771-1) | SQL Server keeps known NULLs in future foreign-key tuples and exempts only the same row and key from unknown-default refusals. |
-| DEC-1771.2 | [diff](decisions/diff.md#dec-1771-2) | SQL Server CHECK probes report a column-name handoff as unchecked instead of reading the outgoing column. |
-| DEC-1533.1 | [pull](decisions/pull.md#dec-1533-1) | A parent's `partitions: external` hands its partitions to another tool: pbps keeps the parent alone, refuses a partition holding anything of its own, and `pull` learns the setting from pg_partman's catalog or `--partitions-external`. |
-| DEC-1636.1 | [resolver](decisions/resolver.md#dec-1636-1) | The measured resolver profiles are removed with everything only they used; the resolver the operator vouches for is the only one, is called plainly "resolver", and runs on every platform; a removed profile is refused naming the resolver. |
-| DEC-1516.1 | [resolver](decisions/resolver.md#dec-1516-1) | A resolver's plan is published after the ordinary connected checks and a fresh recheck of the target on a new session, sealed in the order those checks leave, with the target's cluster identity keyed and the accepted limitations named; a failed write leaves no new plan beside an old script, and each file is written in place. |
-| DEC-1869.1 | [policies](decisions/policies.md#dec-1869-1) | `column.no-deprecated-type` takes its list of deprecated types from the target dialect: SQL Server's LOB types, none on PostgreSQL. |
-| DEC-1433.1 | [policies](decisions/policies.md#dec-1433-1) | A computed column is a column to the policy rules: its add and drop are the two sides of `change.expand-contract` unless the name stays, and `naming.column` reads its name. |
-| DEC-1789.1 | [cli](decisions/cli.md#dec-1789-1) | `pbps partitions extend` declares a RANGE series from the last declared range to an end the user states, as a function of the declarations alone: no clock, no identity, no connection; a step that does not tile, an unprinted spelling and a zone other than UTC are refused. |
-| DEC-1631.1 | [types-and-probes](decisions/types-and-probes.md#dec-1631-1) | A PostgreSQL `serial` is its integer type plus a sequence the column owns, declared `type: serial` with an optional `sequence:`, and read back as one only in exactly the shape `serial` makes; changing a kept column's sequence is refused (#1889). |
-| DEC-1789.2 | [doctor](decisions/doctor.md#dec-1789-2) | `doctor` warns that a RANGE series is running out, measured by occupancy against a horizon in `pbps.yml`, and that a DEFAULT holds rows of a declared partition the database lacks; both are `doctor`'s because a plan reads no data, and a question it could not answer is its own `-unknown` finding. |
-| DEC-1966.1 | [diff](decisions/diff.md#dec-1966-1) | A table rename cycle, through exact names or a cross-schema move's intermediate name, is refused at diff time as `TableRenameCycle`, as a column rename cycle is; a chain is ordered as before. |
-| DEC-1961.1 | [diff](decisions/diff.md#dec-1961-1) | A plan's steps are operations held beside it in memory: keyed by the uid their object or table was recorded under, never by a spelled name, lowered by `emit` on their own change, and never serialized, so saved plans and checksums are unchanged. |
-| DEC-1961.2 | [diff](decisions/diff.md#dec-1961-2) | An incarnation is the base or the final instance of an object; a drop or teardown ends the first, a create or restoration produces the second, a third is refused, and an alteration in place is not an incarnation. |
-| DEC-1942.1 | [cli](decisions/cli.md#dec-1942-1) | `partitions extend` refuses while the `policies:` block is invalid, naming each problem as `policy.invalid`, because an invalid block yields no findings and an empty delta would read as "no rule broken"; `pull` and `init` skip an invalid block, a separate question (#1983). |
-| DEC-1634.1 | [types-and-probes](decisions/types-and-probes.md#dec-1634-1) | `inet`, `cidr`, `macaddr`, `tsvector` and `xml` are PostgreSQL column types: `cidr -> inet` is safe, `inet -> cidr` narrows with a probe for the host bits the engine clears silently, each of the five into a string narrows, every other pair is incompatible, and writes and the read scope pin `xmloption = content` (#1634). |
-| DEC-1517.1 | [resolver](decisions/resolver.md#dec-1517-1) | A resolved plan explains its sealed evidence from the file alone, in human and JSON output from one field: the entry, scratch kind and layout, now sealed, the qualification by name, each surface's verdict, the order and the prerequisites; SQL Server, `--staged` and an unstaged retained object are `resolver.unresolved` gates that name themselves. |

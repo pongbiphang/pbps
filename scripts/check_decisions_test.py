@@ -90,6 +90,18 @@ class TheRecord(unittest.TestCase):
         self.assertIn("5 is a new number in the closed sequence", " ".join(errors))
         self.assertIn("row 5 extends the closed sequence, which ends at 4", " ".join(errors))
 
+    def test_a_dec_row_in_the_index_is_refused_and_named(self):
+        index = INDEX + "| DEC-9.1 | [ledger](decisions/ledger.md#dec-9-1) | Nine |\n"
+        errors = run(index=index)
+        self.assertEqual(
+            errors,
+            ["docs/DECISIONS.md: row DEC-9.1 does not belong in the index; "
+             "a DEC entry is listed only in its topic file"],
+        )
+
+    def test_an_index_of_only_numeric_rows_is_clean(self):
+        self.assertEqual(run(), [])
+
     def test_a_number_taken_by_two_branches_in_two_files_is_refused(self):
         a = LEDGER + '\n<a id="decision-5"></a>\n\n5. **Five.** Body.\n'
         b = IDENTITY + '\n<a id="decision-5"></a>\n\n5. **Five, again.** Body.\n'
