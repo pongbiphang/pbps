@@ -790,11 +790,14 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // The object's own name, without a signature: nothing overloads on
         // this engine (ADR-0009 §1), so `DROP FUNCTION app.f` names exactly
         // one object — and a signature in the statement is a syntax error.
-        Change::DropModule { id, kind } => one(format!(
-            "DROP {} {};",
-            keyword(*kind),
-            qualified(&id.object_name())?
-        )),
+        Change::DropModule { id, kind } => Ok(vec![
+            Statement::new(format!(
+                "DROP {} {};",
+                keyword(*kind),
+                qualified(&id.object_name())?
+            ))
+            .releasing(pbps_dialect::Released::Module(id.clone())),
+        ]),
     }
 }
 
