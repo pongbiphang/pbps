@@ -5041,3 +5041,76 @@ saved-plan dependent checks, rather than imposing a host-dependent timing
 threshold. The prepared-graph regression verifies that a split default's
 removal and creation get their own facts and restoration edge. Runtime
 reversions of each repeated-projection site make the count regressions fail.
+
+<a id="dec-1955-1"></a>
+
+**DEC-1955.1. A plan's order is finished in one place, `schedule`, from the
+plan, what the declarations say and the facts a catalog supplied; a pass that
+needs a fact the caller lacks is skipped and named, never run over an empty
+read.** Each call site used to remember which reordering passes to run.
+`plan --db` ran them all, bootstrap re-ran three, and the offline preview ran
+none, so the preview of a new table whose default or generated column calls a
+new function showed the table created first (#1598), a script no engine runs.
+`dependents::schedule::schedule` (`crates/pbps-cli/src/dependents/schedule.rs`)
+now holds the list: it takes the plan by value and returns it in the order
+`plan --db` runs the passes, so a refusal leaves no half-ordered plan behind.
+`plan --db`, bootstrap, the offline preview and the dev rehearsal's baseline
+call it; the resolver's answer reaches it through `plan --db`, whose
+`schedule` runs before the plan is sealed (#1516), so a step that moves the
+order after sealing cannot arise from it.
+This changes which call sites order a plan, not how a plan is ordered.
+
+What a catalog said and what nobody asked are different values. `Facts` holds
+each fact as an `Option`: `Some` once it was read, even when what was read is
+empty, `None` when no one asked, and `Facts::default()` is the offline case.
+A pass that needs a fact it does not hold is not run: `weave` (with the set of
+columns it leaves released, read from what it found) needs the dependents of
+every module the plan drops or rebuilds, and the member ordering of role drops
+needs the roles' members. The result names each skipped pass, and the preview
+prints what its output lacks, as it already did for a dropped role's members.
+Running `weave` over an empty read would say a module has no dependents when
+nobody looked; the three states (read and found, read and empty, not read) are
+three outcomes. The passes that read nothing run in every case, so bootstrap
+now also runs `split_moving_defaults` and `before_its_partitions_indexes`,
+which `plan --db` always ran. Into an empty database neither has anything to
+act on in the usual declarations; where one does, bootstrap now orders the
+plan as `plan --db` would have, and the preview shows it. A refusal a pass
+makes is the one `plan --db` gives, by name and with its two-plan remedy, so
+the offline `plan` refuses a plan no order performs, as bootstrap does,
+instead of previewing it in an order the engine would reject.
+The facts are not the whole input: the declared schema, the baseline's and the
+final identities and the `depends_on:` edges are known offline too, and travel
+in `Declarations`.
+
+Enforcement is two-fold, because visibility reaches only so far. The passes
+that live in `crates/pbps-cli/src/dependents.rs` (`weave`, `split_new_tables`,
+`split_moving_defaults`, `after_the_rebuilds`, `after_their_parents_defaults`,
+`before_its_partitions_indexes`, the `PUBLIC` decisions' take and settle, and
+`released`) are private to that module, and `schedule` is its child, so the
+compiler refuses a call from any other module of the crate. A pass in another
+crate has to be `pub` for `schedule` to reach it, so it is listed here, and
+`no_pass_is_called_outside_the_schedule` scans the workspace and fails when a
+listed pass is called outside `schedule` and its own crate's tests:
+
+- `pbps_diff::order_role_drops` re-ranks the role drops by membership once
+  the members `plan --db` read are written into them (DECISIONS 127, 139). It applies
+  `member_depth`, the rank the differ's sort uses, so it stays beside it;
+  moving it to the CLI would copy the rank or export it, and either leaves two
+  answers to one question. It is `pub` because the CLI is another crate.
+
+Two things are not on the list. The resolver's own `after_their_functions`
+(`pbps-pg/src/resolver/reconstruct.rs`) orders the compile steps of the
+scratch build, not a plan, and is private to its crate; it is named so that no
+one takes it for the plan's pass. And the passes that read the catalog
+themselves, over the planning transaction, stay `plan --db`'s own calls after
+`schedule`: `release_generated_inputs`, `order_computed_by_edges`,
+`order_created_object_names` and the carried-moves ordering. Each takes a
+connection and reads inside the pass, so a `schedule` that reads nothing
+cannot own them until their reads become facts supplied ahead.
+Each exception has a slice that removes it. S3 (#1956) replaces
+`order_after_releases` and `computed_order`'s release, which
+`release_generated_inputs` and `order_computed_by_edges` run. S4 (#1957)
+turns `object_order`, which `order_created_object_names` runs, and
+`order_carried_moves` into proposed edges. S7 (#1959) converts
+`order_role_drops` and makes "nothing outside `pbps-diff::order` moves
+operations" the rule that closes the list.

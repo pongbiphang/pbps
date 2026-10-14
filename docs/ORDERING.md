@@ -98,13 +98,23 @@ Then, in this order:
   module passes. It runs again, over the same catalog reads, after the last
   pass that reorders, because a module pass may plan the revision again in
   the differ's order (DEC-1767.1).
-- **On a connected plan, `order_role_drops`** (called from `deploy.rs`, once
+- **One entry point finishes the order after the differ**: `schedule`
+  (`crates/pbps-cli/src/dependents/schedule.rs`, DEC-1955.1). `plan --db`,
+  bootstrap, the offline `plan` preview and the dev rehearsal's baseline all
+  call it, and the PostgreSQL passes below are private to its module. It runs each pass
+  in `plan --db`'s order and skips a pass that needs a catalog fact its caller
+  does not hold, reporting the skip: a fact read and empty is not a fact not
+  read. Offline, `weave` and the member ordering of role drops are skipped and
+  every other pass runs, so the preview of a new table orders what it calls
+  ahead of it as `plan --db` does (#1598). The resolver's answer is scheduled
+  by `plan --db` before it is sealed (#1516).
+- **With the members read, `order_role_drops`** (`schedule` calls it once
   `plan --db` has read the dropped roles' members) ranks the role drops by
   membership again. The differ saw no members when it sorted (DECISIONS 127,
   139).
-- **On a connected PostgreSQL plan** (`module_dependents` in
-  `crates/pbps-cli/src/engine.rs`):
-  - `weave` puts each catalog dependent of a dropped or rebuilt module on the
+- **On a PostgreSQL plan**, in this order:
+  - `weave`, when the catalog's dependents are supplied (`plan --db`), puts
+    each catalog dependent of a dropped or rebuilt module on the
     right side of the drop: removed before it, restored after its create
     (DECISIONS 311, DEC-942.1). A partition's part is released by its
     parent's drop of the column, `DROP DEFAULT` or new generation
@@ -114,16 +124,23 @@ Then, in this order:
     `release_generated_inputs` then moves the retype or drop of a column a
     generated column reads after the expression change that stops reading it,
     and what needs the retype after it, by edges from the catalog and the
-    expressions' text (DEC-1316.1, DEC-1391.1).
+    expressions' text (DEC-1316.1, DEC-1391.1). `release_generated_inputs` is
+    one of the passes that read the catalog themselves and so stay
+    `plan --db`'s own calls after `schedule` (DEC-1955.1).
   - `split_new_tables` splits the parts of a new table whose text names a
     function the plan creates out of it, ahead of that create.
+  - `split_moving_defaults` sets a create's own default after the last
+    function its text may call, where the create moves rows out of a DEFAULT
+    partition (DEC-1547.1).
   - `after_the_rebuilds` moves the expression-bearing additions whose text
     names a function the plan creates after the last function create, and
     places a new column whose expression names one after that create, with
     what may read the column after it (DEC-942.1, DEC-1364.1).
   - `after_their_parents_defaults` then sets each partition's own default
     again after a parent's default the plan sets, which reaches every
-    partition (DEC-1581.1). It runs in bootstrap too.
+    partition (DEC-1581.1).
+  - `before_its_partitions_indexes` moves a partitioned parent's new index
+    ahead of the partition indexes it could take (DEC-1688.1).
 - **On SQL Server**, a retype or recollation drops and re-adds the keys,
   indexes and checks over the column, through `retype_dependents` and
   `recollate_dependents` (#1175, DECISIONS 515). `CREATE OR ALTER` means a
@@ -473,7 +490,10 @@ decision or the issue named in its row.
   `every_change_kind_has_a_row_in_the_ordering_audit` lists the variants from
   the enum and refuses one this file does not name.
 - A new sort class, rank or reordering pass updates [the mechanism](#the-mechanism)
-  and re-reads the pairs its changes appear in.
+  and re-reads the pairs its changes appear in. A pass that reorders a plan
+  after the differ is added to `schedule` and nowhere else; one that must be
+  `pub` for it to reach is added to the list in DEC-1955.1 and to
+  `no_pass_is_called_outside_the_schedule`.
 - A new interacting pair found in review goes into the matching table with its
   verdict. It is not fixed in isolation: decide whether it is fixed or
   content-dependent first.

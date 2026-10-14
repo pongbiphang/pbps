@@ -5082,36 +5082,29 @@ pub fn cmd_bootstrap(
         errors.print_human();
         errors
     })?;
-    // What a new table calls goes ahead of it, by the reordering passes
-    // `plan --db` runs on PostgreSQL (#1585, DEC-942.1, DEC-1364.1): a
-    // default or generated column calling a declared function. They read no
-    // catalog, so the `--sql` script gets them too. Into an empty database
-    // nothing is dropped or rebuilt, so no column is released and `weave`
-    // has nothing to add; SQL Server needs none, as
-    // `engine::account_for_module_dependents` says.
-    let mut cs = cs;
-    if dialect.name() == "postgres" {
-        let decisions = crate::dependents::take_public_execution(&mut cs);
-        let ordered = crate::dependents::split_new_tables(&mut cs, &[&ids], dialect.as_ref())
-            .and_then(|_| {
-                crate::dependents::after_the_rebuilds(
-                    &mut cs,
-                    &BTreeSet::new(),
-                    &loaded.hints.module_deps,
-                    &loaded.schema,
-                )
-            })
-            .and_then(|_| {
-                crate::dependents::after_their_parents_defaults(
-                    &mut cs,
-                    &loaded.schema,
-                    &[&ids],
-                    dialect.as_ref(),
-                )
-            });
-        ordered.map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
-        crate::dependents::settle_public_execution(&mut cs, decisions);
-    }
+    // What a new table calls goes ahead of it, by the same reordering passes
+    // `plan --db` runs (#1585, DEC-942.1, DEC-1364.1): a default or generated
+    // column calling a declared function. Into an empty database there is no
+    // catalog to read, so the facts are none: nothing is dropped or rebuilt,
+    // no column is released, and `weave` has nothing to add. The passes that
+    // read nothing run, so the `--sql` script gets them too (#1955).
+    let cs = crate::dependents::schedule::schedule(
+        cs,
+        &crate::dependents::schedule::Declarations {
+            schema: &loaded.schema,
+            sources: crate::dependents::Sources {
+                before: pbps_diff::Side {
+                    schema: &Schema::default(),
+                    ids: &IdsFile::default(),
+                },
+                after: &ids,
+            },
+            module_deps: &loaded.hints.module_deps,
+        },
+        &crate::dependents::schedule::Facts::default(),
+        dialect.as_ref(),
+    )?
+    .changes;
     // And the check `plan --db` runs on that final order (DEC-1576.1): an
     // expression naming, in a literal, a relation created only after it is
     // refused with the two-plan remedy, before any script or DDL, rather
@@ -6144,32 +6137,45 @@ pub fn cmd_plan_db(
             let owned = crate::engine::role_owned_securables(&mut conn)
                 .await
                 .context("cannot read what the roles own")?;
-            for p in &mut cs.changes {
-                if let pbps_model::Change::DropRole {
-                    name, members: m, ..
-                } = &mut p.change
+            for p in &cs.changes {
+                if let pbps_model::Change::DropRole { name, .. } = &p.change
+                    && let Some(securables) = owned.get(name.as_str())
+                    && !securables.is_empty()
                 {
-                    if let Some(securables) = owned.get(name.as_str())
-                        && !securables.is_empty()
-                    {
-                        bail!(
-                            "role `{name}` cannot be dropped in `{}`: it owns {}.\n\
-                             Move the ownership first (`ALTER AUTHORIZATION ON {} TO dbo;`, \
-                             by hand, since pbps does not decide who owns a securable), or keep \
-                             the role.",
-                            target.label,
-                            securables.join(", "),
-                            securables[0]
-                        );
-                    }
-                    *m = members.get(name).cloned().unwrap_or_default();
+                    bail!(
+                        "role `{name}` cannot be dropped in `{}`: it owns {}.\n\
+                         Move the ownership first (`ALTER AUTHORIZATION ON {} TO dbo;`, \
+                         by hand, since pbps does not decide who owns a securable), or keep \
+                         the role.",
+                        target.label,
+                        securables.join(", "),
+                        securables[0]
+                    );
                 }
             }
             // The differ sorted the drops before it could know who holds
-            // whom; now that the members are in, a role holding another
-            // dropped role goes first, or its `DROP MEMBER` names a principal
-            // already gone (DECISIONS 127, 139).
-            pbps_diff::order_role_drops(&mut cs);
+            // whom. The schedule writes the members just read into the drops
+            // and orders them, so a role holding another dropped role goes
+            // first, or its `DROP MEMBER` names a principal already gone
+            // (DECISIONS 127, 139). On SQL Server, the only engine that reads
+            // them, this is the whole of what it runs.
+            cs = crate::dependents::schedule::schedule(
+                cs,
+                &crate::dependents::schedule::Declarations {
+                    schema: &loaded.schema,
+                    sources: crate::dependents::Sources {
+                        before: pbps_diff::Side {
+                            schema: &recorded_snapshot.schema,
+                            ids: &recorded_ids,
+                        },
+                        after: &resolved.ids,
+                    },
+                    module_deps: &hints.module_deps,
+                },
+                &crate::dependents::schedule::Facts::default().with_role_members(&members),
+                dialect.as_ref(),
+            )?
+            .changes;
         }
 
         // The plan rules (ADR-0008), the connected ones included: this is the

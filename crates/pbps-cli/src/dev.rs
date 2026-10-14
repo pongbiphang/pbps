@@ -156,6 +156,26 @@ pub fn rehearse(
             errs.len()
         )
     })?;
+    // Through the schedule as bootstrap is (#1955): whichever passes an
+    // engine has for a plan built from nothing, the rehearsal's baseline gets.
+    // SQL Server has none today.
+    let build = crate::dependents::schedule::schedule(
+        build,
+        &crate::dependents::schedule::Declarations {
+            schema: baseline,
+            sources: crate::dependents::Sources {
+                before: pbps_diff::Side {
+                    schema: &Schema::default(),
+                    ids: &IdsFile::default(),
+                },
+                after: baseline_ids,
+            },
+            module_deps: &baseline_hints.module_deps,
+        },
+        &crate::dependents::schedule::Facts::default(),
+        dialect,
+    )?
+    .changes;
     let build = crate::statements(&build, dialect)?;
 
     let container = match spec {
