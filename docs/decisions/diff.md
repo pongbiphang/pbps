@@ -5067,7 +5067,10 @@ A pass that needs a fact it does not hold is not run: `weave` (with the set of
 columns it leaves released, read from what it found) needs the dependents of
 every module the plan drops or rebuilds, and the member ordering of role drops
 needs the roles' members. The result names each skipped pass, and the preview
-prints what its output lacks, as it already did for a dropped role's members.
+prints what its output lacks, as it already did for a dropped role's members;
+a JSON report carries the same as a note, `plan.module-dependents-unread` or
+`plan.role-members-unread`, so the two reports hold the same evidence (SPEC
+§9.8).
 Running `weave` over an empty read would say a module has no dependents when
 nobody looked; the three states (read and found, read and empty, not read) are
 three outcomes. The passes that read nothing run in every case, so bootstrap

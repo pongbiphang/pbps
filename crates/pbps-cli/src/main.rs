@@ -3201,6 +3201,16 @@ fn cmd_plan(
             println!("\n  {skip}");
         }
     }
+    // And in JSON, as a note a consumer can key on: the same evidence in both
+    // reports (SPEC §9.8), so a preview's silence about a catalog fact is
+    // never read as "nothing there".
+    if json {
+        findings.extend(
+            skipped
+                .iter()
+                .map(|skip| output::Finding::note(skip.id(), skip.to_string())),
+        );
+    }
 
     // ADR-0003 decision 3: whether ONLINE exists is an edition question, and an
     // offline plan has no edition to ask. Saying so is the honest form of a

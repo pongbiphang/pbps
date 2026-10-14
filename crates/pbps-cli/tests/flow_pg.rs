@@ -21611,6 +21611,45 @@ fn an_offline_plan_creates_what_a_new_table_calls_before_it() {
     assert!(at("CREATE TABLE \"app\".\"a_plain\"") < zz, "{script}");
 }
 
+/// An offline preview that drops a module cannot read what depends on it, so
+/// the dependents pass is skipped and said so: in human output as a line, and
+/// in JSON as a note with a stable id (SPEC §9.8, #1982 review), never as
+/// silence a consumer would read as "no dependents". Negative: a preview that
+/// drops no module carries no such note.
+#[test]
+fn an_offline_plan_names_the_catalog_fact_it_could_not_read_in_json_too() {
+    let d = Demo::new("preview-skip-notes");
+    let function = d.dir.join("schema/app.zz%28%29.function.yml");
+    std::fs::write(
+        &function,
+        "function: app.zz()\ndefinition: |-\n  () RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'x' $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let notes = |report: &serde_json::Value| {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "plan.module-dependents-unread")
+            .map(|f| f["severity"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let unchanged = json_output(succeeds(d.run(&["plan", "--format", "json"])));
+    assert!(notes(&unchanged).is_empty(), "{unchanged}");
+
+    std::fs::remove_file(&function).unwrap();
+    let dropped = json_output(succeeds(d.run(&["plan", "--check", "--format", "json"])));
+    assert_eq!(notes(&dropped), ["note"], "{dropped}");
+    let human = succeeds(d.run(&["plan", "--check"]));
+    assert!(
+        stdout(&human).contains("What depends on a dropped or rebuilt module"),
+        "{}",
+        stdout(&human)
+    );
+}
+
 /// A bootstrap whose reordering moves a relation after an expression naming
 /// it in a literal is refused by name before any script or DDL, as `plan
 /// --db` refuses it (DEC-1576.1, #1599 review): an expression index on

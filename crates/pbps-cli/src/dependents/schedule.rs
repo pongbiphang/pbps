@@ -95,6 +95,17 @@ pub(crate) enum Skipped {
     RoleDrops,
 }
 
+impl Skipped {
+    /// The stable id of the note a JSON report carries for it (SPEC §9.8:
+    /// offline uncertainty is the same evidence in both reports).
+    pub(crate) fn id(&self) -> &'static str {
+        match self {
+            Self::Weave => "plan.module-dependents-unread",
+            Self::RoleDrops => "plan.role-members-unread",
+        }
+    }
+}
+
 impl fmt::Display for Skipped {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
