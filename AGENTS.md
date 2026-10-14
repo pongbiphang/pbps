@@ -16,7 +16,7 @@ checksum-pinned, and state lives in the database itself.
   choice that is not the obvious one; the entries live by topic in
   `docs/decisions/`. Code comments cite their identifiers; never renumber. A new
   entry is `DEC-<issue>.<k>` at the end of its topic file, never the next
-  sequential number (the index says why).
+  sequential number, and adds no row to the index (the index says why).
 - **[docs/PITFALLS.md](docs/PITFALLS.md)** — bugs shipped or nearly shipped, and
   the shapes they belong to.
 - **[docs/STATUS.md](docs/STATUS.md)** — phase, command surface, open items.
@@ -48,8 +48,8 @@ checksum-pinned, and state lives in the database itself.
   warning-free, `cargo test --workspace --all-targets`, `scripts/live-tests.sh`
   and `scripts/live-tests-pg.sh`. Run it on every head that can be queued:
   before the first push of the branch, before marking the PR ready, before
-  every push in the ready phase, and before pushing a rebase. All green, then
-  push (DEC-1838.1).
+  every push in the ready phase, and before pushing a rebase — except a
+  docs-only rebase (below). All green, then push (DEC-1838.1).
 - Every other push (a draft-phase review round's fixes) runs the **round
   gate**: the two decision checks, `fmt`, warning-free `clippy`, and the tests
   that pin the round's fixes, live ones included when a fix is engine-facing.
@@ -107,7 +107,8 @@ checksum-pinned, and state lives in the database itself.
   need the combined tree in your hands: a conflict, or an interaction the merge
   group confirmed;
   that rebase does not repeat the qualified draft gate, but the ready-phase code
-  review must then name the resolution head. Marking ready triggers the required
+  review must then name the resolution head (a docs-only rebase excepted,
+  below). Marking ready triggers the required
   code review; wait for it. A security review is optional: if run, its findings
   use the same triage rules, but its completion is not a gate.
 - In the ready phase, a completed code review with no findings qualifies the PR
@@ -123,7 +124,8 @@ checksum-pinned, and state lives in the database itself.
   environment, and runs nothing; the next push cancels it. Do not approve
   during the review loop. Approve exactly one run: the one on the current head,
   once the ready-phase gate below qualifies it — or once the resulting-head
-  review of a rebase does. The primary agent approves it:
+  review of a rebase does, or directly after a docs-only rebase (below). The
+  primary agent approves it:
   `gh api repos/{owner}/{repo}/actions/runs/<run-id>/pending_deployments -X POST
   -F 'environment_ids[]=<id>' -f state=approved -f comment='review qualified'`,
   with the id from `GET .../pending_deployments` on the same run. Until it is
@@ -174,6 +176,15 @@ checksum-pinned, and state lives in the database itself.
   review has no P0 or P1, the PR may proceed without repeating the draft or
   ready three-review gates; approve the run on that head, and all branch checks
   required on it must still be green.
+- **A docs-only rebase is the exception.** When every conflict the rebase
+  resolves is in documentation (typically two branches appending entries at
+  the end of the same `docs/decisions/` topic file) and resolving it changes no
+  code, test, script or CI file, the change that was reviewed and gated is
+  unchanged. Confirm that with `git range-diff`: the branch's own commits may
+  differ only in documentation. Then run only the two decision checks, push
+  with `git push --force-with-lease`, and approve the CI run on the resulting
+  head — no full gate and no new code review. A rebase for an interaction the
+  merge group confirmed is never docs-only.
 - Before **enqueueing**, the primary agent independently verifies the
   issue-to-diff match, architecture, local-test evidence, review counts and
   heads, thread dispositions, dependency order, and required CI checks. That

@@ -136,7 +136,7 @@ unclaimed, and not already carried by a PR. You own the DAG and the merge order.
   stale branch cannot even compile. Rebase, fix it, run the
   full gate, push with `--force-with-lease`, and follow the resulting-head
   code-review gate in the review reference. Do not automatically repeat the
-  draft or ready streak.
+  draft or ready streak. A docs-only conflict is lighter: a docs-only rebase (one whose conflicts and resolution touch only documentation, confirmed by `git range-diff`) runs only the two decision checks and needs no new code review: push it and approve CI on the resulting head.
 - Never merge a downstream PR while its required upstream issue is unmerged.
   Related issues without a true prerequisite may merge independently.
 
@@ -156,7 +156,8 @@ review reference.
 
 Workers run the **full gate** on every head that can be queued: before the
 first push of the branch, before the PR is marked ready, before every push in
-the ready phase, and before pushing a rebase (AGENTS.md, DEC-1838.1):
+the ready phase, and before pushing a rebase other than a docs-only one
+(AGENTS.md, DEC-1838.1):
 
 ```bash
 python3 scripts/check_decisions_test.py
