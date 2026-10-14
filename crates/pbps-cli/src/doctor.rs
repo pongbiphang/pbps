@@ -1585,7 +1585,13 @@ fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
                     )
                     .remedy(format!(
                         "pbps move-rows {} --max-rows {} --reason {}",
-                        shown
+                        // Only a partition the read proved holds a row is named.
+                        // When it could not say, `shown` is the candidates, and
+                        // naming the first would send a human to record a move
+                        // for a range that may hold nothing; the placeholder
+                        // leaves the choice to them, the message lists the
+                        // candidates.
+                        holding
                             .first()
                             .map_or_else(|| crate::report::placeholder("partition"), parent_arg),
                         crate::report::placeholder("max-rows"),
@@ -3127,7 +3133,8 @@ mod tests {
         );
         assert!(!crate::report::has_bare_placeholder(remedy), "{remedy}");
         // When it could not, the declared partitions it might be are named,
-        // a few and a count, and the remedy starts at the first.
+        // a few and a count, but the remedy names none of them: the first is
+        // an arbitrary one, and the range may hold no row (#1926).
         let finding = &parent_findings(&held(Vec::new()))[0];
         assert!(
             finding.message.contains(
@@ -3137,13 +3144,26 @@ mod tests {
             "{}",
             finding.message
         );
-        assert!(
-            finding
-                .remedy
-                .as_deref()
-                .unwrap()
-                .starts_with("pbps move-rows app.ev_2027_01 --max-rows"),
-            "{finding:?}"
+        let remedy = finding.remedy.as_deref().unwrap();
+        assert_eq!(
+            remedy,
+            "pbps move-rows \"<partition>\" --max-rows \"<max-rows>\" --reason \"<why>\""
+        );
+        assert!(!crate::report::has_bare_placeholder(remedy), "{remedy}");
+        // No candidate is recorded as the target, whichever it is.
+        for candidate in &missing {
+            assert!(
+                !remedy.contains(&candidate.to_string()),
+                "{candidate} in {remedy}"
+            );
+        }
+        // Several holding partitions: the first of them is named, not a
+        // placeholder, and not a partition that was only a candidate.
+        let finding =
+            &parent_findings(&held(vec![name("app.ev_2027_04"), name("app.ev_2027_02")]))[0];
+        assert_eq!(
+            finding.remedy.as_deref(),
+            Some("pbps move-rows app.ev_2027_04 --max-rows \"<max-rows>\" --reason \"<why>\"")
         );
     }
 
