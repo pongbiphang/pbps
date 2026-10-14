@@ -166,6 +166,18 @@ pub(crate) fn observe(
     sink(&operations, &lines, any);
 }
 
+/// Cuts `text` to at most `max` bytes without splitting a character: a
+/// module or table name may be non-ASCII, and `String::truncate` panics inside
+/// one. A diagnostic must never fail the plan it describes.
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn clip(text: &mut String, max: usize) {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
 /// The verifier's findings as lines, and whether any of them fails the run.
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn judge(ops: &[Operation], report: &Report) -> (Vec<String>, bool) {
@@ -175,7 +187,7 @@ pub(crate) fn judge(ops: &[Operation], report: &Report) -> (Vec<String>, bool) {
             || id.to_string(),
             |o| {
                 let mut text = format!("{id} {:?}", o.change());
-                text.truncate(160);
+                clip(&mut text, 160);
                 text
             },
         )
@@ -308,7 +320,7 @@ pub(crate) fn observe_constraints(
     let ops = operations.as_slice();
     let name = |i: usize| {
         let mut text = format!("{}:{:?}", ops[i].id(), ops[i].change());
-        text.truncate(110);
+        clip(&mut text, 110);
         text
     };
     let mut lines = Vec::new();

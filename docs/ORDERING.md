@@ -228,7 +228,7 @@ requirement is common to all of them, so it is listed once,
 | `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values | Absent, Exists, creates, removes, rewrites |
 | `AlterColumnNumbering` | 9; −3 giving up a source or an identity, +2 otherwise; (6, 1 + chain depth) giving up, renaming, or turning into an identity an owned sequence on a column it neither tightens nor retypes; (12, 3) putting a source on a table whose rows it updates or deletes and does not only insert | Putting an identity on: the column `NOT NULL`. Putting a source on: the column in its final type. Giving up an identity: the column still `NOT NULL`. P: no value too near the type's bound to continue past (pre-flight) | The column's identity or owned sequence put on, taken off, retuned or converted; one put on continues past the column's values (DEC-1889.1) | PLACEHOLDER |
 | `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) | Exists, creates |
-| `SetColumnDeprecated` | 10 | Nothing | Metadata only | Exists, rewrites |
+| `SetColumnDeprecated` | 10 | Nothing | Metadata only | Exists |
 | `SetTablePersistence` | 9 (9, 10 + depth) | P: the foreign keys that stand: to logged, the tables it references logged first; to unlogged, the tables referencing it unlogged first (refused the other way round, measured) | Rewrites the table and its indexes under `AccessExclusiveLock` (DEC-1443.1) | Exists |
 | `SetStorageParameters` | 10 | P: the table, under its final name. Nothing reads a storage parameter | The table's heap storage parameters; no rewrite (DEC-1441.1) | Exists |
 | `SetIndexStorageParameters` | 10 | P: the index, which stands: one the plan adds or rebuilds takes its parameters in its `CREATE` instead | An index's storage parameters, in place; no rebuild (DEC-1442.1) | Exists |
@@ -236,7 +236,7 @@ requirement is common to all of them, so it is listed once,
 | `DeleteRow` | 12 | Child rows moved away or cascaded | Removes a row | Exists, removes, rewrites |
 | `SetPrimaryKey { to: Some }`, `AddUnique`, `AddIndex` | 13 | Columns, NOT NULL, unique data; a clustered index first | A key or index | Exists, Reads, creates, removes |
 | `AddForeignKey` | 13 | Its columns, the referenced key, valid data | A foreign key | Exists, Is, Reads, creates |
-| `SetReplicaIdentity` | 0 (0, 1) or 13, last | P: the key, unique constraint or unique index it names, over NOT NULL columns. At (0, 1) when that stands before the plan, before any drop of the old identity's index; after the additions otherwise | The table's replica identity (DEC-1444.1) | Exists, Is, rewrites |
+| `SetReplicaIdentity` | 0 (0, 1) or 13, last | P: the key, unique constraint or unique index it names, over NOT NULL columns. At (0, 1) when that stands before the plan, before any drop of the old identity's index; after the additions otherwise | The table's replica identity (DEC-1444.1) | Exists, Is |
 | `AddCheck` | 13 | Its columns, valid data. Functions it calls: *content* | A check | Exists, Reads, creates |
 | `CreateModule`, `AlterModule` | 14 | What its definition names: other modules, by lexed name (DECISIONS 315); tables, columns and types | A module. P `AlterModule`: a drop and a create | Exists, creates, rewrites |
 | `CreateRole` | 15 | The name free | A role | creates |

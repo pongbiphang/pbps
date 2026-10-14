@@ -5254,6 +5254,11 @@ nothing creates and the baseline does not hold is reported as unmet, not
 dropped; a key the baseline model cannot say anything about (rows,
 permissions, a role the cluster owns) is unknown, and unknown is never read
 as absent.
+A step that only annotates an object (a column's deprecation) is not a
+rewrite of it, and a replica identity moving to an index that already stands reads
+its old index as it stands (`Is` of the base incarnation) instead of rewriting
+it: a rewrite orders every
+reader of the object after the step, which refused valid plans.
 
 <a id="dec-1954-2"></a>
 

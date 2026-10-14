@@ -280,21 +280,14 @@ fn a_broken_depends_on_is_refused_as_declared() {
     );
 }
 
-/// A column deprecated twice: a synthetic pair of writes to one definition,
-/// whose final state depends on which runs last.
-fn deprecated_twice() -> Plan {
+/// Two rows inserted into one table: a synthetic pair of writes to the
+/// table's values, whose final state depends on which runs last.
+fn two_rows_of_one_table() -> Plan {
     let mut after = Schema::default();
-    after.tables.insert(t("t"), table_with(&["c"]));
-    let column = |reason: &str| {
-        p(Change::SetColumnDeprecated {
-            uid: uid(UidKind::Column, "t.c"),
-            column: t("t").column("c"),
-            reason: Some(reason.parse().unwrap()),
-        })
-    };
-    let ids = Plan::ids(&["t"], &[("t", "c")]);
+    after.tables.insert(t("t"), table_with(&["id"]));
+    let ids = Plan::ids(&["t"], &[("t", "id")]);
     Plan {
-        logical: vec![column("first"), column("second")],
+        logical: vec![row("t", "1"), row("t", "2")],
         before: after.clone(),
         after,
         before_ids: ids.clone(),
@@ -304,7 +297,7 @@ fn deprecated_twice() -> Plan {
 
 #[test]
 fn two_writes_to_one_resource_swapped_from_their_base_order_are_refused() {
-    let plan = deprecated_twice();
+    let plan = two_rows_of_one_table();
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     let none = ModuleDeps::new();
     assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
@@ -749,4 +742,188 @@ fn a_partitions_default_and_not_null_on_one_column_do_not_order_each_other() {
         )),
         "{early:?}"
     );
+}
+
+#[test]
+fn a_column_gaining_a_default_and_a_deprecation_runs_them_in_either_order() {
+    let mut x = Column::new(int());
+    x.value_source = pbps_model::ValueSource::Default("1".into());
+    let mut table = table_with(&[]);
+    table.columns.insert("x".into(), x);
+    let mut after = Schema::default();
+    after.tables.insert(t("t"), table.clone());
+    let bare = Table {
+        columns: [("x".to_owned(), Column::new(int()))].into_iter().collect(),
+        ..Table::default()
+    };
+    let (tid, cid) = (uid(UidKind::Table, "t"), uid(UidKind::Column, "t.x"));
+    let plan = Plan {
+        logical: vec![
+            p(Change::CreateTable {
+                uid: tid,
+                name: t("t"),
+                table: Box::new(bare),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+            p(Change::AlterColumnDefault {
+                uid: cid.clone(),
+                column: t("t").column("x"),
+                from: None,
+                to: Some("1".into()),
+            }),
+            p(Change::SetColumnDeprecated {
+                uid: cid,
+                column: t("t").column("x"),
+                reason: Some("old".into()),
+            }),
+        ],
+        before: Schema::default(),
+        after,
+        before_ids: IdsFile::default(),
+        after_ids: Plan::ids(&["t"], &[("t", "x")]),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    for order in [[0, 1, 2], [0, 2, 1]] {
+        assert_eq!(
+            run(&ops, &fx, &baseline, &order, &none, Checks::ALL),
+            [],
+            "{order:?}"
+        );
+    }
+    // Negative: the deprecation still waits for the column to exist.
+    assert!(!run(&ops, &fx, &baseline, &[2, 0, 1], &none, Checks::ALL).is_empty());
+}
+
+#[test]
+fn a_new_replica_identity_index_does_not_order_the_old_one_s_parameter_change() {
+    use pbps_model::IndexPart;
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod, ReplicaIdentity};
+    let index = || Index {
+        columns: vec![IndexColumn {
+            key: IndexKey::Column("a".into()),
+            descending: false,
+            opclass: None,
+        }],
+        include: vec![],
+        unique: true,
+        filter: None,
+        method: IndexMethod::Btree,
+        storage_parameters: Default::default(),
+    };
+    let mut was = table_with(&["a"]);
+    was.indexes.insert("ix_old".into(), index());
+    was.replica_identity = Some(ReplicaIdentity::Index("ix_old".into()));
+    let mut will = was.clone();
+    will.indexes.insert("ix_new".into(), index());
+    will.replica_identity = Some(ReplicaIdentity::Index("ix_new".into()));
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), was);
+    after.tables.insert(t("t"), will);
+    let plan = Plan {
+        logical: vec![
+            p(Change::SetIndexStorageParameters {
+                table: t("t"),
+                target: IndexPart::Index("ix_old".into()),
+                method: IndexMethod::Btree,
+                set: [("fillfactor".to_owned(), "70".to_owned())]
+                    .into_iter()
+                    .collect(),
+                reset: Default::default(),
+            }),
+            p(Change::AddIndex {
+                table: t("t"),
+                name: "ix_new".into(),
+                index: Box::new(index()),
+                clustered: false,
+            }),
+            p(Change::SetReplicaIdentity {
+                uid: uid(UidKind::Table, "t"),
+                table: t("t"),
+                to: Some(ReplicaIdentity::Index("ix_new".into())),
+            }),
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(&["t"], &[("t", "a")]),
+        after_ids: Plan::ids(&["t"], &[("t", "a")]),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    for order in [[0, 1, 2], [1, 2, 0], [1, 0, 2]] {
+        assert_eq!(
+            run(&ops, &fx, &baseline, &order, &none, Checks::ALL),
+            [],
+            "{order:?}"
+        );
+    }
+    // Negative: the switch to the new index still follows its creation.
+    assert!(!run(&ops, &fx, &baseline, &[2, 1, 0], &none, Checks::ALL).is_empty());
+}
+
+#[test]
+fn a_diagnostic_is_cut_inside_no_character() {
+    // "é" is two bytes: byte 3 of "aaé" falls inside it.
+    for max in 0..8 {
+        let mut text = "aaéé".to_owned();
+        super::shadow::clip(&mut text, max);
+        assert!(
+            text.len() <= max && "aaéé".starts_with(&text),
+            "{max}: {text}"
+        );
+    }
+    let mut short = "ab".to_owned();
+    super::shadow::clip(&mut short, 10);
+    assert_eq!(short, "ab");
+}
+
+#[test]
+fn a_replica_identity_moves_to_a_standing_index_before_the_old_one_is_dropped() {
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod, ReplicaIdentity};
+    let index = || Index {
+        columns: vec![IndexColumn {
+            key: IndexKey::Column("a".into()),
+            descending: false,
+            opclass: None,
+        }],
+        include: vec![],
+        unique: true,
+        filter: None,
+        method: IndexMethod::Btree,
+        storage_parameters: Default::default(),
+    };
+    let mut was = table_with(&["a"]);
+    was.indexes.insert("ix_old".into(), index());
+    was.indexes.insert("ix_new".into(), index());
+    was.replica_identity = Some(ReplicaIdentity::Index("ix_old".into()));
+    let mut will = was.clone();
+    will.indexes.remove("ix_old");
+    will.replica_identity = Some(ReplicaIdentity::Index("ix_new".into()));
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), was);
+    after.tables.insert(t("t"), will);
+    let plan = Plan {
+        logical: vec![
+            p(Change::SetReplicaIdentity {
+                uid: uid(UidKind::Table, "t"),
+                table: t("t"),
+                to: Some(ReplicaIdentity::Index("ix_new".into())),
+            }),
+            p(Change::DropIndex {
+                table: t("t"),
+                name: "ix_old".into(),
+            }),
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(&["t"], &[("t", "a")]),
+        after_ids: Plan::ids(&["t"], &[("t", "a")]),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // Negative: the old index is dropped under the identity that still
+    // binds it.
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
 }

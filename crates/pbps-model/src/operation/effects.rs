@@ -466,8 +466,10 @@ impl Cx<'_> {
                 let owner = self.table(&column.table)?;
                 self.exists(ObjectKey::Table(owner));
                 let key = ObjectKey::Column(ColumnKey::Recorded(Recorded(uid.clone())));
-                self.exists(key.clone());
-                self.rewrites(Resource::Object(key, Incarnation::Final));
+                // Metadata only: nothing reads a column's deprecation, so it
+                // is not a rewrite of the column, which would order the
+                // column's other alterations against it.
+                self.exists(key);
             }
             Change::SetReplicaIdentity { uid, to, .. } => {
                 let owner = Recorded(uid.clone());
@@ -480,9 +482,9 @@ impl Cx<'_> {
                     Some(ReplicaIdentity::Index(n)) => Some(PartKey::Index(n.clone())),
                     Some(ReplicaIdentity::Full | ReplicaIdentity::Nothing) | None => None,
                 };
-                if let Some(part) = target {
+                if let Some(part) = &target {
                     self.requires(Requirement::Is(
-                        Self::part(&owner, part),
+                        Self::part(&owner, part.clone()),
                         Incarnation::Final,
                     ));
                 }
@@ -496,11 +498,26 @@ impl Cx<'_> {
                         Some(ReplicaIdentity::Index(n)) => Some(PartKey::Index(n.clone())),
                         Some(ReplicaIdentity::Full | ReplicaIdentity::Nothing) | None => None,
                     });
-                if let Some(part) = old {
-                    self.rewrites(Resource::Object(
-                        Self::part(&owner, part),
-                        Incarnation::Final,
-                    ));
+                // Read, not rewritten: the old index's own alterations are
+                // not ordered by where the identity moves. It is read only
+                // when the target already stands, so the switch goes first
+                // and the old index can then be dropped (ORDERING.md, at
+                // (0, 1)); a target the plan adds is switched to after the
+                // additions, the old index long since dropped. When the
+                // identity stays on the one index the plan rebuilds, the
+                // switch is the later `Is(Final)` above, and the old
+                // incarnation is not one to read.
+                let stands = self.base_of(&owner).is_some_and(|(_, t)| match &target {
+                    Some(PartKey::PrimaryKey) => t.primary_key.is_some(),
+                    Some(PartKey::Unique(n)) => t.unique.contains_key(n),
+                    Some(PartKey::Index(n)) => t.indexes.contains_key(n),
+                    _ => false,
+                });
+                if let Some(part) = old
+                    && stands
+                    && target.as_ref() != Some(&part)
+                {
+                    self.requires(Requirement::Is(Self::part(&owner, part), Incarnation::Base));
                 }
             }
             Change::SetStorageParameters { uid, .. } | Change::SetTablePersistence { uid, .. } => {
