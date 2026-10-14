@@ -50,6 +50,11 @@ impl Project {
         .unwrap();
     }
 
+    /// Replaces `pbps.yml` with `text`, as the project's own file.
+    fn pbps_yml(&self, text: &str) {
+        std::fs::write(self.dir.join("pbps.yml"), text).unwrap();
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         Command::new(BIN)
             .arg("--project")
@@ -544,6 +549,136 @@ fn a_rule_below_error_does_not_block_the_command() {
     let v = p.run(&["validate"]);
     assert_eq!(code(&v), 0, "{}{}", stdout(&v), stderr(&v));
     assert!(stderr(&v).contains("ev_2026_12_01"), "{}", stderr(&v));
+}
+
+/// `naming.table` at `error` with no pattern: the rule cannot run, and
+/// `validate` names the block as `policy.invalid`.
+const NO_PATTERN: &str =
+    "dialect: postgres\npolicies:\n  rules:\n    naming.table: {severity: error}\n";
+
+/// A `policies:` block that is itself invalid is not "no findings": the
+/// evaluator skips the rule it cannot run, so a delta of findings before and
+/// after would be empty and the command would write while `validate` refuses
+/// the project. Refused first, by the finding `validate` names it with, and
+/// nothing is written (#1942).
+#[test]
+fn a_policies_block_with_a_problem_is_refused_and_nothing_is_written() {
+    let p = Project::new("policy-invalid", "postgres");
+    p.declare("app.ev.yml", EVENTS);
+    p.pbps_yml(NO_PATTERN);
+    let v = p.run(&["validate", "--format", "json"]);
+    assert_ne!(code(&v), 0, "the premise: validate refuses this project");
+    assert!(stdout(&v).contains("\"policy.invalid\""), "{}", stdout(&v));
+    let before = p.files();
+
+    let o = p.extend("app.ev", "1month", "2027-02-01");
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let said = stderr(&o);
+    assert!(
+        said.contains("policy.invalid")
+            && said.contains("naming.table")
+            && said.contains("1 problem(s)")
+            && said.contains("nothing was written")
+            && said.contains("pbps validate"),
+        "{said}"
+    );
+    assert_eq!(p.files(), before, "a file changed");
+}
+
+/// The positive twin: the same command on the same tree, once the block is
+/// valid, writes, and the `validate` after it is clean. The only difference
+/// from the refusal above is the pattern the rule was missing.
+#[test]
+fn the_same_series_is_written_once_the_policies_block_is_valid() {
+    let p = Project::new("policy-repaired", "postgres");
+    p.declare("app.ev.yml", EVENTS);
+    p.pbps_yml(NO_PATTERN);
+    let before = p.files();
+    let o = p.extend("app.ev", "1month", "2027-02-01");
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert_eq!(p.files(), before);
+
+    p.naming_table("error", MONTHLY);
+    let o = p.extend("app.ev", "1month", "2027-02-01");
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(p.read("app.ev.yml").contains("ev_2027_01"));
+    let v = p.run(&["validate"]);
+    assert_eq!(code(&v), 0, "{}{}", stdout(&v), stderr(&v));
+}
+
+/// Every problem of the block is named, whatever its shape, and the count is
+/// the block's: a misspelled rule id, a rule switched on by a YAML boolean and
+/// a rule missing its pattern are each `policy.invalid` to `validate`.
+#[test]
+fn every_problem_in_the_policies_block_is_named() {
+    let p = Project::new("policy-invalid-all", "postgres");
+    p.declare("app.ev.yml", EVENTS);
+    p.pbps_yml(
+        "dialect: postgres\npolicies:\n  rules:\n    naming.tabel: {severity: error, \
+         pattern: \"^x$\"}\n    naming.column: on\n    naming.table: {severity: error}\n",
+    );
+    let v = p.run(&["validate"]);
+    assert_ne!(code(&v), 0);
+    let before = p.files();
+
+    let o = p.extend("app.ev", "1month", "2027-02-01");
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    let said = stderr(&o);
+    assert!(
+        said.contains("3 problem(s)")
+            && said.contains("naming.tabel")
+            && said.contains("naming.column")
+            && said.contains("naming.table"),
+        "{said}"
+    );
+    assert_eq!(p.files(), before);
+}
+
+/// The refusal is about the block, not about the series: it also answers a
+/// request that would add nothing, which would otherwise say "nothing to add"
+/// to a project `validate` refuses. A block whose rules are only advice, or
+/// off, is not a problem and does not refuse.
+#[test]
+fn an_invalid_policies_block_refuses_even_when_there_is_nothing_to_add() {
+    let p = Project::new("policy-invalid-noop", "postgres");
+    p.declare("app.ev.yml", EVENTS);
+    // The series already reaches 2026-12-01.
+    p.pbps_yml(NO_PATTERN);
+    let o = p.extend("app.ev", "1month", "2026-12-01");
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("policy.invalid"), "{}", stderr(&o));
+    assert!(!stdout(&o).contains("nothing to add"), "{}", stdout(&o));
+
+    // Off, or a warning with its pattern: a valid block, and the same request
+    // is answered as before.
+    p.pbps_yml("dialect: postgres\npolicies:\n  rules:\n    naming.table: off\n");
+    let o = p.extend("app.ev", "1month", "2026-12-01");
+    assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(stdout(&o).contains("nothing to add"), "{}", stdout(&o));
+}
+
+/// What the engine cannot extend is still said first, by name: an invalid
+/// block does not hide that SQL Server has no RANGE partitions behind a
+/// problem the user could fix and still not get a series.
+#[test]
+fn the_engine_refusal_comes_before_the_policies_block() {
+    let p = Project::new("policy-invalid-mssql", "mssql");
+    std::fs::write(
+        p.path("dbo.ev.yml"),
+        "table: dbo.ev\ncolumns:\n  ts: {type: date, nullable: false}\npartition_by: [ts]\n",
+    )
+    .unwrap();
+    p.pbps_yml("dialect: mssql\npolicies:\n  rules:\n    naming.table: {severity: error}\n");
+    let before = p.files();
+    let o = p.extend("dbo.ev", "1month", "2027-03-01");
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("mssql does not support generating a series of range partitions")
+            && !stderr(&o).contains("policy.invalid"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(p.files(), before);
 }
 
 /// SQL Server has no RANGE partitions: refused by name, nothing written.

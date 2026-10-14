@@ -1111,3 +1111,23 @@ JSON control preserves the complete changed-file set. A non-root filesystem
 probe with a readable but read-only first or later file verifies actual write
 failures and retained progress; it does not substitute a read failure for a
 write failure or claim that Unix permission bits deny a root process.
+
+<a id="dec-1942-1"></a>
+
+**DEC-1942.1. `partitions extend` refuses while the `policies:` block is invalid; it
+does not read the invalid block as "no findings".** The command refuses a series that
+adds an error-severity policy finding the tree did not already carry (DEC-1789.1). The
+evaluator skips a rule it cannot run, so a block with `naming.table: {severity: error}`
+and no pattern leaves both finding sets empty, their delta empty, and the command wrote
+while `validate` named the project `policy.invalid`: an empty answer taken from a
+question never asked. Absent, empty and unreadable are three answers. The check is
+`Policies::check`, the one `validate` uses, and it runs beside the declaration-problem
+refusal, after the engine has said what it cannot extend and before the "nothing to add"
+answer, which would otherwise be told to a project `validate` refuses. It names each
+problem as `policy.invalid` and points at `pbps validate`. `pull` and `init`
+skip an invalid block (`refuse_policy_errors`) and are a separate question (#1983); this
+command's promise is that the next `validate` has nothing new to say, which it cannot
+make about rules it could not run. Pinned by the cases in
+`tests/partitions_extend.rs` (an invalid block refused with every problem named and the
+files unchanged; the same command written once the block is valid; a refusal even when
+there is nothing to add; an engine refusal still said first).

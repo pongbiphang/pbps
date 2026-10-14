@@ -63,6 +63,32 @@ pub fn cmd_extend(
         );
     }
 
+    // The project's rules must be runnable before they can be asked anything.
+    // The evaluator skips a rule it cannot run, so with a bad `policies:` block
+    // (`validate` reports it as `policy.invalid`) the finding sets below
+    // lose what that rule would say, and an empty delta would read as "no rule
+    // broken" when the rule was never asked. Absent, empty and unreadable are
+    // different answers (DEC-1942.1). Refused beside the declaration problems, for
+    // the same reason, and before the no-op answer below, which would
+    // otherwise say "nothing to add" for a project `validate` refuses.
+    let invalid: Vec<String> = project
+        .config
+        .policies()
+        .check()
+        .into_iter()
+        .map(|problem| format!("policy.invalid: {problem}"))
+        .collect();
+    if !invalid.is_empty() {
+        bail!(
+            "the `policies:` block in `{}` has {} problem(s), so the project's rules cannot be \
+             checked against the generated partitions; nothing was written. Fix them first \
+             (`pbps validate` lists them):\n{}",
+            project.config_file().display(),
+            invalid.len(),
+            list(invalid.iter().map(String::as_str))
+        );
+    }
+
     if series.partitions.is_empty() {
         println!(
             "{parent} already reaches `{}`, which is at or past --until `{until}`; nothing to \
