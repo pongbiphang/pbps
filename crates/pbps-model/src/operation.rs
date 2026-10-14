@@ -54,8 +54,8 @@ use std::fmt;
 use crate::plan_names::{At, Holder, PlanNames};
 use crate::resolver::Surface;
 use crate::{
-    Change, ColumnRef, GrantTarget, IdsFile, IndexPart, ModuleId, PlannedChange, RowKey, TableName,
-    Uid,
+    Change, ColumnRef, GrantTarget, IdsFile, IdsIndex, IndexPart, ModuleId, PlannedChange, RowKey,
+    TableName, Uid,
 };
 
 /// Which operation of a plan this is, deterministic for a given plan: the
@@ -296,6 +296,12 @@ pub enum ObjectKey {
     /// back while the column stands (DEC-1168.1).
     Default(ColumnKey),
     Module(ModuleId),
+    /// The constraint that keeps a column from holding NULL. Its own key
+    /// because tightening and relaxing are opposite directions of one
+    /// attribute: a relaxation must precede what writes a NULL, a tightening
+    /// must follow it, and no single "the column changed" resource orders both
+    /// (DEC-1954.2).
+    NotNull(ColumnKey),
     Part {
         table: Recorded,
         part: PartKey,
@@ -313,7 +319,7 @@ pub enum ObjectKey {
 }
 
 /// Which instance of an object: the baseline's or the plan's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Incarnation {
     Base,
     Final,
@@ -367,6 +373,10 @@ pub trait Owners {
     fn table(&self, name: &TableName, spelling: Spelling) -> Result<Uid, OwnerError>;
     /// The uid of the column a step spells as `column`.
     fn column(&self, column: &ColumnRef, spelling: Spelling) -> Result<Uid, OwnerError>;
+    /// The uid of the role a step spells as `name`: a grant names its role
+    /// by spelling, and a role can be created or renamed by the same plan
+    /// (DEC-1954.1).
+    fn role(&self, name: &str, spelling: Spelling) -> Result<Uid, OwnerError>;
 }
 
 /// Ownership from the logical plan's own identity history and the two
@@ -378,16 +388,18 @@ pub trait Owners {
 /// the identity files and nothing else.
 pub struct PlanOwners<'p> {
     names: PlanNames<'p>,
-    base: &'p IdsFile,
-    desired: &'p IdsFile,
+    base: IdsIndex<'p>,
+    desired: IdsIndex<'p>,
 }
 
 impl<'p> PlanOwners<'p> {
     pub fn new(names: PlanNames<'p>, base: &'p IdsFile, desired: &'p IdsFile) -> Self {
+        // Indexed once: a plan asks for every step's owners, and a scan of
+        // the identity file per question is quadratic (#1870).
         Self {
             names,
-            base,
-            desired,
+            base: base.index(),
+            desired: desired.index(),
         }
     }
 
@@ -413,7 +425,7 @@ fn held(holder: Holder<'_>, name: String, spelling: Spelling) -> Result<Uid, Own
 
 impl Owners for PlanOwners<'_> {
     fn table(&self, name: &TableName, spelling: Spelling) -> Result<Uid, OwnerError> {
-        let recorded = |ids: &IdsFile| {
+        let recorded = |ids: &IdsIndex<'_>| {
             ids.table_uid(name)
                 .cloned()
                 .ok_or_else(|| OwnerError::Unmanaged {
@@ -422,8 +434,8 @@ impl Owners for PlanOwners<'_> {
                 })
         };
         match spelling {
-            Spelling::Base => recorded(self.base),
-            Spelling::Final => recorded(self.desired),
+            Spelling::Base => recorded(&self.base),
+            Spelling::Final => recorded(&self.desired),
             Spelling::At(_) => {
                 let at = self.inside(spelling)?;
                 held(self.names.holder(name, at), name.to_string(), spelling)
@@ -432,7 +444,7 @@ impl Owners for PlanOwners<'_> {
     }
 
     fn column(&self, column: &ColumnRef, spelling: Spelling) -> Result<Uid, OwnerError> {
-        let recorded = |ids: &IdsFile| {
+        let recorded = |ids: &IdsIndex<'_>| {
             ids.column_uid(column)
                 .cloned()
                 .ok_or_else(|| OwnerError::Unmanaged {
@@ -441,8 +453,8 @@ impl Owners for PlanOwners<'_> {
                 })
         };
         match spelling {
-            Spelling::Base => recorded(self.base),
-            Spelling::Final => recorded(self.desired),
+            Spelling::Base => recorded(&self.base),
+            Spelling::Final => recorded(&self.desired),
             Spelling::At(_) => {
                 let at = self.inside(spelling)?;
                 held(
@@ -450,6 +462,25 @@ impl Owners for PlanOwners<'_> {
                     column.to_string(),
                     spelling,
                 )
+            }
+        }
+    }
+
+    fn role(&self, name: &str, spelling: Spelling) -> Result<Uid, OwnerError> {
+        let recorded = |ids: &IdsIndex<'_>| {
+            ids.role_uid(name)
+                .cloned()
+                .ok_or_else(|| OwnerError::Unmanaged {
+                    name: name.to_owned(),
+                    spelling,
+                })
+        };
+        match spelling {
+            Spelling::Base => recorded(&self.base),
+            Spelling::Final => recorded(&self.desired),
+            Spelling::At(_) => {
+                let at = self.inside(spelling)?;
+                held(self.names.role_holder(name, at), name.to_owned(), spelling)
             }
         }
     }
@@ -994,6 +1025,12 @@ impl Incarnations {
         }
     }
 }
+
+mod effects;
+pub use effects::{
+    BaseTable, BoundInput, Effects, Requirement, Resource, Snapshot, base_table, base_table_named,
+    baseline_keys, effects, holds_unknown, module_key,
+};
 
 #[cfg(test)]
 mod tests;

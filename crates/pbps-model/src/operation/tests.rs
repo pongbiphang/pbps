@@ -268,6 +268,7 @@ fn keyless_objects_are_keyed_by_their_owner_and_name() {
             ObjectKey::Table(_)
             | ObjectKey::Column(_)
             | ObjectKey::Role(_)
+            | ObjectKey::NotNull(_)
             | ObjectKey::Default(ColumnKey::Recorded(_)) => {
                 panic!("{:?} keyed by a uid of its own: {key:?}", op.change())
             }

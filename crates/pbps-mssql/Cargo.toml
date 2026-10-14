@@ -24,6 +24,7 @@ tiberius.workspace = true
 
 [dev-dependencies]
 pbps-diff.workspace = true
+indexmap.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [lints]

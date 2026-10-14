@@ -483,6 +483,12 @@ pub(crate) fn rebuilding_by(
         base, declared, dialect, hints, also, rebinding, screen, read_back,
     );
     if d.errors.is_empty() {
+        // The resolver's intermediate plan is not an order anything runs: its
+        // final one is observed where it is made.
+        #[cfg(any(test, debug_assertions))]
+        if rebinding == Rebinding::Candidates {
+            crate::order::shadow::observe_plan(base, declared, dialect, hints, &d.changes);
+        }
         Ok(d.changes)
     } else {
         Err(d.errors)

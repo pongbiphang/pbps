@@ -166,10 +166,23 @@ pub fn plan_operations(
         base,
         desired,
     );
+    #[cfg(any(test, debug_assertions))]
+    crate::order::shadow::observe_constraints(
+        base,
+        desired,
+        dialect,
+        hints,
+        &logical,
+        &operations,
+        &edges,
+    );
     let (ordered, sequence) = ordered(prepared.changes, edges)?;
+    let operations = operations.reordered(&sequence);
+    #[cfg(any(test, debug_assertions))]
+    crate::order::shadow::observe(base, desired, dialect, hints, &logical, &operations);
     Ok(Planned {
         ordered,
-        operations: operations.reordered(&sequence),
+        operations,
         logical,
     })
 }

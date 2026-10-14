@@ -1755,6 +1755,44 @@ impl Dialect for Postgres {
         true
     }
 
+    /// What PostgreSQL's catalog does beyond the portable effects
+    /// (DEC-1954.3):
+    ///
+    /// - a check or filtered index that may name a column stands in the way
+    ///   of dropping it;
+    /// - `ALTER TABLE ... SET SCHEMA` carries the table's indexes and keys
+    ///   with it, so they are rewritten by it (DEC-1767.1). Owned sequences
+    ///   move too, but they have no key until name slots (#1964).
+    fn engine_effects(
+        &self,
+        op: &pbps_model::operation::Operation,
+        owners: &dyn pbps_model::operation::Owners,
+        before: pbps_model::operation::Snapshot<'_>,
+        _after: pbps_model::operation::Snapshot<'_>,
+    ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
+        use pbps_model::Change;
+        use pbps_model::operation::{Incarnation, PartKey, Resource, base_table};
+        let mut fx =
+            pbps_dialect::engine_effects::text_dependents(self, op, owners, before, false)?;
+        if let Change::RenameTable { from, to, .. } = op.change()
+            && from.schema != to.schema
+            && let Some(base) = base_table(op, owners, before, from)?
+        {
+            let t = base.table;
+            let mut parts: Vec<PartKey> = Vec::new();
+            if t.primary_key.is_some() {
+                parts.push(PartKey::PrimaryKey);
+            }
+            parts.extend(t.unique.keys().cloned().map(PartKey::Unique));
+            parts.extend(t.indexes.keys().cloned().map(PartKey::Index));
+            for part in parts {
+                fx.rewrites
+                    .push(Resource::Object(base.part(part), Incarnation::Final));
+            }
+        }
+        Ok(fx)
+    }
+
     /// **Yes, and it is the reason this method exists.** Measured on 18.6: a
     /// function created with no grant at all has `proacl IS NULL`, which is
     /// not "granted to nobody" but "the built-in default applies", and that

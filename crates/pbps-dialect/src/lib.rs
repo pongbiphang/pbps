@@ -39,6 +39,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod engine_effects;
 pub mod estimate;
 pub mod lower;
 pub mod plan_rows;
@@ -2602,6 +2603,27 @@ pub trait Dialect {
     /// exactly as it treats a `DropModule` when this answers `true`.
     fn rebuilds_modules(&self) -> bool {
         false
+    }
+
+    /// What only this engine knows about a step's effects, beside the
+    /// portable ones `pbps_model::operation::effects` reads from the payload
+    /// (#1776 slice S1b-i, DEC-1954.3): a requirement its catalog enforces
+    /// (SQL Server's 3729: a function cannot be altered while a computed
+    /// column calls it), or a write its statement makes beyond its change (a
+    /// parent's `SET DEFAULT` reaching its partitions).
+    ///
+    /// Pure, like the rest of the dialect: it reads the step's payload and
+    /// the two snapshots, and runs no query. A dependency only a connected
+    /// plan's catalog reads is the `Catalog` edge source's, not this one's.
+    /// The default knows nothing the portable effects do not.
+    fn engine_effects(
+        &self,
+        _op: &pbps_model::operation::Operation,
+        _owners: &dyn pbps_model::operation::Owners,
+        _before: pbps_model::operation::Snapshot<'_>,
+        _after: pbps_model::operation::Snapshot<'_>,
+    ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
+        Ok(pbps_model::operation::Effects::default())
     }
 
     /// Whether a routine this engine creates arrives executable by every

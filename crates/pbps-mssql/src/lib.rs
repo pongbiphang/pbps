@@ -53,6 +53,80 @@ impl Dialect for Mssql {
         types::DIALECT
     }
 
+    /// What SQL Server's catalog refuses beyond the portable effects
+    /// (DEC-1954.3):
+    ///
+    /// - a computed column that may call a function stands in the way of
+    ///   altering or dropping it (3729, measured on 17.0, even without
+    ///   SCHEMABINDING);
+    /// - a computed column that may read a column stands in the way of
+    ///   dropping, renaming or retyping it, or tightening it (15336, 4922);
+    /// - a check or filtered index that may name a column stands in the way
+    ///   of dropping, renaming or retyping it (DECISIONS 474).
+    ///
+    /// "May" by the lexer, which over-approximates: a false yes costs an edge,
+    /// a false no costs an apply the engine refuses (DEC-1174.1).
+    fn engine_effects(
+        &self,
+        op: &pbps_model::operation::Operation,
+        owners: &dyn pbps_model::operation::Owners,
+        before: pbps_model::operation::Snapshot<'_>,
+        _after: pbps_model::operation::Snapshot<'_>,
+    ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
+        use pbps_model::Change;
+        use pbps_model::operation::{PartKey, Requirement, base_table, base_table_named};
+        let mut fx = pbps_dialect::engine_effects::text_dependents(self, op, owners, before, true)?;
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match op.change() {
+            Change::AlterModule { id, .. } | Change::DropModule { id, .. } => {
+                if let pbps_model::ModuleId::Routine(routine) = id {
+                    for (name, table) in &before.schema.tables {
+                        let Some(base) = base_table_named(owners, before, name) else {
+                            continue;
+                        };
+                        for (column, computed) in &table.computed {
+                            if self.may_name_qualified(
+                                &computed.expression,
+                                &routine.name.schema,
+                                &routine.name.name,
+                            ) {
+                                fx.requires.push(Requirement::Absent(
+                                    base.part(PartKey::Computed(column.clone())),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Change::DropColumn { column, .. }
+            | Change::AlterColumnType { column, .. }
+            | Change::AlterColumnNullability { column, .. } => {
+                if let Some(table) = base_table(op, owners, before, &column.table)? {
+                    for (name, computed) in &table.table.computed {
+                        if self.may_name(&computed.expression, &column.name) {
+                            fx.requires.push(Requirement::Absent(
+                                table.part(PartKey::Computed(name.clone())),
+                            ));
+                        }
+                    }
+                }
+            }
+            Change::RenameColumn { table, from, .. } => {
+                if let Some(base) = base_table(op, owners, before, table)? {
+                    for (name, computed) in &base.table.computed {
+                        if self.may_name(&computed.expression, from) {
+                            fx.requires.push(Requirement::Absent(
+                                base.part(PartKey::Computed(name.clone())),
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(fx)
+    }
+
     /// Both spellings of each column default's generated name: which one a
     /// database holds is the catalog's to say, and the plan is ordered offline.
     fn generated_constraint_names(&self, name: &TableName, table: &Table) -> Vec<String> {

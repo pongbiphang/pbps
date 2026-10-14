@@ -5232,3 +5232,127 @@ longer left out), `list_and_hash_partitions_are_held_to_what_the_engine_takes`,
 `the_engines_reading_replaces_only_the_texts_it_was_read_for`,
 `a_parent_that_is_not_partitioned_or_is_external_or_is_a_partition_is_refused`
 and `a_partition_tree_is_created_then_gains_and_loses_partitions_only`.
+
+<a id="dec-1954-1"></a>
+
+**DEC-1954.1. Every operation declares what it creates, removes, rewrites
+and requires, in an exhaustive match over its own payload; the verifier and
+the edges read those declarations and never decide an order.**
+`pbps_model::operation::effects` is the requires table of
+`docs/ORDERING.md` in code. A `Change` kind without effects does not compile,
+and `ordering_audit` compares the last column of that table with what the
+code reports, kind by kind. The baseline and the desired state are asked only
+for the other end of a change: what a drop takes with it, what stands over a
+column, what a created partition must rely on. The obvious alternative reads
+the desired model for the step, which hands a bare table the indexes a later
+step adds (DEC-1961.1). Requirements are `Exists`, `Is(key, Base|Final)`,
+`Absent` and `Bound`, which only the resolver's evidence builds, plus
+`Reads` (DEC-1954.2). `Owners` gained `role`, so a grant requires the role
+the plan creates or renames: the role holder S1a left open is here, not in
+#1871, because grants are the first step to need it. A requirement on a key
+nothing creates and the baseline does not hold is reported as unmet, not
+dropped; a key the baseline model cannot say anything about (rows,
+permissions, a role the cluster owns) is unknown, and unknown is never read
+as absent.
+
+<a id="dec-1954-2"></a>
+
+**DEC-1954.2. NOT NULL is a key of its own, and a step that reads the values
+under a key says so with `Reads`, a fifth requirement.** A relaxation has to
+precede what writes a NULL and a tightening has to follow it, so no single
+"the column changed" resource orders both: a recomputed generated column must
+come after the relaxation and before the tightening (DEC-1168.1), and a rewrite
+of the column read by an expression would put the tightening first. The
+obvious alternative gives the column one definition resource; it either invents
+the cycle (DEC-1364.1) or leaves one of the two unordered. `ObjectKey::NotNull`
+is produced by a tightening and ended by a relaxation, and what needs a NULL
+or none requires `Absent` or `Is` of it. A check, a key, a foreign key and a
+data-mode change validate or depend on the rows as the plan leaves them, which
+`Exists` of the table cannot say (every step on a table requires it): they
+`Reads` the table, and a step that writes a column's values or a row is what it
+reads. Two writes of different columns of one table are not one write.
+
+<a id="dec-1954-3"></a>
+
+**DEC-1954.3. What only the engine's lexer or catalog knows is
+`Dialect::engine_effects`, pure, merged beside the portable effects.** A
+check, a filtered index or a computed column that may name a column stands in
+the way of dropping, renaming or retyping it; a function a computed column
+may call cannot be altered or dropped while it stands (3729, measured on
+17.0); on PostgreSQL `SET SCHEMA` rewrites the indexes and keys it carries.
+They are `Absent` requirements and rewrites, found by the dialect's
+over-approximating lexer (DEC-174, DEC-1174.1) and built through the owners
+(`base_table`), so a dialect cannot make a key up. A dependency only a
+connected plan's catalog reads is the `Catalog` edge source's (S6a), and a
+body or an expression read by the lexer is `Lexical`: neither is produced
+here. Owned sequences moved by `SET SCHEMA` have no key until name slots.
+
+<a id="dec-1954-4"></a>
+
+**DEC-1954.4. A step is ordered against the renames of what it reads by the
+name it spells, never by position; two removers of one object are ordered by
+the first.** A rename rewrites an address, and "rewrites before reads" would
+put every reader after it, including the steps the differ places before it
+and spells with the old name (a replica identity at (0, 1), a teardown spelled
+by its base name). The direction is the reader's spelling (DEC-1961.1): a
+base spelling reads before, a final one after, a name in force at a boundary
+by the boundary. Several steps that remove one object (a foreign key dropped
+explicitly and with its table) are one `Absent`: once the first has run the
+object is gone, and the others follow it as a second write of the same
+resource. `Exists` of an object the plan both ends and produces draws no edge
+(a step that means one instance says `Is`) and is counted as ambiguous; the
+base instance ends before the plan's produces under one address.
+
+<a id="dec-1954-5"></a>
+
+**DEC-1954.5. A parent's default or NOT NULL reaching a partition is an
+ordering requirement of the partition's own entry, and attach and detach move
+the entries.** The parent's `SET DEFAULT` recurses into every partition and
+overwrites its own default (DEC-1687.1), so what sets the partition's default
+follows whatever the plan does to the parent's. The first reading was a write
+of the partition's key by the parent, ordered by the base order of the two;
+that is wrong where the plan appended the parent's change after the
+partition's, and the direction is a fact of the engine, not of position. The
+partition's step therefore requires the parent's default as the plan leaves it
+(`Is`) or gone (`Absent`), and likewise its NOT NULL. This is in the portable
+effects because partitions are in the model, not an engine's. Attach ends the
+table's own columns and produces the partition's entries; detach ends the
+entries and produces the table's own columns, so what releases one runs before
+the move and what restores one after. The partition's own alterations keep
+their order after an attach as writes of the same entry (DEC-1545.1).
+
+<a id="dec-1954-6"></a>
+
+**DEC-1954.6. The effects and the verifier run beside every order in tests
+and debug builds; a violation fails the test that made the order.**
+`pbps_diff::order` replays the operations from the baseline and refuses a
+requirement not satisfied at its step, an `Absent` dependency still present, a
+broken `depends_on:` annotation, and an edge the effects imply that the order
+runs the other way. A requirement nothing in the plan provides and the baseline lacks (an identity
+file naming a column the base declarations lack) is recorded as `unprovided`
+and does not fail: no order could meet it, so it says nothing about the order. They run where an order is made: the differ's, and the
+resolver's. The resolver's intermediate ordinary plan is not observed, because
+it is not an order anything runs. With `PBPS_ORDER_SHADOW` set to a file they
+write their findings and never fail, which is how the go/no-go report is
+measured. The edge check holds by construction once `settle` produces the
+order and is then dropped; the replay stays independent of the scheduler.
+Write-write pairs take the direction of the operations' ids, which a plan's
+logical order assigned (DEC-1961.1): swapped from it they are refused. Three
+guard flags turn the baseline, the incarnations or write-write off for the
+tests that show each negative then passes wrongly.
+
+<a id="dec-1954-7"></a>
+
+**DEC-1954.7. Every edge `graph::constraints` emits is classified against the
+effects' edges, and none is required to be contained.** Some edges only keep
+the original order, and reproducing them would carry the over-constraint
+into the new graph. The classes are *covered* (implied by effects, directly or
+through others), *binding* (evidence the resolver supplies, which stays in
+`graph.rs` for S7a), *position only* (order kept between steps whose effects
+do not interact), *slot* (an address released and claimed again: S1b-ii),
+*execution* (the executing principal must hold a permission when the step
+runs: an execution requirement, not an effect) and *missing* (a real
+dependency effects do not imply: an `effects` correction made in this slice).
+The classifier runs in tests and debug builds on every resolver plan; the go
+criterion is no *missing*. Edges the effects add that the graph lacks are
+listed with their reason.
