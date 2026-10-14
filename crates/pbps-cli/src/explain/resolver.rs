@@ -175,10 +175,12 @@ fn prerequisites(opening: &[Prerequisite], closing: &[Prerequisite]) -> Vec<Prer
     opening
         .iter()
         .chain(closing.iter().filter(|p| p.is_managed_closing()))
-        .filter(|p| seen.insert((&p.object, p.fingerprinted())))
+        // A record lacks a fingerprint exactly when it is a placeholder: the
+        // digest is a keyed hash, so no value of it can say so (#1945 review).
+        .filter(|p| seen.insert((&p.object, !p.is_managed_closing())))
         .map(|p| PrerequisiteDetail {
             object: ObjectDetail::from(&p.object),
-            fingerprinted: p.fingerprinted(),
+            fingerprinted: !p.is_managed_closing(),
         })
         .collect()
 }
@@ -389,7 +391,11 @@ mod tests {
             vec![id("pg_type", &["pg_catalog", "int4"], vec![])],
         ))
         .managed_closing();
-        let opening = [record(default_of("t")), record(default_of("u"))];
+        // A target record whose keyed digest happens to be all zeros is
+        // still fingerprinted: only the placeholder marker says otherwise.
+        let mut zeros = record(default_of("u"));
+        zeros.properties = "00".repeat(32);
+        let opening = [record(default_of("t")), zeros];
         // The closing manifest repeats the target's records; the plan's own
         // is a placeholder, here twice.
         let closing = [

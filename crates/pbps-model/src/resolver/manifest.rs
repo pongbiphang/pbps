@@ -99,13 +99,6 @@ impl Prerequisite {
     pub fn is_managed_closing(&self) -> bool {
         self.canonicalization == MANAGED_CLOSING
     }
-
-    /// Whether the record carries a keyed fingerprint of the object's
-    /// properties: a record the plan installs has none to carry. Presence
-    /// only; the value is never shown (#1517).
-    pub fn fingerprinted(&self) -> bool {
-        self.properties != NO_FINGERPRINT
-    }
 }
 
 /// Required, complete catalog input for one coherent observation. Fields have
