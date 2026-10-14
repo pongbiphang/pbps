@@ -39,7 +39,8 @@ NOT_CITATIONS = {INDEX, "scripts/check-decisions.py", "scripts/check_decisions_t
 LEGACY_ENTRY = re.compile(r"^(\d+)\. \*\*")
 NEW_ENTRY = re.compile(r"^\*\*DEC-(\d+)\.(\d+)\. ")
 ANCHOR = re.compile(r'^<a id="(decision-(\d+)|dec-(\d+)-(\d+))"></a>$')
-DEC_INDEX_ROW = re.compile(r"^\| (DEC-\d+\.\d+)\b")
+# Any spacing Markdown accepts around the first cell: `|DEC-9.1|` is the same row.
+DEC_INDEX_ROW = re.compile(r"^\|\s*(DEC-\d+\.\d+)\s*\|")
 INDEX_ROW = re.compile(r"^\| (\d+) \| \[[^\]]+\]\(decisions/([^)#]+)#decision-(\d+)\) \|")
 # The last number of the closed sequence. Fixed here rather than read from the
 # index, which is an ordinary file a branch could extend along with its entry.

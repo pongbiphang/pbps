@@ -172,7 +172,9 @@ Before merge, the primary agent—not an issue worker—must independently confi
 - the issue is still open and the PR closes the intended issue;
 - the final diff is a complete solution limited to the issue;
 - architecture and product guardrails are preserved;
-- the full gate actually ran and passed on the head being queued;
+- the full gate actually ran and passed on the head being queued, or, after a
+  docs-only rebase (§5), on the head it was rebased from, with `git range-diff`
+  showing the branch's own commits differ only in documentation;
 - the qualifying draft and ready reviews belong to the recorded pushed heads;
 - every finding has the required fix or linked deferred issue;
 - no review thread is unresolved;
