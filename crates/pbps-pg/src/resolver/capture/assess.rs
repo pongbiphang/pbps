@@ -587,8 +587,9 @@ pub(super) fn assess_with(
                          ADR-0013's conservative rebuild",
                         overload(member),
                         // The declaration, not its part: a view's rule, a
-                        // default's record.
-                        super::staged::named(owner(object))
+                        // default's record. With its signature, as the
+                        // candidate is: a declared routine has overloads.
+                        overload(owner(object))
                     ),
                     None => "a same-named candidate on the target was not reconstructed on \
                              scratch"

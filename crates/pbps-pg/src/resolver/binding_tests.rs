@@ -2787,5 +2787,57 @@ async fn an_unstaged_external_object_of_any_class_is_refused_by_name() {
                 None => assert_eq!(found, Verdict::Created, "{variable} {tag}"),
             }
         }
+        // The declaration is named with its signature too: two overloads of
+        // `app.g` are told apart, and only the one whose body calls `f(1)`
+        // is named (#1945 review).
+        let overloads = || {
+            numeric_f()
+                .function(
+                    "app.g(integer)",
+                    "(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN f(1)",
+                )
+                .function(
+                    "app.g(text)",
+                    "(text) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN 0",
+                )
+        };
+        let assessment = analyze(
+            &server,
+            "declaring",
+            Case {
+                schemas: &["app", "util"],
+                extras: &["util"],
+                target: "CREATE FUNCTION app.f(numeric) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;
+                         CREATE FUNCTION util.f(integer) RETURNS numeric LANGUAGE sql IMMUTABLE RETURN $1;",
+                base: numeric_f(),
+                desired: overloads(),
+            },
+        )
+        .await
+        .unwrap();
+        let conditions: Vec<String> = verdicts(&assessment, "app", "g")
+            .into_iter()
+            .filter_map(|verdict| {
+                if let Verdict::Unresolved { condition } = verdict {
+                    Some(condition)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            conditions.iter().any(|condition| condition.starts_with(
+                "routine util.f(pg_catalog.int4) on the target is not in the resolver's \
+                 baseline, and routine app.g(pg_catalog.int4) could bind it"
+            )),
+            "{variable}: {assessment:#?}"
+        );
+        // Negative: the overload that calls nothing is not named.
+        assert!(
+            !conditions
+                .iter()
+                .any(|condition| condition.contains("app.g(pg_catalog.text)")),
+            "{variable}: {conditions:?}"
+        );
     }
 }
