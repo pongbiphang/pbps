@@ -1423,3 +1423,75 @@ fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change
     assert!(fails, "{lines:?}");
     assert!(lines.iter().any(|l| l.starts_with("present ")), "{lines:?}");
 }
+
+fn update_pid(id: i64, parent: i64) -> PlannedChange {
+    use pbps_model::Cell;
+    p(Change::UpdateRow {
+        table: t("c"),
+        key_column: "id".into(),
+        key: RowKey::from(id.to_string().as_str()),
+        columns: [(
+            "pid".to_owned(),
+            (Cell::Value(Value::Null), Cell::Value(Value::Int(parent))),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    })
+}
+
+#[test]
+fn two_standing_rows_updated_to_reference_each_other_are_not_a_cycle() {
+    let plan = rows_of_c(true, true, vec![update_pid(1, 2), update_pid(2, 1)]);
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    let g = graph(ops.as_slice(), &fx, &baseline, &none, Checks::ALL);
+    assert!(!g.has_cycle(2), "{:?}", g.edges);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // Negative: an update of a row the plan inserts still follows the insert.
+    let plan = rows_of_c(true, true, vec![child_row(1, None), update_pid(1, 1)]);
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
+
+#[test]
+fn a_primary_key_over_a_column_the_plan_tightens_follows_the_tightening() {
+    let mut was = table_with(&["id"]);
+    let mut n = Column::new(int());
+    n.nullable = true;
+    was.columns.insert("n".into(), n);
+    let mut will = was.clone();
+    will.columns.get_mut("n").unwrap().nullable = false;
+    will.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["n".into()],
+        storage_parameters: Default::default(),
+    });
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), was);
+    after.tables.insert(t("t"), will.clone());
+    let ids = Plan::ids(&["t"], &[("t", "id"), ("t", "n")]);
+    let plan = Plan {
+        logical: vec![
+            tighten(),
+            p(Change::SetPrimaryKey {
+                table: t("t"),
+                from: None,
+                to: will.primary_key,
+                nonclustered: false,
+            }),
+        ],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}

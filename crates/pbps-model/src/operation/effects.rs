@@ -757,13 +757,13 @@ impl Cx<'_> {
                     })
                     .collect();
                 self.row_references(&owner, &old, false);
-                self.rewrites(Resource::Object(
-                    ObjectKey::Row {
-                        table: owner,
-                        key: key.clone(),
-                    },
-                    Incarnation::Final,
-                ));
+                // The row must stand; its values change, its identity does
+                // not, so a lookup of it by another row waits for nothing
+                // here.
+                self.exists(ObjectKey::Row {
+                    table: owner,
+                    key: key.clone(),
+                });
             }
             Change::DeleteRow {
                 table, key, row, ..
@@ -864,10 +864,22 @@ impl Cx<'_> {
         }
     }
 
-    /// A column the step needs, in the final type if it reads values.
-    fn requires_column(&mut self, table: &TableName, column: &str, _strict: bool) {
-        if let Ok(key) = self.column(&table.column(column)) {
-            self.exists(ObjectKey::Column(key));
+    /// A column the step needs. A `strict` one must also be NOT NULL where it
+    /// ends (a primary key's), so the tightening that makes it so goes first;
+    /// a column the plan creates has no producer of its NOT NULL here and
+    /// adds nothing.
+    fn requires_column(&mut self, table: &TableName, column: &str, strict: bool) {
+        let Ok(key) = self.column(&table.column(column)) else {
+            return;
+        };
+        self.exists(ObjectKey::Column(key.clone()));
+        if strict
+            && let Ok(owner) = self.table(table)
+            && let Some((_, will)) = self.final_of(&owner)
+            && let Some((_, now)) = self.names_of(&key)
+            && will.columns.get(&now).is_some_and(|c| !c.nullable)
+        {
+            self.exists(Self::not_null(key));
         }
     }
 
