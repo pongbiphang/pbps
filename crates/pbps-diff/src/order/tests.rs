@@ -1206,3 +1206,220 @@ fn a_replica_identity_target_made_usable_by_the_plan_is_switched_to_last() {
         []
     );
 }
+
+/// `t(id, n)` keyed by `id`, `n` nullable before and NOT NULL after.
+fn tightened_column(logical: Vec<PlannedChange>) -> Plan {
+    let table = |nullable: bool| {
+        let mut table = table_with(&["id"]);
+        let mut n = Column::new(int());
+        n.nullable = nullable;
+        table.columns.insert("n".into(), n);
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table(true));
+    after.tables.insert(t("t"), table(false));
+    let ids = Plan::ids(&["t"], &[("t", "id"), ("t", "n")]);
+    Plan {
+        logical,
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    }
+}
+
+fn tighten() -> PlannedChange {
+    p(Change::AlterColumnNullability {
+        uid: uid(UidKind::Column, "t.n"),
+        column: t("t").column("n"),
+        ty: int(),
+        to_nullable: false,
+        collation: None,
+        through_external_partitions: false,
+    })
+}
+
+#[test]
+fn a_tightening_followed_by_a_non_null_write_is_a_valid_order() {
+    let insert = p(Change::InsertRow {
+        table: t("t"),
+        key_column: "id".into(),
+        identity_key: false,
+        key: RowKey::from("1"),
+        row: [
+            ("id".to_owned(), Value::Int(1)),
+            ("n".to_owned(), Value::Int(5)),
+        ]
+        .into_iter()
+        .collect::<Row>(),
+        defaults: Default::default(),
+        types: Default::default(),
+    });
+    let plan = tightened_column(vec![tighten(), insert]);
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert_eq!(
+        run(
+            &ops,
+            &fx,
+            &baseline,
+            &[0, 1],
+            &ModuleDeps::new(),
+            Checks::ALL
+        ),
+        []
+    );
+}
+
+#[test]
+fn a_recomputed_expression_runs_before_the_tightening_that_would_refuse_its_nulls() {
+    let recompute = p(Change::AlterColumnExpression {
+        uid: uid(UidKind::Column, "t.n"),
+        column: t("t").column("n"),
+        from: "1".into(),
+        to: "2".into(),
+    });
+    let plan = tightened_column(vec![recompute, tighten()]);
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
+
+#[test]
+fn a_long_chain_of_annotated_modules_is_ordered_without_scanning_every_pair() {
+    let n = 800;
+    let modules: Vec<(ModuleId, Module)> = (0..n).map(|i| view(&format!("v{i}"))).collect();
+    let logical: Vec<PlannedChange> = modules
+        .iter()
+        .map(|(id, module)| {
+            p(Change::CreateModule {
+                id: id.clone(),
+                module: Box::new(module.clone()),
+            })
+        })
+        .collect();
+    let declared: ModuleDeps = (1..n)
+        .map(|i| {
+            (
+                modules[i].0.clone(),
+                BTreeSet::from([modules[i - 1].0.clone()]),
+            )
+        })
+        .collect();
+    let plan = Plan {
+        logical,
+        before: Schema::default(),
+        after: Schema::default(),
+        before_ids: IdsFile::default(),
+        after_ids: IdsFile::default(),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let order: Vec<usize> = (0..n).collect();
+    assert_eq!(
+        run(&ops, &fx, &baseline, &order, &declared, Checks::ALL),
+        []
+    );
+    // Negative: the chain still orders, reversed.
+    let reversed: Vec<usize> = (0..n).rev().collect();
+    assert!(!run(&ops, &fx, &baseline, &reversed, &declared, Checks::ALL).is_empty());
+}
+
+/// `t(a)` with a computed column `c` over `a`, a view `v`, and a plan that
+/// drops `c` and then does `second`, whose requirement that `c` is gone is
+/// added by hand (the SQL Server effects are in another crate).
+fn computed_then(second: Change, id: Option<ModuleId>) -> (Operations, Vec<Effects>, Baseline) {
+    use pbps_model::ComputedColumn;
+    use pbps_model::operation::PartKey;
+    let computed = ComputedColumn {
+        expression: "[a]*2".into(),
+        persisted: false,
+        not_null: false,
+    };
+    let mut table = table_with(&["a"]);
+    table.computed.insert("c".into(), computed.clone());
+    let mut before = Schema::default();
+    before.tables.insert(t("t"), table);
+    if let Some(id) = &id {
+        before.modules.insert(id.clone(), view("v").1);
+    }
+    let mut after = Schema::default();
+    after.tables.insert(t("t"), table_with(&["a"]));
+    if let Some(id) = &id {
+        after.modules.insert(id.clone(), view("v").1);
+    }
+    let plan = Plan {
+        logical: vec![
+            p(Change::DropComputedColumn {
+                table: t("t"),
+                name: "c".into(),
+                computed,
+            }),
+            p(second),
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(&["t"], &[("t", "a")]),
+        after_ids: Plan::ids(&["t"], &[]),
+    };
+    let (ops, mut fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
+    let owners = PlanOwners::new(names, &plan.before_ids, &plan.after_ids);
+    let snapshot = Snapshot {
+        schema: &plan.before,
+        ids: &plan.before_ids,
+    };
+    let key = pbps_model::operation::base_table_named(&owners, snapshot, &t("t"))
+        .unwrap()
+        .part(PartKey::Computed("c".into()));
+    fx[1].requires.push(Requirement::Absent(key));
+    (ops, fx, baseline)
+}
+
+#[test]
+fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change_is_not() {
+    use super::shadow::{Shadowed, judge};
+    let judged = |ops: &Operations, fx: &[Effects], baseline: &Baseline, order: &[usize]| {
+        let reordered = ops.reordered(order);
+        let effects: Vec<Effects> = order.iter().map(|&i| fx[i].clone()).collect();
+        let report = Shadowed {
+            effects,
+            unowned: Vec::new(),
+        }
+        .report(&reordered, baseline, &ModuleDeps::new());
+        judge(reordered.as_slice(), &report)
+    };
+    // The function's alteration ahead of the column's drop: the connected
+    // pass moves it, so it is recorded and does not fail.
+    let (id, module) = view("v");
+    let (ops, fx, baseline) = computed_then(
+        Change::AlterModule {
+            id: id.clone(),
+            module: Box::new(module),
+        },
+        Some(id),
+    );
+    let (lines, fails) = judged(&ops, &fx, &baseline, &[1, 0]);
+    assert!(!fails, "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l.starts_with("connected ")),
+        "{lines:?}"
+    );
+    // Negative: the same requirement on a column drop is an order the
+    // differ itself makes, and fails.
+    let (ops, fx, baseline) = computed_then(
+        Change::DropColumn {
+            uid: uid(UidKind::Column, "t.a"),
+            column: t("t").column("a"),
+        },
+        None,
+    );
+    let (lines, fails) = judged(&ops, &fx, &baseline, &[1, 0]);
+    assert!(fails, "{lines:?}");
+    assert!(lines.iter().any(|l| l.starts_with("present ")), "{lines:?}");
+}

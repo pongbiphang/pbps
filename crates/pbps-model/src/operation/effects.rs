@@ -407,7 +407,7 @@ impl Cx<'_> {
                     Incarnation::Final,
                 ));
                 self.writes_values(ObjectKey::Column(key.clone()), &owner);
-                self.nullability_moves(&key, *from_nullable, *to_nullable, false);
+                self.nullability_moves(&key, *from_nullable, *to_nullable);
                 // A default written for the old type blocks the retype, and
                 // one written for the new type follows it (DEC-1168.1).
                 if self.default_goes(&owner, &key) {
@@ -424,7 +424,7 @@ impl Cx<'_> {
                 self.exists(ObjectKey::Table(owner));
                 let key = ColumnKey::Recorded(Recorded(uid.clone()));
                 self.exists(ObjectKey::Column(key.clone()));
-                self.nullability_moves(&key, !*to_nullable, *to_nullable, true);
+                self.nullability_moves(&key, !*to_nullable, *to_nullable);
             }
             Change::AlterColumnDefault {
                 uid, column, to, ..
@@ -450,8 +450,10 @@ impl Cx<'_> {
                 self.writes_values(ObjectKey::Column(key.clone()), &owner);
                 // A recomputed value may be NULL where the column stood NOT
                 // NULL: a relaxation goes first, a tightening after
-                // (DEC-1168.1).
-                if self.relaxes(&owner, &key) {
+                // (DEC-1168.1). `Absent` of the NOT NULL says both: it
+                // follows the step that ends it and precedes the one that
+                // produces it.
+                if self.relaxes(&owner, &key) || self.tightens(&owner, &key) {
                     self.requires(Requirement::Absent(Self::not_null(key)));
                 }
             }
@@ -1185,15 +1187,11 @@ impl Cx<'_> {
     }
 
     /// NOT NULL moves with a change of nullability: a relaxation ends the
-    /// constraint, a tightening produces it and reads the values it must
-    /// hold over.
-    fn nullability_moves(
-        &mut self,
-        column: &ColumnKey,
-        from_nullable: bool,
-        to_nullable: bool,
-        reads: bool,
-    ) {
+    /// constraint, a tightening produces it. A tightening reads no values: a
+    /// write of a non-NULL value is valid on either side of it, and one of
+    /// NULL is refused after it whatever the order, so a read would order
+    /// every later write before it and refuse the differ's own plan.
+    fn nullability_moves(&mut self, column: &ColumnKey, from_nullable: bool, to_nullable: bool) {
         let key = Self::not_null(column.clone());
         if from_nullable == to_nullable {
             return;
@@ -1202,9 +1200,6 @@ impl Cx<'_> {
             self.removes(Resource::Object(key, Incarnation::Base));
         } else {
             self.creates(Resource::Object(key, Incarnation::Final));
-            if reads {
-                self.requires(Requirement::Reads(ObjectKey::Column(column.clone())));
-            }
         }
     }
 
@@ -1233,6 +1228,20 @@ impl Cx<'_> {
             _ => None,
         };
         default(was, &was_name).is_some() && default(was, &was_name) != default(will, &will_name)
+    }
+
+    /// Whether the plan tightens the column to NOT NULL.
+    fn tightens(&self, owner: &Recorded, column: &ColumnKey) -> bool {
+        let (Some((_, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner)) else {
+            return false;
+        };
+        let Some((was_name, will_name)) = self.names_of(column) else {
+            return false;
+        };
+        match (was.columns.get(&was_name), will.columns.get(&will_name)) {
+            (Some(a), Some(b)) => a.nullable && !b.nullable,
+            _ => false,
+        }
     }
 
     /// Whether the plan relaxes the column from NOT NULL.

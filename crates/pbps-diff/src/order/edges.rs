@@ -523,18 +523,24 @@ pub fn declared_edges(
     edge: &mut dyn FnMut(usize, usize),
 ) {
     use pbps_model::Change;
+    // Indexed once: a pair scan over every operation per annotation is cubic
+    // in the module operations of a plan.
+    let mut by_module: std::collections::BTreeMap<&pbps_model::ModuleId, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (i, op) in operations.iter().enumerate() {
+        if let Some(id) = op.change().module_id() {
+            by_module.entry(id).or_default().push(i);
+        }
+    }
+    let none: Vec<usize> = Vec::new();
+    let defines =
+        |c: &Change| matches!(c, Change::CreateModule { .. } | Change::AlterModule { .. });
     for (dependent, inputs) in declared {
+        let dependents = by_module.get(dependent).unwrap_or(&none);
         for input in inputs {
-            for (i, a) in operations.iter().enumerate() {
-                for (j, b) in operations.iter().enumerate() {
-                    if a.change().module_id() != Some(input)
-                        || b.change().module_id() != Some(dependent)
-                    {
-                        continue;
-                    }
-                    let defines = |c: &Change| {
-                        matches!(c, Change::CreateModule { .. } | Change::AlterModule { .. })
-                    };
+            for &i in by_module.get(input).unwrap_or(&none) {
+                for &j in dependents {
+                    let (a, b) = (&operations[i], &operations[j]);
                     if defines(a.change()) && defines(b.change()) {
                         edge(i, j);
                     }

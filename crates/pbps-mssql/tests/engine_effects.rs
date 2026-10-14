@@ -15,7 +15,7 @@ fn t() -> TableName {
 }
 
 fn setup() -> (Schema, IdsFile, ModuleId, Module) {
-    let id: ModuleId = "dbo.f(integer)".parse().unwrap();
+    let id = ModuleId::Named(TableName::new("dbo", "f"));
     let module = Module {
         kind: ModuleKind::Function,
         definition: "CREATE FUNCTION dbo.f(@a int) RETURNS int AS BEGIN RETURN @a END".into(),

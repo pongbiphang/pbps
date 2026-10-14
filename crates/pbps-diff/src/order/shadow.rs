@@ -6,7 +6,7 @@ use pbps_model::operation::{
     Effects, Operation, OperationId, Operations, OwnerError, Owners, Requirement, Snapshot, effects,
 };
 
-use super::edges::{Baseline, Checks, Graph, graph};
+use super::edges::{Baseline, Because, Checks, Graph, graph};
 use super::verify::{Violation, verify_with};
 
 /// Everything the effects say about one ordered plan.
@@ -202,6 +202,28 @@ pub(crate) fn judge(ops: &[Operation], report: &Report) -> (Vec<String>, bool) {
                 && &u.requirement == requirement
         })
     };
+    // A function a computed column calls is moved by the connected pass
+    // (`computed_order.rs`, DEC-1431.1) after the differ made this order, from
+    // the catalog's edges; the differ's own order for that pair is not the one
+    // that runs. Recorded as `connected`, and not failed, until the verifier
+    // runs on the order that runs.
+    let module_op = |id: OperationId| {
+        find(id).is_some_and(|o| {
+            matches!(
+                o.change(),
+                pbps_model::Change::AlterModule { .. } | pbps_model::Change::DropModule { .. }
+            )
+        })
+    };
+    let computed = |key: &pbps_model::operation::ObjectKey| {
+        matches!(
+            key,
+            pbps_model::operation::ObjectKey::Part {
+                part: pbps_model::operation::PartKey::Computed(_),
+                ..
+            }
+        )
+    };
     let violations: Vec<String> = report
         .violations
         .iter()
@@ -221,8 +243,30 @@ pub(crate) fn judge(ops: &[Operation], report: &Report) -> (Vec<String>, bool) {
             {
                 format!("unprovided {} needs {key:?} gone", name(*operation))
             }
+            Violation::StillPresent { operation, key }
+                if module_op(*operation) && computed(key) =>
+            {
+                format!("connected {} needs {key:?} gone", name(*operation))
+            }
             Violation::StillPresent { operation, key } => {
                 format!("present {} needs {key:?} gone", name(*operation))
+            }
+            Violation::Edge {
+                before,
+                after,
+                edge,
+            } if (module_op(*before) || module_op(*after))
+                && matches!(
+                    &edge.because,
+                    Because::Frees(key) | Because::Precedes(key) if computed(key)
+                ) =>
+            {
+                format!(
+                    "connected {} must precede {} because {:?}",
+                    name(*before),
+                    name(*after),
+                    edge.because
+                )
             }
             Violation::Edge {
                 before,
@@ -239,7 +283,9 @@ pub(crate) fn judge(ops: &[Operation], report: &Report) -> (Vec<String>, bool) {
             }
         })
         .collect();
-    let any = violations.iter().any(|v| !v.starts_with("unprovided "));
+    let any = violations
+        .iter()
+        .any(|v| !v.starts_with("unprovided ") && !v.starts_with("connected "));
     (violations, any)
 }
 

@@ -78,18 +78,32 @@ impl Dialect for Mssql {
         let mut fx = pbps_dialect::engine_effects::text_dependents(self, op, owners, before, true)?;
         #[allow(clippy::wildcard_enum_match_arm)]
         match op.change() {
-            Change::AlterModule { id, .. } | Change::DropModule { id, .. } => {
-                if let pbps_model::ModuleId::Routine(routine) = id {
+            Change::AlterModule { .. } | Change::DropModule { .. } => {
+                // A SQL Server function is addressed by its name
+                // (`ModuleId::Named`); its kind is in the payload.
+                let (id, kind) = match op.change() {
+                    Change::AlterModule { id, module } => (id, module.kind),
+                    Change::DropModule { id, kind } => (id, *kind),
+                    _ => unreachable!("matched above"),
+                };
+                let function = match id {
+                    pbps_model::ModuleId::Named(name)
+                        if kind == pbps_model::ModuleKind::Function =>
+                    {
+                        Some((name.schema.as_str(), name.name.as_str()))
+                    }
+                    pbps_model::ModuleId::Routine(routine) => {
+                        Some((routine.name.schema.as_str(), routine.name.name.as_str()))
+                    }
+                    pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Trigger { .. } => None,
+                };
+                if let Some((schema, function)) = function {
                     for (name, table) in &before.schema.tables {
                         let Some(base) = base_table_named(owners, before, name) else {
                             continue;
                         };
                         for (column, computed) in &table.computed {
-                            if self.may_name_qualified(
-                                &computed.expression,
-                                &routine.name.schema,
-                                &routine.name.name,
-                            ) {
+                            if self.may_name_qualified(&computed.expression, schema, function) {
                                 fx.requires.push(Requirement::Absent(
                                     base.part(PartKey::Computed(column.clone())),
                                 ));

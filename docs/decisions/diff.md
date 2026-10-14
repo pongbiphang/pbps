@@ -5282,7 +5282,9 @@ or none requires `Absent` or `Is` of it. A check, a key, a foreign key and a
 data-mode change validate or depend on the rows as the plan leaves them, which
 `Exists` of the table cannot say (every step on a table requires it): they
 `Reads` the table, and a step that writes a column's values or a row is what it
-reads. Two writes of different columns of one table are not one write.
+reads. Two writes of different columns of one table are not one write. A tightening reads no values: a non-NULL write is valid on either side of
+it, and what may produce a NULL, a recomputed expression, is ordered before it
+by `Absent` of the NOT NULL it produces.
 
 <a id="dec-1954-3"></a>
 
@@ -5346,7 +5348,11 @@ file naming a column the base declarations lack), or a dependent that stands
 throughout and that no operation removes (a check the lowering rebuilds around
 a retype, a computed column the catalog judges by its own collation, #1460), is
 recorded as `unprovided` and does not fail: no order could meet it, so it says
-nothing about the order. They run where an order is made: the differ's, and the
+nothing about the order. A function a computed column calls that the differ's order alters or drops
+ahead of the column's own removal is recorded as `connected`: the connected
+pass moves it afterwards from the catalog's edges (DEC-1431.1), so the order
+the differ made is not the one that runs. It is not failed until the verifier
+runs on the order that runs; a column change in the same position still fails. They run where an order is made: the differ's, and the
 resolver's. The resolver's intermediate ordinary plan is not observed, because
 it is not an order anything runs. With `PBPS_ORDER_SHADOW` set to a file they
 write their findings and never fail, which is how the go/no-go report is
