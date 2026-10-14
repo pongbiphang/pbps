@@ -1,115 +1,116 @@
+use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart};
 use pbps_model::resolver::{OrderEdge, OrderReason, Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, GrantTarget, TableName, ValueSource};
 use std::collections::BTreeSet;
 
-// This is a projection onto the binding-bearing effects, not an alternative
-// exhaustive definition of Change. All other changes retain ordinary order.
+// Model facts classify every Change kind. This consumer selects the binding
+// surfaces it provides; scheduling and containment remain graph policy.
 #[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn provides(c: &Change) -> BTreeSet<Surface> {
-    match c {
-        // A generation expression stays in its CREATE TABLE, where its place
-        // in the column order is; a default is split out (prepare.rs). Either
-        // way the step that writes it provides its `pg_attrdef` surface, so a
-        // function it calls is ordered first (DEC-1168.1, DEC-1274.2).
-        // A partition's own default is set by its CREATE TABLE's step too
-        // (DEC-1578.1).
-        Change::CreateTable { name, table, .. } => std::iter::once(Surface::Table(name.clone()))
-            .chain(
-                table
-                    .columns
-                    .keys()
-                    .map(|n| Surface::Column(name.column(n))),
-            )
-            .chain(
-                table
-                    .expression_columns()
-                    .map(|n| Surface::Default(name.column(n))),
-            )
-            .collect(),
-        Change::AddColumn {
-            table,
-            name,
-            column,
-            ..
-        } => {
-            let mut set = BTreeSet::from([Surface::Column(table.column(name))]);
-            match column.value_source {
-                ValueSource::Default(_) | ValueSource::Generated(_) => {
-                    set.insert(Surface::Default(table.column(name)));
-                }
-                ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => {}
+    c.part_effects()
+        .into_iter()
+        .filter_map(|fact| match (fact.part, fact.effect) {
+            (DependencyPart::Table(table), Effect::Created) => Some(Surface::Table(table.clone())),
+            (DependencyPart::Column(column), Effect::Created) => Some(Surface::Column(column)),
+            (
+                DependencyPart::Default { column, .. } | DependencyPart::Generated(column),
+                Effect::Created | Effect::Rewritten,
+            ) => Some(Surface::Default(column)),
+            (DependencyPart::Module { id, .. }, Effect::Created | Effect::Rewritten) => {
+                Some(Surface::Module(id.clone()))
             }
-            set
-        }
-        Change::AlterColumnDefault {
-            column,
-            to: Some(_),
-            ..
-        }
-        | Change::AlterColumnExpression { column, .. } => {
-            BTreeSet::from([Surface::Default(column.clone())])
-        }
-        // A partition's own default, or its parent's again: either is the
-        // partition's `pg_attrdef` (#1610).
-        Change::SetPartitionDefault {
-            table,
-            column,
-            to,
-            fallback,
-            ..
-        } if to.is_some() || fallback.is_some() => {
-            BTreeSet::from([Surface::Default(table.column(column))])
-        }
-        Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
-            BTreeSet::from([Surface::Module(id.clone())])
-        }
-        Change::AddCheck { table, name, .. } => BTreeSet::from([Surface::Check {
-            table: table.clone(),
-            name: name.clone(),
-        }]),
-        Change::AddIndex { table, name, .. } => BTreeSet::from([Surface::Index {
-            table: table.clone(),
-            name: name.clone(),
-        }]),
-        _ => BTreeSet::new(),
-    }
+            (
+                DependencyPart::Named {
+                    table,
+                    kind: pbps_model::Part::Check,
+                    name,
+                },
+                Effect::Created,
+            ) => Some(Surface::Check {
+                table: table.clone(),
+                name: name.to_owned(),
+            }),
+            (
+                DependencyPart::Named {
+                    table,
+                    kind: pbps_model::Part::Index,
+                    name,
+                },
+                Effect::Created,
+            ) => Some(Surface::Index {
+                table: table.clone(),
+                name: name.to_owned(),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
+// Ordinary default rewrites have already been split by prepare. A partition
+// can release its own binding while retaining an inherited default; neither
+// question is simply whether the effective expression disappears (DEC-1773.1).
 #[allow(clippy::wildcard_enum_match_arm)]
 fn release(c: &Change, surface: &Surface) -> bool {
-    match (c, surface) {
-        (Change::DropModule { id, .. }, Surface::Module(m)) => id == m,
-        (
-            Change::AlterColumnDefault {
-                column, to: None, ..
-            },
-            Surface::Default(r),
-        ) => column == r,
-        // Its own default taken off, whether the partition is left with
-        // none or with its parent's again: either lets go of what its own
-        // expression bound (#1610 review).
-        (
-            Change::SetPartitionDefault {
-                table,
-                column,
-                from: Some(_),
-                to: None,
-                ..
-            },
-            Surface::Default(r),
-        ) => *table == r.table && *column == r.name,
-        (Change::DropColumn { column, .. }, Surface::Default(r)) => column == r,
-        // A rewritten generation expression lets go of what the old one
-        // bound, as a dropped default does, so it precedes the drop of a
-        // routine the old text called (DEC-1168.1).
-        (Change::AlterColumnExpression { column, .. }, Surface::Default(r)) => column == r,
-        (Change::DropCheck { table, name }, Surface::Check { table: t, name: n })
-        | (Change::DropIndex { table, name }, Surface::Index { table: t, name: n }) => {
-            table == t && name == n
-        }
-        (Change::DropTable { name, .. }, surface) => table_of(surface).is_some_and(|t| t == name),
-        _ => false,
-    }
+    c.part_effects()
+        .iter()
+        .any(|fact| match (&fact.part, fact.effect, surface) {
+            (DependencyPart::Module { id, .. }, Effect::Removed, Surface::Module(module)) => {
+                *id == module
+            }
+            (
+                DependencyPart::Default {
+                    column,
+                    change: DefaultChange::Column { to: None, .. },
+                },
+                _,
+                Surface::Default(target),
+            )
+            | (
+                DependencyPart::Default {
+                    column,
+                    change:
+                        DefaultChange::Partition {
+                            from: Some(_),
+                            to: None,
+                            ..
+                        },
+                },
+                _,
+                Surface::Default(target),
+            )
+            | (DependencyPart::Column(column), Effect::Removed, Surface::Default(target))
+            | (DependencyPart::Generated(column), Effect::Rewritten, Surface::Default(target)) => {
+                column == target
+            }
+            (
+                DependencyPart::Named {
+                    table,
+                    kind: pbps_model::Part::Check,
+                    name,
+                },
+                Effect::Removed,
+                Surface::Check {
+                    table: target,
+                    name: target_name,
+                },
+            )
+            | (
+                DependencyPart::Named {
+                    table,
+                    kind: pbps_model::Part::Index,
+                    name,
+                },
+                Effect::Removed,
+                Surface::Index {
+                    table: target,
+                    name: target_name,
+                },
+            ) => *table == target && *name == target_name,
+            (DependencyPart::Table(table), Effect::Removed, surface) => {
+                table_of(surface).is_some_and(|target| *table == target)
+            }
+            _ => false,
+        })
 }
 
 /// Whether a step writes a column's `pg_attrdef` expression in its own DDL:
@@ -705,4 +706,28 @@ fn grant_matches(target: &GrantTarget, surface: &Surface) -> bool {
         (GrantTarget::Routine(a), Surface::Module(pbps_model::ModuleId::Routine(b))) => a == b,
         _ => false,
     }
+}
+
+#[test]
+fn a_prepared_default_rewrite_releases_then_provides_its_binding() {
+    let column = "app.t.n".parse::<pbps_model::ColumnRef>().unwrap();
+    let change = |from: Option<&str>, to: Option<&str>| Change::AlterColumnDefault {
+        uid: "c_aaaaaa".parse().unwrap(),
+        column: column.clone(),
+        from: from.map(str::to_owned),
+        to: to.map(str::to_owned),
+    };
+    let target = Surface::Default(column.clone());
+    let rewrite = change(Some("app.old()"), Some("app.new()"));
+    assert!(
+        !release(&rewrite, &target),
+        "release consumes the prepared split, not the unsplit edit"
+    );
+    assert!(provides(&rewrite).contains(&target));
+    let drop = change(Some("app.old()"), None);
+    let create = change(None, Some("app.new()"));
+    assert!(release(&drop, &target));
+    assert!(!provides(&drop).contains(&target));
+    assert!(provides(&create).contains(&target));
+    assert!(!release(&create, &target));
 }

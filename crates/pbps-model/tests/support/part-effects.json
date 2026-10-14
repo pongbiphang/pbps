@@ -1,0 +1,1089 @@
+[
+  {
+    "name": "CreateTable",
+    "change": {
+      "op": "create_table",
+      "uid": "t_aaaaaa",
+      "name": "app.t",
+      "table": {
+        "columns": {
+          "n": {
+            "type": "integer",
+            "nullable": true
+          },
+          "d": {
+            "type": "integer",
+            "nullable": true,
+            "default": "app.f()"
+          },
+          "g": {
+            "type": "integer",
+            "nullable": true,
+            "generated": {
+              "expression": "n + 1",
+              "stored": true
+            }
+          },
+          "i": {
+            "type": "integer",
+            "nullable": true,
+            "identity": {
+              "seed": 1,
+              "increment": 1
+            }
+          },
+          "s": {
+            "type": "integer",
+            "nullable": true,
+            "sequence": {
+              "start": 1,
+              "increment": 1
+            }
+          }
+        }
+      },
+      "beside_default": null,
+      "moves_at_most": null
+    }
+  },
+  {
+    "name": "DropTable",
+    "change": {
+      "op": "drop_table",
+      "uid": "t_aaaaaa",
+      "name": "app.t",
+      "detach_from": null
+    }
+  },
+  {
+    "name": "DetachPartition",
+    "change": {
+      "op": "detach_partition",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "names": [],
+      "shape": {
+        "columns": {
+          "n": {
+            "type": "integer",
+            "nullable": true
+          },
+          "d": {
+            "type": "integer",
+            "nullable": true,
+            "default": "app.f()"
+          },
+          "g": {
+            "type": "integer",
+            "nullable": true,
+            "generated": {
+              "expression": "n + 1",
+              "stored": true
+            }
+          },
+          "i": {
+            "type": "integer",
+            "nullable": true,
+            "identity": {
+              "seed": 1,
+              "increment": 1
+            }
+          },
+          "s": {
+            "type": "integer",
+            "nullable": true,
+            "sequence": {
+              "start": 1,
+              "increment": 1
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "AttachPartition",
+    "change": {
+      "op": "attach_partition",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "bound": "default",
+      "shape": {
+        "columns": {
+          "n": {
+            "type": "integer",
+            "nullable": true
+          },
+          "d": {
+            "type": "integer",
+            "nullable": true,
+            "default": "app.f()"
+          },
+          "g": {
+            "type": "integer",
+            "nullable": true,
+            "generated": {
+              "expression": "n + 1",
+              "stored": true
+            }
+          },
+          "i": {
+            "type": "integer",
+            "nullable": true,
+            "identity": {
+              "seed": 1,
+              "increment": 1
+            }
+          },
+          "s": {
+            "type": "integer",
+            "nullable": true,
+            "sequence": {
+              "start": 1,
+              "increment": 1
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "RenameTable",
+    "change": {
+      "op": "rename_table",
+      "uid": "t_aaaaaa",
+      "from": "app.t",
+      "to": "app.renamed",
+      "defaults": []
+    }
+  },
+  {
+    "name": "AddColumn",
+    "change": {
+      "op": "add_column",
+      "uid": "c_aaaaaa",
+      "table": "app.t",
+      "name": "n",
+      "column": {
+        "type": "integer",
+        "nullable": true
+      }
+    }
+  },
+  {
+    "name": "DropColumn",
+    "change": {
+      "op": "drop_column",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n"
+    }
+  },
+  {
+    "name": "RenameColumn",
+    "change": {
+      "op": "rename_column",
+      "uid": "c_aaaaaa",
+      "table": "app.t",
+      "from": "n",
+      "to": "renamed",
+      "table_was": null
+    }
+  },
+  {
+    "name": "AlterColumnType",
+    "change": {
+      "op": "alter_column_type",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": "integer",
+      "to": "bigint",
+      "from_nullable": false,
+      "to_nullable": false,
+      "from_collation": null,
+      "to_collation": null,
+      "through_external_partitions": false
+    }
+  },
+  {
+    "name": "AlterColumnNullability",
+    "change": {
+      "op": "alter_column_nullability",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "ty": "integer",
+      "to_nullable": false,
+      "collation": null,
+      "through_external_partitions": false
+    }
+  },
+  {
+    "name": "AlterColumnDefault",
+    "change": {
+      "op": "alter_column_default",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": null,
+      "to": null
+    }
+  },
+  {
+    "name": "AlterColumnExpression",
+    "change": {
+      "op": "alter_column_expression",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": "part",
+      "to": "part"
+    }
+  },
+  {
+    "name": "AddComputedColumn",
+    "change": {
+      "op": "add_computed_column",
+      "table": "app.t",
+      "name": "part",
+      "computed": {
+        "expression": "n + 1"
+      }
+    }
+  },
+  {
+    "name": "DropComputedColumn",
+    "change": {
+      "op": "drop_computed_column",
+      "table": "app.t",
+      "name": "part",
+      "computed": {
+        "expression": "n + 1"
+      }
+    }
+  },
+  {
+    "name": "SetColumnDeprecated",
+    "change": {
+      "op": "set_column_deprecated",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "reason": null
+    }
+  },
+  {
+    "name": "SetReplicaIdentity",
+    "change": {
+      "op": "set_replica_identity",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "to": null
+    }
+  },
+  {
+    "name": "SetStorageParameters",
+    "change": {
+      "op": "set_storage_parameters",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "set": {},
+      "reset": []
+    }
+  },
+  {
+    "name": "SetTablePersistence",
+    "change": {
+      "op": "set_table_persistence",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "unlogged": false
+    }
+  },
+  {
+    "name": "SetPartitionDefault",
+    "change": {
+      "op": "set_partition_default",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "column": "n",
+      "from": null,
+      "to": null,
+      "fallback": null
+    }
+  },
+  {
+    "name": "SetPartitionNotNull",
+    "change": {
+      "op": "set_partition_not_null",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "column": "n",
+      "not_null": false
+    }
+  },
+  {
+    "name": "SetIndexStorageParameters",
+    "change": {
+      "op": "set_index_storage_parameters",
+      "table": "app.t",
+      "target": {
+        "index": "part"
+      },
+      "method": "btree",
+      "set": {},
+      "reset": []
+    }
+  },
+  {
+    "name": "SetPrimaryKey",
+    "change": {
+      "op": "set_primary_key",
+      "table": "app.t",
+      "from": null,
+      "to": null,
+      "nonclustered": false
+    }
+  },
+  {
+    "name": "AddUnique",
+    "change": {
+      "op": "add_unique",
+      "table": "app.t",
+      "name": "part",
+      "constraint": {
+        "columns": [
+          "n"
+        ]
+      },
+      "clustered": false
+    }
+  },
+  {
+    "name": "DropUnique",
+    "change": {
+      "op": "drop_unique",
+      "table": "app.t",
+      "name": "part"
+    }
+  },
+  {
+    "name": "AddForeignKey",
+    "change": {
+      "op": "add_foreign_key",
+      "table": "app.t",
+      "name": "part",
+      "constraint": {
+        "columns": [
+          "n"
+        ],
+        "references_table": "app.parent",
+        "references_columns": [
+          "n"
+        ]
+      }
+    }
+  },
+  {
+    "name": "DropForeignKey",
+    "change": {
+      "op": "drop_foreign_key",
+      "table": "app.t",
+      "name": "part"
+    }
+  },
+  {
+    "name": "AddCheck",
+    "change": {
+      "op": "add_check",
+      "table": "app.t",
+      "name": "part",
+      "constraint": {
+        "expression": "n > 0"
+      }
+    }
+  },
+  {
+    "name": "DropCheck",
+    "change": {
+      "op": "drop_check",
+      "table": "app.t",
+      "name": "part"
+    }
+  },
+  {
+    "name": "AddIndex",
+    "change": {
+      "op": "add_index",
+      "table": "app.t",
+      "name": "part",
+      "index": {
+        "columns": [
+          {
+            "name": "n",
+            "descending": false
+          }
+        ]
+      },
+      "clustered": false
+    }
+  },
+  {
+    "name": "DropIndex",
+    "change": {
+      "op": "drop_index",
+      "table": "app.t",
+      "name": "part"
+    }
+  },
+  {
+    "name": "InsertRow",
+    "change": {
+      "op": "insert_row",
+      "table": "app.t",
+      "key_column": "n",
+      "identity_key": false,
+      "key": "1",
+      "row": {},
+      "defaults": {},
+      "types": {}
+    }
+  },
+  {
+    "name": "UpdateRow",
+    "change": {
+      "op": "update_row",
+      "table": "app.t",
+      "key_column": "n",
+      "key": "1",
+      "columns": {},
+      "unchanged": {},
+      "types": {},
+      "after_types": {},
+      "key_type": null
+    }
+  },
+  {
+    "name": "DeleteRow",
+    "change": {
+      "op": "delete_row",
+      "table": "app.t",
+      "key_column": "n",
+      "key": "1",
+      "cause": "undeclared",
+      "row": {},
+      "dropped": {},
+      "types": {},
+      "after_types": {},
+      "key_type": null
+    }
+  },
+  {
+    "name": "SetDataMode",
+    "change": {
+      "op": "set_data_mode",
+      "table": "app.t",
+      "from": null,
+      "to": null
+    }
+  },
+  {
+    "name": "SetEnsureKeys",
+    "change": {
+      "op": "set_ensure_keys",
+      "table": "app.t",
+      "from": [],
+      "to": []
+    }
+  },
+  {
+    "name": "CreateModule",
+    "change": {
+      "op": "create_module",
+      "id": "app.v",
+      "module": {
+        "kind": "view",
+        "definition": "SELECT n FROM app.t"
+      }
+    }
+  },
+  {
+    "name": "AlterModule",
+    "change": {
+      "op": "alter_module",
+      "id": "app.v",
+      "module": {
+        "kind": "view",
+        "definition": "SELECT n FROM app.t"
+      }
+    }
+  },
+  {
+    "name": "DropModule",
+    "change": {
+      "op": "drop_module",
+      "id": "app.v",
+      "kind": "view"
+    }
+  },
+  {
+    "name": "CreateRole",
+    "change": {
+      "op": "create_role",
+      "uid": "r_aaaaaa",
+      "name": "part"
+    }
+  },
+  {
+    "name": "DropRole",
+    "change": {
+      "op": "drop_role",
+      "uid": "r_aaaaaa",
+      "name": "part",
+      "members": []
+    }
+  },
+  {
+    "name": "RenameRole",
+    "change": {
+      "op": "rename_role",
+      "uid": "r_aaaaaa",
+      "from": "part",
+      "to": "part"
+    }
+  },
+  {
+    "name": "Grant",
+    "change": {
+      "op": "grant",
+      "role": "part",
+      "target": "app.t",
+      "permissions": []
+    }
+  },
+  {
+    "name": "Revoke",
+    "change": {
+      "op": "revoke",
+      "role": "part",
+      "target": "app.t",
+      "permissions": []
+    }
+  },
+  {
+    "name": "PublicExecution",
+    "change": {
+      "op": "public_execution",
+      "routine": "app.f()",
+      "access": "revoked",
+      "origin": "created"
+    }
+  },
+  {
+    "name": "AlterColumnDefault/False-False",
+    "change": {
+      "op": "alter_column_default",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": null,
+      "to": null
+    }
+  },
+  {
+    "name": "AlterColumnDefault/False-True",
+    "change": {
+      "op": "alter_column_default",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": null,
+      "to": "app.f()"
+    }
+  },
+  {
+    "name": "AlterColumnDefault/True-False",
+    "change": {
+      "op": "alter_column_default",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": "app.f()",
+      "to": null
+    }
+  },
+  {
+    "name": "AlterColumnDefault/True-True",
+    "change": {
+      "op": "alter_column_default",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": "app.f()",
+      "to": "app.f()"
+    }
+  },
+  {
+    "name": "SetPartitionDefault/False-False-False",
+    "change": {
+      "op": "set_partition_default",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "column": "n",
+      "from": null,
+      "to": null,
+      "fallback": null
+    }
+  },
+  {
+    "name": "SetPartitionDefault/False-False-True",
+    "change": {
+      "op": "set_partition_default",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "column": "n",
+      "from": null,
+      "to": null,
+      "fallback": "app.f()"
+    }
+  },
+  {
+    "name": "SetPartitionDefault/False-True-False",
+    "change": {
+      "op": "set_partition_default",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "column": "n",
+      "from": null,
+      "to": "app.f()",
+      "fallback": null
+    }
+  },
+  {
+    "name": "SetPartitionDefault/False-True-True",
+    "change": {
+      "op": "set_partition_default",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "column": "n",
+      "from": null,
+      "to": "app.f()",
+      "fallback": "app.f()"
+    }
+  },
+  {
+    "name": "SetPartitionDefault/True-False-False",
+    "change": {
+      "op": "set_partition_default",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "column": "n",
+      "from": "app.f()",
+      "to": null,
+      "fallback": null
+    }
+  },
+  {
+    "name": "SetPartitionDefault/True-False-True",
+    "change": {
+      "op": "set_partition_default",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "column": "n",
+      "from": "app.f()",
+      "to": null,
+      "fallback": "app.f()"
+    }
+  },
+  {
+    "name": "SetPartitionDefault/True-True-False",
+    "change": {
+      "op": "set_partition_default",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "column": "n",
+      "from": "app.f()",
+      "to": "app.f()",
+      "fallback": null
+    }
+  },
+  {
+    "name": "SetPartitionDefault/True-True-True",
+    "change": {
+      "op": "set_partition_default",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "parent": "app.parent",
+      "column": "n",
+      "from": "app.f()",
+      "to": "app.f()",
+      "fallback": "app.f()"
+    }
+  },
+  {
+    "name": "AlterColumnType/nullable-False-collation-False",
+    "change": {
+      "op": "alter_column_type",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": "integer",
+      "to": "bigint",
+      "from_nullable": false,
+      "to_nullable": false,
+      "from_collation": null,
+      "to_collation": null,
+      "through_external_partitions": false
+    }
+  },
+  {
+    "name": "AlterColumnType/nullable-False-collation-True",
+    "change": {
+      "op": "alter_column_type",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": "integer",
+      "to": "bigint",
+      "from_nullable": false,
+      "to_nullable": false,
+      "from_collation": null,
+      "to_collation": "C",
+      "through_external_partitions": false
+    }
+  },
+  {
+    "name": "AlterColumnType/nullable-True-collation-False",
+    "change": {
+      "op": "alter_column_type",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": "integer",
+      "to": "bigint",
+      "from_nullable": false,
+      "to_nullable": true,
+      "from_collation": null,
+      "to_collation": null,
+      "through_external_partitions": false
+    }
+  },
+  {
+    "name": "AlterColumnType/nullable-True-collation-True",
+    "change": {
+      "op": "alter_column_type",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "from": "integer",
+      "to": "bigint",
+      "from_nullable": false,
+      "to_nullable": true,
+      "from_collation": null,
+      "to_collation": "C",
+      "through_external_partitions": false
+    }
+  },
+  {
+    "name": "AlterColumnNullability/False",
+    "change": {
+      "op": "alter_column_nullability",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "ty": "integer",
+      "to_nullable": false,
+      "collation": null,
+      "through_external_partitions": false
+    }
+  },
+  {
+    "name": "AlterColumnNullability/True",
+    "change": {
+      "op": "alter_column_nullability",
+      "uid": "c_aaaaaa",
+      "column": "app.t.n",
+      "ty": "integer",
+      "to_nullable": true,
+      "collation": null,
+      "through_external_partitions": false
+    }
+  },
+  {
+    "name": "SetPrimaryKey/False-False",
+    "change": {
+      "op": "set_primary_key",
+      "table": "app.t",
+      "from": null,
+      "to": null,
+      "nonclustered": false
+    }
+  },
+  {
+    "name": "SetPrimaryKey/False-True",
+    "change": {
+      "op": "set_primary_key",
+      "table": "app.t",
+      "from": null,
+      "to": {
+        "name": "part",
+        "columns": [
+          "n"
+        ]
+      },
+      "nonclustered": false
+    }
+  },
+  {
+    "name": "SetPrimaryKey/True-False",
+    "change": {
+      "op": "set_primary_key",
+      "table": "app.t",
+      "from": {
+        "name": "part",
+        "columns": [
+          "n"
+        ]
+      },
+      "to": null,
+      "nonclustered": false
+    }
+  },
+  {
+    "name": "SetPrimaryKey/True-True",
+    "change": {
+      "op": "set_primary_key",
+      "table": "app.t",
+      "from": {
+        "name": "part",
+        "columns": [
+          "n"
+        ]
+      },
+      "to": {
+        "name": "part",
+        "columns": [
+          "n"
+        ]
+      },
+      "nonclustered": false
+    }
+  },
+  {
+    "name": "AddColumn/n",
+    "change": {
+      "op": "add_column",
+      "uid": "c_aaaaaa",
+      "table": "app.t",
+      "name": "n",
+      "column": {
+        "type": "integer",
+        "nullable": true
+      }
+    }
+  },
+  {
+    "name": "AddColumn/d",
+    "change": {
+      "op": "add_column",
+      "uid": "c_aaaaaa",
+      "table": "app.t",
+      "name": "n",
+      "column": {
+        "type": "integer",
+        "nullable": true,
+        "default": "app.f()"
+      }
+    }
+  },
+  {
+    "name": "AddColumn/g",
+    "change": {
+      "op": "add_column",
+      "uid": "c_aaaaaa",
+      "table": "app.t",
+      "name": "n",
+      "column": {
+        "type": "integer",
+        "nullable": true,
+        "generated": {
+          "expression": "n + 1",
+          "stored": true
+        }
+      }
+    }
+  },
+  {
+    "name": "AddColumn/i",
+    "change": {
+      "op": "add_column",
+      "uid": "c_aaaaaa",
+      "table": "app.t",
+      "name": "n",
+      "column": {
+        "type": "integer",
+        "nullable": true,
+        "identity": {
+          "seed": 1,
+          "increment": 1
+        }
+      }
+    }
+  },
+  {
+    "name": "AddColumn/s",
+    "change": {
+      "op": "add_column",
+      "uid": "c_aaaaaa",
+      "table": "app.t",
+      "name": "n",
+      "column": {
+        "type": "integer",
+        "nullable": true,
+        "sequence": {
+          "start": 1,
+          "increment": 1
+        }
+      }
+    }
+  },
+  {
+    "name": "CreateTable/partition",
+    "change": {
+      "op": "create_table",
+      "uid": "t_aaaaaa",
+      "name": "app.t",
+      "table": {
+        "columns": {},
+        "partition_of": {
+          "parent": "app.parent",
+          "bound": "default",
+          "columns": {
+            "n": {
+              "default": "app.f()"
+            },
+            "other": {}
+          }
+        }
+      },
+      "beside_default": null,
+      "moves_at_most": null
+    }
+  },
+  {
+    "name": "CreateModule/view",
+    "change": {
+      "op": "create_module",
+      "id": "app.v",
+      "module": {
+        "kind": "view",
+        "definition": "body"
+      }
+    }
+  },
+  {
+    "name": "AlterModule/view",
+    "change": {
+      "op": "alter_module",
+      "id": "app.v",
+      "module": {
+        "kind": "view",
+        "definition": "body"
+      }
+    }
+  },
+  {
+    "name": "DropModule/view",
+    "change": {
+      "op": "drop_module",
+      "id": "app.v",
+      "kind": "view"
+    }
+  },
+  {
+    "name": "CreateModule/function",
+    "change": {
+      "op": "create_module",
+      "id": "app.f()",
+      "module": {
+        "kind": "function",
+        "definition": "body"
+      }
+    }
+  },
+  {
+    "name": "AlterModule/function",
+    "change": {
+      "op": "alter_module",
+      "id": "app.f()",
+      "module": {
+        "kind": "function",
+        "definition": "body"
+      }
+    }
+  },
+  {
+    "name": "DropModule/function",
+    "change": {
+      "op": "drop_module",
+      "id": "app.f()",
+      "kind": "function"
+    }
+  },
+  {
+    "name": "CreateModule/procedure",
+    "change": {
+      "op": "create_module",
+      "id": "app.p()",
+      "module": {
+        "kind": "procedure",
+        "definition": "body"
+      }
+    }
+  },
+  {
+    "name": "AlterModule/procedure",
+    "change": {
+      "op": "alter_module",
+      "id": "app.p()",
+      "module": {
+        "kind": "procedure",
+        "definition": "body"
+      }
+    }
+  },
+  {
+    "name": "DropModule/procedure",
+    "change": {
+      "op": "drop_module",
+      "id": "app.p()",
+      "kind": "procedure"
+    }
+  },
+  {
+    "name": "CreateModule/trigger",
+    "change": {
+      "op": "create_module",
+      "id": "app.t.trig",
+      "module": {
+        "kind": "trigger",
+        "definition": "body"
+      }
+    }
+  },
+  {
+    "name": "AlterModule/trigger",
+    "change": {
+      "op": "alter_module",
+      "id": "app.t.trig",
+      "module": {
+        "kind": "trigger",
+        "definition": "body"
+      }
+    }
+  },
+  {
+    "name": "DropModule/trigger",
+    "change": {
+      "op": "drop_module",
+      "id": "app.t.trig",
+      "kind": "trigger"
+    }
+  }
+]

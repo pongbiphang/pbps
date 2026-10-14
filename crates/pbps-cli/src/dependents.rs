@@ -22,6 +22,7 @@
 //! an engine; the reads are `engine::module_dependents`'.
 
 use pbps_model::ValueSource;
+use pbps_model::part_effects::{DefaultChange, Effect, Origin, Part as DependencyPart};
 use pbps_model::physical_sources::{ColumnAt, Located, Owner, PhysicalSources};
 use pbps_model::plan_names::{At, PlanNames};
 
@@ -202,47 +203,90 @@ fn span(changes: &[PlannedChange], root: &ModuleId) -> Option<Span> {
     })
 }
 
+// These callers ask different questions of the same part address. Parent
+// reach belongs to removal above, never to exact restoration (DEC-1699.1).
+#[allow(clippy::wildcard_enum_match_arm)]
+fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
+    match (part, holds) {
+        (DependencyPart::Module { id, .. }, Holds::Module(module)) => *id == module,
+        (
+            DependencyPart::Named {
+                table,
+                kind: pbps_model::Part::Check,
+                name,
+            },
+            Holds::TablePart {
+                table: target,
+                part: Part::Check(target_name),
+            },
+        )
+        | (
+            DependencyPart::Named {
+                table,
+                kind: pbps_model::Part::Index,
+                name,
+            },
+            Holds::TablePart {
+                table: target,
+                part: Part::Index(target_name),
+            },
+        ) => *table == target && *name == target_name,
+        (
+            DependencyPart::Default { column, .. },
+            Holds::TablePart {
+                table,
+                part: Part::Default(name),
+            },
+        )
+        | (
+            DependencyPart::Generated(column),
+            Holds::TablePart {
+                table,
+                part: Part::Generated(name),
+            },
+        ) => column.table == *table && column.name == *name,
+        _ => false,
+    }
+}
+
 /// Whether `change` removes exactly this dependent.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn removes(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
-    match (holds, change) {
-        (Holds::Module(x), Change::DropModule { id, .. }) => id == x,
-        (Holds::TablePart { table, part }, change) => match (part, change) {
-            (Part::Check(n), Change::DropCheck { table: t, name }) => t == table && name == n,
-            (Part::Index(n), Change::DropIndex { table: t, name }) => t == table && name == n,
-            // On a partition, its parent's too: the engine recurses `DROP
-            // DEFAULT` into every partition, its own default included
-            // (measured on 16 and 18, #1699).
+    change.part_effects().into_iter().any(|fact| {
+        if fact.effect != Effect::Removed
+            && !matches!(
+                (&fact.part, fact.effect),
+                (DependencyPart::Generated(_), Effect::Rewritten)
+            )
+        {
+            return false;
+        }
+        match (&fact.part, holds) {
             (
-                Part::Default(c),
-                Change::AlterColumnDefault {
-                    column, to: None, ..
+                DependencyPart::Default { column, change },
+                Holds::TablePart {
+                    table,
+                    part: Part::Default(name),
                 },
-            ) => reaches(&column.table, table, partitions) && column.name == *c,
-            // A partition's default goes only when the partition takes
-            // neither its own nor its parent's (#1588).
-            (
-                Part::Default(c),
-                Change::SetPartitionDefault {
-                    table: t,
-                    column,
-                    to: None,
-                    fallback: None,
-                    ..
-                },
-            ) => t == table && column == c,
-            // A changed expression takes the old one's dependency away
-            // (DEC-1168.1). If the new one calls the module again, its
-            // `SET EXPRESSION` binds the old module and the drop is refused
-            // inside the transaction: the loud outcome, where telling the two
-            // apart would mean parsing the expression (DECISIONS 174).
-            (Part::Generated(c), Change::AlterColumnExpression { column, .. }) => {
-                reaches(&column.table, table, partitions) && column.name == *c
+            ) => {
+                column.name == *name
+                    && match change {
+                        DefaultChange::Partition { .. } => column.table == *table,
+                        DefaultChange::Column { .. } | DefaultChange::Declaration => {
+                            reaches(&column.table, table, partitions)
+                        }
+                    }
             }
-            _ => false,
-        },
-        _ => false,
-    }
+            (
+                DependencyPart::Generated(column),
+                Holds::TablePart {
+                    table,
+                    part: Part::Generated(name),
+                },
+            ) => column.name == *name && reaches(&column.table, table, partitions),
+            _ => exact_dependent(&fact.part, holds),
+        }
+    })
 }
 
 /// Whether `change` creates exactly this dependent.
@@ -252,35 +296,12 @@ fn removes(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
 /// own change, which has to be the one placed after the module (#1699).
 #[allow(clippy::wildcard_enum_match_arm)]
 fn restores(change: &Change, holds: &Holds, _: &Partitions) -> bool {
-    match (holds, change) {
-        (Holds::Module(x), Change::CreateModule { id, .. }) => id == x,
-        (Holds::TablePart { table, part }, change) => match (part, change) {
-            (Part::Check(n), Change::AddCheck { table: t, name, .. }) => t == table && name == n,
-            (Part::Index(n), Change::AddIndex { table: t, name, .. }) => t == table && name == n,
-            (
-                Part::Default(c),
-                Change::AlterColumnDefault {
-                    column,
-                    from: None,
-                    to: Some(_),
-                    ..
-                },
-            ) => column.table == *table && column.name == *c,
-            (
-                Part::Default(c),
-                Change::SetPartitionDefault {
-                    table: t,
-                    column,
-                    from: None,
-                    to,
-                    fallback,
-                    ..
-                },
-            ) => t == table && column == c && (to.is_some() || fallback.is_some()),
-            _ => false,
-        },
-        _ => false,
-    }
+    change.part_effects().iter().any(|fact| {
+        fact.origin == Origin::Direct
+            && fact.effect == Effect::Created
+            && !matches!(fact.part, DependencyPart::Generated(_))
+            && exact_dependent(&fact.part, holds)
+    })
 }
 
 /// Whether `change` takes the dependent away with something larger: its
@@ -289,17 +310,23 @@ fn restores(change: &Change, holds: &Holds, _: &Partitions) -> bool {
 /// is one the declarations let go of, not one they fail to hold.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn removes_with_its_owner(change: &Change, holds: &Holds, partitions: &Partitions) -> bool {
-    match (holds, change) {
-        (Holds::TablePart { table, .. }, Change::DropTable { name, .. }) => name == table,
-        (
-            Holds::TablePart {
-                table,
-                part: Part::Default(c) | Part::Generated(c),
-            },
-            Change::DropColumn { column, .. },
-        ) => reaches(&column.table, table, partitions) && column.name == *c,
-        _ => false,
-    }
+    change
+        .part_effects()
+        .iter()
+        .any(|fact| match (&fact.part, fact.effect, holds) {
+            (DependencyPart::Table(name), Effect::Removed, Holds::TablePart { table, .. }) => {
+                *name == table
+            }
+            (
+                DependencyPart::Column(column),
+                Effect::Removed,
+                Holds::TablePart {
+                    table,
+                    part: Part::Default(name) | Part::Generated(name),
+                },
+            ) => column.name == *name && reaches(&column.table, table, partitions),
+            _ => false,
+        })
 }
 
 /// The partitions of `schema` that stand through the whole plan: every one
@@ -340,37 +367,14 @@ fn reaches(changed: &TableName, table: &TableName, partitions: &Partitions) -> b
 /// another.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn edits_in_place(change: &Change, holds: &Holds, _: &Partitions) -> bool {
-    match (holds, change) {
-        (Holds::Module(x), Change::AlterModule { id, .. }) => id == x,
-        (
-            Holds::TablePart {
-                table,
-                part: Part::Default(c),
-            },
-            Change::AlterColumnDefault {
-                column,
-                from: Some(_),
-                to: Some(_),
-                ..
-            },
-        ) => column.table == *table && column.name == *c,
-        // A partition's own default replaced by another, or by its parent's.
-        (
-            Holds::TablePart {
-                table,
-                part: Part::Default(c),
-            },
-            Change::SetPartitionDefault {
-                table: t,
-                column,
-                from: Some(_),
-                to,
-                fallback,
-                ..
-            },
-        ) => t == table && column == c && (to.is_some() || fallback.is_some()),
-        _ => false,
-    }
+    change.part_effects().iter().any(|fact| {
+        fact.effect == Effect::Rewritten
+            && matches!(
+                fact.part,
+                DependencyPart::Module { .. } | DependencyPart::Default { .. }
+            )
+            && exact_dependent(&fact.part, holds)
+    })
 }
 
 /// Replaces one change that edits this dependent in place with its removal
