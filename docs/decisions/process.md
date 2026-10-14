@@ -1290,9 +1290,12 @@ gate and no new review. The full gate and the reviews that qualified the head
 it was rebased from stand for it. A rebase for an interaction the merge group
 confirmed is never one of these, since the reason for it is code.
 
-The index rows that caused half of those conflicts are gone: a DEC entry has no
-row in `docs/DECISIONS.md`, and `scripts/check-decisions.py` refuses any row in
-the index that is not a topic file or an entry of the closed sequence. It checks
-rows against those two shapes rather than against spellings of a DEC row,
-because GitHub's tables accept the first cell with any spacing, without the
-leading pipe, and in bold, code or a link.
+The index rows that caused half of those conflicts are gone. A DEC entry is
+listed only in its topic file; `docs/DECISIONS.md` keeps the rules for adding
+one and the list of topic files, and the closed table of entries 1–543 moved to
+`docs/decisions/legacy-index.md`, which no branch has a reason to touch. The
+rule is written, not enforced by `scripts/check-decisions.py`: a check for DEC
+rows had to guess every spelling GitHub renders as a table row (spacing, no
+leading pipe, bold, code, a link), and each guess drew a review finding for
+the next one. With the closed table in its own file, a stray row is a reviewer's
+catch and a one-line conflict, not a recurring one.

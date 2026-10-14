@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Check the decision record's identifiers and every citation of them.
 
-The record lives in docs/decisions/, one file per topic, indexed by
-docs/DECISIONS.md (issue #671). Entries 1..N were numbered in one sequence while
+The record lives in docs/decisions/, one file per topic, listed by
+docs/DECISIONS.md (issue #671); the closed numbered sequence is indexed by
+docs/decisions/legacy-index.md (#2000). Entries 1..N were numbered in one sequence while
 the record was one file; that sequence is closed, and a new entry is named
 after its issue, DEC-<issue>.<k>. Two branches that each took "the next number"
 would now write it into two different files, where git reports no conflict and
@@ -13,9 +14,6 @@ It refuses:
   - an entry numbered past the closed sequence's fixed end, even with an index
     row for it (a stale branch appending "N+1."), one the index does not list,
     or one the index places in another file;
-  - a `DEC-<issue>.<k>` row in the index: the closed table lists only the
-    numbered sequence, and a new entry is listed only in its topic file, so a
-    row would be unchecked and a conflict for every branch that adds one;
   - an entry without the anchor its citations link to, or with the wrong one;
   - a number of the closed sequence whose entry or index row is gone — the
     sequence is complete except for the four numbers it never used (523–526),
@@ -31,22 +29,18 @@ import subprocess
 import sys
 from pathlib import Path
 
-INDEX = "docs/DECISIONS.md"
+RECORD = "docs/DECISIONS.md"
+# The table of the closed numbered sequence, in its own file so that nothing a
+# branch adds to the record touches it (#2000).
+INDEX = "docs/decisions/legacy-index.md"
 TOPICS = "docs/decisions/"
 # Files that spell identifiers as examples or fixtures, not as citations.
-NOT_CITATIONS = {INDEX, "scripts/check-decisions.py", "scripts/check_decisions_test.py"}
+NOT_CITATIONS = {RECORD, INDEX, "scripts/check-decisions.py", "scripts/check_decisions_test.py"}
 
 LEGACY_ENTRY = re.compile(r"^(\d+)\. \*\*")
 NEW_ENTRY = re.compile(r"^\*\*DEC-(\d+)\.(\d+)\. ")
 ANCHOR = re.compile(r'^<a id="(decision-(\d+)|dec-(\d+)-(\d+))"></a>$')
-# The index holds two tables and nothing else that has a pipe: the topic files
-# and the closed sequence. A row is checked against those shapes, not against a
-# list of ways to spell a DEC row: GitHub's tables take the first cell with any
-# spacing, without the leading pipe, in bold, in code or as a link, so every
-# spelling a deny-list misses would be a row that passes.
-TABLE_FRAME = re.compile(r"^\|(?:\s*(?::?-+:?|#|Topic|Decision|File|Scope)\s*\|)+$")
-TOPIC_ROW = re.compile(r"^\| \[[^\]]+\]\(decisions/[^)#]+\.md\) \| .+ \|$")
-INDEX_ROW = re.compile(r"^\| (\d+) \| \[[^\]]+\]\(decisions/([^)#]+)#decision-(\d+)\) \|")
+INDEX_ROW = re.compile(r"^\| (\d+) \| \[[^\]]+\]\(([^)#]+)#decision-(\d+)\) \|")
 # The last number of the closed sequence. Fixed here rather than read from the
 # index, which is an ordinary file a branch could extend along with its entry.
 CLOSED = 543
@@ -158,13 +152,8 @@ def check(topic_files, index_text, cited_in, closed=CLOSED):
                 where[ident] = f"{path}:{line}"
 
     indexed = {}
-    for number, line in enumerate(index_text.split("\n"), 1):
+    for line in index_text.split("\n"):
         row = INDEX_ROW.match(line)
-        if "|" in line and not (row or TOPIC_ROW.match(line) or TABLE_FRAME.match(line)):
-            errors.append(
-                f"{INDEX}:{number}: `{line.strip()}` is neither a topic file nor an entry "
-                "of the closed sequence; a DEC entry is listed only in its topic file"
-            )
         if row:
             if row[1] != row[3]:
                 errors.append(f"{INDEX}: row {row[1]} links to decision-{row[3]}")
@@ -176,7 +165,7 @@ def check(topic_files, index_text, cited_in, closed=CLOSED):
         if int(ident) > closed or int(ident) in reserved:
             errors.append(
                 f"{at}: {ident} is a new number in the closed sequence; "
-                f"name the entry DEC-<issue>.<k> instead (see {INDEX})"
+                f"name the entry DEC-<issue>.<k> instead (see {RECORD})"
             )
         elif ident not in indexed:
             errors.append(f"{at}: {ident} has no row in {INDEX}")
@@ -220,7 +209,11 @@ def main():
             texts[path] = (root / path).read_text(encoding="utf-8")
         except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError):
             continue
-    topics = {p: t for p, t in texts.items() if p.startswith(TOPICS) and p.endswith(".md")}
+    topics = {
+        p: t
+        for p, t in texts.items()
+        if p.startswith(TOPICS) and p.endswith(".md") and p != INDEX
+    }
     if not topics:
         # An empty record is not a clean one: the walk found nothing to check.
         print(f"no topic files under {TOPICS}", file=sys.stderr)

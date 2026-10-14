@@ -12,11 +12,13 @@ checksum-pinned, and state lives in the database itself.
 
 - **[docs/SPEC.md](docs/SPEC.md)** — the design. Read before changing the data
   model or adding a kind of change.
-- **[docs/DECISIONS.md](docs/DECISIONS.md)** — index of the record of every
-  choice that is not the obvious one; the entries live by topic in
-  `docs/decisions/`. Code comments cite their identifiers; never renumber. A new
-  entry is `DEC-<issue>.<k>` at the end of its topic file, never the next
-  sequential number, and adds no row to the index (the index says why).
+- **[docs/DECISIONS.md](docs/DECISIONS.md)** — the record of every choice that
+  is not the obvious one: how to add an entry, and which topic file in
+  `docs/decisions/` holds which kind of decision. Code comments cite their
+  identifiers; never renumber. A new entry is `DEC-<issue>.<k>` at the end of
+  its topic file, never the next sequential number, and adds no row anywhere
+  else (DECISIONS.md says why). The closed numbered entries 1–543 are looked up
+  in `docs/decisions/legacy-index.md`.
 - **[docs/PITFALLS.md](docs/PITFALLS.md)** — bugs shipped or nearly shipped, and
   the shapes they belong to.
 - **[docs/STATUS.md](docs/STATUS.md)** — phase, command surface, open items.

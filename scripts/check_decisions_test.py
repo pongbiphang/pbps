@@ -15,10 +15,10 @@ INDEX = """# Decisions
 
 | # | Topic | Decision |
 | ---: | --- | --- |
-| 1 | [identity](decisions/identity.md#decision-1) | One |
-| 2 | [ledger](decisions/ledger.md#decision-2) | Two |
-| 3 | [identity](decisions/identity.md#decision-3) | Three |
-| 4 | [ledger](decisions/ledger.md#decision-4) | Four |
+| 1 | [identity](identity.md#decision-1) | One |
+| 2 | [ledger](ledger.md#decision-2) | Two |
+| 3 | [identity](identity.md#decision-3) | Three |
+| 4 | [ledger](ledger.md#decision-4) | Four |
 """
 
 IDENTITY = """# Identity
@@ -85,42 +85,10 @@ class TheRecord(unittest.TestCase):
 
     def test_the_next_number_is_refused_even_with_an_index_row(self):
         stale = LEDGER + '\n<a id="decision-5"></a>\n\n5. **Five.** Body.\n'
-        index = INDEX + "| 5 | [ledger](decisions/ledger.md#decision-5) | Five |\n"
+        index = INDEX + "| 5 | [ledger](ledger.md#decision-5) | Five |\n"
         errors = run({"docs/decisions/ledger.md": stale}, index=index)
         self.assertIn("5 is a new number in the closed sequence", " ".join(errors))
         self.assertIn("row 5 extends the closed sequence, which ends at 4", " ".join(errors))
-
-    def test_a_dec_row_in_the_index_is_refused_and_named(self):
-        # Every spelling GitHub renders as the same row: spacing, no leading
-        # pipe, and markup around the identifier.
-        for row in (
-            "| DEC-9.1 | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
-            "|  DEC-9.1 | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
-            "|DEC-9.1|[ledger](decisions/ledger.md#dec-9-1)|Nine|",
-            "DEC-9.1 | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
-            "| **DEC-9.1** | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
-            "| `DEC-9.1` | [ledger](decisions/ledger.md#dec-9-1) | Nine |",
-            "| [DEC-9.1](decisions/ledger.md#dec-9-1) | ledger | Nine |",
-        ):
-            with self.subTest(row=row):
-                lines = INDEX.count("\n") + 1
-                errors = run(index=INDEX + row + "\n")
-                self.assertEqual(
-                    errors,
-                    [f"docs/DECISIONS.md:{lines}: `{row}` is neither a topic file nor an "
-                     "entry of the closed sequence; a DEC entry is listed only in its topic file"],
-                )
-
-    def test_the_topic_table_and_a_dec_citation_inside_an_entry_row_are_clean(self):
-        topics = (
-            "| File | Scope |\n| --- | --- |\n"
-            "| [ledger](decisions/ledger.md) | The tables pbps keeps. |\n"
-        )
-        cites = INDEX.replace("| Four |", "| Four, amended by DEC-9.1 |")
-        self.assertEqual(run(index=topics + cites), [])
-
-    def test_an_index_of_only_numeric_rows_is_clean(self):
-        self.assertEqual(run(), [])
 
     def test_a_number_taken_by_two_branches_in_two_files_is_refused(self):
         a = LEDGER + '\n<a id="decision-5"></a>\n\n5. **Five.** Body.\n'
@@ -165,26 +133,26 @@ class TheRecord(unittest.TestCase):
 
     def test_deleting_an_entry_and_its_index_row_is_refused(self):
         ledger = LEDGER.split('<a id="decision-4">')[0]
-        index = INDEX.replace("| 4 | [ledger](decisions/ledger.md#decision-4) | Four |\n", "")
+        index = INDEX.replace("| 4 | [ledger](ledger.md#decision-4) | Four |\n", "")
         errors = run({"docs/decisions/ledger.md": ledger}, index=index)
         self.assertEqual(
-            errors, ["docs/DECISIONS.md: 4 has neither an entry nor an index row; it was lost"]
+            errors, ["docs/decisions/legacy-index.md: 4 has neither an entry nor an index row; it was lost"]
         )
 
     def test_an_entry_or_a_row_alone_going_missing_is_refused(self):
-        unindexed = INDEX.replace("| 4 | [ledger](decisions/ledger.md#decision-4) | Four |\n", "")
+        unindexed = INDEX.replace("| 4 | [ledger](ledger.md#decision-4) | Four |\n", "")
         self.assertEqual(
-            run(index=unindexed), ["docs/decisions/ledger.md:9: 4 has no row in docs/DECISIONS.md"]
+            run(index=unindexed), ["docs/decisions/ledger.md:9: 4 has no row in docs/decisions/legacy-index.md"]
         )
         gone = LEDGER.split('<a id="decision-4">')[0]
         errors = run({"docs/decisions/ledger.md": gone})
         self.assertEqual(
-            errors, ["docs/DECISIONS.md: 4 is indexed but no entry in docs/decisions/ledger.md has it"]
+            errors, ["docs/decisions/legacy-index.md: 4 is indexed but no entry in docs/decisions/ledger.md has it"]
         )
 
     def test_a_jointly_deleted_number_is_not_a_skipped_citation(self):
         ledger = LEDGER.split('<a id="decision-4">')[0]
-        index = INDEX.replace("| 4 | [ledger](decisions/ledger.md#decision-4) | Four |\n", "")
+        index = INDEX.replace("| 4 | [ledger](ledger.md#decision-4) | Four |\n", "")
         errors = run({"docs/decisions/ledger.md": ledger}, {"src/a.rs": "// DECISIONS 4"}, index)
         self.assertIn("src/a.rs:1: DECISIONS 4 names no entry", errors)
 
@@ -198,7 +166,7 @@ class TheRecord(unittest.TestCase):
             topic = "# All\n" + "".join(
                 f'\n<a id="decision-{n}"></a>\n\n{n}. **N{n}.** Body.\n' for n in numbers
             )
-            index = "".join(f"| {n} | [all](decisions/all.md#decision-{n}) | N |\n" for n in numbers)
+            index = "".join(f"| {n} | [all](all.md#decision-{n}) | N |\n" for n in numbers)
             return {"docs/decisions/all.md": topic}, index
 
         topics, index = record(used)
@@ -207,7 +175,7 @@ class TheRecord(unittest.TestCase):
 
         topics, index = record([n for n in used if n != 522])
         self.assertIn(
-            "docs/DECISIONS.md: 522 has neither an entry nor an index row; it was lost",
+            "docs/decisions/legacy-index.md: 522 has neither an entry nor an index row; it was lost",
             cd.check(topics, index, {}),
         )
 
@@ -250,7 +218,7 @@ class TheRecord(unittest.TestCase):
             )
         # A middle number gone: the range's endpoints are there, its interior is not.
         identity = IDENTITY.split('<a id="decision-3">')[0]
-        index = INDEX.replace("| 3 | [identity](decisions/identity.md#decision-3) | Three |\n", "")
+        index = INDEX.replace("| 3 | [identity](identity.md#decision-3) | Three |\n", "")
         errors = run({"docs/decisions/identity.md": identity}, {"src/a.rs": "DECISIONS 2–4"}, index)
         self.assertIn("src/a.rs:1: DECISIONS 3 names no entry", errors)
         # A number inside the sequence after a comma is the citation's, prose or not.
