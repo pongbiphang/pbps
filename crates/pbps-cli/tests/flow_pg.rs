@@ -716,7 +716,7 @@ fn psql_script_in(container: &str, db: &OwnDatabase, script: &str) -> Output {
     let options = "-c standard_conforming_strings=off -c check_function_bodies=off \
         -c DateStyle=German,DMY -c TimeZone=America/New_York -c IntervalStyle=sql_standard \
         -c timezone_abbreviations=Australia -c transform_null_equals=on \
-        -c bytea_output=escape -c extra_float_digits=-3";
+        -c bytea_output=escape -c extra_float_digits=-3 -c xmloption=document";
     let mut command = if let Some(psql) = std::env::var_os("PBPS_TEST_PSQL") {
         let mut command = Command::new(psql);
         command
@@ -778,6 +778,7 @@ columns:
   id: {type: integer, nullable: false}
   d: {type: date}
   label: {type: text}
+  payload: {type: xml, default: "'<a/><b/>'::xml"}
 primary_key: [id]
 checks:
   date_pin: "d >= '01/02/2026'"
@@ -810,7 +811,7 @@ checks:
             r#"
 SELECT 'initial=' || current_setting('standard_conforming_strings') || ',' || current_setting('DateStyle');
 {generated}
-SELECT 'pins=' || current_setting('standard_conforming_strings') || ',' || current_setting('check_function_bodies') || ',' || current_setting('DateStyle') || ',' || current_setting('TimeZone') || ',' || current_setting('IntervalStyle') || ',' || current_setting('timezone_abbreviations') || ',' || current_setting('transform_null_equals') || ',' || current_setting('bytea_output') || ',' || current_setting('extra_float_digits');
+SELECT 'pins=' || current_setting('standard_conforming_strings') || ',' || current_setting('check_function_bodies') || ',' || current_setting('DateStyle') || ',' || current_setting('TimeZone') || ',' || current_setting('IntervalStyle') || ',' || current_setting('timezone_abbreviations') || ',' || current_setting('transform_null_equals') || ',' || current_setting('bytea_output') || ',' || current_setting('extra_float_digits') || ',' || current_setting('xmloption');
 SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='app.t'::regclass AND conname IN ('date_pin', 'string_pin') ORDER BY conname;
 "#
         );
@@ -830,7 +831,7 @@ SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='app.t'::regc
         };
         assert!(
             output.contains(&format!(
-                "pins=on,on,ISO, MDY,{zone},postgres,Default,off,hex,1"
+                "pins=on,on,ISO, MDY,{zone},postgres,Default,off,hex,1,content"
             )),
             "{name}: {output}"
         );
@@ -875,15 +876,15 @@ fn staged_and_resumed_writes_pin_the_session_before_the_next_statement() {
         let slug = if resume { "pins_resume" } else { "pins_staged" };
         let own = OwnDatabase::new(&server(), slug);
         let connection = own.connection();
-        let base = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  d: {type: date}\n  label: {type: text}\nprimary_key: [id]\n";
+        let base = "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  d: {type: date}\n  label: {type: text}\n  payload: {type: xml, default: \"'<a/><b/>'::xml\"}\nprimary_key: [id]\n";
         let d = bootstrapped_demo(connection, slug, ONE_COLUMN);
         // Database-local defaults affect fresh deployment connections without
         // changing the shared test login or another test's session.
         on_server(
             connection,
             &format!(
-                "ALTER DATABASE {} SET standard_conforming_strings = off; ALTER DATABASE {} SET DateStyle = 'German, DMY'",
-                own.name, own.name
+                "ALTER DATABASE {} SET standard_conforming_strings = off; ALTER DATABASE {} SET DateStyle = 'German, DMY'; ALTER DATABASE {} SET xmloption = document",
+                own.name, own.name, own.name
             ),
         );
         std::fs::write(
@@ -942,6 +943,16 @@ CREATE EVENT TRIGGER stop_after_first ON ddl_command_end WHEN TAG IN ('ALTER TAB
         on_server(
             connection,
             "INSERT INTO app.u (id, d, label) VALUES (4, DATE '2026-01-15', 'a' || chr(10))",
+        );
+        // The default is an `xml` fragment, which `document` refuses: it was
+        // stored under the pinned `content` (DEC-1634.1), on this connection
+        // whose database default is the other.
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM app.u WHERE payload::text = '<a/><b/>'"
+            ),
+            2
         );
         let snapshot = latest_snapshot(connection);
         assert!(snapshot.staged.is_none());

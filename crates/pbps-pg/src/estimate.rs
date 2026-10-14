@@ -213,11 +213,14 @@ impl Estimate {
 /// timestamp             -> timestamptz             the session's TimeZone decides
 /// timestamp(3)          -> timestamp(6)            no rewrite (and any temporal
 ///                                                  precision that holds or widens)
+/// cidr                  -> inet                    no rewrite (DEC-1634.1)
+/// xml                   -> text                    no rewrite
+/// xml                   -> character varying       no rewrite
 /// ```
 ///
 /// and everything else rewrites, including the ones that look free:
 /// `integer -> bigint`, `real -> double precision`, `character(5) ->
-/// character(10)`, `jsonb -> json`, and `numeric(10,2) -> numeric(10,4)`, where
+/// character(10)`, `jsonb -> json`, `inet -> cidr`, and `numeric(10,2) -> numeric(10,4)`, where
 /// widening the *precision* is free and widening the *scale* is not. Nothing
 /// about the declaration's shape suggests that asymmetry, which is the argument
 /// for measuring the whole table rather than reasoning about it.
@@ -261,6 +264,16 @@ fn rewrites(from: &ColumnType, to: &ColumnType) -> Rewrite {
         // A varying string keeps its bytes; only the declared bound moves.
         ("character varying", "character varying") => unbounded_or_at_least(&from, &to),
         ("character varying", "text") => true,
+        // The engine's binary-coercible casts between the types DEC-1634.1
+        // added: a `cidr` is an `inet` with its host bits clear, and an `xml`
+        // is stored as the text it was written as. **Measured** on 16.15 and
+        // 18.6 with `relfilenode`: `cidr -> inet`, `xml -> text` and
+        // `xml -> character varying` rewrite nothing, while `xml -> character
+        // varying(10)` and `xml -> character(10)` do (the length check reads
+        // every row), as does `inet -> cidr`, which is a function cast. The
+        // bounded form follows `character varying`'s own rule above.
+        ("cidr", "inet") | ("xml", "text") => true,
+        ("xml", "character varying") => arg(&to, 0).is_none(),
         // `text` is a `character varying` with no bound, so the only free way
         // back is to one that has none either.
         ("text", "character varying") => arg(&to, 0).is_none(),
@@ -1583,6 +1596,10 @@ mod tests {
             ("numeric(10,2)", "numeric"),
             ("numeric(10,2)", "numeric(12,2)"),
             ("integer", "integer"),
+            // Binary-coercible casts of the types DEC-1634.1 added.
+            ("cidr", "inet"),
+            ("xml", "text"),
+            ("xml", "character varying"),
         ] {
             assert_eq!(
                 rewrites(&ty(from), &ty(to)),
@@ -1607,6 +1624,14 @@ mod tests {
             ("jsonb", "json"),
             ("json", "jsonb"),
             ("date", "timestamp"),
+            // A function cast, not a relabelling: it clears host bits.
+            ("inet", "cidr"),
+            // The bound is a check on every row, and a string is rendered.
+            ("xml", "character varying(10)"),
+            ("xml", "character(10)"),
+            ("inet", "text"),
+            ("tsvector", "text"),
+            ("macaddr", "character varying"),
         ] {
             assert_eq!(
                 rewrites(&ty(from), &ty(to)),

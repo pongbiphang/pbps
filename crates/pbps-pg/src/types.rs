@@ -65,7 +65,7 @@ const MAX_INTERVAL_PRECISION: i64 = 6;
 /// What kind of argument list a type takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArgShape {
-    /// No arguments at all: `integer`, `text`, `date`, `uuid`.
+    /// No arguments at all: `integer`, `text`, `date`, `uuid`, `inet`.
     None,
     /// One length in `1..=MAX_STRING_LEN`. `fills_in` is what the engine
     /// supplies when the declaration writes none, and the two string types
@@ -121,6 +121,15 @@ const CATALOGUE: &[(&str, ArgShape)] = &[
     ("uuid", ArgShape::None),
     ("json", ArgShape::None),
     ("jsonb", ArgShape::None),
+    // Network addresses, a search document and XML. None takes a modifier or
+    // has an alias, and `format_type` spells each by its bare name, measured
+    // on 16.15 and 18.6 (DEC-1634.1). `macaddr8` is not here and stays a
+    // reported limitation.
+    ("inet", ArgShape::None),
+    ("cidr", ArgShape::None),
+    ("macaddr", ArgShape::None),
+    ("tsvector", ArgShape::None),
+    ("xml", ArgShape::None),
 ];
 
 /// Alias to canonical name. The right-hand side is what `format_type` returns,
@@ -164,6 +173,11 @@ const CATALOG_NAMES: &[&str] = &[
     "uuid",
     "json",
     "jsonb",
+    "inet",
+    "cidr",
+    "macaddr",
+    "tsvector",
+    "xml",
     "int2",
     "int4",
     "int8",
@@ -528,7 +542,7 @@ pub fn identity_seed_range(ty: &ColumnType, increment: i64) -> Option<RangeInclu
 ///
 /// A change within a family is a question of capacity; a change across families
 /// is a conversion, and PostgreSQL refuses most of those outright — measured, a
-/// twenty-by-twenty matrix of `ALTER TABLE ... ALTER COLUMN ... TYPE` on an
+/// matrix (twenty-five types by twenty-five now) of `ALTER TABLE ... ALTER COLUMN ... TYPE` on an
 /// empty table, which is the engine's own answer to "is this conversion
 /// possible at all" with no data to confuse it. The live suite runs that matrix
 /// against a real server and asserts this file agrees with it.
@@ -579,6 +593,24 @@ enum Family {
         precision: i64,
     },
     Uuid,
+    /// `inet` and `cidr`: one family and not two types, because the engine
+    /// converts between them and the two directions differ. `cidr` is an
+    /// `inet` whose host bits are all zero, so `cidr -> inet` is the identity
+    /// on every stored value, while `inet -> cidr` **silently clears** the host
+    /// bits of one that has any (DEC-1634.1).
+    Inet {
+        cidr: bool,
+    },
+    /// `macaddr`. It has no cast to or from any other type of this catalogue
+    /// but the strings, which every type has (`macaddr8` is outside it).
+    MacAddr,
+    /// `tsvector`: sorted lexemes and positions, so its text is a normal form
+    /// of what was written, and it converts to nothing but the strings.
+    TsVector,
+    /// `xml`, which converts to nothing but the strings. The reverse is an
+    /// explicit cast only, so `text -> xml` is a conversion the engine will not
+    /// infer.
+    Xml,
     /// `json` and `jsonb` are one family and not one type: the conversion
     /// between them loses data in one direction only.
     Json {
@@ -822,6 +854,11 @@ fn family(t: &ColumnType) -> Family {
             precision: int_arg(0).unwrap_or(MAX_INTERVAL_PRECISION),
         },
         "uuid" => Family::Uuid,
+        "inet" => Family::Inet { cidr: false },
+        "cidr" => Family::Inet { cidr: true },
+        "macaddr" => Family::MacAddr,
+        "tsvector" => Family::TsVector,
+        "xml" => Family::Xml,
         "json" => Family::Json { binary: false },
         "jsonb" => Family::Json { binary: true },
         _ => Family::Unknown,
@@ -997,7 +1034,10 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
         // bounded target (measured, `integer` holding `1234567890` into
         // `character varying(9)` is `value too long`), the rendering of a
         // `bytea` or a `date` depends on session settings ADR-0013 spends
-        // whole decisions on, and the round trip is not the identity.
+        // whole decisions on, and the round trip is not the identity. The
+        // last is true of the five DEC-1634.1 added too: `tsvector` text is
+        // its sorted lexemes and not what was written, and an `inet` renders
+        // with its mask (`10.0.0.1/32`).
         (
             Family::Exact { .. }
             | Family::Approx { .. }
@@ -1006,6 +1046,10 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
             | Family::Temporal { .. }
             | Family::Interval { .. }
             | Family::Uuid
+            | Family::Inet { .. }
+            | Family::MacAddr
+            | Family::TsVector
+            | Family::Xml
             | Family::Json { .. },
             Family::Text { .. },
         ) => TypeChangeRisk::Narrowing,
@@ -1108,6 +1152,15 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
         }
         (Family::Json { binary: true }, Family::Json { binary: false }) => TypeChangeRisk::Safe,
 
+        // `cidr -> inet` is the engine's implicit, binary-coercible cast: a
+        // `cidr` is an `inet` with its host bits clear, so no stored value
+        // moves (DEC-1634.1). The other direction is an assignment cast and
+        // **clears the host bits without saying so** — measured on 16.15 and
+        // 18.6, `10.0.0.1/8` becomes `10.0.0.0/8` and the statement succeeds —
+        // so it narrows, and `cannot_become` names the rows that would change.
+        (Family::Inet { cidr: true }, Family::Inet { cidr: false }) => TypeChangeRisk::Safe,
+        (Family::Inet { cidr: false }, Family::Inet { cidr: true }) => TypeChangeRisk::Narrowing,
+
         // Everything else is a conversion this engine refuses outright, before
         // it looks at a single row: `character varying -> integer` is `column
         // "c" cannot be cast automatically to type integer`. The remedy the
@@ -1122,6 +1175,10 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
             | Family::Temporal { .. }
             | Family::Interval { .. }
             | Family::Uuid
+            | Family::Inet { .. }
+            | Family::MacAddr
+            | Family::TsVector
+            | Family::Xml
             | Family::Json { .. }
             | Family::Unknown,
             _,
@@ -1158,6 +1215,23 @@ pub fn change_risk(from: &ColumnType, to: &ColumnType) -> TypeChangeRisk {
 /// The boundary is exact in every one: the probe and the engine agree on the
 /// same character.
 ///
+/// **The five types DEC-1634.1 added are on the same side, measured** on 16.15
+/// and 18.6 the same way, `varchar(L)` accepted and `varchar(L - 1)` refused:
+///
+/// ```text
+/// inet         '10.0.0.1'               L=11   (it renders its mask, /32)
+/// inet         '2001:db8::1/64'         L=14
+/// cidr         '10.0.0.0/8'             L=10
+/// macaddr      '08:00:2b:01:02:03'      L=17
+/// tsvector     'a b c'                  L=11   (the lexemes sorted and quoted)
+/// xml          '<a>b</a>'               L=8
+/// ```
+///
+/// None of their output functions reads one of the pinned settings — `inet`,
+/// `cidr` and `macaddr` print a fixed form, a `tsvector` prints its own
+/// normal form, and `xml_out` does not consult `xmloption`, which only
+/// decides what *input* is read as a document.
+///
 /// # Why it is still a check at all
 ///
 /// Every name `CATALOGUE` holds is one of the families above, so today this
@@ -1183,7 +1257,9 @@ fn renders_alike_under_the_pins(t: &ColumnType) -> bool {
 /// `None` where no count exists, which is not the same as "nothing can go
 /// wrong": a change may lose data without ever failing, and those are listed
 /// in [`crate::preflight`]'s own documentation rather than answered here with
-/// a zero. Reducing a `numeric`'s scale rounds (measured, `1.55` into
+/// a zero. The exception is `inet -> cidr`, which clears the host bits
+/// without raising and is answered all the same, because the rows it changes
+/// are exactly the rows one comparison names. Reducing a `numeric`'s scale rounds (measured, `1.55` into
 /// `numeric(10,1)` is `1.6`), a float into an integer rounds (`1.5` is `2`),
 /// a shorter `interval` rounds, `json` into `jsonb` drops duplicate keys and
 /// whitespace, and `double precision` into `real` drops precision. Not one of
@@ -1412,6 +1488,20 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
             Some(format!(
                 "{value} <> 'infinity'::date AND {value} > '{last}-12-31'::date"
             ))
+        }
+
+        // `inet -> cidr` clears the host bits without raising, and that is the
+        // one narrowing without an error that this function still answers:
+        // the change is exact and the rows it changes are decided by one
+        // comparison. A `cidr` cast back to `inet` is the value the `ALTER`
+        // would store, so a row that differs from it holds bits the target
+        // cannot — **measured** on 16.15 and 18.6, `10.0.0.1/8` and
+        // `2001:db8::1/64` differ from theirs and `10.0.0.0/8`, `10.0.0.1`
+        // (a `/32`) and `::1` do not. Unlike a rounded `numeric` there is no
+        // legitimate loss to approve here: two addresses of one network become
+        // one value, which a key or a join then treats as the same (DEC-1634.1).
+        (Family::Inet { cidr: false }, Family::Inet { cidr: true }) => {
+            Some(format!("({value}) <> ({value})::cidr::inet"))
         }
 
         // Everything else narrows without a row to point at; the list is in
@@ -2355,10 +2445,11 @@ mod tests {
             "ar._my_type",
             "ar._solo",
             // Types this catalogue does not carry, spelled as the engine
-            // spells them.
+            // spells them. `macaddr8` is one of them (DEC-1634.1): its array
+            // type is `_macaddr8`, which only the engine can fold.
             "bit varying",
-            "inet",
-            "tsvector",
+            "macaddr8",
+            "_macaddr8",
             "interval",
         ] {
             assert_eq!(arg(text), text, "{text}");
@@ -2372,6 +2463,32 @@ mod tests {
             ("interval\u{a0}hour", "\"interval\u{a0}hour\""),
         ] {
             assert_eq!(arg(text), spelled, "{text}");
+        }
+    }
+
+    /// The five types DEC-1634.1 added are the catalogue's now, so a routine
+    /// argument spelled with one folds like any other built-in: **measured** on
+    /// 16.15 and 18.6, `f(a _inet, b pg_catalog.xml, c _tsvector, d _cidr)` is
+    /// identified as `f(inet[],xml,tsvector[],cidr[])`. Before they were
+    /// carried the catalog's own array name `_inet` stayed as written, and the
+    /// key it made was one the catalog never held. `macaddr8`, still outside,
+    /// keeps its engine-decided spelling (the previous test).
+    #[test]
+    fn a_routine_argument_of_one_of_the_five_folds_to_the_identity_the_catalog_writes() {
+        for (declared, identity) in [
+            ("inet", "inet"),
+            ("_inet", "inet[]"),
+            ("pg_catalog.inet", "inet"),
+            ("pg_catalog._cidr", "cidr[]"),
+            ("macaddr[]", "macaddr[]"),
+            ("_macaddr", "macaddr[]"),
+            ("TSVECTOR", "tsvector"),
+            ("_tsvector", "tsvector[]"),
+            ("pg_catalog.xml", "xml"),
+            ("xml ARRAY", "xml[]"),
+        ] {
+            assert_eq!(arg(declared), identity, "{declared}");
+            assert_eq!(arg(identity), identity, "{identity} folds to itself");
         }
     }
 
@@ -2551,7 +2668,7 @@ mod tests {
 
         // And the types no pin reaches never get that far: the catalogue is
         // closed (ADR-0012 §1), so they are refused before any probe is built.
-        for spelling in ["money", "xml", "inet", "cidr", "tsvector"] {
+        for spelling in ["money", "macaddr8"] {
             assert!(
                 normalize(&ty(spelling)).is_err(),
                 "`{spelling}` must not reach a probe: nothing pins how it renders"
@@ -2663,6 +2780,11 @@ mod tests {
         ("json", "json"),
         ("jsonb", "jsonb"),
         ("uuid", "uuid"),
+        ("inet", "inet"),
+        ("cidr", "cidr"),
+        ("macaddr", "macaddr"),
+        ("tsvector", "tsvector"),
+        ("xml", "xml"),
     ];
 
     /// The catalogue's whole purpose: a declaration and the column the engine
@@ -2695,9 +2817,7 @@ mod tests {
         // rather than aliased to `character`: measured, `bpchar(5)` reads back
         // as `character(5)` but a bare `bpchar` reads back as `bpchar`, so one
         // alias would be right and the other wrong.
-        for spelling in [
-            "bpchar", "xml", "money", "inet", "cidr", "tsvector", "widget",
-        ] {
+        for spelling in ["bpchar", "money", "macaddr8", "widget"] {
             assert!(
                 refused(spelling).contains("has no type"),
                 "`{spelling}` is not in the catalogue and must say so"
@@ -2885,7 +3005,7 @@ mod tests {
         )
     }
 
-    /// The twenty types of the measured matrix, in the order its rows are
+    /// The twenty-five types of the measured matrix, in the order its rows are
     /// written below.
     const MATRIX_TYPES: &[&str] = &[
         "smallint",
@@ -2908,6 +3028,11 @@ mod tests {
         "uuid",
         "json",
         "jsonb",
+        "inet",
+        "cidr",
+        "macaddr",
+        "tsvector",
+        "xml",
     ];
 
     /// What PostgreSQL 18.6 does with `ALTER TABLE ... ALTER COLUMN c TYPE ...`
@@ -2916,26 +3041,31 @@ mod tests {
     /// fail is the conversion itself, which is exactly the question
     /// `Incompatible` answers.
     const MATRIX: &[&str] = &[
-        "YYYYYY.YYY..........",
-        "YYYYYY.YYY..........",
-        "YYYYYY.YYY..........",
-        "YYYYYY.YYY..........",
-        "YYYYYY.YYY..........",
-        "YYYYYY.YYY..........",
-        "......YYYY..........",
-        ".......YYY..........",
-        ".......YYY..........",
-        ".......YYY..........",
-        ".......YYYY.........",
-        ".......YYY.Y..YY....",
-        ".......YYY..YY..Y...",
-        ".......YYY..YY......",
-        ".......YYY.YY.YY....",
-        ".......YYY.YYYYY....",
-        ".......YYY..Y...Y...",
-        ".......YYY.......Y..",
-        ".......YYY........YY",
-        ".......YYY........YY",
+        "YYYYYY.YYY...............",
+        "YYYYYY.YYY...............",
+        "YYYYYY.YYY...............",
+        "YYYYYY.YYY...............",
+        "YYYYYY.YYY...............",
+        "YYYYYY.YYY...............",
+        "......YYYY...............",
+        ".......YYY...............",
+        ".......YYY...............",
+        ".......YYY...............",
+        ".......YYYY..............",
+        ".......YYY.Y..YY.........",
+        ".......YYY..YY..Y........",
+        ".......YYY..YY...........",
+        ".......YYY.YY.YY.........",
+        ".......YYY.YYYYY.........",
+        ".......YYY..Y...Y........",
+        ".......YYY.......Y.......",
+        ".......YYY........YY.....",
+        ".......YYY........YY.....",
+        ".......YYY..........YY...",
+        ".......YYY..........YY...",
+        ".......YYY............Y..",
+        ".......YYY.............Y.",
+        ".......YYY..............Y",
     ];
 
     /// `Incompatible` means *the engine refuses the conversion*, and it has to
@@ -2973,6 +3103,133 @@ mod tests {
         }
     }
 
+    const ADDED: [&str; 5] = ["inet", "cidr", "macaddr", "tsvector", "xml"];
+
+    /// DEC-1634.1's table, pair by pair, against the casts measured in
+    /// `pg_cast` on 16.15 and 18.6: each of the five reaches a string only by
+    /// assignment, and `text` reaches none of them without a `USING`.
+    #[test]
+    fn the_five_added_types_are_classified_by_the_casts_the_engine_has() {
+        for added in ADDED {
+            for text in ["text", "varchar", "varchar(9)", "char(5)"] {
+                assert_eq!(
+                    risk(added, text),
+                    TypeChangeRisk::Narrowing,
+                    "`{added}` -> `{text}` renders, and the rendering may not fit"
+                );
+                assert_eq!(
+                    risk(text, added),
+                    TypeChangeRisk::Incompatible,
+                    "`{text}` -> `{added}` needs a `USING` the engine will not infer"
+                );
+            }
+        }
+        // The one implicit cast and the one assignment cast among them.
+        assert_eq!(risk("cidr", "inet"), TypeChangeRisk::Safe);
+        assert_eq!(risk("inet", "cidr"), TypeChangeRisk::Narrowing);
+    }
+
+    /// Every other pair is a conversion the engine refuses: two of the five,
+    /// and one of them with any other type of the catalogue.
+    #[test]
+    fn a_change_between_the_added_types_and_anything_else_is_incompatible() {
+        for (from, to) in ADDED.iter().flat_map(|a| ADDED.iter().map(move |b| (a, b))) {
+            if from == to || (*from, *to) == ("inet", "cidr") || (*from, *to) == ("cidr", "inet") {
+                continue;
+            }
+            assert_eq!(
+                risk(from, to),
+                TypeChangeRisk::Incompatible,
+                "`{from}` -> `{to}`"
+            );
+        }
+        for (other, _) in CATALOGUE {
+            let strings = matches!(*other, "text" | "character" | "character varying");
+            if ADDED.contains(other) || strings {
+                continue;
+            }
+            for added in ADDED {
+                assert_eq!(
+                    risk(added, other),
+                    TypeChangeRisk::Incompatible,
+                    "`{added}` -> `{other}`"
+                );
+                assert_eq!(
+                    risk(other, added),
+                    TypeChangeRisk::Incompatible,
+                    "`{other}` -> `{added}`"
+                );
+            }
+        }
+    }
+
+    /// A change between two of the five is a change, never "no change": the
+    /// only pair `change_risk` calls safe is the one whose values do not move,
+    /// and even it is a different type to the diff, which compares
+    /// normalized types for equality.
+    #[test]
+    fn a_change_between_two_of_the_five_is_never_no_change() {
+        for (a, b) in ADDED.iter().flat_map(|a| ADDED.iter().map(move |b| (a, b))) {
+            if a == b {
+                continue;
+            }
+            assert_ne!(norm(a), norm(b), "`{a}` and `{b}` are two types");
+            assert_ne!(
+                normalize(&ty(a)).unwrap(),
+                normalize(&ty(b)).unwrap(),
+                "`{a}` and `{b}` must not compare equal"
+            );
+        }
+        // And an array of one is still its own type next to its element.
+        assert_eq!(risk("inet[]", "cidr[]"), TypeChangeRisk::Narrowing);
+        assert_eq!(risk("cidr[]", "inet[]"), TypeChangeRisk::Safe);
+        assert_eq!(risk("inet", "inet[]"), TypeChangeRisk::Incompatible);
+    }
+
+    /// `inet -> cidr` clears the host bits without raising, so the probe is a
+    /// comparison with the value the `ALTER` would store, and it exists for
+    /// that one pair. The opposite direction, a string target and the pairs
+    /// the engine refuses have no such predicate (DEC-1634.1).
+    #[test]
+    fn only_inet_into_cidr_counts_the_rows_whose_host_bits_would_be_cleared() {
+        let n = |s: &str| normalize(&ty(s)).unwrap();
+        assert_eq!(
+            cannot_become(&n("inet"), &n("cidr"), "\"a\"").as_deref(),
+            Some("(\"a\") <> (\"a\")::cidr::inet")
+        );
+        for (from, to) in [
+            // Safe: no value moves.
+            ("cidr", "inet"),
+            // Not a narrowing the probe understands: a rendering is not a
+            // comparison of values, and these have the length probe instead.
+            ("macaddr", "cidr"),
+            ("xml", "tsvector"),
+            ("inet", "inet"),
+            ("inet[]", "cidr[]"),
+        ] {
+            assert_eq!(
+                cannot_become(&n(from), &n(to), "\"a\""),
+                None,
+                "{from} -> {to}"
+            );
+        }
+        // A string target keeps the length probe for every one of the five,
+        // and measures the rendering `ALTER` stores (the `/32` included).
+        for added in ADDED {
+            let got = cannot_become(&n(added), &n("varchar(9)"), "\"a\"");
+            assert_eq!(
+                got.as_deref(),
+                Some("length(rtrim((\"a\")::text, ' ')) > 9"),
+                "{added}"
+            );
+            assert_eq!(
+                cannot_become(&n(added), &n("text"), "\"a\""),
+                None,
+                "{added}"
+            );
+        }
+    }
+
     /// Widening inside one family is the case the gate must not stop.
     #[test]
     fn a_widening_within_a_family_is_safe() {
@@ -2992,6 +3249,9 @@ mod tests {
             ("real", "double precision"),
             ("varchar(10)", "varchar(20)"),
             ("varchar(20)", "text"),
+            // A `cidr` is an `inet` with its host bits clear: measured, the
+            // engine's implicit, binary-coercible cast (DEC-1634.1).
+            ("cidr", "inet"),
             ("char(5)", "varchar(9)"),
             ("numeric(10,2)", "numeric(12,2)"),
             ("jsonb", "json"),
@@ -3041,6 +3301,9 @@ mod tests {
             ("time", "interval(5)"),
             // Measured: `{"a": 1,  "a": 2}` into `jsonb` becomes `{"a": 2}`.
             ("json", "jsonb"),
+            // Measured: `10.0.0.1/8` into a `cidr` is `10.0.0.0/8`, with no
+            // error (DEC-1634.1).
+            ("inet", "cidr"),
         ] {
             assert_eq!(
                 risk(from, to),

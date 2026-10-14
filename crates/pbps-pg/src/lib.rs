@@ -510,7 +510,8 @@ pub(crate) fn session_pins(zone: &SessionZone) -> String {
          SET IntervalStyle = 'postgres'; \
          SET timezone_abbreviations = 'Default'; \
          SET transform_null_equals = off; \
-         SET bytea_output = 'hex'; SET extra_float_digits = 1;",
+         SET bytea_output = 'hex'; SET extra_float_digits = 1; \
+         SET xmloption = content;",
         zone = emit::literal(zone.as_str())
     )
 }
@@ -689,6 +690,15 @@ impl Dialect for Postgres {
     /// output function, and the list of which ones read a setting is exactly
     /// the list this pin makes irrelevant. The values are the read scope's, so
     /// what a plan writes is what the next `pull` reads back.
+    ///
+    /// **`xmloption = content` joins the list (DEC-1634.1)**, and it is the
+    /// parser class: it decides what an `xml` literal is read as. Measured on
+    /// 16.15 and 18.6, `'abc'::xml` and `'<a/><b/>'::xml` are accepted under
+    /// `content` and are `invalid XML document` under `document`, so the same
+    /// `DEFAULT` or row is a valid plan from one session and a refusal from the
+    /// other. `content` is the pin because it reads every document and every
+    /// fragment: it never refuses a value the other would take. The server's
+    /// own default is `content`, so a session nobody configured already agrees.
     ///
     /// `lc_monetary` belongs to this class and is deliberately absent, for the
     /// reason `catalog.rs` gives on the read side: `SET` fails outright on a
@@ -2939,6 +2949,29 @@ mod tests {
                 &pbps_model::SessionZone::utc()
             )
             .is_empty()
+        );
+    }
+
+    /// An `xml` literal is read as `content` wherever a write runs
+    /// (DEC-1634.1): a fragment such as `<a/><b/>` is `invalid XML document`
+    /// under the other option, and the server's own default is only the
+    /// default. The pin rides in the transaction framing like the rest, and
+    /// the read scope carries the same value, so a declared `xml` value is
+    /// judged as the apply stores it.
+    #[test]
+    fn the_write_pins_and_the_read_scope_both_read_xml_as_content() {
+        let pg = super::Postgres::new();
+        let zone = pbps_model::SessionZone::new("UTC").unwrap();
+        let pins = pg.session_pins(&zone).expect("this dialect pins");
+        assert!(pins.contains("SET xmloption = content;"), "{pins}");
+        assert!(!pins.contains("document"), "{pins}");
+        assert!(
+            pg.transaction_framing(&zone).begin.starts_with(&pins),
+            "the framing carries every pin"
+        );
+        assert!(
+            crate::catalog::canonical_path(&zone).contains("'xmloption', 'content', true"),
+            "the read scope pins it too"
         );
     }
 

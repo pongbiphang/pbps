@@ -197,6 +197,10 @@ add an entry here.
 database's own zone, which the plan records, not to UTC. The rule is
 unchanged — the zone is still pinned — only whose zone it is.*
 
+*Extended by [DEC-1634.1](types-and-probes.md#dec-1634-1): `xmloption =
+content` joins the list, for the same reason — it decides what an `xml`
+literal is read as — in the write pins and in the canonical read scope.*
+
 <a id="decision-275"></a>
 
 275. **`$user` is refused as a schema name and as a write-path extra.**
