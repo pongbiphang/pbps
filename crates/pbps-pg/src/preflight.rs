@@ -469,6 +469,17 @@ struct Added {
     referenced: Vec<String>,
 }
 
+impl Added {
+    fn of(table: &TableName, constraint: &pbps_model::ForeignKey) -> Self {
+        Self {
+            child: table.clone(),
+            columns: constraint.columns.clone(),
+            parent: constraint.references_table.clone(),
+            referenced: constraint.references_columns.clone(),
+        }
+    }
+}
+
 /// A foreign key whose delete action will run in this session — the only
 /// kind the delete meets.
 ///
@@ -580,12 +591,7 @@ impl<'v, 'p> AsStored<'v, 'p> {
                 Event::AddForeignKey {
                     table, constraint, ..
                 } => {
-                    this.added.push(Added {
-                        child: table.clone(),
-                        columns: constraint.columns.clone(),
-                        parent: constraint.references_table.clone(),
-                        referenced: constraint.references_columns.clone(),
-                    });
+                    this.added.push(Added::of(table, constraint));
                 }
                 Event::UpdateRow {
                     table,
@@ -1209,9 +1215,8 @@ fn a_hidden_child(parent: &str) -> String {
 impl AsStored<'_, '_> {
     /// The stored children whose key into `parent` this plan adds, under the
     /// names the catalog holds now (DECISIONS 336, 345).
-    fn planned_children(&self, parent: &TableName) -> Vec<TableName> {
-        self.added
-            .iter()
+    fn planned_children(&self, parent: &TableName, keys: &[Added]) -> Vec<TableName> {
+        keys.iter()
             .filter(|a| a.parent == *parent)
             .filter_map(|a| self.view().table(&a.child))
             .collect()
@@ -1220,9 +1225,14 @@ impl AsStored<'_, '_> {
     /// The stored columns of `child` the planned-key count reads: the key's
     /// stored columns, and the row key where the plan moves rows of it
     /// (DECISIONS 340).
-    fn planned_reads(&self, parent: &TableName, stored_child: &TableName) -> BTreeSet<String> {
+    fn planned_reads(
+        &self,
+        parent: &TableName,
+        stored_child: &TableName,
+        keys: &[Added],
+    ) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
-        for a in self.added.iter().filter(|a| a.parent == *parent) {
+        for a in keys.iter().filter(|a| a.parent == *parent) {
             if self.view().table(&a.child).as_ref() != Some(stored_child) {
                 continue;
             }
@@ -1396,14 +1406,15 @@ fn hidden_children_probe(
     key: &RowKey,
     stored: &ColumnRef,
     names: &AsStored,
+    keys: &[Added],
 ) -> Result<Probe, DialectError> {
     let parent = qualified(&stored.table)?;
     // A child whose key this plan adds has no constraint row yet, and is
     // asked about by name (DECISIONS 336, 345).
     let mut planned = String::new();
-    for child in names.planned_children(table) {
+    for child in names.planned_children(table, keys) {
         let reads: Vec<String> = names
-            .planned_reads(table, &child)
+            .planned_reads(table, &child, keys)
             .iter()
             .map(|c| {
                 format!(
@@ -1459,7 +1470,7 @@ fn hidden_children_probe(
         "pg_catalog.has_column_privilege(pc.oid, {}, 'SELECT')",
         value_literal(&stored.name)
     )];
-    for a in &names.added {
+    for a in keys {
         if a.parent != *table {
             continue;
         }
@@ -1730,6 +1741,7 @@ fn planned_key_probes(
     key: &RowKey,
     stored: &ColumnRef,
     names: &AsStored,
+    keys: &[Added],
 ) -> Result<Vec<Probe>, DialectError> {
     let parent = qualified(&stored.table)?;
     let parent_key = quote(&stored.name)?;
@@ -1739,7 +1751,7 @@ fn planned_key_probes(
     );
     let is_null = |sql: &str| crate::rows::unwrapped(sql).eq_ignore_ascii_case("null");
     let mut out = Vec::new();
-    for a in names.added.iter().filter(|a| a.parent == *table) {
+    for a in keys.iter().filter(|a| a.parent == *table) {
         // A child this plan creates is named as the plan names it, and holds
         // no stored rows: only its arrivals are counted (DECISIONS 343).
         let created = names.view().created(&a.child);
@@ -3617,6 +3629,45 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
                 }
             }
         }
+        if let Change::AddForeignKey {
+            table, constraint, ..
+        } = &p.change
+        {
+            // Validation belongs to this key's statement. A preceding delete
+            // cannot see the future key, while its earlier row/column changes
+            // must still inform the key's backfill and survivor checks.
+            let added = Added::of(table, constraint);
+            let keys = std::slice::from_ref(&added);
+            for (_, event) in facts.before(step).events() {
+                let Event::DeleteRow {
+                    table,
+                    key_column,
+                    key,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if *table != added.parent {
+                    continue;
+                }
+                let Some(stored) = names.column(&table.column(key_column)) else {
+                    continue;
+                };
+                match hidden_children_probe(table, key, &stored, &names, keys) {
+                    Ok(probe) => out.push(probe),
+                    Err(error) => {
+                        unchecked.push(Unchecked::for_change(&p.change, error.to_string()))
+                    }
+                }
+                match planned_key_probes(table, key, &stored, &names, keys) {
+                    Ok(probes) => out.extend(probes),
+                    Err(error) => {
+                        unchecked.push(Unchecked::for_change(&p.change, error.to_string()))
+                    }
+                }
+            }
+        }
         if let Change::DeleteRow {
             table,
             key_column,
@@ -3656,11 +3707,11 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             }
             // Then whether that count could be complete at all, before the
             // refusals about what the plan itself writes.
-            match hidden_children_probe(table, key, &stored, &names) {
+            match hidden_children_probe(table, key, &stored, &names, &names.added) {
                 Ok(hidden) => out.push(hidden),
                 Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
             }
-            match planned_key_probes(table, key, &stored, &names) {
+            match planned_key_probes(table, key, &stored, &names, &names.added) {
                 Ok(planned) => out.extend(planned),
                 Err(error) => unchecked.push(Unchecked::for_change(&p.change, error.to_string())),
             }

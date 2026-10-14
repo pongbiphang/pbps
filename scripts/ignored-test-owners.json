@@ -1508,7 +1508,8 @@
         "alias_batches::aliases_in_different_batches_still_refuse_a_collision",
         "positional_preflight_tests::tightening_reads_prior_writes_and_never_future_writes",
         "positional_preflight_tests::tightening_sees_an_attached_child_only_after_the_attach",
-        "positional_preflight_tests::an_attach_cannot_borrow_a_later_detachs_empty_range"
+        "positional_preflight_tests::an_attach_cannot_borrow_a_later_detachs_empty_range",
+        "positional_preflight_tests::a_new_key_validates_writes_before_its_own_step_and_never_after_it"
       ]
     },
     {

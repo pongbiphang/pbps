@@ -1891,5 +1891,14 @@ DEFAULT partition's rows remain range blockers until its detach has run.
 The current statement still owns its simultaneous effects: a DELETE removes
 its target's self-reference, and a CREATE's inline foreign keys see the
 columns it defines. Neither requires making later statements visible.
+A foreign key added after a row deletion validates that deletion at the key's
+own step. Its current definition is explicit input to the dialect's planned-key
+checks; it is not inserted into the prefix as if already installed. This keeps
+the existing converted-value, backfill, survivor and unreadable-child guards
+without making a future key visible to an earlier DELETE. Measured on
+PostgreSQL 18/16, repairing the child between DELETE and ADD FOREIGN KEY makes
+the key succeed, while the same repair after ADD does not:
+`a_new_key_validates_writes_before_its_own_step_and_never_after_it`.
+
 The extraction was first checked against 192 existing preflight reports with
 byte-identical SQL and diagnostics before changing the read boundaries.

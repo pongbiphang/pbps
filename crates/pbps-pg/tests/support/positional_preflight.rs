@@ -231,3 +231,124 @@ async fn tightening_sees_an_attached_child_only_after_the_attach() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL"]
+async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
+    use pbps_model::{
+        Cell, Change, ChangeSet, ForeignKey, IdsFile, PlannedChange, ReferentialAction, Uid,
+        UidKind, Value, plan_names::PlanNames,
+    };
+    let mut db = TestDb::create("key_position1775").await;
+    db.conn
+        .execute(
+            "CREATE TABLE public.parent (id int PRIMARY KEY);
+         CREATE TABLE public.child (id int PRIMARY KEY, parent int);
+         INSERT INTO public.parent VALUES (1), (2);
+         INSERT INTO public.child VALUES (10, 1);",
+        )
+        .await
+        .unwrap();
+    let parent = TableName::new("public", "parent");
+    let child = TableName::new("public", "child");
+    let delete = Change::DeleteRow {
+        table: parent.clone(),
+        key_column: "id".into(),
+        key: "1".into(),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+        row: Default::default(),
+        dropped: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: None,
+    };
+    let update = Change::UpdateRow {
+        table: child.clone(),
+        key_column: "id".into(),
+        key: "10".into(),
+        columns: [(
+            "parent".into(),
+            (Cell::Value(Value::Int(1)), Cell::Value(Value::Int(2))),
+        )]
+        .into(),
+        unchanged: Default::default(),
+        types: [("parent".into(), ty("int"))].into(),
+        after_types: Default::default(),
+        key_type: None,
+    };
+    let add = Change::AddForeignKey {
+        table: child.clone(),
+        name: "child_parent_fkey".into(),
+        constraint: Box::new(ForeignKey {
+            columns: vec!["parent".into()],
+            references_table: parent.clone(),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        }),
+    };
+    let ids = IdsFile {
+        tables: [
+            (Uid::derived(UidKind::Table, "parent", 0), parent.clone()),
+            (Uid::derived(UidKind::Table, "child", 0), child.clone()),
+        ]
+        .into(),
+        columns: [
+            (
+                Uid::derived(UidKind::Column, "parent.id", 0),
+                parent.column("id"),
+            ),
+            (
+                Uid::derived(UidKind::Column, "child.id", 0),
+                child.column("id"),
+            ),
+            (
+                Uid::derived(UidKind::Column, "child.parent", 0),
+                child.column("parent"),
+            ),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let dialect = Postgres::new();
+    let mut observations = Vec::new();
+    for (label, changes, expected) in [
+        ("no repair", vec![delete.clone(), add.clone()], 1),
+        (
+            "repair between delete and key",
+            vec![delete.clone(), update.clone(), add.clone()],
+            0,
+        ),
+        ("repair after key", vec![delete, add, update], 1),
+    ] {
+        let plan = ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        };
+        let names = PlanNames::of(&plan.changes, &ids).unwrap();
+        let report = dialect.preflight(&names);
+        let probe = report
+            .probes
+            .iter()
+            .find(|p| p.description.contains("on a column it also adds"))
+            .expect("the key checks the effects of preceding deletes at its own step");
+        let count = counted(&mut db.conn, &probe.sql).await;
+        let frame = dialect.transaction_framing(&pbps_model::SessionZone::utc());
+        db.conn.begin(&frame).await.unwrap();
+        let mut accepted = true;
+        'apply: for p in &plan.changes {
+            for statement in dialect.emit(&p.change, p.strategy).unwrap() {
+                if db.conn.execute(&statement.sql).await.is_err() {
+                    accepted = false;
+                    break 'apply;
+                }
+            }
+        }
+        db.conn.rollback(&frame).await.unwrap();
+        observations.push((label, expected, count, accepted));
+    }
+    db.drop().await;
+    for (label, expected, count, accepted) in observations {
+        assert_eq!(count, expected, "{label}: the key owns its row projection");
+        assert_eq!(accepted, expected == 0, "{label}: the engine agrees");
+    }
+}
