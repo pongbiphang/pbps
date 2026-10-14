@@ -437,7 +437,9 @@ pub enum Change {
     /// default off entirely, which is how a function rebuild releases it
     /// (#1588). `parent` is where `fallback` was written: it is resolved under
     /// the parent's schema, and `to` under the partition's, which may be
-    /// another.
+    /// another. Function rebuilds also use this table-keyed form before an
+    /// attach when restoring a parent-derived expression: the plain table's
+    /// column UID cannot carry the parent's expression scope (DEC-1875.1).
     SetPartitionDefault {
         uid: Uid,
         table: TableName,

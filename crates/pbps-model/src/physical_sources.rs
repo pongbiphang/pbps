@@ -24,12 +24,14 @@ pub enum Source<A> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Owner {
     Column(Uid),
-    Partition { table: Uid, parent: TableName },
+    Partition { parent: TableName },
     Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnAt {
+    /// The table identity survives a change in managed column ownership.
+    pub table_uid: Uid,
     pub address: ColumnRef,
     pub owner: Owner,
 }
@@ -257,7 +259,6 @@ impl<'p> PhysicalSources<'p> {
         let owner = match self.partitions.get(&slot.0, self.names.boundary(at)) {
             Some(Some(parent)) => match self.names.table_at(parent, at) {
                 Some(parent) => Owner::Partition {
-                    table: slot.0.clone(),
                     parent: parent.clone(),
                 },
                 None => Owner::Unavailable,
@@ -273,7 +274,11 @@ impl<'p> PhysicalSources<'p> {
                 },
             },
         };
-        Located::Present(ColumnAt { address, owner })
+        Located::Present(ColumnAt {
+            table_uid: slot.0.clone(),
+            address,
+            owner,
+        })
     }
 }
 

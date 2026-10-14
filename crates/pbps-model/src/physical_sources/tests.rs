@@ -117,9 +117,9 @@ fn detach_preserves_the_catalog_column_through_rename_and_ends_it_only_on_drop()
     assert_eq!(
         sources.locate(&stored, At::Start),
         Located::Present(ColumnAt {
+            table_uid: uid("t_bbbbbb"),
             address: stored.clone(),
             owner: Owner::Partition {
-                table: uid("t_bbbbbb"),
                 parent: table("parent")
             },
         })
@@ -127,6 +127,7 @@ fn detach_preserves_the_catalog_column_through_rename_and_ends_it_only_on_drop()
     assert_eq!(
         sources.locate(&stored, At::Before(2)),
         Located::Present(ColumnAt {
+            table_uid: uid("t_bbbbbb"),
             address: table("child").column("amount"),
             owner: Owner::Column(uid("c_dddddd")),
         })
@@ -157,6 +158,7 @@ fn attach_uses_the_recorded_ordinary_uid_before_its_scope_is_retired() {
     assert_eq!(
         sources.locate(&stored, At::Start),
         Located::Present(ColumnAt {
+            table_uid: uid("t_bbbbbb"),
             address: stored.clone(),
             owner: Owner::Column(uid("c_dddddd")),
         })
@@ -164,9 +166,9 @@ fn attach_uses_the_recorded_ordinary_uid_before_its_scope_is_retired() {
     assert_eq!(
         sources.locate(&stored, At::End),
         Located::Present(ColumnAt {
+            table_uid: uid("t_bbbbbb"),
             address: stored.clone(),
             owner: Owner::Partition {
-                table: uid("t_bbbbbb"),
                 parent: table("parent")
             },
         })
@@ -184,6 +186,7 @@ fn attach_uses_the_recorded_ordinary_uid_before_its_scope_is_retired() {
     assert_eq!(
         missing.locate(&stored, At::Start),
         Located::Present(ColumnAt {
+            table_uid: uid("t_bbbbbb"),
             address: stored,
             owner: Owner::Unavailable
         })
@@ -213,6 +216,7 @@ fn attach_then_detach_keeps_the_source_but_does_not_resurrect_the_old_uid() {
     assert_eq!(
         sources.locate(&stored, At::End),
         Located::Present(ColumnAt {
+            table_uid: uid("t_bbbbbb"),
             address: stored,
             owner: Owner::Column(uid("c_ffffff"))
         })

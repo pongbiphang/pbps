@@ -997,3 +997,13 @@ A parent's release moved before its table rename keeps the parent's UID and
 uses its earlier name, so the engine still removes the child's own default.
 The standing relation is spelled at each lookup boundary as well; comparing
 its final parent name with that earlier statement would refuse this plan.
+
+Expression origin is separate from boundary ownership. Restoring a parent's
+unqualified default before attach still needs the parent's schema, even
+though the child then has a column UID. The projection exposes the physical
+table UID alongside the current owner; synthesis retains the existing
+`SetPartitionDefault` expression-origin fields for an inherited fallback on
+either side of attach. Ordinary own defaults use the boundary's column UID.
+There is no new serialized change or expression rewriting. On both engines,
+calling the child's same-named function instead returns the wrong value;
+with no such function, losing the parent's schema fails execution outright.

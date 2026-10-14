@@ -185,6 +185,7 @@
         "deploy::tests::a_read_only_probe_still_refuses_a_violating_row",
         "deploy::tests::transactional_read_back_refuses_concurrent_managed_ddl_but_ignores_unmanaged_ddl",
         "dependents::physical_tests::connected_weaving_executes_defaults_around_both_sides_of_each_ownership_transition",
+        "dependents::physical_tests::inherited_default_keeps_its_expression_schema_across_attach",
         "engine::tests::a_failed_cost_query_is_unavailable_not_a_static_guess",
         "engine::tests::a_module_handed_to_the_postgres_rename_impact_is_refused_not_empty",
         "engine::tests::the_postgres_arms_answer_engine_only_questions_by_name",

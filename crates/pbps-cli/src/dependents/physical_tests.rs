@@ -378,3 +378,146 @@ fn assert_parent_release(cs: &ChangeSet) {
         "no partition-only replacement for the parent's release"
     );
 }
+
+#[test]
+#[ignore = "needs a live PostgreSQL"]
+fn inherited_default_keeps_its_expression_schema_across_attach() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for rebuild_first in [true, false] {
+                for conflicting_function in [false, true] {
+                    inherited_scope_case(rebuild_first, conflicting_function).await;
+                }
+            }
+        });
+}
+
+async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
+    let database = crate::test_pg::TestDb::create("physical_scope1875").await;
+    let mut conn = database.connect().await;
+    let pg = pbps_pg::Postgres::new();
+    conn.execute(
+        "CREATE SCHEMA parent_scope; CREATE SCHEMA child_scope;
+         CREATE FUNCTION parent_scope.f(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x $$;
+         CREATE TABLE parent_scope.parent(k integer NOT NULL, n integer DEFAULT parent_scope.f(1)) PARTITION BY RANGE(k);
+         CREATE TABLE child_scope.child(k integer NOT NULL, n integer DEFAULT parent_scope.f(1));",
+    ).await.unwrap();
+    if conflicting_function {
+        // Successful execution alone cannot detect rebinding to the child's
+        // schema. Its same-signature function must never supply this default.
+        conn.execute("CREATE FUNCTION child_scope.f(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT 99 $$;")
+            .await.unwrap();
+    }
+    let before = pbps_pg::catalog::introspect(&mut conn)
+        .await
+        .unwrap()
+        .schema;
+    let parent = TableName::new("parent_scope", "parent");
+    let child = TableName::new("child_scope", "child");
+    let root: ModuleId = "parent_scope.f(integer)".parse().unwrap();
+    let mut after = before.clone();
+    after
+        .tables
+        .get_mut(&parent)
+        .unwrap()
+        .columns
+        .get_mut("n")
+        .unwrap()
+        .value_source = ValueSource::Default("f(1)".into());
+    let attached = Table {
+        partition_of: Some(PartitionOf {
+            parent: parent.clone(),
+            bound: PartitionBound::Default,
+            columns: Default::default(),
+        }),
+        ..Default::default()
+    };
+    after.tables.insert(child.clone(), attached.clone());
+    let module = Module {
+        kind: ModuleKind::Function,
+        description: None,
+        definition: "(x integer) RETURNS integer LANGUAGE sql AS $$ SELECT x + 1 $$".into(),
+    };
+    after.modules.insert(root.clone(), module.clone());
+    let before_ids = IdsFile {
+        tables: [
+            (uid("t_aaaaaa"), parent.clone()),
+            (uid("t_bbbbbb"), child.clone()),
+        ]
+        .into(),
+        columns: [
+            (uid("c_aaaaaa"), parent.column("k")),
+            (uid("c_bbbbbb"), parent.column("n")),
+            (uid("c_cccccc"), child.column("k")),
+            (uid("c_dddddd"), child.column("n")),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let mut after_ids = before_ids.clone();
+    after_ids.columns.retain(|_, c| c.table != child);
+    let rebuild = Change::AlterModule {
+        id: root,
+        module: Box::new(module),
+    };
+    let attach = Change::AttachPartition {
+        uid: uid("t_bbbbbb"),
+        table: child.clone(),
+        parent,
+        bound: PartitionBound::Default,
+        shape: Box::new(attached),
+    };
+    let changes = if rebuild_first {
+        vec![rebuild, attach]
+    } else {
+        vec![attach, rebuild]
+    };
+    let mut cs = ChangeSet {
+        changes: changes.into_iter().map(PlannedChange::new).collect(),
+    };
+    let sources = Sources {
+        before: pbps_diff::Side {
+            schema: &before,
+            ids: &before_ids,
+        },
+        after: &after_ids,
+    };
+    let framing = pg.transaction_framing(&pbps_model::SessionZone::utc());
+    conn.begin(&framing).await.unwrap();
+    crate::engine::account_for_module_dependents(
+        &mut conn,
+        &mut cs,
+        &after,
+        sources,
+        &ModuleDeps::default(),
+        &pg,
+        &|_| panic!("the plan already rebuilds the function"),
+    )
+    .await
+    .unwrap();
+    crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids)
+        .await
+        .unwrap();
+    for p in &cs.changes {
+        for statement in pg.emit(&p.change, p.strategy).unwrap() {
+            conn.execute(&statement.sql)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{:?}\n{}", p.change, statement.sql));
+        }
+    }
+    let rows = conn
+        .query("INSERT INTO child_scope.child(k) VALUES(7) RETURNING n")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0].try_get_at::<i32>(0).unwrap(),
+        Some(2),
+        "rebuild_first={rebuild_first}, conflicting_function={conflicting_function}"
+    );
+    conn.rollback(&framing).await.unwrap();
+    drop(conn);
+    database.drop().await;
+}

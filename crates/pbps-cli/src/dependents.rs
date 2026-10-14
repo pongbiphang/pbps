@@ -531,11 +531,11 @@ fn respell_at(
     let Located::Present(located) = sources.locate(&table.column(column), at) else {
         return Err("the default's physical source is unavailable".into());
     };
-    let (from, to, fallback) = match &p.change {
+    let (from, to, fallback, origin) = match &p.change {
         Change::AlterColumnDefault { uid, from, to, .. } => {
             // A standing parent's change still recurses into its child. It
             // keeps its identity, but uses its name at the new boundary.
-            if let Owner::Partition { parent, .. } = &located.owner
+            if let Owner::Partition { parent } = &located.owner
                 && let Some((table_uid, name)) = sources.names().column_at(uid, at)
                 && let Some(table) = sources.names().table_at(table_uid, at)
                 && table == parent
@@ -549,14 +549,23 @@ fn respell_at(
                 p.risks = dialect.change_risks(&p.change);
                 return Ok(());
             }
-            (from.clone(), to.clone(), None)
+            (from.clone(), to.clone(), None, None)
         }
         Change::SetPartitionDefault {
-            from, to, fallback, ..
-        } => (from.clone(), to.clone(), fallback.clone()),
+            from,
+            to,
+            fallback,
+            parent,
+            ..
+        } => (
+            from.clone(),
+            to.clone(),
+            fallback.clone(),
+            Some(parent.clone()),
+        ),
         _ => return Ok(()),
     };
-    p.change = default_change(Some(located), from, to, fallback)?;
+    p.change = default_change(Some(located), from, to, fallback, origin)?;
     p.risks = dialect.change_risks(&p.change);
     Ok(())
 }
@@ -568,31 +577,44 @@ fn default_change(
     from: Option<String>,
     to: Option<String>,
     fallback: Option<String>,
+    origin: Option<TableName>,
 ) -> Result<Change, String> {
     let located =
         located.ok_or("the default's physical source is unavailable at its insertion boundary")?;
-    Ok(match located.owner {
-        Owner::Column(uid) => Change::AlterColumnDefault {
-            uid,
-            column: located.address,
-            from,
-            to: to.or(fallback),
-        },
-        Owner::Partition { table: uid, parent } => Change::SetPartitionDefault {
-            uid,
-            table: located.address.table,
-            parent,
-            column: located.address.name,
-            from,
-            to,
-            fallback,
-        },
+    let (column_uid, parent) = match located.owner {
+        Owner::Column(uid) => (Some(uid), None),
+        Owner::Partition { parent } => (None, Some(parent)),
         Owner::Unavailable => {
             return Err(
                 "the default's managed owner is unavailable at its insertion boundary".into(),
             );
         }
-    })
+    };
+    // Ownership and expression origin are different facts. An inherited
+    // default needs the parent's write path even before ATTACH; the existing
+    // table-keyed change carries that origin without inventing a column UID
+    // or losing it in an ordinary column's `to` expression (DEC-1875.1).
+    let inherited = to.is_none() && fallback.is_some();
+    if !inherited && let Some(uid) = column_uid {
+        Ok(Change::AlterColumnDefault {
+            uid,
+            column: located.address,
+            from,
+            to,
+        })
+    } else {
+        Ok(Change::SetPartitionDefault {
+            uid: located.table_uid,
+            table: located.address.table,
+            parent: origin
+                .or(parent)
+                .ok_or("the default's expression origin is unavailable")?,
+            column: located.address.name,
+            from,
+            to,
+            fallback,
+        })
+    }
 }
 
 /// The first change matching `test` against the dependent's name at that
@@ -698,7 +720,7 @@ fn removal_of(
                             | ValueSource::Generated(_) => None,
                         })
                 };
-                default_change(located, from, None, None)?
+                default_change(located, from, None, None, None)?
             }
             // No statement takes a generation expression off; only the
             // plan's own expression change can, and `weave` looks for that.
@@ -749,10 +771,11 @@ fn restoration_of(
                 },
                 Part::Generated(_) => return Err(unsupported()),
                 Part::Default(column) => {
-                    let (to, fallback) = if let Some(of) = &t.partition_of {
+                    let (to, fallback, origin) = if let Some(of) = &t.partition_of {
                         (
                             of.columns.get(column).and_then(|own| own.default.clone()),
                             parent_default(declared, table, column),
+                            Some(of.parent.clone()),
                         )
                     } else {
                         let to = match &t.columns.get(column).ok_or_else(unsupported)?.value_source
@@ -763,12 +786,12 @@ fn restoration_of(
                             | ValueSource::Sequence(_)
                             | ValueSource::Generated(_) => None,
                         };
-                        (to, None)
+                        (to, None, None)
                     };
                     if to.is_none() && fallback.is_none() {
                         return Err(unsupported());
                     }
-                    default_change(located, None, to, fallback)?
+                    default_change(located, None, to, fallback, origin)?
                 }
             })
         }
