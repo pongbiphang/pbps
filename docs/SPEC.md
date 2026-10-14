@@ -2390,12 +2390,15 @@ steps. They are `doctor`'s and not a plan's because a plan reads no data (7.2):
   every declared range is not a finding.
 - `doctor.partition-runway-unknown` and `doctor.partition-default-rows-unknown`: the
   question could not be answered, with the reason (a denied `SELECT`, a lock or
-  statement timeout). That is never read as a series that is long enough.
+  statement timeout, row-level security filtering the account's reads of the
+  parent: DEC-1925.1). That is never read as a series that is long enough.
 
 All four are warnings, and leave the environment `ready`. The reads are `EXISTS`
 through the parent, in a `READ ONLY` transaction, under a lock timeout, so a
 rebuild holding the table is not waited for; the account needs `SELECT` on the
-parent alone. Nothing is read of a row but whether one is there.
+parent alone, and no policy may filter what it reads: row-level security that applies to
+the account makes both questions `…-unknown` (DEC-1925.1). Nothing is read of a row but
+whether one is there.
 
 **Each is asked for at the securable where it is actually needed**, and the
 report names that securable. The four `CREATE` permissions cannot be granted

@@ -42,6 +42,10 @@
 //! - Anything that could not be read, a bound this reader does not know, a
 //!   horizon this key cannot take: its own `…-unknown` finding. Absent, empty
 //!   and unreadable are three different things.
+//! - A parent whose rows this account cannot read in full, because row-level
+//!   security applies to it (#1925, DEC-1925.1): the same, for each question
+//!   that would read a row. An `EXISTS` through it sees only the rows a policy
+//!   allows, so "no row there" would be "no row I may see".
 
 use pbps_db::doctor::{
     DeclaredRange, DefaultRows, ParentRunway, PartitionedParent, Runway, RunwayAsk, RunwayReport,
@@ -159,6 +163,10 @@ pub async fn partition_runway(
 
 /// A parent as the database holds it.
 struct Found {
+    /// Whether row-level security filters this account's reads of the parent
+    /// (`row_security_active`, [`FILTERED`]). Every read of rows goes through
+    /// [`held`], which refuses when this is set.
+    filtered: bool,
     key: Key,
     /// The key column, quoted for a statement.
     column: String,
@@ -179,7 +187,27 @@ enum Lookup {
     Absent,
     /// It does, and the question does not apply to it.
     NotApplicable,
-    Found(Found),
+    Found(Box<Found>),
+}
+
+/// Why no row of a parent can be asked about when row-level security filters
+/// this account's reads of it (#1925, DEC-1925.1).
+const FILTERED: &str = "row-level security is active for this account, so occupancy cannot be \
+     read: the policies hide rows from this check, and a row it cannot see is not an empty \
+     table. Run it as a role they do not apply to";
+
+impl Found {
+    /// Refuses the question when what it reads would be filtered. Not an
+    /// answer of "nothing there": a policy that hides the newest rows makes the
+    /// series look longer than it is, and one that hides them all makes it
+    /// look empty.
+    fn readable(&self) -> Result<(), Failure> {
+        if self.filtered {
+            Err(Failure::said(FILTERED))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// A parent's key and its partitions, from the catalog. Run inside a
@@ -192,7 +220,8 @@ async fn lookup(conn: &mut Conn, physical: &ObjectName) -> Result<Lookup, Failur
                     pt.partstrat::text AS strategy,
                     pt.partnatts::int AS natts,
                     pg_catalog.quote_ident(a.attname) AS column_quoted,
-                    pg_catalog.format_type(a.atttypid, NULL) AS column_type
+                    pg_catalog.format_type(a.atttypid, NULL) AS column_type,
+                    pg_catalog.row_security_active(c.oid) AS filtered
                FROM pg_catalog.pg_class c
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                JOIN pg_catalog.pg_partitioned_table pt ON pt.partrelid = c.oid
@@ -224,6 +253,13 @@ async fn lookup(conn: &mut Conn, physical: &ObjectName) -> Result<Lookup, Failur
         return Ok(Lookup::NotApplicable);
     };
     let column = column.to_owned();
+    // Asked of the parent alone, which is what a read through it is subject
+    // to: measured on 16.15 and 18.6, a policy on a partition does not filter
+    // a read through its partitioned parent (DEC-1925.1). NULL is a parent
+    // dropped under this read, and no answer is not "not filtered".
+    let filtered = row.try_get::<bool>("filtered")?.ok_or_else(|| {
+        Failure::said("the engine returned no answer to whether row-level security is active")
+    })?;
 
     let rows = conn
         .query_with(
@@ -276,13 +312,14 @@ async fn lookup(conn: &mut Conn, physical: &ObjectName) -> Result<Lookup, Failur
         }
     }
     let parent = qualified(physical).map_err(|e| Failure::said(e.to_string()))?;
-    Ok(Lookup::Found(Found {
+    Ok(Lookup::Found(Box::new(Found {
+        filtered,
         key,
         column,
         parent,
         ranges,
         default,
-    }))
+    })))
 }
 
 /// Opens a read of one question: the canonical session, a lock a rebuild
@@ -325,8 +362,16 @@ async fn finish<T>(conn: &mut Conn, outcome: Result<T, Failure>) -> Result<T, St
     }
 }
 
-/// Whether a `SELECT EXISTS (…)` answered yes. A NULL is no answer.
-async fn held(conn: &mut Conn, sql: &str, params: &[Param<'_>]) -> Result<bool, Failure> {
+/// Whether a `SELECT EXISTS (…)` over `found`'s rows answered yes. A NULL is
+/// no answer, and so is a parent whose rows row-level security hides: the one
+/// way into the parent's rows, so that no question can skip the check.
+async fn held(
+    conn: &mut Conn,
+    found: &Found,
+    sql: &str,
+    params: &[Param<'_>],
+) -> Result<bool, Failure> {
+    found.readable()?;
     let rows = conn.query_with(sql, params).await?;
     let answer = match rows.first() {
         Some(row) => row.try_get::<bool>("held")?,
@@ -389,7 +434,7 @@ async fn runway_in(
     let mut occupied = None;
     for i in runway::newest_first(&ranges) {
         let sql = exists_in_range(&found, &ranges[i]);
-        if held(conn, &sql, &[]).await? {
+        if held(conn, &found, &sql, &[]).await? {
             occupied = Some(i);
             break;
         }
@@ -492,7 +537,7 @@ async fn default_rows_in(
         return Ok(None);
     }
     let params = [Param::I64(default_oid)];
-    if !held(conn, &exists_sql(&found, &asked), &params).await? {
+    if !held(conn, &found, &exists_sql(&found, &asked), &params).await? {
         return Ok(None);
     }
     // Which of them, so that the remedy names a partition that holds rows. One
@@ -609,6 +654,7 @@ mod tests {
 
     fn found() -> Found {
         Found {
+            filtered: false,
             key: Key::Date,
             column: "\"ts\"".to_owned(),
             parent: "\"app\".\"ev\"".to_owned(),
@@ -682,5 +728,26 @@ mod tests {
             hi: Some(int("2026-12-01")),
         };
         assert!(!exists_in_range(&found(), &open_below).contains(">="));
+    }
+
+    /// A parent that row-level security filters for this account is not read,
+    /// and says why; one it does not filter is (#1925).
+    #[test]
+    fn a_parent_row_level_security_filters_is_refused_before_any_row_is_read() {
+        let filtered = Found {
+            filtered: true,
+            ..found()
+        };
+        let refusal = filtered
+            .readable()
+            .expect_err("a filtered parent is refused");
+        assert!(
+            refusal
+                .reason()
+                .contains("row-level security is active for this account, so occupancy cannot"),
+            "{}",
+            refusal.reason()
+        );
+        assert!(found().readable().is_ok());
     }
 }

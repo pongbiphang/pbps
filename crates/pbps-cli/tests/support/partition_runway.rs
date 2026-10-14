@@ -836,3 +836,218 @@ pub fn fractions(server: &str, slug: &str) {
         "{message}"
     );
 }
+
+/// Row-level security hides rows from `doctor`'s `EXISTS` through a parent, so
+/// neither question is answered as "nothing there" for an account it applies
+/// to (#1925, DEC-1925.1).
+///
+/// Six parents, each with a row in the last partition of a series that ends
+/// with it, and a row in the DEFAULT inside a declared partition not created
+/// yet, so that a superuser gets both findings for every one of them:
+///
+/// | parent | row-level security | the policy |
+/// |---|---|---|
+/// | `plain` | off | none |
+/// | `gated` | on the parent | hides every row |
+/// | `partial` | on the parent | hides the newest rows only: the series looks longer |
+/// | `nopolicy` | on the parent | none: the engine hides every row |
+/// | `forced` | on the parent, `FORCE` | hides every row, from the owner as well |
+/// | `leafonly` | on one partition only | hides that partition's rows |
+///
+/// Read as a login that owns them, one that does not, and one with `BYPASSRLS`:
+/// the owner and the bypass role are read as before, except for the owner of
+/// `forced`; the other login gets `…-unknown` for both questions of the four
+/// whose parent filters it, and findings for the two whose parent does not
+/// (a policy on a partition does not filter a read through the parent).
+pub fn row_security(server: &str, slug: &str) {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let pid = std::process::id();
+    let role = |kind: &str| Role(server.to_owned(), format!("pbps_rls_{kind}_{pid}"));
+    // Declared before the database: dropped after it.
+    let (owner, reader, bypass) = (role("own"), role("rd"), role("bp"));
+    let own = OwnDatabase::new(server, slug);
+    let conn = own.connection().to_owned();
+    on_server(&conn, "CREATE SCHEMA app");
+    let d = Demo::new(slug);
+    let months = |parent: &str| -> String {
+        (10..=12)
+            .map(|m| {
+                format!(
+                    "  {parent}_2026_{m}: {{from: ['2026-{m}-01'], to: ['{}']}}\n",
+                    {
+                        if m == 12 {
+                            "2027-01-01".to_owned()
+                        } else {
+                            format!("2026-{}-01", m + 1)
+                        }
+                    }
+                )
+            })
+            .collect::<String>()
+            + &format!("  {parent}_rest: default\n")
+    };
+    let parents = [
+        "plain", "gated", "partial", "nopolicy", "forced", "leafonly",
+    ];
+    for name in parents {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!(
+                "table: app.{name}\ncolumns:\n  id: {{type: bigint, nullable: false}}\n  \
+                 k: {{type: date, nullable: false}}\nprimary_key: [id, k]\n\
+                 partition_by: [k]\npartitions:\n{}",
+                months(name)
+            ),
+        )
+        .unwrap();
+    }
+    succeeds(d.run(&["fmt"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &conn]));
+    for name in parents {
+        on_server(
+            &conn,
+            &format!("INSERT INTO app.{name} VALUES (1, '2026-12-15'), (2, '2027-01-15')"),
+        );
+        // Declared further than the database has, so that the DEFAULT's row
+        // lies in a partition not created yet.
+        succeeds(d.run(&[
+            "partitions",
+            "extend",
+            &format!("app.{name}"),
+            "--every",
+            "1month",
+            "--until",
+            "2027-03-01",
+        ]));
+    }
+    let (o, r, b) = (owner.1.as_str(), reader.1.as_str(), bypass.1.as_str());
+    on_server(
+        &conn,
+        &format!(
+            "CREATE ROLE {o} LOGIN NOSUPERUSER PASSWORD 'rls-1925-secret'; \
+             CREATE ROLE {r} LOGIN NOSUPERUSER PASSWORD 'rls-1925-secret'; \
+             CREATE ROLE {b} LOGIN NOSUPERUSER BYPASSRLS PASSWORD 'rls-1925-secret'; \
+             GRANT USAGE ON SCHEMA public, app TO {o}, {r}, {b}; \
+             GRANT SELECT ON public.__pbps_state, public.__pbps_lock TO {o}, {r}, {b}; \
+             GRANT SELECT ON app.plain, app.gated, app.partial, app.nopolicy, app.forced, \
+               app.leafonly TO {r}, {b}; \
+             ALTER TABLE app.plain OWNER TO {o}; ALTER TABLE app.gated OWNER TO {o}; \
+             ALTER TABLE app.partial OWNER TO {o}; ALTER TABLE app.nopolicy OWNER TO {o}; \
+             ALTER TABLE app.forced OWNER TO {o}; ALTER TABLE app.leafonly OWNER TO {o}; \
+             ALTER TABLE app.gated ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY hide ON app.gated USING (false); \
+             ALTER TABLE app.partial ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY older ON app.partial USING (k < '2026-12-01'); \
+             ALTER TABLE app.nopolicy ENABLE ROW LEVEL SECURITY; \
+             ALTER TABLE app.forced ENABLE ROW LEVEL SECURITY; \
+             ALTER TABLE app.forced FORCE ROW LEVEL SECURITY; \
+             CREATE POLICY hide ON app.forced USING (false); \
+             ALTER TABLE app.leafonly_rest ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY hide ON app.leafonly_rest USING (false); \
+             ALTER TABLE app.leafonly_2026_12 ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY hide ON app.leafonly_2026_12 USING (false)"
+        ),
+    );
+    let login = |who: &str| {
+        format!(
+            "{} user={who} password=rls-1925-secret",
+            conn.split_whitespace()
+                .filter(|word| !word.starts_with("user=") && !word.starts_with("password="))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    // The parents a family of findings is about, by the name the message gives
+    // first: `app.<parent>'s`, or the DEFAULT `app.<parent>_rest`.
+    let parents_of = |target: &str, id: &str| -> (serde_json::Value, Vec<String>) {
+        let output = d.run(&["doctor", "--db", target, "--format", "json"]);
+        let json = json_of(&output);
+        assert!(
+            !stdout(&output).contains("rls-1925-secret")
+                && !stderr(&output).contains("rls-1925-secret"),
+            "the password is never printed"
+        );
+        let mut names: Vec<String> = json["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{json}"))
+            .iter()
+            .filter(|f| f["id"] == id)
+            .map(|f| {
+                let message = f["message"].as_str().unwrap();
+                let start = message.find("app.").unwrap_or_else(|| panic!("{message}"));
+                let name: String = message[start + 4..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                name.split('_').next().unwrap().to_owned()
+            })
+            .collect();
+        names.sort();
+        (json, names)
+    };
+    let all = [
+        "forced", "gated", "leafonly", "nopolicy", "partial", "plain",
+    ];
+    let questions = [
+        ("doctor.partition-runway", "doctor.partition-runway-unknown"),
+        (
+            "doctor.partition-default-rows",
+            "doctor.partition-default-rows-unknown",
+        ),
+    ];
+    // (who, parents answered, parents `…-unknown`)
+    let expected: [(&str, &str, &[&str], &[&str]); 4] = [
+        // A superuser bypasses row-level security: the reference.
+        ("superuser", &conn, &all, &[]),
+        // Not the owner of anything: filtered by the four whose parent has it
+        // on. The policy on a partition does not filter a read through its
+        // parent, so `leafonly` is read in full.
+        (
+            "a login that owns none",
+            &login(r),
+            &["leafonly", "plain"],
+            &["forced", "gated", "nopolicy", "partial"],
+        ),
+        // The owner is exempt, except from a table that forces it on.
+        (
+            "the owner",
+            &login(o),
+            &["gated", "leafonly", "nopolicy", "partial", "plain"],
+            &["forced"],
+        ),
+        ("BYPASSRLS", &login(b), &all, &[]),
+    ];
+    for (who, target, answered, unknown) in expected {
+        for (finding, finding_unknown) in questions {
+            let (json, found) = parents_of(target, finding);
+            assert_eq!(found, answered, "{who}, {finding}: {json}");
+            let (json, found) = parents_of(target, finding_unknown);
+            assert_eq!(found, unknown, "{who}, {finding_unknown}: {json}");
+            for f in json["findings"].as_array().unwrap() {
+                if f["id"] == finding_unknown {
+                    let message = f["message"].as_str().unwrap();
+                    assert!(
+                        message.contains("row-level security is active for this account"),
+                        "{who}: {f}"
+                    );
+                    assert_eq!(f["severity"], "warning", "{f}");
+                }
+            }
+        }
+    }
+    // The reason is the account's, not a data question: the same login reads
+    // `gated` as it always could, and sees no row of it.
+    assert_eq!(
+        text_of(&login(r), "SELECT count(*)::text FROM app.gated"),
+        "0",
+        "the scenario needs a login the policy hides every row from"
+    );
+    assert_eq!(text_of(&conn, "SELECT count(*)::text FROM app.gated"), "2");
+}
