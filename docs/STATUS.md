@@ -488,7 +488,8 @@ on` are pinned by the transaction framing, the earlier batch a transactional
 apply runs (DECISIONS 260), and so are the seven that decide what a declared
 expression *means* or what a conversion writes back — `DateStyle`, `TimeZone`,
 `IntervalStyle`, `timezone_abbreviations`, `transform_null_equals`,
-`bytea_output` and `extra_float_digits`. They are fixed rather than
+`bytea_output` and `extra_float_digits`, with `xmloption = content` beside
+them since DEC-1634.1. They are fixed rather than
 per-object — `TimeZone` is the target database's own zone, which the plan
 records and `apply` requires again (DEC-1916.1) — and measured, the same check constraint stores a different day,
 a different instant, an interval with the opposite sign, a time fifteen and a

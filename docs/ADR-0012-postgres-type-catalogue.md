@@ -47,6 +47,11 @@ named as an open question rather than asserted.
 | `float(25)`, `float(53)` | **`double precision`** | | `serial` | **`integer`** + an owned sequence |
 | `text`, `date`, `bytea` | unchanged | | `timestamptz`, `timestamp with time zone` | `timestamp with time zone` |
 | | | | `text[]` | unchanged by the catalog, and **unloadable** — see below |
+| `inet`, `cidr`, `macaddr`, `tsvector`, `xml` | unchanged ([DEC-1634.1](decisions/types-and-probes.md#dec-1634-1)) | | `macaddr8` | outside the catalogue: a reported limitation |
+
+The last row was added by [DEC-1634.1](decisions/types-and-probes.md#dec-1634-1),
+measured on 16.15 and 18.6 in the same way: none of the five takes a modifier or
+has an alias, so `format_type` returns each by its bare name.
 
 Two of these are traps rather than aliases:
 

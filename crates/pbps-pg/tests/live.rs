@@ -792,6 +792,14 @@ async fn every_spelling_the_catalogue_admits_reads_back_as_the_dialect_says() {
         "json",
         "jsonb",
         "uuid",
+        // DEC-1634.1: spelled by their bare names, with no alias and no
+        // modifier.
+        "inet",
+        "cidr",
+        "macaddr",
+        "tsvector",
+        "xml",
+        "inet[]",
     ];
 
     conn.execute(&format!("DROP TABLE IF EXISTS {table}"))
@@ -843,8 +851,8 @@ async fn every_spelling_the_catalogue_admits_reads_back_as_the_dialect_says() {
 }
 
 /// `Incompatible` has to mean exactly "this engine refuses the conversion", and
-/// the only way to know is to ask it. Twenty types, four hundred ordered pairs,
-/// on an **empty** table: with no rows the only thing that can fail is the
+/// the only way to know is to ask it. Twenty-five types, six hundred and
+/// twenty-five ordered pairs, on an **empty** table: with no rows the only thing that can fail is the
 /// conversion itself, which is the question the class answers.
 ///
 /// A pair called incompatible that the engine accepts blocks a plan that would
@@ -877,6 +885,11 @@ async fn the_engine_and_the_dialect_agree_on_which_type_changes_are_impossible()
         "uuid",
         "json",
         "jsonb",
+        "inet",
+        "cidr",
+        "macaddr",
+        "tsvector",
+        "xml",
     ];
 
     for from in types {
@@ -3104,6 +3117,435 @@ async fn a_stored_generated_column_round_trips_and_changes_its_expression() {
     assert_eq!(value, Some(15));
     assert_eq!(after, changed);
     assert!(plan(&after, &ids, &changed, &ids).is_empty());
+}
+
+/// DEC-1634.1: a table holding every one of the five types — a defaulted
+/// column of each, a generated `tsvector`, an array of `inet`, and a btree over
+/// each that the engine can order — is pulled with no limitation, rebuilt from
+/// that read in another database, read back the same, and leaves nothing to
+/// plan. This is the acceptance the issue asks for on 16 and 18, and the
+/// converse of the GitLab failure it came from: `the emitter cannot write
+/// table …: postgres has no type inet`.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn inet_cidr_macaddr_tsvector_and_xml_columns_pull_recreate_and_repull_to_an_empty_plan() {
+    let s = emit_schema("net1634");
+    let t = TableName::new(&s, "hosts");
+
+    let mut source = TestDb::create("net1634_src").await;
+    fresh(&mut source, &s).await;
+    source
+        .execute(&format!(
+            "CREATE TABLE {s}.hosts (
+                 id integer PRIMARY KEY,
+                 addr inet NOT NULL,
+                 net cidr,
+                 mac macaddr,
+                 doc xml,
+                 body text,
+                 tsv tsvector,
+                 fts tsvector GENERATED ALWAYS AS (to_tsvector('english'::regconfig, body)) STORED,
+                 peers inet[],
+                 d_addr inet DEFAULT '10.0.0.1'::inet,
+                 d_net cidr DEFAULT '10.0.0.0/8'::cidr,
+                 d_mac macaddr DEFAULT '08:00:2b:01:02:03'::macaddr,
+                 d_tsv tsvector DEFAULT 'a b'::tsvector,
+                 d_doc xml DEFAULT '<a/><b/>'::xml,
+                 d_null inet DEFAULT NULL::inet
+             );
+             CREATE INDEX hosts_addr ON {s}.hosts (addr);
+             CREATE INDEX hosts_net ON {s}.hosts (net);
+             CREATE INDEX hosts_mac ON {s}.hosts (mac);
+             CREATE INDEX hosts_tsv ON {s}.hosts (tsv);
+             CREATE UNIQUE INDEX hosts_pair ON {s}.hosts (addr, net);
+             CREATE TABLE {s}.flows (id integer, src inet NOT NULL) PARTITION BY RANGE (src);
+             CREATE TABLE {s}.flows_lo PARTITION OF {s}.flows
+                 FOR VALUES FROM ('0.0.0.0') TO ('128.0.0.0');
+             CREATE TABLE {s}.flows_hi PARTITION OF {s}.flows
+                 FOR VALUES FROM ('128.0.0.0') TO (MAXVALUE)"
+        ))
+        .await
+        .expect("the source table");
+    let read = pull(&mut source).await;
+    let limitations = ours_limitations(&read, &s);
+    let pulled = ours_only(&read, &s);
+    drop_schema(&mut source, &s).await;
+    source.drop().await;
+    assert!(limitations.is_empty(), "{limitations:?}");
+
+    let columns = &pulled.tables[&t].columns;
+    for (name, spelled) in [
+        ("addr", "inet"),
+        ("net", "cidr"),
+        ("mac", "macaddr"),
+        ("doc", "xml"),
+        ("tsv", "tsvector"),
+        ("fts", "tsvector"),
+        ("peers", "inet[]"),
+        ("d_addr", "inet"),
+        ("d_net", "cidr"),
+        ("d_mac", "macaddr"),
+        ("d_tsv", "tsvector"),
+        ("d_doc", "xml"),
+    ] {
+        assert_eq!(columns[name].ty.to_string(), spelled, "{name}");
+    }
+    let pbps_model::ValueSource::Generated(fts) = columns["fts"].value_source.clone() else {
+        panic!("fts is generated")
+    };
+    assert!(fts.stored);
+    // The engine's own deparse, welded `regconfig` cast and all: the
+    // expression is carried verbatim and is stable across the rebuild below.
+    assert_eq!(fts.expression, "to_tsvector('english'::regconfig, body)");
+    // Negative: a plain column of the same type is a column, not a generation.
+    assert!(
+        matches!(columns["tsv"].value_source, pbps_model::ValueSource::None),
+        "{:?}",
+        columns["tsv"].value_source
+    );
+    assert_eq!(
+        pulled.tables[&t].indexes.len(),
+        5,
+        "{:?}",
+        pulled.tables[&t].indexes.keys()
+    );
+
+    let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
+    let mut target = TestDb::create("net1634_dst").await;
+    fresh(&mut target, &s).await;
+    apply(
+        &mut target,
+        &Postgres::new(),
+        &plan(&Schema::default(), &IdsFile::default(), &pulled, &ids),
+    )
+    .await;
+    target
+        .execute(&format!(
+            "INSERT INTO {s}.hosts (id, addr, net, mac, doc, body, tsv, peers)
+             VALUES (1, '10.0.0.1/8', '10.0.0.0/8', '08:00:2b:01:02:03', '<a/>',
+                     'the quick fox', 'b a', ARRAY['::1'::inet])"
+        ))
+        .await
+        .expect("a row of every type");
+    let rebuilt = ours_only(&pull(&mut target).await, &s);
+    assert_eq!(rebuilt, pulled);
+    assert!(plan(&rebuilt, &ids, &pulled, &ids).is_empty());
+    // The generated column computed from the row the engine was given.
+    let stored = text(
+        &mut target,
+        &format!("SELECT fts::text FROM {s}.hosts WHERE id = 1"),
+    )
+    .await;
+    assert_eq!(stored, "'fox':3 'quick':2");
+    drop_schema(&mut target, &s).await;
+    target.drop().await;
+}
+
+/// The converse: what DEC-1634.1 leaves out stays a reported limitation, and
+/// is never read as a type it is not. `macaddr8` is a sixth type the engine
+/// converts to and from `macaddr` and this catalogue does not hold, and a GIN
+/// index over a `tsvector` is an index method the model has nowhere to write
+/// (#1169 holds `gin` over plain `jsonb` only). Each earns a limitation on its
+/// own table, and a sibling table of the five types beside them is untouched.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn macaddr8_and_a_gin_over_a_tsvector_stay_reported_limitations() {
+    let s = emit_schema("net1634l");
+    let mut db = TestDb::create("net1634_lim").await;
+    fresh(&mut db, &s).await;
+    db.execute(&format!(
+        "CREATE TABLE {s}.eight (id integer PRIMARY KEY, m macaddr8);
+         CREATE TABLE {s}.searched (id integer PRIMARY KEY, tsv tsvector);
+         CREATE INDEX searched_gin ON {s}.searched USING gin (tsv);
+         CREATE TABLE {s}.plain (id integer PRIMARY KEY, a inet, b cidr, c macaddr, d tsvector, e xml)"
+    ))
+    .await
+    .expect("the tables");
+    let read = pull(&mut db).await;
+    let named: Vec<String> = ours_limitations(&read, &s)
+        .iter()
+        .map(|l| l.target.object_name().to_string())
+        .collect();
+    drop_schema(&mut db, &s).await;
+    db.drop().await;
+    assert!(
+        named.iter().any(|n| n == &format!("{s}.eight")),
+        "a macaddr8 column is a limitation: {named:?}"
+    );
+    assert!(
+        named
+            .iter()
+            .any(|n| n.starts_with(&format!("{s}.searched"))),
+        "a GIN over a tsvector is a limitation: {named:?}"
+    );
+    assert!(
+        !named.iter().any(|n| n.contains(".plain")),
+        "the five types themselves are held: {named:?}"
+    );
+    assert!(
+        read.schema
+            .tables
+            .contains_key(&TableName::new(&s, "plain"))
+    );
+    // And the dialect still refuses the sixth by name rather than guessing.
+    let refused = Postgres::new()
+        .normalize_type(&ty("macaddr8"))
+        .expect_err("macaddr8 is outside the catalogue");
+    assert!(refused.to_string().contains("macaddr8"), "{refused}");
+}
+
+/// DEC-1634.1: `inet -> cidr` is the one change among the five that succeeds
+/// while changing the data. Measured here, `10.0.0.1/8` becomes `10.0.0.0/8`
+/// with no error, so the class is `Narrowing` and the pre-flight probe counts
+/// the rows whose host bits would be cleared; the reverse is a `Safe`
+/// relabelling with no probe at all; and a change between any two other of the
+/// five is planned as the type change it is and refused by name, never read as
+/// no change.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn inet_into_cidr_is_a_narrowing_whose_probe_counts_the_rows_with_host_bits() {
+    use pbps_model::{Change, ChangeSet, PlannedChange};
+
+    let s = emit_schema("net1634c");
+    let mut conn = connect().await;
+    fresh(&mut conn, &s).await;
+    let column = TableName::new(&s, "t").column("v");
+    let change = |from: &str, to: &str| Change::AlterColumnType {
+        uid: "c_aaaaaa".parse().expect("a uid"),
+        column: column.clone(),
+        from: ty(from),
+        to: ty(to),
+        from_nullable: true,
+        to_nullable: true,
+        through_external_partitions: false,
+        from_collation: None,
+        to_collation: None,
+    };
+    let pg = Postgres::new();
+    let risk = |from: &str, to: &str| {
+        pg.type_change_risk(
+            &pg.normalize_type(&ty(from)).unwrap(),
+            &pg.normalize_type(&ty(to)).unwrap(),
+        )
+    };
+    assert_eq!(risk("inet", "cidr"), TypeChangeRisk::Narrowing);
+    assert_eq!(risk("cidr", "inet"), TypeChangeRisk::Safe);
+
+    // The engine does not refuse the narrowing, so the probe is the only thing
+    // that can: the host bits are gone afterwards and nothing said so.
+    conn.execute(&format!(
+        "CREATE TABLE {s}.t (v inet);
+         INSERT INTO {s}.t VALUES ('10.0.0.1/8'), ('10.0.0.0/8'), ('10.0.0.7'), ('2001:db8::1/64'), ('::1'), (NULL)"
+    ))
+    .await
+    .expect("rows with and without host bits");
+    let cs = ChangeSet {
+        changes: vec![PlannedChange::new(change("inet", "cidr"))],
+    };
+    assert_eq!(
+        one(&counts(&mut conn, &cs).await, "cannot become"),
+        2,
+        "10.0.0.1/8 and 2001:db8::1/64 hold host bits; a /32, a /128, a clean network and NULL do not"
+    );
+    conn.execute(&format!("ALTER TABLE {s}.t ALTER COLUMN v TYPE cidr"))
+        .await
+        .expect("the engine accepts it");
+    assert_eq!(
+        text(
+            &mut conn,
+            &format!("SELECT string_agg(v::text, ' ' ORDER BY v) FROM {s}.t")
+        )
+        .await,
+        "10.0.0.0/8 10.0.0.0/8 10.0.0.7/32 ::1/128 2001:db8::/64",
+        "the engine cleared the host bits without a word"
+    );
+
+    // Repaired rows count nothing, and the widening has no probe.
+    conn.execute(&format!(
+        "DROP TABLE {s}.t;
+         CREATE TABLE {s}.t (v inet);
+         INSERT INTO {s}.t VALUES ('10.0.0.0/8'), ('10.0.0.7'), (NULL)"
+    ))
+    .await
+    .expect("rows without host bits");
+    assert_eq!(one(&counts(&mut conn, &cs).await, "cannot become"), 0);
+    conn.execute(&format!("DROP TABLE {s}.t; CREATE TABLE {s}.t (v cidr)"))
+        .await
+        .expect("a cidr column");
+    let widening = ChangeSet {
+        changes: vec![PlannedChange::new(change("cidr", "inet"))],
+    };
+    assert!(
+        counts(&mut conn, &widening)
+            .await
+            .iter()
+            .all(|(d, _)| !d.contains("cannot become")),
+        "a cidr is already an inet: nothing to count"
+    );
+
+    // Declared that way, the change is a plan and not "no change"; and a pair
+    // the engine will not convert is planned too, and refused by name.
+    for (from, to, narrowing, refused) in [
+        ("inet", "cidr", true, false),
+        ("cidr", "inet", false, false),
+        ("macaddr", "inet", false, true),
+        ("tsvector", "xml", false, true),
+        ("xml", "tsvector", false, true),
+        ("inet", "macaddr", false, true),
+    ] {
+        let declared = |spelled: &str| {
+            let mut table = Table::default();
+            table.columns.insert("v".into(), Column::new(ty(spelled)));
+            let mut schema = Schema::default();
+            schema.tables.insert(TableName::new(&s, "t"), table);
+            schema
+        };
+        let (was, now) = (declared(from), declared(to));
+        let ids = mint_ids(&was, &IdsFile::default(), &[]);
+        let step = plan(&was, &ids, &now, &ids);
+        assert!(
+            matches!(
+                step.changes.as_slice(),
+                [p] if matches!(&p.change, Change::AlterColumnType { from: f, to: t, .. }
+                    if f.to_string() == from && t.to_string() == to)
+            ),
+            "{from} -> {to}: {step:#?}"
+        );
+        let emitted = pg.emit(&step.changes[0].change, Strategy::default());
+        assert_eq!(emitted.is_err(), refused, "{from} -> {to}: {emitted:?}");
+        if refused {
+            assert!(
+                emitted.unwrap_err().to_string().contains("USING"),
+                "{from} -> {to}"
+            );
+        }
+        assert_eq!(
+            risk(from, to) == TypeChangeRisk::Narrowing,
+            narrowing,
+            "{from} -> {to}"
+        );
+    }
+    drop_schema(&mut conn, &s).await;
+}
+
+/// DEC-1634.1: `xmloption` is pinned to `content` on the read scope too, so a
+/// declared `xml` value is judged as the apply will store it. Measured, an
+/// `xml` fragment is `invalid XML document` from a session left on `document`
+/// and fine from one on `content`; the spelling check runs inside the
+/// canonical scope, so a session's own setting must not decide whether a
+/// declared row is readable. The other four types are spelled by the engine
+/// (`10.0.0.1` is `10.0.0.1/32`, the dashed MAC is the colon one, a
+/// `tsvector` is its sorted lexemes) and a value the type cannot read at all
+/// is the other finding.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_declared_xml_or_network_value_is_read_under_the_pins_and_not_the_sessions_xmloption() {
+    use pbps_model::{DataMode, Value};
+
+    let mut conn = connect().await;
+    let s = data_schema("net1634");
+    fresh(&mut conn, &s).await;
+    let name = TableName::new(&s, "hosts");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("code".into(), Column::new(ty("text")).not_null());
+    for (column, spelled) in [
+        ("doc", "xml"),
+        ("addr", "inet"),
+        ("net", "cidr"),
+        ("mac", "macaddr"),
+        ("tsv", "tsvector"),
+    ] {
+        table
+            .columns
+            .insert(column.into(), Column::new(ty(spelled)));
+    }
+    table.primary_key = Some(PrimaryKey {
+        name: None,
+        columns: vec!["code".into()],
+        storage_parameters: Default::default(),
+    });
+    with_data(
+        &mut table,
+        DataMode::Exact,
+        &[
+            (
+                "a",
+                row(&[
+                    ("doc", Value::Text("<a/><b/>".into())),
+                    ("addr", Value::Text("10.0.0.1".into())),
+                    ("net", Value::Text("10.0.0.0/8".into())),
+                    ("mac", Value::Text("08-00-2b-01-02-03".into())),
+                    ("tsv", Value::Text("b a".into())),
+                ]),
+            ),
+            (
+                "b",
+                row(&[
+                    ("doc", Value::Text("plain text".into())),
+                    ("addr", Value::Text("10.0.0.999".into())),
+                    ("net", Value::Text("10.0.0.1/8".into())),
+                ]),
+            ),
+        ],
+    );
+    let mut declared = Schema::default();
+    declared.tables.insert(name.clone(), table);
+
+    // The hostile session, set on the connection the check borrows.
+    conn.execute("SET xmloption = document")
+        .await
+        .expect("a session on document");
+    assert_eq!(text(&mut conn, "SHOW xmloption").await, "document");
+    let found =
+        pbps_pg::catalog::misspelt(&mut conn, &declared, &pbps_pg::rows::CatalogNames::new())
+            .await
+            .expect("ask the engine");
+    assert_eq!(
+        text(&mut conn, "SHOW xmloption").await,
+        "document",
+        "the check leaves the session as it found it"
+    );
+    let mut got: Vec<(String, String, String, Option<String>)> = found
+        .misspelt
+        .iter()
+        .filter(|m| m.table == name)
+        .map(|m| {
+            (
+                m.key.to_string(),
+                m.column.clone().unwrap_or_default(),
+                m.declared.clone(),
+                m.canonical.clone(),
+            )
+        })
+        .collect();
+    got.sort();
+    let expect = |key: &str, column: &str, declared: &str, canonical: Option<&str>| {
+        (
+            key.to_owned(),
+            column.to_owned(),
+            declared.to_owned(),
+            canonical.map(str::to_owned),
+        )
+    };
+    assert_eq!(
+        got,
+        [
+            expect("a", "addr", "10.0.0.1", Some("10.0.0.1/32")),
+            expect("a", "mac", "08-00-2b-01-02-03", Some("08:00:2b:01:02:03")),
+            expect("a", "tsv", "b a", Some("'a' 'b'")),
+            expect("b", "addr", "10.0.0.999", None),
+            // Host bits set in a `cidr` literal: the engine refuses the text
+            // outright, which is not the same finding as respelling it.
+            expect("b", "net", "10.0.0.1/8", None),
+        ],
+        "the fragment `<a/><b/>` and `plain text` are readable `xml` under the pins, \
+         and `{found:#?}` names no `doc` cell"
+    );
+    conn.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
 }
 
 /// A `serial` added to a table another role owns, applied by a superuser:
@@ -8150,6 +8592,11 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
         table
             .columns
             .insert("j".into(), Column::new(ty("json")).not_null());
+        // `xml` has no `=` either, so it is refused as a key exactly as `json`
+        // is, with the same states (DEC-1634.1).
+        table
+            .columns
+            .insert("x".into(), Column::new(ty("xml")).not_null());
         table
     };
     let mut cases: Vec<(String, Table, Option<&str>)> = Vec::new();
@@ -8167,6 +8614,10 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
             ),
             (
                 vec!["j"],
+                Some(if kind == "foreign" { "42804" } else { "42704" }),
+            ),
+            (
+                vec!["x"],
                 Some(if kind == "foreign" { "42804" } else { "42704" }),
             ),
             (vec!["a"], None),
@@ -15977,6 +16428,12 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
         "pg_catalog._int4",
         "_varbit",
         "_numeric(10,2)",
+        // And for the five DEC-1634.1 added, which the catalogue carries now.
+        "_inet",
+        "pg_catalog._cidr",
+        "_tsvector",
+        "pg_catalog.xml",
+        "macaddr[]",
         // Aliases the engine identifies as something else and the column
         // catalogue does not carry.
         "varbit(4)",
@@ -28664,6 +29121,11 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
         "uuid",
         "json",
         "jsonb",
+        "inet",
+        "cidr",
+        "macaddr",
+        "tsvector",
+        "xml",
     ];
 
     // The whole matrix in one round trip: the engine creates, alters, and

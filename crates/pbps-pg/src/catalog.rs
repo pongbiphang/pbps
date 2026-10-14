@@ -995,6 +995,7 @@ pub(crate) fn canonical_path(zone: &SessionZone) -> String {
        pg_catalog.set_config('bytea_output', 'hex', true),
        pg_catalog.set_config('extra_float_digits', '1', true),
        pg_catalog.set_config('standard_conforming_strings', 'on', true),
+       pg_catalog.set_config('xmloption', 'content', true),
        pg_catalog.set_config('jit', 'off', true)",
         zone = crate::emit::literal(zone.as_str())
     )
@@ -4053,6 +4054,8 @@ mod tests {
             "timezone",
             "bytea_output",
             "extra_float_digits",
+            // What an `xml` literal is read as (DEC-1634.1).
+            "xmloption",
         ] {
             assert!(path.contains(setting), "{setting}");
         }

@@ -1937,3 +1937,110 @@ same cases against both dialects; PostgreSQL also checks planned keys in
 before/after key controls and checks the DELETE boundary and retired keys.
 Name reads never move past the current statement, and later repairs remain
 invisible. Conversion, collation, backfill and key comparison stay engine-owned.
+
+
+<a id="dec-1634-1"></a>
+
+**DEC-1634.1. `inet`, `cidr`, `macaddr`, `tsvector` and `xml` are PostgreSQL
+column types: `cidr -> inet` is `Safe`, `inet -> cidr` narrows and has a probe,
+each of the five into a string narrows, every other pair is `Incompatible`, and
+every write and the read scope pin `xmloption = content` (#1634).**
+
+Before this a column of one of them was read as opaque with a limitation, and
+the emitter then raised `postgres has no type inet` (`UnknownType`) for the
+table, which stopped the GitLab measurement of #1616. It was a catalogue gap and
+nothing else: row values are read with `CAST(… AS text)`, defaults through any
+`::type`, generated expressions are carried verbatim, and the resolver already
+listed all five output functions. Everything is in `types.rs`, modelled on
+`uuid`, plus one pair in `estimate.rs` and the pin.
+
+**The catalogue.** Five rows, `ArgShape::None`. Measured on 16.15 and 18.6:
+none takes a modifier or has an alias, and `format_type` spells each by its bare
+name. They are also in `CATALOG_NAMES`, so `NULL::pg_catalog.inet` is the
+default the engine keeps, and the routine-argument fold now reads `_inet` as
+`inet[]` as the catalog does. `Family` gets `Inet { cidr }`, `MacAddr`,
+`TsVector` and `Xml`; none may be `Unknown`, because both the to-text arm of
+`change_risk` and the length probe's allow-list key on that.
+
+**The classes**, from `pg_cast` on both versions and a 25-by-25 matrix of
+`ALTER … TYPE` on an empty table (the live matrix now holds them):
+
+| Change | Engine | Class |
+|---|---|---|
+| `cidr -> inet` | implicit, binary-coercible | `Safe` |
+| `inet -> cidr` | assignment, function | `Narrowing`, with a probe |
+| any of the five -> `text`, `varchar(n)`, `char(n)` | assignment (the string casts every type has) | `Narrowing` |
+| `text`, `varchar`, `char` -> any of the five | none, or explicit only | `Incompatible` |
+| every other pair | none | `Incompatible` |
+
+`macaddr` and `tsvector` appear in `pg_cast` not at all, and `xml` only to
+strings; the strings are reached by I/O conversion, which is an assignment
+cast. A change between two of them is therefore never "no change": the diff
+compares normalized types, they are different types, and `change_risk`
+short-circuits only on equality.
+
+**`inet -> cidr` has a probe although it does not raise.** Measured, the
+`ALTER` succeeds and `10.0.0.1/8` becomes `10.0.0.0/8`, `2001:db8::1/64`
+becomes `2001:db8::/64`: the host bits are cleared and nothing says so, and two
+addresses of one network become one value, which a key or a join then treats as
+the same. The narrowings `preflight` leaves without a probe (a `numeric`
+scale, a float into an integer) have no row to point at, only a precision lost
+on nearly every row; here the rows that change are exactly the rows one
+comparison names, `a <> a::cidr::inet`
+(measured: false for `10.0.0.0/8`, a `/32`, `::1` and `NULL`, true for the two
+above). So `cannot_become` answers it, the apply stops before the first
+statement on a count, and the class stays `Narrowing` so the gate still asks.
+It is the one narrowing that does not raise which is counted, and only because
+the predicate is exact. `cidr -> inet` has none: nothing moves.
+
+**The length probe is accurate for all five**, so they enter
+`renders_alike_under_the_pins`. Measured, `ALTER … TYPE varchar(n)` stores the
+same string as `::text` (`10.0.0.1` is `10.0.0.1/32`, a `tsvector` is its sorted,
+quoted lexemes), `varchar(L)` is accepted and `varchar(L - 1)` refused at the
+rendered length `L` for each. None of their output functions reads a pinned
+setting; in particular `xml_out` ignores `xmloption`, which decides what
+*input* is read as.
+
+**Rewrites.** Measured with `relfilenode`, `cidr -> inet`, `xml -> text` and
+`xml -> character varying` rewrite nothing, and `xml -> character varying(n)`,
+`xml -> character(n)`, `inet -> cidr` and every other string target do. The
+first two are binary-coercible casts with no length check; all three are on
+`estimate.rs`'s free list. The issue's assessment named only the first, and the live
+estimate matrix refused the estimate for the other two until they were listed.
+
+**`xmloption = content` is a pin.** It is the parser class of DECISIONS 267: a
+setting that decides what declared text means. Measured, `'abc'::xml` and
+`'<a/><b/>'::xml` are accepted under `content` and are `invalid XML document`
+under `document`, so the same `DEFAULT` or row is a valid plan from one session
+and a refusal from another; a fragment is the ordinary case. `content` reads
+every document and every fragment, so it never refuses what `document` takes,
+and a text both accept is stored as the same value: `xml` is therefore not on
+`emit::SETTING_SENSITIVE`, whose rule is that the same characters mean
+different values.
+The server's default is already `content`, which is why nothing failed before:
+only a database or role that set the other would. It is in the write pins
+(`session_pins`, so the framing, staged and resumed writes and every rendered
+script) and in the canonical read scope, because the spelling check
+`pg_input_is_valid(v.s, 'xml')` runs there and must judge a cell as the apply
+will store it. `flow_pg`'s hostile-session script and its staged variant now set
+`xmloption=document` and declare an `xml` default of a fragment.
+
+**Left out, and reported.** `macaddr8` stays opaque with its limitation (its
+casts to and from `macaddr` are implicit, and `macaddr8 -> macaddr` can fail at
+run time, so it needs its own arms and a probe). A GIN index over a `tsvector`
+stays a limitation, because it changes the published index text (DEC-1169.1):
+#1984. `gist` over `inet` is left out too. `xml` has no `=`, so a key or a btree
+over it is refused by the engine (42704) exactly as `json` is, and pbps's own
+key probes are reached only in that refused case; the live key test now holds
+`xml` beside `json`. A generated `tsvector`
+(`to_tsvector('english'::regconfig, body)`) already works: created under the
+empty `search_path` it reads back as exactly that, and the one-argument
+`to_tsvector(body)` is refused by the engine as not immutable, so pbps adds no
+rule for it.
+
+Pinned by `the_five_added_types_are_classified_by_the_casts_the_engine_has`,
+`only_inet_into_cidr_counts_the_rows_whose_host_bits_would_be_cleared`, the
+live `inet_into_cidr_is_a_narrowing_whose_probe_counts_the_rows_with_host_bits`,
+`inet_cidr_macaddr_tsvector_and_xml_columns_pull_recreate_and_repull_to_an_empty_plan`,
+`a_declared_xml_or_network_value_is_read_under_the_pins_and_not_the_sessions_xmloption`
+and the extended matrix, spelling, estimate and key tests.
