@@ -1145,7 +1145,8 @@ merges exists, so most of that time qualified heads nobody would queue.
 
 The heads that can reach the queue are the first push of the branch, the head
 marked ready, a ready-phase push and a rebase made for a conflict or a
-confirmed merge-group interaction. The full gate runs before each of those.
+confirmed merge-group interaction. The full gate runs before each of those,
+except a rebase whose conflicts are documentation only (DEC-2000.1).
 Before ready rather than just before enqueueing: if nothing is pushed after the
 ready mark, that head is the one queued, so the run is the same, and a failure
 found there is fixed while the pull request is still a draft instead of
@@ -1269,3 +1270,32 @@ its output as bytes, because text mode on the Windows runner would end the line
 with `\r` and the value would never equal `true`. A crate that starts building
 a driver or TLS configuration belongs in the script's trigger set. The release
 workflow (#1158) must still qualify the exact tagged artifact unconditionally.
+
+<a id="dec-2000-1"></a>
+
+**DEC-2000.1. A rebase whose conflicts are documentation only reruns CI and
+nothing else.** DEC-1838.1 runs the full gate before a conflict rebase, and the
+review loop then wants a completed review naming the resulting head. Most
+conflicts here were two branches appending entries at the end of the same
+`docs/decisions/` topic file, or rows at the end of the index. Resolving one
+keeps both sides' text and changes no code, test, script or CI file, so the
+change that was gated and reviewed is the one being queued; a thirty-minute
+gate and a review round bought nothing but a later place in the queue, where
+the next merge often brought the next conflict.
+
+When every conflict a rebase resolves is in documentation, and `git range-diff`
+shows the branch's own commits differ only in documentation, the rebase runs
+the two decision checks, is pushed, and its CI run is approved, with no full
+gate and no new review. The full gate and the reviews that qualified the head
+it was rebased from stand for it. A rebase for an interaction the merge group
+confirmed is never one of these, since the reason for it is code.
+
+The index rows that caused half of those conflicts are gone. A DEC entry is
+listed only in its topic file; `docs/DECISIONS.md` keeps the rules for adding
+one and the list of topic files, and the closed table of entries 1–543 moved to
+`docs/decisions/legacy-index.md`, which no branch has a reason to touch. The
+rule is written, not enforced by `scripts/check-decisions.py`: a check for DEC
+rows had to guess every spelling GitHub renders as a table row (spacing, no
+leading pipe, bold, code, a link), and each guess drew a review finding for
+the next one. With the closed table in its own file, a stray row is a reviewer's
+catch and a one-line conflict, not a recurring one.

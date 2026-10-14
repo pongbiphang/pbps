@@ -16,8 +16,8 @@ them before advancing a PR.
 4. Sweep every analogous site for the same bug shape before pushing.
 5. Run and observe the **full gate** on every head that can be queued: before
    the first push of the branch, before marking the PR ready, before every
-   push in the ready phase, and before pushing a rebase (`AGENTS.md`,
-   DEC-1838.1):
+   push in the ready phase, and before pushing a rebase other than a
+   docs-only one (`AGENTS.md`, DEC-1838.1, DEC-2000.1):
 
    ```bash
    python3 scripts/check_decisions_test.py
@@ -87,7 +87,8 @@ review before ready. Do **not** rebase merely because
 `master` moved: the merge queue builds the PR against current `master`, so a
 branch that is only behind needs nothing (DECISIONS 502). Rebase only to
 resolve a conflict; that rebase does not repeat the qualified draft gate, but
-the ready-phase code review must then name the resolution head. Never add one
+the ready-phase code review must then name the resolution head, unless it is a
+docs-only rebase (§5). Never add one
 extra draft round without a new user instruction.
 
 ## 4. Ready gate
@@ -114,7 +115,8 @@ do not reset the no-P1 count solely because of that lower-priority finding.
 A pull request's CI runs only when approved (DEC-1017.1): every push starts a
 run that stops at the `approval` job, held by the `ci-approval` environment,
 and runs nothing. Do not approve during the review loop. When the ready gate
-qualifies the head — or the resulting-head review of a rebase does — report
+qualifies the head — or the resulting-head review of a rebase does, or a
+docs-only rebase produced it (§5) — report
 it to the primary agent, which approves the run on that head through
 `POST .../actions/runs/<run-id>/pending_deployments`; a worker never approves.
 Then wait for `ci-gate` on the approved run. Retry a transient failure
@@ -154,6 +156,12 @@ current `master` when it is enqueued.
   resulting-head code review. Once that review has no P0 or P1, proceed without
   repeating either three-review gate. All branch checks required on that head
   must still be green.
+- **Docs-only rebase.** When every conflict the rebase resolves is in
+  documentation and the resolution changes no code, test, script or CI file
+  (`git range-diff` shows the branch's own commits differ only in docs), run
+  only the two decision checks, push with `--force-with-lease`, and have the
+  primary agent approve CI on the resulting head: no full gate and no new code
+  review. A rebase for a confirmed merge-group interaction is never docs-only.
 
 Never bypass the ruleset that requires green CI on the PR head.
 
@@ -164,7 +172,9 @@ Before merge, the primary agent—not an issue worker—must independently confi
 - the issue is still open and the PR closes the intended issue;
 - the final diff is a complete solution limited to the issue;
 - architecture and product guardrails are preserved;
-- the full gate actually ran and passed on the head being queued;
+- the full gate actually ran and passed on the head being queued, or, after a
+  docs-only rebase (§5), on the head it was rebased from, with `git range-diff`
+  showing the branch's own commits differ only in documentation;
 - the qualifying draft and ready reviews belong to the recorded pushed heads;
 - every finding has the required fix or linked deferred issue;
 - no review thread is unresolved;
