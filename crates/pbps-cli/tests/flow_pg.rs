@@ -39,6 +39,27 @@ fn verify_distinguishes_permission_denials_from_failed_connections() {
 #[path = "support/unexpressible.rs"]
 mod unexpressible;
 
+#[path = "support/rename_cycles.rs"]
+mod rename_cycles;
+
+#[test]
+#[ignore = "needs live pg"]
+fn a_table_swap_is_refused_at_diff_time_on_every_path() {
+    let own = OwnDatabase::new(&server(), "swap_1966");
+    on_server(
+        own.connection(),
+        "CREATE SCHEMA app; CREATE TABLE app.a (ay int NOT NULL); \
+         CREATE TABLE app.b (bee int NOT NULL);",
+    );
+    let d = Demo::new("swap-1966");
+    let ok =
+        |output: Output| assert_eq!(code(&output), 0, "{}{}", stdout(&output), stderr(&output));
+    ok(d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    ok(d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    rename_cycles::swap(&d, own.connection(), "app");
+}
+
 #[test]
 #[ignore = "needs live pg"]
 fn connected_diff_refusals_keep_each_column_reason_and_existing_artifacts() {

@@ -23,12 +23,15 @@ use pbps_model::{Change, PlannedChange, Renames, TableName};
 
 use crate::Side;
 
+/// Orders the plan's table renames against the drops that free their names,
+/// and returns the rename cycles no order serves (#1966): each as its
+/// renames' `from -> to`, for the caller to refuse.
 pub(crate) fn order(
     planned: &mut Vec<PlannedChange>,
     base: Side<'_>,
     renames: &Renames,
     dialect: &dyn Dialect,
-) {
+) -> Vec<Vec<(TableName, TableName)>> {
     let indexes = dialect.indexes_share_namespace_with_tables();
     let constraints = dialect.constraints_share_namespace_with_tables();
     // No early return when neither answer is yes: a dropped table releases
@@ -95,7 +98,7 @@ pub(crate) fn order(
         }
     }
     if owners.is_empty() {
-        return;
+        return Vec::new();
     }
     let original_name = |table: &TableName| {
         owners
@@ -269,13 +272,19 @@ pub(crate) fn order(
     // name runs after it: skipped revisions that rename `z` to `a` and then
     // `y` to `z` leave a chain the alphabet would otherwise order (DEC-536.1).
     // A cycle, two tables trading names, has no order an engine takes without
-    // a third name; its edge is left out and the engine refuses it as before.
+    // a third name. Its closing edge is left out of the order, and the cycle
+    // is returned for the caller to refuse (#1966, DEC-1966.1): before that
+    // nothing refused it by design, and an offline plan wrote a script no
+    // engine runs.
     // A move to another schema also passes through an intermediate name, its
     // source name in the destination schema, which it takes and then gives
     // up; a rename into that name waits for it too. And it takes the indexes
     // or constraints it carries out of the source schema, so a rename into
     // one of their names there waits for it as well (review of #1346).
     let mut chained = false;
+    // Every exact wait between two renames, the closing edge of a cycle
+    // included, which `edges` leaves out to stay acyclic.
+    let mut waits = vec![BTreeSet::new(); planned.len()];
     for (to, (rename, from)) in &owners {
         let mut released = vec![(from.clone(), true)];
         if from.schema != to.schema {
@@ -301,6 +310,9 @@ pub(crate) fn order(
         for (name, strong) in &released {
             let exact = claims.get(name).filter(|_| *strong);
             for &claimant in exact.into_iter().flatten() {
+                if claimant != *rename {
+                    waits[*rename].insert(claimant);
+                }
                 if claimant != *rename && !reaches(&edges, claimant, *rename) {
                     edges[*rename].insert(claimant);
                     chained = true;
@@ -326,8 +338,9 @@ pub(crate) fn order(
             }
         }
     }
+    let cycles = cycles(&waits, &owners);
     if drops.is_empty() && !chained {
-        return;
+        return cycles;
     }
     // Before the doomed table goes: its own keys, and every key on another
     // table that references it. The referenced name is read from the
@@ -473,6 +486,59 @@ pub(crate) fn order(
             planned.push(pending[i].take().expect("not selected"));
         }
     }
+    cycles
+}
+
+/// The renames that wait on one another in a cycle through exact names, each
+/// cycle as its renames' `from -> to`, in plan order.
+///
+/// Only exact waits count, as for columns (DEC-541.1): a link through a name
+/// equal only after case folding, or through an engine-generated name, may
+/// not be one name to the engine, and the connected plan decides it
+/// (DEC-981.3, DEC-1366.3).
+fn cycles(
+    waits: &[BTreeSet<usize>],
+    owners: &BTreeMap<TableName, (usize, TableName)>,
+) -> Vec<Vec<(TableName, TableName)>> {
+    let mut placed = BTreeSet::new();
+    let mut found = Vec::new();
+    let renames: BTreeMap<usize, (TableName, TableName)> = owners
+        .iter()
+        .map(|(to, (i, from))| (*i, (from.clone(), to.clone())))
+        .collect();
+    // A rename that waits on nothing is in no cycle, which is most of them,
+    // so the pairwise search below runs over the few that wait.
+    let waiting: Vec<usize> = renames
+        .keys()
+        .copied()
+        .filter(|&i| !waits[i].is_empty())
+        .collect();
+    for &start in &waiting {
+        if placed.contains(&start) {
+            continue;
+        }
+        let members: BTreeSet<usize> = waiting
+            .iter()
+            .copied()
+            .filter(|&other| {
+                other != start && reaches(waits, start, other) && reaches(waits, other, start)
+            })
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        placed.insert(start);
+        placed.extend(&members);
+        found.push(
+            std::iter::once(start)
+                .chain(members)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|i| renames[&i].clone())
+                .collect(),
+        );
+    }
+    found
 }
 
 /// The names a table takes into its schema's table namespace besides its own:

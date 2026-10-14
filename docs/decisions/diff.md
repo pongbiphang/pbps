@@ -4898,3 +4898,36 @@ identity, inline CREATE/ADD generation, and typed same-text
 on the implementation base (#1339); this migration preserves them. They do not
 make a retained generated expression's function droppable: DEC-1168.1's
 release and version restrictions still apply.
+
+<a id="dec-1966-1"></a>
+
+**DEC-1966.1. A table rename cycle is refused at diff time, by name, as a
+column rename cycle is.** Skipped revisions that each run can net to one:
+`a -> c`, then `b -> a`, then `c -> b` leaves `a -> b` beside `b -> a`, and no
+order of the two is one an engine performs without a third name. So can one
+revision that moves two tables across schemas, since each move passes through
+its old name in the destination (`SET SCHEMA` and `TRANSFER` run before the
+rename on both engines): `s1.a -> s2.b` beside `s2.a -> s1.c` shares no final
+name, yet each holds the other's way through. DEC-536.1 left the cycle's
+closing edge out and let "the engine refuse it as before", but nothing
+refused it by design. An offline plan without `--json` failed on the address
+tracker's collision, an invariant with no remedy. With `--json` it wrote
+`--out` and `--sql` first, so a script no engine runs was left on disk. The
+intermediate-name cycle passed offline altogether. A connected PostgreSQL plan
+refused it only through the name-clash check, whose remedy (the rename in a
+plan of its own) does not serve a swap.
+
+`rename_order` now returns every cycle of renames that wait on one another
+through exact names: a target, a cross-schema intermediate name, or a name the
+move carries out of its source schema. The differ reports each as
+`TableRenameCycle`, listing the renames, with DEC-541.1's remedy: separate
+deployments, or a temporary name the deployer chooses. Being a diff error, it
+stops every path at the same point, before any file is written. Only exact
+waits count. A link through a name equal only after case folding, or through
+an engine-generated name, may not be one name to the engine: a case-sensitive
+database takes `a -> B` beside `b -> A` in either order. The connected plan
+decides it there (DEC-981.3, DEC-1366.3). A chain is ordered as before.
+
+The resolver never receives a swap now. DEC-1498.1's pairing through recorded
+UIDs, which one spelling naming two tables in turn needs, is pinned on a chain
+instead (`chained_table_names_pair_bindings_through_recorded_uids`).
