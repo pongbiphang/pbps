@@ -6013,7 +6013,13 @@ pub fn cmd_plan_db(
                 &mut conn,
                 &mut cs,
                 &loaded.schema,
-                &[&resolved.ids, &recorded_ids],
+                crate::dependents::Sources {
+                    before: pbps_diff::Side {
+                        schema: &recorded_snapshot.schema,
+                        ids: &recorded_ids,
+                    },
+                    after: &resolved.ids,
+                },
                 &hints.module_deps,
                 dialect.as_ref(),
                 &rediff,
@@ -6051,7 +6057,14 @@ pub fn cmd_plan_db(
                 facts.order_and_refuse(&mut cs, &target.label)?;
             }
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
-            let drops = crate::engine::check_drop_blockers(&mut conn, &cs, &resolved.ids).await?;
+            let drops = crate::engine::check_drop_blockers(
+                &mut conn,
+                &cs,
+                &resolved.ids,
+                &recorded_snapshot.schema,
+                &recorded_ids,
+            )
+            .await?;
             let slots = crate::engine::logical_slots(&mut conn, &cs).await?;
             crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids)
                 .await?;
@@ -7043,17 +7056,38 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
     )
     .await?;
 
-    preflight(conn, dialect, plan, rename_targets, &scoped.schema).await?;
+    preflight(
+        conn,
+        dialect,
+        plan,
+        rename_targets,
+        &scoped.schema,
+        &recorded_ids,
+    )
+    .await?;
 
     println!("Applying {} statement(s)...", statements.len());
     let result = async {
         conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
             .await?;
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
-        crate::engine::check_module_dependents(conn, &plan.changes, &scoped.schema, &plan.ids)
-            .await?;
+        crate::engine::check_module_dependents(
+            conn,
+            &plan.changes,
+            &scoped.schema,
+            &plan.ids,
+            &recorded_ids,
+        )
+        .await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, false).await?;
-        crate::engine::check_drop_blockers(conn, &plan.changes, &plan.ids).await?;
+        crate::engine::check_drop_blockers(
+            conn,
+            &plan.changes,
+            &plan.ids,
+            &scoped.schema,
+            &recorded_ids,
+        )
+        .await?;
         let data_guard =
             crate::engine::prepare_data_writes(conn, &plan.changes, &entry.snapshot, &plan.ids)
                 .await?;
@@ -7496,7 +7530,15 @@ async fn apply_staged_under_lock(
         // them before the first statement, and after a partial run some of
         // those names have already moved — a probe answered about the wrong
         // object is worse than one that was not asked.
-        preflight(conn, dialect, plan, rename_targets, &scoped.schema).await?;
+        preflight(
+            conn,
+            dialect,
+            plan,
+            rename_targets,
+            &scoped.schema,
+            &recorded_ids,
+        )
+        .await?;
         (0, watching)
     };
 
@@ -7515,7 +7557,15 @@ async fn apply_staged_under_lock(
     // Staged plans carry one logical change. A completed DROP has no catalog
     // target left; a closing-only resume must not ask for that old target.
     if start < total {
-        drop_preflight(conn, dialect, &plan.changes, &plan.ids).await?;
+        drop_preflight(
+            conn,
+            dialect,
+            &plan.changes,
+            &plan.ids,
+            &entry.snapshot.schema,
+            &entry.snapshot.ids,
+        )
+        .await?;
     }
     // The names the catalog has right now. It starts at whatever the newest
     // entry recorded — the last ordinary state on a fresh run, the checkpoint
@@ -8160,10 +8210,12 @@ async fn drop_preflight(
     dialect: &dyn pbps_dialect::Dialect,
     changes: &pbps_model::ChangeSet,
     ids: &IdsFile,
+    stored: &Schema,
+    stored_ids: &IdsFile,
 ) -> anyhow::Result<()> {
     conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
         .await?;
-    let result = crate::engine::check_drop_blockers(conn, changes, ids).await;
+    let result = crate::engine::check_drop_blockers(conn, changes, ids, stored, stored_ids).await;
     let rollback = conn
         .rollback(&dialect.transaction_framing(&pin_zone(conn)))
         .await;
@@ -8178,6 +8230,7 @@ async fn preflight(
     plan: &pbps_model::SavedPlan,
     rename_targets: &[pbps_db::impact::RenameTarget],
     stored: &pbps_model::Schema,
+    stored_ids: &IdsFile,
 ) -> anyhow::Result<()> {
     // **The pins before the questions.** Every read below — the edition, the
     // role checks, the rename impact scans and the probes — used to run under
@@ -8191,7 +8244,7 @@ async fn preflight(
     // caller that gets the old bug back, and this function is the one whose
     // answers depend on it.
     pin_session(conn, dialect).await?;
-    drop_preflight(conn, dialect, &plan.changes, &plan.ids).await?;
+    drop_preflight(conn, dialect, &plan.changes, &plan.ids, stored, stored_ids).await?;
     // Asked again, as the edition is below: a table outside the declarations
     // can gain a key to the parent between the plan and this apply, and the
     // engine takes the unlogged partition under it all the same (#1595).

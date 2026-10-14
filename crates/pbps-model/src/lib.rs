@@ -35,6 +35,7 @@ pub mod intent;
 pub mod module;
 pub mod name;
 pub mod partitions;
+pub mod physical_sources;
 pub mod plan;
 pub mod plan_names;
 pub mod reason;

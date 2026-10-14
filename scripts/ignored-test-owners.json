@@ -184,6 +184,8 @@
         "deploy::tests::a_probe_is_answered_under_the_settings_the_statement_will_run_under",
         "deploy::tests::a_read_only_probe_still_refuses_a_violating_row",
         "deploy::tests::transactional_read_back_refuses_concurrent_managed_ddl_but_ignores_unmanaged_ddl",
+        "dependents::physical_tests::connected_weaving_executes_defaults_around_both_sides_of_each_ownership_transition",
+        "dependents::physical_tests::inherited_default_keeps_its_expression_schema_across_attach",
         "engine::tests::a_failed_cost_query_is_unavailable_not_a_static_guess",
         "engine::tests::a_module_handed_to_the_postgres_rename_impact_is_refused_not_empty",
         "engine::tests::the_postgres_arms_answer_engine_only_questions_by_name",
@@ -1500,6 +1502,7 @@
         "a_date_or_time_literal_read_two_ways_is_found_on_both_versions",
         "plan_names_tests::estimates_measure_each_occupant_before_and_after_name_reuse",
         "plan_names_tests::a_detached_columns_estimate_keeps_its_catalog_spelling_after_rename",
+        "physical_sources::a_detached_column_removes_its_existing_foreign_key_before_the_referenced_table",
         "alias_batches::ten_thousand_aliases_keep_every_requested_row_at_the_default_stack_limit",
         "alias_batches::aliases_in_different_batches_still_refuse_a_collision"
       ]

@@ -22,6 +22,35 @@
 //! an engine; the reads are `engine::module_dependents`'.
 
 use pbps_model::ValueSource;
+use pbps_model::physical_sources::{ColumnAt, Located, Owner, PhysicalSources};
+use pbps_model::plan_names::{At, PlanNames};
+
+/// Each rebuild of the projection borrows the current immutable order. A
+/// splice must release that view; the next lookup then sees the new boundary.
+#[derive(Clone, Copy)]
+pub(crate) struct Sources<'a> {
+    pub before: pbps_diff::Side<'a>,
+    pub after: &'a IdsFile,
+}
+
+impl Sources<'_> {
+    pub(crate) fn project<'p>(
+        &'p self,
+        changes: &'p [PlannedChange],
+    ) -> Result<PhysicalSources<'p>, String> {
+        let names = PlanNames::of(changes, self.after).map_err(|e| e.to_string())?;
+        PhysicalSources::of(names, self.before.schema, self.before.ids).map_err(|e| e.to_string())
+    }
+}
+
+fn boundary(changes: &[PlannedChange], i: usize) -> At {
+    if i == changes.len() {
+        At::End
+    } else {
+        At::Before(i)
+    }
+}
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
@@ -354,9 +383,11 @@ fn split_in_place_edit(
     holds: &Holds,
     partitions: &Partitions,
     dialect: &dyn Dialect,
-) {
-    let Some(i) = find(changes, holds, partitions, edits_in_place) else {
-        return;
+    sources: &Sources<'_>,
+) -> Result<(), String> {
+    let view = sources.project(changes)?;
+    let Some(i) = find(&view, holds, partitions, edits_in_place) else {
+        return Ok(());
     };
     let (removal, restoration) = match changes[i].change.clone() {
         Change::AlterModule { id, module } => (
@@ -413,12 +444,13 @@ fn split_in_place_edit(
                 fallback,
             },
         ),
-        _ => return,
+        _ => return Ok(()),
     };
     changes.splice(
         i..=i,
         [planned(removal, dialect), planned(restoration, dialect)],
     );
+    Ok(())
 }
 
 fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
@@ -434,99 +466,184 @@ fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
 /// renames after a `DropModule` and before an `AlterModule`, so one dependent
 /// has two names in one plan, and each change must be matched, and each
 /// synthesized one written, with the name that holds at its own position.
-#[allow(clippy::wildcard_enum_match_arm)]
-fn named_at(changes: &[PlannedChange], i: usize, holds: &Holds, partitions: &Partitions) -> Holds {
+fn named_at(sources: &PhysicalSources<'_>, at: At, holds: &Holds) -> Option<Holds> {
     let Holds::TablePart { table, part } = holds else {
-        return holds.clone();
+        return Some(holds.clone());
     };
-    let (mut table, mut part) = (table.clone(), part.clone());
-    for p in &changes[..i] {
-        match &p.change {
-            Change::RenameTable { from, to, .. } if *from == table => table = to.clone(),
-            // A partition's column is renamed with its parent's (#1699).
-            Change::RenameColumn {
-                table: t, from, to, ..
-            } if reaches(t, &table, partitions) => {
-                if let Part::Default(c) | Part::Generated(c) = &mut part
-                    && c == from
-                {
-                    *c = to.clone();
-                }
-            }
-            _ => {}
+    let (table, part) = match part {
+        Part::Default(column) | Part::Generated(column) => {
+            let Located::Present(here) = sources.locate(&table.column(column), at) else {
+                return None;
+            };
+            let part = match part {
+                Part::Default(_) => Part::Default(here.address.name),
+                Part::Generated(_) => Part::Generated(here.address.name),
+                Part::Check(_) | Part::Index(_) => unreachable!(),
+            };
+            (here.address.table, part)
         }
-    }
-    Holds::TablePart { table, part }
+        Part::Check(_) | Part::Index(_) => {
+            let Located::Present(table) = sources.locate_table(table, at) else {
+                return None;
+            };
+            (table, part.clone())
+        }
+    };
+    Some(Holds::TablePart { table, part })
 }
 
-/// Rewrites a table part's change to name its table and column as `holds`
-/// does: the name that holds where the change is being moved to. A removal
-/// the differ put after a rename, moved before the module's drop, may land
-/// before that rename, where the table still has its old name.
-///
-/// A parent's change that reaches a partition's part keeps the parent's
-/// table: it is the parent's statement, which the engine recurses, and the
-/// partition's name in it would change the partition alone (#1699). Only its
-/// column follows the rename.
+/// Checks and indexes have no column owner to select. Their payload stays
+/// declared while their table follows the physical source at insertion.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn respell(p: &mut PlannedChange, holds: &Holds, partitions: &Partitions, dialect: &dyn Dialect) {
-    let Holds::TablePart { table, part } = holds else {
+fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
+    let Holds::TablePart { table, .. } = holds else {
         return;
     };
-    match (&mut p.change, part) {
-        (
-            Change::DropCheck { table: t, .. }
-            | Change::AddCheck { table: t, .. }
-            | Change::DropIndex { table: t, .. }
-            | Change::AddIndex { table: t, .. },
-            _,
-        ) => *t = table.clone(),
-        (Change::AlterColumnDefault { column, .. }, Part::Default(c)) => {
-            let owner = match partitions.parent(table) {
-                Some(parent) if *parent == column.table => parent.clone(),
-                _ => table.clone(),
-            };
-            *column = ColumnRef::new(owner, c.clone());
-        }
-        // A partition's, named by its parent's column as that holds there.
-        (
-            Change::SetPartitionDefault {
-                table: t, column, ..
-            },
-            Part::Default(c),
-        ) => {
-            *t = table.clone();
-            *column = c.clone();
-        }
+    match &mut p.change {
+        Change::DropCheck { table: t, .. }
+        | Change::AddCheck { table: t, .. }
+        | Change::DropIndex { table: t, .. }
+        | Change::AddIndex { table: t, .. } => *t = table.clone(),
         _ => return,
     }
     p.risks = dialect.change_risks(&p.change);
 }
 
+#[allow(clippy::wildcard_enum_match_arm)]
+fn respell_at(
+    p: &mut PlannedChange,
+    original: &Holds,
+    sources: &PhysicalSources<'_>,
+    at: At,
+    dialect: &dyn Dialect,
+) -> Result<(), String> {
+    let here = named_at(sources, at, original).ok_or_else(|| {
+        "the dependent's physical source is unavailable at its insertion boundary".to_owned()
+    })?;
+    let Holds::TablePart {
+        table,
+        part: Part::Default(column),
+    } = original
+    else {
+        respell(p, &here, dialect);
+        return Ok(());
+    };
+    let Located::Present(located) = sources.locate(&table.column(column), at) else {
+        return Err("the default's physical source is unavailable".into());
+    };
+    let (from, to, fallback, origin) = match &p.change {
+        Change::AlterColumnDefault { uid, from, to, .. } => {
+            // A standing parent's change still recurses into its child. It
+            // keeps its identity, but uses its name at the new boundary.
+            if let Owner::Partition { parent } = &located.owner
+                && let Some((table_uid, name)) = sources.names().column_at(uid, at)
+                && let Some(table) = sources.names().table_at(table_uid, at)
+                && table == parent
+            {
+                p.change = Change::AlterColumnDefault {
+                    uid: uid.clone(),
+                    column: table.column(name),
+                    from: from.clone(),
+                    to: to.clone(),
+                };
+                p.risks = dialect.change_risks(&p.change);
+                return Ok(());
+            }
+            (from.clone(), to.clone(), None, None)
+        }
+        Change::SetPartitionDefault {
+            from,
+            to,
+            fallback,
+            parent,
+            ..
+        } => (
+            from.clone(),
+            to.clone(),
+            fallback.clone(),
+            Some(parent.clone()),
+        ),
+        _ => return Ok(()),
+    };
+    p.change = default_change(Some(located), from, to, fallback, origin)?;
+    p.risks = dialect.change_risks(&p.change);
+    Ok(())
+}
+
+/// Synthesis and movement share the boundary's typed ownership. A desired
+/// name cannot identify an earlier holder, especially across attach/detach.
+fn default_change(
+    located: Option<ColumnAt>,
+    from: Option<String>,
+    to: Option<String>,
+    fallback: Option<String>,
+    origin: Option<TableName>,
+) -> Result<Change, String> {
+    let located =
+        located.ok_or("the default's physical source is unavailable at its insertion boundary")?;
+    let (column_uid, parent) = match located.owner {
+        Owner::Column(uid) => (Some(uid), None),
+        Owner::Partition { parent } => (None, Some(parent)),
+        Owner::Unavailable => {
+            return Err(
+                "the default's managed owner is unavailable at its insertion boundary".into(),
+            );
+        }
+    };
+    // Ownership and expression origin are different facts. An inherited
+    // default needs the parent's write path even before ATTACH; the existing
+    // table-keyed change carries that origin without inventing a column UID
+    // or losing it in an ordinary column's `to` expression (DEC-1875.1).
+    let inherited = to.is_none() && fallback.is_some();
+    if !inherited && let Some(uid) = column_uid {
+        Ok(Change::AlterColumnDefault {
+            uid,
+            column: located.address,
+            from,
+            to,
+        })
+    } else {
+        Ok(Change::SetPartitionDefault {
+            uid: located.table_uid,
+            table: located.address.table,
+            parent: origin
+                .or(parent)
+                .ok_or("the default's expression origin is unavailable")?,
+            column: located.address.name,
+            from,
+            to,
+            fallback,
+        })
+    }
+}
+
 /// The first change matching `test` against the dependent's name at that
 /// change's own position.
 fn find(
-    changes: &[PlannedChange],
+    sources: &PhysicalSources<'_>,
     holds: &Holds,
     partitions: &Partitions,
     test: fn(&Change, &Holds, &Partitions) -> bool,
 ) -> Option<usize> {
-    (0..changes.len()).find(|&i| {
-        test(
-            &changes[i].change,
-            &named_at(changes, i, holds, partitions),
-            partitions,
-        )
-    })
+    sources
+        .names()
+        .changes()
+        .iter()
+        .enumerate()
+        .find_map(|(i, p)| {
+            let partitions = partitions.at(sources.names(), At::End, At::Before(i));
+            named_at(sources, At::Before(i), holds)
+                .filter(|here| test(&p.change, here, &partitions))
+                .map(|_| i)
+        })
 }
 
-/// The dependent under the name the declarations use: after every rename in
-/// the plan.
-fn as_declared(changes: &[PlannedChange], d: &Dependent, partitions: &Partitions) -> Dependent {
-    Dependent {
+/// A retired source is never the declarations' next holder of the same name.
+fn as_declared(sources: &PhysicalSources<'_>, d: &Dependent) -> Option<Dependent> {
+    Some(Dependent {
         described: d.described.clone(),
-        holds: named_at(changes, changes.len(), &d.holds, partitions),
-    }
+        holds: named_at(sources, At::End, &d.holds)?,
+    })
 }
 
 /// The partition `table` is, as declared.
@@ -558,7 +675,11 @@ fn parent_default(declared: &Schema, table: &TableName, column: &str) -> Option<
 }
 
 /// The change that removes a dependent the plan does not remove yet.
-fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Change, String> {
+fn removal_of(
+    d: &Dependent,
+    declared: &Schema,
+    located: Option<ColumnAt>,
+) -> Result<Change, String> {
     match &d.holds {
         Holds::Module(x) => {
             // Only a declared module reaches here: an undeclared one the plan
@@ -583,48 +704,23 @@ fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Chan
                 table: table.clone(),
                 name: name.clone(),
             },
-            // A partition's, its own or its copy of its parent's: taken off
-            // the partition alone (#1588).
-            Part::Default(column) if let Some(of) = partition_of(declared, table) => {
-                Change::SetPartitionDefault {
-                    uid: ids
-                        .iter()
-                        .find_map(|ids| ids.table_uid(table))
-                        .cloned()
-                        .ok_or_else(|| format!("{}: no identity names `{table}`", d.described))?,
-                    table: table.clone(),
-                    parent: of.parent.clone(),
-                    column: column.clone(),
-                    from: of.columns.get(column).and_then(|own| own.default.clone()),
-                    to: None,
-                    fallback: None,
-                }
-            }
             Part::Default(column) => {
-                let column = ColumnRef::new(table.clone(), column.clone());
-                let uid = ids
-                    .iter()
-                    .find_map(|ids| ids.column_uid(&column))
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!("{}: no identity names column `{column}`", d.described)
-                    })?;
-                Change::AlterColumnDefault {
-                    uid,
-                    from: declared
+                let from = if let Some(of) = partition_of(declared, table) {
+                    of.columns.get(column).and_then(|own| own.default.clone())
+                } else {
+                    declared
                         .tables
                         .get(table)
-                        .and_then(|t| t.columns.get(&column.name))
+                        .and_then(|t| t.columns.get(column))
                         .and_then(|c| match &c.value_source {
                             ValueSource::Default(default) => Some(default.clone()),
                             ValueSource::None
                             | ValueSource::Identity(_)
                             | ValueSource::Sequence(_)
                             | ValueSource::Generated(_) => None,
-                        }),
-                    column,
-                    to: None,
-                }
+                        })
+                };
+                default_change(located, from, None, None, None)?
             }
             // No statement takes a generation expression off; only the
             // plan's own expression change can, and `weave` looks for that.
@@ -640,67 +736,82 @@ fn removal_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Result<Chan
 }
 
 /// The change that puts a declared dependent back.
-fn restoration_of(d: &Dependent, declared: &Schema, ids: &[&IdsFile]) -> Option<Change> {
+fn restoration_of(
+    d: &Dependent,
+    declared: &Schema,
+    located: Option<ColumnAt>,
+) -> Result<Change, String> {
+    let unsupported = || {
+        format!(
+            "{}: the declarations hold it, but not in a form pbps can restore",
+            d.described
+        )
+    };
     match &d.holds {
-        Holds::Module(x) => declared.modules.get(x).map(|m| Change::CreateModule {
-            id: x.clone(),
-            module: Box::new(m.clone()),
-        }),
-        Holds::TablePart { table, part } => {
-            let t = declared.tables.get(table)?;
-            match part {
-                Part::Check(name) => t.checks.get(name).map(|c| Change::AddCheck {
-                    table: table.clone(),
-                    name: name.clone(),
-                    constraint: c.clone(),
-                }),
-                Part::Index(name) => t.indexes.get(name).map(|i| Change::AddIndex {
-                    table: table.clone(),
-                    name: name.clone(),
-                    index: Box::new(i.clone()),
-                    clustered: false,
-                }),
-                Part::Generated(_) => None,
-                // Its own, or its parent's again (#1588).
-                Part::Default(column) if t.partition_of.is_some() => {
-                    let to = partition_of(declared, table)?
-                        .columns
-                        .get(column)
-                        .and_then(|own| own.default.clone());
-                    let fallback = parent_default(declared, table, column);
-                    if to.is_none() && fallback.is_none() {
-                        return None;
-                    }
-                    Some(Change::SetPartitionDefault {
-                        uid: ids.iter().find_map(|ids| ids.table_uid(table))?.clone(),
-                        table: table.clone(),
-                        parent: partition_of(declared, table)?.parent.clone(),
-                        column: column.clone(),
-                        from: None,
-                        to,
-                        fallback,
-                    })
-                }
-                Part::Default(column) => {
-                    let to = match &t.columns.get(column)?.value_source {
-                        ValueSource::Default(default) => default.clone(),
-                        ValueSource::None
-                        | ValueSource::Identity(_)
-                        | ValueSource::Sequence(_)
-                        | ValueSource::Generated(_) => return None,
-                    };
-                    let column = ColumnRef::new(table.clone(), column.clone());
-                    let uid = ids.iter().find_map(|ids| ids.column_uid(&column))?.clone();
-                    Some(Change::AlterColumnDefault {
-                        uid,
-                        column,
-                        from: None,
-                        to: Some(to),
-                    })
-                }
-            }
+        Holds::Module(x) => {
+            let module = declared.modules.get(x).ok_or_else(unsupported)?;
+            Ok(Change::CreateModule {
+                id: x.clone(),
+                module: Box::new(module.clone()),
+            })
         }
-        Holds::Unrepresentable(_) => None,
+        Holds::TablePart { table, part } => {
+            let t = declared.tables.get(table).ok_or_else(unsupported)?;
+            Ok(match part {
+                Part::Check(name) => Change::AddCheck {
+                    table: table.clone(),
+                    name: name.clone(),
+                    constraint: t.checks.get(name).ok_or_else(unsupported)?.clone(),
+                },
+                Part::Index(name) => Change::AddIndex {
+                    table: table.clone(),
+                    name: name.clone(),
+                    index: Box::new(t.indexes.get(name).ok_or_else(unsupported)?.clone()),
+                    clustered: false,
+                },
+                Part::Generated(_) => return Err(unsupported()),
+                Part::Default(column) => {
+                    let (to, fallback, origin) = if let Some(of) = &t.partition_of {
+                        (
+                            of.columns.get(column).and_then(|own| own.default.clone()),
+                            parent_default(declared, table, column),
+                            Some(of.parent.clone()),
+                        )
+                    } else {
+                        let to = match &t.columns.get(column).ok_or_else(unsupported)?.value_source
+                        {
+                            ValueSource::Default(default) => Some(default.clone()),
+                            ValueSource::None
+                            | ValueSource::Identity(_)
+                            | ValueSource::Sequence(_)
+                            | ValueSource::Generated(_) => None,
+                        };
+                        (to, None, None)
+                    };
+                    if to.is_none() && fallback.is_none() {
+                        return Err(unsupported());
+                    }
+                    default_change(located, None, to, fallback, origin)?
+                }
+            })
+        }
+        Holds::Unrepresentable(_) => Err(unsupported()),
+    }
+}
+
+/// Only defaults need a column owner when synthesizing a table part. A
+/// missing source remains an error in `default_change`, never a new holder.
+fn default_location(sources: &PhysicalSources<'_>, original: &Holds, at: At) -> Option<ColumnAt> {
+    let Holds::TablePart {
+        table,
+        part: Part::Default(column),
+    } = original
+    else {
+        return None;
+    };
+    match sources.locate(&table.column(column), at) {
+        Located::Present(here) => Some(here),
+        Located::Retired | Located::Unavailable => None,
     }
 }
 
@@ -782,12 +893,13 @@ pub(crate) fn weave(
     cs: &mut ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
-    ids: &[&IdsFile],
+    sources: Sources<'_>,
     dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let roots = dropped_modules(cs);
     let mut refused: Vec<String> = Vec::new();
     let partitions = standing_partitions(declared, cs);
+    let view = sources.project(&cs.changes)?;
     for (root, _) in &roots {
         let Some(deps) = found.get(root) else {
             continue;
@@ -795,10 +907,10 @@ pub(crate) fn weave(
         let blocked: Vec<Dependent> = deps
             .iter()
             .filter(|d| {
-                let accounted = find(&cs.changes, &d.holds, &partitions, removes).is_some()
-                    || find(&cs.changes, &d.holds, &partitions, removes_with_its_owner).is_some();
+                let accounted = find(&view, &d.holds, &partitions, removes).is_some()
+                    || find(&view, &d.holds, &partitions, removes_with_its_owner).is_some();
                 matches!(d.holds, Holds::Unrepresentable(_))
-                    || (!as_declared(&cs.changes, d, &partitions).managed(declared)
+                    || (!as_declared(&view, d).is_some_and(|d| d.managed(declared))
                         && !accounted
                         && !its_parents_once_attached(&cs.changes, &d.holds))
             })
@@ -882,7 +994,8 @@ pub(crate) fn weave(
             if is_generated(&d.holds) {
                 continue;
             }
-            split_in_place_edit(&mut cs.changes, &d.holds, &partitions, dialect);
+            split_in_place_edit(&mut cs.changes, &d.holds, &partitions, dialect, &sources)?;
+            let view = sources.project(&cs.changes)?;
             let Some(at) = span(&cs.changes, root) else {
                 continue;
             };
@@ -895,22 +1008,18 @@ pub(crate) fn weave(
             // already removed, and nothing to put back, since the
             // declarations no longer have its owner. A removal synthesized
             // here would name an object that is gone by then.
-            if find(&cs.changes, &d.holds, &partitions, removes_with_its_owner)
+            if find(&view, &d.holds, &partitions, removes_with_its_owner)
                 .is_some_and(|i| i < at.drop_at)
             {
                 continue;
             }
-            let removal = find(&cs.changes, &d.holds, &partitions, removes);
+            let removal = find(&view, &d.holds, &partitions, removes);
             let removed_at = match removal {
                 Some(i) if i < at.drop_at => i,
                 Some(i) => {
-                    let mut moved = cs.changes.remove(i);
-                    respell(
-                        &mut moved,
-                        &named_at(&cs.changes, at.drop_at, &d.holds, &partitions),
-                        &partitions,
-                        dialect,
-                    );
+                    let mut moved = cs.changes[i].clone();
+                    respell_at(&mut moved, &d.holds, &view, At::Before(at.drop_at), dialect)?;
+                    cs.changes.remove(i);
                     cs.changes.insert(at.drop_at, moved);
                     at.drop_at
                 }
@@ -919,10 +1028,19 @@ pub(crate) fn weave(
                     // after any rename the plan makes ahead of that.
                     let here = Dependent {
                         described: d.described.clone(),
-                        holds: named_at(&cs.changes, at.drop_at, &d.holds, &partitions),
+                        holds: named_at(&view, At::Before(at.drop_at), &d.holds).ok_or_else(
+                            || format!("{}: physical source is unavailable", d.described),
+                        )?,
                     };
-                    let change = removal_of(&here, declared, ids)?;
-                    cs.changes.insert(at.drop_at, planned(change, dialect));
+                    let final_name = as_declared(&view, d).unwrap_or_else(|| here.clone());
+                    let change = removal_of(
+                        &final_name,
+                        declared,
+                        default_location(&view, &d.holds, At::Before(at.drop_at)),
+                    )?;
+                    let mut added = planned(change, dialect);
+                    respell(&mut added, &here.holds, dialect);
+                    cs.changes.insert(at.drop_at, added);
                     at.drop_at
                 }
             };
@@ -931,10 +1049,13 @@ pub(crate) fn weave(
             // new table or column, created with it, and not this dependent
             // kept. The old one is removed before the drop above; the new one
             // is its own creation's business.
-            if find(&cs.changes, &d.holds, &partitions, removes_with_its_owner).is_some() {
+            let view = sources.project(&cs.changes)?;
+            if find(&view, &d.holds, &partitions, removes_with_its_owner).is_some() {
                 continue;
             }
-            let kept = as_declared(&cs.changes, d, &partitions);
+            let Some(kept) = as_declared(&view, d) else {
+                continue;
+            };
             if !kept.managed(declared) {
                 continue;
             }
@@ -944,29 +1065,33 @@ pub(crate) fn weave(
                 continue;
             };
             let after = at.create_at.unwrap_or(removed_at);
-            let restoration = find(&cs.changes, &d.holds, &partitions, restores);
+            let restoration = find(&view, &d.holds, &partitions, restores);
             match restoration {
                 Some(j) if j > after => {}
                 Some(j) => {
-                    let mut moved = cs.changes.remove(j);
+                    let mut moved = cs.changes[j].clone();
+                    respell_at(
+                        &mut moved,
+                        &d.holds,
+                        &view,
+                        boundary(&cs.changes, after + 1),
+                        dialect,
+                    )?;
+                    cs.changes.remove(j);
                     // `after` moved down by one if the restoration was above it.
                     let after = if j < after { after - 1 } else { after };
-                    respell(
-                        &mut moved,
-                        &named_at(&cs.changes, after + 1, &d.holds, &partitions),
-                        &partitions,
-                        dialect,
-                    );
                     cs.changes.insert(after + 1, moved);
                 }
                 None if at.create_at.is_some() => {
-                    let change = restoration_of(&kept, declared, ids).ok_or_else(|| {
-                        format!(
-                            "{}: the declarations hold it, but not in a form pbps can restore",
-                            d.described
-                        )
+                    let at = boundary(&cs.changes, after + 1);
+                    let here = named_at(&view, at, &d.holds).ok_or_else(|| {
+                        format!("{}: physical source is unavailable", d.described)
                     })?;
-                    cs.changes.insert(after + 1, planned(change, dialect));
+                    let change =
+                        restoration_of(&kept, declared, default_location(&view, &d.holds, at))?;
+                    let mut added = planned(change, dialect);
+                    respell(&mut added, &here, dialect);
+                    cs.changes.insert(after + 1, added);
                 }
                 None => {
                     return Err(format!(
@@ -990,7 +1115,8 @@ pub(crate) fn weave(
                 root,
                 found.get(root).map_or(&[][..], Vec::as_slice),
                 &partitions,
-            );
+                &sources,
+            )?;
         }
         if !moved {
             break;
@@ -1033,9 +1159,11 @@ fn after_its_release(
     root: &ModuleId,
     deps: &[Dependent],
     partitions: &Partitions,
-) -> bool {
+    sources: &Sources<'_>,
+) -> Result<bool, String> {
+    let view = sources.project(&cs.changes)?;
     let Some(at) = span(&cs.changes, root) else {
-        return false;
+        return Ok(false);
     };
     let latest = deps
         .iter()
@@ -1043,21 +1171,21 @@ fn after_its_release(
             Holds::TablePart {
                 part: Part::Generated(_),
                 ..
-            } => find(&cs.changes, &d.holds, partitions, removes)
-                .or_else(|| find(&cs.changes, &d.holds, partitions, removes_with_its_owner)),
-            Holds::Module(_) => find(&cs.changes, &d.holds, partitions, removes),
+            } => find(&view, &d.holds, partitions, removes)
+                .or_else(|| find(&view, &d.holds, partitions, removes_with_its_owner)),
+            Holds::Module(_) => find(&view, &d.holds, partitions, removes),
             Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
         })
         .filter(|i| *i > at.drop_at)
         .max();
     let Some(i) = latest else {
-        return false;
+        return Ok(false);
     };
     // Removing the drop shifts what it follows up by one, so inserting at its
     // old index puts the drop right after it.
     let drop = cs.changes.remove(at.drop_at);
     cs.changes.insert(i, drop);
-    true
+    Ok(true)
 }
 
 /// The columns whose default a row this plan writes takes: an insert that
@@ -3456,6 +3584,7 @@ pub(crate) fn released(
     cs: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     partitions: &Partitions,
+    view: &PhysicalSources<'_>,
 ) -> BTreeSet<ColumnRef> {
     let mut out = BTreeSet::new();
     for (root, _) in dropped_modules(cs) {
@@ -3469,7 +3598,7 @@ pub(crate) fn released(
             ) {
                 continue;
             }
-            if let Some(i) = find(&cs.changes, &d.holds, partitions, removes)
+            if let Some(i) = find(view, &d.holds, partitions, removes)
                 && let Change::AlterColumnExpression { column, .. } = &cs.changes[i].change
             {
                 out.insert(column.clone());
@@ -3486,6 +3615,7 @@ pub(crate) fn unaccounted(
     cs: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     partitions: &Partitions,
+    view: &PhysicalSources<'_>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     for (root, _) in dropped_modules(cs) {
@@ -3493,8 +3623,8 @@ pub(crate) fn unaccounted(
             continue;
         };
         for d in deps {
-            let removed_first = find(&cs.changes, &d.holds, partitions, removes)
-                .or_else(|| find(&cs.changes, &d.holds, partitions, removes_with_its_owner))
+            let removed_first = find(view, &d.holds, partitions, removes)
+                .or_else(|| find(view, &d.holds, partitions, removes_with_its_owner))
                 .is_some_and(|i| i < at.drop_at)
                 || taken_by_its_parent(&cs.changes, &d.holds, at.drop_at);
             if !removed_first {
@@ -3506,7 +3636,13 @@ pub(crate) fn unaccounted(
 }
 
 #[cfg(test)]
+mod fixture;
+#[cfg(test)]
+mod physical_tests;
+
+#[cfg(test)]
 mod tests {
+    use super::fixture::{unaccounted, weave};
     use super::*;
     use pbps_model::{CheckConstraint, Column, Module, Table, TableName, Uid, UidKind};
 
@@ -6053,7 +6189,9 @@ mod tests {
 
         // The parent's column renamed: the partition's own default on it is
         // taken off under the name that holds before the rename, and put back
-        // under the one after it.
+        // under the spelling at the restoration boundary. A restoration before
+        // the rename must still name m; the rename then carries its default.
+        // The connected physical-source test executes both orders.
         let mut renamed = s.clone();
         {
             let p = renamed.tables.get_mut(&ev).unwrap();
@@ -6076,7 +6214,7 @@ mod tests {
                 [
                     "default ev_1.m -> None else None",
                     "alter app.f(integer)",
-                    "default ev_1.m2 -> Some(\"app.f(2)\") else None",
+                    "default ev_1.m -> Some(\"app.f(2)\") else None",
                 ],
             ),
             (

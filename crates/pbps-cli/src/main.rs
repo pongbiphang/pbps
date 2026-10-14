@@ -30,6 +30,9 @@ mod state_list;
 mod status;
 #[cfg(test)]
 mod test_pg;
+#[cfg(test)]
+#[path = "../../pbps-model/tests/support/plan_ids.rs"]
+mod test_plan_ids;
 
 /// The command ran correctly and found something the user must act on.
 ///

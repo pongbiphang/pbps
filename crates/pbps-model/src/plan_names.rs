@@ -507,7 +507,7 @@ impl<'p> PlanNames<'p> {
         self.changes
     }
 
-    fn boundary(&self, at: At) -> usize {
+    pub(crate) fn boundary(&self, at: At) -> usize {
         match at {
             At::Start => 0,
             At::End => self.changes.len(),
@@ -603,6 +603,16 @@ impl<'p> PlanNames<'p> {
         };
         let (owner, name) = self.column_at(uid, At::Start)?;
         Some(self.table_at(owner, At::Start)?.column(name))
+    }
+
+    /// Managed columns at a boundary, including identities retired before End.
+    /// Physical-source readers need Start evidence even when the final ids file
+    /// no longer contains a dropped or attached ordinary column.
+    pub fn columns_at(&self, at: At) -> impl Iterator<Item = (&Uid, ColumnRef)> {
+        self.columns.names.keys().filter_map(move |uid| {
+            let (owner, name) = self.column_at(uid, at)?;
+            Some((uid, self.table_at(owner, at)?.column(name)))
+        })
     }
 }
 

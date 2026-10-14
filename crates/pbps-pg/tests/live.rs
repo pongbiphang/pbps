@@ -31,6 +31,9 @@ mod alias_batches;
 #[path = "support/plan_names.rs"]
 mod plan_names_tests;
 
+#[path = "support/physical_sources.rs"]
+mod physical_sources;
+
 #[path = "support/resolver.rs"]
 mod resolver_tests;
 
@@ -5808,7 +5811,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             );
         }
         in_a_transaction(&mut conn).await;
-        let blockers = pbps_pg::impact::drop_blockers(&mut conn, &drop_step)
+        let blockers = physical_sources::reports(&mut conn, &drop_step)
             .await
             .expect("read the blockers");
         rollback(&mut conn).await;
@@ -31228,7 +31231,7 @@ async fn drop_blockers_predict_restrict_and_allow_earlier_removal_and_automatic_
     .await
     .unwrap();
     let alone = drop_changes(vec![dropping_column(&s, "id")]);
-    let outside = pbps_pg::impact::drop_blockers(&mut conn, &alone)
+    let outside = physical_sources::reports(&mut conn, &alone)
         .await
         .unwrap_err();
     assert!(
@@ -31236,9 +31239,7 @@ async fn drop_blockers_predict_restrict_and_allow_earlier_removal_and_automatic_
         "{outside}"
     );
     in_a_transaction(&mut conn).await;
-    let report = pbps_pg::impact::drop_blockers(&mut conn, &alone)
-        .await
-        .unwrap();
+    let report = physical_sources::reports(&mut conn, &alone).await.unwrap();
     assert_eq!(report.len(), 1);
     for name in ["child_id_fkey", ".v", ".w"] {
         assert!(
@@ -31261,7 +31262,7 @@ async fn drop_blockers_predict_restrict_and_allow_earlier_removal_and_automatic_
 
     in_a_transaction(&mut conn).await;
     let unrelated =
-        pbps_pg::impact::drop_blockers(&mut conn, &drop_changes(vec![dropping_column(&s, "d")]))
+        physical_sources::reports(&mut conn, &drop_changes(vec![dropping_column(&s, "d")]))
             .await
             .unwrap();
     assert!(unrelated[0].blocking.is_empty(), "{unrelated:?}");
@@ -31279,7 +31280,7 @@ async fn drop_blockers_predict_restrict_and_allow_earlier_removal_and_automatic_
         dropping_column(&s, "id"),
     ]);
     in_a_transaction(&mut conn).await;
-    let report = pbps_pg::impact::drop_blockers(&mut conn, &ordered)
+    let report = physical_sources::reports(&mut conn, &ordered)
         .await
         .unwrap();
     assert!(report.iter().all(|r| r.blocking.is_empty()), "{report:?}");
@@ -31292,9 +31293,7 @@ async fn drop_blockers_predict_restrict_and_allow_earlier_removal_and_automatic_
         dropping_column(&s, "id"),
     ]);
     in_a_transaction(&mut conn).await;
-    let report = pbps_pg::impact::drop_blockers(&mut conn, &wrong)
-        .await
-        .unwrap();
+    let report = physical_sources::reports(&mut conn, &wrong).await.unwrap();
     assert!(
         report[0].blocking.iter().any(|s| s.contains(".w")),
         "{report:?}"
@@ -31312,7 +31311,7 @@ async fn drop_blockers_predict_restrict_and_allow_earlier_removal_and_automatic_
         dropping_table(&s, "t"),
     ]);
     in_a_transaction(&mut conn).await;
-    let report = pbps_pg::impact::drop_blockers(&mut conn, &ordered)
+    let report = physical_sources::reports(&mut conn, &ordered)
         .await
         .unwrap();
     assert!(report.iter().all(|r| r.blocking.is_empty()), "{report:?}");
@@ -31340,9 +31339,7 @@ async fn drop_blockers_keep_row_type_domain_rule_and_unenumerated_catalog_paths(
     .unwrap();
     let cs = drop_changes(vec![dropping_table(&s, "t")]);
     in_a_transaction(&mut conn).await;
-    let report = pbps_pg::impact::drop_blockers(&mut conn, &cs)
-        .await
-        .unwrap();
+    let report = physical_sources::reports(&mut conn, &cs).await.unwrap();
     for name in ["rule relay", "reads()", "positive_check", "takes_array"] {
         assert!(
             report[0].blocking.iter().any(|s| s.contains(name)),
@@ -31401,9 +31398,7 @@ async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets(
         },
     ]);
     in_a_transaction(&mut conn).await;
-    let report = pbps_pg::impact::drop_blockers(&mut conn, &cs)
-        .await
-        .unwrap();
+    let report = physical_sources::reports(&mut conn, &cs).await.unwrap();
     assert!(
         report[0].blocking.iter().any(|s| s.contains(".v")),
         "{report:?}"
@@ -31424,15 +31419,13 @@ async fn drop_blockers_follow_prior_renames_and_refuse_missing_existing_targets(
         dropping_column(&s, "id"),
     ]);
     in_a_transaction(&mut conn).await;
-    let report = pbps_pg::impact::drop_blockers(&mut conn, &cs)
-        .await
-        .unwrap();
+    let report = physical_sources::reports(&mut conn, &cs).await.unwrap();
     assert!(report[0].blocking.is_empty(), "{report:?}");
     apply(&mut conn, &Postgres::new(), &cs).await;
     rollback(&mut conn).await;
 
     in_a_transaction(&mut conn).await;
-    let absent = pbps_pg::impact::drop_blockers(
+    let absent = physical_sources::reports(
         &mut conn,
         &drop_changes(vec![dropping_column(&s, "absent")]),
     )
@@ -32260,7 +32253,7 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         ("ordinary_index", false),
         ("filtered_index", false),
     ] {
-        let reports = pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_index(name)]))
+        let reports = physical_sources::reports(&mut conn, &plan(vec![drop_index(name)]))
             .await
             .unwrap();
         assert_eq!(
@@ -32277,25 +32270,25 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         drop_index("standalone_key"),
     ]);
     assert!(
-        pbps_pg::impact::drop_blockers(&mut conn, &removed)
+        physical_sources::reports(&mut conn, &removed)
             .await
             .unwrap()
             .iter()
             .all(|r| r.blocking.is_empty())
     );
     assert!(
-        pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_index("missing")]))
+        physical_sources::reports(&mut conn, &plan(vec![drop_index("missing")]))
             .await
             .is_err()
     );
-    let reports = pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_key("other_key")]))
+    let reports = physical_sources::reports(&mut conn, &plan(vec![drop_key("other_key")]))
         .await
         .unwrap();
     assert!(
         reports.iter().all(|r| r.blocking.is_empty()),
         "the other key has the same columns but no binding: {reports:?}"
     );
-    let reports = pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_key("old_key")]))
+    let reports = physical_sources::reports(&mut conn, &plan(vec![drop_key("old_key")]))
         .await
         .unwrap();
     assert_eq!(reports.len(), 1);
@@ -32308,11 +32301,11 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         name: "child_fk".into(),
     };
     let reports =
-        pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![fk.clone(), drop_key("old_key")]))
+        physical_sources::reports(&mut conn, &plan(vec![fk.clone(), drop_key("old_key")]))
             .await
             .unwrap();
     assert!(reports.iter().all(|r| r.blocking.is_empty()), "{reports:?}");
-    let reports = pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_key("old_key"), fk]))
+    let reports = physical_sources::reports(&mut conn, &plan(vec![drop_key("old_key"), fk]))
         .await
         .unwrap();
     assert!(
@@ -32344,14 +32337,14 @@ async fn referenced_key_guards_use_actual_bindings_and_prior_removals() {
         },
     ]);
     assert!(
-        pbps_pg::impact::drop_blockers(&mut conn, &renamed)
+        physical_sources::reports(&mut conn, &renamed)
             .await
             .unwrap()
             .iter()
             .all(|r| r.blocking.is_empty())
     );
     assert!(
-        pbps_pg::impact::drop_blockers(&mut conn, &plan(vec![drop_key("missing")]))
+        physical_sources::reports(&mut conn, &plan(vec![drop_key("missing")]))
             .await
             .is_err(),
         "an absent existing key is not a successful dependency read"
