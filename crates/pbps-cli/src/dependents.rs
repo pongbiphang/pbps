@@ -21,6 +21,8 @@
 //! Pure over the dependents already read, so the ordering is testable without
 //! an engine; the reads are `engine::module_dependents`'.
 
+pub(crate) mod schedule;
+
 use pbps_model::ValueSource;
 use pbps_model::part_effects::{DefaultChange, Effect, Origin, Part as DependencyPart, PartEffect};
 use pbps_model::physical_sources::{ColumnAt, Located, Owner, PhysicalSources};
@@ -913,7 +915,7 @@ fn attached_at(changes: &[PlannedChange], holds: &Holds) -> Option<usize> {
 /// `found` is each dropped module's dependents in `modules::dependents`'
 /// order, deepest first; the removals go in that order and the restorations
 /// in its reverse, which is DECISIONS 311's topological order.
-pub(crate) fn weave(
+fn weave(
     cs: &mut ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
@@ -1367,7 +1369,7 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
 /// after it (#1588).
 // The complement is every change that writes no rows.
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(crate) fn split_new_tables(
+fn split_new_tables(
     cs: &mut ChangeSet,
     ids: &[&IdsFile],
     dialect: &dyn Dialect,
@@ -1493,7 +1495,7 @@ pub(crate) fn split_new_tables(
 /// satisfies, refused by name, as is a change between them that could
 /// create a table, a column or a module: those are what the differ ranks
 /// ahead, and crossing them is what this pass would have to prove safe.
-pub(crate) fn before_its_partitions_indexes(
+fn before_its_partitions_indexes(
     cs: &mut ChangeSet,
     declared: &Schema,
     dialect: &dyn Dialect,
@@ -1675,7 +1677,7 @@ fn rests_on(later: &Change, earlier: &Change, dialect: &dyn Dialect) -> bool {
 }
 
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(crate) fn after_their_parents_defaults(
+fn after_their_parents_defaults(
     cs: &mut ChangeSet,
     declared: &Schema,
     ids: &[&IdsFile],
@@ -1761,7 +1763,7 @@ pub(crate) fn after_their_parents_defaults(
 /// routine's create to another routine's revoke: a cycle where none exists.
 /// A decision depends only on its routine existing, so it is set aside and
 /// put back by [`settle_public_execution`] once the order is final.
-pub(crate) fn take_public_execution(cs: &mut ChangeSet) -> Vec<PlannedChange> {
+fn take_public_execution(cs: &mut ChangeSet) -> Vec<PlannedChange> {
     let (decisions, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut cs.changes)
         .into_iter()
         .partition(|p| matches!(p.change, Change::PublicExecution { .. }));
@@ -1773,7 +1775,7 @@ pub(crate) fn take_public_execution(cs: &mut ChangeSet) -> Vec<PlannedChange> {
 /// `ALTER` of its routine, which is where DEC-687.1 orders it. A decision
 /// on a routine this plan does not create or rebuild goes ahead of the roles
 /// and grants, where its class leaves it.
-pub(crate) fn settle_public_execution(cs: &mut ChangeSet, decisions: Vec<PlannedChange>) {
+fn settle_public_execution(cs: &mut ChangeSet, decisions: Vec<PlannedChange>) {
     for decision in decisions {
         let Change::PublicExecution { routine, .. } = &decision.change else {
             cs.changes.push(decision);
@@ -1839,7 +1841,7 @@ pub(crate) fn settle_public_execution(cs: &mut ChangeSet, decisions: Vec<Planned
 /// A column added with a default or a generation expression that names a
 /// function the plan creates or rebuilds is placed by [`after_their_functions`].
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(crate) fn after_the_rebuilds(
+fn after_the_rebuilds(
     cs: &mut ChangeSet,
     released: &BTreeSet<ColumnRef>,
     deps: &ModuleDeps,
@@ -1964,7 +1966,7 @@ pub(crate) fn after_the_rebuilds(
 /// Run before [`after_the_rebuilds`], which holds what calls a function. The
 /// create and what is split off it carry the dialect's risks recomputed: a
 /// NOT NULL the create no longer sets is a risk of the change that does.
-pub(crate) fn split_moving_defaults(cs: &mut ChangeSet, declared: &Schema, dialect: &dyn Dialect) {
+fn split_moving_defaults(cs: &mut ChangeSet, declared: &Schema, dialect: &dyn Dialect) {
     let functions = function_creates(cs);
     let called_after = |text: &str, at: usize| {
         functions
@@ -3608,7 +3610,7 @@ fn touches(change: &Change, table: &TableName) -> bool {
 /// this plan drops, named as that change names them (DEC-1168.1). `weave`
 /// puts the module's drop after each such change; this is how
 /// [`after_the_rebuilds`] knows not to move it past that drop.
-pub(crate) fn released(
+fn released(
     cs: &ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     partitions: &Partitions,

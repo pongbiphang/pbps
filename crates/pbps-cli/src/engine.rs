@@ -2983,25 +2983,55 @@ async fn module_dependents(
 
 /// The planner's half of #314: reads what depends on every module this plan
 /// drops and puts each dependent on the right side of that drop, in the plan
-/// the approver sees (`dependents::weave`). Called inside the planning
-/// transaction, before `check_module_rebuilds`, so that a view the plan now
-/// drops and recreates is held to the same bar as one the declarations edit.
+/// the approver sees (`dependents::weave`, which the schedule runs over the
+/// dependents just read, ahead of the passes that read no catalog,
+/// DEC-1955.1). Called inside the planning transaction, before
+/// `check_module_rebuilds`, so that a view the plan now drops and recreates is
+/// held to the same bar as one the declarations edit.
+///
+/// It is where a connected plan is scheduled, on either engine: SQL Server
+/// has no module dependents to read, and its plan goes through the schedule
+/// with the members of the roles it drops, `role_members`, which the caller
+/// read when there were any.
 ///
 /// `rediff` plans the same revision again with the given unchanged modules
 /// rebuilt (`pbps_diff::diff_rebuilding`): a module dependent the plan does
 /// not touch has to be rebuilt around the module under it, and a rebuild is
 /// its grants and its `PUBLIC` execute as well as its two statements, which
 /// only the differ's own passes write.
+// The eighth argument is the role members the caller read: the schedule
+// takes every fact in one call (#1955).
+#[allow(clippy::too_many_arguments)]
 pub async fn account_for_module_dependents(
     conn: &mut Conn,
     changes: &mut ChangeSet,
     declared: &pbps_model::Schema,
     sources: crate::dependents::Sources<'_>,
     deps: &pbps_model::ModuleDeps,
+    role_members: Option<&crate::dependents::schedule::RoleMembers>,
     dialect: &dyn pbps_dialect::Dialect,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<ChangeSet>,
 ) -> anyhow::Result<ConnectedCheck> {
+    let declarations = crate::dependents::schedule::Declarations {
+        schema: declared,
+        sources,
+        module_deps: deps,
+    };
+    // The members of the roles this plan drops, which the caller read when
+    // there were any: every connected plan goes through the schedule once,
+    // whichever facts its engine supplies (#1955 review).
+    let read = match role_members {
+        Some(members) => crate::dependents::schedule::Facts::default().with_role_members(members),
+        None => crate::dependents::schedule::Facts::default(),
+    };
     if conn.driver() != Driver::Postgres {
+        let scheduled = crate::dependents::schedule::schedule(
+            std::mem::take(changes),
+            &declarations,
+            &read,
+            dialect,
+        )?;
+        *changes = scheduled.changes;
         return Ok(ConnectedCheck {
             name: "module_dependents",
             engine: "SQL Server",
@@ -3009,43 +3039,25 @@ pub async fn account_for_module_dependents(
             message: "SQL Server uses CREATE OR ALTER, so a module change drops nothing that depends on it".into(),
         });
     }
-    let ids = &[sources.after, sources.before.ids][..];
     let mut found = module_dependents(conn, changes).await?;
     let untouched = crate::dependents::untouched_module_dependents(changes, &found, declared);
     if !untouched.is_empty() {
         *changes = rediff(&untouched)?;
         found = module_dependents(conn, changes).await?;
     }
-    // Out of the way of the reordering passes, and back beside each routine's
-    // final `CREATE` once they are done (#687).
-    let decisions = crate::dependents::take_public_execution(changes);
-    let added = crate::dependents::weave(changes, &found, declared, sources, dialect)
-        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
-    let split = crate::dependents::split_new_tables(changes, ids, dialect)
-        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
+    // Every reordering pass, in one place (#1955): `weave` over what the
+    // catalog just said depends on the modules this plan drops, then the
+    // passes that read nothing.
+    let facts = read.with_module_dependents(&found);
+    let scheduled = crate::dependents::schedule::schedule(
+        std::mem::take(changes),
+        &declarations,
+        &facts,
+        dialect,
+    )?;
+    *changes = scheduled.changes;
+    let (added, split, moved) = (scheduled.added, scheduled.split, scheduled.moved);
     let partitions = crate::dependents::standing_partitions(declared, changes);
-    let released = crate::dependents::released(
-        changes,
-        &found,
-        &partitions,
-        &sources
-            .project(&changes.changes)
-            .map_err(anyhow::Error::msg)?,
-    );
-    // A create that moves rows out of a DEFAULT is not held with the rest
-    // (#1763 review).
-    crate::dependents::split_moving_defaults(changes, declared, dialect);
-    let moved = crate::dependents::after_the_rebuilds(changes, &released, deps, declared)
-        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
-    // Last of the reorderings: a partition's own default after its parent's,
-    // wherever the passes above left that (#1588).
-    let added = added
-        + crate::dependents::after_their_parents_defaults(changes, declared, ids, dialect)
-            .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
-    // And a parent's new index ahead of the partition indexes it could take
-    // (#1745 review).
-    crate::dependents::before_its_partitions_indexes(changes, declared, dialect)
-        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
     // On the final order: every pass above may move what an expression
     // names, or the expression (#1576).
     // Which name each unnamed key's index takes depends on what holds its
@@ -3064,7 +3076,6 @@ pub async fn account_for_module_dependents(
     }
     crate::dependents::later_relation_refusal(&later)
         .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
-    crate::dependents::settle_public_execution(changes, decisions);
     let left = crate::dependents::unaccounted(
         changes,
         &found,

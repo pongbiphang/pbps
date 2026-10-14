@@ -3130,7 +3130,7 @@ fn cmd_plan(
     if let baseline::Source::File(_) = source {
         pbps_dialect::name_read_sequences(&mut base_schema, dialect.as_ref());
     }
-    let mut cs = pbps_diff::diff(
+    let cs = pbps_diff::diff(
         Side {
             schema: &base_schema,
             ids: &base.ids,
@@ -3156,6 +3156,36 @@ fn cmd_plan(
         }
         errors
     })?;
+
+    // The order `plan --db` would give these declarations with no catalog to
+    // read (#1598): what a new table calls goes ahead of it. The passes that
+    // need the target's catalog stay `plan --db`'s, and are named when they
+    // matter. A refusal is the one `plan --db` gives, before any file is
+    // written.
+    let scheduled = output::or_unanswerable(
+        "plan",
+        json,
+        "plan.unorderable",
+        dependents::schedule::schedule(
+            cs,
+            &dependents::schedule::Declarations {
+                schema: &loaded.schema,
+                sources: dependents::Sources {
+                    before: Side {
+                        schema: &base_schema,
+                        ids: &base.ids,
+                    },
+                    after: &res.ids,
+                },
+                module_deps: &hints.module_deps,
+            },
+            &dependents::schedule::Facts::default(),
+            dialect.as_ref(),
+        )
+        .map_err(anyhow::Error::from),
+    )?;
+    let skipped = scheduled.skipped;
+    let mut cs = scheduled.changes;
 
     // The plan rules (ADR-0008): attached to the changes they are about, so
     // the plan file carries them to `explain`, and reported here at the
@@ -3191,19 +3221,23 @@ fn cmd_plan(
                 &pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?
             )
         );
-        // Membership is each environment's own, so an offline plan cannot
-        // list who a dropped role is taken from; saying so keeps "no members
-        // listed" from reading as "no members".
-        if cs
-            .changes
-            .iter()
-            .any(|p| matches!(p.change, pbps_model::Change::DropRole { .. }))
-        {
-            println!(
-                "\n  A dropped role's members are removed first; `pbps plan --db` lists them for \
-                 the target, this preview cannot."
-            );
+        // What the target's catalog would add to the order, and an offline
+        // plan cannot: who a dropped role is taken from, what depends on a
+        // dropped module. Saying so keeps "none listed" from reading as
+        // "none".
+        for skip in &skipped {
+            println!("\n  {skip}");
         }
+    }
+    // And in JSON, as a note a consumer can key on: the same evidence in both
+    // reports (SPEC §9.8), so a preview's silence about a catalog fact is
+    // never read as "nothing there".
+    if json {
+        findings.extend(
+            skipped
+                .iter()
+                .map(|skip| output::Finding::note(skip.id(), skip.to_string())),
+        );
     }
 
     // ADR-0003 decision 3: whether ONLINE exists is an edition question, and an

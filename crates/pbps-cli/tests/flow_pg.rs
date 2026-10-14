@@ -2254,24 +2254,30 @@ fn a_new_column_calling_a_rebuilt_function_follows_the_rebuild() {
 /// #1364: a new generated column calling a new function that reads the
 /// column is a cycle no order performs, and planning refuses it by name with
 /// the two-plan remedy, rather than leaving the engine to refuse it at apply
-/// (DEC-1364.1).
+/// (DEC-1364.1). The offline `plan` refuses it too, as `plan --db` does
+/// (#1955): the identities are minted while the function does not read the
+/// column, since the refusal comes before anything is written.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_new_column_calling_a_function_that_reads_it_is_refused_by_name() {
     let (own, d) = adopted_table("new-column-cycle");
     let connection = own.connection();
-    declare_function(&d, "g", "SELECT coalesce(max(c), 0) + x FROM app.t");
+    declare_function(&d, "g", "SELECT x");
     declare_columns(
         &d,
         "  c: {type: integer, generated: {expression: 'app.g(a)', stored: true}}\n",
     );
     succeeds(d.run(&["plan"]));
+    declare_function(&d, "g", "SELECT coalesce(max(c), 0) + x FROM app.t");
+    let offline = d.run(&["plan"]);
     d.commit();
-    let refused = d.run(&["plan", "--db", connection]);
-    assert_ne!(code(&refused), 0, "{}", stdout(&refused));
-    let why = stderr(&refused);
-    for needle in ["`app.t.c`", "`app.g(integer)`", "two plans"] {
-        assert!(why.contains(needle), "{needle}: {why}");
+    let connected = d.run(&["plan", "--db", connection]);
+    for refused in [offline, connected] {
+        assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+        let why = stderr(&refused);
+        for needle in ["`app.t.c`", "`app.g(integer)`", "two plans"] {
+            assert!(why.contains(needle), "{needle}: {why}");
+        }
     }
 }
 
@@ -21729,6 +21735,115 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
     succeeds(d.run(&["verify", "--db", &pln]));
     let next = succeeds(d.run(&["plan", "--db", &pln]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+/// The offline `plan` orders what a new table calls ahead of it, as `plan
+/// --db` does (#1598): a generated column calling a declared function is
+/// created after that function, and a default calling one is set after it.
+/// Before the preview went through the same schedule as the connected plan
+/// (#1955), it showed the table created first, a script no engine runs. The
+/// negative: a table that calls nothing keeps its place, ahead of the
+/// function, so only what calls one moves. The script is the one `--out`
+/// records, so the preview and its artifact agree.
+#[test]
+fn an_offline_plan_creates_what_a_new_table_calls_before_it() {
+    let d = Demo::new("preview-1598");
+    let schema = d.dir.join("schema");
+    std::fs::write(
+        schema.join("app.zz%28%29.function.yml"),
+        "function: app.zz()\ndefinition: |-\n  () RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'x' $$\n",
+    )
+    .unwrap();
+    std::fs::write(
+        schema.join("app.zz_double%28integer%29.function.yml"),
+        "function: app.zz_double(integer)\ndefinition: |-\n  (i integer) RETURNS integer \
+         LANGUAGE sql IMMUTABLE AS $$ SELECT i * 2 $$\n",
+    )
+    .unwrap();
+    std::fs::write(
+        schema.join("app.gen.yml"),
+        "table: app.gen\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+         g: {type: integer, generated: {expression: 'app.zz_double(id)', stored: true}}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        schema.join("app.dflt.yml"),
+        "table: app.dflt\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+         note: {type: text, default: 'app.zz()'}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        schema.join("app.a_plain.yml"),
+        "table: app.a_plain\ncolumns:\n  id: {type: integer, nullable: false}\n",
+    )
+    .unwrap();
+    // Mints the identities, which the preview needs to split a default out.
+    succeeds(d.run(&["plan"]));
+    let sql = d.dir.join("preview.sql");
+    let plan = d.dir.join("preview.json");
+    succeeds(d.run(&[
+        "plan",
+        "--sql",
+        sql.to_str().unwrap(),
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(&sql).unwrap();
+    let at = |needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} is not in:\n{script}"))
+    };
+    let zz = at("CREATE FUNCTION \"app\".\"zz\"\n");
+    let double = at("CREATE FUNCTION \"app\".\"zz_double\"");
+    // A generated column stays in its table, so the table follows the function.
+    assert!(double < at("CREATE TABLE \"app\".\"gen\""), "{script}");
+    // A default is split out of its table and set after the function.
+    assert!(
+        at("CREATE TABLE \"app\".\"dflt\"") < zz && zz < at("SET DEFAULT"),
+        "{script}"
+    );
+    // Nothing about the table that calls nothing moves it.
+    assert!(at("CREATE TABLE \"app\".\"a_plain\"") < zz, "{script}");
+}
+
+/// An offline preview that drops a module cannot read what depends on it, so
+/// the dependents pass is skipped and said so: in human output as a line, and
+/// in JSON as a note with a stable id (SPEC §9.8, #1982 review), never as
+/// silence a consumer would read as "no dependents". Negative: a preview that
+/// drops no module carries no such note.
+#[test]
+fn an_offline_plan_names_the_catalog_fact_it_could_not_read_in_json_too() {
+    let d = Demo::new("preview-skip-notes");
+    let function = d.dir.join("schema/app.zz%28%29.function.yml");
+    std::fs::write(
+        &function,
+        "function: app.zz()\ndefinition: |-\n  () RETURNS text LANGUAGE sql IMMUTABLE AS $$ SELECT 'x' $$\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let notes = |report: &serde_json::Value| {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["id"] == "plan.module-dependents-unread")
+            .map(|f| f["severity"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let unchanged = json_output(succeeds(d.run(&["plan", "--format", "json"])));
+    assert!(notes(&unchanged).is_empty(), "{unchanged}");
+
+    std::fs::remove_file(&function).unwrap();
+    let dropped = json_output(succeeds(d.run(&["plan", "--check", "--format", "json"])));
+    assert_eq!(notes(&dropped), ["note"], "{dropped}");
+    let human = succeeds(d.run(&["plan", "--check"]));
+    assert!(
+        stdout(&human).contains("What depends on a dropped or rebuilt module"),
+        "{}",
+        stdout(&human)
+    );
 }
 
 /// A bootstrap whose reordering moves a relation after an expression naming
