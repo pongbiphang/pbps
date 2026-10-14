@@ -472,6 +472,37 @@ impl Cx<'_> {
                     self.requires(Requirement::Absent(Self::not_null(key)));
                 }
             }
+            Change::AlterColumnNumbering {
+                uid,
+                column,
+                from,
+                to,
+                ..
+            } => {
+                let owner = self.table(&column.table)?;
+                self.exists(ObjectKey::Table(owner.clone()));
+                let key = ColumnKey::Recorded(Recorded(uid.clone()));
+                self.exists(ObjectKey::Column(key.clone()));
+                // The engine refuses an identity on a nullable column, so a
+                // tightening goes first; and it refuses to relax an identity
+                // column, so a numbering given up goes before the relaxation
+                // (DEC-1889.1). The retype and the rows are not modelled: a
+                // read of the column's values would order every row write
+                // before the numbering.
+                if matches!(to, ValueSource::Identity(_)) && self.tightens(&owner, &key) {
+                    self.exists(Self::not_null(key.clone()));
+                }
+                if matches!(from, ValueSource::Identity(_)) && self.relaxes(&owner, &key) {
+                    self.exists(Self::not_null(key.clone()));
+                }
+                // And a plain default is dropped before a source goes on:
+                // measured on 16 and 18, an identity on a column with a
+                // default is refused.
+                if matches!(from, ValueSource::Default(_)) && !matches!(to, ValueSource::Default(_))
+                {
+                    self.requires(Requirement::Absent(ObjectKey::Default(key)));
+                }
+            }
             Change::AddComputedColumn { table, .. } | Change::DropComputedColumn { table, .. } => {
                 let owner = self.table(table)?;
                 self.exists(ObjectKey::Table(owner.clone()));

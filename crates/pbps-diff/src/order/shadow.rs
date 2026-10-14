@@ -156,7 +156,60 @@ pub(crate) fn observe_plan(
         ModuleEdits::InPlace
     };
     let operations = Operations::of_plan(&changes.changes, modes);
-    observe(base, desired, dialect, hints, changes, &operations);
+    observe(
+        base,
+        desired,
+        dialect,
+        &hints.module_deps,
+        changes,
+        &operations,
+        Stage::Differ,
+    );
+}
+
+/// Which order a plan is observed at. The differ's and the schedule's are not
+/// the order that runs on a connected SQL Server plan: `computed_order` moves
+/// a function's change after the computed column that reads it from the
+/// catalog's edges (DEC-1431.1), so the pair is recorded and not failed there.
+#[cfg(any(test, debug_assertions))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Before the connected passes: a computed column and its function may
+    /// still be in the wrong order.
+    Differ,
+    /// The order that runs: every pass has finished (S3, #1954).
+    Final,
+}
+
+/// The verifier on the order a caller outside this crate holds, in tests and
+/// debug builds only: `schedule`'s output (`Stage::Differ` on a connected
+/// plan, whose last pass is still to come) and the order a connected plan
+/// finally runs (`Stage::Final`, where nothing is exempt).
+#[cfg(any(test, debug_assertions))]
+pub fn observe_scheduled(
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    dialect: &dyn Dialect,
+    declared: &ModuleDeps,
+    changes: &pbps_model::ChangeSet,
+    stage: Stage,
+) {
+    use pbps_model::operation::ModuleEdits;
+    let modes = if dialect.rebuilds_modules() {
+        ModuleEdits::Rebuilt
+    } else {
+        ModuleEdits::InPlace
+    };
+    let operations = Operations::of_plan(&changes.changes, modes);
+    observe(
+        base,
+        desired,
+        dialect,
+        declared,
+        changes,
+        &operations,
+        stage,
+    );
 }
 
 /// [`observe_plan`] for operations an expansion made, in the order they run:
@@ -166,9 +219,10 @@ pub(crate) fn observe(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
     dialect: &dyn Dialect,
-    hints: &pbps_model::Hints,
+    declared: &ModuleDeps,
     logical: &pbps_model::ChangeSet,
     operations: &Operations,
+    stage: Stage,
 ) {
     use pbps_model::operation::PlanOwners;
     use pbps_model::plan_names::PlanNames;
@@ -193,14 +247,14 @@ pub(crate) fn observe(
     );
     let baseline = Baseline::of(before, &owners);
     let shadowed = analyse(&operations, &owners, before, after, dialect);
-    let report = shadowed.report(&operations, &baseline, &hints.module_deps);
+    let report = shadowed.report(&operations, &baseline, declared);
     let mut lines: Vec<String> = report
         .unowned
         .iter()
         .map(|(id, error)| format!("unowned {id}: {error}"))
         .collect();
     let ops = operations.as_slice();
-    let (violations, any) = judge(ops, &report);
+    let (violations, any) = judge(ops, &report, stage);
     lines.extend(violations);
     if std::env::var_os("PBPS_ORDER_SHADOW").is_some() {
         let kind = |i: usize| {
@@ -241,7 +295,7 @@ pub(crate) fn clip(text: &mut String, max: usize) {
 
 /// The verifier's findings as lines, and whether any of them fails the run.
 #[cfg(any(test, debug_assertions))]
-pub(crate) fn judge(ops: &[Operation], report: &Report) -> (Vec<String>, bool) {
+pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<String>, bool) {
     let find = |id: OperationId| ops.iter().find(|o| o.id() == id);
     let name = |id: OperationId| {
         find(id).map_or_else(
@@ -269,12 +323,13 @@ pub(crate) fn judge(ops: &[Operation], report: &Report) -> (Vec<String>, bool) {
     // that runs. Recorded as `connected`, and not failed, until the verifier
     // runs on the order that runs.
     let module_op = |id: OperationId| {
-        find(id).is_some_and(|o| {
-            matches!(
-                o.change(),
-                pbps_model::Change::AlterModule { .. } | pbps_model::Change::DropModule { .. }
-            )
-        })
+        stage == Stage::Differ
+            && find(id).is_some_and(|o| {
+                matches!(
+                    o.change(),
+                    pbps_model::Change::AlterModule { .. } | pbps_model::Change::DropModule { .. }
+                )
+            })
     };
     let computed = |key: &pbps_model::operation::ObjectKey| {
         matches!(

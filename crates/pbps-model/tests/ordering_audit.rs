@@ -460,6 +460,32 @@ mod effects_of_each_kind {
                 },
             ),
             (
+                "AlterColumnNumbering",
+                Change::AlterColumnNumbering {
+                    uid: x.clone(),
+                    column: xref.clone(),
+                    ty: int(),
+                    from: ValueSource::Default("1".into()),
+                    to: ValueSource::Identity(Identity {
+                        seed: 1,
+                        increment: 1,
+                    }),
+                },
+            ),
+            (
+                "AlterColumnNumbering",
+                Change::AlterColumnNumbering {
+                    uid: y.clone(),
+                    column: yref.clone(),
+                    ty: int(),
+                    from: ValueSource::Identity(Identity {
+                        seed: 1,
+                        increment: 1,
+                    }),
+                    to: ValueSource::None,
+                },
+            ),
+            (
                 "AddComputedColumn",
                 Change::AddComputedColumn {
                     table: tn("t"),

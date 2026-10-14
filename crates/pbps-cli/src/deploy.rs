@@ -6156,6 +6156,24 @@ pub fn cmd_plan_db(
             if let Some(facts) = &name_facts {
                 facts.order_and_refuse(&mut cs, &target.label)?;
             }
+            // Every pass that orders the plan has run: the verifier checks the
+            // order that is saved and applied, in tests and debug builds
+            // (#1954, DEC-1954.6).
+            #[cfg(any(test, debug_assertions))]
+            pbps_diff::order::shadow::observe_scheduled(
+                pbps_diff::Side {
+                    schema: &recorded_snapshot.schema,
+                    ids: &recorded_ids,
+                },
+                pbps_diff::Side {
+                    schema: &loaded.schema,
+                    ids: &resolved.ids,
+                },
+                dialect.as_ref(),
+                &hints.module_deps,
+                &cs,
+                pbps_diff::order::shadow::Stage::Final,
+            );
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
             let drops = crate::engine::check_drop_blockers(
                 &mut conn,

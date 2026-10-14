@@ -5352,12 +5352,15 @@ recorded as `unprovided` and does not fail: no order could meet it, so it says
 nothing about the order. A function a computed column calls that the differ's order alters or drops
 ahead of the column's own removal is recorded as `connected`: the connected
 pass moves it afterwards from the catalog's edges (DEC-1431.1), so the order
-the differ made is not the one that runs. It is not failed until the verifier
-runs on the order that runs; a column change in the same position still fails.
+the differ made is not the one that runs. It is not failed at the differ's or
+`schedule`'s output, where the connected pass has yet to run; it is failed
+where the order that runs is complete (`deploy`, after the last pass that
+orders the plan, `Stage::Final`). A column change in the same position fails
+at every stage.
 A foreign key the plan drops and adds again is read as absent by the rows
 written in between; a report file that cannot be written fails the run that was
-measuring, with the I/O error on stderr, rather than reading as an empty report. They run where an order is made: the differ's, and the
-resolver's. The resolver's intermediate ordinary plan is not observed, because
+measuring, with the I/O error on stderr, rather than reading as an empty report. They run where an order is made: the differ's, the
+resolver's, `schedule`'s (#1955) and a connected plan's final order. The resolver's intermediate ordinary plan is not observed, because
 it is not an order anything runs. With `PBPS_ORDER_SHADOW` set to a file they
 write their findings and never fail, which is how the go/no-go report is
 measured. The edge check holds by construction once `settle` produces the
@@ -5382,3 +5385,15 @@ dependency effects do not imply: an `effects` correction made in this slice).
 The classifier runs in tests and debug builds on every resolver plan; the go
 criterion is no *missing*. Edges the effects add that the graph lacks are
 listed with their reason.
+
+<a id="dec-1954-8"></a>
+
+**DEC-1954.8. A numbering change declares the nullability and default orders
+DEC-1889.1 measured, and nothing about the column's values.**
+`AlterColumnNumbering` requires the column and its table. An identity put on a
+column a tightening makes `NOT NULL`, or taken off one a relaxation frees,
+reads that nullability state; a plain default turned into a source requires the
+default gone. The retype, the owned sequence's names and the rows the new
+source numbers stay with the class ranks DEC-1889.1 gave them: reading the
+column's values would order every row write before the numbering, which the
+engine does not require.

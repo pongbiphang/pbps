@@ -179,7 +179,15 @@ pub fn plan_operations(
     let (ordered, sequence) = ordered(prepared.changes, edges)?;
     let operations = operations.reordered(&sequence);
     #[cfg(any(test, debug_assertions))]
-    crate::order::shadow::observe(base, desired, dialect, hints, &logical, &operations);
+    crate::order::shadow::observe(
+        base,
+        desired,
+        dialect,
+        &hints.module_deps,
+        &logical,
+        &operations,
+        crate::order::shadow::Stage::Differ,
+    );
     Ok(Planned {
         ordered,
         operations,

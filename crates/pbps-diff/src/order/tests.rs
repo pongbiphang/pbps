@@ -523,7 +523,7 @@ fn a_clean_order_verifies_clean() {
 
 #[test]
 fn an_obligation_nothing_can_provide_is_recorded_and_does_not_fail_the_run() {
-    use super::shadow::{Shadowed, judge};
+    use super::shadow::{Shadowed, Stage, judge};
     // The column is added to a table the baseline lacks and no operation
     // creates: the input disagrees with itself, and no order could meet it.
     let mut plan = create_then_add_column();
@@ -535,7 +535,7 @@ fn an_obligation_nothing_can_provide_is_recorded_and_does_not_fail_the_run() {
     }
     .report(&alone, &baseline, &ModuleDeps::new());
     assert!(!report.violations.is_empty(), "the replay still sees it");
-    let (lines, fails) = judge(alone.as_slice(), &report);
+    let (lines, fails) = judge(alone.as_slice(), &report, Stage::Differ);
     assert!(!fails, "{lines:?}");
     assert!(
         lines.iter().all(|l| l.starts_with("unprovided ")),
@@ -545,7 +545,7 @@ fn an_obligation_nothing_can_provide_is_recorded_and_does_not_fail_the_run() {
 
 #[test]
 fn an_obligation_some_order_could_meet_but_this_one_meets_too_late_fails_the_run() {
-    use super::shadow::{Shadowed, judge};
+    use super::shadow::{Shadowed, Stage, judge};
     let plan = create_then_add_column();
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     let swapped = ops.reordered(&[1, 0]);
@@ -554,14 +554,14 @@ fn an_obligation_some_order_could_meet_but_this_one_meets_too_late_fails_the_run
         unowned: Vec::new(),
     }
     .report(&swapped, &baseline, &ModuleDeps::new());
-    let (lines, fails) = judge(swapped.as_slice(), &report);
+    let (lines, fails) = judge(swapped.as_slice(), &report, Stage::Differ);
     assert!(fails, "{lines:?}");
     assert!(lines.iter().any(|l| l.starts_with("unmet ")), "{lines:?}");
 }
 
 #[test]
 fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_fails() {
-    use super::shadow::{Shadowed, judge};
+    use super::shadow::{Shadowed, Stage, judge};
     // Only the parent is dropped: the child's key into it stands in the
     // baseline and nothing removes it, so no order could satisfy the drop.
     let mut standing = two_dropped_tables();
@@ -573,7 +573,7 @@ fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_
     }
     .report(&ops, &baseline, &ModuleDeps::new());
     assert!(!report.violations.is_empty(), "the replay still sees it");
-    let (lines, fails) = judge(ops.as_slice(), &report);
+    let (lines, fails) = judge(ops.as_slice(), &report, Stage::Differ);
     assert!(!fails, "{lines:?}");
     assert!(
         lines.iter().all(|l| l.starts_with("unprovided ")),
@@ -589,7 +589,7 @@ fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_
         unowned: Vec::new(),
     }
     .report(&swapped, &baseline, &ModuleDeps::new());
-    let (lines, fails) = judge(swapped.as_slice(), &report);
+    let (lines, fails) = judge(swapped.as_slice(), &report, Stage::Differ);
     assert!(fails, "{lines:?}");
     assert!(lines.iter().any(|l| l.starts_with("present ")), "{lines:?}");
 }
@@ -1383,16 +1383,20 @@ fn computed_then(second: Change, id: Option<ModuleId>) -> (Operations, Vec<Effec
 
 #[test]
 fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change_is_not() {
-    use super::shadow::{Shadowed, judge};
+    use super::shadow::{Shadowed, Stage, judge};
+    let judged_at =
+        |stage: Stage, ops: &Operations, fx: &[Effects], baseline: &Baseline, order: &[usize]| {
+            let reordered = ops.reordered(order);
+            let effects: Vec<Effects> = order.iter().map(|&i| fx[i].clone()).collect();
+            let report = Shadowed {
+                effects,
+                unowned: Vec::new(),
+            }
+            .report(&reordered, baseline, &ModuleDeps::new());
+            judge(reordered.as_slice(), &report, stage)
+        };
     let judged = |ops: &Operations, fx: &[Effects], baseline: &Baseline, order: &[usize]| {
-        let reordered = ops.reordered(order);
-        let effects: Vec<Effects> = order.iter().map(|&i| fx[i].clone()).collect();
-        let report = Shadowed {
-            effects,
-            unowned: Vec::new(),
-        }
-        .report(&reordered, baseline, &ModuleDeps::new());
-        judge(reordered.as_slice(), &report)
+        judged_at(Stage::Differ, ops, fx, baseline, order)
     };
     // The function's alteration ahead of the column's drop: the connected
     // pass moves it, so it is recorded and does not fail.
@@ -1408,6 +1412,14 @@ fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change
     assert!(!fails, "{lines:?}");
     assert!(
         lines.iter().any(|l| l.starts_with("connected ")),
+        "{lines:?}"
+    );
+    // Negative: on the order that runs nothing moves it afterwards, so the
+    // same order fails there.
+    let (lines, fails) = judged_at(Stage::Final, &ops, &fx, &baseline, &[1, 0]);
+    assert!(fails, "{lines:?}");
+    assert!(
+        lines.iter().all(|l| !l.starts_with("connected ")),
         "{lines:?}"
     );
     // Negative: the same requirement on a column drop is an order the
@@ -1548,4 +1560,41 @@ fn a_dropped_column_takes_its_default_with_it_so_a_later_insert_is_valid() {
     assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
     // Negative: the insert before the drop would take the column's default.
     assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
+
+#[test]
+fn the_scheduled_observer_accepts_the_right_order_and_refuses_a_wrong_one() {
+    use super::shadow::{Stage, observe_scheduled};
+    // The observer panics on a violation unless a shadow file collects them,
+    // so the property is only observable without one.
+    if std::env::var_os("PBPS_ORDER_SHADOW").is_some() {
+        return;
+    }
+    let plan = two_dropped_tables();
+    let run = |order: &[usize], stage: Stage| {
+        let changes = pbps_model::ChangeSet {
+            changes: order.iter().map(|&i| plan.logical[i].clone()).collect(),
+        };
+        std::panic::catch_unwind(|| {
+            observe_scheduled(
+                crate::Side {
+                    schema: &plan.before,
+                    ids: &plan.before_ids,
+                },
+                crate::Side {
+                    schema: &plan.after,
+                    ids: &plan.after_ids,
+                },
+                &pbps_dialect::MinimalDialect,
+                &ModuleDeps::new(),
+                &changes,
+                stage,
+            );
+        })
+        .is_ok()
+    };
+    assert!(run(&[0, 1], Stage::Final), "the child first is accepted");
+    assert!(run(&[0, 1], Stage::Differ));
+    assert!(!run(&[1, 0], Stage::Final), "the parent first is refused");
+    assert!(!run(&[1, 0], Stage::Differ));
 }
