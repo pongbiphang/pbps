@@ -1273,6 +1273,17 @@ fn cmd_pull(
         })
         .collect::<anyhow::Result<_>>()?;
 
+    // The project's rules must be runnable before they can be asked about
+    // what is pulled. With an invalid `policies:` block (`validate` reports it
+    // as `policy.invalid`) the evaluator skips the rules it cannot run and the
+    // rest of the block with them, so a pull would write declarations no rule
+    // was asked about and read "nothing wrong" from it (DEC-1983.1). Refused
+    // here, before anything connects, and before the overwrite guard below,
+    // whose advice to re-run with `--force` would send the user to a pull this
+    // refuses just the same: `--force` replaces declarations, it does not
+    // excuse a configuration `validate` calls invalid.
+    refuse_invalid_policies(project, "the declarations a pull would write")?;
+
     let dir = project.schema_dir();
     // Force authorizes replacing declarations, not forgetting identity. Read
     // before connecting so damaged history cannot become a fresh adoption
@@ -1486,7 +1497,7 @@ fn cmd_pull(
     // project whose `pbps.yml` sets a rule to `error` must not leave behind
     // files that rule refuses (DECISIONS 114, DEC-919.1).
     for f in adopt::refuse_policy_errors(project, &loaded, dialect.as_ref())? {
-        eprintln!("{}: {}", f.severity, f.message);
+        eprintln!("{}: {}", f.severity_word(), f.message);
     }
     drop(stage);
 
@@ -2266,6 +2277,44 @@ pub(crate) fn declaration_policy_findings(
         .iter()
         .map(policy_finding)
         .collect()
+}
+
+/// Refuses a command that writes declarations while the `policies:` block is
+/// itself invalid, naming each problem as `validate` does (`policy.invalid`).
+///
+/// The evaluator skips a rule it cannot run, so a block with
+/// `naming.table: {severity: error}` and no pattern yields no finding for a
+/// name that rule would refuse, and `pbps_policy::declarations` has nothing to
+/// say about the rest either way. A command that took that empty answer would
+/// write files `validate` then refuses, from a question it never asked: absent,
+/// empty and unreadable are three answers (DEC-1942.1, DEC-1983.1). The check
+/// is `Policies::check`, the one `validate` uses.
+///
+/// `checked_against` finishes the sentence "so the project's rules cannot be
+/// checked against ..." for the command that asks, so that `partitions extend`
+/// and `pull` read alike and a second copy of the message cannot drift.
+pub(crate) fn refuse_invalid_policies(
+    project: &Project,
+    checked_against: &str,
+) -> anyhow::Result<()> {
+    let invalid: Vec<String> = project
+        .config
+        .policies()
+        .check()
+        .into_iter()
+        .map(|problem| format!("  - policy.invalid: {problem}"))
+        .collect();
+    if invalid.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "the `policies:` block in `{}` has {} problem(s), so the project's rules cannot be \
+         checked against {checked_against}; nothing was written. Fix them first (`pbps \
+         validate` lists them):\n{}",
+        project.config_file().display(),
+        invalid.len(),
+        invalid.join("\n")
+    )
 }
 
 fn cmd_validate(

@@ -1132,8 +1132,8 @@ question never asked. Absent, empty and unreadable are three answers. The check 
 `Policies::check`, the one `validate` uses, and it runs beside the declaration-problem
 refusal, after the engine has said what it cannot extend and before the "nothing to add"
 answer, which would otherwise be told to a project `validate` refuses. It names each
-problem as `policy.invalid` and points at `pbps validate`. `pull` and `init`
-skip an invalid block (`refuse_policy_errors`) and are a separate question (#1983); this
+problem as `policy.invalid` and points at `pbps validate`. `pull` and `init` skipped an
+invalid block (`refuse_policy_errors`) until #1983, which closed it (DEC-1983.1); this
 command's promise is that the next `validate` has nothing new to say, which it cannot
 make about rules it could not run. Pinned by the cases in
 `tests/partitions_extend.rs` (an invalid block refused with every problem named and the
@@ -1208,3 +1208,40 @@ still does and `ev_rest` (the old finding) is not named beside it, and `validate
 a written series names only the finding it had; and the same rule at `warning` writes, with
 `validate` printing the finding as advice. The one-instant property is pinned by the unit
 tests in `partitions.rs` (DEC-1943.1).
+
+<a id="dec-1983-1"></a>
+
+**DEC-1983.1. `pull` refuses an invalid `policies:` block before it connects, and the
+adoption's rule check refuses it too instead of returning no findings.** The same
+mechanism as DEC-1942.1, in the other command that writes declarations: with a
+`naming.table: {severity: error}` that has no pattern, `refuse_policy_errors` returned an
+empty list without evaluating anything, so an unforced or forced `pull` wrote tables no
+rule had been asked about while `validate` named the project `policy.invalid`. The
+refusal is one function, `refuse_invalid_policies`, that `partitions extend` and `pull`
+both call, so the two commands name the problems in the same words and a second copy of
+the message cannot drift. In `pull` it runs after the command line is parsed and before
+anything else: before the identity file is read, before the overwrite guard, and so before
+a connection. Before the guard because that guard answers an unforced pull over existing
+declarations with "re-run with `--force`", and a `--force` pull is refused for the block
+just the same, so the advice would send the user to a second refusal; before the
+connection because the block is a fact about the project, and a pull that introspected a
+database first would tell the user about a local file only after that round trip.
+`--force` replaces declarations and does not excuse a configuration `validate` calls
+invalid, so forced and unforced pulls are refused alike. `refuse_policy_errors` calls the
+same function first, which is no second user-facing check (`pull` has already refused) but
+what makes the adoption's check unable to answer "nothing wrong" to a question it did not
+ask, for any caller added later. That function also stopped repeating the body of
+`declaration_policy_findings` (the spelling of the types, the context, the evaluation) and
+calls it: the two evaluations were identical, the clock is read once either way, and a
+rule that sees one spelling in `validate` and another in an adoption is how a rule is
+bypassed by an alias. What refuses a `pull` for a valid block is unchanged: only a finding
+at `error`, with the rest printed. `init` is not affected: it writes the `pbps.yml` itself,
+which has no `policies:` block, and a re-run over an existing `pbps.yml`, valid or not, is
+refused as "already inside the pbps project" before any of this runs. `validate` itself
+still reports the block's problems beside the findings of the rules that can run, since it
+reports and refuses nothing it would write. Pinned by `flow_pg.rs`: offline, a refusal that
+names `policy.invalid` with an unreachable database, over existing declarations forced and
+unforced, which are left byte for byte; live, the same refusal against a real database, the
+repaired block asking its rule (the refusal then names the table and not the block), and a
+rule `off` and a rule at `warning` writing and passing `validate`; and the unit test in
+`adopt.rs` for the function's own refusal.
