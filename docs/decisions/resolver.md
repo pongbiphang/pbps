@@ -2889,7 +2889,9 @@ Measured on PostgreSQL 16.15 and 18.6 with two sessions (the table is on
   placeholder nothing binds to and no lookup names may be missing, since an
   engine-chosen name (a key's, a sequence's) can differ between the scratch
   and the target; a record the seal lacks must be owned by a change of the
-  plan, its surface or a part of the same table. A generated relation's
+  plan: its surface, a part of the same table, or a record a table's change
+  carries as a reference on the terms sealing admitted it (DEC-1274.1), such
+  as another table's foreign key a rename rewrites, with its RI triggers. A generated relation's
   system attributes go with it, as a declared table's do: the closing read
   finds an identity sequence the target named `n_id_seq1` while the scratch
   named it `n_id_seq`.
@@ -2909,9 +2911,11 @@ Measured on PostgreSQL 16.15 and 18.6 with two sessions (the table is on
 **Pinned by** `the_capture_in_a_callers_transaction_refuses_a_commit_between_its_reads`
 and `the_apply_capture_reads_the_callers_transaction_and_binds_each_lookup_to_the_seal`
 (`pbps-pg`), `a_record_of_the_table_a_rebuilt_part_belongs_to_is_owned_by_that_change`
+and `a_record_another_tables_change_carries_as_a_reference_is_the_plans`
 (`pbps-model`), and, live through the binary,
 `resolver_plans_apply_with_their_sealed_checks`,
 `a_resolved_plan_is_refused_before_ddl_when_a_sealed_input_moved`,
-`a_resolved_plan_rolls_back_when_its_closing_check_finds_another_writer` and
-`a_resolved_plan_closes_over_what_it_installs_under_the_targets_names`
+`a_resolved_plan_rolls_back_when_its_closing_check_finds_another_writer`,
+`a_resolved_plan_closes_over_what_it_installs_under_the_targets_names` and
+`a_resolved_plan_renaming_a_referenced_table_closes`
 (`flow_pg`).

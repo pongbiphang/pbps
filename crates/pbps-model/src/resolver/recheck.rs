@@ -121,10 +121,11 @@ impl InputManifest {
         let installed: BTreeSet<&ObjectIdentity> = now
             .iter()
             .filter(|(object, _)| !sealed.contains_key(*object))
-            .filter(|(_, record)| {
-                transitions
-                    .iter()
-                    .any(|transition| owns(transition, &record.ownership))
+            .filter(|(object, record)| {
+                transitions.iter().any(|transition| {
+                    owns(transition, &record.ownership)
+                        || carried(transition, object, &record.ownership)
+                })
             })
             .map(|(object, _)| *object)
             .collect();
@@ -188,6 +189,22 @@ fn owns(transition: &ObjectTransition, ownership: &ObjectOwnership) -> bool {
     };
     ownership.permits(&transition.surface)
         || table(owner).is_some_and(|table_name| table(&transition.surface) == Some(table_name))
+}
+
+/// A record a table-family transition carries as a reference, owned by a
+/// table-family surface: what one DDL statement reaches past its own
+/// surface, such as another table's foreign key a rename rewrites, with its
+/// RI triggers and dependency rows. Sealing admitted it on the same terms
+/// (`carried_reference`, DEC-1274.1), and the closing manifest keeps no
+/// placeholder for it, so the closing read finds it unsealed (#616).
+fn carried(
+    transition: &ObjectTransition,
+    object: &ObjectIdentity,
+    ownership: &ObjectOwnership,
+) -> bool {
+    transition.references.contains(object)
+        && table(&transition.surface).is_some()
+        && matches!(ownership, ObjectOwnership::Surface(owner) if table(owner).is_some())
 }
 
 /// The table a table-family surface is part of.

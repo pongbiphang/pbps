@@ -303,6 +303,13 @@ fn a_resolved_plan_is_refused_before_ddl_when_a_sealed_input_moved() {
 
 #[test]
 #[ignore = "needs live postgres"]
+fn a_resolved_plan_renaming_a_referenced_table_closes() {
+    resolver_publication::renamed_parent(&server());
+    resolver_publication::renamed_parent(&old_server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
 fn a_resolved_plan_closes_over_what_it_installs_under_the_targets_names() {
     resolver_publication::installed(&server());
     resolver_publication::installed(&old_server());

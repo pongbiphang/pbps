@@ -747,7 +747,7 @@ impl Sealed {
                 "--checksum",
                 checksum,
                 "--allow",
-                "destructive,constraint",
+                "rename,destructive,constraint",
             ])
             .env("PBPS_TARGET_1516", self.connection())
             .env("PBPS_SCRATCH_1516", "host=127.0.0.1 port=1 dbname=unused");
@@ -888,6 +888,69 @@ pub fn installed(server: &str) {
             )
         ),
         "true"
+    );
+    let next = successful(run(
+        &sealed.d,
+        &["plan", "--env", "prod", "--format", "json"],
+        Some(&Targets {
+            target: sealed.connection(),
+            scratch: &sealed._scratch.connection,
+        }),
+    ));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&next)).unwrap();
+    assert_eq!(value["data"]["changes"], 0, "{value}");
+}
+
+/// A rename of a table another, unchanged table's foreign key references
+/// closes (#616): the rename rewrites the child's key, its internal RI
+/// triggers and its dependency rows, which the parent's change carries as
+/// references, so the closing read finds them owned by the child and the
+/// plan admits them. The plan applies, records, and the next plan is empty.
+pub fn renamed_parent(server: &str) {
+    let sealed = Sealed::revised(
+        server,
+        "rename616",
+        Revision {
+            bootstrapped: &[
+                (
+                    "app.p.yml",
+                    "table: app.p\ncolumns:\n  id: {type: integer, nullable: false}\n\
+                     primary_key: {name: pk_p, columns: [id]}\n",
+                ),
+                (
+                    "app.c.yml",
+                    "table: app.c\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+                     p_id: {type: integer}\nprimary_key: {name: pk_c, columns: [id]}\n\
+                     foreign_keys:\n  fk_c_p:\n    columns: [p_id]\n    references: app.p(id)\n",
+                ),
+            ],
+            // The child's declaration names its parent by the new name; its key
+            // is the same key.
+            files: &[
+                (
+                    "app.c.yml",
+                    "table: app.c\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+                     p_id: {type: integer}\nprimary_key: {name: pk_c, columns: [id]}\n\
+                     foreign_keys:\n  fk_c_p:\n    columns: [p_id]\n    references: app.q(id)\n",
+                ),
+                (
+                    "app.p.yml",
+                    "table: app.q\nrenamed_from: app.p\ncolumns:\n  id: {type: integer, \
+                 nullable: false}\nprimary_key: {name: pk_p, columns: [id]}\n",
+                ),
+            ],
+            ..Revision::default()
+        },
+    );
+    let before = sealed.untouched();
+    successful(sealed.apply(&sealed.artifact));
+    assert_eq!(sealed.untouched(), (before.0 + 1, 1));
+    assert_eq!(
+        text_of(
+            sealed.connection(),
+            "SELECT confrelid::regclass::text FROM pg_catalog.pg_constraint WHERE conname = 'fk_c_p'"
+        ),
+        "app.q"
     );
     let next = successful(run(
         &sealed.d,

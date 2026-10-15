@@ -521,6 +521,7 @@
         "a_resolved_plan_is_refused_before_ddl_when_a_sealed_input_moved",
         "a_resolved_plan_rolls_back_when_its_closing_check_finds_another_writer",
         "a_resolved_plan_closes_over_what_it_installs_under_the_targets_names",
+        "a_resolved_plan_renaming_a_referenced_table_closes",
         "a_reused_tables_key_and_the_renamed_tables_key_of_one_name_both_go",
         "a_revoke_that_does_not_land_is_refused_at_the_closing_read",
         "a_rewrite_rule_on_a_reached_table_is_refused",

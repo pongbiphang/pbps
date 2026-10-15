@@ -314,6 +314,52 @@ fn a_record_of_the_table_a_rebuilt_part_belongs_to_is_owned_by_that_change() {
     );
 }
 
+/// Another table's foreign key that a rename rewrites rides on the renamed
+/// table's change as a reference (DEC-1274.1): the closing read finds it
+/// owned by its own table, unsealed, and it is the plan's (#616). A record
+/// the change does not list, or one listed but owned by no table, is not.
+#[test]
+fn a_record_another_tables_change_carries_as_a_reference_is_the_plans() {
+    let (sealed, _) = closing();
+    let key = object("pg_constraint", "fk_c_p");
+    let renamed = |references: BTreeSet<ObjectIdentity>| {
+        vec![ObjectTransition {
+            surface: Surface::Table(TableName::new("app", "q")),
+            before: BTreeSet::new(),
+            after: references.clone(),
+            references,
+        }]
+    };
+    let child = |ownership: ObjectOwnership| {
+        let mut p = record(&key, "09", &[]);
+        p.ownership = ownership;
+        p
+    };
+    let child_table = ObjectOwnership::Surface(Surface::Table(TableName::new("app", "c")));
+    assert_eq!(
+        sealed.closing_differences(
+            &closed("n_pkey", Some((child(child_table.clone()), false))),
+            &renamed(BTreeSet::from([key.clone()]))
+        ),
+        Vec::<String>::new()
+    );
+    let refused = ["pg_constraint app.fk_c_p arrived, and no change of the plan owns it"];
+    assert_eq!(
+        sealed.closing_differences(
+            &closed("n_pkey", Some((child(child_table), false))),
+            &renamed(BTreeSet::new())
+        ),
+        refused
+    );
+    assert_eq!(
+        sealed.closing_differences(
+            &closed("n_pkey", Some((child(ObjectOwnership::Unqualified), false))),
+            &renamed(BTreeSet::from([key.clone()]))
+        ),
+        refused
+    );
+}
+
 #[test]
 fn a_moved_untouched_record_or_installed_binding_or_lookup_is_refused() {
     let (sealed, transitions) = closing();

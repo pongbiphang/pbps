@@ -1294,9 +1294,10 @@ alone; no resolver, scratch or Docker socket is reached.
   sees the transaction's own objects, must match the closing manifest sealed
   from the approved typed changes. An untouched record keeps its properties
   and bindings; a record the plan installs has its sealed bindings; a record
-  the seal lacks must be owned by a change of the plan — its surface, or a
-  part of the same table — so an engine-chosen name (a key's, a sequence's)
-  may differ from the scratch's; candidate membership and lookups move only
+  the seal lacks must be owned by a change of the plan — its surface, a part
+  of the same table, or a record the change carries as a reference, such as
+  another table's foreign key a rename rewrites — so an engine-chosen name
+  (a key's, a sequence's) may differ from the scratch's; candidate membership and lookups move only
   by what the plan installs. The facts and authorization are compared again.
 
 A mismatch or unreadable required input refuses: before the first statement
