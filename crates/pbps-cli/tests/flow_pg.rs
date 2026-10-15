@@ -4880,7 +4880,7 @@ const PULL_MALFORMED_TABLE_ARGS: [(&[&str], &str); 4] = [
 /// the block ahead of the target and the names were parsed behind the target.
 /// A malformed value is a fact about the command line alone, which the user
 /// can see without opening any file, so it is said first: command line, then
-/// the project, then the target (DEC-1983.1). Pinned against an invalid block
+/// the project, then the target (DEC-2042.1). Pinned against an invalid block
 /// and against every way the target fails to resolve, and an invalid block
 /// with well-formed names is still the block's refusal.
 #[test]
@@ -5012,7 +5012,7 @@ fn pull_still_reports_a_malformed_table_argument_under_a_valid_policies_block() 
 /// variable is read from this one. A pull whose variable is unset and whose
 /// declarations are in the way has two refusals and nothing is written either
 /// way, so the order is fixed and not left to which function happened to run
-/// first. `--force` passes the guard and reaches the target.
+/// first (DEC-2042.1). `--force` passes the guard and reaches the target.
 #[test]
 fn pull_reads_the_identity_file_and_the_overwrite_guard_before_it_resolves_the_target() {
     let d = Demo::new("pull-project-before-target");

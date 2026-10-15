@@ -1302,7 +1302,7 @@ fn cmd_docs(
 ///
 /// Every refusal `pull` makes before it writes is made in one order, here, so
 /// that two independent errors are always said in the same order and a new
-/// refusal has one place to go (DEC-1983.1; #1983, #2027, #2042):
+/// refusal has one place to go (DEC-2042.1; DEC-1983.1, #2027):
 ///
 /// 1. the command line: the table names of `--data` and `--partitions-external`;
 /// 2. the project: the `policies:` block, the identity file, the overwrite guard;
