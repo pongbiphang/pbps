@@ -1790,6 +1790,26 @@ impl Dialect for Postgres {
                     .push(Resource::Object(base.part(part), Incarnation::Final));
             }
         }
+        // A kept identity retuned goes before a retype that narrows its
+        // column, and after one that does not: the engine moves an identity's
+        // sequence with its column and refuses the retype while a bound set
+        // for the wider type stands, but a bound set for the wider type is
+        // refused on the narrower column (DEC-1921.1, measured on 16 and 18).
+        // The portable effects leave the retune free of the column's
+        // rewrites; this puts it after them unless the retype narrows.
+        if let Change::AlterColumnNumbering {
+            uid,
+            from: pbps_model::ValueSource::Identity(_),
+            to: pbps_model::ValueSource::Identity(_),
+            ..
+        } = op.change()
+            && let Some((was, will)) = pbps_model::operation::column_types(uid, before, after)
+            && self.type_change_risk(was, will) == TypeChangeRisk::Safe
+        {
+            fx.requires.push(pbps_model::operation::Requirement::Exists(
+                pbps_model::operation::column_key(uid),
+            ));
+        }
         Ok(fx)
     }
 

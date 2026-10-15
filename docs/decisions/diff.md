@@ -5398,6 +5398,14 @@ source numbers stay with the class ranks DEC-1889.1 gave them: reading the
 column's values would order every row write before the numbering, which the
 engine does not require.
 
+A kept identity retuned (`Identity` to `Identity`) does not wait for its
+column's rewrites in the portable effects: whether it follows a retype or goes
+before it is the engine's to say. PostgreSQL's `engine_effects` makes it wait
+unless the retype narrows, which DEC-1921.1 measured (the engine refuses a
+narrowing while a bound for the wider type stands, and a bound for the wider
+type on the narrower column). SQL Server has no such retune, so there the
+retune is free of the retype, which is too narrow and refuses no valid plan.
+
 <a id="dec-1954-9"></a>
 
 **DEC-1954.9. The verifier on the order that runs refused six kinds of valid

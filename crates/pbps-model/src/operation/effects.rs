@@ -497,6 +497,12 @@ impl Cx<'_> {
                         ValueSource::Identity(_) | ValueSource::Sequence(_),
                         ValueSource::None | ValueSource::Default(_)
                     ) | (ValueSource::Identity(_), ValueSource::Sequence(_))
+                        // A kept identity retuned: whether it follows a retype
+                        // of its column or goes before it depends on whether
+                        // the retype narrows, which is the engine's to say
+                        // (DEC-1921.1); `Dialect::engine_effects` adds the
+                        // dependency where the retype does not.
+                        | (ValueSource::Identity(_), ValueSource::Identity(_))
                 );
                 if !early {
                     self.exists(ObjectKey::Column(key.clone()));
@@ -1648,6 +1654,26 @@ pub fn base_table<'a>(
 pub fn final_table<'a>(after: Snapshot<'a>, base: &BaseTable<'_>) -> Option<&'a Table> {
     let name = after.ids.tables.get(&base.owner.0)?;
     after.schema.tables.get(name)
+}
+
+/// The key of the column a step names by uid, so a dialect can add a
+/// requirement on it without making up a key.
+pub fn column_key(uid: &crate::Uid) -> ObjectKey {
+    ObjectKey::Column(ColumnKey::Recorded(Recorded(uid.clone())))
+}
+
+/// A column's type in the baseline and in the desired state, found by
+/// identity: its name may differ between the two.
+pub fn column_types<'a>(
+    uid: &crate::Uid,
+    before: Snapshot<'a>,
+    after: Snapshot<'a>,
+) -> Option<(&'a crate::ColumnType, &'a crate::ColumnType)> {
+    let of = |side: Snapshot<'a>| {
+        let at = side.ids.columns.get(uid)?;
+        Some(&side.schema.tables.get(&at.table)?.columns.get(&at.name)?.ty)
+    };
+    Some((of(before)?, of(after)?))
 }
 
 /// A key for a module, so a dialect need not name `ObjectKey` variants.
