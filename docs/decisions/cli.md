@@ -1255,6 +1255,12 @@ repaired block asking its rule (the refusal then names the table and not the blo
 rule `off` and a rule at `warning` writing and passing `validate`; and the unit test in
 `adopt.rs` for the function's own refusal.
 
+*Amended (#2042) by [DEC-2042.1](#dec-2042-1): the call is in `cmd_pull`, after the
+table names are parsed and before the target is resolved, and no longer in `run`;
+the identity file and the overwrite guard are read before the target too. The
+reasons given above for the order of the block, the guard and the connection
+stand.*
+
 <a id="dec-2032-1"></a>
 
 **DEC-2032.1. A refusal shows the file's text escaped; it does not refuse the
@@ -1318,3 +1324,56 @@ the escaped value is in it), by `a_refusal_names_a_unicode_value_as_the_file_spe
 unknown variant and a string where a number belongs, each holding a line break
 in one file and the two characters `\n` in another, refused differently by
 `explain` in both formats and by `apply`) and by the unit tests in `escape.rs`.
+
+<a id="dec-2042-1"></a>
+
+**DEC-2042.1. The refusals `pull` makes before it writes are made in one order, the
+command line, then the project, then the target, then the database, and the order is
+fixed at the head of `cmd_pull`.** Two independent refusals, with nothing written by
+either, are always said in that order, so that the second is reported once the first is
+fixed and no function decides it again by running first. It was decided three times, for
+one pair each: the `policies:` block before the connection (#1983, DEC-1983.1), the block
+before the target (#2027), and the table names before the block (#2042). From what a user
+can see in their own command and files to what only the machine or a round trip can tell:
+
+1. Before `cmd_pull`, shared with every command: clap's own parse of the flags and
+   values, and discovery of the project (`pbps.yml` absent or unreadable). The project is
+   found before any argument is looked at, as for `drop-table` or `move-rows`.
+2. The command line: the table names of `--data` and `--partitions-external`, each parsed
+   as `schema.table`, and a bad one in a list is found as well as a bad first. These are the
+   only values `pull` parses; `--force` is a flag, and `--db` and `--env` are not parsed as
+   values but resolved in step 4. A malformed name is a fact about the command line alone,
+   which the user can read without opening a file, so it comes before the project's own
+   facts. #2027 had moved the block ahead of the names by moving it ahead of the target,
+   which the names then followed (#2042). They are parsed in `cmd_pull` and not by a clap
+   value parser, which would say them before the project is even discovered and exit 2
+   where `drop-table` and `move-rows` parse their table names after discovery and exit 1.
+3. The project, in this order: the `policies:` block (DEC-1983.1), the identity file
+   (DEC-1790.1), and the overwrite guard that answers an unforced pull over existing
+   declarations with "re-run with `--force`". All three are read from the project and say
+   the same on every machine. The block is first because a `--force` pull is refused for
+   it just the same, so the guard's advice would send the user to a second refusal. The
+   identity file and the guard were read after the target until #2042: they are the same
+   kind of fact as the block, and left behind the target they would have been the next
+   pair reported in the wrong order.
+4. The target, a fact about this machine: `--db` with `--env`, neither of them, an
+   environment the project does not declare, and an unset `url_env` variable. `--db` with
+   `--env` and no target are shapes of the command line, but they are refusals of the
+   target as a whole, #2027 placed them behind the block and pinned them there, and a pull
+   that gave a target twice or none has not named a database for step 5 to be about, so
+   they stay with the resolution they belong to. `cmd_pull` takes the unresolved
+   `TargetArgs` and resolves them here, so no caller can resolve the target earlier.
+5. The database: the connection, what is read from it, a `--data` table it does not have,
+   the identities that cannot be minted, the staged declarations, and the findings of the
+   project's rules at `error`.
+
+The alternative was to leave the identity file and the guard behind the target, which is
+what the issue's text alone asks for: the table names would then be the only change. It was not
+taken because the same review would have found the next pair (an unset variable named
+before "already has declarations"), and the order is only a rule if it covers every
+refusal `pull` makes before it connects. Pinned by `flow_pg.rs`, offline: a malformed
+`--data` or `--partitions-external` value said ahead of an invalid block and of each way
+the target fails to resolve, forced and not, with the block still named for names that
+parse, and its twin with a valid block (a reachable `--db` and the unresolvable targets);
+and the overwrite guard and a damaged identity file said ahead of an unresolved target,
+with `--force` passing the guard to reach it.
