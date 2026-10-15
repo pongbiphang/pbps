@@ -589,9 +589,24 @@ fn quote_ident(name: &str) -> String {
 /// its own batch behind and the engine's error for it is the one returned,
 /// exactly as when each went alone; the batches before it stay, which is why
 /// the run records every role name before the first is created.
+///
+/// A batch that finds the shared lock table too full for a lock per role
+/// (`53200`, a small `max_locks_per_transaction` or a busy cluster; DEC-2049.1)
+/// is sent again in halves, and the rest of the statements keep the size that
+/// fitted: a plan the one-statement transactions could run is not refused for
+/// the batch size.
 async fn batched(admin: &mut impl ExecuteConnection, statements: &[String]) -> Result<(), DbError> {
-    for batch in statements.chunks(ROLE_BATCH) {
-        admin.execute(&batch.join(";\n")).await?;
+    let mut size = ROLE_BATCH;
+    let mut rest = statements;
+    while !rest.is_empty() {
+        let (batch, later) = rest.split_at(size.min(rest.len()));
+        match admin.execute(&batch.join(";\n")).await {
+            Ok(()) => rest = later,
+            Err(error) if size > 1 && error.server_error_code().as_deref() == Some("53200") => {
+                size = size.div_ceil(2);
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }

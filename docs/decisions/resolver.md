@@ -2850,7 +2850,11 @@ unchanged; only the statements travel together.
   row per role, measured on 18.6), and the shared lock table holds
   `max_locks_per_transaction` x (`max_connections` + `max_prepared_transactions`)
   entries, 6400 by default and shared with every other session (#2050). 250 is
-  4% of that; ten thousand roles take 40 round trips.
+  4% of that; ten thousand roles take 40 round trips. A batch the table cannot
+  hold (`53200`, a small `max_locks_per_transaction` or a busy cluster) is sent
+  again in halves down to one statement, and the batches after it keep the size
+  that fitted, so a plan the one-statement transactions could run is not
+  refused for the batch size.
 - **A failed batch leaves nothing of its own,** and the engine's error for the
   failing statement is the one returned. The batches before it stay, which is
   why the run records every role name before creating the first (it always
@@ -2873,7 +2877,8 @@ before, and 30.0 s against 14.5 s after. The reproduction itself is 0.9 s at
 the role catalog, about 1.5 ms a role.
 
 **Pinned by** `resolver_run_owned_reproduction_stays_linear_in_the_clusters_roles`
-(live), `recon2049::a_reproduction_that_fails_partway_names_the_failing_role_and_leaves_none_after_cleanup`
-and `recon2049::cleanup_names_exactly_the_role_that_cannot_be_dropped_and_drops_the_rest`
+(live), `recon2049::a_reproduction_that_fails_partway_names_the_failing_role_and_leaves_none_after_cleanup`,
+`recon2049::cleanup_names_exactly_the_role_that_cannot_be_dropped_and_drops_the_rest`
+and `recon2049::a_batch_the_shared_lock_table_cannot_hold_is_sent_in_halves`
 (live, `pbps-pg`), and the unit test
 `the_logical_role_of_a_run_local_one_is_a_lookup_not_a_scan`.

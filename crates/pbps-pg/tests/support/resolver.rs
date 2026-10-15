@@ -1556,6 +1556,27 @@ mod recon2049 {
         }
     }
 
+    /// Whether one of these tests holds the scratch cluster: the third fills
+    /// its lock table, which would turn the others' batches into smaller ones.
+    /// A flag and a sleep, not a guard held across an await.
+    static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    struct Alone;
+
+    impl Drop for Alone {
+        fn drop(&mut self) {
+            BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    async fn alone() -> Alone {
+        use std::sync::atomic::Ordering::SeqCst;
+        while BUSY.compare_exchange(false, true, SeqCst, SeqCst).is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Alone
+    }
+
     /// How many of `names` exist on the server.
     async fn existing(admin: &mut Conn, names: &[String]) -> usize {
         let list = names
@@ -1620,6 +1641,7 @@ mod recon2049 {
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_SCRATCH_DB (see scripts/live-tests-pg.sh)"]
     async fn cleanup_names_exactly_the_role_that_cannot_be_dropped_and_drops_the_rest() {
+        let _alone = alone().await;
         let pid = std::process::id();
         let run_login = format!("pbps_r2049b_login_{pid}");
         let table = format!("pbps_r2049b_t_{pid}");
@@ -1664,5 +1686,95 @@ mod recon2049 {
         assert_eq!(left, 1, "only the role that owns a table is left");
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(after, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_SCRATCH_DB (see scripts/live-tests-pg.sh)"]
+    async fn a_batch_the_shared_lock_table_cannot_hold_is_sent_in_halves() {
+        let _alone = alone().await;
+        let pid = std::process::id();
+        let run_login = format!("pbps_r2049c_login_{pid}");
+        let mut admin = Conn::connect(Driver::Postgres, &server()).await.unwrap();
+        let mut holder = Conn::connect(Driver::Postgres, &server()).await.unwrap();
+        admin
+            .execute(&format!("CREATE ROLE {run_login} LOGIN"))
+            .await
+            .unwrap();
+        // A session-level advisory lock takes one entry of the shared lock
+        // table, the table a role's creation takes one from until it commits.
+        // Take them until the table is full, to learn how many it gives out
+        // (more than the nominal 6400: it has slack), then leave 100 free.
+        let mut taken = 0_i64;
+        let held = loop {
+            match holder
+                .query(&format!(
+                    "SELECT count(*)::bigint FROM \
+                       (SELECT pg_advisory_lock(g) FROM generate_series({}, {}) g) s",
+                    taken,
+                    taken + 999
+                ))
+                .await
+            {
+                Ok(_) => taken += 1000,
+                Err(error) => {
+                    assert_eq!(
+                        error.server_error_code().as_deref(),
+                        Some("53200"),
+                        "{error}"
+                    );
+                    let rows = holder
+                        .query(
+                            "SELECT count(*)::bigint FROM pg_locks \
+                             WHERE locktype = 'advisory' AND pid = pg_backend_pid()",
+                        )
+                        .await
+                        .unwrap();
+                    break rows[0].try_get_at::<i64>(0).unwrap().unwrap();
+                }
+            }
+        };
+        holder
+            .query("SELECT pg_advisory_unlock_all()")
+            .await
+            .unwrap();
+        holder
+            .query(&format!(
+                "SELECT count(*)::bigint FROM \
+                   (SELECT pg_advisory_lock(g) FROM generate_series(1, {}) g) s",
+                held - 100
+            ))
+            .await
+            .unwrap();
+
+        let map = RoleMap::generate(&context(), &[], &run_login, &format!("c{pid}"));
+        let names = map.run_local_names();
+        // Control: a full batch does not fit now, so the run below is not
+        // sent in halves for nothing.
+        let probe = (0..ROLE_BATCH)
+            .map(|i| format!("CREATE ROLE pbps_r2049c_probe_{pid}_{i}"))
+            .collect::<Vec<_>>()
+            .join(";\n");
+        let refused = admin.execute(&probe).await;
+        let outcome = reconstruct(&mut admin, &map, &context(), "pbps_test").await;
+        holder
+            .query("SELECT pg_advisory_unlock_all()")
+            .await
+            .unwrap();
+        drop(holder);
+        let made = existing(&mut admin, &names).await;
+        let dropped = pbps_pg::resolver::drop_roles(&mut admin, &names).await;
+        admin
+            .execute(&format!("DROP ROLE {run_login}"))
+            .await
+            .unwrap();
+        let refused = refused.expect_err("a full batch needs more locks than are free");
+        assert_eq!(
+            refused.server_error_code().as_deref(),
+            Some("53200"),
+            "{refused}"
+        );
+        outcome.expect("the batches shrink to what the lock table holds");
+        assert_eq!(made, ROLES + 1, "every mapped role was created");
+        assert!(dropped.is_empty(), "{dropped:?}");
     }
 }
