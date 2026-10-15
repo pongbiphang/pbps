@@ -561,3 +561,81 @@ fn a_key_waits_for_the_index_whose_name_it_takes() {
         "{found:?}"
     );
 }
+
+/// Review of #2052: the catalog's row for a declared trigger is the trigger,
+/// which the plan drops: a move that stops at its name afterwards is valid.
+#[test]
+fn a_dropped_triggers_catalog_row_does_not_hold_its_name() {
+    let trigger: pbps_model::ModuleId = "s2.owner.old".parse().unwrap();
+    let mut plan = Plan::new(
+        &[("old", "s1.old"), ("owner", "s2.owner")],
+        &[("old", "s2.new"), ("owner", "s2.owner")],
+        vec![
+            Change::DropModule {
+                id: trigger.clone(),
+                kind: pbps_model::ModuleKind::Trigger,
+            },
+            rename_table("old", "s1.old", "s2.new"),
+        ],
+    );
+    plan.before.modules.insert(
+        trigger,
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::Trigger,
+            description: None,
+            definition: "after insert as select 1".into(),
+        },
+    );
+    let facts = CatalogFacts {
+        occupants: vec![pbps_dialect::slots::Occupant {
+            slot: SlotKey {
+                namespace: Namespace::Relations("s2".into()),
+                name: "old".into(),
+            },
+            kind: "sql trigger".into(),
+            owner: Some(name("s2.owner")),
+            column: None,
+        }],
+        ..CatalogFacts::default()
+    };
+    let exact = Slotted { exact: true };
+    let (ok, _, _) = plan.run(&[0, 1], &exact, Some(&facts));
+    assert!(ok.is_empty(), "{ok:?}");
+    let (wrong, _, _) = plan.run(&[1, 0], &exact, Some(&facts));
+    assert_eq!(held(&wrong), ["intermediate s2.old"], "{wrong:?}");
+}
+
+/// Review of #2052: an unchanged table whose name the engine may compare
+/// equal to a move's stop is asked about, not passed over for its spelling:
+/// refused where the catalog says they are alike, recorded as skipped where
+/// nothing says.
+#[test]
+fn an_unchanged_name_alike_to_a_moves_stop_is_compared() {
+    let plan = Plan::new(
+        &[("x", "s1.x"), ("big", "dbo.X")],
+        &[("x", "dbo.z"), ("big", "dbo.X")],
+        vec![rename_table("x", "s1.x", "dbo.z")],
+    );
+    let collated = Slotted { exact: false };
+    let key = |schema: &str, n: &str| SlotKey {
+        namespace: Namespace::Relations(schema.into()),
+        name: n.into(),
+    };
+    let facts = CatalogFacts {
+        compared: [key("dbo", "x"), key("dbo", "X"), key("dbo", "z")]
+            .into_iter()
+            .collect(),
+        alike: [(key("dbo", "x"), key("dbo", "X"))].into_iter().collect(),
+        ..CatalogFacts::default()
+    };
+    let (found, _, _) = plan.run(&[0], &collated, Some(&facts));
+    assert_eq!(held(&found), ["intermediate dbo.x"], "{found:?}");
+    let (none, skipped, _) = plan.run(&[0], &collated, None);
+    assert!(none.is_empty(), "{none:?}");
+    assert!(
+        skipped
+            .iter()
+            .any(|s| s.claimed == key("dbo", "x") && s.held == key("dbo", "X")),
+        "{skipped:?}"
+    );
+}

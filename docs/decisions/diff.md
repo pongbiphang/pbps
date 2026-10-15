@@ -5504,7 +5504,13 @@ a statement-level check of intermediate names.** (#1964)
   - those a step gives up before taking;
   - the catalog's occupants;
   - what the baseline holds, unchanged, at a name some step claims or passes
-    through.
+    through. The baseline names are selected by the engine's comparison, not
+    by spelling, so a name it cannot tell apart is asked and recorded as
+    skipped.
+
+  A catalog row at a name a baseline object holds is that object, which its
+  own claims and releases track: a table, a part, a view, a routine or a
+  trigger.
   - If that object gives the name up later in the plan, the order is wrong.
   - If it never does, the declarations collide and no order fixes them. The
     claim is recorded as contested and fails nothing; the collision is the

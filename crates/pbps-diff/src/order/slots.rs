@@ -359,16 +359,38 @@ pub fn verify(
         .iter()
         .flat_map(|fx| fx.claims.iter().map(|(s, _)| s).chain(&fx.intermediate))
         .collect();
-    for named in baseline_names(owners, before) {
-        for s in slots_of(dialect, &named.address) {
-            let holder = Occupier::Managed(named.holder.clone());
-            if wanted.contains(&s) && !held.iter().any(|(hs, who)| *hs == s && *who == holder) {
-                held.push((s, holder));
-            }
+    let baseline: Vec<(SlotKey, ObjectKey)> = baseline_names(owners, before)
+        .into_iter()
+        .flat_map(|named| {
+            slots_of(dialect, &named.address)
+                .into_iter()
+                .map(move |s| (s, named.holder.clone()))
+        })
+        .collect();
+    // A baseline name may be the claimed one under the engine's comparison
+    // and not by its spelling, so the comparison selects it: a name it may
+    // be is seeded too, and the claim then records what it cannot tell
+    // (review of #2052).
+    for (s, h) in &baseline {
+        let holder = Occupier::Managed(h.clone());
+        if wanted
+            .iter()
+            .any(|w| same(dialect, facts, w, s) != Same::No)
+            && !held.iter().any(|(hs, who)| hs == s && *who == holder)
+        {
+            held.push((s.clone(), holder));
         }
     }
+    // The catalog's rows for names the baseline's own objects hold are those
+    // objects, tracked by their own claims and releases: a trigger, a view,
+    // a routine, a table or a part (review of #2052).
+    let declared: BTreeSet<&SlotKey> = baseline.iter().map(|(s, _)| s).collect();
     if let Some(facts) = facts {
-        for o in facts.occupants.iter().filter(|o| !declared(before, o)) {
+        for o in facts
+            .occupants
+            .iter()
+            .filter(|o| !declared.contains(&o.slot))
+        {
             let table = o
                 .owner
                 .as_ref()
@@ -495,33 +517,6 @@ pub fn verify(
         }
     }
     (violations, skipped)
-}
-
-/// Whether the baseline's declarations name a catalog occupant: a table, a
-/// view or a table's named part, whose name the plan's own claims and releases
-/// already track. The reads return every object at the names they ask, so
-/// the managed ones are among them.
-fn declared(before: Snapshot<'_>, o: &pbps_dialect::slots::Occupant) -> bool {
-    let pbps_dialect::slots::Namespace::Relations(schema) = &o.slot.namespace else {
-        return false;
-    };
-    let name = &o.slot.name;
-    let here = TableName::new(schema.clone(), name.clone());
-    if let Some(owner) = o.owner.as_ref().and_then(|t| before.schema.tables.get(t)) {
-        return owner
-            .primary_key
-            .as_ref()
-            .is_some_and(|pk| pk.name.as_ref() == Some(name))
-            || owner.unique.contains_key(name)
-            || owner.indexes.contains_key(name)
-            || owner.checks.contains_key(name)
-            || owner.foreign_keys.contains_key(name);
-    }
-    before.schema.tables.contains_key(&here)
-        || before
-            .schema
-            .modules
-            .contains_key(&pbps_model::ModuleId::Named(here))
 }
 
 /// Whether `op`, whose own key is `key`, takes a catalog occupant out of its
