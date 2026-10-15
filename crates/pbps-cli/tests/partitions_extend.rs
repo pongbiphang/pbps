@@ -458,7 +458,7 @@ const MONTHLY: &str = "^ev(_[0-9]{4}_[0-9]{2}|_rest)?$";
 /// `validate` runs the project's `policies:`, and so must the command that
 /// writes declarations: a rule set to `error` that the generated names break
 /// is named before a byte is written, not by the `validate` after it
-/// (#1904).
+/// (#1904, DEC-1941.1).
 #[test]
 fn a_generated_name_an_error_rule_rejects_is_refused_and_nothing_is_written() {
     let p = Project::new("policy-refused", "postgres");
