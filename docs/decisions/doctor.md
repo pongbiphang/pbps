@@ -1207,7 +1207,13 @@ question about a live database, and the maintainer settled where it is asked
   generator counts its steps, with a day the target month lacks becoming its last day,
   as the engine adds an interval. Absent, it is twice the newest partition's width. A
   width of time on a number is not guessed at: that parent gets an `…-unknown` finding
-  saying to write a count.
+  saying to write a count. A width whose target would lie past year 9999, the last
+  year a bound can be written in (DEC-1789.1), gets the same finding saying the
+  horizon reaches past the supported calendar (#1924): there is no point for the series
+  to fall short of, and no remedy that reaches one. The year is checked before the
+  value is built, so no date past 9999 is computed or printed, and it holds for the
+  default of twice the newest width as for a configured one. A count of partitions
+  is never a point on the key's axis, so it has no calendar to leave, however large.
 - **The DEFAULT's rows.** `EXISTS` of a row in the DEFAULT inside the range of any
   declared partition the database does not have. A range the database has cannot have
   a row there, so only the declared ranges it lacks are asked about, compared by their

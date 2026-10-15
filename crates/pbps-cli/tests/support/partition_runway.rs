@@ -373,6 +373,36 @@ pub fn check(server: &str, slug: &str) {
         ["withdef"],
         "{json}"
     );
+    // A width that reaches past year 9999 is a horizon no series can hold a
+    // point of: the parents with rows to be ahead of say it cannot be
+    // represented, and none is called short of a value that does not exist
+    // (#1924). `empty` has no row, so it is asked nothing.
+    for setting in ["100000year", "9000year"] {
+        let json = configured(setting);
+        assert!(
+            of(&json, "doctor.partition-runway").is_empty(),
+            "{setting}: {json}"
+        );
+        assert_eq!(
+            parents_of(&json, "doctor.partition-runway-unknown"),
+            [
+                "covered", "far", "ints", "pending", "short", "tz", "wall", "withdef"
+            ],
+            "{setting}: {json}"
+        );
+        for parent in ["short", "tz", "wall"] {
+            let message = one(&json, "doctor.partition-runway-unknown", parent)["message"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                message.contains(&format!("partition_runway `{setting}`"))
+                    && message.contains("reaches past the supported calendar")
+                    && message.contains("undetermined, not fine"),
+                "{setting} {parent}: {message}"
+            );
+        }
+    }
     std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
 
     // 3. The declared partitions applied, and the move of the DEFAULT's rows

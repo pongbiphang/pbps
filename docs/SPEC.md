@@ -151,7 +151,10 @@ as `../shared/schema` is fine.
 partitions must run before `doctor` warns that they are running out (9.5): a
 count of partitions (`3`) or, for a date or time key, a width in the grammar of
 `pbps partitions extend --every` (`2month`). Absent, it is twice the newest
-partition's width (DEC-1789.2).
+partition's width (DEC-1789.2). A width whose target would lie past year 9999,
+the last the calendar supports, is a horizon `doctor` cannot ask of the series
+and says so (`doctor.partition-runway-unknown`); a count of partitions has no
+calendar to leave.
 
 The `policies:` block selects built-in rules and their severities and records
 suppressions — a rule id, a reason and an optional expiry — with parameters

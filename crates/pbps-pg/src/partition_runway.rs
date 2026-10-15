@@ -181,31 +181,41 @@ fn width_of(step: &Step) -> Width {
     }
 }
 
-/// `c` moved forward by `times` widths. A month is a calendar month, and a
-/// day that the target month lacks is its last day, which is how the engine
-/// adds an interval.
-fn add(c: &Civil, width: Width, times: i64) -> Civil {
+/// The years a bound can be written in: years 1 to 9999, which is what
+/// [`parse_civil`] reads and what `pbps partitions extend` steps through
+/// (DEC-1789.1). The engine prints a year outside them with five digits, a
+/// spelling no reader here takes, so a target past 9999 names a value no
+/// series can hold.
+const YEARS: std::ops::RangeInclusive<i64> = 1..=9999;
+
+/// `c` moved forward by `times` widths, or `None` when that leaves
+/// [`YEARS`]. The year is checked before the value is built, so that no
+/// `Civil` past the calendar ever exists to be compared or printed (#1924).
+///
+/// A month is a calendar month, and a day that the target month lacks is its
+/// last day, which is how the engine adds an interval.
+fn add(c: &Civil, width: Width, times: i64) -> Option<Civil> {
     match width {
         Width::Months(n) => {
             let total = c.y * 12 + (c.m - 1) + n * times;
             let (y, m) = (total.div_euclid(12), total.rem_euclid(12) + 1);
-            Civil {
+            YEARS.contains(&y).then(|| Civil {
                 y,
                 m,
                 d: c.d.min(days_in_month(y, m)),
                 ..*c
-            }
+            })
         }
         Width::Seconds(s) => {
             let total = days_from_civil(c.y, c.m, c.d) * 86_400 + c.secs + s * times;
             let (y, m, d) = civil_from_days(total.div_euclid(86_400));
-            Civil {
+            YEARS.contains(&y).then(|| Civil {
                 y,
                 m,
                 d,
                 secs: total.rem_euclid(86_400),
                 micros: c.micros,
-            }
+            })
         }
     }
 }
@@ -288,20 +298,43 @@ fn plural(n: u32) -> String {
     format!("{n} partition{}", if n == 1 { "" } else { "s" })
 }
 
+/// Why a horizon cannot be asked of a series whose newest rows start at
+/// `held_from`: its target is a value past the calendar, so there is no point
+/// to say the series falls short of (#1924). The reason reads inside the
+/// `…-unknown` finding's parentheses, like the others.
+fn past_the_calendar(horizon: &str, held_from: &str, remedy: &str) -> String {
+    format!(
+        "{horizon}, counted from `{held_from}`, reaches past the supported calendar, which ends \
+         in year 9999: {remedy}"
+    )
+}
+
 /// The need, and the horizon in words for the message.
+///
+/// A count of partitions is a number of partitions and never a point on the
+/// key's axis, so it has no calendar to leave and serves every key type,
+/// however large (it is at most `u32::MAX`). A target on the axis of a date or
+/// time key can leave the calendar, and then it is an `Err`: undetermined, not
+/// a series that is short of a point nothing can reach.
 fn need(
     key: Key,
     horizon: &Horizon,
-    reference: &Val,
+    reference: &End,
     newest: &Range,
 ) -> Result<(Need, String), String> {
     match horizon {
         Horizon::Partitions(k) => Ok((Need::Partitions(*k), plural(*k))),
-        Horizon::Width { step, text } => match reference {
-            Val::Time(c) => Ok((
-                Need::Until(Val::Time(add(c, width_of(step), 1))),
-                text.clone(),
-            )),
+        Horizon::Width { step, text } => match &reference.val {
+            Val::Time(c) => {
+                let until = add(c, width_of(step), 1).ok_or_else(|| {
+                    past_the_calendar(
+                        &format!("partition_runway `{text}`"),
+                        &reference.text,
+                        "write a shorter width, or a count of partitions, as `3`",
+                    )
+                })?;
+                Ok((Need::Until(Val::Time(until)), text.clone()))
+            }
             Val::Int(_) => Err(format!(
                 "partition_runway `{text}` is a width of time, and this key is a {}: write a \
                  count of partitions, as `3`",
@@ -310,11 +343,18 @@ fn need(
         },
         Horizon::Default => {
             let words = "twice the newest partition's width".to_owned();
-            let twice = match (newest.lo.as_ref(), newest.hi.as_ref(), reference) {
+            let twice = match (newest.lo.as_ref(), newest.hi.as_ref(), &reference.val) {
                 (Some(lo), Some(hi), Val::Time(c)) => match (&lo.val, &hi.val) {
-                    (Val::Time(a), Val::Time(b)) => {
-                        width_between(a, b).map(|w| Val::Time(add(c, w, 2)))
-                    }
+                    (Val::Time(a), Val::Time(b)) => match width_between(a, b) {
+                        Some(w) => Some(Val::Time(add(c, w, 2).ok_or_else(|| {
+                            past_the_calendar(
+                                &format!("the default horizon, {words}"),
+                                &reference.text,
+                                "set partition_runway to a count of partitions, as `3`",
+                            )
+                        })?)),
+                        None => None,
+                    },
                     _ => None,
                 },
                 (Some(lo), Some(hi), Val::Int(r)) => match (&lo.val, &hi.val) {
@@ -404,7 +444,7 @@ pub(crate) fn assess(
         .as_ref()
         .or(occupied.hi.as_ref())
         .ok_or_else(|| "the partition holding the newest rows has no bound".to_owned())?;
-    let (needed, words) = need(key, horizon, &reference.val, newest)?;
+    let (needed, words) = need(key, horizon, reference, newest)?;
     if covers(catalog, &reference.val, &needed) {
         return Ok(Verdict::Covered);
     }
@@ -580,27 +620,27 @@ mod tests {
         // day of February, in a leap year or not.
         let jan31 = parse_civil(Key::Date, "2027-01-31").ok().unwrap();
         assert_eq!(
-            fmt_civil(Key::Date, &add(&jan31, Width::Months(1), 1)),
+            fmt_civil(Key::Date, &add(&jan31, Width::Months(1), 1).unwrap()),
             "2027-02-28"
         );
         let jan31 = parse_civil(Key::Date, "2028-01-31").ok().unwrap();
         assert_eq!(
-            fmt_civil(Key::Date, &add(&jan31, Width::Months(1), 1)),
+            fmt_civil(Key::Date, &add(&jan31, Width::Months(1), 1).unwrap()),
             "2028-02-29"
         );
         assert_eq!(
-            fmt_civil(Key::Date, &add(&jan31, Width::Months(13), 1)),
+            fmt_civil(Key::Date, &add(&jan31, Width::Months(13), 1).unwrap()),
             "2029-02-28"
         );
         // Across a year end, and a negative-free count of days across a leap day.
         let dec = parse_civil(Key::Date, "2026-12-15").ok().unwrap();
         assert_eq!(
-            fmt_civil(Key::Date, &add(&dec, Width::Months(2), 1)),
+            fmt_civil(Key::Date, &add(&dec, Width::Months(2), 1).unwrap()),
             "2027-02-15"
         );
         let feb = parse_civil(Key::Date, "2028-02-28").ok().unwrap();
         assert_eq!(
-            fmt_civil(Key::Date, &add(&feb, Width::Seconds(86_400), 2)),
+            fmt_civil(Key::Date, &add(&feb, Width::Seconds(86_400), 2).unwrap()),
             "2028-03-01"
         );
     }
@@ -1035,5 +1075,227 @@ mod tests {
         assert!(range(Key::Date, &BoundDatum::MinValue, &BoundDatum::MinValue).is_err());
         let all = range(Key::Date, &BoundDatum::MinValue, &BoundDatum::MaxValue).unwrap();
         assert_eq!((all.lo, all.hi), (None, None));
+    }
+
+    // -----------------------------------------------------------------------
+    // A horizon that leaves the calendar (#1924)
+    // -----------------------------------------------------------------------
+
+    fn width(text: &str) -> Horizon {
+        Horizon::parse(Some(text)).unwrap()
+    }
+
+    /// The reason a horizon could not be asked, which must not have built the
+    /// year it names: the point is that no value past the calendar exists.
+    fn undetermined(v: Result<Verdict, String>) -> String {
+        match v {
+            Err(reason) => reason,
+            other => panic!("expected an undetermined horizon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_calendar_here_is_the_one_a_bound_is_read_in() {
+        // The edge of `YEARS` is the edge of `parse_civil`, which the
+        // generator steps through: a value either can name, the other can.
+        assert!(parse_civil(Key::Date, "9999-12-31").is_ok());
+        assert!(parse_civil(Key::Date, "0001-01-01").is_ok());
+        assert!(parse_civil(Key::Date, "10000-01-01").is_err());
+        assert!(parse_civil(Key::Date, "0000-12-31").is_err());
+        assert_eq!((*YEARS.start(), *YEARS.end()), (1, 9999));
+    }
+
+    #[test]
+    fn a_width_that_leaves_the_calendar_is_undetermined_not_short() {
+        let ranges = series(12);
+        let october = ranges[9].clone();
+        for text in ["100000year", "9000year", "99999month"] {
+            let reason = undetermined(assess(Key::Date, &ranges, &[], &october, &width(text)));
+            assert!(
+                reason.contains(&format!("partition_runway `{text}`"))
+                    && reason.contains("counted from `2026-10-01`")
+                    && reason.contains("reaches past the supported calendar")
+                    && reason.contains("which ends in year 9999")
+                    && reason.contains("a count of partitions, as `3`"),
+                "{text}: {reason}"
+            );
+        }
+        // No year past the calendar is spelled out: 2026 and 9000 years is
+        // 11026, and that value is never built.
+        let reason = undetermined(assess(
+            Key::Date,
+            &ranges,
+            &[],
+            &october,
+            &width("9000year"),
+        ));
+        assert!(!reason.contains("11026"), "{reason}");
+        // Days and weeks leave it too, near the end of it.
+        let late = months(&[("9999-06-01", "9999-07-01")]);
+        for text in ["365day", "31week"] {
+            let reason = undetermined(assess(Key::Date, &late, &[], &late[0], &width(text)));
+            assert!(
+                reason.contains("counted from `9999-06-01`")
+                    && reason.contains("reaches past the supported calendar"),
+                "{text}: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_time_key_that_leaves_the_calendar_is_undetermined_whatever_its_fraction() {
+        for (key, suffix) in [(Key::Timestamp, ""), (Key::TimestampTz, "+00")] {
+            let at = |text: &str| end(key, &format!("{text}{suffix}")).unwrap();
+            let held = Range {
+                lo: Some(at("2026-01-01 00:00:00.5")),
+                hi: Some(at("2026-01-02 00:00:00.5")),
+            };
+            for text in ["100000year", "9000year", "99999month"] {
+                let reason = undetermined(assess(
+                    key,
+                    std::slice::from_ref(&held),
+                    &[],
+                    &held,
+                    &width(text),
+                ));
+                assert!(
+                    reason.contains(&format!("counted from `2026-01-01 00:00:00.5{suffix}`"))
+                        && reason.contains("reaches past the supported calendar"),
+                    "{key:?} {text}: {reason}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_default_horizon_that_leaves_the_calendar_is_undetermined_not_short() {
+        // Yearly partitions of 9997 and 9998: twice a year from 9998 is 10000.
+        let ranges = months(&[("9997-01-01", "9998-01-01"), ("9998-01-01", "9999-01-01")]);
+        let reason = undetermined(assess(
+            Key::Date,
+            &ranges,
+            &[],
+            &ranges[1],
+            &Horizon::Default,
+        ));
+        assert!(
+            reason.contains(
+                "the default horizon, twice the newest partition's width, counted from \
+                 `9998-01-01`, reaches past the supported calendar"
+            ) && reason.contains("set partition_runway to a count of partitions"),
+            "{reason}"
+        );
+        // Negative: from 9997 it is 9999-01-01, which the series reaches.
+        assert_eq!(
+            assess(Key::Date, &ranges, &[], &ranges[0], &Horizon::Default),
+            Ok(Verdict::Covered)
+        );
+        // And a count of partitions, which has no calendar, is still asked.
+        let s = short(assess(
+            Key::Date,
+            &ranges,
+            &[],
+            &ranges[1],
+            &Horizon::Partitions(3),
+        ));
+        assert_eq!(s.reach, Reach::Partitions(3));
+    }
+
+    /// Negative: a target that lands in the last year the calendar has is a
+    /// target like any other, short or covered on its merits.
+    #[test]
+    fn a_horizon_ending_in_year_9999_is_assessed_as_usual() {
+        // A date: the series ends 9999-12-30; a day from 9999-12-29 is
+        // 9999-12-30 and covered, two days is 9999-12-31 and short.
+        let days = months(&[("9999-12-29", "9999-12-30")]);
+        assert_eq!(
+            assess(Key::Date, &days, &[], &days[0], &width("1day")),
+            Ok(Verdict::Covered)
+        );
+        let s = short(assess(Key::Date, &days, &[], &days[0], &width("2day")));
+        assert_eq!(s.reach, Reach::Until("9999-12-31".into()));
+        assert_eq!(s.frontier, "9999-12-30");
+        // The day after it is not a date, and is not a point to fall short of.
+        assert!(
+            undetermined(assess(Key::Date, &days, &[], &days[0], &width("3day")))
+                .contains("reaches past the supported calendar")
+        );
+        // Thirty weeks from the 1st of June is the 28th of December: short of
+        // it, and still a finding about the series.
+        let late = months(&[("9999-06-01", "9999-07-01")]);
+        let s = short(assess(Key::Date, &late, &[], &late[0], &width("30week")));
+        assert_eq!(s.reach, Reach::Until("9999-12-28".into()));
+        // Months and years end in 9999 too: a year from 9998-01-01 is
+        // 9999-01-01, a short runway for a series that ends on it, and 2 years
+        // is 10000-01-01.
+        let year = months(&[("9997-01-01", "9998-01-01")]);
+        let s = short(assess(Key::Date, &year, &[], &year[0], &width("2year")));
+        assert_eq!(s.reach, Reach::Until("9999-01-01".into()));
+        assert!(
+            undetermined(assess(Key::Date, &year, &[], &year[0], &width("3year")))
+                .contains("reaches past the supported calendar")
+        );
+        // A timestamp, to the last microsecond the calendar has.
+        for (key, suffix) in [(Key::Timestamp, ""), (Key::TimestampTz, "+00")] {
+            let at = |text: &str| end(key, &format!("{text}{suffix}")).unwrap();
+            let held = Range {
+                lo: Some(at("9999-12-30 23:59:59.999999")),
+                hi: Some(at("9999-12-31 00:00:00")),
+            };
+            let s = short(assess(
+                key,
+                std::slice::from_ref(&held),
+                &[],
+                &held,
+                &width("1day"),
+            ));
+            assert_eq!(
+                s.reach,
+                Reach::Until(format!("9999-12-31 23:59:59.999999{suffix}")),
+                "{key:?}"
+            );
+            // One day on from the start of that day is out of the calendar.
+            assert!(
+                undetermined(assess(
+                    key,
+                    std::slice::from_ref(&held),
+                    &[],
+                    &held,
+                    &width("2day"),
+                ))
+                .contains("counted from `9999-12-30 23:59:59.999999"),
+                "{key:?}"
+            );
+        }
+    }
+
+    /// A count of partitions is not a point on any axis: the largest one the
+    /// setting reads is a short runway, for a key with a calendar and a key
+    /// without one alike, and never an undetermined horizon.
+    #[test]
+    fn a_huge_count_of_partitions_is_short_not_undetermined() {
+        let huge = u32::MAX.to_string();
+        let ranges = series(12);
+        let s = short(assess(Key::Date, &ranges, &[], &ranges[11], &width(&huge)));
+        assert_eq!(s.reach, Reach::Partitions(u32::MAX));
+        assert_eq!(s.horizon, "4294967295 partitions");
+        let int = |lo: &str, hi: &str| Range {
+            lo: Some(end(Key::Integer(BIGINT), lo).unwrap()),
+            hi: Some(end(Key::Integer(BIGINT), hi).unwrap()),
+        };
+        const BIGINT: Int = Int {
+            name: "bigint",
+            min: i64::MIN as i128,
+            max: i64::MAX as i128,
+        };
+        let ints = vec![int("0", "1000"), int("1000", "2000")];
+        let s = short(assess(
+            Key::Integer(BIGINT),
+            &ints,
+            &[],
+            &ints[1],
+            &width(&huge),
+        ));
+        assert_eq!(s.reach, Reach::Partitions(u32::MAX));
     }
 }
