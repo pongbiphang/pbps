@@ -5,6 +5,8 @@
 //! platform: a server scratch is a connection string, and a Docker scratch
 //! is the `docker` command the runner has, on any platform it runs on.
 
+pub mod apply;
+
 pub mod scope;
 
 pub mod server;

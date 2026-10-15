@@ -8,7 +8,7 @@ how to add an entry here.
 
 490. **Engine-assisted planning is optional infrastructure, but required
      evidence cannot be waived (accepted design; not implemented).**
-     [SPEC §9.3.2–9.3.3](../SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered)
+     [SPEC §9.3.2–9.3.3](../SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered)
      and [ADR-0016](../ADR-0016-engine-assisted-planning.md) keep offline previews
      and the existing `--dev` rehearsal distinct from a future target-aware
      `--resolve-with` path. Typed/catalog facts retain a lightweight path;
@@ -2835,4 +2835,83 @@ Fill, the second step, waits for #1956: its order is `Catalog` edges
 and `resolver_draft_lists_a_routine_and_a_chain_and_writes_neither` (live,
 16 and 18), the `resolver::draft` unit tests, and
 `resolver_externals_drafts_what_a_managed_view_reads_and_never_replaces_the_externals_file`
+
+<a id="dec-616-1"></a>
+
+**DEC-616.1. Apply rechecks a resolved plan from the target connection alone:
+each capture runs inside the apply's `READ COMMITTED` transaction, with its
+signature lookups as separate statements bracketed by a one-statement manifest
+read and a one-statement `(ctid, xmin)` witness read (#616).**
+
+A resolved plan's evidence names the target it was sealed against: its key,
+cluster, reported facts, the deployer's authorization, and an opening and a
+closing manifest of every prerequisite a binding read. Apply has to compare
+the target with all of it before the first statement and again after the
+last, and the apply transaction is `READ COMMITTED` (SPEC 7.6), where each
+statement reads its own snapshot.
+
+Measured on PostgreSQL 16.15 and 18.6 with two sessions (the table is on
+#616):
+
+- **A signature lookup does not read the statement's snapshot.**
+  `to_regprocedure` resolves through the syscache, the latest committed
+  catalog: under `REPEATABLE READ` it returned an OID the transaction's own
+  snapshot could not see, and on 16 a session's search-path cache kept
+  answering with a role membership another session had already revoked.
+  So no placement inside one statement binds a lookup to the scan beside it,
+  and the single-statement form is rejected.
+- **The per-statement form is chosen.** Inside the caller's transaction the
+  capture opens a savepoint, sets its read-only session state locally, reads
+  the manifest through one cursor (DECISIONS 423), runs each lookup as its
+  own statement, and ends with one statement reading every witnessed row's
+  `(ctid, xmin)`. It rolls back to the savepoint and releases it, so the
+  caller's settings and writable transaction are as they were, and it sees
+  the transaction's own DDL. Apply accepts only when the witness sets are
+  equal, each lookup's result is in the manifest, each result equals the
+  sealed one, and the inputs a lookup depends on (candidates, namespaces,
+  their ACLs, membership) equal the sealed ones. A lookup is a function of
+  those inputs, so a transient change — a candidate created and dropped
+  between the reads, a grant and its revoke — can only produce a result that
+  differs from the sealed one and refuse; it never matches falsely. Checking
+  only that the previously returned routine is unchanged is not enough: a
+  grant can move the lookup while that routine's tuple stays the same.
+- **What is compared, and when.** The key before connecting; the cluster
+  before the deployment lock, so its refusal writes nothing; the opening
+  manifest, facts and authorization under the lock, after the routine and
+  schema locks the statements take, before the first statement; the closing
+  manifest, facts and authorization after the last statement, before
+  recording. The ledger's latest entry, which the planning capture reads, is
+  not compared: every failed attempt adds one, and comparing it would refuse
+  every retry of a valid plan; the ordinary drift check holds the recorded
+  state.
+- **The closing manifest admits what the plan installs, under the target's
+  names.** A record the seal holds keeps its sealed bindings; a sealed
+  placeholder nothing binds to and no lookup names may be missing, since an
+  engine-chosen name (a key's, a sequence's) can differ between the scratch
+  and the target; a record the seal lacks must be owned by a change of the
+  plan, its surface or a part of the same table. A generated relation's
+  system attributes go with it, as a declared table's do: the closing read
+  finds an identity sequence the target named `n_id_seq1` while the scratch
+  named it `n_id_seq`.
+- **Platforms.** Every recheck reads the target connection: no native
+  inspection, resolver, scratch or Docker socket is needed, so resolved apply
+  has no platform limitation of its own.
+
+**Why not the alternatives.**
+- **A `LATERAL`/`set_config` single statement.** PostgreSQL does not
+  guarantee subexpression evaluation order, and the lookup reads the syscache
+  regardless of where it is placed.
+- **Parse `regprocedure` signatures and resolve them from the manifest.** A
+  second name resolver beside the engine's, which is what the resolver
+  exists not to be.
+- **Revalidate only the returned routine.** Refuted by the grant case above.
+
+**Pinned by** `the_capture_in_a_callers_transaction_refuses_a_commit_between_its_reads`
+and `the_apply_capture_reads_the_callers_transaction_and_binds_each_lookup_to_the_seal`
+(`pbps-pg`), `a_record_of_the_table_a_rebuilt_part_belongs_to_is_owned_by_that_change`
+(`pbps-model`), and, live through the binary,
+`resolver_plans_apply_with_their_sealed_checks`,
+`a_resolved_plan_is_refused_before_ddl_when_a_sealed_input_moved`,
+`a_resolved_plan_rolls_back_when_its_closing_check_finds_another_writer` and
+`a_resolved_plan_closes_over_what_it_installs_under_the_targets_names`
 (`flow_pg`).

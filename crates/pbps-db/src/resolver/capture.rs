@@ -101,6 +101,10 @@ pub enum CaptureError {
     Coverage(#[from] Uncovered),
     #[error("target capture requires its own transaction")]
     CallerTransaction,
+    /// An apply-time capture reads inside the apply's transaction, so its
+    /// closing read sees that transaction's own DDL (#616).
+    #[error("an apply-time capture runs inside the apply's transaction, and none is open")]
+    NoTransaction,
     #[error("target capture cannot qualify this engine version")]
     Version,
     #[error("target capture could not read a required catalog")]

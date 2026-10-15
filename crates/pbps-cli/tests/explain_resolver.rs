@@ -1,4 +1,5 @@
-//! Saved resolver artifacts remain reviewable before guarded apply is available.
+//! Saved resolver artifacts: reviewable from the file alone, and approved
+//! through the ordinary command (#616).
 
 use pbps_model::resolver::*;
 use pbps_model::{ChangeSet, IdsFile, PlanBaseline, PlanOrigin, SavedPlan};
@@ -56,6 +57,10 @@ fn sealed_under(rule: &str, limitations: std::collections::BTreeMap<String, Stri
             channels: "08".repeat(32),
             target_cluster: "09".repeat(32),
             limitations,
+            target_scope: pbps_model::resolver::TargetScope {
+                schemas: vec!["app".into()],
+                write_path_extras: vec![],
+            },
             runtime: ResolverRuntime::Scratch {
                 entry: "scratch".into(),
                 scratch: ScratchSource::Server {},
@@ -128,49 +133,54 @@ fn report(out: &Output) -> serde_json::Value {
     value
 }
 
+/// A resolved plan is approved as any database plan is, with the ordinary
+/// command and checksum (#616, #618): nothing about resolver evidence changes
+/// what a reviewer types or what the gate compares.
 #[test]
-fn unsupported_resolver_apply_is_not_offered_as_an_approval_or_preview() {
+fn a_resolved_plan_is_offered_the_ordinary_approval_command() {
     let plan = resolved_plan();
     plan.validate_analysis().unwrap();
     assert_eq!(plan.origin, PlanOrigin::ResolvedDatabase);
-    assert!(
-        plan.origin.is_applyable(),
-        "database provenance is preserved"
-    );
     let artifact = Artifact::new(&serde_json::to_value(&plan).unwrap());
+    let approve = format!(
+        "pbps apply --env \"<environment>\" --plan plan.json --checksum {}",
+        plan.checksum()
+    );
     for format in ["text", "json"] {
         let out = artifact.explain(format);
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{text} {:?}", out.stderr);
         assert!(out.stderr.is_empty(), "{:?}", out.stderr);
-        assert!(
-            text.contains("cannot yet enforce resolver pre/postconditions"),
-            "{text}"
-        );
-        for forbidden in [
-            "To approve and run it",
-            "pbps apply",
-            "pbps plan",
-            "offline",
-            "plan.preview",
-        ] {
+        for forbidden in ["pbps plan", "offline", "plan.preview", "cannot be applied"] {
             assert!(!text.contains(forbidden), "{forbidden}: {text}");
         }
         if format == "json" {
             let value = report(&out);
-            assert_eq!(value["data"]["applyable"], false, "{value}");
-            assert_eq!(value["data"]["approve_with"], "", "{value}");
+            assert_eq!(value["data"]["applyable"], true, "{value}");
+            assert_eq!(value["data"]["approve_with"], approve.as_str(), "{value}");
             assert_eq!(value["data"]["checksum"], plan.checksum());
-            assert!(value["data"]["apply_limitation"].is_string(), "{value}");
-            assert_eq!(value["findings"][0]["id"], "plan.apply-unsupported");
+            assert_eq!(value["findings"], serde_json::json!([]), "{value}");
             assert!(value["data"].get("target").is_none(), "{value}");
         } else {
+            assert!(text.contains("To approve and run it"), "{text}");
+            assert!(text.contains(&approve), "{text}");
             assert!(
-                text.contains("computed against the target with sealed resolver evidence"),
+                text.contains(
+                    "computed against the target with sealed resolver evidence — applyable"
+                ),
                 "{text}"
             );
         }
     }
+    // Negative: the same evidence in a staged plan is refused by name, since
+    // it describes one transaction.
+    let staged = Artifact::new(&serde_json::to_value(resolved_plan().staged()).unwrap());
+    let out = staged.explain("text");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("this plan is staged"),
+        "{out:?}"
+    );
 }
 
 #[test]
@@ -184,11 +194,9 @@ fn ordinary_database_approval_and_preview_remedy_keep_their_meaning() {
             let out = artifact.explain(format);
             let text = String::from_utf8_lossy(&out.stdout);
             assert!(out.status.success(), "{text} {:?}", out.stderr);
-            assert!(!text.contains("cannot yet enforce"), "{text}");
             if format == "json" {
                 let value = report(&out);
                 assert_eq!(value["data"]["applyable"], origin == PlanOrigin::Database);
-                assert!(value["data"].get("apply_limitation").is_none(), "{value}");
                 // An ordinary plan carries no resolver provenance (#1517).
                 assert!(value["data"].get("resolver").is_none(), "{value}");
             } else {
@@ -333,8 +341,7 @@ fn malformed_or_unsupported_resolver_evidence_is_refused_before_presentation() {
 /// The qualification rule's identifier moves with the facts it compares
 /// (DEC-2012.1), so a resolved plan an earlier build sealed is refused by
 /// `explain` and by `apply` before the target is contacted, naming the rule
-/// and the remedy, and is never shown as this build's coverage. Nothing else
-/// reads such a plan today: apply refuses every resolved plan (#616).
+/// and the remedy, and is never shown as this build's coverage.
 #[test]
 fn a_plan_sealed_under_the_previous_qualification_rule_is_refused_naming_it() {
     let previous = sealed_under("pg-reported-scope-v1", Default::default());
@@ -378,10 +385,6 @@ fn a_plan_sealed_under_the_previous_qualification_rule_is_refused_naming_it() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     let error = String::from_utf8_lossy(&out.stderr);
     assert!(error.contains("`pg-reported-scope-v1`"), "{error}");
-    assert!(
-        !error.contains("cannot yet enforce resolver pre/postconditions"),
-        "an unreadable rule fails validation before the capability refusal: {error}"
-    );
     assert_eq!(
         target.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
@@ -654,10 +657,6 @@ fn current_resolver_artifacts_cannot_bypass_required_evidence_on_apply() {
             !error.contains("no longer matches the artifact approved"),
             "{error}"
         );
-        assert!(
-            !error.contains("cannot yet enforce resolver pre/postconditions"),
-            "invalid evidence must fail validation before the capability refusal: {error}"
-        );
         assert!(!error.is_empty(), "{out:?}");
         assert_eq!(
             target.accept().unwrap_err().kind(),
@@ -666,8 +665,11 @@ fn current_resolver_artifacts_cannot_bypass_required_evidence_on_apply() {
     }
 }
 
+/// A resolved plan's key is checked before apply connects (#616): a target
+/// that names no environment has no key, and the refusal names the key the
+/// plan was sealed under and the remedy.
 #[test]
-fn unsupported_resolver_apply_still_refuses_before_contacting_the_target() {
+fn a_resolved_plan_without_its_key_is_refused_before_contacting_the_target() {
     let plan = resolved_plan();
     let artifact = Artifact::new(&serde_json::to_value(&plan).unwrap());
     std::fs::write(artifact.0.join("pbps.yml"), "dialect: postgres\n").unwrap();
@@ -691,11 +693,15 @@ fn unsupported_resolver_apply_still_refuses_before_contacting_the_target() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let error = String::from_utf8_lossy(&out.stderr);
     assert!(
-        String::from_utf8_lossy(&out.stderr)
-            .contains("cannot yet enforce resolver pre/postconditions"),
-        "{out:?}"
+        error.contains(&format!(
+            "sealed under fingerprint key {}, and no key is configured",
+            "01".repeat(8)
+        )),
+        "{error}"
     );
+    assert!(error.contains("Plan again"), "{error}");
     assert_eq!(
         target.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
@@ -703,12 +709,12 @@ fn unsupported_resolver_apply_still_refuses_before_contacting_the_target() {
 }
 
 #[test]
-fn the_viewer_distinguishes_unsupported_database_plans_from_offline_previews() {
+fn the_viewer_shows_a_resolved_plan_as_a_deployment_with_its_evidence() {
     use std::io::Write;
     use std::process::Stdio;
     let mut cases = vec![];
     for (origin, title) in [
-        (PlanOrigin::ResolvedDatabase, "Unsupported deployment plan"),
+        (PlanOrigin::ResolvedDatabase, "Deployment plan"),
         (PlanOrigin::Database, "Deployment plan"),
         (PlanOrigin::Preview, "Preview plan"),
     ] {
@@ -721,9 +727,11 @@ fn the_viewer_distinguishes_unsupported_database_plans_from_offline_previews() {
         let out = artifact.explain("json");
         assert!(out.status.success(), "{out:?}");
         let served = pbps_ui::contract::parse("explain", &out.stdout, 0).unwrap();
-        cases.push(
-            serde_json::json!({"title": title, "response": String::from_utf8(served).unwrap()}),
-        );
+        cases.push(serde_json::json!({
+            "title": title,
+            "resolved": origin == PlanOrigin::ResolvedDatabase,
+            "response": String::from_utf8(served).unwrap()
+        }));
     }
     let node = std::env::var_os("PBPS_TEST_NODE").unwrap_or_else(|| "node".into());
     let mut child = Command::new(node)
@@ -759,7 +767,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
     for (const other of CASES.filter(other => other.title !== item.title)) assert(!titles.includes(other.title));
     // A resolved plan's provenance, read from its JSON (#1517); none for
     // any other plan.
-    const resolved = item.title === "Unsupported deployment plan";
+    const resolved = item.resolved;
     assert(titles.includes("Resolver evidence") === resolved, JSON.stringify(titles));
     const lines = [...elements.content.walk()].filter(e => e.tagName === "p").map(e => e.textContent);
     assert(lines.includes("scratch (server scratch, supplied)") === resolved, JSON.stringify(lines));
@@ -776,4 +784,49 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Evidence naming a runtime this build does not run, such as a measured
+/// profile #1636 retired, is refused as an unknown runtime with the remedy,
+/// before the target is contacted (#616).
+#[test]
+fn evidence_naming_an_unknown_runtime_is_refused_with_the_remedy() {
+    let mut value = serde_json::to_value(resolved_plan()).unwrap();
+    value["analysis"]["evidence"]["qualification"]["runtime"] =
+        serde_json::json!({"kind": "measured", "image": "retired"});
+    let artifact = Artifact::new(&value);
+    std::fs::write(artifact.0.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let connection = format!(
+        "postgres://unused@{}/unused?sslmode=disable",
+        target.local_addr().unwrap()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_pbps"))
+        .current_dir(&artifact.0)
+        .args([
+            "apply",
+            "--plan",
+            "plan.json",
+            "--db",
+            &connection,
+            "--checksum",
+            &"0".repeat(64),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        error.contains("names the runtime `measured`, which this build does not run"),
+        "{error}"
+    );
+    assert!(error.contains("Plan again with this build"), "{error}");
+    assert_eq!(
+        target.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    // Negative: the resolver's own runtime reads.
+    let readable = Artifact::new(&serde_json::to_value(resolved_plan()).unwrap());
+    assert!(readable.explain("text").status.success());
 }

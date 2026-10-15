@@ -287,6 +287,34 @@ fn resolver_plans_pass_the_ordinary_connected_checks() {
     resolver_publication::ordinary_checks(&server(), false);
 }
 
+#[test]
+#[ignore = "needs live postgres"]
+fn resolver_plans_apply_with_their_sealed_checks() {
+    resolver_publication::applied(&server());
+    resolver_publication::applied(&old_server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_resolved_plan_is_refused_before_ddl_when_a_sealed_input_moved() {
+    resolver_publication::refused_before_ddl(&server());
+    resolver_publication::refused_before_ddl(&old_server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_resolved_plan_closes_over_what_it_installs_under_the_targets_names() {
+    resolver_publication::installed(&server());
+    resolver_publication::installed(&old_server());
+}
+
+#[test]
+#[ignore = "needs live postgres"]
+fn a_resolved_plan_rolls_back_when_its_closing_check_finds_another_writer() {
+    resolver_publication::closing_refusals(&server());
+    resolver_publication::closing_refusals(&old_server());
+}
+
 #[path = "support/resolver_discovery.rs"]
 mod resolver_discovery;
 

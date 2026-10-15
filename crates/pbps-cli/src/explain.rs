@@ -37,13 +37,9 @@ use crate::{db, output, report};
 /// change list would be a second implementation of the gate's own arithmetic.
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct Explanation {
-    /// Database-derived and supported by this build's apply implementation.
-    /// This does not assert that the target or risk approval is ready.
+    /// Database-derived, with or without resolver evidence (#616). This
+    /// does not assert that the target or risk approval is ready.
     pub applyable: bool,
-    /// Why a database-derived artifact cannot be applied by this build.
-    /// An absent value does not turn an offline preview into an applyable plan.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub apply_limitation: Option<&'static str>,
     pub dialect: String,
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,8 +60,7 @@ pub struct Explanation {
     pub risks: Vec<RiskDetail>,
     /// The exact command that approves this plan, `--allow` included — or, for
     /// a preview, the command that produces an applyable plan instead. Which
-    /// one it is is [`Explanation::applyable`]. Empty when this build cannot
-    /// apply the artifact; [`Explanation::apply_limitation`] explains why.
+    /// one it is is [`Explanation::applyable`].
     pub approve_with: String,
 
     /// Set only when the plan path could not be spelled safely for every shell
@@ -356,11 +351,8 @@ fn explain(
     // whatever `--allow` it is given (§7.3). Printing one anyway would have the
     // report contradict its own first line — which says the plan is a preview —
     // and hand the reviewer something that cannot work.
-    let apply_limitation = crate::engine::resolver_apply_limitation(plan);
-    let applyable = plan.origin.is_applyable() && apply_limitation.is_none();
-    let approve = if apply_limitation.is_some() {
-        String::new()
-    } else if applyable {
+    let applyable = plan.origin.is_applyable();
+    let approve = if applyable {
         // `apply` requires exactly one of --db / --env, so a command printed
         // without one fails the moment it is pasted. The environment's *name*
         // is used when there is one; a --db target contributes only its
@@ -404,7 +396,6 @@ fn explain(
     let preflight = dialect.preflight(&names);
     Ok(Explanation {
         applyable,
-        apply_limitation,
         dialect: plan.dialect.clone(),
         created_at: plan.created_at.clone(),
         git_sha: plan.git_sha.clone(),
@@ -420,8 +411,7 @@ fn explain(
         role_count,
         risks,
         approve_with: approve,
-        plan_path: (apply_limitation.is_none() && plan_arg == placeholder("plan path"))
-            .then_some(literal),
+        plan_path: (plan_arg == placeholder("plan path")).then_some(literal),
         probes: preflight
             .probes
             .into_iter()
@@ -561,12 +551,6 @@ fn target_state(target: &db::Target) -> anyhow::Result<TargetState> {
 
 fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
     let mut out = Vec::new();
-    if let Some(limitation) = e.apply_limitation {
-        out.push(output::Finding::warning(
-            "plan.apply-unsupported",
-            limitation,
-        ));
-    }
     if plan.origin == PlanOrigin::Preview {
         out.push(output::Finding::warning(
             "plan.preview",
@@ -615,7 +599,7 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         match plan.origin {
             PlanOrigin::Database => "computed against the target environment — applyable",
             PlanOrigin::ResolvedDatabase =>
-                "computed against the target with sealed resolver evidence",
+                "computed against the target with sealed resolver evidence — applyable",
             PlanOrigin::Preview => "computed offline — a preview; `apply` will refuse it",
         }
     ));
@@ -728,21 +712,15 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         }
     }
 
-    if let Some(limitation) = e.apply_limitation {
-        out.push_str(&format!(
-            "\nThis plan cannot be applied by this build:\n  {limitation}\n"
-        ));
-    } else {
-        out.push_str(&format!(
-            "\n{}\n  {}\n",
-            if e.applyable {
-                "To approve and run it:"
-            } else {
-                "This plan cannot be applied. To produce one that can:"
-            },
-            e.approve_with
-        ));
-    }
+    out.push_str(&format!(
+        "\n{}\n  {}\n",
+        if e.applyable {
+            "To approve and run it:"
+        } else {
+            "This plan cannot be applied. To produce one that can:"
+        },
+        e.approve_with
+    ));
     if let Some(literal) = &e.plan_path {
         out.push_str(&format!(
             "\n  {} is:\n    {literal}\n  \

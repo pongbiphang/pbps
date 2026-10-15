@@ -92,13 +92,13 @@ test runtime for the shipped browser module, not a product dependency.
 ## Planned engine-assisted planning
 
 [ADR-0016](ADR-0016-engine-assisted-planning.md) and
-[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered)
+[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered)
 are accepted design; initial read-only `doctor` environment discovery (#597),
 resolver selection/policy (#606), engine compatibility qualification (#610,
 #611) and the resolver's server and Docker scratch runs (#1672, #1674) are
 implemented, and PostgreSQL planning publishes sealed binding evidence (#1516)
-that `explain` shows from the plan (#1517). Applying a resolved plan remains
-planned (#616). The design
+that `explain` shows from the plan (#1517), and `apply` rechecks it from the
+target connection alone (#616). The design
 preserves the boundaries
 above: CLI owns resolver lifecycle and reporting; the engine crates own
 environment queries, compatibility rules, scratch DDL and binding extraction;

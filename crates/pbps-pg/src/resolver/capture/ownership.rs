@@ -531,9 +531,14 @@ pub(super) fn classify(
             };
             if allowed {
                 // A generated relation (a key's index, an identity sequence)
-                // has attribute rows that go with it, as a declared index's do.
+                // has attribute rows that go with it, as a declared index's do,
+                // and a sequence's system attributes as a declared table's do:
+                // the closing read finds them under the name the target gave
+                // the sequence, which the scratch's need not be (#616). An
+                // index has none.
                 if made.class == "pg_class" {
                     physical_attributes(capture, &mut owned, made, &owner, false)?;
+                    physical_attributes(capture, &mut owned, made, &owner, true)?;
                 }
                 assign(&mut owned, made.clone(), owner)?;
                 changed = true;

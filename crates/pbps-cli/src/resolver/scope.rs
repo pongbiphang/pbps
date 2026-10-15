@@ -91,6 +91,13 @@ pub enum Principals {
 /// rule's so that no authorization digest equals a catalog one.
 const AUTHORIZATION_RULE: &str = "pbps/authorization-context/v1";
 
+fn authorization_digest(
+    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    canonical: &[u8],
+) -> String {
+    crate::resolver::sealing::hex(key.fingerprint(AUTHORIZATION_RULE, "authorization", canonical))
+}
+
 /// The schemas whose authorization is read and reproduced for a request:
 /// the in-scope schemas and, on PostgreSQL, the write-path extras, without
 /// the `pg_temp` alias, which names no persistent schema. SQL Server has no
@@ -326,6 +333,19 @@ impl Authorization {
     /// Persist both sides under the configured environment key. These bytes
     /// come from the measured context and the adapter's grant projection, not
     /// from a process-key digest or a caller-chosen expected hash.
+    /// What [`Self::persisted`] seals as its `before` for this context, so
+    /// apply can compare the context it reads now with the plan's `before`
+    /// and `after` (#616). `None` where nothing is sealed.
+    pub(crate) fn digest(
+        &self,
+        key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
+    ) -> Option<String> {
+        match self {
+            Self::Postgres(context) => Some(authorization_digest(key, &context.canonical())),
+            Self::Mssql(_) => None,
+        }
+    }
+
     pub fn persisted(
         &self,
         key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
@@ -347,12 +367,7 @@ impl Authorization {
                 );
             }
         };
-        let fingerprint = |bytes: &[u8]| {
-            key.fingerprint(AUTHORIZATION_RULE, "authorization", bytes)
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect()
-        };
+        let fingerprint = |bytes: &[u8]| authorization_digest(key, bytes);
         Ok(pbps_model::resolver::AuthorizationCondition {
             rule: self.rule().into(),
             before: fingerprint(&before),
