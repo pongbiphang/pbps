@@ -51,11 +51,13 @@ pub(crate) fn decode(raw: &str, path: &Path) -> anyhow::Result<SavedPlan> {
 /// a name a type refused — and that text is the file's. The sentence is one line
 /// by construction, so every control character in it came from the artifact and
 /// is shown escaped, like the other values a refusal takes from a plan
-/// (DEC-2032.1). Held as text rather than as `serde_json::Error` because
-/// nothing downcasts the cause, and the error's `Display` is the only thing
-/// printed.
+/// (DEC-2032.1), and so is its backslash: serde repeats some of that text raw
+/// and some behind `Debug` escapes, and only a doubled backslash tells a line
+/// break from the two characters `\n` in both (#2038). Held as text rather than
+/// as `serde_json::Error` because nothing downcasts the cause, and the error's
+/// `Display` is the only thing printed.
 #[derive(Debug, thiserror::Error)]
-#[error("{}", pbps_model::escape::EscapedSentence(.0))]
+#[error("{}", pbps_model::escape::Escaped(.0))]
 struct Echoed(String);
 
 pub(crate) fn require_current(version: u32, path: &Path) -> anyhow::Result<()> {

@@ -1267,12 +1267,25 @@ evidence (`EvidenceError::Rule`), the engine the evidence names
 could put a line break in any of them, which starts a line the tool never wrote,
 or an escape sequence, which erases or rewrites the lines before it (#2032,
 from the review of #2028). Each of these goes through
-`pbps_model::escape::Escaped` (`EscapedSentence` for serde's sentence, which
-already carries `Debug` escapes of its own): the control characters, the line
+`pbps_model::escape::Escaped`: the control characters, the line
 and paragraph separators, and the zero-width and bidirectional marks are shown
 as `\n`, `\r`, `\t` or `\u{..}`, the backslash is doubled so that an escape
 cannot be mistaken for text the file held, and every other character, every
 non-ASCII letter included, is left as the file spells it.
+
+serde's sentence goes through the same `Escaped`, backslashes doubled like the
+rest, although serde quotes some of the text it stops at behind Rust's `Debug`
+escapes (`invalid type: string "a\nb"`) and some raw (an unknown variant or
+field). The first version of this rule left the backslash alone in that one
+sentence, so that serde's own escapes would not be doubled, and a variant that
+held the two characters `\n` then read exactly like one that held a line break
+(#2038). Doubling everywhere costs only readability, and only for a quoted
+string that held a control character, a quote or a backslash, which shows as
+`string "a\\nb"` for a line break; an ordinary refusal (`string "twelve"`, a
+missing field, a plain unknown variant) is unchanged. Building the sentence from
+`serde_json::Error`'s classification instead was not taken: it exposes the
+category and the position and not the text, so the reviewer would lose the
+value the refusal is about. `EscapedSentence` is removed.
 
 The alternative was to refuse a control character when the plan is decoded, so
 that no printer downstream could ever print one, and for the three
@@ -1300,4 +1313,8 @@ variant, each carrying a line break, a terminal sequence, a carriage return and
 a right-to-left override, through `explain` in both formats and through `apply`:
 stderr is one line with no raw control character but its final newline, and
 the escaped value is in it), by `a_refusal_names_a_unicode_value_as_the_file_spells_it`
-(a non-ASCII rule is shown unchanged) and by the unit tests in `escape.rs`.
+(a non-ASCII rule is shown unchanged), by
+`a_decode_refusal_tells_a_line_break_from_the_two_characters_backslash_n` (an
+unknown variant and a string where a number belongs, each holding a line break
+in one file and the two characters `\n` in another, refused differently by
+`explain` in both formats and by `apply`) and by the unit tests in `escape.rs`.
