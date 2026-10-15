@@ -764,6 +764,52 @@ mod tests {
         ),
     ];
 
+    /// Why a rule history is not a valid record, if it is not. Each entry's names
+    /// are read as a set: the list order is only how the history is written, so
+    /// a later entry that reorders the names before it compares nothing new
+    /// and would invalidate every saved plan under the earlier identifier for
+    /// no change (#2034).
+    fn refuse_history(history: &[(&str, &[&str])]) -> Result<(), String> {
+        let sets: Vec<std::collections::BTreeSet<&str>> = history
+            .iter()
+            .map(|(identifier, names)| {
+                let set: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+                if set.len() == names.len() {
+                    Ok(set)
+                } else {
+                    Err(format!("{identifier} lists a name twice"))
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        for (pair, sets) in history.windows(2).zip(sets.windows(2)) {
+            if pair[0].0 == pair[1].0 {
+                return Err(format!("{} is reused", pair[1].0));
+            }
+            if sets[0] == sets[1] {
+                return Err(format!(
+                    "{} compares what {} compared",
+                    pair[1].0, pair[0].0
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_history_entry_that_only_reorders_or_repeats_names_is_refused() {
+        // Negative: the same facts in another order are not a new rule, and
+        // neither is a name listed twice or an identifier used twice.
+        assert!(refuse_history(&[("a", &["x", "y"]), ("b", &["y", "x"])]).is_err());
+        assert!(refuse_history(&[("a", &["x", "y"]), ("b", &["x", "x", "y"])]).is_err());
+        assert!(refuse_history(&[("a", &["x", "x"]), ("b", &["y"])]).is_err());
+        assert!(refuse_history(&[("a", &["x"]), ("a", &["y"])]).is_err());
+        // Positive: a changed set is accepted in either direction, whatever
+        // the order it is written in.
+        assert!(refuse_history(&[("a", &["x", "y"]), ("b", &["y"])]).is_ok());
+        assert!(refuse_history(&[("a", &["y"]), ("b", &["z", "y"])]).is_ok());
+        assert!(refuse_history(&[("a", &["x"])]).is_ok());
+    }
+
     #[test]
     fn the_compared_facts_move_with_the_rule_identifier() {
         let (current, pinned) = RULE_HISTORY.last().unwrap();
@@ -771,7 +817,6 @@ mod tests {
         let compared: std::collections::BTreeSet<&str> =
             report.facts.keys().map(String::as_str).collect();
         let pinned_set: std::collections::BTreeSet<&str> = pinned.iter().copied().collect();
-        assert_eq!(pinned_set.len(), pinned.len(), "a name is listed twice");
         assert_eq!(
             REPORTED_RULE, *current,
             "REPORTED_RULE is not the newest entry of RULE_HISTORY: a bump appends the new \
@@ -787,16 +832,9 @@ mod tests {
             compared.difference(&pinned_set).collect::<Vec<_>>(),
             pinned_set.difference(&compared).collect::<Vec<_>>(),
         );
-        // Negative: a bump that compares the same facts is not a new rule, and
-        // an identifier is not reused for another set.
-        for pair in RULE_HISTORY.windows(2) {
-            assert_ne!(pair[0].0, pair[1].0, "an identifier is reused");
-            assert_ne!(
-                pair[0].1, pair[1].1,
-                "{} compares what {} compared",
-                pair[1].0, pair[0].0
-            );
-        }
+        // A bump that compares the same facts is not a new rule, an identifier
+        // is not reused for another set, and no entry lists a name twice.
+        assert_eq!(refuse_history(RULE_HISTORY), Ok(()));
         // Only the newest identifier is read; each earlier one is refused by
         // name, whatever it compared.
         assert_eq!(ACCEPTED_RULES, [REPORTED_RULE]);
