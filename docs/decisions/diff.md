@@ -5502,6 +5502,13 @@ a statement-level check of intermediate names.** (#1964)
     `rename_order` reads it (review of #1346).
   - A catalog occupant goes with its table: it leaves when the table is
     dropped and claims its name again in the schema the table moves to.
+  - An occupant that belongs to a column leaves at the first step that may
+    drop or rename it: an owned sequence, or a SQL Server default constraint.
+    Such a step drops, renames or retypes the column, gives it another
+    default or numbering, or renames its table with that default. Whether the
+    step really gives the name up is the engine's walk to say (`object_order`,
+    `order_carried_moves`). Reading it as given up can let a misorder pass,
+    and never refuses a valid plan.
 - **Statement level.** A move to another schema passes through its old name in
   the new schema, between `SET SCHEMA` and `RENAME` on PostgreSQL and between
   `TRANSFER` and `sp_rename` on SQL Server. That name is in neither the

@@ -376,3 +376,66 @@ fn a_name_two_objects_keep_is_contested_not_misordered() {
     let (found, _, _) = plan.run(&[0, 1], &Slotted { exact: true }, None);
     assert_eq!(held(&found), ["contested app.shared"], "{found:?}");
 }
+
+/// A catalog occupant that belongs to a column, a SQL Server default
+/// constraint here, leaves at the step that changes that column's default.
+/// A table created at its name waits for that step. Where no step touches the
+/// column, the name is held whatever the order: contested, not misordered.
+#[test]
+fn a_columns_default_constraint_leaves_with_the_columns_default() {
+    let column_uid = Uid::derived(UidKind::Column, "app.t.c", 0);
+    let mut plan = Plan::new(
+        &[("t", "app.t")],
+        &[("t", "app.t"), ("n", "app.DF_t_c")],
+        vec![
+            Change::AlterColumnDefault {
+                uid: column_uid.clone(),
+                column: name("app.t").column("c"),
+                from: Some("1".into()),
+                to: None,
+            },
+            Change::CreateTable {
+                uid: uid("n"),
+                name: name("app.DF_t_c"),
+                table: Box::default(),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ],
+    );
+    for (schema, ids) in [
+        (&mut plan.before, &mut plan.before_ids),
+        (&mut plan.after, &mut plan.after_ids),
+    ] {
+        schema
+            .tables
+            .get_mut(&name("app.t"))
+            .unwrap()
+            .columns
+            .insert("c".into(), pbps_model::Column::new("int".parse().unwrap()));
+        ids.columns
+            .insert(column_uid.clone(), name("app.t").column("c"));
+    }
+    let facts = CatalogFacts {
+        occupants: vec![pbps_dialect::slots::Occupant {
+            slot: SlotKey {
+                namespace: Namespace::Relations("app".into()),
+                name: "DF_t_c".into(),
+            },
+            kind: "default constraint".into(),
+            owner: Some(name("app.t")),
+            column: Some("c".into()),
+        }],
+        ..CatalogFacts::default()
+    };
+    let exact = Slotted { exact: true };
+    let (ok, _, _) = plan.run(&[0, 1], &exact, Some(&facts));
+    assert!(ok.is_empty(), "{ok:?}");
+    let (wrong, _, _) = plan.run(&[1, 0], &exact, Some(&facts));
+    assert_eq!(held(&wrong), ["held app.DF_t_c"], "{wrong:?}");
+
+    // Nothing takes the default away: no order frees the name.
+    plan.logical.remove(0);
+    let (kept, _, _) = plan.run(&[0], &exact, Some(&facts));
+    assert_eq!(held(&kept), ["contested app.DF_t_c"], "{kept:?}");
+}

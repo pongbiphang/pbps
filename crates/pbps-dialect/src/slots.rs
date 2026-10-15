@@ -84,6 +84,9 @@ pub struct Occupant {
     /// The table it belongs to, by the baseline's name: it goes where that
     /// table goes and leaves when that table is dropped.
     pub owner: Option<pbps_model::TableName>,
+    /// The owner's column it belongs to, by the baseline's name: an owned
+    /// sequence, or a column's default constraint.
+    pub column: Option<String>,
 }
 
 /// The slot `address` takes, by the dialect's namespace answers.

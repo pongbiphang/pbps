@@ -799,6 +799,7 @@ impl NameFacts {
                     },
                     kind: o.kind.to_owned(),
                     owner: o.owner.clone(),
+                    column: o.owner_column.clone(),
                 })
                 .collect(),
             ..CatalogFacts::default()
@@ -1130,6 +1131,7 @@ fn object_slots(
                 slot: key(&o.name),
                 kind: o.kind.clone(),
                 owner: o.parent.clone(),
+                column: o.parent_column.clone(),
             })
             .collect(),
         compared: candidates.iter().map(key).collect(),

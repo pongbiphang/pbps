@@ -294,6 +294,9 @@ enum Occupier {
     Catalog {
         kind: String,
         owner: Option<ObjectKey>,
+        /// The owner's column it belongs to, by the column's key and the
+        /// baseline's name.
+        column: Option<(ObjectKey, String)>,
     },
 }
 
@@ -337,16 +340,20 @@ pub fn verify(
     }
     if let Some(facts) = facts {
         for o in facts.occupants.iter().filter(|o| !declared(before, o)) {
-            let owner = o
+            let table = o
                 .owner
                 .as_ref()
-                .and_then(|t| base_table_named(owners, before, t))
-                .map(|t| t.table_key());
+                .and_then(|t| base_table_named(owners, before, t));
+            let column = table
+                .as_ref()
+                .zip(o.column.as_ref())
+                .and_then(|(t, c)| t.column(owners, c).map(|k| (k, c.clone())));
             held.push((
                 o.slot.clone(),
                 Occupier::Catalog {
                     kind: o.kind.clone(),
-                    owner,
+                    owner: table.map(|t| t.table_key()),
+                    column,
                 },
             ));
         }
@@ -368,10 +375,13 @@ pub fn verify(
                             .effects
                             .iter()
                             .any(|fx| fx.releases.iter().any(|(rs, rh)| rs == h && rh == k)),
-                        // An occupant leaves with its table, which the plan may
-                        // drop or move: the replay reads that, and a name it
-                        // still holds here is held whatever the order.
-                        Occupier::Catalog { owner, .. } => owner.is_some(),
+                        // An occupant leaves with its table or its column;
+                        // one no step takes away holds the name whatever the
+                        // order.
+                        Occupier::Catalog { .. } => operations.iter().any(|op| {
+                            let key = op.key(owners).ok();
+                            leaves(op, key.as_ref(), who) || moves(op, key.as_ref(), who)
+                        }),
                     };
                     return Some((who.describe(), gives_up));
                 }
@@ -393,16 +403,13 @@ pub fn verify(
         // the new schema with a move, where it claims its name again.
         let mut landed = Vec::new();
         let key = op.key(owners).ok();
-        let owned_here = |who: &Occupier| matches!(who, Occupier::Catalog { owner: Some(o), .. } if Some(o) == key.as_ref());
-        if let Change::DropTable { .. } = op.change() {
-            held.retain(|(_, who)| !owned_here(who));
-        }
+        held.retain(|(_, who)| !leaves(op, key.as_ref(), who));
         if let Change::RenameTable { from, to, .. } = op.change()
             && from.schema != to.schema
         {
             let (moving, staying): (Vec<_>, Vec<_>) = std::mem::take(&mut held)
                 .into_iter()
-                .partition(|(_, who)| owned_here(who));
+                .partition(|(_, who)| moves(op, key.as_ref(), who));
             held = staying;
             for (mut s, who) in moving {
                 if let pbps_dialect::slots::Namespace::Relations(schema) = &mut s.namespace {
@@ -486,4 +493,64 @@ fn declared(before: Snapshot<'_>, o: &pbps_dialect::slots::Occupant) -> bool {
             .schema
             .modules
             .contains_key(&pbps_model::ModuleId::Named(here))
+}
+
+/// Whether `op`, whose own key is `key`, takes a catalog occupant out of its
+/// schema: its table dropped, or a column's own occupant (an owned sequence, a
+/// default constraint) at the first step that may drop or rename it, which is
+/// its column dropped, renamed, retyped or given another default or
+/// numbering, or its table renamed with that default (`defaults`). Whether
+/// that step really gives the name up is the engine's walk (`object_order`,
+/// `order_carried_moves`); reading it as given up can let a misorder pass,
+/// never refuse a valid plan (DEC-1964.2).
+fn leaves(op: &Operation, key: Option<&ObjectKey>, who: &Occupier) -> bool {
+    let Occupier::Catalog { owner, column, .. } = who else {
+        return false;
+    };
+    let owned = owner.is_some() && owner.as_ref() == key;
+    if let Change::DropTable { .. } = op.change() {
+        return owned;
+    }
+    let Some((column, column_name)) = column else {
+        return false;
+    };
+    if let Change::RenameTable { defaults, .. } = op.change() {
+        return owned && defaults.contains(column_name);
+    }
+    matches!(
+        op.change(),
+        Change::DropColumn { .. }
+            | Change::RenameColumn { .. }
+            | Change::AlterColumnType { .. }
+            | Change::AlterColumnDefault { .. }
+            | Change::AlterColumnNumbering { .. }
+    ) && key
+        .and_then(column_of)
+        .is_some_and(|k| Some(k) == column_of(column))
+}
+
+/// The column a key is about: a column's own key, or its default's, which is
+/// what a default change acts on.
+fn column_of(key: &ObjectKey) -> Option<&pbps_model::operation::ColumnKey> {
+    match key {
+        ObjectKey::Column(c) | ObjectKey::Default(c) => Some(c),
+        ObjectKey::Table(_)
+        | ObjectKey::Role(_)
+        | ObjectKey::Module(_)
+        | ObjectKey::NotNull(_)
+        | ObjectKey::Part { .. }
+        | ObjectKey::Row { .. }
+        | ObjectKey::Grant { .. } => None,
+    }
+}
+
+/// Whether `op` moves a catalog occupant's table to another schema, which
+/// carries the occupant there.
+fn moves(op: &Operation, key: Option<&ObjectKey>, who: &Occupier) -> bool {
+    let Occupier::Catalog { owner, .. } = who else {
+        return false;
+    };
+    matches!(op.change(), Change::RenameTable { from, to, .. } if from.schema != to.schema)
+        && owner.is_some()
+        && owner.as_ref() == key
 }
