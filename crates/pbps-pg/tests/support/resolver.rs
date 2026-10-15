@@ -1199,6 +1199,18 @@ mod recon610 {
         assert!(!narrowed.roles.contains_key(&owner));
         let stale = verify(&mut run, &map, &narrowed, &schemas).await.unwrap();
         assert!(stale.contains(&format!("role:{owner}:extra")), "{stale:?}");
+        // And the other way: a role the target lists and the reproduction
+        // lacks is named too (#2049).
+        let mut widened = narrowed.clone();
+        widened.roles.insert(
+            "a_role_only_the_target_has".into(),
+            widened.roles[&reader].clone(),
+        );
+        let absent = verify(&mut run, &map, &widened, &schemas).await.unwrap();
+        assert!(
+            absent.contains(&"role:a_role_only_the_target_has:absent".to_owned()),
+            "{absent:?}"
+        );
 
         drop(planning);
         drop(setup);
@@ -1449,6 +1461,32 @@ mod recon610_super {
             "a first grant on a default ACL did not reproduce: {after:?}"
         );
 
+        // A closure that differs from the target's is refused for a superuser
+        // as for anyone, although a superuser's answers do not depend on it:
+        // the reproduction has a role the target no longer lists, and lacks
+        // one the target has (#2049).
+        let mut narrowed = expected.clone();
+        let dropped = narrowed
+            .roles
+            .keys()
+            .find(|role| **role != target.principal.effective && !role.starts_with("pg_"))
+            .cloned()
+            .expect("the run login is in a superuser's closure");
+        narrowed.roles.remove(&dropped);
+        let extra = verify(&mut run, &map, &narrowed, &schemas).await.unwrap();
+        assert_eq!(extra, [format!("role:{dropped}:extra")], "{extra:?}");
+        let mut widened = expected.clone();
+        widened.roles.insert(
+            "a_role_only_the_target_has".into(),
+            widened.roles[&dropped].clone(),
+        );
+        let absent = verify(&mut run, &map, &widened, &schemas).await.unwrap();
+        assert_eq!(
+            absent,
+            ["role:a_role_only_the_target_has:absent".to_owned()],
+            "{absent:?}"
+        );
+
         drop(planning);
         drop(run);
         drop(scratch_admin);
@@ -1470,5 +1508,161 @@ mod recon610_super {
             .execute(&format!("DROP ROLE {run_login}"))
             .await
             .unwrap();
+    }
+}
+
+/// The run's role reproduction is sent in batches (#2049): a batch is one
+/// implicit transaction, so what a failure leaves and what cleanup reaches
+/// are measured here on a real server, on the scratch cluster that only the
+/// resolver's runs use.
+mod recon2049 {
+    use super::*;
+    use pbps_db::resolver::environment::DeploymentPrincipal;
+    use pbps_pg::resolver::ROLE_BATCH;
+    use pbps_pg::resolver::authorization::{
+        AuthorizationContext, RoleAttributes, RoleMap, reconstruct,
+    };
+    use std::collections::BTreeMap;
+
+    /// More than two batches, so a failure in the second leaves the first
+    /// behind.
+    const ROLES: usize = ROLE_BATCH * 2 + 100;
+
+    fn server() -> String {
+        std::env::var("PBPS_TEST_PG_SCRATCH_DB").unwrap()
+    }
+
+    /// A target whose deployer reaches `ROLES` roles, none of which exist on
+    /// the server the reproduction runs on.
+    fn context() -> AuthorizationContext {
+        let attributes = RoleAttributes {
+            superuser: false,
+            inherit: true,
+            bypass_rls: false,
+            can_set: true,
+            inherits: true,
+        };
+        AuthorizationContext {
+            principal: DeploymentPrincipal {
+                login: "dep".into(),
+                effective: "dep".into(),
+                superuser: false,
+            },
+            schemas: BTreeMap::new(),
+            roles: (0..ROLES)
+                .map(|i| (format!("crowd_{i:05}"), attributes.clone()))
+                .collect(),
+            settings: BTreeMap::new(),
+        }
+    }
+
+    /// How many of `names` exist on the server.
+    async fn existing(admin: &mut Conn, names: &[String]) -> usize {
+        let list = names
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = admin
+            .query(&format!(
+                "SELECT count(*)::bigint FROM pg_roles WHERE rolname IN ({list})"
+            ))
+            .await
+            .unwrap();
+        rows[0].try_get_at::<i64>(0).unwrap().unwrap() as usize
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_SCRATCH_DB (see scripts/live-tests-pg.sh)"]
+    async fn a_reproduction_that_fails_partway_names_the_failing_role_and_leaves_none_after_cleanup()
+     {
+        let pid = std::process::id();
+        let run_login = format!("pbps_r2049a_login_{pid}");
+        let mut admin = Conn::connect(Driver::Postgres, &server()).await.unwrap();
+        admin
+            .execute(&format!("CREATE ROLE {run_login} LOGIN"))
+            .await
+            .unwrap();
+        let map = RoleMap::generate(&context(), &[], &run_login, &format!("a{pid}"));
+        let names = map.run_local_names();
+        assert_eq!(names.len(), ROLES + 1);
+        // The role in the middle of the second batch is already taken, as a
+        // name on a shared server can be.
+        let taken = names[ROLE_BATCH + ROLE_BATCH / 2].clone();
+        admin
+            .execute(&format!("CREATE ROLE \"{taken}\""))
+            .await
+            .unwrap();
+        let outcome = reconstruct(&mut admin, &map, &context(), "pbps_test").await;
+        let error = outcome.expect_err("a taken name is refused").to_string();
+        let left = existing(&mut admin, &names).await;
+        let dropped = pbps_pg::resolver::drop_roles(&mut admin, &names).await;
+        let after = existing(&mut admin, &names).await;
+        admin
+            .execute(&format!("DROP ROLE {run_login}"))
+            .await
+            .unwrap();
+        // The engine's own sentence for the statement that failed, naming the
+        // role: a batch does not swallow or rewrite it.
+        assert!(
+            error.contains(&taken) && error.contains("already exists"),
+            "{error}"
+        );
+        // The first batch was committed, so it is there to be dropped; the
+        // second ran as one transaction and left only the name that was
+        // already taken, so no role is half-made.
+        assert_eq!(left, ROLE_BATCH + 1, "the first batch and the taken name");
+        // Cleanup reaches every recorded name, whatever batch it was in.
+        assert!(dropped.is_empty(), "{dropped:?}");
+        assert_eq!(after, 0, "no run-local role is left");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_SCRATCH_DB (see scripts/live-tests-pg.sh)"]
+    async fn cleanup_names_exactly_the_role_that_cannot_be_dropped_and_drops_the_rest() {
+        let pid = std::process::id();
+        let run_login = format!("pbps_r2049b_login_{pid}");
+        let table = format!("pbps_r2049b_t_{pid}");
+        let mut admin = Conn::connect(Driver::Postgres, &server()).await.unwrap();
+        admin
+            .execute(&format!("CREATE ROLE {run_login} LOGIN"))
+            .await
+            .unwrap();
+        let map = RoleMap::generate(&context(), &[], &run_login, &format!("b{pid}"));
+        let names = map.run_local_names();
+        reconstruct(&mut admin, &map, &context(), "pbps_test")
+            .await
+            .unwrap();
+        let made = existing(&mut admin, &names).await;
+        // One role in the second batch owns something, so dropping it fails
+        // and takes its whole batch with it.
+        let owner = names[ROLE_BATCH + 7].clone();
+        admin
+            .execute(&format!(
+                "CREATE TABLE public.{table} (c int); ALTER TABLE public.{table} OWNER TO \"{owner}\""
+            ))
+            .await
+            .unwrap();
+        let failed = pbps_pg::resolver::drop_roles(&mut admin, &names).await;
+        let left = existing(&mut admin, &names).await;
+        // Negative control: once it owns nothing it goes, and so does the run.
+        admin
+            .execute(&format!("DROP TABLE public.{table}"))
+            .await
+            .unwrap();
+        let again = pbps_pg::resolver::drop_roles(&mut admin, &names).await;
+        let after = existing(&mut admin, &names).await;
+        admin
+            .execute(&format!("DROP ROLE {run_login}"))
+            .await
+            .unwrap();
+        assert_eq!(made, ROLES + 1, "every mapped role was created");
+        // Each drop is independent: the one that cannot go is named, and the
+        // others in its batch, which the batch rolled back, are dropped one
+        // at a time.
+        assert_eq!(failed, [owner]);
+        assert_eq!(left, 1, "only the role that owns a table is left");
+        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(after, 0);
     }
 }

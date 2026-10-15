@@ -324,6 +324,207 @@ async fn resolver_answers_a_managed_question_without_root_or_observation() {
     );
 }
 
+/// The first part of every crowd role's name; the rest is the process id, an
+/// underscore and a number.
+const CROWD_STEM: &str = "pbps_crowd2049_";
+
+/// How many roles one transaction creates or drops.
+///
+/// `CREATE ROLE` and `DROP ROLE` each hold a lock on the role until the
+/// transaction ends (one `pg_locks` row per role, measured on 18.6). The shared
+/// lock table holds `max_locks_per_transaction` x (`max_connections` +
+/// `max_prepared_transactions`) entries, 6400 by default and shared with every
+/// other session on the cluster, so ten thousand roles in one transaction fit
+/// only by slack and fail with `out of shared memory` (#2050).
+const CROWD_BATCH: u32 = 250;
+
+/// A crowd of `NOLOGIN` roles on the target's cluster that cannot outlive the
+/// test that made it.
+///
+/// A superuser deployer's closure is every role in its cluster, so these are
+/// what the run under test reproduces. Roles belong to the cluster and not to
+/// a test's database, so a crowd left behind by a failed run is read by every
+/// later test that lists the cluster's roles (#2050). A `Drop` cannot `.await`
+/// and the connection it would use may be the thing that failed, so the removal
+/// on drop runs on its own thread, runtime and connection, and so runs on a
+/// panic and on an early return alike.
+struct RoleCrowd {
+    server: String,
+    /// `pbps_crowd2049_<pid>_`: the pid keeps one run's roles from being
+    /// counted as another's.
+    prefix: String,
+    made: u32,
+    armed: bool,
+}
+
+impl RoleCrowd {
+    /// Starts the guard. Nothing is created until [`RoleCrowd::grow_to`].
+    fn arm(server: &str) -> Self {
+        Self {
+            server: server.to_owned(),
+            prefix: format!("{CROWD_STEM}{}_", std::process::id()),
+            made: 0,
+            armed: true,
+        }
+    }
+
+    /// Brings the crowd to `count` roles, [`CROWD_BATCH`] to a transaction.
+    /// Roles an earlier run left behind (any pid) are dropped first, so one bad
+    /// run cannot poison the next.
+    async fn grow_to(&mut self, admin: &mut Conn, count: u32) -> Result<(), String> {
+        if self.made == 0 {
+            drop_crowd_roles(admin, CROWD_STEM).await?;
+        }
+        while self.made < count {
+            let first = self.made + 1;
+            let last = (self.made + CROWD_BATCH).min(count);
+            admin
+                .execute(&format!(
+                    "DO $$ BEGIN FOR i IN {first}..{last} LOOP \
+                       EXECUTE format('CREATE ROLE %I NOLOGIN', '{}' || i); \
+                     END LOOP; END $$",
+                    self.prefix
+                ))
+                .await
+                .map_err(|e| format!("create crowd roles {first}..{last}: {e}"))?;
+            self.made = last;
+        }
+        Ok(())
+    }
+
+    /// Drops the crowd, and disarms the guard only once none is left.
+    async fn remove(&mut self, admin: &mut Conn) -> Result<(), String> {
+        drop_crowd_roles(admin, &self.prefix).await?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for RoleCrowd {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (server, prefix) = (self.server.clone(), self.prefix.clone());
+        // Never a panic from here: this may already be one unwinding, and a
+        // second aborts the process, taking the other tests' verdicts with it.
+        let outcome = std::thread::spawn(move || -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(async {
+                let mut conn = Conn::connect(Driver::Postgres, &server)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                drop_crowd_roles(&mut conn, &prefix).await
+            })
+        })
+        .join();
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => eprintln!("could not drop the `{}*` roles: {why}", self.prefix),
+            Err(_) => eprintln!(
+                "could not drop the `{}*` roles: the cleanup panicked",
+                self.prefix
+            ),
+        }
+    }
+}
+
+/// Drops every role whose name starts with `stem`, [`CROWD_BATCH`] to a
+/// transaction. The count is read again after each batch, and the rounds are
+/// bounded: a role that cannot be dropped is reported and not retried forever.
+async fn drop_crowd_roles(conn: &mut Conn, stem: &str) -> Result<(), String> {
+    let matching = format!("left(rolname, {}) = '{stem}'", stem.len());
+    let mut stalled = 0;
+    let mut previous = i64::MAX;
+    loop {
+        let rows = conn
+            .query(&format!(
+                "SELECT count(*)::bigint FROM pg_roles WHERE {matching}"
+            ))
+            .await
+            .map_err(|e| format!("count the `{stem}*` roles: {e}"))?;
+        let left = rows
+            .first()
+            .and_then(|row| row.try_get_at::<i64>(0).ok().flatten())
+            .ok_or_else(|| format!("count the `{stem}*` roles: no count came back"))?;
+        if left == 0 {
+            return Ok(());
+        }
+        // A batch that removed nothing twice running is not going to.
+        stalled = if left < previous { 0 } else { stalled + 1 };
+        if stalled >= 2 {
+            return Err(format!("{left} `{stem}*` roles cannot be dropped"));
+        }
+        previous = left;
+        conn.execute(&format!(
+            "DO $$ DECLARE r text; BEGIN \
+               FOR r IN SELECT rolname::text FROM pg_roles WHERE {matching} \
+                        ORDER BY rolname LIMIT {CROWD_BATCH} LOOP \
+                 EXECUTE format('DROP ROLE %I', r); \
+               END LOOP; END $$"
+        ))
+        .await
+        .map_err(|e| format!("drop the `{stem}*` roles: {e}"))?;
+    }
+}
+
+/// A run's cost grows with the roles of its target's cluster by a small
+/// constant, not by a round trip each (#2049). A superuser deployer's closure is
+/// every role in the cluster, and the run-owned layout reproduces each one in
+/// the scratch cluster: a `CREATE ROLE`, a `GRANT` and a `DROP ROLE`. One round
+/// trip each cost about 9 ms a role (110 s at 11,000 roles, against about 10 s
+/// of server time), so ten thousand more roles took minutes. Sent in batches,
+/// ten thousand more roles cost under 20 s, about 2 ms a role. Run-to-run noise
+/// on a shared machine is a few seconds, so the bound is the issue's own.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_run_owned_reproduction_stays_linear_in_the_clusters_roles() {
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = target.target().await;
+    let mut admin = target.admin().await;
+    // Armed before the first role exists, so a panic anywhere below, a failed
+    // creation included, still removes whatever was made.
+    let mut crowd = RoleCrowd::arm(&target.server);
+    let before = scratch.inventory().await;
+    let inputs = Inputs::overload();
+    let key = ProjectKey::new(true);
+    let mut runs = Vec::new();
+    let mut grown = Ok(());
+    for count in [1_000, 10_000] {
+        grown = crowd.grow_to(&mut admin, count).await;
+        if grown.is_err() {
+            break;
+        }
+        let started = std::time::Instant::now();
+        let result = produce(&scratch.server, &target.on(&target_db), &inputs, &key).await;
+        runs.push((count, started.elapsed(), result));
+    }
+    let removed = crowd.remove(&mut admin).await;
+    let after = scratch.inventory().await;
+    target.drop().await;
+    grown.unwrap();
+    removed.unwrap();
+    for (count, took, result) in &runs {
+        eprintln!("issue 2049: {count} crowd roles: {took:?}");
+        assert_answers_the_overload(result.as_ref().unwrap_or_else(|e| panic!("{count}: {e}")));
+    }
+    assert_eq!(
+        before, after,
+        "every role the runs made on the scratch server is dropped"
+    );
+    let [(_, small, _), (_, large, _)] = &runs[..] else {
+        panic!("two runs were expected");
+    };
+    assert!(
+        *large <= *small + std::time::Duration::from_secs(20),
+        "ten thousand roles took {large:?}, a thousand took {small:?}: more than 20 s longer"
+    );
+}
+
 /// The layout the run used is sealed as its own (#1517).
 fn assert_layout(plan: &ResolvedPlan, layout: pbps_model::resolver::ScratchLayout) {
     let pbps_model::resolver::ResolverRuntime::Scratch { layout: sealed, .. } =

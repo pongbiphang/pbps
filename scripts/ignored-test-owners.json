@@ -1469,6 +1469,8 @@
         "resolver_tests::recon610::scratch_reproduces_the_deployers_authorization_not_the_admins",
         "resolver_tests::recon610_public::scratch_reproduces_the_template_public_and_refuses_an_impossible_grant",
         "resolver_tests::recon610_super::a_superuser_deployer_on_the_default_database_reproduces_public_owner",
+        "resolver_tests::recon2049::a_reproduction_that_fails_partway_names_the_failing_role_and_leaves_none_after_cleanup",
+        "resolver_tests::recon2049::cleanup_names_exactly_the_role_that_cannot_be_dropped_and_drops_the_rest",
         "resolver_tests::resolver_discovery_observes_both_catalog_versions_without_writes_or_qualification",
         "resolver_tests::scope610::a_schema_name_is_one_visibility_element_whatever_it_contains",
         "resolver_tests::scope610::scope_facts_end_their_snapshot_whether_the_read_completes_or_is_refused",
@@ -1549,6 +1551,7 @@
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
         "resolver::server::scratch::live_tests::resolver_answers_a_managed_question_without_root_or_observation",
+        "resolver::server::scratch::live_tests::resolver_run_owned_reproduction_stays_linear_in_the_clusters_roles",
         "resolver::server::scratch::live_tests::resolver_recheck_binds_the_target_by_engine_identity",
         "resolver::server::scratch::live_tests::resolver_recheck_refuses_a_target_changed_after_the_run",
         "resolver::server::scratch::live_tests::resolver_recheck_refuses_an_external_shape_changed_after_planning",
