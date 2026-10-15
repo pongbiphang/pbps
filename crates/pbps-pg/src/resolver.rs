@@ -3,6 +3,7 @@
 pub mod authorization;
 pub mod capture;
 pub mod compatibility;
+pub mod draft;
 pub mod environment;
 pub mod externals;
 pub mod reconstruct;

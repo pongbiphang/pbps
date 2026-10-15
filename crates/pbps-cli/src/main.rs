@@ -12,6 +12,7 @@ mod dev;
 mod doctor;
 mod engine;
 mod explain;
+mod externals_draft;
 mod hooks;
 mod init;
 mod integration;
@@ -327,6 +328,12 @@ enum Command {
         command: PartitionsCommand,
     },
 
+    /// Draft a resolver's files from the target
+    Resolver {
+        #[command(subcommand)]
+        command: ResolverCommand,
+    },
+
     /// Render documentation and an ERD from the declarations
     Docs {
         /// markdown, html or erd
@@ -496,6 +503,7 @@ impl Command {
             | Command::DropRole { .. }
             | Command::MoveRows { .. }
             | Command::Partitions { .. }
+            | Command::Resolver { .. }
             | Command::Docs { .. }
             | Command::Ui
             | Command::Pull { .. }
@@ -547,6 +555,39 @@ enum PartitionsCommand {
         /// a table that declares no range yet
         #[arg(long)]
         from: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResolverCommand {
+    /// Draft an externals file from the target, for review (#1778)
+    ///
+    /// Reads, from the target's recorded dependencies, the objects outside
+    /// the managed set that the deployed managed objects depend on, with the
+    /// shapes those need in turn, and writes them as SQL: tables with their
+    /// columns and keys, views as shape views of their output columns,
+    /// enums, domains, composite types and extensions. Routines are listed
+    /// by signature and never written; casts, operators, collations and
+    /// operator classes are listed for writing by hand. Prints the draft
+    /// unless --out names a new file.
+    Externals {
+        #[command(flatten)]
+        target: TargetArgs,
+
+        /// Also draft every unmanaged object in this schema, for references
+        /// only undeployed declarations make; repeatable
+        #[arg(long = "schema", value_name = "NAME")]
+        schemas: Vec<String>,
+
+        /// Write the draft to this file instead of stdout; an existing file
+        /// is refused without --force
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// Replace an existing --out file; never one a resolver entry or the
+        /// project already uses
+        #[arg(long, requires = "out")]
+        force: bool,
     },
 }
 
@@ -1143,6 +1184,18 @@ fn run() -> anyhow::Result<()> {
                     from,
                 },
         } => partitions::cmd_extend(&project, &table, &every, &until, from.as_deref()),
+        Command::Resolver {
+            command:
+                ResolverCommand::Externals {
+                    target,
+                    schemas,
+                    out,
+                    force,
+                },
+        } => {
+            let target = target.resolve(&project)?;
+            externals_draft::cmd_externals(&project, &target, &schemas, out.as_deref(), force)
+        }
         Command::Pull {
             target,
             force,
