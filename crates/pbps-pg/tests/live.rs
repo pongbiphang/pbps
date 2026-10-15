@@ -12401,6 +12401,150 @@ async fn the_database_owner_is_no_exception_to_the_ledger_editor_rule() {
     }
 }
 
+/// The first part of every crowd role's name; the rest is the process id, an
+/// underscore and a number.
+const CROWD_STEM: &str = "pbps_crowd_";
+
+/// How many roles one transaction creates or drops.
+///
+/// `CREATE ROLE` and `DROP ROLE` each hold a lock on the role until the
+/// transaction ends (one `pg_locks` row per role, measured on 18.6). The shared
+/// lock table holds `max_locks_per_transaction` x (`max_connections` +
+/// `max_prepared_transactions`) entries, 6400 by default and shared with every
+/// other test running at that moment, so ten thousand roles in one transaction
+/// fit only by slack and fail with `out of shared memory` (#2050).
+const CROWD_BATCH: u32 = 250;
+
+/// A crowd of login roles that cannot outlive the test that made it.
+///
+/// Roles belong to the cluster, not to the test's database, so a crowd left
+/// behind by a failed run is read by every later test that lists the cluster's
+/// roles (#2050: the resolver suite took 75 minutes instead of a few). A
+/// `Drop` cannot `.await` and the connection it would use may be the thing
+/// that failed, so the removal on drop runs on its own thread, runtime and
+/// connection, and so runs on a panic and on an early return alike. This crate
+/// has no `futures` to catch an unwind with, and a guard also covers a step
+/// that returns early.
+struct RoleCrowd {
+    /// `pbps_crowd_<pid>_`: the pid keeps one run's roles from being counted as
+    /// another's by the test's own assertions.
+    prefix: String,
+    armed: bool,
+}
+
+impl RoleCrowd {
+    /// Starts the guard. Nothing is created until [`RoleCrowd::create`].
+    fn arm() -> RoleCrowd {
+        RoleCrowd {
+            prefix: format!("{CROWD_STEM}{}_", std::process::id()),
+            armed: true,
+        }
+    }
+
+    /// Creates `count` roles, [`CROWD_BATCH`] to a transaction.
+    ///
+    /// Roles an earlier run left behind (any pid) are dropped first, so one bad
+    /// run cannot poison the next. Every live suite owns its cluster for the
+    /// run (`scripts/live-tests-pg.sh`), and within one process this is the only
+    /// test that makes crowd roles.
+    async fn create(&mut self, conn: &mut Conn, count: u32) -> Result<(), String> {
+        drop_crowd_roles(conn, CROWD_STEM).await?;
+        let mut first = 1;
+        while first <= count {
+            let last = (first + CROWD_BATCH - 1).min(count);
+            conn.execute(&format!(
+                "DO $$ BEGIN FOR i IN {first}..{last} LOOP \
+                   EXECUTE format('CREATE ROLE %I LOGIN NOSUPERUSER', '{}' || i); \
+                 END LOOP; END $$",
+                self.prefix
+            ))
+            .await
+            .map_err(|e| format!("create roles {first}..{last}: {e}"))?;
+            first = last + 1;
+        }
+        Ok(())
+    }
+
+    /// Drops the crowd, and disarms the guard only once none is left.
+    async fn remove(&mut self, conn: &mut Conn) -> Result<(), String> {
+        drop_crowd_roles(conn, &self.prefix).await?;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for RoleCrowd {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let prefix = self.prefix.clone();
+        // Never a panic from here: this may already be one unwinding, and a
+        // second aborts the process, taking the other tests' verdicts with it.
+        let outcome = std::thread::spawn(move || -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(async {
+                let mut conn = Conn::connect(Driver::Postgres, &conn_str())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                drop_crowd_roles(&mut conn, &prefix).await
+            })
+        })
+        .join();
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => eprintln!("could not drop the `{}*` roles: {why}", self.prefix),
+            Err(_) => eprintln!(
+                "could not drop the `{}*` roles: the cleanup panicked",
+                self.prefix
+            ),
+        }
+    }
+}
+
+/// Drops every role whose name starts with `stem`, [`CROWD_BATCH`] to a
+/// transaction. The count is read again after each batch, so a role created
+/// meanwhile is not missed, and the rounds are bounded so a role that cannot
+/// be dropped is reported and not retried forever.
+async fn drop_crowd_roles(conn: &mut Conn, stem: &str) -> Result<(), String> {
+    let matching = format!("left(rolname, {}) = '{stem}'", stem.len());
+    let mut stalled = 0;
+    let mut previous = i64::MAX;
+    loop {
+        let rows = conn
+            .query(&format!(
+                "SELECT count(*)::bigint FROM pg_roles WHERE {matching}"
+            ))
+            .await
+            .map_err(|e| format!("count the `{stem}*` roles: {e}"))?;
+        let left = rows
+            .first()
+            .and_then(|row| row.try_get_at::<i64>(0).ok().flatten())
+            .ok_or_else(|| format!("count the `{stem}*` roles: no count came back"))?;
+        if left == 0 {
+            return Ok(());
+        }
+        // A batch that removed nothing twice running is not going to.
+        stalled = if left < previous { 0 } else { stalled + 1 };
+        if stalled >= 2 {
+            return Err(format!("{left} `{stem}*` roles cannot be dropped"));
+        }
+        previous = left;
+        conn.execute(&format!(
+            "DO $$ DECLARE r text; BEGIN \
+               FOR r IN SELECT rolname::text FROM pg_roles WHERE {matching} \
+                        ORDER BY rolname LIMIT {CROWD_BATCH} LOOP \
+                 EXECUTE format('DROP ROLE %I', r); \
+               END LOOP; END $$"
+        ))
+        .await
+        .map_err(|e| format!("drop the `{stem}*` roles: {e}"))?;
+    }
+}
+
 /// The ledger's trust check stays linear in the cluster's roles (#1529). Its
 /// editor branches asked every login role about every role in the cluster,
 /// `pg_has_role` roles² times: about 1.9 s a call on a 2285-role cluster, paid
@@ -12414,16 +12558,12 @@ async fn the_database_owner_is_no_exception_to_the_ledger_editor_rule() {
 async fn the_ledger_trust_check_stays_linear_in_the_clusters_roles() {
     let mut db = TestDb::create("ledger_many_roles").await;
     state::ensure_tables(&mut db.conn).await.unwrap();
-    let prefix = format!("pbps_crowd_{}_", std::process::id());
     let mut admin = Conn::connect(Driver::Postgres, &conn_str()).await.unwrap();
-    admin
-        .execute(&format!(
-            "DO $$ BEGIN FOR i IN 1..10000 LOOP \
-               EXECUTE format('CREATE ROLE %I LOGIN NOSUPERUSER', '{prefix}' || i); \
-             END LOOP; END $$"
-        ))
-        .await
-        .unwrap();
+    // Armed before the first role exists, so a panic anywhere below, a failed
+    // creation included, still removes whatever was made (#2050).
+    let mut crowd = RoleCrowd::arm();
+    let prefix = crowd.prefix.clone();
+    crowd.create(&mut admin, 10000).await.unwrap();
     // How long one check takes, and how many of the crowd it names.
     let check = async |conn: &mut Conn| {
         let started = std::time::Instant::now();
@@ -12449,14 +12589,7 @@ async fn the_ledger_trust_check_stays_linear_in_the_clusters_roles() {
         .await
         .unwrap();
     results.push(("UPDATE to PUBLIC", check(&mut db.conn).await, 10000));
-    admin
-        .execute(&format!(
-            "DO $$ BEGIN FOR i IN 1..10000 LOOP \
-               EXECUTE format('DROP ROLE IF EXISTS %I', '{prefix}' || i); \
-             END LOOP; END $$"
-        ))
-        .await
-        .unwrap();
+    crowd.remove(&mut admin).await.unwrap();
     for (case, (took, problems), named) in results {
         let problems = problems.unwrap();
         let crowd = problems.iter().filter(|p| p.contains(&prefix)).count();
