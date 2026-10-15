@@ -94,58 +94,6 @@ impl Nx<'_> {
         self.names.releases.push(Named { address, holder });
     }
 
-    /// Every declared name `table` holds under `name`, owned by `owner`:
-    /// what its creation claims and its drop releases.
-    fn whole_table(&self, name: &TableName, owner: &Recorded, table: &Table) -> Vec<Named> {
-        let scope = Some(ObjectKey::Table(owner.clone()));
-        let part = |kind: NameKind, key: PartKey, part_name: &str| Named {
-            address: Address {
-                kind,
-                schema: name.schema.clone(),
-                table: scope.clone(),
-                name: part_name.to_owned(),
-                signature: None,
-            },
-            holder: ObjectKey::Part {
-                table: owner.clone(),
-                part: key,
-            },
-        };
-        let mut out = vec![Named {
-            address: Address {
-                kind: NameKind::Table,
-                schema: name.schema.clone(),
-                table: None,
-                name: name.name.clone(),
-                signature: None,
-            },
-            holder: ObjectKey::Table(owner.clone()),
-        }];
-        if let Some(pk_name) = table.primary_key.as_ref().and_then(|pk| pk.name.as_deref()) {
-            out.push(part(NameKind::Key, PartKey::PrimaryKey, pk_name));
-        }
-        for n in table.unique.keys() {
-            out.push(part(NameKind::Key, PartKey::Unique(n.clone()), n));
-        }
-        for n in table.indexes.keys() {
-            out.push(part(NameKind::Index, PartKey::Index(n.clone()), n));
-        }
-        for n in table.checks.keys() {
-            out.push(part(NameKind::Constraint, PartKey::Check(n.clone()), n));
-        }
-        for n in table.foreign_keys.keys() {
-            out.push(part(
-                NameKind::Constraint,
-                PartKey::ForeignKey(n.clone()),
-                n,
-            ));
-        }
-        for n in table.computed.keys() {
-            out.push(part(NameKind::Column, PartKey::Computed(n.clone()), n));
-        }
-        out
-    }
-
     fn part(
         &mut self,
         claim: bool,
@@ -199,10 +147,66 @@ impl Nx<'_> {
     }
 }
 
+/// Every declared name `table` holds under `name`, owned by `owner`: what its
+/// creation claims and its drop releases.
+fn whole_table(name: &TableName, owner: &Recorded, table: &Table) -> Vec<Named> {
+    let scope = Some(ObjectKey::Table(owner.clone()));
+    let part = |kind: NameKind, key: PartKey, part_name: &str| Named {
+        address: Address {
+            kind,
+            schema: name.schema.clone(),
+            table: scope.clone(),
+            name: part_name.to_owned(),
+            signature: None,
+        },
+        holder: ObjectKey::Part {
+            table: owner.clone(),
+            part: key,
+        },
+    };
+    let mut out = vec![Named {
+        address: Address {
+            kind: NameKind::Table,
+            schema: name.schema.clone(),
+            table: None,
+            name: name.name.clone(),
+            signature: None,
+        },
+        holder: ObjectKey::Table(owner.clone()),
+    }];
+    if let Some(pk_name) = table.primary_key.as_ref().and_then(|pk| pk.name.as_deref()) {
+        out.push(part(NameKind::Key, PartKey::PrimaryKey, pk_name));
+    }
+    for n in table.unique.keys() {
+        out.push(part(NameKind::Key, PartKey::Unique(n.clone()), n));
+    }
+    for n in table.indexes.keys() {
+        out.push(part(NameKind::Index, PartKey::Index(n.clone()), n));
+    }
+    for n in table.checks.keys() {
+        out.push(part(NameKind::Constraint, PartKey::Check(n.clone()), n));
+    }
+    for n in table.foreign_keys.keys() {
+        out.push(part(
+            NameKind::Constraint,
+            PartKey::ForeignKey(n.clone()),
+            n,
+        ));
+    }
+    for n in table.computed.keys() {
+        out.push(part(NameKind::Column, PartKey::Computed(n.clone()), n));
+    }
+    out
+}
+
 /// The address a module's id takes: a view or a routine by its name in its
 /// schema, a trigger by its name on its table. `None` for a trigger on a table
 /// the identity file does not record, which is nobody's scope.
-fn module_address(nx: &Nx<'_>, id: &ModuleId, kind: ModuleKind) -> Option<Address> {
+fn module_address(
+    table: impl Fn(&TableName) -> Option<Recorded>,
+    id: &ModuleId,
+    kind: ModuleKind,
+) -> Option<Address> {
     Some(match id {
         ModuleId::Named(name) => Address {
             kind: NameKind::Module(kind),
@@ -221,10 +225,7 @@ fn module_address(nx: &Nx<'_>, id: &ModuleId, kind: ModuleKind) -> Option<Addres
         ModuleId::Trigger { on, name } => Address {
             kind: NameKind::Module(kind),
             schema: on.schema.clone(),
-            table: Some(ObjectKey::Table(
-                nx.table(&TableName::new(on.schema.clone(), on.name.clone()))
-                    .ok()?,
-            )),
+            table: Some(ObjectKey::Table(table(on)?)),
             name: name.clone(),
             signature: None,
         },
@@ -250,7 +251,7 @@ pub fn names(
             uid, name, table, ..
         } => {
             let owner = Recorded(uid.clone());
-            for named in nx.whole_table(name, &owner, table) {
+            for named in whole_table(name, &owner, table) {
                 nx.names.claims.push(named);
             }
             for (column, _) in &table.columns {
@@ -280,7 +281,7 @@ pub fn names(
                 .and_then(|base| before.schema.tables.get(base));
             match base {
                 Some(table) => {
-                    for named in nx.whole_table(name, &owner, table) {
+                    for named in whole_table(name, &owner, table) {
                         nx.names.releases.push(named);
                     }
                 }
@@ -334,7 +335,7 @@ pub fn names(
             if from.schema != to.schema
                 && let Some(base) = super::base_table(op, owners, before, from)?
             {
-                for named in nx.whole_table(from, &owner, base.table) {
+                for named in whole_table(from, &owner, base.table) {
                     if named.address.kind == NameKind::Table {
                         continue;
                     }
@@ -460,12 +461,12 @@ pub fn names(
             )?;
         }
         Change::CreateModule { id, module } => {
-            if let Some(address) = module_address(&nx, id, module.kind) {
+            if let Some(address) = module_address(|t| nx.table(t).ok(), id, module.kind) {
                 nx.claim(address, ObjectKey::Module(id.clone()));
             }
         }
         Change::DropModule { id, kind } => {
-            if let Some(address) = module_address(&nx, id, *kind) {
+            if let Some(address) = module_address(|t| nx.table(t).ok(), id, *kind) {
                 nx.release(address, ObjectKey::Module(id.clone()));
             }
         }
@@ -515,4 +516,48 @@ fn role_address(name: &str) -> Address {
         name: name.to_owned(),
         signature: None,
     }
+}
+
+/// Every name the baseline holds, with its holder: what stands before the
+/// first step. A name the identity file records no owner for is nobody's.
+pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<Named> {
+    let table = |name: &TableName| owners.table(name, Spelling::Base).ok().map(Recorded);
+    let mut out = Vec::new();
+    for (name, t) in &before.schema.tables {
+        let Some(owner) = table(name) else {
+            continue;
+        };
+        out.extend(whole_table(name, &owner, t));
+        for column in t.columns.keys() {
+            if let Ok(uid) = owners.column(&name.column(column), Spelling::Base) {
+                out.push(Named {
+                    address: Address {
+                        kind: NameKind::Column,
+                        schema: name.schema.clone(),
+                        table: Some(ObjectKey::Table(owner.clone())),
+                        name: column.clone(),
+                        signature: None,
+                    },
+                    holder: ObjectKey::Column(ColumnKey::Recorded(Recorded(uid))),
+                });
+            }
+        }
+    }
+    for (id, module) in &before.schema.modules {
+        if let Some(address) = module_address(table, id, module.kind) {
+            out.push(Named {
+                address,
+                holder: ObjectKey::Module(id.clone()),
+            });
+        }
+    }
+    for role in before.schema.roles.keys() {
+        if let Ok(uid) = owners.role(role, Spelling::Base) {
+            out.push(Named {
+                address: role_address(role),
+                holder: ObjectKey::Role(Recorded(uid)),
+            });
+        }
+    }
+    out
 }

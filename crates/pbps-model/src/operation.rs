@@ -1027,7 +1027,7 @@ impl Incarnations {
 }
 
 mod slots;
-pub use slots::{Address, NameKind, Named, Names, names};
+pub use slots::{Address, NameKind, Named, Names, baseline_names, names};
 
 mod effects;
 pub use effects::{

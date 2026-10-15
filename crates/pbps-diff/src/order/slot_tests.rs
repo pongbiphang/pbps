@@ -439,3 +439,125 @@ fn a_columns_default_constraint_leaves_with_the_columns_default() {
     let (kept, _, _) = plan.run(&[0], &exact, Some(&facts));
     assert_eq!(held(&kept), ["contested app.DF_t_c"], "{kept:?}");
 }
+
+/// Review of #2052: a table's columns and its indexes are two namespaces, so
+/// a column renamed to the name of an index the plan drops later is not a
+/// claim on a held name.
+#[test]
+fn a_column_and_an_index_of_one_table_do_not_share_a_name() {
+    let column_uid = Uid::derived(UidKind::Column, "app.t.a", 0);
+    let mut plan = Plan::new(
+        &[("t", "app.t")],
+        &[("t", "app.t")],
+        vec![
+            Change::RenameColumn {
+                uid: column_uid.clone(),
+                table: name("app.t"),
+                from: "a".into(),
+                to: "ix".into(),
+                table_was: None,
+            },
+            Change::DropIndex {
+                table: name("app.t"),
+                name: "ix".into(),
+            },
+        ],
+    );
+    let int = || pbps_model::Column::new("int".parse().unwrap());
+    let before = plan.before.tables.get_mut(&name("app.t")).unwrap();
+    before.columns.insert("a".into(), int());
+    before.indexes.insert(
+        "ix".into(),
+        pbps_model::Index {
+            columns: Vec::new(),
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        },
+    );
+    plan.before_ids
+        .columns
+        .insert(column_uid.clone(), name("app.t").column("a"));
+    plan.after
+        .tables
+        .get_mut(&name("app.t"))
+        .unwrap()
+        .columns
+        .insert("ix".into(), int());
+    plan.after_ids
+        .columns
+        .insert(column_uid, name("app.t").column("ix"));
+    let (found, _, _) = plan.run(&[0, 1], &Slotted { exact: true }, None);
+    assert!(found.is_empty(), "{found:?}");
+}
+
+/// Review of #2052: a table the plan leaves where it is still holds its name,
+/// so a move that stops at that name on its way to another is refused there,
+/// though no step releases it and the final names do not collide.
+#[test]
+fn an_unchanged_table_at_a_moves_intermediate_name_refuses_it() {
+    let plan = Plan::new(
+        &[("x", "s1.x"), ("y", "s2.x")],
+        &[("x", "s2.z"), ("y", "s2.x")],
+        vec![rename_table("x", "s1.x", "s2.z")],
+    );
+    let (found, _, _) = plan.run(&[0], &Slotted { exact: true }, None);
+    assert_eq!(held(&found), ["intermediate s2.x"], "{found:?}");
+}
+
+/// Review of #2052: a named key holds its name twice on SQL Server, among the
+/// schema's objects and among its table's indexes. Replacing an index `k`
+/// with a key `k`, the key waits for the index's drop.
+#[test]
+fn a_key_waits_for_the_index_whose_name_it_takes() {
+    let mut plan = Plan::new(
+        &[("t", "app.t")],
+        &[("t", "app.t")],
+        vec![
+            Change::DropIndex {
+                table: name("app.t"),
+                name: "k".into(),
+            },
+            Change::AddUnique {
+                table: name("app.t"),
+                name: "k".into(),
+                constraint: pbps_model::UniqueConstraint {
+                    columns: Vec::new(),
+                    storage_parameters: Default::default(),
+                },
+                clustered: false,
+            },
+        ],
+    );
+    plan.before
+        .tables
+        .get_mut(&name("app.t"))
+        .unwrap()
+        .indexes
+        .insert(
+            "k".into(),
+            pbps_model::Index {
+                columns: Vec::new(),
+                include: Vec::new(),
+                unique: false,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+    // `Slotted` answers as SQL Server does: indexes per table, constraints
+    // per schema.
+    let collated = Slotted { exact: true };
+    let (ok, _, _) = plan.run(&[0, 1], &collated, None);
+    assert!(ok.is_empty(), "{ok:?}");
+    let (wrong, _, _) = plan.run(&[1, 0], &collated, None);
+    let found = held(&wrong);
+    assert!(
+        found.len() == 2
+            && found[0].starts_with("held k (Indexes)")
+            && found[1].starts_with("edge k (Indexes)"),
+        "{found:?}"
+    );
+}

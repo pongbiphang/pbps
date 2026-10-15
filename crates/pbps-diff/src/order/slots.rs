@@ -23,9 +23,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
-use pbps_dialect::slots::{CatalogFacts, Same, SlotKey, same, slot};
+use pbps_dialect::slots::{CatalogFacts, Same, SlotKey, same, slots as slots_of};
 use pbps_model::operation::{
-    ObjectKey, Operation, OperationId, OwnerError, Owners, Snapshot, base_table_named, names,
+    ObjectKey, Operation, OperationId, OwnerError, Owners, Snapshot, base_table_named,
+    baseline_names, names,
 };
 use pbps_model::{Change, TableName};
 
@@ -63,12 +64,20 @@ pub fn analyse(
                 fx.claims = n
                     .claims
                     .iter()
-                    .map(|c| (slot(dialect, &c.address), c.holder.clone()))
+                    .flat_map(|c| {
+                        slots_of(dialect, &c.address)
+                            .into_iter()
+                            .map(|s| (s, c.holder.clone()))
+                    })
                     .collect();
                 fx.releases = n
                     .releases
                     .iter()
-                    .map(|r| (slot(dialect, &r.address), r.holder.clone()))
+                    .flat_map(|r| {
+                        slots_of(dialect, &r.address)
+                            .into_iter()
+                            .map(|s| (s, r.holder.clone()))
+                    })
                     .collect();
                 // A part that stays in its table's own namespace through a
                 // move is released and claimed in one slot by one holder:
@@ -92,7 +101,7 @@ pub fn analyse(
                     fx.intermediate = lowered
                         .intermediate_tables()
                         .into_iter()
-                        .map(|t| table_slot(dialect, t))
+                        .filter_map(|t| table_slot(dialect, t))
                         .collect();
                 }
                 Err(_) => out.unlowered.push(op.id()),
@@ -119,8 +128,9 @@ pub fn analyse(
     out
 }
 
-fn table_slot(dialect: &dyn Dialect, table: &TableName) -> SlotKey {
-    slot(
+fn table_slot(dialect: &dyn Dialect, table: &TableName) -> Option<SlotKey> {
+    // A table's name is one slot in its schema.
+    slots_of(
         dialect,
         &pbps_model::operation::Address {
             kind: pbps_model::operation::NameKind::Table,
@@ -130,6 +140,8 @@ fn table_slot(dialect: &dyn Dialect, table: &TableName) -> SlotKey {
             signature: None,
         },
     )
+    .into_iter()
+    .next()
 }
 
 /// An edge a name's handover implies: `before` gives the name up, `after`
@@ -336,6 +348,23 @@ pub fn verify(
         }
         for (s, h) in &fx.claims {
             seen.insert((s, h));
+        }
+    }
+    // And what the baseline holds unchanged at a name a step claims, or
+    // passes through: a table that stays where a move stops on its way
+    // (review of #2052). Only those names are asked: a name nothing claims
+    // cannot be refused.
+    let wanted: BTreeSet<&SlotKey> = slots
+        .effects
+        .iter()
+        .flat_map(|fx| fx.claims.iter().map(|(s, _)| s).chain(&fx.intermediate))
+        .collect();
+    for named in baseline_names(owners, before) {
+        for s in slots_of(dialect, &named.address) {
+            let holder = Occupier::Managed(named.holder.clone());
+            if wanted.contains(&s) && !held.iter().any(|(hs, who)| *hs == s && *who == holder) {
+                held.push((s, holder));
+            }
         }
     }
     if let Some(facts) = facts {

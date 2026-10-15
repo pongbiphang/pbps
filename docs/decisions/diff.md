@@ -5458,6 +5458,12 @@ dialect's existing answers, so no namespace is written down twice:
 - `shares_namespace_with_tables`;
 - `overloads`.
 
+A table's own names are four namespaces, not one: its columns, its indexes,
+its constraints and its triggers (review of #2052). A named key is a
+constraint backed by an index, so it holds its name in both namespaces. On
+SQL Server those are the schema's objects and the table's indexes. On
+PostgreSQL they are the schema's relations and the table's constraints.
+
 Two spellings in one namespace are one name when the engine compares them
 equal. `Dialect::compares_names_exactly` says whether that is the spelling
 itself:
@@ -5493,7 +5499,12 @@ a statement-level check of intermediate names.** (#1964)
   such borrowers from their positions would invent an order. Proposing one is
   S4's search (#1957).
 - **Replay.** The replay walks the order given and refuses a claim on a name
-  another object still holds.
+  another object still holds. The names held at the start are of three kinds
+  (review of #2052):
+  - those a step gives up before taking;
+  - the catalog's occupants;
+  - what the baseline holds, unchanged, at a name some step claims or passes
+    through.
   - If that object gives the name up later in the plan, the order is wrong.
   - If it never does, the declarations collide and no order fixes them. The
     claim is recorded as contested and fails nothing; the collision is the

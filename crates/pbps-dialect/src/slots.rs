@@ -29,10 +29,20 @@ pub enum Namespace {
     Relations(String),
     /// A schema's routines, where they do not share the tables' namespace.
     Routines(String),
-    /// One table's names, by the table's identity.
-    Table(ObjectKey),
+    /// One table's names of one kind, by the table's identity: a table keeps
+    /// its columns, its indexes, its constraints and its triggers apart.
+    Table(ObjectKey, TableSpace),
     /// Roles, which belong to no schema.
     Roles,
+}
+
+/// Which of a table's own namespaces a name is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TableSpace {
+    Columns,
+    Indexes,
+    Constraints,
+    Triggers,
 }
 
 /// One name in one namespace.
@@ -47,7 +57,7 @@ impl std::fmt::Display for SlotKey {
         match &self.namespace {
             Namespace::Relations(schema) => write!(f, "{schema}.{}", self.name),
             Namespace::Routines(schema) => write!(f, "{schema}.{} (routine)", self.name),
-            Namespace::Table(table) => write!(f, "{} on {table:?}", self.name),
+            Namespace::Table(table, space) => write!(f, "{} ({space:?}) on {table:?}", self.name),
             Namespace::Roles => write!(f, "role {}", self.name),
         }
     }
@@ -89,37 +99,60 @@ pub struct Occupant {
     pub column: Option<String>,
 }
 
-/// The slot `address` takes, by the dialect's namespace answers.
-pub fn slot(dialect: &dyn Dialect, address: &Address) -> SlotKey {
+/// The slots `address` takes, by the dialect's namespace answers: one, or
+/// two for a named key, which is a constraint backed by an index and holds its
+/// name in both namespaces.
+pub fn slots(dialect: &dyn Dialect, address: &Address) -> Vec<SlotKey> {
     let schema = || Namespace::Relations(address.schema.clone());
     // A per-table name whose table no identity records has no table to be
     // scoped by; its schema is the narrowest scope there is.
-    let table = || address.table.clone().map_or_else(schema, Namespace::Table);
+    let table = |space: TableSpace| {
+        address
+            .table
+            .clone()
+            .map_or_else(schema, |t| Namespace::Table(t, space))
+    };
+    let index = || {
+        if dialect.indexes_share_namespace_with_tables() {
+            schema()
+        } else {
+            table(TableSpace::Indexes)
+        }
+    };
+    let constraint = || {
+        if dialect.constraints_share_namespace_with_tables() {
+            schema()
+        } else {
+            table(TableSpace::Constraints)
+        }
+    };
     let mut name = address.name.clone();
-    let namespace = match address.kind {
-        NameKind::Table => schema(),
-        NameKind::Module(kind) if dialect.shares_namespace_with_tables(kind) => schema(),
-        NameKind::Module(ModuleKind::Trigger) => table(),
+    let mut namespaces = match address.kind {
+        NameKind::Table => vec![schema()],
+        NameKind::Module(kind) if dialect.shares_namespace_with_tables(kind) => vec![schema()],
+        NameKind::Module(ModuleKind::Trigger) => vec![table(TableSpace::Triggers)],
         NameKind::Module(kind) => {
             if dialect.overloads(kind)
                 && let Some(signature) = &address.signature
             {
                 name.clone_from(signature);
             }
-            Namespace::Routines(address.schema.clone())
+            vec![Namespace::Routines(address.schema.clone())]
         }
-        NameKind::Index if dialect.indexes_share_namespace_with_tables() => schema(),
-        NameKind::Key
-            if dialect.indexes_share_namespace_with_tables()
-                || dialect.constraints_share_namespace_with_tables() =>
-        {
-            schema()
-        }
-        NameKind::Constraint if dialect.constraints_share_namespace_with_tables() => schema(),
-        NameKind::Index | NameKind::Key | NameKind::Constraint | NameKind::Column => table(),
-        NameKind::Role => Namespace::Roles,
+        NameKind::Index => vec![index()],
+        NameKind::Key => vec![index(), constraint()],
+        NameKind::Constraint => vec![constraint()],
+        NameKind::Column => vec![table(TableSpace::Columns)],
+        NameKind::Role => vec![Namespace::Roles],
     };
-    SlotKey { namespace, name }
+    namespaces.dedup();
+    namespaces
+        .into_iter()
+        .map(|namespace| SlotKey {
+            namespace,
+            name: name.clone(),
+        })
+        .collect()
 }
 
 /// Whether `a` and `b` are one name: equal slots are; otherwise the engine's
@@ -129,7 +162,7 @@ pub fn same(dialect: &dyn Dialect, facts: Option<&CatalogFacts>, a: &SlotKey, b:
         return Same::Yes;
     }
     // Two tables' own namespaces are two namespaces, whatever their names.
-    if matches!((&a.namespace, &b.namespace), (Namespace::Table(x), Namespace::Table(y)) if x != y)
+    if matches!((&a.namespace, &b.namespace), (Namespace::Table(x, p), Namespace::Table(y, q)) if (x, p) != (y, q))
         || std::mem::discriminant(&a.namespace) != std::mem::discriminant(&b.namespace)
     {
         return Same::No;

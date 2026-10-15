@@ -1,7 +1,7 @@
 //! PostgreSQL's name slots (#1964): which namespace holds each kind of name,
 //! and that two spellings are two names.
 
-use pbps_dialect::slots::{Namespace, Same, SlotKey, same, slot};
+use pbps_dialect::slots::{Namespace, Same, SlotKey, TableSpace, same, slots};
 use pbps_model::operation::{Address, NameKind, ObjectKey, module_key};
 use pbps_model::{ModuleId, ModuleKind};
 use pbps_pg::Postgres;
@@ -21,30 +21,50 @@ fn address(kind: NameKind, name: &str, signature: Option<&str>) -> Address {
     }
 }
 
+fn namespaces(kind: NameKind) -> Vec<Namespace> {
+    slots(&Postgres::new(), &address(kind, "x", None))
+        .into_iter()
+        .map(|s| s.namespace)
+        .collect()
+}
+
 #[test]
-fn tables_views_indexes_and_keys_share_the_schemas_relation_namespace() {
+fn tables_views_and_indexes_share_the_schemas_relation_namespace() {
     let relations = Namespace::Relations("app".into());
     for kind in [
         NameKind::Table,
         NameKind::Module(ModuleKind::View),
         NameKind::Index,
-        NameKind::Key,
     ] {
         assert_eq!(
-            slot(&Postgres::new(), &address(kind, "x", None)).namespace,
-            relations,
+            namespaces(kind),
+            std::slice::from_ref(&relations),
             "{kind:?}"
         );
     }
-    // A check, a foreign key, a column and a trigger are the table's own.
-    for kind in [
-        NameKind::Constraint,
-        NameKind::Column,
-        NameKind::Module(ModuleKind::Trigger),
+    // A key is a constraint backed by an index: its name is in the relation
+    // namespace and among its table's constraints.
+    assert_eq!(
+        namespaces(NameKind::Key),
+        [
+            relations,
+            Namespace::Table(table(), TableSpace::Constraints)
+        ]
+    );
+}
+
+/// A table keeps its columns, its constraints and its triggers apart: a
+/// column and a check may share a name.
+#[test]
+fn a_tables_columns_constraints_and_triggers_are_separate_namespaces() {
+    for (kind, space) in [
+        (NameKind::Constraint, TableSpace::Constraints),
+        (NameKind::Column, TableSpace::Columns),
+        (NameKind::Module(ModuleKind::Trigger), TableSpace::Triggers),
     ] {
         assert_eq!(
-            slot(&Postgres::new(), &address(kind, "x", None)).namespace,
-            Namespace::Table(table()),
+            namespaces(kind),
+            [Namespace::Table(table(), space)],
             "{kind:?}"
         );
     }
@@ -53,7 +73,7 @@ fn tables_views_indexes_and_keys_share_the_schemas_relation_namespace() {
 #[test]
 fn overloaded_routines_are_told_apart_by_their_signatures() {
     let f = |signature: &str| {
-        slot(
+        slots(
             &Postgres::new(),
             &address(NameKind::Module(ModuleKind::Function), "f", Some(signature)),
         )
@@ -61,7 +81,7 @@ fn overloaded_routines_are_told_apart_by_their_signatures() {
     assert_ne!(f("app.f(integer)"), f("app.f(text)"));
     // Not a relation: a function may share a table's name.
     assert_eq!(
-        f("app.f(integer)").namespace,
+        f("app.f(integer)")[0].namespace,
         Namespace::Routines("app".into())
     );
 }
