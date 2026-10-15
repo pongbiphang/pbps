@@ -4507,10 +4507,20 @@ async fn resolver_stages_an_externals_file_drafted_from_the_target_unchanged() {
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn resolver_draft_lists_a_routine_and_a_chain_and_writes_neither() {
     let a = format!(
-        "SELECT {EXTERNAL}.f(1) AS one, {EXTERNAL}.g() AS two, c.m, u.x \
+        "SELECT {EXTERNAL}.f(1) AS one, {EXTERNAL}.g() AS two, {MANAGED}.h(3) AS three, c.m, u.x \
          FROM {EXTERNAL}.c c, {EXTERNAL}.u u"
     );
-    let declarations = declared(&[("a", &a)], &["m"]);
+    let mut declarations = declared(&[("a", &a)], &["m"]);
+    // A declared routine: its lookup runs under its declaration's path, and
+    // the reads after it must still spell every name under the empty one.
+    declarations.modules.insert(
+        format!("{MANAGED}.h(integer)").parse().unwrap(),
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+        },
+    );
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
         let target_db = staging_target(
@@ -4523,6 +4533,10 @@ async fn resolver_draft_lists_a_routine_and_a_chain_and_writes_neither() {
                      LANGUAGE sql IMMUTABLE RETURN $1 + 1"
                 ),
                 format!("CREATE TABLE {MANAGED}.m (id integer)"),
+                format!(
+                    "CREATE FUNCTION {MANAGED}.h(integer) RETURNS integer \
+                     LANGUAGE sql IMMUTABLE RETURN $1"
+                ),
                 // Its body reads the managed table; a body is not compared,
                 // so that is no chain (SPEC §9.3.2).
                 format!(
@@ -4585,6 +4599,12 @@ async fn resolver_draft_lists_a_routine_and_a_chain_and_writes_neither() {
                 .sql
                 .contains(&format!("CREATE DOMAIN {EXTERNAL}.d AS oid;\n")),
             "{server}: a domain's default is no chain\n{}",
+            draft.sql
+        );
+        // Negative: the managed routine is neither listed nor written.
+        assert!(
+            !draft.sql.contains(&format!("{MANAGED}.h")),
+            "{server}\n{}",
             draft.sql
         );
         // Negative: neither is written, and no routine source in any form.

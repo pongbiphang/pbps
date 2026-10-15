@@ -73,16 +73,12 @@ pub async fn draft(
             signatures.push(signature);
         }
     }
-    let routines = super::externals::routine_oids(conn, &signatures)
+    let (routines, facts) = read(conn, &signatures)
         .await
         .map_err(|source| Error::Read {
-            what: "the target's managed routines",
+            what: "the target's catalog",
             source,
         })?;
-    let facts = read(conn).await.map_err(|source| Error::Read {
-        what: "the target's catalog",
-        source,
-    })?;
     if let Some(absent) = schemas
         .iter()
         .find(|schema| !facts.schemas.contains(*schema))
@@ -243,19 +239,32 @@ struct Extension {
     version: String,
 }
 
-/// Reads [`Facts`] in one `REPEATABLE READ READ ONLY` transaction, so every
-/// part describes one catalog state. Every pbps session pins the empty path
-/// (DEC-1564.1), so each spelling names its schema.
-async fn read(conn: &mut impl QueryConnection) -> Result<Facts, DbError> {
+/// The managed routines' OIDs and [`Facts`], read in one `REPEATABLE READ
+/// READ ONLY` transaction, so every part describes one catalog state: a
+/// routine recreated between two reads would otherwise read as unmanaged
+/// (review of #2024).
+async fn read(
+    conn: &mut impl QueryConnection,
+    signatures: &[super::capture::DroppedSignature],
+) -> Result<(BTreeSet<u32>, Facts), DbError> {
     conn.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await?;
-    let read = read_in(conn).await;
+    let read = async {
+        let routines = super::externals::routine_oids(conn, signatures).await?;
+        // Each lookup sets a transaction-local path, which inside this
+        // transaction outlives its statement; the reads below spell every
+        // name under the empty path every pbps session pins (DEC-1564.1).
+        conn.query("SELECT pg_catalog.set_config('search_path', '', true)")
+            .await?;
+        Ok::<_, DbError>((routines, read_in(conn).await?))
+    }
+    .await;
     let ended = conn
         .query(if read.is_ok() { "COMMIT" } else { "ROLLBACK" })
         .await;
-    let facts = read?;
+    let read = read?;
     ended?;
-    Ok(facts)
+    Ok(read)
 }
 
 async fn read_in(conn: &mut impl QueryConnection) -> Result<Facts, DbError> {
