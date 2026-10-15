@@ -520,10 +520,10 @@ pub fn diff_partial(
     )
 }
 
-/// The DEFAULT partition a new range partition is made beside, under the
-/// name the plan leaves it (#1547, DEC-1547.1): one the base holds as the
-/// parent's DEFAULT and the declarations keep as that parent's. Its rows in
-/// the new range are moved into the partition before it is attached, so the
+/// The DEFAULT partition a new range or list partition is made beside, under
+/// the name the plan leaves it (#1547, DEC-1547.1, #1632): one the base holds
+/// as the parent's DEFAULT and the declarations keep as that parent's. Its
+/// rows in the new range or list are moved into the partition before it is attached, so the
 /// plan is the same whether it holds any or not. A parent the plan creates
 /// has none, and neither has a DEFAULT the plan drops, detaches or makes:
 /// one leaving goes in class 6, before the partition is created, and a new
@@ -534,7 +534,11 @@ fn standing_default(
     declared: Side<'_>,
     of: &pbps_model::PartitionOf,
 ) -> Option<TableName> {
-    if !matches!(of.bound, pbps_model::PartitionBound::Range { .. }) {
+    // A HASH parent has no DEFAULT (#1632).
+    if !matches!(
+        of.bound,
+        pbps_model::PartitionBound::Range { .. } | pbps_model::PartitionBound::List { .. }
+    ) {
         return None;
     }
     let parent = base.ids.tables.get(declared.ids.table_uid(&of.parent)?)?;
@@ -3441,8 +3445,8 @@ fn attached(
     }
     if of.bound == pbps_model::PartitionBound::Default {
         what.push(
-            "it would be the DEFAULT partition, which only a range is attached as here; create \
-             the DEFAULT partition and move the rows into it"
+            "it would be the DEFAULT partition, which is never attached here, only a bounded \
+             one; create the DEFAULT partition and move the rows into it"
                 .to_owned(),
         );
     }
@@ -4034,6 +4038,7 @@ fn refuse_partition_changes(
                         .iter()
                         .map(|c| names.get(c).cloned().unwrap_or_else(|| c.clone()))
                         .collect(),
+                    strategy: by.strategy,
                 }
             };
             if (b.partition_by.as_ref().map(renamed) != d.partition_by
@@ -7957,6 +7962,7 @@ mod tests {
             parent.partition_by = Some(PartitionBy {
                 external: false,
                 columns: vec!["ts".into()],
+                strategy: Default::default(),
             });
             for (name, ix) in parent_indexes {
                 parent.indexes.insert((*name).into(), ix.clone());
@@ -8303,6 +8309,7 @@ mod tests {
             parent.partition_by = Some(PartitionBy {
                 external,
                 columns: vec!["ts".into()],
+                strategy: Default::default(),
             });
             s.tables.insert(ev.clone(), parent);
             for name in partitions {
@@ -8413,6 +8420,7 @@ mod tests {
             parent.partition_by = Some(PartitionBy {
                 external: false,
                 columns: vec!["ts".into()],
+                strategy: Default::default(),
             });
             s.tables.insert(parent_name.clone(), parent);
             for (k, name) in partitions.iter().enumerate() {
@@ -8602,6 +8610,7 @@ mod tests {
             parent.partition_by = Some(PartitionBy {
                 external: false,
                 columns: vec!["ts".into()],
+                strategy: Default::default(),
             });
             let mut partition = Table {
                 partition_of: Some(PartitionOf {
@@ -8807,6 +8816,7 @@ mod tests {
             t.partition_by = Some(PartitionBy {
                 external: false,
                 columns: vec!["ts".into()],
+                strategy: Default::default(),
             });
             t
         };
@@ -8974,6 +8984,7 @@ mod tests {
                     p.partition_by = Some(PartitionBy {
                         external: false,
                         columns: vec!["at".into()],
+                        strategy: Default::default(),
                     });
                 },
                 &[("m2", own_default("7"))],
@@ -9093,6 +9104,7 @@ mod tests {
         no_key.tables.get_mut(&ev).unwrap().partition_by = Some(PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let e = refused(&no_key, &drop_ts);
         assert!(
@@ -9297,6 +9309,7 @@ mod tests {
                 p.partition_by = Some(PartitionBy {
                     external: false,
                     columns: vec!["spare".into()],
+                    strategy: Default::default(),
                 });
             },
             &keep_a,
@@ -9342,6 +9355,7 @@ mod tests {
                 p.partition_by = Some(PartitionBy {
                     external: false,
                     columns: vec!["k".into()],
+                    strategy: Default::default(),
                 });
             },
             &keep_a,
@@ -9356,6 +9370,7 @@ mod tests {
                 p.partition_by = Some(PartitionBy {
                     external: false,
                     columns: vec!["k".into()],
+                    strategy: Default::default(),
                 });
             },
             &keep_a,
@@ -9574,6 +9589,7 @@ mod tests {
         parent.partition_by = Some(PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let partition = |bound: PartitionBound| Table {
             partition_of: Some(PartitionOf {
@@ -9724,8 +9740,19 @@ mod tests {
             kinds(&outcome(&tree, &column, &[]).expect("a parent's column")),
             ["AddColumn"]
         );
+        // The parent's strategy is its partitioning too (#1632).
+        let mut strategy = tree.clone();
+        strategy
+            .tables
+            .get_mut(&"app.ev".parse::<TableName>().unwrap())
+            .unwrap()
+            .partition_by
+            .as_mut()
+            .unwrap()
+            .strategy = pbps_model::PartitionStrategy::List;
         for (declared, intents, expected) in [
             (&bound, &[][..], "change its partitioning"),
+            (&strategy, &[][..], "change its partitioning"),
             (&renamed, &rename[..], "rename table"),
             (&no_parent, &drop_all[..], "app.ev is a partitioned table"),
         ] {
@@ -9773,6 +9800,7 @@ mod tests {
         parent.partition_by = Some(PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let partition = |bound: PartitionBound| Table {
             partition_of: Some(PartitionOf {
@@ -9872,6 +9900,7 @@ mod tests {
         parent.partition_by = Some(PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let partition = |bound: PartitionBound| Table {
             partition_of: Some(PartitionOf {
@@ -9995,6 +10024,7 @@ mod tests {
         parent.partition_by = Some(PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let partition = |bound: PartitionBound, not_null: bool| Table {
             partition_of: Some(PartitionOf {
@@ -10180,6 +10210,7 @@ mod tests {
         parent.partition_by = Some(PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let range = |from: &str, to: &str| PartitionBound::Range {
             from: vec![BoundDatum::Value(from.into())],
@@ -10567,6 +10598,7 @@ mod tests {
                 .partition_by = Some(PartitionBy {
                 external: false,
                 columns: vec!["id".into()],
+                strategy: Default::default(),
             });
             schema
         };
@@ -11112,6 +11144,7 @@ mod tests {
         parent.partition_by = Some(PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let mut tree = schema_of("app.ev", parent.clone());
         let mut referenced = table(&[("id", Column::new(ty("int")).not_null())]);
@@ -11423,6 +11456,7 @@ mod tests {
         parent.partition_by = Some(PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let own = |default: &str| Table {
             partition_of: Some(PartitionOf {
@@ -11658,6 +11692,7 @@ mod tests {
         parent.partition_by = Some(PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let mut own = Table {
             partition_of: Some(PartitionOf {
@@ -11838,6 +11873,7 @@ mod tests {
         parent.partition_by = Some(PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let own = Table {
             partition_of: Some(PartitionOf {

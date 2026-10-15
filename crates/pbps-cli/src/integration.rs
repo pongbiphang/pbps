@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 46;
+pub const SCHEMA_VERSION: u32 = 47;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -60,6 +60,7 @@ pub const SCHEMA_VERSION: u32 = 46;
 // 44: `explain`'s `resolver`: a resolved plan's sealed evidence (issue #1517).
 // 45: a resolver entry's `externals:`, formerly `baseline:` (issue #2007).
 // 46: an `identity:` mapping and a `sequence:`'s `min`, `max`, `cycle`, `cache` (issue #1921).
+// 47: `partition_by:`'s `list:` and `hash:`, and a partition's `in:`, `modulus:`, `remainder:` (issue #1632).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).

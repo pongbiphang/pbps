@@ -22,6 +22,7 @@ fn baseline(attached: bool) -> (Schema, IdsFile) {
     parent.partition_by = Some(PartitionBy {
         external: false,
         columns: vec!["k".into()],
+        strategy: Default::default(),
     });
     let child = if attached {
         Table {

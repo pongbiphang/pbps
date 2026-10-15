@@ -65,8 +65,9 @@ created whole, and gains a nullable column in place, its history with it;
 every other change to one is refused by name (#1176, #1177, DEC-1176.1,
 DEC-1177.1).
 
-A PostgreSQL table declares `partition_by:` and its RANGE partitions under
-`partitions:`, in its own file. `pull` reads a tree whose partitions are their
+A PostgreSQL table declares `partition_by:` and its RANGE, LIST or HASH
+partitions under `partitions:`, in its own file (LIST and HASH since #1632,
+DEC-1632.1). `pull` reads a tree whose partitions are their
 parent's and their own checks, indexes (#1577, DEC-1577.1), column defaults
 and NOT NULLs (#1578, DEC-1578.1), grants on the parent and on each
 partition, each its own (#1579, DEC-1579.1), and persistence and storage
@@ -75,8 +76,8 @@ whole, by name. A
 tree is created whole, and a partition nobody declared is refused with the
 commands that adopt it (#1170, DEC-1170.1). A partition is then added under its
 standing parent, or dropped with drop intent; the apply's pre-flight refuses
-the drop of a referenced partition (#1171, DEC-1171.1). A range added beside a
-standing DEFAULT partition takes the DEFAULT's rows of its range, made as a
+the drop of a referenced partition (#1171, DEC-1171.1). A range or a list added
+beside a standing DEFAULT partition takes the DEFAULT's rows of it, made as a
 plain table, filled and attached (#1547, DEC-1547.1). A partition declared in a file of its own with its
 parent's shape is detached and kept, under its declared names (#1544,
 DEC-1544.1). A standing partition's own indexes, checks, defaults, NOT NULLs,

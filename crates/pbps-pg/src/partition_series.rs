@@ -530,6 +530,12 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
             "`{parent}` declares no `partition_by:`; a series extends a RANGE-partitioned table"
         ))
     })?;
+    if !by.strategy.is_range() {
+        return Err(invalid(format!(
+            "`{parent}` is partitioned by {}: a series extends a RANGE-partitioned table",
+            by.strategy.keyword()
+        )));
+    }
     if by.external {
         return Err(invalid(format!(
             "`{parent}` declares `partitions: external`: its partitions are another tool's, and \
@@ -567,6 +573,12 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
         match &of.bound {
             // A DEFAULT takes the rows no range does and has no end.
             PartitionBound::Default => {}
+            // A series is of ranges (#1632).
+            PartitionBound::List { .. } | PartitionBound::Hash { .. } => {
+                return Err(invalid(format!(
+                    "partition {name} is not a range: only a RANGE parent's partitions extend"
+                )));
+            }
             PartitionBound::Range { from, to } => {
                 let ([_], [end]) = (from.as_slice(), to.as_slice()) else {
                     return Err(invalid(format!(
@@ -916,6 +928,7 @@ mod tests {
         table.partition_by = Some(PartitionBy {
             columns: vec!["ts".into()],
             external: false,
+            strategy: Default::default(),
         });
         let mut schema = Schema::default();
         schema.tables.insert(parent(), table);
@@ -1666,6 +1679,7 @@ mod tests {
         parent_table.partition_by = Some(PartitionBy {
             columns: vec!["tenant".into(), "ts".into()],
             external: false,
+            strategy: Default::default(),
         });
         let said = refusal(ask(&s, "1month", "2027-01-01", Some("2026-01-01")));
         assert!(said.contains("2 columns"), "{said}");
@@ -1674,6 +1688,7 @@ mod tests {
         s.tables.get_mut(&parent()).unwrap().partition_by = Some(PartitionBy {
             columns: vec!["nope".into()],
             external: false,
+            strategy: Default::default(),
         });
         assert!(refusal(ask(&s, "1month", "2027-01-01", Some("2026-01-01"))).contains("`nope`"));
     }
@@ -1685,6 +1700,26 @@ mod tests {
         table.partition_by.as_mut().unwrap().external = true;
         let said = refusal(ask(&s, "1month", "2026-03-01", None));
         assert!(said.contains("partitions: external"), "{said}");
+        // A LIST or HASH parent has no range to extend (#1632).
+        for strategy in [
+            pbps_model::PartitionStrategy::List,
+            pbps_model::PartitionStrategy::Hash,
+        ] {
+            let mut other = schema("date", &[]);
+            other
+                .tables
+                .get_mut(&parent())
+                .unwrap()
+                .partition_by
+                .as_mut()
+                .unwrap()
+                .strategy = strategy;
+            let said = refusal(ask(&other, "1month", "2026-03-01", None));
+            assert!(
+                said.contains("a series extends a RANGE-partitioned"),
+                "{said}"
+            );
+        }
         s.tables.get_mut(&parent()).unwrap().partition_by = None;
         let said = refusal(ask(&s, "1month", "2026-03-01", None));
         assert!(said.contains("declares no `partition_by:`"), "{said}");
@@ -1765,6 +1800,7 @@ mod tests {
         table.partition_by = Some(PartitionBy {
             columns: vec!["ts".into()],
             external: false,
+            strategy: Default::default(),
         });
         s.tables.insert(parent_name.clone(), table);
         let said = refusal(series(&RangeSeriesRequest {

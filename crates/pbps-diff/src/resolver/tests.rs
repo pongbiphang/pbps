@@ -2693,6 +2693,7 @@ mod generated_surface_coverage {
                 partition_by: Some(PartitionBy {
                     external: false,
                     columns: vec!["d".into()],
+                    strategy: Default::default(),
                 }),
                 ..Default::default()
             },
@@ -3078,6 +3079,7 @@ mod generated_surface_coverage {
                     partition_by: Some(PartitionBy {
                         external: false,
                         columns: vec!["k".into()],
+                        strategy: Default::default(),
                     }),
                     ..Default::default()
                 },
@@ -3152,6 +3154,7 @@ mod generated_surface_coverage {
                     partition_by: Some(PartitionBy {
                         external: false,
                         columns: vec!["k".into()],
+                        strategy: Default::default(),
                     }),
                     ..Default::default()
                 },
@@ -3236,6 +3239,7 @@ mod generated_surface_coverage {
                 partition_by: Some(PartitionBy {
                     external: false,
                     columns: vec!["k".into()],
+                    strategy: Default::default(),
                 }),
                 ..Default::default()
             },
@@ -4013,6 +4017,7 @@ fn a_parents_new_index_precedes_its_partitions_own_under_the_resolver() {
             partition_by: Some(PartitionBy {
                 external: false,
                 columns: vec!["ts".into()],
+                strategy: Default::default(),
             }),
             ..Default::default()
         },
@@ -4096,6 +4101,7 @@ fn a_resolver_plan_keeps_the_move_a_human_allowed() {
     parent.partition_by = Some(PartitionBy {
         external: false,
         columns: vec!["ts".into()],
+        strategy: Default::default(),
     });
     base.tables.insert("app.ev".parse().unwrap(), parent);
     let partition = |bound: PartitionBound| pbps_model::Table {

@@ -133,9 +133,9 @@ pub enum Blocker {
         /// name, a view's, or a routine's.
         table: Option<TableName>,
     },
-    /// A move was allowed for a table that is not a range partition whose
-    /// parent declares a DEFAULT partition, so no rows can ever move into it
-    /// (#1788).
+    /// A move was allowed for a table that is not a range or list partition
+    /// whose parent declares a DEFAULT partition, so no rows can ever move
+    /// into it (#1788, #1632).
     MoveNotBesideDefault { table: TableName },
 }
 
@@ -1306,7 +1306,13 @@ fn resolve_moves(
             .tables
             .get(table)
             .and_then(|t| t.partition_of.as_ref())
-            .filter(|of| matches!(of.bound, pbps_model::PartitionBound::Range { .. }))
+            .filter(|of| {
+                matches!(
+                    of.bound,
+                    pbps_model::PartitionBound::Range { .. }
+                        | pbps_model::PartitionBound::List { .. }
+                )
+            })
             .is_some_and(|of| {
                 declared.tables.values().any(|other| {
                     other.partition_of.as_ref().is_some_and(|o| {

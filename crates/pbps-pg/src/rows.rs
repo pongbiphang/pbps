@@ -1384,8 +1384,29 @@ pub fn bound_spelling_queries(
         let Some(of) = &table.partition_of else {
             continue;
         };
-        let pbps_model::PartitionBound::Range { from, to } = &of.bound else {
-            continue;
+        // A list's values are its one key column's (#1632); a hash bound
+        // and a DEFAULT declare none.
+        let declared = |i: usize| -> Vec<String> {
+            match &of.bound {
+                pbps_model::PartitionBound::Range { from, to } => [from.get(i), to.get(i)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|d| match d {
+                        pbps_model::BoundDatum::Value(v) => Some(v.clone()),
+                        pbps_model::BoundDatum::MinValue | pbps_model::BoundDatum::MaxValue => None,
+                    })
+                    .collect(),
+                pbps_model::PartitionBound::List { values } if i == 0 => values
+                    .iter()
+                    .filter_map(|d| match d {
+                        pbps_model::ListDatum::Value(v) => Some(v.clone()),
+                        pbps_model::ListDatum::Null => None,
+                    })
+                    .collect(),
+                pbps_model::PartitionBound::List { .. }
+                | pbps_model::PartitionBound::Hash { .. }
+                | pbps_model::PartitionBound::Default => Vec::new(),
+            }
         };
         let Some(parent) = schema.tables.get(&of.parent) else {
             continue;
@@ -1397,14 +1418,7 @@ pub fn bound_spelling_queries(
             let Some(spec) = parent.columns.get(column) else {
                 continue;
             };
-            let values: Vec<String> = [from.get(i), to.get(i)]
-                .into_iter()
-                .flatten()
-                .filter_map(|d| match d {
-                    pbps_model::BoundDatum::Value(v) => Some(v.clone()),
-                    pbps_model::BoundDatum::MinValue | pbps_model::BoundDatum::MaxValue => None,
-                })
-                .collect();
+            let values = declared(i);
             if values.is_empty() {
                 continue;
             }

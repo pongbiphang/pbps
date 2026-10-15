@@ -3978,7 +3978,8 @@ fn partition_probes(
             ..
         } = &p.change
             && let Some(of) = &table.partition_of
-            && let pbps_model::PartitionBound::Range { from, to } = &of.bound
+            && let bound @ (pbps_model::PartitionBound::Range { .. }
+            | pbps_model::PartitionBound::List { .. }) = &of.bound
         {
             // Its rows are moved, not refused (#1547), unless the move would
             // set off what a delete from the DEFAULT sets off. Both are read
@@ -3998,15 +3999,8 @@ fn partition_probes(
             // the catalog's to say when the move runs, and the moving
             // statement asks the values it meets there (#1763 review).
             if names.recomputed.is_empty() && names.retyped.is_empty() {
-                match default_reference_probe(
-                    name,
-                    &parent,
-                    &stored,
-                    names,
-                    &dropped_before,
-                    from,
-                    to,
-                ) {
+                match default_reference_probe(name, &parent, &stored, names, &dropped_before, bound)
+                {
                     Ok(probe) => out.push(probe),
                     Err(error) => {
                         unchecked.push(Unchecked::for_change(&p.change, error.to_string()))
@@ -4023,17 +4017,16 @@ fn partition_probes(
             // measured on 16 and 18, the subscriber went on replicating
             // (#1763 review).
             let inserted = (!table.unlogged)
-                .then(|| default_insert_publication_probe(name, &parent, &stored, from, to));
+                .then(|| default_insert_publication_probe(name, &parent, &stored, bound));
             // The rows a human did not allow to move (#1788), asked by
             // their count alone: the questions above say what a move would
             // set off, this one whether it may happen at all.
-            let unallowed =
-                default_move_bound_probe(name, &parent, &stored, from, to, *moves_at_most);
+            let unallowed = default_move_bound_probe(name, &parent, &stored, bound, *moves_at_most);
             for probe in [
-                default_hidden_referencers_probe(name, &parent, &stored, names, from, to),
-                default_trigger_probe(name, &parent, &stored, &gone, from, to),
+                default_hidden_referencers_probe(name, &parent, &stored, names, bound),
+                default_trigger_probe(name, &parent, &stored, &gone, bound),
                 default_statement_probe(name, &stored, &gone),
-                default_publication_probe(name, &parent, &stored, from, to),
+                default_publication_probe(name, &parent, &stored, bound),
             ]
             .into_iter()
             .chain(inserted)
@@ -4049,7 +4042,10 @@ fn partition_probes(
             continue;
         } else if let Change::CreateTable { name, table, .. } = &p.change
             && let Some(of) = &table.partition_of
-            && let pbps_model::PartitionBound::Range { from, to } = &of.bound
+            // A HASH parent has no DEFAULT to hold rows of a new remainder,
+            // and no row is stored without a partition to take it (#1632).
+            && let bound @ (pbps_model::PartitionBound::Range { .. }
+            | pbps_model::PartitionBound::List { .. }) = &of.bound
             && !names.view().created(&of.parent)
         {
             // Under the parent's name before the plan's renames, as above.
@@ -4058,7 +4054,7 @@ fn partition_probes(
                 .view()
                 .table(&of.parent)
                 .unwrap_or_else(|| of.parent.clone());
-            partition_range_probe(name, &parent, from, to, &leaving, "create a partition")
+            partition_range_probe(name, &parent, bound, &leaving, "create a partition")
         } else if let Change::DropTable {
             name,
             detach_from: Some(parent),
@@ -4077,18 +4073,22 @@ fn partition_probes(
         } else if let Change::AttachPartition {
             table,
             parent,
-            bound: pbps_model::PartitionBound::Range { from, to },
+            bound:
+                bound @ (pbps_model::PartitionBound::Range { .. }
+                | pbps_model::PartitionBound::List { .. }
+                | pbps_model::PartitionBound::Hash { .. }),
             ..
         } = &p.change
         {
             // Four questions, a created partition's one among them: the
-            // table's own rows outside the range, which the engine refuses to
+            // table's own rows outside the bound, which the engine refuses to
             // attach over; its triggers and its column grants, which it does
             // not refuse and the reader does; and the DEFAULT partition's
-            // rows inside it (#1545).
+            // rows inside it (#1545), which a HASH parent has none of
+            // (#1632).
             let leaving = leaving(parent);
             for probe in [
-                attach_range_probe(table, parent, from, to),
+                attach_range_probe(table, parent, bound),
                 attach_trigger_probe(table),
                 attach_column_grant_probe(table),
             ] {
@@ -4099,7 +4099,10 @@ fn partition_probes(
                     }
                 }
             }
-            partition_range_probe(table, parent, from, to, &leaving, "attach a table")
+            if matches!(bound, pbps_model::PartitionBound::Hash { .. }) {
+                continue;
+            }
+            partition_range_probe(table, parent, bound, &leaving, "attach a table")
         } else {
             continue;
         };
@@ -4119,6 +4122,66 @@ fn key_prefix(count: usize) -> String {
          JOIN pg_catalog.pg_attribute a ON a.attrelid = pt.partrelid AND a.attnum = k.attnum \
          WHERE k.n <= {count})"
     )
+}
+
+/// Where a DEFAULT's rows a partition takes are, in words: inside its range,
+/// or among its values (#1632).
+pub(crate) fn inside(bound: &pbps_model::PartitionBound) -> &'static str {
+    match bound {
+        pbps_model::PartitionBound::List { .. } => "among the values of",
+        pbps_model::PartitionBound::Range { .. }
+        | pbps_model::PartitionBound::Hash { .. }
+        | pbps_model::PartitionBound::Default => "inside the range of",
+    }
+}
+
+/// The rows a partition's bound takes, as SQL the engine evaluates, over
+/// `pt`, the parent's `pg_partitioned_table` row, to the text of a predicate
+/// on `r`, parenthesized (#1632): a range's ([`range_predicate`]); a LIST's
+/// key among its values, or NULL where it takes NULL; a HASH's through
+/// `satisfies_hash_partition`, the engine's own routing, NULLs included. A
+/// DEFAULT takes what no other bound does, which no one predicate says, and
+/// is never asked for.
+pub(crate) fn bound_predicate(bound: &pbps_model::PartitionBound) -> String {
+    match bound {
+        pbps_model::PartitionBound::Range { from, to } => {
+            format!("'(' || {} || ')'", range_predicate(from, to))
+        }
+        pbps_model::PartitionBound::List { values } => {
+            let listed: Vec<String> = values
+                .iter()
+                .filter_map(|v| match v {
+                    pbps_model::ListDatum::Value(v) => Some(value_literal(v)),
+                    pbps_model::ListDatum::Null => None,
+                })
+                .collect();
+            let null = values.contains(&pbps_model::ListDatum::Null);
+            // Never NULL itself: `NOT` of it counts the rows outside, and
+            // `k IN (…)` of a NULL key is NULL, which `NOT` would not count.
+            let key = key_prefix(1);
+            let among = format!(
+                "{key} || ' IS NOT NULL AND ' || {key} || {}",
+                value_literal(&format!(" IN ({})", listed.join(", ")))
+            );
+            match (listed.is_empty(), null) {
+                (true, true) => format!("'(' || {key} || {}", value_literal(" IS NULL)")),
+                (true, false) => value_literal("FALSE"),
+                (false, false) => format!("'(' || {among} || ')'"),
+                (false, true) => format!(
+                    "'(' || {among} || ' OR ' || {key} || {}",
+                    value_literal(" IS NULL)")
+                ),
+            }
+        }
+        pbps_model::PartitionBound::Hash { modulus, remainder } => format!(
+            "'pg_catalog.satisfies_hash_partition(' || pt.partrelid::pg_catalog.text || {} || \
+             {} || ')'",
+            value_literal(&format!("::pg_catalog.oid, {modulus}, {remainder}, ")),
+            // Every key column: a key has at most 32.
+            key_prefix(32)
+        ),
+        pbps_model::PartitionBound::Default => value_literal("FALSE"),
+    }
 }
 
 /// The rows of a range, as SQL the engine evaluates, over `pt`, the parent's
@@ -4190,11 +4253,11 @@ fn range_end(data: &[pbps_model::BoundDatum], lower: bool) -> String {
 fn partition_range_probe(
     partition: &TableName,
     parent: &TableName,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
     leaving: &[&TableName],
     making: &str,
 ) -> Result<Probe, DialectError> {
+    let inside = inside(bound);
     let mut excluded = String::new();
     for child in leaving {
         excluded.push_str(&format!(
@@ -4208,12 +4271,12 @@ fn partition_range_probe(
             "SELECT count(*) AS n FROM {} AS r WHERE ",
             qualified(parent)?
         )),
-        range_predicate(from, to),
+        bound_predicate(bound),
         value_literal(&excluded),
     );
     Ok(Probe::new(
         format!(
-            "rows of {parent} inside the range of its new partition {partition}: they are in its \
+            "rows of {parent} {inside} its new partition {partition}: they are in its \
              DEFAULT partition now, and the engine will not {making} over them; move or delete \
              them first, then plan again"
         ),
@@ -4247,9 +4310,9 @@ fn default_reference_probe(
     default: &TableName,
     names: &AsStored,
     dropped_before: &[&TableName],
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
 ) -> Result<Probe, DialectError> {
+    let inside = inside(bound);
     // The rows of a referencing table's partitions dropped before the move
     // are gone by then, as for a detach (#1763 review).
     let mut gone_rows = String::new();
@@ -4268,20 +4331,20 @@ fn default_reference_probe(
         "'SELECT count(*) AS n FROM ' || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END \
          || pg_catalog.quote_ident(ns.nspname) || '.' || pg_catalog.quote_ident(cl.relname) \
          || {child} || {matched} || ' AND ' || {} || ')' || {} || {}",
-        range_predicate(from, to),
+        bound_predicate(bound),
         moved_with_it(
             default,
             &format!(
                 "pg_catalog.to_regclass({})",
                 value_literal(&qualified(default)?)
             ),
-            &range_predicate(from, to),
+            &bound_predicate(bound),
         )?,
         value_literal(&gone_rows)
     );
     Ok(Probe::new(
         format!(
-            "rows that reference rows of {default} inside the range of {partition}, its parent \
+            "rows that reference rows of {default} {inside} {partition}, its parent \
              {parent}'s new partition beside it: moving those rows into {partition} deletes \
              them from {default}, which fires the foreign key's action on the rows referencing \
              them; delete or repoint the referencing rows, or move the rows first, then plan \
@@ -4425,13 +4488,13 @@ fn default_insert_publication_probe(
     partition: &TableName,
     parent: &TableName,
     default: &TableName,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
 ) -> Result<Probe, DialectError> {
+    let inside = inside(bound);
     Ok(Probe::new(
         format!(
             "publications that publish inserts into every table, or every table of {}: moving \
-             the rows of {default} inside the range of {partition} inserts them into it before \
+             the rows of {default} {inside} {partition} inserts them into it before \
              it is attached, and a subscriber receives them as rows of a table it does not \
              have, which stops its replication; move the rows by hand, or take the inserts \
              out of the publication for the move, then plan again",
@@ -4439,7 +4502,7 @@ fn default_insert_publication_probe(
         ),
         format!(
             "SELECT CASE WHEN {} > 0 THEN {} ELSE 0 END",
-            default_rows_in_range(parent, default, from, to)?,
+            default_rows_in_range(parent, default, bound)?,
             saturated_count(&format!(
                 "(SELECT count(*) {})",
                 insert_publications(&value_literal(&partition.schema))
@@ -4454,8 +4517,7 @@ fn default_publication_probe(
     partition: &TableName,
     parent: &TableName,
     default: &TableName,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
 ) -> Result<Probe, DialectError> {
     Ok(Probe::new(
         format!(
@@ -4466,14 +4528,14 @@ fn default_publication_probe(
         ),
         format!(
             "SELECT CASE WHEN {} > 0 THEN {} ELSE 0 END",
-            default_rows_in_range(parent, default, from, to)?,
+            default_rows_in_range(parent, default, bound)?,
             saturated_count(&format!(
                 "(SELECT count(DISTINCT p.pubname) {} AND (pubt.rowfilter IS NULL OR {}))",
                 publications_of(&format!(
                     "pg_catalog.to_regclass({})",
                     value_literal(&qualified(default)?)
                 )),
-                filter_holds_moved(parent, default, from, to)?
+                filter_holds_moved(parent, default, bound)?
             ))
         ),
     ))
@@ -4484,8 +4546,7 @@ fn default_publication_probe(
 fn filter_holds_moved(
     parent: &TableName,
     default: &TableName,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
 ) -> Result<String, DialectError> {
     let text = format!(
         "{} || {} || ' AND (' || pubt.rowfilter || ')'",
@@ -4493,7 +4554,7 @@ fn filter_holds_moved(
             "SELECT count(*) AS n FROM ONLY {} AS r WHERE ",
             qualified(default)?
         )),
-        range_predicate(from, to),
+        bound_predicate(bound),
     );
     Ok(format!(
         "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
@@ -4557,11 +4618,10 @@ fn dropped_triggers(
 fn default_rows_in_range(
     parent: &TableName,
     default: &TableName,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
 ) -> Result<String, DialectError> {
     Ok(saturated_count(&default_rows_in_range_unclamped(
-        parent, default, from, to,
+        parent, default, bound,
     )?))
 }
 
@@ -4573,13 +4633,12 @@ fn default_move_bound_probe(
     partition: &TableName,
     parent: &TableName,
     default: &TableName,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
     moves_at_most: Option<u64>,
 ) -> Result<Probe, DialectError> {
-    let rows = default_rows_in_range_unclamped(parent, default, from, to)?;
+    let rows = default_rows_in_range_unclamped(parent, default, bound)?;
     Ok(Probe::new(
-        crate::emit::moving_beyond_its_intent(partition, parent, default, from, to, moves_at_most)?,
+        crate::emit::moving_beyond_its_intent(partition, parent, default, bound, moves_at_most)?,
         // Counted once: on a table worth bounding, a second count is a
         // second scan of its range.
         format!(
@@ -4596,8 +4655,7 @@ fn default_move_bound_probe(
 fn default_rows_in_range_unclamped(
     parent: &TableName,
     default: &TableName,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
 ) -> Result<String, DialectError> {
     let text = format!(
         "{} || {}",
@@ -4605,7 +4663,7 @@ fn default_rows_in_range_unclamped(
             "SELECT count(*) AS n FROM {} AS r WHERE ",
             qualified(default)?
         )),
-        range_predicate(from, to),
+        bound_predicate(bound),
     );
     Ok(format!(
         "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
@@ -4629,8 +4687,7 @@ fn default_hidden_referencers_probe(
     parent: &TableName,
     default: &TableName,
     names: &AsStored,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
 ) -> Result<Probe, DialectError> {
     let d = value_literal(&qualified(default)?);
     Ok(Probe::new(
@@ -4643,7 +4700,7 @@ fn default_hidden_referencers_probe(
         ),
         format!(
             "SELECT CASE WHEN {} > 0 THEN {} ELSE 0 END",
-            default_rows_in_range(parent, default, from, to)?,
+            default_rows_in_range(parent, default, bound)?,
             saturated_count(&format!(
                 "(SELECT count(DISTINCT cl.oid) FROM pg_catalog.pg_constraint con \
                  JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid \
@@ -4673,13 +4730,13 @@ fn default_trigger_probe(
     parent: &TableName,
     default: &TableName,
     gone: &str,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
 ) -> Result<Probe, DialectError> {
+    let inside = inside(bound);
     let d = value_literal(&qualified(default)?);
     Ok(Probe::new(
         format!(
-            "rows of {default} inside the range of {partition}, its parent {parent}'s new \
+            "rows of {default} {inside} {partition}, its parent {parent}'s new \
              partition beside it, under a row trigger on {default} that fires on delete: moving \
              them into {partition} deletes them from {default}, which runs the trigger for each; \
              drop or disable it, or move the rows first, then plan again"
@@ -4689,7 +4746,7 @@ fn default_trigger_probe(
              WHERE t.tgrelid = pg_catalog.to_regclass({d}) AND NOT t.tgisinternal \
              AND {} AND (t.tgtype::int & 9) = 9 AND NOT ({gone})) THEN {} ELSE 0 END",
             fires_here("t.tgenabled"),
-            default_rows_in_range(parent, default, from, to)?
+            default_rows_in_range(parent, default, bound)?
         ),
     ))
 }
@@ -4734,8 +4791,7 @@ fn default_statement_probe(
 fn attach_range_probe(
     table: &TableName,
     parent: &TableName,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
 ) -> Result<Probe, DialectError> {
     let text = format!(
         "{} || {} || ')'",
@@ -4743,13 +4799,22 @@ fn attach_range_probe(
             "SELECT count(*) AS n FROM {} AS r WHERE NOT (",
             qualified(table)?
         )),
-        range_predicate(from, to),
+        bound_predicate(bound),
     );
+    // A range never takes a NULL key; a list may, and a hash always does.
+    let outside = match bound {
+        pbps_model::PartitionBound::Range { .. } => {
+            "outside the range it takes under {parent}, or with a NULL in its partition key"
+        }
+        pbps_model::PartitionBound::List { .. } => "outside the values it takes under {parent}",
+        pbps_model::PartitionBound::Hash { .. } => "outside the remainder it takes under {parent}",
+        pbps_model::PartitionBound::Default => "that its parent routes elsewhere",
+    }
+    .replace("{parent}", &parent.to_string());
     Ok(Probe::new(
         format!(
-            "rows of {table} outside the range it takes under {parent}, or with a NULL in its \
-             partition key: the engine will not attach it over them; move or delete them first, \
-             then plan again"
+            "rows of {table} {outside}: the engine will not attach it over them; move or delete \
+             them first, then plan again"
         ),
         format!(
             "SELECT {}",

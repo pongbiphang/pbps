@@ -123,6 +123,7 @@ fn a_created_partition_keeps_its_place_from_the_first_read() {
                     changed.partition_by = Some(pbps_model::PartitionBy {
                         columns: vec!["v".into()],
                         external: false,
+                        strategy: Default::default(),
                     })
                 }
                 _ => unreachable!(),
@@ -157,6 +158,7 @@ fn a_partition_default_follows_the_last_parent_or_own_setting() {
         parent_table.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["id".into()],
+            strategy: Default::default(),
         });
         schema.tables.insert(parent.clone(), parent_table);
         schema
@@ -261,6 +263,7 @@ fn a_parent_drop_keeps_the_other_own_entries_across_a_table_rename() {
     parent_table.partition_by = Some(pbps_model::PartitionBy {
         external: false,
         columns: vec!["ts".into()],
+        strategy: Default::default(),
     });
     before.tables.insert(parent.clone(), parent_table);
     for renamed in [false, true] {
@@ -402,6 +405,7 @@ fn touching_a_table_keeps_each_scalar_at_every_read() {
                 changed.partition_by = Some(pbps_model::PartitionBy {
                     columns: vec!["id".into()],
                     external: false,
+                    strategy: Default::default(),
                 });
                 "partition parent, bound or key"
             }
@@ -1059,6 +1063,7 @@ fn parent_with_distinct_own_columns() -> Schema {
     p.partition_by = Some(pbps_model::PartitionBy {
         columns: vec!["id".into()],
         external: false,
+        strategy: Default::default(),
     });
     for (name, value) in [("a", "1"), ("b", "2")] {
         let mut c = Column::new("integer".parse().unwrap());

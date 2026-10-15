@@ -2076,6 +2076,7 @@ fn a_partitions_own_default_needs_its_catalog_record() {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["id".into()],
+            strategy: Default::default(),
         });
         schema.tables.insert("app.ev".parse().unwrap(), parent);
         let partition = pbps_model::Table {

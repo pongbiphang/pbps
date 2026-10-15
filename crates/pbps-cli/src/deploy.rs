@@ -2802,23 +2802,33 @@ fn as_read(
         else {
             continue;
         };
-        let Some(pbps_model::PartitionBound::Range { from, to }) = out
+        match out
             .tables
             .get_mut(&b.partition)
             .and_then(|t| t.partition_of.as_mut())
             .map(|of| &mut of.bound)
-        else {
-            continue;
-        };
-        // Both ends, wherever the declared text stands: the same text is
-        // the same reading.
-        for datum in [from.get_mut(position), to.get_mut(position)]
-            .into_iter()
-            .flatten()
         {
-            if *datum == pbps_model::BoundDatum::Value(b.declared.clone()) {
-                *datum = pbps_model::BoundDatum::Value(canonical.clone());
+            // Both ends, wherever the declared text stands: the same text is
+            // the same reading.
+            Some(pbps_model::PartitionBound::Range { from, to }) => {
+                for datum in [from.get_mut(position), to.get_mut(position)]
+                    .into_iter()
+                    .flatten()
+                {
+                    if *datum == pbps_model::BoundDatum::Value(b.declared.clone()) {
+                        *datum = pbps_model::BoundDatum::Value(canonical.clone());
+                    }
+                }
             }
+            // Every value of a list is its one key column's (#1632).
+            Some(pbps_model::PartitionBound::List { values }) if position == 0 => {
+                for datum in values.iter_mut() {
+                    if *datum == pbps_model::ListDatum::Value(b.declared.clone()) {
+                        *datum = pbps_model::ListDatum::Value(canonical.clone());
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -9989,6 +9999,7 @@ mod tests {
                 partition_by: Some(PartitionBy {
                     external: false,
                     columns: vec!["a".into(), "b".into()],
+                    strategy: Default::default(),
                 }),
                 ..Table::default()
             },
@@ -10051,6 +10062,49 @@ mod tests {
         };
         assert_eq!(from, &[value("2026-02-01 00:00:00"), value("2026-02-01")]);
         assert_eq!(to, &[value("2026-02-01 00:00:00"), BoundDatum::MaxValue]);
+        // A list's value on its one key column is replaced wherever it stands
+        // in the list; another value, and NULL, are not (#1632).
+        let mut listed = schema.clone();
+        listed
+            .tables
+            .get_mut(&p)
+            .unwrap()
+            .partition_by
+            .as_mut()
+            .unwrap()
+            .strategy = pbps_model::PartitionStrategy::List;
+        listed.tables.get_mut(&p_a).unwrap().partition_of = Some(PartitionOf {
+            parent: p.clone(),
+            bound: PartitionBound::List {
+                values: vec![
+                    pbps_model::ListDatum::Null,
+                    pbps_model::ListDatum::Value("2026-02-01".into()),
+                    pbps_model::ListDatum::Value("2026-03-01".into()),
+                ],
+            },
+            columns: Default::default(),
+        });
+        let bound = |column: &str| MisspeltBound {
+            partition: p_a.clone(),
+            column: column.to_owned(),
+            declared: "2026-02-01".to_owned(),
+            ty: "timestamp without time zone".to_owned(),
+            canonical: Some("2026-02-01 00:00:00".to_owned()),
+            temporal: true,
+        };
+        let read = super::as_read(&listed, &[], &[bound("a")]);
+        assert_eq!(
+            read.tables[&p_a].partition_of.as_ref().map(|of| &of.bound),
+            Some(&PartitionBound::List {
+                values: vec![
+                    pbps_model::ListDatum::Null,
+                    pbps_model::ListDatum::Value("2026-02-01 00:00:00".into()),
+                    pbps_model::ListDatum::Value("2026-03-01".into()),
+                ],
+            })
+        );
+        // Negative: a list has no second key column to replace a value on.
+        assert_eq!(super::as_read(&listed, &[], &[bound("b")]), listed);
         // Nothing to replace leaves the declarations as they were.
         assert_eq!(super::as_read(&schema, &[], &[]), schema);
     }
@@ -10071,6 +10125,7 @@ mod tests {
             partition_by: Some(PartitionBy {
                 external: false,
                 columns: vec!["id".into()],
+                strategy: Default::default(),
             }),
             ..Table::default()
         };
@@ -14945,6 +15000,7 @@ mod tests {
             p.partition_by = Some(PartitionBy {
                 external: false,
                 columns: vec!["v".into()],
+                strategy: Default::default(),
             });
             let t = Table {
                 partition_of: Some(PartitionOf {
@@ -15269,6 +15325,7 @@ mod tests {
             p.partition_by = Some(PartitionBy {
                 external: false,
                 columns: vec![key.into()],
+                strategy: Default::default(),
             });
             s
         };

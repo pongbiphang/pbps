@@ -3483,7 +3483,7 @@ fn a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan() 
         "CREATE TABLE app.x (id integer PRIMARY KEY); \
          CREATE VIEW app.v AS SELECT 1 AS n; \
          CREATE FUNCTION app.g(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$; \
-         CREATE TABLE app.p (id integer NOT NULL) PARTITION BY LIST (id)",
+         CREATE TABLE app.p (id integer NOT NULL) PARTITION BY LIST ((id + 1))",
     );
     let table = |name: &str| {
         std::fs::write(
@@ -7640,7 +7640,7 @@ fn pull_declares_a_named_parents_partitions_external_on(server: &str, k: usize) 
         assert_ne!(code(&o), 0, "{name}: {}", stdout(&o));
         assert!(
             stderr(&o).contains(&format!(
-                "--partitions-external {name}: this database has no range-partitioned parent"
+                "--partitions-external {name}: this database has no partitioned parent"
             )),
             "{name}: {}",
             stderr(&o)
@@ -22775,7 +22775,7 @@ fn default_move_flow(server: &str, slug: &str, container: &str) {
     assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     assert!(
         format!("{}{}", stdout(&o), stderr(&o))
-            .contains("app.ev is not a range partition whose parent declares a DEFAULT partition"),
+            .contains("app.ev is not a range or list partition whose parent declares a DEFAULT"),
         "{}{}",
         stdout(&o),
         stderr(&o)

@@ -59,7 +59,7 @@ async fn the_pull_keeps_project_ledger_names_beside_the_real_ledger() {
          CREATE TABLE app.__pbps_state (id integer PRIMARY KEY);
          CREATE TABLE app.__pbps_lock (id integer REFERENCES app.__pbps_state(id));
          CREATE TABLE app.__pbps_customers (id integer);
-         CREATE TABLE limited.__pbps_state (id integer) PARTITION BY LIST (id);
+         CREATE TABLE limited.__pbps_state (id integer) PARTITION BY LIST ((id + 1));
          CREATE FUNCTION app.ledger185_fn() RETURNS trigger LANGUAGE plpgsql
              AS $$ BEGIN RETURN NEW; END $$;
          CREATE TRIGGER ledger185_trigger BEFORE INSERT ON app.__pbps_state
@@ -2209,7 +2209,8 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              CREATE TABLE {s}.referring (
                  a integer, CONSTRAINT referring_fk FOREIGN KEY (a)
                      REFERENCES {s}.referenced (a));
-             CREATE TABLE {s}.parted (id integer, at date) PARTITION BY LIST (at);
+             -- A key over an expression, which no strategy holds (#1632).
+             CREATE TABLE {s}.parted (id integer, at date) PARTITION BY LIST ((at + 1));
              CREATE TABLE {s}.ancestor (a integer, b integer);
              CREATE TABLE {s}.descendant (c integer) INHERITS ({s}.ancestor);
              CREATE TABLE {s}.__pbps_state (id integer);
@@ -5239,7 +5240,8 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
              CREATE TABLE {s}.gen (k integer NOT NULL, v integer,
                  g integer GENERATED ALWAYS AS (v * 2) STORED) PARTITION BY RANGE (k);
              CREATE TABLE {s}.gen_1 PARTITION OF {s}.gen FOR VALUES FROM (0) TO (10);
-             ALTER TABLE {s}.gen_1 ALTER COLUMN g SET NOT NULL;"
+             ALTER TABLE {s}.gen_1 ALTER COLUMN g SET NOT NULL;
+             CREATE TABLE {s}.lst (x integer) PARTITION BY LIST (x);"
         );
         conn.execute(&trees).await.expect("the held trees");
         // Each of these is a tree pbps does not hold, for one reason each.
@@ -5256,7 +5258,6 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
              CREATE TABLE {s}.nest (x integer, y integer) PARTITION BY RANGE (x);
              CREATE TABLE {s}.nest_1 PARTITION OF {s}.nest
                  FOR VALUES FROM (0) TO (10) PARTITION BY RANGE (y);
-             CREATE TABLE {s}.lst (x integer) PARTITION BY LIST (x);
              CREATE TABLE {s}.granted (x integer) PARTITION BY RANGE (x);
              CREATE TABLE {s}.granted_1 PARTITION OF {s}.granted FOR VALUES FROM (0) TO (10);
              GRANT SELECT ON {s}.granted_1 TO PUBLIC;
@@ -5468,7 +5469,6 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             "own_1",
             "nest",
             "nest_1",
-            "lst",
             "colgrant",
             "colgrant_1",
             "dropdef",
@@ -5578,6 +5578,464 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             .unwrap()
             .to_owned();
         assert_eq!(own, "2024-01-01,old");
+
+        drop(conn);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .expect("drop the database");
+    }
+}
+
+/// LIST and HASH trees (#1632, DEC-1632.1) are read with their strategy and
+/// bounds, rebuilt from the declaration alone, and route rows as they did: a
+/// NULL to the partition listing it, a value no list takes to the DEFAULT, a
+/// hash row by the engine's own hashing. A list value the engine spells
+/// otherwise is named with its spelling. A LIST partition made beside a
+/// DEFAULT holding its values takes them, counted first and refused without
+/// a move a human allowed, as a range does (#1547, #1788); a HASH partition
+/// is added for a remainder no partition takes. A table attached under a
+/// list or a hash bound has its rows outside the bound counted, a NULL key
+/// among them where the list does not take NULL, the count agreeing with the
+/// engine's refusal. On 16 and 18.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
+    use pbps_model::{
+        Change, ListDatum as L, PartitionBound as B, PartitionOf, PartitionStrategy as S,
+    };
+
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    for connection in [conn_str(), old] {
+        let database = format!("pbps_test_part1632_{}", std::process::id());
+        let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        admin
+            .execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+            .await
+            .expect("clear a database left by an earlier run");
+        admin
+            .execute(&format!("CREATE DATABASE {database}"))
+            .await
+            .expect("create the database");
+        let own = connection.replace("dbname=pbps_test", &format!("dbname={database}"));
+        assert_ne!(
+            own, connection,
+            "the fixture names its database `pbps_test`"
+        );
+        let mut conn = Conn::connect(Driver::Postgres, &own).await.unwrap();
+        let s = emit_schema("part1632");
+        fresh(&mut conn, &s).await;
+        conn.execute(&format!(
+            "CREATE TABLE {s}.l (k text, n integer) PARTITION BY LIST (k);
+             CREATE TABLE {s}.l_ab PARTITION OF {s}.l FOR VALUES IN ('a', 'it''s');
+             CREATE TABLE {s}.l_null PARTITION OF {s}.l FOR VALUES IN (NULL, 'c');
+             CREATE TABLE {s}.l_rest PARTITION OF {s}.l DEFAULT;
+             CREATE TABLE {s}.d (ts date NOT NULL) PARTITION BY LIST (ts);
+             CREATE TABLE {s}.d_1 PARTITION OF {s}.d FOR VALUES IN ('2025-01-01', '2024-12-31');
+             CREATE TABLE {s}.i (x bigint) PARTITION BY LIST (x);
+             CREATE TABLE {s}.i_1 PARTITION OF {s}.i FOR VALUES IN (-5, 7);
+             CREATE TABLE {s}.b (f boolean) PARTITION BY LIST (f);
+             CREATE TABLE {s}.b_t PARTITION OF {s}.b FOR VALUES IN (true);
+             CREATE TABLE {s}.h (a integer NOT NULL, b text NOT NULL, PRIMARY KEY (a, b))
+                 PARTITION BY HASH (a, b);
+             CREATE TABLE {s}.h0 PARTITION OF {s}.h FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+             CREATE TABLE {s}.h1 PARTITION OF {s}.h FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+             CREATE TABLE {s}.h3 PARTITION OF {s}.h FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+             CREATE TABLE {s}.hh (a integer NOT NULL) PARTITION BY HASH (a);
+             CREATE TABLE {s}.hh0 PARTITION OF {s}.hh FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+             CREATE TABLE {s}.hh1 PARTITION OF {s}.hh FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+             CREATE TABLE {s}.hh2 PARTITION OF {s}.hh FOR VALUES WITH (MODULUS 4, REMAINDER 2);"
+        ))
+        .await
+        .expect("the trees");
+        let read = |pulled: &pbps_pg::introspect::Pulled| {
+            let mut held = Schema::default();
+            for (name, table) in &pulled.schema.tables {
+                if name.schema == s {
+                    held.tables.insert(name.clone(), table.clone());
+                }
+            }
+            held
+        };
+        let pulled = pbps_pg::catalog::introspect(&mut conn).await.expect("pull");
+        let held = read(&pulled);
+        let t = |name: &str| TableName::new(&s, name);
+        let strategy = |name: &str| {
+            held.tables[&t(name)]
+                .partition_by
+                .as_ref()
+                .map(|by| by.strategy)
+        };
+        assert_eq!(strategy("l"), Some(S::List));
+        assert_eq!(strategy("h"), Some(S::Hash));
+        let bound = |schema: &Schema, name: &str| {
+            schema.tables[&t(name)]
+                .partition_of
+                .as_ref()
+                .map(|of| of.bound.clone())
+        };
+        let v = |s: &str| L::Value(s.to_owned());
+        for (name, expected) in [
+            (
+                "l_ab",
+                B::List {
+                    values: vec![v("a"), v("it's")],
+                },
+            ),
+            (
+                "l_null",
+                B::List {
+                    values: vec![L::Null, v("c")],
+                },
+            ),
+            ("l_rest", B::Default),
+            (
+                "d_1",
+                B::List {
+                    values: vec![v("2025-01-01"), v("2024-12-31")],
+                },
+            ),
+            (
+                "i_1",
+                B::List {
+                    values: vec![v("-5"), v("7")],
+                },
+            ),
+            (
+                "b_t",
+                B::List {
+                    values: vec![v("true")],
+                },
+            ),
+            (
+                "h1",
+                B::Hash {
+                    modulus: 4,
+                    remainder: 1,
+                },
+            ),
+        ] {
+            assert_eq!(bound(&held, name), Some(expected), "{name}");
+        }
+        assert!(
+            pulled
+                .limitations
+                .iter()
+                .all(|l| !l.target.object_name().to_string().starts_with(&s)),
+            "{:?}",
+            pulled.limitations
+        );
+
+        // A list value the engine spells otherwise is named with its spelling.
+        let mut misspelt = held.clone();
+        misspelt.tables.get_mut(&t("d_1")).unwrap().partition_of = Some(PartitionOf {
+            parent: t("d"),
+            bound: B::List {
+                values: vec![v("2025-1-1"), v("2024-12-31")],
+            },
+            columns: Default::default(),
+        });
+        let found = pbps_pg::catalog::misspelt(&mut conn, &misspelt, &Default::default())
+            .await
+            .expect("ask");
+        let bounds: Vec<_> = found
+            .bounds
+            .iter()
+            .map(|b| {
+                (
+                    b.partition.name.as_str(),
+                    b.declared.as_str(),
+                    b.canonical.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(bounds, [("d_1", "2025-1-1", Some("2025-01-01"))]);
+        // A list value a session's date order reads two ways is named, as a
+        // range's is.
+        let mut ambiguous = held.clone();
+        ambiguous.tables.get_mut(&t("d_1")).unwrap().partition_of = Some(PartitionOf {
+            parent: t("d"),
+            bound: B::List {
+                values: vec![v("01/02/2026")],
+            },
+            columns: Default::default(),
+        });
+        let found = pbps_pg::catalog::misspelt(&mut conn, &ambiguous, &Default::default())
+            .await
+            .expect("ask");
+        let listed: Vec<_> = found
+            .ambiguous
+            .iter()
+            .map(|a| (a.at.clone(), a.pinned.clone()))
+            .collect();
+        assert_eq!(
+            listed,
+            [(
+                pbps_db::catalog::LiteralAt::Bound {
+                    partition: t("d_1"),
+                    column: "ts".into(),
+                },
+                Some("2026-01-02".to_owned())
+            )],
+            "{found:#?}"
+        );
+        let clean = pbps_pg::catalog::misspelt(&mut conn, &held, &Default::default())
+            .await
+            .expect("ask");
+        assert!(clean.bounds.is_empty(), "{:?}", clean.bounds);
+
+        // Rebuilt from the declaration alone: the same trees, routing rows
+        // the same way, and nothing left to plan.
+        let ids = mint_ids(&held, &IdsFile::default(), &[]);
+        fresh(&mut conn, &s).await;
+        let pg = Postgres::new();
+        apply(
+            &mut conn,
+            &pg,
+            &plan(&Schema::default(), &IdsFile::default(), &held, &ids),
+        )
+        .await;
+        let back = read(
+            &pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .expect("read back"),
+        );
+        assert_eq!(back, held);
+        assert!(plan(&back, &ids, &held, &ids).is_empty());
+        conn.execute(&format!(
+            "INSERT INTO {s}.l VALUES ('a', 1), (NULL, 2), ('c', 3), ('z', 4), ('d', 5), ('d', 6);
+             INSERT INTO {s}.h SELECT g, 'r' || g FROM generate_series(1, 40) g;"
+        ))
+        .await
+        .expect("route the rows");
+        let where_ = conn
+            .query(&format!(
+                "SELECT string_agg(tableoid::regclass::text, ',' ORDER BY n) AS r FROM {s}.l"
+            ))
+            .await
+            .unwrap()[0]
+            .try_get::<&str>("r")
+            .unwrap()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            where_,
+            format!("{s}.l_ab,{s}.l_null,{s}.l_null,{s}.l_rest,{s}.l_rest,{s}.l_rest")
+        );
+        assert_eq!(
+            counted(&mut conn, &format!("SELECT count(*)::int FROM {s}.h")).await,
+            40
+        );
+
+        // A LIST partition beside the DEFAULT, which holds two rows of its
+        // value: refused without a move a human allowed, then moved.
+        let mut over = held.clone();
+        over.tables.insert(
+            t("l_d"),
+            pbps_model::Table {
+                partition_of: Some(PartitionOf {
+                    parent: t("l"),
+                    bound: B::List {
+                        values: vec![v("d")],
+                    },
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        let unallowed = plan(&held, &ids, &over, &mint_ids(&over, &ids, &[]));
+        let probes = pg.fixture_preflight(&unallowed).probes;
+        let refused = probes
+            .iter()
+            .find(|p| p.description.contains("no move of them was allowed"))
+            .expect("the move is asked whether it was allowed");
+        assert!(
+            refused.description.contains("among the values of"),
+            "{}",
+            refused.description
+        );
+        assert_eq!(
+            counted(&mut conn, &refused.sql).await,
+            2,
+            "{}",
+            refused.description
+        );
+        let over_ids = mint_moving(&over, &ids);
+        let step = plan(&held, &ids, &over, &over_ids);
+        assert_eq!(step.changes.len(), 1, "{step:#?}");
+        for probe in pg.fixture_preflight(&step).probes {
+            assert_eq!(
+                counted(&mut conn, &probe.sql).await,
+                0,
+                "{}",
+                probe.description
+            );
+        }
+        apply(&mut conn, &pg, &step).await;
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.l_d")
+            )
+            .await,
+            2
+        );
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.l_rest")
+            )
+            .await,
+            1
+        );
+        let after = read(
+            &pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .expect("read back"),
+        );
+        assert_eq!(after, over);
+        assert!(plan(&after, &over_ids, &over, &over_ids).is_empty());
+
+        // A HASH partition for the remainder no partition takes: added under
+        // the populated tree with nothing to ask, and the rows it takes are
+        // then routed to it.
+        conn.execute(&format!(
+            "INSERT INTO {s}.hh SELECT g FROM generate_series(1, 40) g
+              WHERE NOT satisfies_hash_partition('{s}.hh'::regclass, 4, 3, g)"
+        ))
+        .await
+        .expect("the rows the tree routes");
+        let mut more = after.clone();
+        more.tables.insert(
+            t("hh3"),
+            pbps_model::Table {
+                partition_of: Some(PartitionOf {
+                    parent: t("hh"),
+                    bound: B::Hash {
+                        modulus: 4,
+                        remainder: 3,
+                    },
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        let more_ids = mint_ids(&more, &over_ids, &[]);
+        let step = plan(&after, &over_ids, &more, &more_ids);
+        assert_eq!(step.changes.len(), 1, "{step:#?}");
+        assert!(
+            pg.fixture_preflight(&step).probes.is_empty(),
+            "{:?}",
+            pg.fixture_preflight(&step).probes
+        );
+        apply(&mut conn, &pg, &step).await;
+        let grown = read(
+            &pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .expect("read back"),
+        );
+        assert_eq!(grown, more);
+        assert!(plan(&grown, &more_ids, &more, &more_ids).is_empty());
+        conn.execute(&format!(
+            "INSERT INTO {s}.hh SELECT g FROM generate_series(41, 80) g"
+        ))
+        .await
+        .expect("every row has a partition now");
+        assert!(
+            counted(
+                &mut conn,
+                &format!("SELECT count(*)::int FROM ONLY {s}.hh3")
+            )
+            .await
+                > 0
+        );
+
+        // A table attached under a list bound: its rows outside the values,
+        // a NULL key among them, are counted, and the engine refuses over
+        // them; without them the attach applies.
+        conn.execute(&format!(
+            "CREATE TABLE {s}.l_e (k text, n integer);
+             INSERT INTO {s}.l_e VALUES ('e', 7), ('x', 8), (NULL, 9);
+             CREATE TABLE {s}.h_x (a integer NOT NULL, b text NOT NULL);
+             INSERT INTO {s}.h_x SELECT g, 'r' || g FROM generate_series(1, 40) g;"
+        ))
+        .await
+        .expect("the tables to attach");
+        let attach = |table: &str, parent: &str, bound: B| pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(Change::AttachPartition {
+                uid: "t_aaaaaa".parse().unwrap(),
+                table: t(table),
+                parent: t(parent),
+                bound,
+                shape: Box::default(),
+            })],
+        };
+        // The rows of `h` the engine routes to remainder 3 of 4, `h_x`'s
+        // copy of them: every other row of `h_x` is outside its bound.
+        let inside = counted(&mut conn, &format!("SELECT count(*)::int FROM ONLY {s}.h3")).await;
+        assert!(inside > 0 && inside < 40, "{inside}");
+        for (table, parent, bound, outside, cleared) in [
+            (
+                "l_e",
+                "l",
+                B::List {
+                    values: vec![v("e")],
+                },
+                2,
+                format!("DELETE FROM {s}.l_e WHERE k IS DISTINCT FROM 'e'"),
+            ),
+            (
+                "h_x",
+                "h",
+                B::Hash {
+                    modulus: 4,
+                    remainder: 3,
+                },
+                40 - inside,
+                format!(
+                    "DELETE FROM {s}.h_x x WHERE NOT EXISTS (SELECT 1 FROM ONLY {s}.h3 h \
+                     WHERE h.a = x.a AND h.b = x.b)"
+                ),
+            ),
+        ] {
+            if table == "h_x" {
+                // Remainder 3 is `h3`'s, which a plan attaching `h_x` there
+                // detaches first.
+                conn.execute(&format!("ALTER TABLE {s}.h DETACH PARTITION {s}.h3"))
+                    .await
+                    .unwrap();
+            }
+            let step = attach(table, parent, bound.clone());
+            let probes = pg.fixture_preflight(&step).probes;
+            // No DEFAULT to ask about under HASH.
+            assert_eq!(
+                probes.len(),
+                if table == "h_x" { 3 } else { 4 },
+                "{probes:?}"
+            );
+            assert!(probes[0].description.contains("outside the"), "{probes:?}");
+            assert_eq!(counted(&mut conn, &probes[0].sql).await, outside, "{table}");
+            for probe in &probes[1..] {
+                assert_eq!(
+                    counted(&mut conn, &probe.sql).await,
+                    0,
+                    "{table}: {}",
+                    probe.description
+                );
+            }
+            let attached = pg.emit(&step.changes[0].change, step.changes[0].strategy);
+            let attached = attached.expect("emit").remove(0).sql;
+            in_a_transaction(&mut conn).await;
+            let refused = conn
+                .execute(&attached)
+                .await
+                .expect_err("the engine refuses the rows outside the bound");
+            assert_eq!(sqlstate(&refused), "23514", "{table}: {refused:?}");
+            rollback(&mut conn).await;
+            conn.execute(&cleared).await.unwrap();
+            assert_eq!(counted(&mut conn, &probes[0].sql).await, 0, "{table}");
+            conn.execute(&attached).await.expect("the attach");
+        }
 
         drop(conn);
         admin
@@ -7859,7 +8317,7 @@ fn mint_ids(schema: &Schema, base: &IdsFile, intents: &[Intent]) -> IdsFile {
         .ids
 }
 
-/// [`mint_ids`], with a move allowed (#1788) into every range partition
+/// [`mint_ids`], with a move allowed (#1788) into every range or list partition
 /// whose parent declares a DEFAULT: for a test about what a move does, not
 /// about whether one was allowed.
 fn mint_moving(schema: &Schema, base: &IdsFile) -> IdsFile {
@@ -7869,12 +8327,14 @@ fn mint_moving(schema: &Schema, base: &IdsFile) -> IdsFile {
 /// [`mint_moving`], with `intents` besides.
 fn mint_moving_and(schema: &Schema, base: &IdsFile, intents: &[Intent]) -> IdsFile {
     let beside_default = |of: &pbps_model::PartitionOf| {
-        matches!(of.bound, pbps_model::PartitionBound::Range { .. })
-            && schema.tables.values().any(|t| {
-                t.partition_of.as_ref().is_some_and(|o| {
-                    o.parent == of.parent && matches!(o.bound, pbps_model::PartitionBound::Default)
-                })
+        matches!(
+            of.bound,
+            pbps_model::PartitionBound::Range { .. } | pbps_model::PartitionBound::List { .. }
+        ) && schema.tables.values().any(|t| {
+            t.partition_of.as_ref().is_some_and(|o| {
+                o.parent == of.parent && matches!(o.bound, pbps_model::PartitionBound::Default)
             })
+        })
     };
     let moves: Vec<Intent> = intents
         .iter()

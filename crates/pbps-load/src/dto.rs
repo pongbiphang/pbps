@@ -384,9 +384,10 @@ pub struct TableDto {
     #[serde(default)]
     pub unlogged: bool,
 
-    /// A PostgreSQL RANGE-partitioned parent's key columns, `[ts]`.
+    /// A PostgreSQL partitioned parent's key columns: `[ts]` for RANGE, or
+    /// `{list: [k]}` or `{hash: [a, b]}` (#1632).
     #[serde(default)]
-    pub partition_by: Option<Vec<String>>,
+    pub partition_by: Option<PartitionByDto>,
 
     /// The parent's partitions, by name (qualified when in another schema):
     /// `{from: ['2025-01-01'], to: ['2026-01-01']}`, `MINVALUE`/`MAXVALUE`
@@ -605,9 +606,10 @@ macro_rules! list_or_spec {
 // `list_or_spec!` is: buffered first, a bound value would be matched as
 // whatever YAML type it buffered as, and the error would name no variant.
 
-/// A RANGE partition: `default`, or a mapping of its bound, `{from: [...], to:
-/// [...]}` with one value per key column or `default: true`, and what it has of
-/// its own beside its parent's: `checks:` and `indexes:`, written as a table's
+/// A partition: `default`, or a mapping of its bound, `{from: [...], to:
+/// [...]}` with one value per key column, `{in: [...]}` (#1632), `{modulus: m,
+/// remainder: r}` (#1632), or `default: true`, and what it has of its own
+/// beside its parent's: `checks:` and `indexes:`, written as a table's
 /// (#1577).
 #[derive(Debug, schemars::JsonSchema)]
 #[serde(untagged)]
@@ -638,12 +640,30 @@ pub enum PartitionDto {
             "from": {"type": "null"}, "to": {"type": "null"},
         },
     }),
+    serde_json::json!({
+        "required": ["in"],
+        "properties": {"in": {"type": "array"}, "default": {"const": false}},
+    }),
+    serde_json::json!({
+        "required": ["modulus", "remainder"],
+        "properties": {"default": {"const": false}},
+    }),
 ]))]
 pub struct PartitionEntryDto {
     #[serde(default)]
     pub from: Option<Vec<BoundValueDto>>,
     #[serde(default)]
     pub to: Option<Vec<BoundValueDto>>,
+    /// A LIST partition's values (#1632); `NULL` takes the rows whose key
+    /// is NULL.
+    #[serde(default, rename = "in")]
+    pub values: Option<Vec<ListValueDto>>,
+    /// A HASH partition's modulus (#1632), with `remainder:`.
+    #[serde(default)]
+    pub modulus: Option<u32>,
+    /// A HASH partition's remainder (#1632), with `modulus:`.
+    #[serde(default)]
+    pub remainder: Option<u32>,
     /// The DEFAULT partition, written as a mapping so that it can carry what
     /// it has of its own.
     #[serde(default)]
@@ -798,6 +818,105 @@ impl<'de> serde::Deserialize<'de> for BoundValueDto {
                 i64::try_from(v)
                     .map(BoundValueDto::Int)
                     .map_err(|_| E::custom("a bound value out of range: quote it"))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// One value of a LIST partition (#1632): text, a whole number, a boolean,
+/// or YAML's `null`, which is SQL's `NULL`.
+#[derive(Debug, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ListValueDto {
+    Text(String),
+    Int(i64),
+    Bool(bool),
+    Null,
+}
+
+impl<'de> serde::Deserialize<'de> for ListValueDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = ListValueDto;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "a list value: text, a whole number, a boolean, or NULL (quote a decimal)",
+                )
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ListValueDto, E> {
+                Ok(ListValueDto::Text(v.to_owned()))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<ListValueDto, E> {
+                Ok(ListValueDto::Int(v))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<ListValueDto, E> {
+                i64::try_from(v)
+                    .map(ListValueDto::Int)
+                    .map_err(|_| E::custom("a list value out of range: quote it"))
+            }
+            // A boolean key's value, as the engine spells it.
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<ListValueDto, E> {
+                Ok(ListValueDto::Bool(v))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<ListValueDto, E> {
+                Ok(ListValueDto::Null)
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<ListValueDto, E> {
+                Ok(ListValueDto::Null)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// A parent's `partition_by:` (#1632): a column list, which is RANGE, or a
+/// mapping naming LIST or HASH.
+#[derive(Debug, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PartitionByDto {
+    Range(Vec<String>),
+    Strategy(PartitionStrategyDto),
+}
+
+/// `{list: [k]}` or `{hash: [a, b]}`: one of the two.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("oneOf" = [
+    serde_json::json!({"required": ["list"]}),
+    serde_json::json!({"required": ["hash"]}),
+]))]
+pub struct PartitionStrategyDto {
+    #[serde(default)]
+    pub list: Option<Vec<String>>,
+    #[serde(default)]
+    pub hash: Option<Vec<String>>,
+}
+
+impl<'de> serde::Deserialize<'de> for PartitionByDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // A list or a mapping, told apart by what the document holds, as
+        // `PartitionsDto` is.
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PartitionByDto;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a list of key columns, or a mapping of `list:` or `hash:`")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<PartitionByDto, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(PartitionByDto::Range)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<PartitionByDto, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(PartitionByDto::Strategy)
             }
         }
         d.deserialize_any(V)

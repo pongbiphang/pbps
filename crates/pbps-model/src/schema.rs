@@ -512,10 +512,15 @@ pub struct Table {
     pub data: Option<TableData>,
 }
 
-/// `PARTITION BY RANGE (…)` over plain columns (#1170).
+/// `PARTITION BY RANGE | LIST | HASH (…)` over plain columns (#1170,
+/// #1632).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionBy {
+    /// How rows are routed to partitions. `RANGE` is written as nothing, so
+    /// every file, snapshot and plan from before #1632 reads as it was.
+    #[serde(default, skip_serializing_if = "PartitionStrategy::is_range")]
+    pub strategy: PartitionStrategy,
     /// The key's columns, in order.
     pub columns: Vec<String>,
     /// Its partitions are another tool's to create and drop: pg_partman, a
@@ -526,6 +531,35 @@ pub struct PartitionBy {
     /// from what is compared against.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub external: bool,
+}
+
+/// How a partitioned table routes rows (#1632, DEC-1632.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartitionStrategy {
+    /// By ranges of the key, with an optional DEFAULT partition.
+    #[default]
+    Range,
+    /// By lists of the key's values, one key column, with an optional
+    /// DEFAULT partition.
+    List,
+    /// By the key's hash, modulus and remainder; never a DEFAULT partition.
+    Hash,
+}
+
+impl PartitionStrategy {
+    pub fn is_range(&self) -> bool {
+        *self == PartitionStrategy::Range
+    }
+
+    /// The keyword `PARTITION BY` and the catalog's key text use.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            PartitionStrategy::Range => "RANGE",
+            PartitionStrategy::List => "LIST",
+            PartitionStrategy::Hash => "HASH",
+        }
+    }
 }
 
 /// A partition's parent and the rows it takes (#1170).
@@ -557,9 +591,10 @@ pub struct PartitionColumn {
     pub not_null: bool,
 }
 
-/// What a RANGE partition takes: every row no other partition does, or a
-/// range from one key value (inclusive) to another (exclusive), one datum per
-/// key column.
+/// What a partition takes: every row no other partition does, a range from
+/// one key value (inclusive) to another (exclusive), one datum per key
+/// column, a list of the key's values, or the rows whose key hashes to a
+/// remainder of a modulus (#1632).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PartitionBound {
@@ -568,6 +603,47 @@ pub enum PartitionBound {
         from: Vec<BoundDatum>,
         to: Vec<BoundDatum>,
     },
+    /// `FOR VALUES IN (…)`, in the order written, which the engine keeps.
+    List {
+        values: Vec<ListDatum>,
+    },
+    /// `FOR VALUES WITH (MODULUS m, REMAINDER r)`.
+    Hash {
+        modulus: u32,
+        remainder: u32,
+    },
+}
+
+impl PartitionBound {
+    /// The strategy a bound of this kind belongs to; `None` for DEFAULT,
+    /// which a RANGE or LIST parent may have.
+    pub fn strategy(&self) -> Option<PartitionStrategy> {
+        match self {
+            PartitionBound::Default => None,
+            PartitionBound::Range { .. } => Some(PartitionStrategy::Range),
+            PartitionBound::List { .. } => Some(PartitionStrategy::List),
+            PartitionBound::Hash { .. } => Some(PartitionStrategy::Hash),
+        }
+    }
+}
+
+/// One value of a LIST partition: the engine's own text for it, unquoted,
+/// or `NULL`, which a LIST partition may take and a range may not.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListDatum {
+    Null,
+    Value(String),
+}
+
+/// As a declaration writes one: `NULL`, or the value.
+impl std::fmt::Display for ListDatum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ListDatum::Null => f.write_str("NULL"),
+            ListDatum::Value(v) => f.write_str(v),
+        }
+    }
 }
 
 /// One key column's end of a range: the engine's own text for a value,

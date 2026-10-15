@@ -3686,9 +3686,6 @@ fn no_clustered_layout(table: &TableName) -> DialectError {
     ))
 }
 
-/// A RANGE partition's bound clause: `DEFAULT`, or `FOR VALUES FROM (…) TO
-/// (…)` with each value as a literal the session cannot reinterpret, which
-/// the engine converts to its key column's type (#1170).
 /// Why rows of `default` inside the range of `partition` may not move, and
 /// what to do (#1788): read after their count, as the moving statement and
 /// the pre-flight both report it. Without a move a human allowed, the command
@@ -3698,8 +3695,7 @@ pub(crate) fn moving_beyond_its_intent(
     partition: &TableName,
     parent: &TableName,
     default: &TableName,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
     moves_at_most: Option<u64>,
 ) -> Result<String, DialectError> {
     let (q, p, d) = (
@@ -3707,29 +3703,27 @@ pub(crate) fn moving_beyond_its_intent(
         qualified(parent)?,
         qualified(default)?,
     );
-    let bound = bound_clause(&pbps_model::PartitionBound::Range {
-        from: from.to_vec(),
-        to: to.to_vec(),
-    });
+    let inside = crate::preflight::inside(bound);
+    let bound = bound_clause(bound);
     // The move this statement would make, written out without the questions
     // it asks first: the operator who runs it has answered them.
     let by_hand = format!(
         "LOCK TABLE ONLY {d} IN SHARE MODE; CREATE TABLE {q} (LIKE {p} INCLUDING DEFAULTS \
          INCLUDING GENERATED INCLUDING CONSTRAINTS INCLUDING STORAGE INCLUDING COMPRESSION); \
-         WITH moved AS (DELETE FROM {d} WHERE <the partition key is in the range> RETURNING \
+         WITH moved AS (DELETE FROM {d} WHERE <the partition key is in the bound> RETURNING \
          <every column but the generated ones>) INSERT INTO {q} <the same columns> SELECT * \
          FROM moved; ALTER TABLE {p} ATTACH PARTITION {q} {bound};"
     );
     Ok(match moves_at_most {
         None => format!(
-            "rows of {default} are inside the range of {partition}, its parent {parent}'s new \
+            "rows of {default} are {inside} {partition}, its parent {parent}'s new \
              partition beside it, and no move of them was allowed, which may be seen by \
              whatever reads the database's changes; nothing was moved. Allow it with \
              `pbps move-rows {partition} --max-rows <N> --reason <why>` and plan again, or \
              move them by hand, in one transaction: {by_hand}"
         ),
         Some(most) => format!(
-            "rows of {default} are inside the range of {partition}, more than the {most} its \
+            "rows of {default} are {inside} {partition}, more than the {most} its \
              allowed move may take; nothing was moved. Move them by hand: create the table and \
              move the rows a batch at a time, then run the last batch and the attach in one \
              transaction with the DEFAULT locked, as in: {by_hand} Or allow more with \
@@ -3738,6 +3732,10 @@ pub(crate) fn moving_beyond_its_intent(
     })
 }
 
+/// A partition's bound clause: `DEFAULT`, `FOR VALUES FROM (…) TO (…)`,
+/// `FOR VALUES IN (…)` or `FOR VALUES WITH (MODULUS m, REMAINDER r)`, each
+/// value a literal the session cannot reinterpret, which the engine converts
+/// to its key column's type (#1170, #1632).
 fn bound_clause(bound: &pbps_model::PartitionBound) -> String {
     let list = |data: &[pbps_model::BoundDatum]| {
         data.iter()
@@ -3754,11 +3752,25 @@ fn bound_clause(bound: &pbps_model::PartitionBound) -> String {
         pbps_model::PartitionBound::Range { from, to } => {
             format!("FOR VALUES FROM ({}) TO ({})", list(from), list(to))
         }
+        pbps_model::PartitionBound::List { values } => format!(
+            "FOR VALUES IN ({})",
+            values
+                .iter()
+                .map(|v| match v {
+                    pbps_model::ListDatum::Null => "NULL".to_owned(),
+                    pbps_model::ListDatum::Value(v) => value_literal(v),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        pbps_model::PartitionBound::Hash { modulus, remainder } => {
+            format!("FOR VALUES WITH (MODULUS {modulus}, REMAINDER {remainder})")
+        }
     }
 }
 
-/// A range partition made beside its parent's DEFAULT partition, which may
-/// hold rows of its range (#1547, DEC-1547.1). `CREATE ... PARTITION OF`
+/// A range or list partition made beside its parent's DEFAULT partition,
+/// which may hold rows of its range or values (#1547, DEC-1547.1, #1632). `CREATE ... PARTITION OF`
 /// refuses over such rows (#1171), so the partition is made as a plain table
 /// of its parent's shape, the DEFAULT's rows in its range are moved into it,
 /// and it is attached. Measured on 16 and 18:
@@ -3803,8 +3815,7 @@ fn beside_its_default(
     storage: &str,
     parent: &TableName,
     default: &TableName,
-    from: &[pbps_model::BoundDatum],
-    to: &[pbps_model::BoundDatum],
+    bound: &pbps_model::PartitionBound,
     moves_at_most: Option<u64>,
 ) -> Sql {
     let q = qualified(name)?;
@@ -3931,11 +3942,8 @@ fn beside_its_default(
          \x20   ALTER TABLE {p} ATTACH PARTITION {q} {bound};\n\
          END",
         create_sql = create.sql,
-        bound = bound_clause(&pbps_model::PartitionBound::Range {
-            from: from.to_vec(),
-            to: to.to_vec(),
-        }),
-        range = crate::preflight::range_predicate(from, to),
+        bound = bound_clause(bound),
+        range = crate::preflight::bound_predicate(bound),
         lp = literal(&p),
         ld = literal(&d),
         lq = literal(&q),
@@ -4004,7 +4012,7 @@ fn beside_its_default(
         allowed = moves_at_most.unwrap_or(0),
         beyond = literal(&format!(
             " {}",
-            moving_beyond_its_intent(name, parent, default, from, to, moves_at_most)?
+            moving_beyond_its_intent(name, parent, default, bound, moves_at_most)?
         )),
         delete = literal(&format!("WITH moved AS (DELETE FROM {d} AS r WHERE ")),
         insert = literal(&format!(") INSERT INTO {q} (")),
@@ -4054,7 +4062,13 @@ fn create_table(
             format!(" WITH ({})", storage_list(&table.storage_parameters)?)
         };
         let mut out = match (beside_default, &of.bound) {
-            (Some((default, moves_at_most)), pbps_model::PartitionBound::Range { from, to }) => {
+            // A range or a list beside its parent's DEFAULT takes the
+            // DEFAULT's rows of it (#1547, #1632).
+            (
+                Some((default, moves_at_most)),
+                bound @ (pbps_model::PartitionBound::Range { .. }
+                | pbps_model::PartitionBound::List { .. }),
+            ) => {
                 let create = format!("CREATE {unlogged}TABLE {q}");
                 beside_its_default(
                     pg,
@@ -4063,8 +4077,7 @@ fn create_table(
                     &storage,
                     &of.parent,
                     default,
-                    from,
-                    to,
+                    bound,
                     moves_at_most,
                 )?
             }
@@ -4177,7 +4190,8 @@ fn create_table(
         // (#1170).
         match &table.partition_by {
             Some(by) => format!(
-                " PARTITION BY RANGE ({})",
+                " PARTITION BY {} ({})",
+                by.strategy.keyword(),
                 by.columns
                     .iter()
                     .map(|c| quote(c))
@@ -5414,6 +5428,85 @@ mod tests {
         assert!(!plain[0].creates.is_empty() && !plain[0].sql.contains("LOCK"));
     }
 
+    /// A LIST or HASH parent is created with its strategy, and its
+    /// partitions with the engine's own spellings of their bounds: values as
+    /// literals, NULL bare, in the order declared (#1632). A RANGE parent
+    /// still says RANGE.
+    #[test]
+    fn list_and_hash_trees_are_created_with_their_strategy_and_bounds() {
+        use pbps_model::{ListDatum as L, PartitionBound as B, PartitionStrategy as S};
+        let create = |name: &str, table: &pbps_model::Table| {
+            Postgres::new()
+                .emit(
+                    &Change::CreateTable {
+                        uid: "t_aaaaaa".parse().unwrap(),
+                        name: name.parse().unwrap(),
+                        table: Box::new(table.clone()),
+                        beside_default: None,
+                        moves_at_most: None,
+                    },
+                    Default::default(),
+                )
+                .expect("emit")
+                .into_iter()
+                .map(|s| s.sql)
+                .collect::<Vec<_>>()
+        };
+        let parent = |strategy: S| {
+            let mut t = pbps_model::Table::default();
+            t.columns
+                .insert("k".into(), pbps_model::Column::new("text".parse().unwrap()));
+            t.partition_by = Some(pbps_model::PartitionBy {
+                external: false,
+                columns: vec!["k".into()],
+                strategy,
+            });
+            t
+        };
+        for (strategy, keyword) in [(S::List, "LIST"), (S::Hash, "HASH"), (S::Range, "RANGE")] {
+            let sql = create("app.p", &parent(strategy));
+            assert!(
+                sql[0].contains(&format!("\n) PARTITION BY {keyword} (\"k\");")),
+                "{sql:?}"
+            );
+        }
+        let of = |bound: B| pbps_model::Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: "app.p".parse().unwrap(),
+                bound,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let sql = create(
+            "app.p1",
+            &of(B::List {
+                values: vec![L::Value("it's".into()), L::Null, L::Value("NULL".into())],
+            }),
+        );
+        assert!(
+            sql[0].contains(
+                "CREATE TABLE \"app\".\"p1\" PARTITION OF \"app\".\"p\" FOR VALUES IN \
+                 (E'it''s', NULL, E'NULL') USING heap;"
+            ),
+            "{sql:?}"
+        );
+        let sql = create(
+            "app.p2",
+            &of(B::Hash {
+                modulus: 4,
+                remainder: 3,
+            }),
+        );
+        assert!(
+            sql[0].contains(
+                "PARTITION OF \"app\".\"p\" FOR VALUES WITH (MODULUS 4, REMAINDER 3) USING \
+                 heap;"
+            ),
+            "{sql:?}"
+        );
+    }
+
     /// A partitioned parent is created with its key and no access method,
     /// and a partition as one statement naming its parent and its bound,
     /// each value a literal no session setting reinterprets (#1170).
@@ -5427,6 +5520,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["ts".into()],
+            strategy: Default::default(),
         });
         let create = |name: &str, table: &pbps_model::Table| {
             Postgres::new()

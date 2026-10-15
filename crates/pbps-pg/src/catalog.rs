@@ -139,6 +139,10 @@ fn tables_query() -> String {
                            ON a.attrelid = c.oid AND a.attnum = k.attnum
                         WHERE pt.partrelid = c.oid)
             END AS partition_key,
+            CASE WHEN c.relkind = 'p'
+                 THEN (SELECT pt.partstrat::text FROM pg_catalog.pg_partitioned_table pt
+                        WHERE pt.partrelid = c.oid)
+            END AS partition_strategy,
             CASE WHEN c.relispartition
                  THEN (SELECT h.inhparent::int8 FROM pg_catalog.pg_inherits h
                         WHERE h.inhrelid = c.oid)
@@ -164,14 +168,15 @@ fn tables_query() -> String {
 }
 
 /// Whether the partitioned table whose oid is `root` heads a tree this model
-/// holds (#1170, DEC-1170.1): RANGE over plain columns, and partitions that
-/// are their parent's and nothing else, so that rebuilding the tree from the
-/// parent and each partition's bound gives back what is there.
+/// holds (#1170, DEC-1170.1): RANGE, LIST or HASH (#1632) over plain
+/// columns, and partitions that are their parent's and nothing else, so that
+/// rebuilding the tree from the parent and each partition's bound gives back
+/// what is there.
 ///
-/// **The parent**: not itself a partition, RANGE, and a key whose deparsed
-/// text is its columns' quoted names and nothing else, so that an expression,
-/// an operator class or a collation, each of which `pg_get_partkeydef` prints,
-/// leaves it out. Permanent, no storage parameters, the default replica
+/// **The parent**: not itself a partition, RANGE, LIST or HASH, and a key
+/// whose deparsed text is its columns' quoted names and nothing else, so that
+/// an expression, an operator class or a collation, each of which
+/// `pg_get_partkeydef` prints, leaves it out. Permanent, no storage parameters, the default replica
 /// identity, no access method of its own, no row security, rules or triggers:
 /// none of them is in the partitioned table's declaration yet.
 ///
@@ -241,9 +246,11 @@ fn partition_tree(root: &str) -> String {
         "EXISTS (SELECT 1 FROM pg_catalog.pg_class pc
                    JOIN pg_catalog.pg_partitioned_table pt ON pt.partrelid = pc.oid
                   WHERE pc.oid = {root} AND pc.relkind = 'p' AND NOT pc.relispartition
-                    AND pt.partstrat = 'r' AND pc.relam = 0
+                    AND pt.partstrat IN ('r', 'l', 'h') AND pc.relam = 0
                     AND {parent_plain}
-                    AND pg_catalog.pg_get_partkeydef(pc.oid) = 'RANGE (' ||
+                    AND pg_catalog.pg_get_partkeydef(pc.oid) =
+                        CASE pt.partstrat WHEN 'r' THEN 'RANGE (' WHEN 'l' THEN 'LIST ('
+                                          ELSE 'HASH (' END ||
                         (SELECT pg_catalog.string_agg(pg_catalog.quote_ident(a.attname), ', '
                                                       ORDER BY k.n)
                            FROM pg_catalog.unnest(pt.partattrs::int2[])
@@ -1176,7 +1183,8 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         let kind = match text(row, "kind")?.as_str() {
             // A tree is held whole or not at all (#1170, DEC-1170.1).
             "p" => {
-                "a partitioned table other than one pbps holds: RANGE over plain columns, with \
+                "a partitioned table other than one pbps holds: RANGE, LIST or HASH over plain \
+                 columns, with \
                  no row security, rules, triggers, storage parameters or replica identity, and \
                  partitions that are its own and nothing else"
             }
@@ -1272,6 +1280,12 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
                 None => return Err(missing("partition_key")),
                 Some(serde_json::Value::Null) => None,
                 Some(_) => Some(strings(row, "partition_key")?),
+            },
+            // The tree's filter admits `r`, `l` and `h` alone (#1632).
+            partition_strategy: match optional_text(row, "partition_strategy")?.as_deref() {
+                Some("l") => pbps_model::PartitionStrategy::List,
+                Some("h") => pbps_model::PartitionStrategy::Hash,
+                Some(_) | None => pbps_model::PartitionStrategy::Range,
             },
             partition_of: match optional_text(row, "partition_bound")? {
                 Some(bound) => Some((number(row, "partition_parent")?, bound)),

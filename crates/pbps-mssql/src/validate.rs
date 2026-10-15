@@ -1416,6 +1416,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["a".into()],
+            strategy: Default::default(),
         });
         let partition = Table {
             partition_of: Some(pbps_model::PartitionOf {

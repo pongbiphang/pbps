@@ -93,8 +93,11 @@ pub struct RawTable {
     /// `relpersistence = 'u'`: an unlogged table (#1443). A temporary one is
     /// never here; it stays a limitation.
     pub unlogged: bool,
-    /// A RANGE-partitioned parent's key columns, in order (#1170).
+    /// A partitioned parent's key columns, in order (#1170).
     pub partition_key: Option<Vec<String>>,
+    /// Its strategy (#1632): `partstrat`, which the tree's filter admits
+    /// only as RANGE, LIST or HASH.
+    pub partition_strategy: pbps_model::PartitionStrategy,
     /// A partition's parent, by oid, and its bound as `pg_get_expr` deparses
     /// it under the canonical session (#1170).
     pub partition_of: Option<(i64, String)>,
@@ -928,6 +931,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 .map(|columns| pbps_model::PartitionBy {
                     external: false,
                     columns,
+                    strategy: raw_table.partition_strategy,
                 }),
             ..Table::default()
         };
@@ -2565,6 +2569,42 @@ pub(crate) fn parse_bound(text: &str) -> Option<pbps_model::PartitionBound> {
     if text == "DEFAULT" {
         return Some(pbps_model::PartitionBound::Default);
     }
+    // LIST and HASH (#1632), as `pg_get_expr` deparses them: measured on 16
+    // and 18, `FOR VALUES IN ('a', NULL)` in the order written, and `FOR
+    // VALUES WITH (modulus 4, remainder 0)` in lower case.
+    if let Some(rest) = text.strip_prefix("FOR VALUES IN (") {
+        let (tokens, rest) = bound_tokens(rest)?;
+        if !rest.is_empty() || tokens.is_empty() {
+            return None;
+        }
+        let values = tokens
+            .into_iter()
+            .map(|token| match token {
+                Token::Quoted(value) => Some(pbps_model::ListDatum::Value(value)),
+                Token::Word(word) if word == "NULL" => Some(pbps_model::ListDatum::Null),
+                // Measured: a boolean unquoted, a number quoted or not.
+                Token::Word(word)
+                    if matches!(word.as_str(), "true" | "false")
+                        || (plain_word(&word)
+                            && word
+                                .chars()
+                                .all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+'))) =>
+                {
+                    Some(pbps_model::ListDatum::Value(word))
+                }
+                Token::Word(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return Some(pbps_model::PartitionBound::List { values });
+    }
+    if let Some(rest) = text.strip_prefix("FOR VALUES WITH (modulus ") {
+        let (modulus, rest) = rest.split_once(", remainder ")?;
+        let remainder = rest.strip_suffix(')')?;
+        return Some(pbps_model::PartitionBound::Hash {
+            modulus: modulus.parse().ok()?,
+            remainder: remainder.parse().ok()?,
+        });
+    }
     let rest = text.strip_prefix("FOR VALUES FROM (")?;
     let (from, rest) = bound_list(rest)?;
     let rest = rest.strip_prefix(" TO (")?;
@@ -2575,12 +2615,52 @@ pub(crate) fn parse_bound(text: &str) -> Option<pbps_model::PartitionBound> {
     Some(pbps_model::PartitionBound::Range { from, to })
 }
 
-/// The datums up to the `)` closing the list, and the text after it.
+/// One datum of a bound as `pg_get_expr` writes it: a quoted value, its
+/// quotes undone, or an unquoted word (a number, `MINVALUE`, `NULL`).
+enum Token {
+    Quoted(String),
+    Word(String),
+}
+
+/// An unquoted word that is a value: a number as the engine prints one.
+fn plain_word(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+}
+
+/// A range's datums up to the `)` closing the list, and the text after it.
 fn bound_list(text: &str) -> Option<(Vec<pbps_model::BoundDatum>, &str)> {
+    let (tokens, rest) = bound_tokens(text)?;
+    let data = tokens
+        .into_iter()
+        .map(|token| match token {
+            // A text key's value spelled like an unbounded end: a
+            // declaration reads the word as the end, so the tree would be
+            // rebuilt with a different partition.
+            Token::Quoted(value)
+                if value.eq_ignore_ascii_case("minvalue")
+                    || value.eq_ignore_ascii_case("maxvalue") =>
+            {
+                None
+            }
+            Token::Quoted(value) => Some(pbps_model::BoundDatum::Value(value)),
+            Token::Word(word) if word == "MINVALUE" => Some(pbps_model::BoundDatum::MinValue),
+            Token::Word(word) if word == "MAXVALUE" => Some(pbps_model::BoundDatum::MaxValue),
+            Token::Word(word) if plain_word(&word) => Some(pbps_model::BoundDatum::Value(word)),
+            Token::Word(_) => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((data, rest))
+}
+
+/// The tokens up to the `)` closing the list, and the text after it.
+fn bound_tokens(text: &str) -> Option<(Vec<Token>, &str)> {
     let mut out = Vec::new();
     let mut chars = text.char_indices().peekable();
     loop {
-        let datum = match chars.peek()? {
+        let token = match chars.peek()? {
             (_, '\'') => {
                 chars.next();
                 let mut value = String::new();
@@ -2594,14 +2674,7 @@ fn bound_list(text: &str) -> Option<(Vec<pbps_model::BoundDatum>, &str)> {
                         (_, c) => value.push(c),
                     }
                 }
-                // A text key's value spelled like an unbounded end: a
-                // declaration reads the word as the end, so the tree would be
-                // rebuilt with a different partition.
-                if value.eq_ignore_ascii_case("minvalue") || value.eq_ignore_ascii_case("maxvalue")
-                {
-                    return None;
-                }
-                pbps_model::BoundDatum::Value(value)
+                Token::Quoted(value)
             }
             (start, _) => {
                 let start = *start;
@@ -2613,21 +2686,10 @@ fn bound_list(text: &str) -> Option<(Vec<pbps_model::BoundDatum>, &str)> {
                     end = *i + c.len_utf8();
                     chars.next();
                 }
-                match &text[start..end] {
-                    "MINVALUE" => pbps_model::BoundDatum::MinValue,
-                    "MAXVALUE" => pbps_model::BoundDatum::MaxValue,
-                    word if !word.is_empty()
-                        && word
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')) =>
-                    {
-                        pbps_model::BoundDatum::Value(word.to_owned())
-                    }
-                    _ => return None,
-                }
+                Token::Word(text[start..end].to_owned())
             }
         };
-        out.push(datum);
+        out.push(token);
         match chars.next()? {
             (_, ')') => {
                 let at = chars.peek().map_or(text.len(), |(i, _)| *i);
@@ -3410,12 +3472,15 @@ fn unresolved(pulled: &mut Pulled, parts: &Parts, kind: &str, name: &str, attnum
 #[cfg(test)]
 mod tests {
     /// Every bound the engine deparses comes apart into its datums, and
-    /// anything else is refused rather than guessed at (#1170). The shapes
-    /// are the ones measured on 16 and 18.
+    /// anything else is refused rather than guessed at (#1170, #1632). The
+    /// shapes are the ones measured on 16 and 18: a LIST's values in the
+    /// order written, `NULL` unquoted and a quoted `'NULL'` text, and a
+    /// HASH's modulus and remainder in lower case.
     #[test]
     fn a_deparsed_bound_comes_apart_and_nothing_else_does() {
-        use pbps_model::{BoundDatum as D, PartitionBound as B};
+        use pbps_model::{BoundDatum as D, ListDatum as L, PartitionBound as B};
         let v = |s: &str| D::Value(s.to_owned());
+        let l = |s: &str| L::Value(s.to_owned());
         for (text, expected) in [
             ("DEFAULT", B::Default),
             (
@@ -3446,13 +3511,49 @@ mod tests {
                     to: vec![v("z\\n")],
                 },
             ),
+            (
+                "FOR VALUES IN ('2025-01-01', '2024-12-31')",
+                B::List {
+                    values: vec![l("2025-01-01"), l("2024-12-31")],
+                },
+            ),
+            (
+                "FOR VALUES IN (NULL, 'NULL', 1.50, '-2')",
+                B::List {
+                    values: vec![L::Null, l("NULL"), l("1.50"), l("-2")],
+                },
+            ),
+            (
+                "FOR VALUES IN ('it''s, (x)', 'minvalue')",
+                B::List {
+                    values: vec![l("it's, (x)"), l("minvalue")],
+                },
+            ),
+            (
+                "FOR VALUES IN (true, NULL)",
+                B::List {
+                    values: vec![l("true"), L::Null],
+                },
+            ),
+            (
+                "FOR VALUES WITH (modulus 4, remainder 0)",
+                B::Hash {
+                    modulus: 4,
+                    remainder: 0,
+                },
+            ),
         ] {
             assert_eq!(super::parse_bound(text), Some(expected), "{text}");
         }
         for text in [
             "",
-            "FOR VALUES IN (1, 2)",
-            "FOR VALUES WITH (modulus 4, remainder 0)",
+            "FOR VALUES IN ()",
+            "FOR VALUES IN ('a'::text)",
+            "FOR VALUES IN (MINVALUE)",
+            "FOR VALUES IN ('a') trailing",
+            "FOR VALUES WITH (MODULUS 4, REMAINDER 0)",
+            "FOR VALUES WITH (modulus 4, remainder x)",
+            "FOR VALUES WITH (modulus 4)",
             "FOR VALUES FROM (1) TO (2, 3)",
             "FOR VALUES FROM () TO ()",
             "FOR VALUES FROM ('a) TO ('b')",
@@ -3558,6 +3659,7 @@ mod tests {
                 unlogged: false,
                 partition_key: None,
                 partition_of: None,
+                partition_strategy: Default::default(),
             }],
             modules: vec![
                 RawModule {
@@ -4509,6 +4611,7 @@ mod tests {
                 unlogged: false,
                 partition_key: None,
                 partition_of: None,
+                partition_strategy: Default::default(),
             }],
             grants: vec![grant(
                 Some("app_reader"),
@@ -4829,6 +4932,7 @@ mod tests {
             unlogged: false,
             partition_key: None,
             partition_of: None,
+            partition_strategy: Default::default(),
         }
     }
 
