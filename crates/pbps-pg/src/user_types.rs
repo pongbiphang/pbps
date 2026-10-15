@@ -33,20 +33,32 @@
 //! `pg_namespace` by name and asks about privilege by OID, which is the only
 //! way to tell "cannot use it" from "not there".
 //!
-//! # Trust (DEC-1663.1)
+//! # Trust (DEC-1663.1): diagnostics, not the gate
 //!
 //! Nothing here casts a value to the type or evaluates it: a domain's CHECK
 //! and DEFAULT are read as the catalog's text and no more. What a later
 //! `ADD COLUMN` over the type would run is a different matter, because that
-//! runs a domain's CHECK once per existing row as the deployer. So the read
-//! names every role that wrote what the type is made of or calls: the type's
-//! owner, the owner of every type nested in it, and the owner of every object
-//! its `pg_depend` closure reaches. Each is marked trusted or not by the first
+//! runs a domain's CHECK once per existing row as the deployer.
+//!
+//! The gate that refuses it is **not** here. #2046 records its design: every
+//! function, operator and cast on the type's input path must be a PostgreSQL
+//! built-in (checked on the stored node trees), every type on the path must be
+//! owned by a trusted role, and `pbps.yml` may declare more trusted roles. No
+//! user-written function is admitted, so no trigger, rule, view or function
+//! body can be reached. Walking `pg_depend` to find who wrote what runs was
+//! tried and cannot be closed: every review round found another kind of
+//! object (#2046).
+//!
+//! So [`UserType::untrusted_owners`] and [`UserType::reached`] are
+//! **diagnostics**. They name the roles and objects a refusal can point at,
+//! and a route they miss costs a less precise message and never a missed
+//! refusal. The read names the owner of the type, of each nested type, and of
+//! each object the closure reaches, and marks each trusted or not by the first
 //! stage of DEC-1663.1's walk: a superuser, or a role that can `SET ROLE` to
 //! the current role or to a superuser. Every other owner is untrusted (a role
 //! that owns an object is always caught by the walk's later stages, and a
 //! role below OID 16384 that is not a superuser is counted untrusted, which
-//! errs towards refusal). Deciding what to refuse is the caller's.
+//! errs towards refusal).
 //!
 //! # The closure
 //!
@@ -57,9 +69,12 @@
 //! type, its array type, its composite relation and its domain constraints (the
 //! parts the type owns) to what they reference, and stops at objects the
 //! engine creates (OID below 16384) and at schemas. It does not follow what
-//! depends *on* the type: a table with a column of the type is the point of
-//! the type, not a reach. Which of the reached objects the plan manages is the
-//! caller's to say ([`UserType::reaches_managed`]).
+//! depends *on* the type (a table with a column of the type is the point of
+//! the type, not a reach), nor what depends on a reached table (its triggers),
+//! nor names a function body resolves at run time. It is a best-effort
+//! picture for messages and for [`UserType::reaches_managed`], never a proof
+//! that nothing else runs. Which of the reached objects the plan manages is the
+//! caller's to say.
 //!
 //! # The pin
 //!
@@ -336,8 +351,9 @@ impl UserType {
         self.owners.values()
     }
 
-    /// What the type depends on, transitively. Types are not listed: the
-    /// types a type is made of are in [`UserType::definition`].
+    /// What the type depends on, transitively, by `pg_depend`. Types are not
+    /// listed: the types a type is made of are in [`UserType::definition`].
+    /// A diagnostic and not a proof (see the module's "The closure", #2046).
     #[must_use]
     pub fn reached(&self) -> &[Reached] {
         &self.reached
@@ -348,10 +364,9 @@ impl UserType {
         &self.pin
     }
 
-    /// The owners that are not trusted, by name. A domain's CHECK and
-    /// DEFAULT run as the deployer when a column of it is added over existing
-    /// rows, so a non-empty answer for a domain is what makes that
-    /// `ADD COLUMN` unsafe (DEC-1663.1).
+    /// The owners that are not trusted, by name, to say in a refusal who owns
+    /// what. A diagnostic and not the gate: an owner the closure missed is
+    /// absent from it, and the `ADD COLUMN` gate does not rely on it (#2046).
     #[must_use]
     pub fn untrusted_owners(&self) -> Vec<&Owner> {
         let mut out: Vec<&Owner> = self.owners.values().filter(|o| !o.trusted).collect();
@@ -360,7 +375,8 @@ impl UserType {
     }
 
     /// The first reached object `is_managed` says the plan manages, if any.
-    /// Which objects are managed is the caller's, who holds the plan.
+    /// Which objects are managed is the caller's, who holds the plan. As
+    /// complete as [`UserType::reached`] is, which is not a proof.
     pub fn reaches_managed(&self, is_managed: impl Fn(&Reached) -> bool) -> Option<&Reached> {
         self.reached.iter().find(|r| is_managed(r))
     }
