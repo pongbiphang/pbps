@@ -1105,6 +1105,11 @@ async fn an_owner_is_trusted_only_when_it_can_become_the_deployer_or_is_a_superu
              ALTER DOMAIN app.strangers OWNER TO {stranger};
              CREATE TYPE app.holds_strangers AS (s app.strangers, m app.mine);
              ALTER TYPE app.holds_strangers OWNER TO {deployer};
+             CREATE DOMAIN app.inner_check AS integer CHECK (VALUE > 0);
+             ALTER DOMAIN app.inner_check OWNER TO {stranger};
+             CREATE DOMAIN app.casts_inner AS integer
+                 CHECK (VALUE::app.inner_check IS NOT NULL);
+             ALTER DOMAIN app.casts_inner OWNER TO {deployer};
              CREATE TEXT SEARCH DICTIONARY app.dict (TEMPLATE = pg_catalog.simple);
              ALTER TEXT SEARCH DICTIONARY app.dict OWNER TO {other_stranger};
              CREATE TEXT SEARCH CONFIGURATION app.cfg (COPY = pg_catalog.simple);
@@ -1158,6 +1163,17 @@ async fn an_owner_is_trusted_only_when_it_can_become_the_deployer_or_is_a_superu
         assert!(holds.owner().trusted);
         assert_eq!(names(&holds), [stranger.as_str()], "on {label}");
         assert!(holds.owners().count() >= 2);
+        // A type an expression names without being made of it: its CHECK runs
+        // inside the outer one, so its owner is named, though the type is not
+        // listed among what is reached.
+        let casts = present(&mut me, "app", "casts_inner").await;
+        assert!(casts.owner().trusted);
+        assert_eq!(names(&casts), [stranger.as_str()], "on {label}");
+        assert!(
+            casts.reached().iter().all(|r| r.catalog != "pg_type"),
+            "{:?}",
+            casts.reached()
+        );
         // A text search configuration and the dictionary it maps to are not
         // routines, and their owners can change what a CHECK means in place.
         let searches = present(&mut me, "app", "searches").await;
@@ -1274,7 +1290,9 @@ async fn a_range_inside_a_type_is_pinned_with_the_type_it_ranges_over() {
                 .collect();
             if *name == "holds_multirange" && !multirange_follows {
                 assert_eq!(read.pin().as_str(), pin, "{name} on {label}");
-                assert!(untrusted.is_empty(), "{name} on {label}: {untrusted:?}");
+                // The multirange's own definition is unchanged, and it still
+                // reaches the range, whose owner is a stranger now.
+                assert_eq!(untrusted, [stranger.as_str()], "{name} on {label}");
             } else {
                 assert_ne!(read.pin().as_str(), pin, "{name} on {label}");
                 assert_eq!(untrusted, [stranger.as_str()], "{name} on {label}");

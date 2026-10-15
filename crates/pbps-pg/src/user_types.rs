@@ -77,7 +77,8 @@
 //!
 //! # One read
 //!
-//! A read is two passes that must agree. The queries of one pass are separate
+//! A read of a set of references is two passes over the whole set that must
+//! agree, reference by reference. The queries of one pass are separate
 //! statements, and in a caller's READ COMMITTED transaction they do not share a
 //! snapshot (DECISIONS 423), so a type changed between them could be returned
 //! as a definition it never had. A pass that differs from the one before it is
@@ -688,20 +689,27 @@ async fn read_all(
 async fn read_each(conn: &mut Conn, references: &[TypeRef]) -> Result<Vec<TypeRead>, DbError> {
     conn.query("SELECT pg_catalog.set_config('search_path', '', true) AS was_set")
         .await?;
-    let mut reads = Vec::with_capacity(references.len());
-    for reference in references {
-        // Read twice and compare. In the caller's READ COMMITTED transaction a
-        // savepoint gives the separate catalog queries of one read no common
-        // snapshot (DECISIONS 423), and even in a snapshot of our own the
-        // deparsing functions see the latest catalog. A type that changed
-        // between the queries would otherwise come back as a definition that
-        // never existed, with a pin to match. Optimistic, like 423's
-        // revalidation: a change after the second read is the replay's to see.
-        let first = read_one(conn, reference).await?;
-        let second = read_one(conn, reference).await?;
-        reads.push(settled(first, second));
+    // Read the whole set twice and compare, one reference against itself. In
+    // the caller's READ COMMITTED transaction a savepoint gives the separate
+    // catalog queries of one read no common snapshot (DECISIONS 423), and even
+    // in a snapshot of our own the deparsing functions see the latest catalog.
+    // A type that changed between the queries would otherwise come back as a
+    // definition that never existed, with a pin to match. Both passes cover
+    // every reference, so a change to the first one while a later one is read
+    // is seen by the second pass. Optimistic, like 423's revalidation: a change
+    // after the last read is the replay's to see.
+    let mut passes = [Vec::new(), Vec::new()];
+    for pass in &mut passes {
+        for reference in references {
+            pass.push(read_one(conn, reference).await?);
+        }
     }
-    Ok(reads)
+    let [first, second] = passes;
+    Ok(first
+        .into_iter()
+        .zip(second)
+        .map(|(first, second)| settled(first, second))
+        .collect())
 }
 
 /// The read both passes agree on, or a failed read when they do not.
@@ -780,8 +788,8 @@ async fn read_one(conn: &mut Conn, reference: &TypeRef) -> Result<TypeRead, DbEr
         return Ok(TypeRead::NotAdmitted(not_admitted));
     }
     let definition = define(conn, oid).await?;
-    let reached = closure(conn, oid).await?;
-    let mut ids = BTreeSet::new();
+    let (reached, type_owners) = closure(conn, oid).await?;
+    let mut ids = type_owners;
     definition.collect_owners(&mut ids);
     ids.extend(reached.iter().filter_map(|r| r.owner));
     let owners = owners(conn, &ids).await?;
@@ -1269,8 +1277,7 @@ fn closure_query() -> String {
       JOIN pg_catalog.pg_class c ON c.oid = n.classid
      CROSS JOIN LATERAL pg_catalog.pg_identify_object(n.classid, n.objid, 0) i
      WHERE NOT n.part
-       AND n.classid NOT IN ('pg_catalog.pg_type'::pg_catalog.regclass,
-                             'pg_catalog.pg_constraint'::pg_catalog.regclass)
+       AND n.classid <> 'pg_catalog.pg_constraint'::pg_catalog.regclass
      ORDER BY 1, 4, 6",
         owner = owner_expression()
     )
@@ -1283,6 +1290,7 @@ fn closure_query() -> String {
 /// owner can change their mappings in place.
 const OWNED_CATALOGS: &[(&str, &str)] = &[
     ("pg_proc", "proowner"),
+    ("pg_type", "typowner"),
     ("pg_class", "relowner"),
     ("pg_operator", "oprowner"),
     ("pg_collation", "collowner"),
@@ -1336,20 +1344,33 @@ fn owner_expression() -> String {
     out
 }
 
-async fn closure(conn: &mut Conn, oid: Oid) -> Result<Vec<Reached>, DbError> {
+/// The objects the type reaches, and the owners of the types it reaches that
+/// are not parts of it. Those are types its expressions name, such as the
+/// domain a CHECK casts `VALUE` to, and whose own CHECKs run when the outer
+/// one does: their owners are among the roles that wrote what runs, though the
+/// types themselves are not listed in [`UserType::reached`].
+async fn closure(conn: &mut Conn, oid: Oid) -> Result<(Vec<Reached>, BTreeSet<Oid>), DbError> {
     let rows = conn
         .query_with(&closure_query(), &[Param::I64(oid)])
         .await?;
-    rows.iter()
-        .map(|row| {
+    let mut reached = Vec::new();
+    let mut type_owners = BTreeSet::new();
+    for row in &rows {
+        {
             let catalog = need::<&str>(row, "catalog")?;
-            if !OWNED_CATALOGS.iter().any(|(c, _)| *c == catalog) && !UNOWNED_CATALOGS.contains(&catalog) {
+            if catalog == "pg_type" {
+                type_owners.extend(row.try_get::<i64>("owner")?);
+                continue;
+            }
+            if !OWNED_CATALOGS.iter().any(|(c, _)| *c == catalog)
+                && !UNOWNED_CATALOGS.contains(&catalog)
+            {
                 return Err(DbError::BadRow(format!(
                     "the type reaches `{}`, an object of the catalog `{catalog}`, whose owner this read cannot find",
                     need::<&str>(row, "identity")?
                 )));
             }
-            Ok(Reached {
+            reached.push(Reached {
                 oid: need(row, "oid")?,
                 catalog: catalog.to_owned(),
                 kind: need::<&str>(row, "kind")?.to_owned(),
@@ -1357,9 +1378,10 @@ async fn closure(conn: &mut Conn, oid: Oid) -> Result<Vec<Reached>, DbError> {
                 name: row.try_get::<&str>("name")?.map(str::to_owned),
                 identity: need::<&str>(row, "identity")?.to_owned(),
                 owner: row.try_get::<i64>("owner")?,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    Ok((reached, type_owners))
 }
 
 /// Each owner and whether DEC-1663.1's first stage trusts it: a superuser, or
