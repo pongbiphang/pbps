@@ -377,10 +377,18 @@ pub fn scope(desired: &CapturedInputs, managed: &[&Managed], paths: &Paths) -> C
     }
 }
 
-/// An object of the engine's own: in a system schema, or an access method,
-/// which has no schema.
+/// An object of the engine's own: in a system schema, a system schema
+/// itself, or one of the classes with no schema a new object reaches by
+/// reference — its access method, language or tablespace. Those exist
+/// before anything uses them, so a new routine's `sql` language is present
+/// even on a target whose captured routines are all `plpgsql`.
 fn built_in(object: &ObjectIdentity) -> bool {
-    object.class == "pg_am" || matches!(object.name.as_slice(), [schema, _] if is_system(schema))
+    match (object.class.as_str(), object.name.as_slice()) {
+        ("pg_am" | "pg_language" | "pg_tablespace", [_]) => true,
+        ("pg_namespace", [schema]) => is_system(schema),
+        (_, [schema, _]) => is_system(schema),
+        _ => false,
+    }
 }
 
 /// The first capture of scratch: its managed objects and their bindings,
@@ -887,6 +895,12 @@ mod tests {
     #[test]
     fn only_the_engines_own_objects_are_retained_as_built_in() {
         assert!(built_in(&id("pg_am", &["gin"], Vec::new())));
+        assert!(built_in(&id("pg_language", &["sql"], Vec::new())));
+        assert!(built_in(&id("pg_tablespace", &["pg_default"], Vec::new())));
+        assert!(built_in(&id("pg_namespace", &["pg_catalog"], Vec::new())));
+        // A schema the plan may create is not the engine's.
+        assert!(!built_in(&id("pg_namespace", &["app"], Vec::new())));
+        assert!(!built_in(&id("pg_extension", &["pg_trgm"], Vec::new())));
         assert!(built_in(&id(
             "pg_opclass",
             &["pg_catalog", "jsonb_ops"],
