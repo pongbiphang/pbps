@@ -226,20 +226,20 @@ fn the_prepared_graph_projects_the_split_steps_not_the_ordinary_positions() {
         },
     ];
     let (unsplit, _) = measured(|| {
-        graph::constraints(
-            &ordinary,
-            ordinary.changes.len(),
-            &observations,
-            &hints.module_deps,
-            old,
-            wanted,
-        )
+        graph::constraints_of_logical(&ordinary, &observations, &hints.module_deps, old, wanted)
     });
     assert!(unsplit.iter().all(|e| e.reason != OrderReason::Restoration));
+    let owners = pbps_model::operation::PlanOwners::new(
+        pbps_model::plan_names::PlanNames::of(&ordinary.changes, &after_ids).unwrap(),
+        &ids,
+        &after_ids,
+    );
     let (edges, projections) = measured(|| {
         graph::constraints(
             &prepared.changes,
             prepared.ordinary,
+            &prepared.origins,
+            &owners,
             &observations,
             &hints.module_deps,
             old,

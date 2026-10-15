@@ -1327,7 +1327,8 @@ teardown of the old `app.b` in a rename chain (`app.b` to `app.c`, then `app.a`
 to `app.b`) would belong to the table that took its name. A rule fires only
 when the names match and, where both UIDs are known, the UIDs match too. This
 only removes the false edges between two tables that share a name in turn; it
-adds none.
+adds none. Since DEC-1871.1 the UID is read from where each step came from, not
+from a history the graph keeps.
 
 The observation edges read the same owners. An observation names its opening
 record by the base spelling when the base holds the surface, and otherwise by
@@ -2677,3 +2678,49 @@ word for the second kind.
 **Pinned by** `an_entry_naming_baseline_is_refused_with_its_new_name` and
 `a_server_entry_names_its_externals_file_relative_to_the_project`
 (`pbps-config`), and the schema/loader agreement cases in `integration`.
+
+<a id="dec-1871-1"></a>
+
+**DEC-1871.1. The ordering graph reads a step's table from where the step
+came from, and refuses a plan whose names it cannot follow.** DEC-1498.1 tells
+tables apart by recorded UID, and the graph found that UID itself. For an
+ordinary step it replayed the earlier steps for the last rename into the name
+or creation under it. For an appended step it took the base table for a
+removal and the desired one for anything else. That was a second copy of the
+plan's name history, kept over the prepared steps rather than the plan they
+came from.
+
+Each prepared step now carries its origin (DEC-1961.1), and the origin says
+which names the step spells by:
+- a whole change spells them as they are at its position in the logical plan;
+- a split part spells them as they are once its change has run;
+- a teardown spells them by the base names, and a restoration by the final
+  ones.
+
+`PlanOwners` answers the UID from the logical plan's `PlanNames` and the two
+identity files. The graph asks it and keeps no history of its own. A step that
+is split, appended or reordered keeps its origin, so its owner survives all of
+them.
+
+The logical plan is the differ's order, which is executable, so its names can
+be followed. A plan `PlanNames` refuses is therefore refused here too
+(`Error::Names`), not ordered by guessed owners. A name no managed table holds
+at that position still leaves the owner unknown, which keeps every edge the
+shared name draws, as before.
+
+Measured by comparing the two readings step by step on every resolver plan of
+the workspace tests and of the resolver's live suites (`pbps-pg`'s library
+tests, the scratch tests, `cli_bin` and `flow_pg`): 922 steps (613 ordinary,
+309 appended) and no difference.
+The edges, plans and checksums are therefore those of before. Today's differ
+spells an ordinary step after the renames it depends on, so its name reads the
+same at its position as at the end. A step ahead of a rename chain is
+therefore pinned with a hand-built plan.
+
+**Pinned by**:
+- `an_ordinary_removal_ahead_of_a_rename_chain_belongs_to_the_table_there`;
+- `a_restoration_belongs_to_the_final_holder_of_its_name` and
+  `a_restoration_into_a_reused_name_follows_the_rename_into_it`;
+- `a_plan_whose_names_cannot_be_followed_is_refused`;
+- the rename chain and reused name cases of DEC-1498.1, which each fail when
+  one role's spelling is changed.

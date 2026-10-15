@@ -20,7 +20,7 @@ fn part_effects(change: &pbps_model::Change) -> Vec<pbps_model::part_effects::Pa
 pub use assess::{Answer, Assessment, assess};
 
 use pbps_dialect::Dialect;
-use pbps_model::operation::{ModuleEdits, Operations};
+use pbps_model::operation::{ModuleEdits, Operations, PlanOwners};
 use pbps_model::resolver::{OrderEdge, OrderingProof, Surface, SurfaceResolution};
 use pbps_model::{ChangeSet, IdsFile};
 use std::collections::BTreeSet;
@@ -39,6 +39,11 @@ pub enum Error {
     Edge,
     #[error("resolver ordering cannot split this data-bearing operation: {0:?}")]
     Unsupported(Surface),
+    /// The ordinary plan is the differ's executable order, so its names are
+    /// followed step by step; a plan whose names cannot be is refused rather
+    /// than ordered by guessed owners (#1871).
+    #[error("the ordinary plan's names cannot be followed step by step: {0}")]
+    Names(String),
 }
 
 /// The spelling a resolution names a base surface by: its own where the plan
@@ -145,9 +150,17 @@ pub fn plan_operations(
             ModuleEdits::InPlace
         },
     );
+    // Who owns each step's table comes from where the step came from, read
+    // against the logical plan's own name history (#1871): the graph keeps
+    // no copy of that history.
+    let names = pbps_model::plan_names::PlanNames::of(&logical.changes, desired.ids)
+        .map_err(|e| Error::Names(e.to_string()))?;
+    let owners = PlanOwners::new(names, base.ids, desired.ids);
     let edges = graph::constraints(
         &prepared.changes,
         prepared.ordinary,
+        &prepared.origins,
+        &owners,
         resolution,
         &hints.module_deps,
         base,
