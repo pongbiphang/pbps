@@ -1212,8 +1212,16 @@ question about a live database, and the maintainer settled where it is asked
   horizon reaches past the supported calendar (#1924): there is no point for the series
   to fall short of, and no remedy that reaches one. The year is checked before the
   value is built, so no date past 9999 is computed or printed, and it holds for the
-  default of twice the newest width as for a configured one. A count of partitions
-  is never a point on the key's axis, so it has no calendar to leave, however large.
+  default of twice the newest width as for a configured one. An integer key has the
+  same edge at the top of its type (#2020): the default horizon, the one horizon an
+  integer key is asked for as a point (a width of time is refused, and a count is no
+  point), gets the same finding when its target is above the largest value of the
+  `smallint`, `integer` or `bigint` the key is, in the words of the generator's own
+  refusal (#1905): no larger value fits. A target exactly at the largest value is
+  asked as usual, since a series can end there. There is no edge at the bottom: a
+  partition's lower end is below its upper end, so the target is above rows that
+  are no lower than the type's minimum. A count of partitions is never a point on
+  the key's axis, so it has no calendar or type to leave, however large.
 - **The DEFAULT's rows.** `EXISTS` of a row in the DEFAULT inside the range of any
   declared partition the database does not have. A range the database has cannot have
   a row there, so only the declared ranges it lacks are asked about, compared by their

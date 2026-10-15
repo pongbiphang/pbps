@@ -52,7 +52,7 @@ use pbps_db::doctor::Reach;
 use pbps_model::BoundDatum;
 
 use crate::partition_series::{
-    Civil, Key, Mode, Step, civil_from_days, days_from_civil, days_in_month, parse_civil,
+    Civil, Int, Key, Mode, Step, civil_from_days, days_from_civil, days_in_month, parse_civil,
     parse_integer, parse_step_as, why,
 };
 
@@ -309,13 +309,28 @@ fn past_the_calendar(horizon: &str, held_from: &str, remedy: &str) -> String {
     )
 }
 
+/// Why a horizon cannot be asked of a series whose newest rows start at
+/// `held_from`: its target is an integer above the largest the key's type
+/// holds, so no partition can end there and there is no point to say the
+/// series falls short of (#2020). The same shape as [`past_the_calendar`], and
+/// the wording of the generator's own refusal (#1905: "no larger value fits a
+/// bigint"). The reason reads inside the `…-unknown` finding's parentheses.
+fn past_the_largest(horizon: &str, held_from: &str, int: Int, remedy: &str) -> String {
+    format!(
+        "{horizon}, counted from `{held_from}`, reaches past the largest {} value, {}, and no \
+         larger value fits: {remedy}",
+        int.name, int.max
+    )
+}
+
 /// The need, and the horizon in words for the message.
 ///
 /// A count of partitions is a number of partitions and never a point on the
-/// key's axis, so it has no calendar to leave and serves every key type,
-/// however large (it is at most `u32::MAX`). A target on the axis of a date or
-/// time key can leave the calendar, and then it is an `Err`: undetermined, not
-/// a series that is short of a point nothing can reach.
+/// key's axis, so it has no calendar or type to leave and serves every key
+/// type, however large (it is at most `u32::MAX`). A target on the axis of a
+/// date or time key can leave the calendar, and one on an integer key can
+/// leave the key's type; either is an `Err`: undetermined, not a series that
+/// is short of a point nothing can reach.
 fn need(
     key: Key,
     horizon: &Horizon,
@@ -357,8 +372,26 @@ fn need(
                     },
                     _ => None,
                 },
-                (Some(lo), Some(hi), Val::Int(r)) => match (&lo.val, &hi.val) {
-                    (Val::Int(a), Val::Int(b)) => Some(Val::Int(r + 2 * (b - a))),
+                (Some(lo), Some(hi), Val::Int(r)) => match (key, &lo.val, &hi.val) {
+                    (Key::Integer(int), Val::Int(a), Val::Int(b)) => {
+                        // The engine refuses a partition whose lower end is
+                        // not below its upper end, so the width is positive
+                        // and the target is above `r`, itself no lower than
+                        // `int.min` ([`parse_integer`]): it cannot leave the
+                        // type downwards. Upwards it can, and the largest
+                        // value is a target like any other, since a series
+                        // can end there.
+                        let target = r + 2 * (b - a);
+                        if target > int.max {
+                            return Err(past_the_largest(
+                                &format!("the default horizon, {words}"),
+                                &reference.text,
+                                int,
+                                "set partition_runway to a count of partitions, as `3`",
+                            ));
+                        }
+                        Some(Val::Int(target))
+                    }
                     _ => None,
                 },
                 // A newest partition with no lower end has no width: two
@@ -1297,5 +1330,178 @@ mod tests {
             &width(&huge),
         ));
         assert_eq!(s.reach, Reach::Partitions(u32::MAX));
+    }
+
+    const SMALLINT: Int = Int {
+        name: "smallint",
+        min: i16::MIN as i128,
+        max: i16::MAX as i128,
+    };
+    const INTEGER: Int = Int {
+        name: "integer",
+        min: i32::MIN as i128,
+        max: i32::MAX as i128,
+    };
+    const BIGINT_KEY: Int = Int {
+        name: "bigint",
+        min: i64::MIN as i128,
+        max: i64::MAX as i128,
+    };
+
+    /// One partition `[lo, hi)` of an integer key, as the engine prints it.
+    fn whole(int: Int, lo: i128, hi: i128) -> Range {
+        Range {
+            lo: Some(end(Key::Integer(int), &lo.to_string()).unwrap()),
+            hi: Some(end(Key::Integer(int), &hi.to_string()).unwrap()),
+        }
+    }
+
+    /// A default horizon whose target lies above the largest value the key's
+    /// type holds is undetermined, for each integer type by its own maximum:
+    /// no partition can end at it, so the series is not short of anything
+    /// (#2020).
+    #[test]
+    fn a_default_horizon_above_the_largest_integer_is_undetermined_not_short() {
+        for (int, width) in [(SMALLINT, 100), (INTEGER, 1000), (BIGINT_KEY, 1000)] {
+            // One past what the type holds: twice the width on from here.
+            let from = int.max - 2 * width + 1;
+            let held = whole(int, from, from + width);
+            let reason = undetermined(assess(
+                Key::Integer(int),
+                std::slice::from_ref(&held),
+                &[],
+                &held,
+                &Horizon::Default,
+            ));
+            assert!(
+                reason.contains(&format!(
+                    "the default horizon, twice the newest partition's width, counted from \
+                     `{from}`, reaches past the largest {} value, {}",
+                    int.name, int.max
+                )) && reason.contains("set partition_runway to a count of partitions, as `3`"),
+                "{}: {reason}",
+                int.name
+            );
+            // The target is not built, so it is not spelled out.
+            assert!(
+                !reason.contains(&(from + 2 * width).to_string()),
+                "{}: {reason}",
+                int.name
+            );
+        }
+        // The case the issue names: an `integer` series ending at 2147483000
+        // with width 1000 and rows in its newest partition.
+        let held = whole(INTEGER, 2_147_482_000, 2_147_483_000);
+        let reason = undetermined(assess(
+            Key::Integer(INTEGER),
+            std::slice::from_ref(&held),
+            &[],
+            &held,
+            &Horizon::Default,
+        ));
+        assert!(
+            reason.contains("counted from `2147482000`")
+                && reason.contains("reaches past the largest integer value, 2147483647"),
+            "{reason}"
+        );
+    }
+
+    /// Negative: a target that is exactly the largest value is a value a
+    /// series can end at, so it is short or covered on its merits.
+    #[test]
+    fn a_default_horizon_at_the_largest_integer_is_assessed_as_usual() {
+        for (int, width) in [(SMALLINT, 100), (INTEGER, 1000), (BIGINT_KEY, 1000)] {
+            let key = Key::Integer(int);
+            let from = int.max - 2 * width;
+            let held = whole(int, from, from + width);
+            let s = short(assess(
+                key,
+                std::slice::from_ref(&held),
+                &[],
+                &held,
+                &Horizon::Default,
+            ));
+            assert_eq!(s.reach, Reach::Until(int.max.to_string()), "{}", int.name);
+            assert_eq!(s.frontier, (from + width).to_string());
+            assert_eq!(s.every, Some(width.to_string()));
+            // A series that does end at the largest value reaches it.
+            let ranges = vec![held.clone(), whole(int, from + width, int.max)];
+            assert_eq!(
+                assess(key, &ranges, &[], &held, &Horizon::Default),
+                Ok(Verdict::Covered),
+                "{}",
+                int.name
+            );
+            // One value on, the target is out of the type again.
+            let past = whole(int, from + 1, from + width + 1);
+            assert!(
+                undetermined(assess(
+                    key,
+                    std::slice::from_ref(&past),
+                    &[],
+                    &past,
+                    &Horizon::Default,
+                ))
+                .contains(&format!("reaches past the largest {} value", int.name)),
+                "{}",
+                int.name
+            );
+        }
+    }
+
+    /// Negative: only the target of the default horizon is a point on the
+    /// key's axis. A count of partitions, the only horizon an integer key
+    /// is given, is a number of partitions at any position of the series,
+    /// the last value of the type included.
+    #[test]
+    fn a_count_of_partitions_at_the_largest_integer_is_short_not_undetermined() {
+        let held = whole(INTEGER, 2_147_482_000, 2_147_483_000);
+        for k in [2_u32, 3, u32::MAX] {
+            let s = short(assess(
+                Key::Integer(INTEGER),
+                std::slice::from_ref(&held),
+                &[],
+                &held,
+                &Horizon::Partitions(k),
+            ));
+            assert_eq!(s.reach, Reach::Partitions(k));
+        }
+    }
+
+    /// The lower end of the type is never a target: the width is positive, so
+    /// the default horizon is above the rows, which are no lower than the
+    /// type's minimum.
+    #[test]
+    fn a_default_horizon_from_the_smallest_integer_is_assessed_as_usual() {
+        for (int, width) in [(SMALLINT, 100), (INTEGER, 1000), (BIGINT_KEY, 1000)] {
+            let held = whole(int, int.min, int.min + width);
+            let s = short(assess(
+                Key::Integer(int),
+                std::slice::from_ref(&held),
+                &[],
+                &held,
+                &Horizon::Default,
+            ));
+            assert_eq!(
+                s.reach,
+                Reach::Until((int.min + 2 * width).to_string()),
+                "{}",
+                int.name
+            );
+            // A newest partition with no lower end has no width: two
+            // partitions, not a point near the minimum.
+            let open = Range {
+                lo: None,
+                hi: held.hi.clone(),
+            };
+            let s = short(assess(
+                Key::Integer(int),
+                std::slice::from_ref(&open),
+                &[],
+                &open,
+                &Horizon::Default,
+            ));
+            assert_eq!(s.reach, Reach::Partitions(2), "{}", int.name);
+        }
     }
 }
