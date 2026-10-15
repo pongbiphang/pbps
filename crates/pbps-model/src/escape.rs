@@ -21,8 +21,10 @@
 //!
 //! What is escaped is a control character, a line or paragraph separator, and
 //! the invisible characters that reorder or hide text (zero-width and
-//! bidirectional marks). Every other character, including every non-ASCII
-//! letter, is shown as it is: an identifier is allowed to be Unicode.
+//! bidirectional marks), together with the other default-ignorable characters
+//! no terminal draws. Every other character, including every non-ASCII letter
+//! and every variation selector, is shown as it is: an identifier is allowed to
+//! be Unicode.
 
 use std::fmt;
 
@@ -69,18 +71,39 @@ fn write_inert(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
 /// C1 introducer (U+009B) that starts one on some terminals. The explicit
 /// ranges are the characters Unicode treats as format or separator and that no
 /// terminal draws: the line and paragraph separators, the zero-width and
-/// directional marks, the embeddings, overrides and isolates, and the byte
-/// order mark.
+/// directional marks, the embeddings, overrides and isolates, the byte order
+/// mark, and the rest of the default-ignorable set that draws nothing by
+/// itself (the grapheme joiner, the Hangul and Khmer fillers, the Mongolian
+/// vowel separator, the interlinear and shorthand and musical format controls,
+/// the tag characters). A hand-made name carrying one would otherwise read the
+/// same as one without it (#2040).
+///
+/// The variation selectors (U+FE00..=U+FE0F, the Mongolian U+180B..=U+180D and
+/// U+180F, and U+E0100..=U+E01EF) are left alone on purpose. Each follows a
+/// visible character in valid text, as the emoji presentation selector U+FE0F
+/// does in `❤️` and an ideographic variation selector does in a CJK name, so
+/// escaping them would rewrite names that are valid (DEC-2032.1).
 fn hides_or_moves(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{061c}'
+            '\u{034f}'
+                | '\u{061c}'
+                | '\u{115f}'..='\u{1160}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180e}'
                 | '\u{200b}'..='\u{200f}'
                 | '\u{2028}'..='\u{202e}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{206f}'
+                | '\u{3164}'
                 | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fff8}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e00ff}'
+                | '\u{e01f0}'..='\u{e0fff}'
         )
 }
 
@@ -110,6 +133,52 @@ mod tests {
         ] {
             let text = shown(&format!("a{c}b"));
             assert_eq!(text, format!("a\\u{{{:x}}}b", u32::from(c)));
+        }
+    }
+
+    #[test]
+    fn zero_width_default_ignorable_characters_are_shown() {
+        // The first and the last character of each range added for #2040 are
+        // shown, so a range cut short at either end fails here.
+        for (first, last) in [
+            ('\u{034f}', '\u{034f}'),
+            ('\u{115f}', '\u{1160}'),
+            ('\u{17b4}', '\u{17b5}'),
+            ('\u{180e}', '\u{180e}'),
+            ('\u{3164}', '\u{3164}'),
+            ('\u{ffa0}', '\u{ffa0}'),
+            ('\u{fff0}', '\u{fff8}'),
+            ('\u{1bca0}', '\u{1bca3}'),
+            ('\u{1d173}', '\u{1d17a}'),
+            ('\u{e0000}', '\u{e00ff}'),
+            ('\u{e01f0}', '\u{e0fff}'),
+        ] {
+            for c in [first, last] {
+                let text = shown(&format!("a{c}b"));
+                assert_eq!(text, format!("a\\u{{{:x}}}b", u32::from(c)));
+            }
+        }
+    }
+
+    #[test]
+    fn a_variation_selector_after_a_visible_character_is_left_alone() {
+        // Negative: the selectors that valid text puts after a base character
+        // (emoji presentation, a CJK variant, a Mongolian letter) are not
+        // rewritten, and nor is the visible character beside each added range.
+        for name in [
+            "\u{2764}\u{fe0f}",
+            "\u{2764}\u{fe0e}",
+            "\u{845b}\u{e0100}",
+            "\u{845b}\u{e01ef}",
+            "\u{1820}\u{180b}",
+            "\u{1820}\u{180d}",
+            "\u{1820}\u{180f}",
+            "e\u{301}\u{350}",
+            "\u{180a}\u{1810}",
+            "\u{1161}\u{17b6}\u{3165}\u{ffa1}",
+            "\u{1bc9f}\u{1d172}\u{1d17b}",
+        ] {
+            assert_eq!(shown(name), name);
         }
     }
 
