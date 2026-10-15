@@ -39,6 +39,22 @@ pub(crate) fn decode(raw: &str, path: &Path) -> anyhow::Result<SavedPlan> {
             if let Ok(header) = serde_json::from_str::<Header>(raw) {
                 require_current(header.version, path)?;
             }
+            // A runtime this build does not run, such as a measured profile
+            // #1636 retired, is refused as such and with the remedy, not as
+            // an unreadable file (#616).
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw)
+                && let Some(kind) = value
+                    .pointer("/analysis/evidence/qualification/runtime/kind")
+                    .and_then(serde_json::Value::as_str)
+                && kind != "scratch"
+            {
+                anyhow::bail!(
+                    "`{}`'s resolver evidence names the runtime `{}`, which this build does not \
+                     run.\nPlan again with this build; its resolver seals the one runtime it has.",
+                    path.display(),
+                    pbps_model::escape::Escaped(kind)
+                );
+            }
             Err(anyhow::Error::new(Echoed(error.to_string())))
                 .with_context(|| format!("`{}` is not a pbps plan", path.display()))
         }

@@ -531,9 +531,14 @@ pub(super) fn classify(
             };
             if allowed {
                 // A generated relation (a key's index, an identity sequence)
-                // has attribute rows that go with it, as a declared index's do.
+                // has attribute rows that go with it, as a declared index's do,
+                // and a sequence's system attributes as a declared table's do:
+                // the closing read finds them under the name the target gave
+                // the sequence, which the scratch's need not be (#616). An
+                // index has none.
                 if made.class == "pg_class" {
                     physical_attributes(capture, &mut owned, made, &owner, false)?;
+                    physical_attributes(capture, &mut owned, made, &owner, true)?;
                 }
                 assign(&mut owned, made.clone(), owner)?;
                 changed = true;
@@ -553,7 +558,11 @@ pub(super) fn classify(
             // Defaults and rewrite rules need their own independently proven
             // surface or measured internal edge above. Their containing
             // column/relation is insufficient authority.
-            "pg_index" | "pg_sequence" | "pg_depend" => object.signature.first(),
+            // A partitioned table's key, and a partition's place under its
+            // parent, are its own: the partition's, not the parent's (#616).
+            "pg_index" | "pg_sequence" | "pg_depend" | "pg_partitioned_table" | "pg_inherits" => {
+                object.signature.first()
+            }
             _ => None,
         };
         if let Some(owner) = subject.and_then(|subject| owned.get(subject)).cloned() {

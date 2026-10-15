@@ -203,8 +203,8 @@ say whether what the emitter sent is what comes back.
 
 ### Engine-assisted planning and resolver environments
 
-**PostgreSQL resolver planning delivered (#615); applying a resolved plan (#616) and SQL Server resolution (#619–#621) remain.**
-[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered)
+**PostgreSQL resolver planning (#615) and transactional apply of a resolved plan (#616) delivered; staged resolved apply and SQL Server resolution (#619–#621) remain.**
+[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered)
 and [ADR-0016](ADR-0016-engine-assisted-planning.md) retain offline previews and
 the existing SQL Server `--dev` rehearsal. Target planning accepts
 `--resolve-with <profile>` (#606), with CLI > environment > project precedence.
@@ -220,7 +220,9 @@ environment inventory and known official image-family suggestions for both
 engines, without acquisition. It names unknown qualification requirements;
 session observations do not establish the deployment context. A resolved
 plan carries its sealed binding evidence (#1516), which `explain` shows from
-the file (#1517); apply refuses it until #616. See
+the file (#1517), and `apply --plan` applies in one transaction, rechecking
+that evidence from the target connection alone before its first statement
+and after its last (#616, DEC-616.1). See
 [the staged delivery plan](RESOLVER-DELIVERY.md) for #595, completed discovery
 #597, and ordered implementation steps #606–#621.
 
@@ -242,8 +244,8 @@ The PostgreSQL target-input library (#612) captures actual historical bindings,
 recorded baseline, complete requested candidate sets and prerequisite properties
 on one owned snapshot. Fresh recapture compares private versioned fingerprints,
 keyed under a per-process key (DEC-952.1). Unknown required coverage refuses. Connected
-planning uses it through the CLI (#1515–#1517); the apply path does not yet
-(#616). Desired-namespace
+planning uses it through the CLI (#1515–#1517), and apply inside its own
+transaction (#616). Desired-namespace
 reconstruction and the managed-only binding comparison (#613) compile the
 declarations on the resolver's scratch database and return, per surface,
 unaffected, rebuild or unresolved; sealing (#614) and planning integration
@@ -267,9 +269,9 @@ from the plan alone, in human and JSON output: the entry that ran, its
 scratch kind and layout, the qualification, each surface's verdict, the
 order and the prerequisites. SQL Server resolution, `--staged` and a
 retained external object the externals file does not stage refuse by name (#1517,
-DEC-1517.1). PostgreSQL planning is delivered; applying a resolved plan is
-#616. [Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order:
-#1778 and #616, then SQL Server's #619, #620 and #621.
+DEC-1517.1). PostgreSQL planning and transactional apply are delivered
+(#616). [Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order:
+the rest of #1778, then SQL Server's #619, #620 and #621.
 
 Delivery is split into three stages:
 
@@ -290,8 +292,9 @@ Resolver-plan fingerprints are keyed under each environment's fingerprint key
 guess of the literals they cover, so a resolver plan and its checksum are
 handled and recorded as any plan's, with no protected ledger table or reader
 qualification (the design of #594, now superseded). `pbps key generate` makes a
-key, and `pbps doctor` checks each environment's. Sealing the key identifier
-into a plan and refusing `apply` under another key are part of #614 and #616.
+key, and `pbps doctor` checks each environment's. A plan seals the key
+identifier (#614), and `apply` under another key, or none, refuses before
+connecting (#616).
 
 Every PostgreSQL plan pins the routines outside its managed set that a role
 short of a superuser can replace (DEC-319.1, #319). The pins are one HMAC per

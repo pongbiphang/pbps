@@ -33,28 +33,13 @@ pub(super) async fn owned(
     dropped: &BTreeSet<super::DroppedSignature>,
     qualify: impl FnOnce(&Catalog, u32) -> Result<Selection, Failure>,
 ) -> Result<Read, Failure> {
-    let token = crate::catalog::probe_token();
-    conn.query(&crate::catalog::probe_set(&token))
-        .await
-        .map_err(|_| Failure::Read)?;
-    let rows = conn
-        .query(crate::catalog::PROBE_READ)
-        .await
-        .map_err(|_| Failure::Read)?;
-    let [row] = rows.as_slice() else {
-        return Err(Failure::Incomplete);
-    };
-    let probe = row
-        .try_get::<&str>("probe")
-        .map_err(|_| Failure::Incomplete)?
-        .ok_or(Failure::Incomplete)?;
-    if probe == token {
+    if in_transaction(conn).await? {
         return Err(Failure::CallerTransaction);
     }
     conn.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .await
         .map_err(|_| Failure::Read)?;
-    let outcome = within(conn, dropped, qualify).await;
+    let outcome = within(conn, Framing::Owned, dropped, qualify).await;
     let (read, witnesses, environment) = match outcome {
         Ok(value) => {
             if conn.query("COMMIT").await.is_err() {
@@ -79,6 +64,108 @@ pub(super) async fn owned(
         return Err(Failure::Changed);
     }
     Ok(read)
+}
+
+/// The capture inside the caller's open `READ COMMITTED` transaction, which
+/// apply's checks run in: before its first statement, and after its last,
+/// where the read must see the transaction's own DDL and every concurrent
+/// commit (DECISIONS 423, #616).
+///
+/// No statement here shares a snapshot with another, and a signature lookup
+/// reads no snapshot at all: measured on 16 and 18, `to_regprocedure` sees a
+/// routine committed after the transaction's snapshot was taken, and on 16
+/// it can keep a search path its session computed before a membership
+/// change. So the reads are bracketed instead. The first catalog read is one
+/// cursor statement; every later one, the rendering pass and the lookups
+/// included, runs before a last one-statement witness read, which must find
+/// every row at the tuple version the first read did. A change that
+/// survives the interval refuses here. One undone inside it leaves the
+/// witnesses equal, and is answered by the caller: each lookup is compared
+/// with the sealed one, and the candidates, namespaces, memberships and
+/// settings it depends on with theirs, so a lookup a transient change moved
+/// differs from the seal and is refused, never matched (DEC-616.1).
+///
+/// Under a savepoint made read-only, rolled back on every path: the
+/// canonical settings the read sets are `is_local`, and the apply's
+/// statements after it run under the session's own (DECISIONS 418).
+pub(super) async fn in_callers_transaction(
+    conn: &mut impl QueryConnection,
+    dropped: &BTreeSet<super::DroppedSignature>,
+    qualify: impl FnOnce(&Catalog, u32) -> Result<Selection, Failure>,
+) -> Result<Read, Failure> {
+    bracketed(conn, dropped, qualify, || Ok(())).await
+}
+
+/// [`in_callers_transaction`], running `between` after the lookups and
+/// before the last read: where a test commits from another session.
+async fn bracketed(
+    conn: &mut impl QueryConnection,
+    dropped: &BTreeSet<super::DroppedSignature>,
+    qualify: impl FnOnce(&Catalog, u32) -> Result<Selection, Failure>,
+    between: impl FnOnce() -> Result<(), Failure>,
+) -> Result<Read, Failure> {
+    if !in_transaction(conn).await? {
+        return Err(Failure::NoTransaction);
+    }
+    conn.query("SAVEPOINT pbps_capture")
+        .await
+        .map_err(|_| Failure::Read)?;
+    let outcome = async {
+        conn.query("SET LOCAL transaction_read_only = on")
+            .await
+            .map_err(|_| Failure::Read)?;
+        let (read, witnesses, environment) =
+            within(conn, Framing::CallersTransaction, dropped, qualify).await?;
+        between()?;
+        // One statement, after every lookup and rendering read.
+        let current = witness_read(conn, read.major).await?;
+        if !environment.unchanged(&super::session::observe(conn).await?) {
+            return Err(Failure::EnvironmentChanged);
+        }
+        if current != witnesses {
+            return Err(Failure::Changed);
+        }
+        Ok(read)
+    }
+    .await;
+    let unwound = match conn.query("ROLLBACK TO SAVEPOINT pbps_capture").await {
+        Ok(_) => conn.query("RELEASE SAVEPOINT pbps_capture").await,
+        Err(error) => Err(error),
+    };
+    match (outcome, unwound) {
+        (Ok(read), Ok(_)) => Ok(read),
+        (Ok(_), Err(_)) => Err(Failure::Close),
+        (Err(error), _) => Err(error),
+    }
+}
+
+/// Whether the connection is inside a transaction it has not ended.
+async fn in_transaction(conn: &mut impl QueryConnection) -> Result<bool, Failure> {
+    let token = crate::catalog::probe_token();
+    conn.query(&crate::catalog::probe_set(&token))
+        .await
+        .map_err(|_| Failure::Read)?;
+    let rows = conn
+        .query(crate::catalog::PROBE_READ)
+        .await
+        .map_err(|_| Failure::Read)?;
+    let [row] = rows.as_slice() else {
+        return Err(Failure::Incomplete);
+    };
+    let probe = row
+        .try_get::<&str>("probe")
+        .map_err(|_| Failure::Incomplete)?
+        .ok_or(Failure::Incomplete)?;
+    Ok(probe == token)
+}
+
+/// Where a capture's statements run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// Its own `REPEATABLE READ READ ONLY` transaction.
+    Owned,
+    /// The caller's `READ COMMITTED` transaction, under a read-only savepoint.
+    CallersTransaction,
 }
 
 type Witnesses = BTreeMap<String, BTreeSet<String>>;
@@ -155,6 +242,7 @@ async fn identify(
 
 async fn within(
     conn: &mut impl QueryConnection,
+    framing: Framing,
     dropped: &BTreeSet<super::DroppedSignature>,
     qualify: impl FnOnce(&Catalog, u32) -> Result<Selection, Failure>,
 ) -> Result<(Read, Witnesses, super::session::Observation), Failure> {
@@ -166,10 +254,16 @@ async fn within(
     let [row] = settings.as_slice() else {
         return Err(Failure::Incomplete);
     };
+    let isolation = match framing {
+        Framing::Owned => "repeatable read",
+        // Each statement sees every commit before it, which the witness
+        // bracket depends on.
+        Framing::CallersTransaction => "read committed",
+    };
     if row
         .try_get::<&str>("isolation")
         .map_err(|_| Failure::Incomplete)?
-        != Some("repeatable read")
+        != Some(isolation)
         || row
             .try_get::<&str>("read_only")
             .map_err(|_| Failure::Incomplete)?
@@ -285,26 +379,7 @@ async fn fresh_witnesses(
         conn.query(&crate::catalog::capture_path())
             .await
             .map_err(|_| Failure::Read)?;
-        let mut witnesses = empty_witnesses();
-        let mut markers = BTreeSet::new();
-        let sql = queries::witness(major).map_err(|_| Failure::Incomplete)?;
-        cursor::read(conn, &sql, |row| {
-            let class = text(&row, "part")?.ok_or(Failure::Incomplete)?;
-            if !witnesses.contains_key(class) {
-                return Err(Failure::Incomplete);
-            }
-            match text(&row, "witness")? {
-                Some(value) => add_witness(&mut witnesses, class, Some(value))?,
-                None if markers.insert(class.to_owned()) => (),
-                None => return Err(Failure::Incomplete),
-            }
-            Ok(())
-        })
-        .await?;
-        if markers.len() != witnesses.len() {
-            return Err(Failure::Incomplete);
-        }
-        Ok(witnesses)
+        witness_read(conn, major).await
     }
     .await;
     let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
@@ -313,6 +388,30 @@ async fn fresh_witnesses(
         return Err(Failure::Close);
     }
     result
+}
+
+/// Every class's witnesses, in one cursor statement and so one snapshot.
+async fn witness_read(conn: &mut impl QueryConnection, major: u32) -> Result<Witnesses, Failure> {
+    let mut witnesses = empty_witnesses();
+    let mut markers = BTreeSet::new();
+    let sql = queries::witness(major).map_err(|_| Failure::Incomplete)?;
+    cursor::read(conn, &sql, |row| {
+        let class = text(&row, "part")?.ok_or(Failure::Incomplete)?;
+        if !witnesses.contains_key(class) {
+            return Err(Failure::Incomplete);
+        }
+        match text(&row, "witness")? {
+            Some(value) => add_witness(&mut witnesses, class, Some(value))?,
+            None if markers.insert(class.to_owned()) => (),
+            None => return Err(Failure::Incomplete),
+        }
+        Ok(())
+    })
+    .await?;
+    if markers.len() != witnesses.len() {
+        return Err(Failure::Incomplete);
+    }
+    Ok(witnesses)
 }
 
 #[cfg(test)]
@@ -416,6 +515,120 @@ mod tests {
             admin.execute(&format!("DROP ROLE {role}")).await.unwrap();
             result.expect("owned capture fixture failed after cleanup");
         }
+    }
+
+    /// The capture inside a caller's transaction (#616): a change another
+    /// session commits between its first catalog read and its last, kept or
+    /// undone, refuses; with none it reads, and leaves the caller's
+    /// transaction and session as they were. A caller transaction of another
+    /// isolation is not read in.
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn the_capture_in_a_callers_transaction_refuses_a_commit_between_its_reads() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+            let name = format!(
+                "pbps_caller616_{}",
+                crate::catalog::probe_token().replace('-', "_")
+            );
+            let mut admin = Conn::connect(Driver::Postgres, &base).await.unwrap();
+            admin
+                .execute(&format!("CREATE DATABASE {name}"))
+                .await
+                .unwrap();
+            let connection = format!("{base} dbname={name}");
+            let result = tokio::spawn(exercise_callers_transaction(connection)).await;
+            admin
+                .execute(&format!("DROP DATABASE {name} WITH (FORCE)"))
+                .await
+                .unwrap();
+            result.expect("caller-transaction capture fixture failed after cleanup");
+        }
+    }
+
+    async fn exercise_callers_transaction(connection: String) {
+        let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        conn.execute("CREATE SCHEMA app; CREATE TABLE app.a(id integer); SET search_path=app; SET timezone='Pacific/Honolulu'").await.unwrap();
+        let begin = "BEGIN ISOLATION LEVEL READ COMMITTED";
+        // The transaction's own uncommitted table is read; nothing else
+        // happened, so the capture reads.
+        conn.execute(begin).await.unwrap();
+        conn.execute("CREATE TABLE app.own(id integer)")
+            .await
+            .unwrap();
+        let read = in_callers_transaction(&mut conn, &BTreeSet::new(), fixture_selection)
+            .await
+            .unwrap();
+        assert!(
+            read.catalog.rows["pg_class"]
+                .iter()
+                .any(|row| { logical::string(row, "relname") == Ok("own") })
+        );
+        // The caller's settings and its writable transaction are its own
+        // again.
+        let rows = conn.query("SELECT current_setting('search_path') AS path, current_setting('timezone') AS zone, current_setting('transaction_read_only') AS ro").await.unwrap();
+        assert_eq!(rows[0].try_get::<&str>("path").unwrap(), Some("app"));
+        assert_eq!(
+            rows[0].try_get::<&str>("zone").unwrap(),
+            Some("Pacific/Honolulu")
+        );
+        assert_eq!(rows[0].try_get::<&str>("ro").unwrap(), Some("off"));
+        conn.execute("CREATE TABLE app.after(id integer)")
+            .await
+            .unwrap();
+        // Committed by another session between the first read and the last.
+        let changed = in_callers_transaction(&mut conn, &BTreeSet::new(), |catalog, major| {
+            writer(connection.clone(), "ALTER TABLE app.a RENAME TO changed")?;
+            fixture_selection(catalog, major)
+        })
+        .await;
+        assert!(
+            matches!(changed, Err(Failure::Changed)),
+            "a commit between the reads was accepted"
+        );
+        // And undone before the last read: the tuple versions still differ.
+        let aba = in_callers_transaction(&mut conn, &BTreeSet::new(), |catalog, major| {
+            writer(connection.clone(), "ALTER TABLE app.changed RENAME TO a")?;
+            writer(connection.clone(), "ALTER TABLE app.a RENAME TO changed")?;
+            fixture_selection(catalog, major)
+        })
+        .await;
+        assert!(
+            matches!(aba, Err(Failure::Changed)),
+            "change-and-restore escaped the witnesses"
+        );
+        // After the rendering and the lookups, before the last read: only
+        // the last read's witnesses can see it.
+        let late = bracketed(&mut conn, &BTreeSet::new(), fixture_selection, || {
+            writer(connection.clone(), "ALTER TABLE app.changed RENAME TO a")
+        })
+        .await;
+        assert!(
+            matches!(late, Err(Failure::Changed)),
+            "a commit after the lookups was accepted"
+        );
+        // Negative: the same bracket with nothing committed reads.
+        bracketed(&mut conn, &BTreeSet::new(), fixture_selection, || Ok(()))
+            .await
+            .unwrap();
+        // The caller's transaction survives a refused capture.
+        let rows = conn.query("SELECT count(*)::text AS n FROM pg_catalog.pg_class WHERE relname IN ('own', 'after')").await.unwrap();
+        assert_eq!(rows[0].try_get::<&str>("n").unwrap(), Some("2"));
+        conn.execute("ROLLBACK").await.unwrap();
+        // Under another isolation the bracket does not hold: refused.
+        conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+            .await
+            .unwrap();
+        let repeatable =
+            in_callers_transaction(&mut conn, &BTreeSet::new(), fixture_selection).await;
+        assert!(
+            matches!(repeatable, Err(Failure::Incomplete)),
+            "a repeatable-read caller was read in"
+        );
+        conn.execute("ROLLBACK").await.unwrap();
+        // And outside any transaction there is none to read in.
+        let outside = in_callers_transaction(&mut conn, &BTreeSet::new(), fixture_selection).await;
+        assert!(matches!(outside, Err(Failure::NoTransaction)));
     }
 
     async fn exercise_owned_capture(connection: String, fixture_role: String) {

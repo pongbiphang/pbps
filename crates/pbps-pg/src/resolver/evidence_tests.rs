@@ -32,6 +32,10 @@ fn evidence() -> ResolverEvidence {
             channels: "08".repeat(32),
             target_cluster: "09".repeat(32),
             limitations: Default::default(),
+            target_scope: pbps_model::resolver::TargetScope {
+                schemas: vec!["app".into()],
+                write_path_extras: vec![],
+            },
             runtime: ResolverRuntime::Scratch {
                 entry: "scratch".into(),
                 scratch: ScratchSource::Server {},

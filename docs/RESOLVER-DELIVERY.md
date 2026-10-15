@@ -2,7 +2,7 @@
 
 Tracking parent: [#595](https://github.com/pongbiphang/pbps/issues/595).
 The requirements are [ADR-0016](ADR-0016-engine-assisted-planning.md) and
-[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered).
+[SPEC §9.3.2–9.3.3](SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered).
 This plan divides their implementation without reducing the acceptance bar.
 The parent stays open until both engine adapters are delivered. Each bounded
 child follows the repository's full local verification, review and CI gates.
@@ -14,14 +14,12 @@ profiles (#608, #609) were removed by #1636, and the confidential source
 transfer (#617) is closed. #615 is delivered for PostgreSQL planning by
 #1514–#1517: the resolver's plan is published after the fresh
 pre-publication recheck, from the sealed order (DEC-1516.1), and `explain`
-shows its evidence offline (DEC-1517.1). The remaining order:
-1. [#1778](https://github.com/pongbiphang/pbps/issues/1778): the externals file
-   draft command, `pbps resolver externals` (DEC-1778.1), after
-   [#2007](https://github.com/pongbiphang/pbps/issues/2007) renamed the file
-   from `baseline`; automatic fill after #1956;
-2. [#616](https://github.com/pongbiphang/pbps/issues/616): apply under the
-   deployment lock, with #618's approval-consumer checks;
-3. SQL Server: [#619](https://github.com/pongbiphang/pbps/issues/619),
+shows its evidence offline (DEC-1517.1). #616 applies it in one transaction
+(DEC-616.1, below). The remaining order:
+1. [#1778](https://github.com/pongbiphang/pbps/issues/1778): automatic fill of
+   the externals file after #1956; its draft command, `pbps resolver
+   externals` (DEC-1778.1), is delivered;
+2. SQL Server: [#619](https://github.com/pongbiphang/pbps/issues/619),
    then [#620](https://github.com/pongbiphang/pbps/issues/620), then
    [#621](https://github.com/pongbiphang/pbps/issues/621).
 
@@ -163,7 +161,7 @@ delivered, #608's and #609's profiles were removed by #1636, and #617 and
 | 10a | [#1273](https://github.com/pongbiphang/pbps/issues/1273) | share scratch analysis lifecycle across supplied-server and run-owned container controls |
 | 10b | [#1274](https://github.com/pongbiphang/pbps/issues/1274) | construct qualified resolver evidence for the shared analysis run |
 | 10 | [#615](https://github.com/pongbiphang/pbps/issues/615) | integrate lazy target planning and pre-publication verification: delivered for PostgreSQL by #1514–#1517 |
-| 11 | [#616](https://github.com/pongbiphang/pbps/issues/616) | verify sealed prerequisites and closing bindings during apply |
+| 11 | [#616](https://github.com/pongbiphang/pbps/issues/616) | verify sealed prerequisites and closing bindings during apply: delivered for PostgreSQL |
 | 12 | [#617](https://github.com/pongbiphang/pbps/issues/617) | closed: the baseline replaces a source transfer (#1673) |
 | 13 | [#618](https://github.com/pongbiphang/pbps/issues/618) | closed: its checks go to #616 and #621 |
 | 14 | [#619](https://github.com/pongbiphang/pbps/issues/619) | design creation binding coverage and catalog consistency |
@@ -273,5 +271,18 @@ needs the resolver; and a retained external object of any candidate class
 that the externals file does not stage, named with the declaration that could bind
 it, whether or not the entry has an externals file.
 
-SPEC §9.3.2 is delivered for PostgreSQL planning only. Applying a resolved
-plan is #616, and this build refuses it before any DDL.
+## PostgreSQL resolved apply (#616)
+
+`apply --plan` applies a resolved plan with the ordinary approval command,
+through the target connection alone: no resolver runs, and no scratch or
+Docker socket is reached, so it has no platform limitation of its own
+(DEC-616.1). The key is checked before connecting, the cluster before the
+deployment lock, and under the lock the target's facts, the deployer's
+authorization and the opening manifest are captured in the apply's own
+`READ COMMITTED` transaction before its first statement; after its last
+statement the closing manifest, sealed from the approved changes, is
+captured and compared before recording (SPEC §7.6). Each capture brackets
+its signature lookups between a one-statement manifest read and a
+one-statement witness read, the form the step 6 experiment on #616 chose.
+`explain` offers the ordinary approval command. A staged resolved plan is
+refused by name (#620).

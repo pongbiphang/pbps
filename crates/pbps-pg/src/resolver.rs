@@ -106,6 +106,52 @@ pub async fn scope_facts(
     Ok(facts)
 }
 
+/// [`scope_facts`] inside the caller's open transaction: apply's checks
+/// before its first statement and after its last, which must see that
+/// transaction's own DDL and grants (#616). Refused outside a transaction,
+/// where [`scope_facts`] is the read.
+///
+/// Its statements read the commits before each, not one snapshot. Every
+/// fact is compared with the one the plan sealed, so a change that lasts
+/// is found at the read that follows it; one made and undone between two
+/// statements leaves nothing the plan's statements or the closing read
+/// can tell from no change (SPEC 7.6).
+///
+/// Under a read-only savepoint, rolled back on every path, so whatever the
+/// readers set for themselves goes with it (DECISIONS 418).
+pub async fn scope_facts_in_transaction(
+    conn: &mut impl QueryConnection,
+    scope: &environment::Scope<'_>,
+    authorization_schemas: &[String],
+) -> Result<(CatalogFacts, authorization::AuthorizationContext), DbError> {
+    let token = crate::catalog::probe_token();
+    conn.query(&crate::catalog::probe_set(&token)).await?;
+    let probed = conn.query(crate::catalog::PROBE_READ).await?;
+    match probed.as_slice() {
+        [row] if row.try_get::<&str>("probe")? == Some(token.as_str()) => {}
+        _ => {
+            return Err(DbError::BadRow(
+                "the apply connection has no transaction open; its checks read inside it".into(),
+            ));
+        }
+    }
+    conn.query("SAVEPOINT pbps_scope").await?;
+    let outcome = async {
+        conn.query("SET LOCAL transaction_read_only = on").await?;
+        let authorization = authorization::read(conn, authorization_schemas).await?;
+        let catalog = environment::read(conn, scope).await?;
+        Ok::<_, DbError>((catalog, authorization))
+    }
+    .await;
+    let unwound = match conn.query("ROLLBACK TO SAVEPOINT pbps_scope").await {
+        Ok(_) => conn.query("RELEASE SAVEPOINT pbps_scope").await,
+        Err(error) => Err(error),
+    };
+    let facts = outcome?;
+    unwound?;
+    Ok(facts)
+}
+
 /// Creates only this run's own resources. `CREATE DATABASE` cannot run inside
 /// a transaction block, so each statement is separate and the caller removes
 /// whatever was created when a later one fails.

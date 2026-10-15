@@ -505,6 +505,11 @@ impl SavedPlan {
                 PlanOrigin::ResolvedDatabase,
                 PlanMode::Transactional,
             ) => evidence.validate(&self.changes),
+            // Evidence describes one transaction, which a staged run is not;
+            // named, since the remedy is the mode (#616).
+            (PlanAnalysis::Resolved(_), PlanOrigin::ResolvedDatabase, PlanMode::Staged) => {
+                Err(EvidenceError::Staged)
+            }
             _ => Err(EvidenceError::Incomplete),
         }
     }

@@ -105,6 +105,20 @@ pub struct Qualification {
     /// refusing them, such as a differing build string (DEC-1672.1): each
     /// name, with what it means (#1700).
     pub limitations: BTreeMap<String, String>,
+    /// What the target facts above answer, for apply to ask again (#616).
+    pub target_scope: TargetScope,
+}
+
+/// The read the target's facts were sealed from: the schemas the plan
+/// reads and writes, and the extras its write path appends after each.
+/// Apply asks the same question; another one would fingerprint other facts
+/// and refuse an unchanged target (#616). Schema names only, which the
+/// plan's changes name anyway.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetScope {
+    pub schemas: Vec<String>,
+    pub write_path_extras: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -130,7 +144,7 @@ pub enum BindingCoverage {
 /// cluster identity and the accepted limitations to the qualification
 /// (#1516, #1700); 4, the resolver entry and scratch layout to the runtime
 /// (#1517).
-pub const EVIDENCE_VERSION: u32 = 4;
+pub const EVIDENCE_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,6 +179,12 @@ pub enum EvidenceError {
     Rule(String),
     #[error("resolver evidence omits or contradicts a required binding or authorization condition")]
     Incomplete,
+    /// Its checks run in the one transaction the evidence describes, which
+    /// a staged plan does not have (#616).
+    #[error(
+        "resolver evidence describes one transaction, and this plan is staged; plan without --staged"
+    )]
+    Staged,
     #[error("resolver evidence does not derive its closing manifest from the approved changes")]
     Projection,
     #[error(transparent)]
@@ -219,6 +239,9 @@ impl ResolverEvidence {
     }
     pub fn authorization(&self) -> &AuthorizationCondition {
         &self.authorization
+    }
+    pub fn transitions(&self) -> &[ObjectTransition] {
+        &self.transitions
     }
     pub fn ordering(&self) -> &OrderingProof {
         &self.ordering
@@ -631,6 +654,10 @@ mod tests {
                 channels: "05".repeat(32),
                 target_cluster: "06".repeat(32),
                 limitations: Default::default(),
+                target_scope: TargetScope {
+                    schemas: vec!["app".into()],
+                    write_path_extras: vec![],
+                },
                 runtime: ResolverRuntime::Scratch {
                     entry: "scratch".into(),
                     scratch: ScratchSource::Server {},

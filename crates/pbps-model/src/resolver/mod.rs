@@ -22,8 +22,11 @@ pub use ownership::ObjectOwnership;
 mod projection;
 pub use projection::ObjectTransition;
 
+mod recheck;
+
 mod evidence;
 pub use evidence::{
     AuthorizationCondition, BindingCoverage, EvidenceError, EvidenceHandling, OutsideWrites,
     PlanAnalysis, Qualification, ResolverEvidence, ResolverRuntime, ScratchLayout, ScratchSource,
+    TargetScope,
 };

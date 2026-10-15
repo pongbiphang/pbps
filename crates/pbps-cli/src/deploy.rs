@@ -6818,9 +6818,6 @@ fn apply_identified(
         );
     }
     crate::validate_saved_plan(plan, dialect)?;
-    if let Some(limitation) = crate::engine::resolver_apply_limitation(plan) {
-        bail!(limitation);
-    }
 
     // The mode lives in the file because that is what the gate approved; the
     // flag exists so that the CI configuration says out loud which kind of
@@ -6884,6 +6881,13 @@ fn apply_identified(
     }
     let names = pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?;
     let targets = crate::engine::rename_targets(target.driver(), &names);
+    // A resolved plan's key, before anything connects: evidence sealed under
+    // another key, or none, is no evidence here (#616, DEC-952.1).
+    let keyed = pbps_cli::resolver::apply::Keyed::check(
+        plan,
+        pbps_cli::resolver::sealing::environment_key(project, target.environment()),
+        &target.label,
+    )?;
     let deployment = Deployment {
         project,
         target,
@@ -6902,6 +6906,12 @@ fn apply_identified(
         // lock. Check before any writes, including staged resumes.
         crate::engine::permission_support(&mut conn, &plan.changes).await?;
         crate::engine::generation_support(&mut conn, &plan.changes, &plan.ids).await?;
+        // A resolved plan's cluster, constant for the connection like the
+        // checks above: the evidence describes one cluster (#616, DEC-1685.1).
+        let resolved = match &keyed {
+            Some(keyed) => Some(keyed.open(&mut conn).await?),
+            None => None,
+        };
 
         // The lock comes first, before the checks and not after them: a
         // pre-flight that passed while another pipeline was mid-apply would
@@ -6912,7 +6922,7 @@ fn apply_identified(
                 .await
                 .map(Some)
         } else {
-            apply_under_lock(&mut conn, &deployment).await
+            apply_under_lock(&mut conn, &deployment, resolved.as_ref()).await
         };
         if let Err(error) = &result {
             record_failed_apply(&mut conn, &deployment, error).await;
@@ -7027,7 +7037,13 @@ struct Deployment<'a> {
 }
 
 /// Everything between taking the lock and releasing it. Returns the ledger id.
-async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result<Option<i64>> {
+/// `resolved` holds a resolved plan's checks, its key and cluster already
+/// passed (#616).
+async fn apply_under_lock(
+    conn: &mut Conn,
+    d: &Deployment<'_>,
+    resolved: Option<&pbps_cli::resolver::apply::Guard<'_>>,
+) -> anyhow::Result<Option<i64>> {
     // Destructured straight back into the names the body below already uses:
     // every field is a shared reference, so this copies nothing.
     let Deployment {
@@ -7186,6 +7202,12 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
             crate::pins::Check::BeforeStatements,
         )
         .await?;
+        // Last before the first statement, inside the transaction and under
+        // the lock: the target is still the one the evidence was sealed
+        // against (#616).
+        if let Some(resolved) = resolved {
+            resolved.before_statements(conn).await?;
+        }
         execute_statements(conn, statements, &data_guard).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
         crate::engine::refuse_unsafe_definers(
@@ -7291,6 +7313,13 @@ async fn apply_under_lock(conn: &mut Conn, d: &Deployment<'_>) -> anyhow::Result
         .map_err(|e| {
             anyhow::anyhow!("{e:#}\n\nNothing has been applied — the transaction was rolled back.")
         })?;
+        // And the closing bindings, after the managed read-back has held the
+        // plan's own records to what it said (DEC-1274.1, #616).
+        if let Some(resolved) = resolved {
+            resolved
+                .before_recording(conn, &after.schema, &plan.ids)
+                .await?;
+        }
         let mut snapshot = pbps_model::StateSnapshot::new(
             pbps_model::StateKind::Apply,
             after.schema,

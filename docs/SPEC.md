@@ -4,7 +4,7 @@
 > Language: Rust
 > Position: declarative database schema version control and deployment
 > Supported dialects: SQL Server and PostgreSQL
-> Partially delivered: engine-assisted planning — PostgreSQL planning with the resolver, its sealed evidence and its offline `explain` are built; resolver-backed apply (#616) and SQL Server (#619–#621) are planned (§9.3.2; ADR-0016)
+> Partially delivered: engine-assisted planning — PostgreSQL planning with the resolver, its sealed evidence, its offline `explain` and its transactional apply (#616) are built; staged resolved apply and SQL Server (#619–#621) are planned (§9.3.2; ADR-0016)
 > Partially delivered: resolver environment discovery — read-only `doctor` discovery, resolver selection, the Docker and server scratch runs and compatibility qualification are built; the remaining stages are planned (§9.3.3; [delivery tracking](RESOLVER-DELIVERY.md))
 
 ---
@@ -1273,17 +1273,46 @@ section, not a defect; it is answered by pointing here.
 
 See DECISIONS 150, 153, 159, 161, 166, 173, 181–190.
 
-**Planned binding-evidence guard (§9.3.2):** a resolver-backed transactional
-plan additionally checks its recorded target prerequisites under the deployment
-lock before DDL, then rechecks its complete prerequisite manifest together with
-covered result bindings before committing and recording success. Closing
-prerequisites match the expected post-apply state sealed during planning,
-including legitimate changes from the approved plan; an unchanged old binding
-cannot excuse a failed prerequisite. A mismatch or unreadable required input
-rolls back the apply. This checks logical result bindings and versioned
-resolution-input fingerprints, not general managed-expression wording, and adds
-neither staged guarantees nor protection against arbitrary external writes after
-the last observation. Plans without resolver evidence retain the existing guard.
+**Binding-evidence guard (§9.3.2, #616, DEC-616.1):** a resolver-backed
+transactional plan is checked against the target its evidence was sealed
+against, by the ordinary `apply --plan` command and the target connection
+alone; no resolver, scratch or Docker socket is reached.
+
+- **Before connecting:** the environment's fingerprint key is the sealed one.
+  A different key names both identifiers; no key names the sealed one. Both
+  say to plan again. An evidence version this build does not read is refused,
+  and a runtime it does not run is refused by name.
+- **Before the lock:** the session reaches the cluster the evidence names. A
+  refusal here writes nothing.
+- **Under the lock, before the first statement**, after the locks the
+  statements' routines and schemas take: the target's reported facts, the
+  deployer's authorization and the complete opening manifest are captured in
+  the apply's own `READ COMMITTED` transaction and must equal the sealed ones
+  — every candidate's properties and membership, the runtime-bound routines,
+  each signature lookup's answer, and the built-in objects the plan's new
+  objects will reach, such as a first `gin` index's operator class.
+- **After the last statement, before recording:** the closing capture, which
+  sees the transaction's own objects, must match the closing manifest sealed
+  from the approved typed changes. An untouched record keeps its properties
+  and bindings; a record the plan installs has its sealed bindings; a record
+  the seal lacks must be owned by a change of the plan — its surface, a part
+  of the same table, or a record the change carries as a reference, such as
+  another table's foreign key a rename rewrites — so an engine-chosen name
+  (a key's, a sequence's) may differ from the scratch's; candidate membership and lookups move only
+  by what the plan installs. The facts and authorization are compared again.
+
+A mismatch or unreadable required input refuses: before the first statement
+nothing runs, after it the transaction rolls back. Either way no state is
+recorded; a refusal under the lock adds the failed attempt to the ledger's
+audit trail, as every failure there does. The ledger's latest entry is not
+compared: the ordinary drift check holds the recorded state. Each capture
+brackets its per-statement lookups between two catalog reads and refuses if
+any tuple version moved between them (DEC-616.1). This checks logical result
+bindings and versioned resolution-input fingerprints, not general
+managed-expression wording, and adds neither staged guarantees nor protection
+against arbitrary external writes after the last observation. A staged
+resolved plan is refused (#620). Plans without resolver evidence retain the
+existing guard.
 
 **External-routine pins (DEC-319.1):** every PostgreSQL plan also
 pins, under the environment's fingerprint key, every unmanaged routine not
@@ -1647,12 +1676,13 @@ Three stances govern this preview rehearsal:
   rather than pretending otherwise (see [ADR-0003](ADR-0003-execution-strategy.md)
   on edition-dependent risk).
 
-#### 9.3.2 Engine-assisted planning (PostgreSQL planning delivered)
+#### 9.3.2 Engine-assisted planning (PostgreSQL planning and apply delivered)
 
-Delivered for PostgreSQL planning only (#1514–#1517): `plan` publishes the
-resolver's sealed plan, and `explain` shows its evidence offline. Applying
-such a plan is #616: until then `apply` refuses it, and `explain` says so.
-SQL Server resolution is refused by name until #619 and #620.
+Delivered for PostgreSQL (#1514–#1517, #616): `plan` publishes the resolver's
+sealed plan, `explain` shows its evidence offline, and `apply --plan` applies
+it in one transaction under the guard in §7.6. A staged resolved plan is
+refused until #620. SQL Server resolution is refused by name until #619 and
+#620.
 
 The new **resolver** answers a different question from preview rehearsal:
 whether desired declarations bind differently from the objects already on the
@@ -2195,8 +2225,9 @@ facts it seals by name (never a fingerprint's value), the limitations it
 accepted, each surface's verdict (created, rebuilt, unaffected or removed,
 as its sealed sides say), every order edge with its reason, and the
 prerequisites by identity and fingerprint presence. The JSON lists each
-prerequisite; the human output counts them by catalog class. The first resolver-backed apply path is transactional
-only, with the additional guard in §7.6; staged restrictions remain unchanged.
+prerequisite; the human output counts them by catalog class. The
+resolver-backed apply path is transactional only, with the additional guard
+in §7.6; a staged resolved plan is refused (#620).
 
 The evidence manifest pins every required external resolution input, not only
 routine/view source: include versioned canonical fingerprints of relevant
@@ -2242,8 +2273,9 @@ The key is configured per environment, never shared and never defaulted:
 - It is base64 of at least 32 bytes. `pbps key generate` makes one, and
   `pbps doctor` checks it and shows its key identifier.
 - A plan records the identifier (derived from the key, never the key) beside the
-  fingerprints it seals (#614). `apply` under a different key refuses with a
-  replan remedy (#616). Resolver planning without a key refuses.
+  fingerprints it seals (#614). `apply` under a different key, or with none,
+  refuses before connecting, naming the sealed identifier, with a replan
+  remedy (#616). Resolver planning without a key refuses.
 
 pbps generates and checks keys; it does not store, share or rotate them, so this
 is no key-management service (ADR-0016 decision 5, as amended). A leaked key
@@ -2631,7 +2663,7 @@ It answers, from the file alone:
 
 | Question | From |
 |---|---|
-| Is this applyable at all? | `origin` and this build's execution support — a preview says so in its own terms (7.3); a database-derived artifact with unsupported apply reports that limitation |
+| Is this applyable at all? | `origin` — a preview says so in its own terms (7.3) |
 | What does it change? | the typed ChangeSet, grouped by table |
 | Why does it need approval? | each risk class present, **with what can go wrong**, and the changes that carry it |
 | How will it run? | `mode`: one transaction all-or-nothing, or staged (ADR-0003) |
@@ -2640,12 +2672,10 @@ It answers, from the file alone:
 | What am I approving? | the plan checksum `apply` will recompute and require to match the explicit `--checksum` supplied by the deployment gate |
 
 A resolver plan's fingerprints are keyed (§9.3.2), so its checksum is shown as
-any plan's. Its approval command is offered only when this build implements its
-guarded apply path. Otherwise `explain` describes the execution limitation,
-without relabeling the database-derived artifact as a preview or recommending
-the preview's replanning remedy. JSON reports `applyable: false`, an
-`apply_limitation`, and an empty `approve_with`; ordinary database approval and
-offline preview remedies keep their existing meaning.
+any plan's, and its approval command is the ordinary one: `apply` checks its
+evidence itself (§7.6, #616). Resolver evidence describes one transaction,
+so a staged plan carrying it is refused by its reader, `explain` and `apply`
+alike, with the remedy to plan without `--staged` (#620).
 
 A target is **optional**: `--db` / `--env` adds the one question no file can
 answer — whether that environment is mid-deployment on a staged checkpoint. It

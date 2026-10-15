@@ -162,6 +162,10 @@ pub(super) fn seal(
             identity.target_cluster.as_bytes(),
         ),
         limitations: identity.limitations,
+        target_scope: pbps_model::resolver::TargetScope {
+            schemas: schemas.clone(),
+            write_path_extras: write_path_extras.clone(),
+        },
     };
     let evidence = ResolverEvidence::new(
         &changes,

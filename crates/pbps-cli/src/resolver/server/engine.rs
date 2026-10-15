@@ -177,6 +177,7 @@ pub(super) fn catalog_read_failed(error: pbps_db::resolver::capture::CaptureErro
             Error::Binding(error.to_string())
         }
         CaptureError::CallerTransaction
+        | CaptureError::NoTransaction
         | CaptureError::Read
         | CaptureError::Incomplete
         | CaptureError::Changed
@@ -214,6 +215,7 @@ mod tests {
     fn a_failed_catalog_read_is_a_read_failure_and_an_uncovered_input_a_verdict() {
         for read in [
             CaptureError::CallerTransaction,
+            CaptureError::NoTransaction,
             CaptureError::Read,
             CaptureError::Incomplete,
             CaptureError::Changed,

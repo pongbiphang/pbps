@@ -42,6 +42,25 @@ pub enum CandidateClass {
 }
 
 impl CandidateClass {
+    const ALL: [Self; 9] = [
+        Self::Relation,
+        Self::Routine,
+        Self::Type,
+        Self::Operator,
+        Self::Collation,
+        Self::OperatorClass,
+        Self::OperatorFamily,
+        Self::Cast,
+        Self::Extension,
+    ];
+
+    /// The class a sealed predicate names by its catalog.
+    fn of_catalog(catalog: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|class| class.catalog() == catalog)
+    }
+
     fn catalog(self) -> &'static str {
         match self {
             Self::Relation => "pg_class",
@@ -89,6 +108,9 @@ pub use ownership::RecordedOwnership;
 
 mod assess;
 pub use assess::{Managed, Paths, assess, managed_scope, scope};
+
+mod apply;
+pub use apply::{capture_closing, recheck_opening};
 
 mod staged;
 pub use pbps_db::resolver::capture::{Assessment, Verdict};

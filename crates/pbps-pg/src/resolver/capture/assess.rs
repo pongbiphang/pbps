@@ -352,14 +352,42 @@ fn derived(
 
 /// What to capture on each side: the managed objects of both and every
 /// candidate their scratch bindings depend on.
+///
+/// The built-in objects the desired managed objects reach on scratch are
+/// retained too: an index's operator class and access method, a column's
+/// type. A target the plan has not touched yet need not reach them, but the
+/// closing read after the plan does, so the opening seals the target's own
+/// records of them and the closing finds them sealed (#616). They are the
+/// engine's and present on every target; anything else reached outside the
+/// managed set is what the externals file stages, retained as staged.
 pub fn scope(desired: &CapturedInputs, managed: &[&Managed], paths: &Paths) -> CaptureScope {
     let mut candidates: BTreeSet<CandidateSet> = managed.iter().flat_map(|m| m.scope()).collect();
     for (object, input) in surfaces(desired) {
         candidates.extend(derived(object, input, paths, &desired.inputs).into_keys());
     }
+    let retained = desired
+        .inputs
+        .keys()
+        .filter(|object| built_in(object))
+        .cloned()
+        .collect();
     CaptureScope {
-        retained: BTreeSet::new(),
+        retained,
         candidates,
+    }
+}
+
+/// An object of the engine's own: in a system schema, a system schema
+/// itself, or one of the classes with no schema a new object reaches by
+/// reference — its access method, language or tablespace. Those exist
+/// before anything uses them, so a new routine's `sql` language is present
+/// even on a target whose captured routines are all `plpgsql`.
+fn built_in(object: &ObjectIdentity) -> bool {
+    match (object.class.as_str(), object.name.as_slice()) {
+        ("pg_am" | "pg_language" | "pg_tablespace", [_]) => true,
+        ("pg_namespace", [schema]) => is_system(schema),
+        (_, [schema, _]) => is_system(schema),
+        _ => false,
     }
 }
 
@@ -859,6 +887,37 @@ mod tests {
             &properties("postgres", "i"),
             &properties("postgres", "a")
         ));
+    }
+
+    /// What the opening retains beside the managed objects is the engine's
+    /// own: a system schema's object, or an access method (#616). A user
+    /// schema's object, or a part named under its relation, is not.
+    #[test]
+    fn only_the_engines_own_objects_are_retained_as_built_in() {
+        assert!(built_in(&id("pg_am", &["gin"], Vec::new())));
+        assert!(built_in(&id("pg_language", &["sql"], Vec::new())));
+        assert!(built_in(&id("pg_tablespace", &["pg_default"], Vec::new())));
+        assert!(built_in(&id("pg_namespace", &["pg_catalog"], Vec::new())));
+        // A schema the plan may create is not the engine's.
+        assert!(!built_in(&id("pg_namespace", &["app"], Vec::new())));
+        assert!(!built_in(&id("pg_extension", &["pg_trgm"], Vec::new())));
+        assert!(built_in(&id(
+            "pg_opclass",
+            &["pg_catalog", "jsonb_ops"],
+            vec![id("pg_am", &["gin"], Vec::new())]
+        )));
+        assert!(built_in(&id(
+            "pg_type",
+            &["information_schema", "sql_identifier"],
+            Vec::new()
+        )));
+        assert!(!built_in(&id("pg_proc", &["app", "f"], Vec::new())));
+        assert!(!built_in(&id("pg_class", &["public", "t"], Vec::new())));
+        assert!(!built_in(&id(
+            "column",
+            &["id"],
+            vec![id("pg_class", &["pg_catalog", "pg_class"], Vec::new())]
+        )));
     }
 
     /// A relation's name covers its row type and array type. An overload

@@ -1003,15 +1003,8 @@
       "type": "object",
       "properties": {
         "applyable": {
-          "description": "Database-derived and supported by this build's apply implementation.\nThis does not assert that the target or risk approval is ready.",
+          "description": "Database-derived, with or without resolver evidence (#616). This\ndoes not assert that the target or risk approval is ready.",
           "type": "boolean"
-        },
-        "apply_limitation": {
-          "description": "Why a database-derived artifact cannot be applied by this build.\nAn absent value does not turn an offline preview into an applyable plan.",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "dialect": {
           "type": "string"
@@ -1065,7 +1058,7 @@
           }
         },
         "approve_with": {
-          "description": "The exact command that approves this plan, `--allow` included — or, for\na preview, the command that produces an applyable plan instead. Which\none it is is [`Explanation::applyable`]. Empty when this build cannot\napply the artifact; [`Explanation::apply_limitation`] explains why.",
+          "description": "The exact command that approves this plan, `--allow` included — or, for\na preview, the command that produces an applyable plan instead. Which\none it is is [`Explanation::applyable`].",
           "type": "string"
         },
         "plan_path": {
@@ -2278,6 +2271,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 47,
+  "x-pbps-schema-version": 48,
   "x-pbps-tool-version": "0.0.0"
 }

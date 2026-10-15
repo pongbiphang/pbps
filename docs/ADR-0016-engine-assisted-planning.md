@@ -16,6 +16,10 @@
   containment (#608) and dedicated-server exclusivity (#609) built for them,
   are removed. The resolver is the only one, on every platform pbps
   supports. See "Amendment: the resolver" below.
+- Amended by #616 (DEC-616.1): a resolved PostgreSQL plan is applied in one
+  transaction by the ordinary `apply --plan`, which rechecks its evidence from
+  the target connection alone before the first statement and after the last.
+  A staged one is refused until #620.
 - Date: 2026-09-15
 - Related: [SPEC §9.3](SPEC.md#93-the-dev-database-optional), §7.3, §7.6,
   §8.2, §9.8 and §11.5; [ARCHITECTURE.md](ARCHITECTURE.md);
@@ -692,7 +696,7 @@ file-based and the final emitter remains the only source of deployment SQL.
 
 ## Amendment: the resolver (#1528, #1636)
 
-This amends decisions 4 and 5. [SPEC §9.3.2](SPEC.md#932-engine-assisted-planning-postgresql-planning-delivered)
+This amends decisions 4 and 5. [SPEC §9.3.2](SPEC.md#932-engine-assisted-planning-postgresql-planning-and-apply-delivered)
 carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
 
 - **One resolver.** The resolver environments designed above are the
@@ -996,7 +1000,9 @@ protection under test is removed.
     clean full restart after requalification and an unchanged run that succeeds.
     The negative control must fail when stability protection is removed, with
     no target writer or production lock required.
-22. **`closing_capture_rechecks_resolution_prerequisites` (planned):** after
+22. **`closing_capture_rechecks_resolution_prerequisites` (PostgreSQL:
+    delivered by #616 as
+    `a_resolved_plan_rolls_back_when_its_closing_check_finds_another_writer`):** after
     the pre-DDL check, commit an unmanaged candidate/property or authorization
     change through a second connection before the closing capture. Keep the
     dependent managed object untouched so its old binding still matches the
