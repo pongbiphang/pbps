@@ -537,25 +537,32 @@ pub(crate) fn check_staged(dir: &Path, dialect: &dyn Dialect) -> anyhow::Result<
 /// object to settle by hand. Leaving the table out would silently narrow the
 /// adoption to what the project's rules happen to like (DECISIONS 114).
 ///
-/// A `policies:` block that is itself invalid is not evaluated, as in
-/// `validate`, which reports it: the block's problem is not the files'.
+/// A `policies:` block that is itself invalid refuses the adoption, naming
+/// each problem as `validate` does, and evaluates nothing: it is not read as
+/// "no finding". `pull` refuses it earlier still, before it connects, so this
+/// is the guarantee of the function and not a second user-facing check (`init`
+/// writes the `pbps.yml` itself, which has no `policies:` block, so it cannot
+/// reach it); a caller added later gets the refusal rather than an empty list
+/// (DEC-1983.1).
+///
+/// The evaluation is [`crate::declaration_policy_findings`], the one function
+/// `validate` and `partitions extend` call, so a rule sees the same spelling of
+/// the types and the same context in all three (DEC-1983.1).
 pub(crate) fn refuse_policy_errors(
     project: &pbps_config::Project,
     loaded: &pbps_load::Loaded,
     dialect: &dyn Dialect,
-) -> anyhow::Result<Vec<pbps_model::Finding>> {
-    let policies = project.config.policies();
-    if !policies.check().is_empty() {
-        return Ok(Vec::new());
-    }
-    let spelled = crate::types_as_the_dialect_spells_them(&loaded.schema, dialect);
-    let (errors, rest): (Vec<_>, Vec<_>) = pbps_policy::declarations(
-        &spelled,
-        &policies,
-        &crate::policy_context(project, dialect, false),
+) -> anyhow::Result<Vec<crate::output::Finding>> {
+    crate::refuse_invalid_policies(project, "the declarations about to be written")?;
+    let (errors, rest): (Vec<_>, Vec<_>) = crate::declaration_policy_findings(
+        project,
+        dialect,
+        &loaded.schema,
+        None,
+        crate::unix_seconds(),
     )
     .into_iter()
-    .partition(|f| f.severity == pbps_model::Severity::Error);
+    .partition(|f| f.severity == crate::output::Severity::Error);
     if !errors.is_empty() {
         anyhow::bail!(
             "these declarations break a rule `pbps.yml` sets to `error`:\n  {}\n\
@@ -1018,7 +1025,7 @@ mod tests {
         let (_d, lenient) = project_with(&rule.replace("SEVERITY", "warning"));
         let found = refuse_policy_errors(&lenient, &loaded, pg().as_ref()).unwrap();
         assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].severity, pbps_model::Severity::Warning);
+        assert_eq!(found[0].severity, crate::output::Severity::Warning);
 
         // Excused by name, with a reason: the same pull goes through quietly.
         let excused = format!(
@@ -1036,5 +1043,63 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A `policies:` block that is itself invalid is not "no findings": the
+    /// rule it misses a pattern for cannot run, and nothing else in the block
+    /// is asked either, so the function that used to return an empty list
+    /// handed a bad name a clean bill (#1983). It refuses, naming each
+    /// problem as `policy.invalid`. The controls: a valid block with the rule
+    /// `off`, or only a warning, is not a problem.
+    #[test]
+    fn an_invalid_policies_block_is_refused_not_read_as_no_findings() {
+        let mut schema = Schema::default();
+        schema
+            .tables
+            .insert(TableName::new("app", "Bad"), table("integer", None));
+        let stage = Stage::new("adopt-policy-invalid").unwrap();
+        write_declarations(stage.path(), &schema, &Default::default()).unwrap();
+        let loaded = check_staged(stage.path(), pg().as_ref()).unwrap();
+        let project_with = |policies: &str| {
+            let dir = Stage::new("adopt-policy-invalid-project").unwrap();
+            let config = dir.path().join("pbps.yml");
+            std::fs::write(&config, format!("dialect: postgres\n{policies}")).unwrap();
+            let project = pbps_config::Project::load(&config).unwrap();
+            (dir, project)
+        };
+
+        // Two problems: a rule missing its pattern, and a misspelt rule id.
+        // The valid rule beside them, `column.no-deprecated-type`, is not run
+        // either; refusing is what says so.
+        let (_d, invalid) = project_with(
+            "policies:\n  rules:\n    naming.table: {severity: error}\n    \
+             naming.tabel: {severity: error, pattern: \"^x$\"}\n",
+        );
+        let e = refuse_policy_errors(&invalid, &loaded, pg().as_ref())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("2 problem(s)")
+                && e.contains("policy.invalid: ")
+                && e.contains("naming.table")
+                && e.contains("naming.tabel")
+                && e.contains("pbps validate")
+                && e.contains("nothing was written"),
+            "{e}"
+        );
+
+        // Not problems: the rule off, and the same rule as a warning with its
+        // pattern, which is returned for the caller to print.
+        let (_d, off) = project_with("policies:\n  rules:\n    naming.table: off\n");
+        assert!(
+            refuse_policy_errors(&off, &loaded, pg().as_ref())
+                .unwrap()
+                .is_empty()
+        );
+        let (_d, warn) = project_with(
+            "policies:\n  rules:\n    naming.table: {severity: warning, pattern: \"^[a-z]+$\"}\n",
+        );
+        let found = refuse_policy_errors(&warn, &loaded, pg().as_ref()).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 }

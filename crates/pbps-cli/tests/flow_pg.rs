@@ -4648,6 +4648,182 @@ fn pull_draws_the_line_the_projects_own_rules_draw() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
 }
 
+/// `naming.table` at `error` with no pattern: the rule cannot run, and
+/// `validate` names the block as `policy.invalid`.
+const POLICIES_NO_PATTERN: &str =
+    "dialect: postgres\npolicies:\n  rules:\n    naming.table: {severity: error}\n";
+
+/// Every file under the project's `schema/` and its identity file, by path,
+/// with its bytes: what a refused `pull` must leave exactly as it found it.
+fn declarations_and_ids(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir.join("schema"))
+        .unwrap()
+        .map(|e| {
+            let path = e.unwrap().path();
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read(&path).unwrap(),
+            )
+        })
+        .collect();
+    if let Ok(ids) = std::fs::read(dir.join("schema.ids.json")) {
+        out.push(("schema.ids.json".into(), ids));
+    }
+    out.sort();
+    out
+}
+
+/// Issue #1983. `pull` called the project's rules only when the `policies:`
+/// block was valid, and an invalid one made it evaluate nothing at all, not
+/// even the block's valid rules: it wrote declarations no rule was asked
+/// about while `validate` reported `policy.invalid`. It now refuses first,
+/// names each problem as `validate` does, and writes nothing, forced or not.
+/// Offline: the refusal comes before `pull` connects, so an unreachable
+/// database is never reached, and it comes before the overwrite guard, whose
+/// advice to re-run with `--force` would lead to the same refusal.
+#[test]
+fn pull_refuses_an_invalid_policies_block_before_it_connects_or_overwrites() {
+    let d = Demo::new("pull-policies-invalid-offline");
+    std::fs::write(d.dir.join("pbps.yml"), POLICIES_NO_PATTERN).unwrap();
+    // The premise: the project is one `validate` refuses, by this finding.
+    let v = d.run(&["validate", "--format", "json"]);
+    assert_ne!(code(&v), 0, "{}{}", stdout(&v), stderr(&v));
+    assert!(stdout(&v).contains("\"policy.invalid\""), "{}", stdout(&v));
+    // Nothing listens there: a pull that got as far as connecting would say so
+    // instead of naming the block.
+    let unreachable = "postgres://pbps@127.0.0.1:1/none";
+
+    let o = d.run(&["pull", "--db", unreachable]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let said = stderr(&o);
+    assert!(
+        said.contains("policy.invalid")
+            && said.contains("1 problem(s)")
+            && said.contains("naming.table")
+            && said.contains("nothing was written")
+            && said.contains("pbps validate")
+            && !said.to_lowercase().contains("cannot connect"),
+        "{said}"
+    );
+
+    // Over declarations already there, forced or not, the block is what is
+    // said, and every declaration is as it was. Unforced, the overwrite guard
+    // would otherwise answer first and send the user to `--force`.
+    d.table("table: app.t\ncolumns:\n  id: {type: integer}\n");
+    let before = declarations_and_ids(&d.dir);
+    for args in [
+        vec!["pull", "--db", unreachable],
+        vec!["pull", "--force", "--db", unreachable],
+    ] {
+        let o = d.run(&args);
+        assert_eq!(code(&o), 1, "{args:?}: {}{}", stdout(&o), stderr(&o));
+        let said = stderr(&o);
+        assert!(
+            said.contains("policy.invalid")
+                && !said.contains("already has declarations")
+                && !said.to_lowercase().contains("cannot connect"),
+            "{args:?}: {said}"
+        );
+        assert_eq!(declarations_and_ids(&d.dir), before, "{args:?}");
+    }
+}
+
+/// Issue #1983, against the engine. The same database pulled into the same
+/// project: refused with the block invalid, forced or not, and written once
+/// the block is valid, which the next `validate` accepts. The controls are the
+/// neighbours of a problem: a rule `off`, and a rule at `warning` with its
+/// pattern, are not problems and write.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn pull_refuses_an_invalid_policies_block_and_writes_once_it_is_valid() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "pull-policies-invalid");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; CREATE TABLE app.\"BadName\" (id integer PRIMARY KEY); \
+         CREATE TABLE app.good (id integer PRIMARY KEY)",
+    );
+    let rule = "{severity: error, pattern: \"^[a-z][a-z0-9_]*$\"}";
+
+    // Unforced into a fresh project: refused, nothing written.
+    let d = Demo::new("pull-policies-invalid");
+    std::fs::write(d.dir.join("pbps.yml"), POLICIES_NO_PATTERN).unwrap();
+    let o = d.run(&["pull", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let said = stderr(&o);
+    assert!(
+        said.contains("policy.invalid")
+            && said.contains("naming.table")
+            && said.contains("nothing was written")
+            && said.contains("pbps validate"),
+        "{said}"
+    );
+    assert!(
+        declarations_and_ids(&d.dir).is_empty(),
+        "a refused pull wrote a file"
+    );
+
+    // Forced over declarations of the project's own: refused, and they are
+    // exactly as they were.
+    d.table("table: app.t\ncolumns:\n  id: {type: integer}\n");
+    let before = declarations_and_ids(&d.dir);
+    let o = d.run(&["pull", "--force", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(stderr(&o).contains("policy.invalid"), "{}", stderr(&o));
+    assert_eq!(declarations_and_ids(&d.dir), before, "a forced pull wrote");
+
+    // The block repaired, the rule is asked: it is the block's own rule that
+    // now refuses the name, with no word of `policy.invalid`, which is what
+    // the invalid block had kept from being asked at all.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        format!("dialect: postgres\npolicies:\n  rules:\n    naming.table: {rule}\n"),
+    )
+    .unwrap();
+    let o = d.run(&["pull", "--force", "--db", &connection]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("naming.table") && stderr(&o).contains("app.BadName"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!stderr(&o).contains("policy.invalid"), "{}", stderr(&o));
+    assert_eq!(declarations_and_ids(&d.dir), before, "a refused pull wrote");
+
+    // The twins: valid blocks the same database is pulled under write, with
+    // the rule off and with the rule at `warning` and its pattern (reported,
+    // not refused), and the next `validate` accepts what they wrote.
+    for (name, block) in [
+        ("off", "naming.table: off".to_owned()),
+        (
+            "warning",
+            "naming.table: {severity: warning, pattern: \"^[a-z][a-z0-9_]*$\"}".to_owned(),
+        ),
+    ] {
+        let d = Demo::new(&format!("pull-policies-valid-{name}"));
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!("dialect: postgres\npolicies:\n  rules:\n    {block}\n"),
+        )
+        .unwrap();
+        let o = d.run(&["pull", "--db", &connection]);
+        assert_eq!(code(&o), 0, "{name}: {}{}", stdout(&o), stderr(&o));
+        assert!(
+            d.dir.join("schema/app.BadName.yml").is_file()
+                && d.dir.join("schema.ids.json").is_file(),
+            "{name}"
+        );
+        assert!(
+            !stderr(&o).contains("policy.invalid"),
+            "{name}: {}",
+            stderr(&o)
+        );
+        let o = d.run(&["validate"]);
+        assert_eq!(code(&o), 0, "{name}: {}{}", stdout(&o), stderr(&o));
+    }
+}
+
 /// Issue #921. `pull --data` validated the requested table before the
 /// omission filter ran, so a table `validate` refuses stopped the whole pull
 /// when its rows were asked for, and was merely left out when they were not.

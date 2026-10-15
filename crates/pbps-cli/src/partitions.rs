@@ -71,23 +71,7 @@ pub fn cmd_extend(
     // different answers (DEC-1942.1). Refused beside the declaration problems, for
     // the same reason, and before the no-op answer below, which would
     // otherwise say "nothing to add" for a project `validate` refuses.
-    let invalid: Vec<String> = project
-        .config
-        .policies()
-        .check()
-        .into_iter()
-        .map(|problem| format!("policy.invalid: {problem}"))
-        .collect();
-    if !invalid.is_empty() {
-        bail!(
-            "the `policies:` block in `{}` has {} problem(s), so the project's rules cannot be \
-             checked against the generated partitions; nothing was written. Fix them first \
-             (`pbps validate` lists them):\n{}",
-            project.config_file().display(),
-            invalid.len(),
-            list(invalid.iter().map(String::as_str))
-        );
-    }
+    crate::refuse_invalid_policies(project, "the generated partitions")?;
 
     if series.partitions.is_empty() {
         println!(

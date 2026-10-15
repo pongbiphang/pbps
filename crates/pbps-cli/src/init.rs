@@ -480,7 +480,7 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         // nothing today; it is here so that the adoption and `validate` draw
         // the same line whatever the default rules become (DEC-919.1).
         for f in crate::adopt::refuse_policy_errors(&project, &loaded, dialect.as_ref())? {
-            eprintln!("{}: {}", f.severity, f.message);
+            eprintln!("{}: {}", f.severity_word(), f.message);
         }
         if loaded.schema != prepared.schema {
             bail!("the staged declarations do not round-trip to the pulled schema");
