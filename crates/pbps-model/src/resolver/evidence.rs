@@ -155,8 +155,12 @@ pub enum EvidenceError {
     /// sealed under another one claims coverage this build does not give it
     /// (DEC-2012.1). The name is in the message because the remedy depends
     /// on it: a new plan, which seals the current identifier.
+    ///
+    /// The identifier is the file's own text, shown escaped: a hand-made plan
+    /// can put a line break or a terminal sequence in it (DEC-2032.1).
     #[error(
-        "resolver evidence was sealed under the qualification rule `{0}`, which this build does not read; plan again with this build to seal it under the current rule"
+        "resolver evidence was sealed under the qualification rule `{}`, which this build does not read; plan again with this build to seal it under the current rule",
+        crate::escape::Escaped(.0)
     )]
     Rule(String),
     #[error("resolver evidence omits or contradicts a required binding or authorization condition")]

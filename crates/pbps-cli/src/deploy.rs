@@ -6781,7 +6781,7 @@ fn apply_identified(
         bail!(
             "`{}` was computed for {} and this project is {}",
             plan_path.display(),
-            plan.dialect,
+            pbps_model::escape::Escaped(&plan.dialect),
             dialect.name()
         );
     }

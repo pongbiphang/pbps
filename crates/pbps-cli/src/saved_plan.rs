@@ -39,10 +39,24 @@ pub(crate) fn decode(raw: &str, path: &Path) -> anyhow::Result<SavedPlan> {
             if let Ok(header) = serde_json::from_str::<Header>(raw) {
                 require_current(header.version, path)?;
             }
-            Err(error).with_context(|| format!("`{}` is not a pbps plan", path.display()))
+            Err(anyhow::Error::new(Echoed(error.to_string())))
+                .with_context(|| format!("`{}` is not a pbps plan", path.display()))
         }
     }
 }
+
+/// The decoder's own sentence about a file it could not read.
+///
+/// serde repeats the text it stopped at — an unknown variant, an unknown field,
+/// a name a type refused — and that text is the file's. The sentence is one line
+/// by construction, so every control character in it came from the artifact and
+/// is shown escaped, like the other values a refusal takes from a plan
+/// (DEC-2032.1). Held as text rather than as `serde_json::Error` because
+/// nothing downcasts the cause, and the error's `Display` is the only thing
+/// printed.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", pbps_model::escape::EscapedSentence(.0))]
+struct Echoed(String);
 
 pub(crate) fn require_current(version: u32, path: &Path) -> anyhow::Result<()> {
     if version != pbps_model::plan::CURRENT_VERSION {

@@ -298,7 +298,7 @@ fn dialect_of(plan: &SavedPlan) -> anyhow::Result<(pbps_db::Driver, Box<dyn Dial
         serde_json::from_value(serde_json::Value::String(plan.dialect.clone())).map_err(|_| {
             anyhow::anyhow!(
                 "this plan was computed for `{}`, which this build cannot explain",
-                plan.dialect
+                pbps_model::escape::Escaped(&plan.dialect)
             )
         })?;
     Ok((db::driver_for(name), crate::dialect_for(name)))

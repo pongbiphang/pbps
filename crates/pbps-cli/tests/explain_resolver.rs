@@ -394,6 +394,144 @@ fn a_plan_sealed_under_the_previous_qualification_rule_is_refused_naming_it() {
     assert!(out.status.success(), "{out:?}");
 }
 
+/// Text a hand-made plan can put in a value that a refusal names: a line break
+/// that starts a line the tool never wrote, a terminal sequence, a carriage
+/// return that overwrites one, and a right-to-left override.
+const HOSTILE: &str = "x\n\u{1b}[31mred\r\u{202e}";
+/// What a refusal shows of [`HOSTILE`] (DEC-2032.1).
+const HOSTILE_SHOWN: &str = "x\\n\\u{1b}[31mred\\r\\u{202e}";
+
+/// A refusal is the one line `error: ...` and its own final newline: nothing
+/// the file held acts on the terminal, and the file's value is still in it.
+fn assert_inert(out: &Output, shown: &[&str], what: &str) {
+    assert_eq!(out.status.code(), Some(1), "{what}: {out:?}");
+    let error = String::from_utf8_lossy(&out.stderr);
+    let body = error.strip_suffix('\n').unwrap_or(&error);
+    assert!(
+        !body.chars().any(char::is_control),
+        "{what}: a raw control character in {error:?}"
+    );
+    assert!(body.starts_with("error: "), "{what}: {error:?}");
+    for fragment in shown {
+        assert!(
+            body.contains(fragment),
+            "{what}: {fragment:?} not in {error:?}"
+        );
+    }
+}
+
+/// `apply` on `plan.json` against a target that must never be contacted.
+fn apply_refused(artifact: &Artifact, checksum: &str) -> Output {
+    std::fs::write(artifact.0.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let connection = format!(
+        "postgres://unused@{}/unused?sslmode=disable",
+        target.local_addr().unwrap()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_pbps"))
+        .current_dir(&artifact.0)
+        .args([
+            "apply",
+            "--plan",
+            "plan.json",
+            "--db",
+            &connection,
+            "--checksum",
+            checksum,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        target.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    out
+}
+
+/// A refusal that names a value out of the plan file shows it escaped, so a
+/// hand-made plan cannot forge or hide terminal output in the flow that reads
+/// a handed-off artifact (DEC-2032.1, #2032). Each case is a different place
+/// a reader takes a string from the file into its own sentence.
+#[test]
+fn a_refusal_shows_the_files_values_escaped_and_never_raw() {
+    let resolved = serde_json::to_value(resolved_plan()).unwrap();
+    let mut ordinary_plan = resolved_plan();
+    ordinary_plan.origin = PlanOrigin::Database;
+    ordinary_plan.analysis = PlanAnalysis::Ordinary;
+    let ordinary = serde_json::to_value(&ordinary_plan).unwrap();
+    let with = |base: &serde_json::Value, pointer: &str| {
+        let mut value = base.clone();
+        *value.pointer_mut(pointer).unwrap() = serde_json::Value::String(HOSTILE.into());
+        value
+    };
+    let rule = format!("rule `{HOSTILE_SHOWN}`");
+    let engine = format!("evidence for {HOSTILE_SHOWN}");
+    let dialect = format!("computed for `{HOSTILE_SHOWN}`, which this build cannot explain");
+    let mismatch = format!("computed for {HOSTILE_SHOWN} and this project is postgres");
+    let variant = format!("unknown variant `{HOSTILE_SHOWN}`");
+    let cases: Vec<(&str, serde_json::Value, String, String)> = vec![
+        (
+            "the qualification rule",
+            with(&resolved, "/analysis/evidence/qualification/rule"),
+            rule.clone(),
+            rule,
+        ),
+        (
+            "the dialect of a resolved plan",
+            with(&resolved, "/dialect"),
+            engine,
+            mismatch.clone(),
+        ),
+        (
+            "the dialect of an ordinary plan",
+            with(&ordinary, "/dialect"),
+            dialect,
+            mismatch,
+        ),
+        (
+            "a variant the decoder does not know",
+            with(&ordinary, "/origin"),
+            variant.clone(),
+            variant,
+        ),
+    ];
+    for (what, value, explained, applied) in cases {
+        // The plan's own checksum where it can be read, so the checksum
+        // refusal cannot be what the apply below reports.
+        let checksum = serde_json::from_value::<SavedPlan>(value.clone())
+            .map(|p| p.checksum())
+            .unwrap_or_else(|_| "00".repeat(32));
+        let artifact = Artifact::new(&value);
+        for format in ["text", "json"] {
+            let out = artifact.explain(format);
+            assert_inert(&out, &[&explained], &format!("explain {format}: {what}"));
+        }
+        let out = apply_refused(&artifact, &checksum);
+        assert_inert(&out, &[&applied], &format!("apply: {what}"));
+    }
+}
+
+/// Negative: only control and invisible characters are rewritten. A name that
+/// is merely not ASCII is shown as the file spells it, so the escape does not
+/// make a refusal harder to read for a valid Unicode identifier.
+#[test]
+fn a_refusal_names_a_unicode_value_as_the_file_spells_it() {
+    let rule = "règle-名前 'q' \u{301}";
+    let plan = sealed_under(rule, Default::default());
+    let artifact = Artifact::new(&serde_json::to_value(&plan).unwrap());
+    assert_inert(
+        &artifact.explain("text"),
+        &[&format!("rule `{rule}`")],
+        "explain",
+    );
+    assert_inert(
+        &apply_refused(&artifact, &plan.checksum()),
+        &[&format!("rule `{rule}`")],
+        "apply",
+    );
+}
+
 #[test]
 fn current_resolver_artifacts_cannot_bypass_required_evidence_on_apply() {
     let plan = resolved_plan();
