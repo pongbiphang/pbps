@@ -439,17 +439,39 @@ pub(crate) fn order(
             edges[drop].insert(claimant);
         }
     }
-    let mut remaining = selected.clone();
-    let mut ordered = Vec::new();
-    while !remaining.is_empty() {
-        // Original stable sort position is the tie-breaker among ready nodes.
-        let next = *remaining
-            .iter()
-            .find(|next| !remaining.iter().any(|i| edges[*i].contains(next)))
-            .expect("only acyclic owner edges were added");
-        remaining.remove(&next);
-        ordered.push(next);
+    // Kahn's algorithm over the selected steps, the ready one first in the
+    // original stable sort position. Asking every remaining step whether
+    // another still holds it back was cubic on a long rename chain (#1971).
+    let mut held: BTreeMap<usize, usize> = selected.iter().map(|&n| (n, 0)).collect();
+    for &i in &selected {
+        for j in &edges[i] {
+            if let Some(count) = held.get_mut(j) {
+                *count += 1;
+            }
+        }
     }
+    let mut ready: BTreeSet<usize> = held
+        .iter()
+        .filter(|&(_, &count)| count == 0)
+        .map(|(&n, _)| n)
+        .collect();
+    let mut ordered = Vec::with_capacity(selected.len());
+    while let Some(next) = ready.pop_first() {
+        ordered.push(next);
+        for j in &edges[next] {
+            if let Some(count) = held.get_mut(j) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.insert(*j);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        ordered.len(),
+        selected.len(),
+        "only acyclic owner edges were added"
+    );
     let positions: BTreeMap<_, _> = ordered.iter().enumerate().map(|(i, n)| (*n, i)).collect();
     for &drop in &drops {
         if fixed.contains(&drop) {
@@ -500,43 +522,87 @@ fn cycles(
     waits: &[BTreeSet<usize>],
     owners: &BTreeMap<TableName, (usize, TableName)>,
 ) -> Vec<Vec<(TableName, TableName)>> {
-    let mut placed = BTreeSet::new();
-    let mut found = Vec::new();
     let renames: BTreeMap<usize, (TableName, TableName)> = owners
         .iter()
         .map(|(to, (i, from))| (*i, (from.clone(), to.clone())))
         .collect();
-    // A rename that waits on nothing is in no cycle, which is most of them,
-    // so the pairwise search below runs over the few that wait.
-    let waiting: Vec<usize> = renames
-        .keys()
-        .copied()
-        .filter(|&i| !waits[i].is_empty())
-        .collect();
-    for &start in &waiting {
-        if placed.contains(&start) {
-            continue;
-        }
-        let members: BTreeSet<usize> = waiting
-            .iter()
-            .copied()
-            .filter(|&other| {
-                other != start && reaches(waits, start, other) && reaches(waits, other, start)
-            })
-            .collect();
-        if members.is_empty() {
-            continue;
-        }
-        placed.insert(start);
-        placed.extend(&members);
-        found.push(
-            std::iter::once(start)
-                .chain(members)
-                .collect::<BTreeSet<_>>()
+    // Two renames are in one cycle when each reaches the other, which is one
+    // strongly connected component: one pass over the waits, where asking
+    // every pair was cubic on a long chain in which nearly every rename
+    // waits (#1971). Cycles come in plan order, each by its first rename.
+    let mut found: Vec<BTreeSet<usize>> = components(waits)
+        .into_iter()
+        .map(|component| {
+            component
                 .into_iter()
-                .map(|i| renames[&i].clone())
-                .collect(),
-        );
+                .filter(|i| renames.contains_key(i))
+                .collect::<BTreeSet<_>>()
+        })
+        .filter(|members| members.len() > 1)
+        .collect();
+    found.sort();
+    found
+        .into_iter()
+        .map(|members| members.into_iter().map(|i| renames[&i].clone()).collect())
+        .collect()
+}
+
+/// The strongly connected components of `edges`, by Tarjan's algorithm with
+/// explicit stacks: a chain of thousands of renames is that many frames deep,
+/// past what recursion can hold.
+fn components(edges: &[BTreeSet<usize>]) -> Vec<Vec<usize>> {
+    const UNSEEN: usize = usize::MAX;
+    let mut index = vec![UNSEEN; edges.len()];
+    let mut low = vec![0; edges.len()];
+    let mut on_stack = vec![false; edges.len()];
+    let mut stack = Vec::new();
+    let mut next = 0;
+    let mut found = Vec::new();
+    for root in 0..edges.len() {
+        if index[root] != UNSEEN {
+            continue;
+        }
+        let mut path = vec![(root, edges[root].iter())];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some((v, successors)) = path.last_mut() {
+            let v = *v;
+            match successors.next().copied() {
+                Some(w) if index[w] == UNSEEN => {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    path.push((w, edges[w].iter()));
+                }
+                Some(w) => {
+                    if on_stack[w] {
+                        low[v] = low[v].min(index[w]);
+                    }
+                }
+                None => {
+                    path.pop();
+                    if let Some((parent, _)) = path.last() {
+                        low[*parent] = low[*parent].min(low[v]);
+                    }
+                    if low[v] == index[v] {
+                        let mut component = Vec::new();
+                        while let Some(w) = stack.pop() {
+                            on_stack[w] = false;
+                            component.push(w);
+                            if w == v {
+                                break;
+                            }
+                        }
+                        found.push(component);
+                    }
+                }
+            }
+        }
     }
     found
 }
