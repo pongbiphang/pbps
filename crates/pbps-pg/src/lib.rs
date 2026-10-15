@@ -74,6 +74,7 @@ pub mod rows;
 pub mod staged;
 pub mod state;
 mod types;
+pub mod user_types;
 pub mod validate;
 
 /// A part of the dialect that Phase 5 has not built yet.

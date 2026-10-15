@@ -1529,7 +1529,17 @@
         "positional_preflight_tests::tightening_sees_an_attached_child_only_after_the_attach",
         "positional_preflight_tests::an_attach_cannot_borrow_a_later_detachs_empty_range",
         "positional_preflight_tests::a_new_key_validates_writes_before_its_own_step_and_never_after_it",
-        "positional_preflight_tests::a_planned_key_counts_only_references_that_survive_the_current_delete"
+        "positional_preflight_tests::a_planned_key_counts_only_references_that_survive_the_current_delete",
+        "user_types_tests::a_read_that_fails_is_unreadable_and_never_absent",
+        "user_types_tests::absent_shell_and_unusable_types_are_three_different_results",
+        "user_types_tests::an_enum_a_domain_and_a_composite_are_read_with_their_kind_and_their_pin",
+        "user_types_tests::an_owner_is_trusted_only_when_it_can_become_the_deployer_or_is_a_superuser",
+        "user_types_tests::each_change_to_a_type_changes_its_pin_and_a_no_op_does_not",
+        "user_types_tests::other_kinds_of_type_are_refused_by_name",
+        "user_types_tests::reading_a_type_runs_none_of_its_code",
+        "user_types_tests::a_range_inside_a_type_is_pinned_with_the_type_it_ranges_over",
+        "user_types_tests::a_vector_type_is_not_an_array_of_its_element",
+        "user_types_tests::the_closure_names_what_a_type_reaches"
       ]
     },
     {
