@@ -25,6 +25,16 @@ use std::collections::BTreeMap;
 /// Rule `mssql-reported-scope-v1`, measured on SQL Server 2025 (17.0) for
 /// Linux. It was `mssql-analysis-scope-v1` while it also compared the
 /// measured profiles' executables (#1636).
+///
+/// The identifier moves whenever the set of facts the rule compares does:
+/// `OBSERVATIONS`, `OPTIONAL_OBSERVATIONS`, `SETTINGS` or a family of facts
+/// `compare_reported` reports. Evidence would seal the identifier, and an older
+/// build would accept evidence by it alone, so a changed set under an
+/// unchanged identifier would be read by that build as the coverage it
+/// required (#2012, DECISIONS 520). No evidence seals this rule yet (#620), so
+/// nothing reads it and no earlier identifier is refused;
+/// `the_compared_facts_move_with_the_rule_identifier` is what keeps the first
+/// reader from inheriting a set that moved unnoticed.
 pub const REPORTED_RULE: &str = "mssql-reported-scope-v1";
 
 /// The product major versions the rule was measured on. Anything else is
@@ -418,6 +428,94 @@ mod tests {
         facts
             .observations
             .insert(key.into(), Observation::reported(Some(value)));
+    }
+
+    /// Every identifier the rule has had, oldest first, each with the names of
+    /// the facts a matching pair is compared on (`assembly:` and `visibility:`
+    /// stand for one fact per name the fixture carries). A change to what is
+    /// compared appends an entry and bumps `REPORTED_RULE`; an earlier entry is
+    /// a record and is never edited (DECISIONS 520).
+    const RULE_HISTORY: &[(&str, &[&str])] = &[(
+        "mssql-reported-scope-v1",
+        &[
+            "assembly:geo",
+            "database_ansi_null_default",
+            "database_ansi_nulls",
+            "database_ansi_padding",
+            "database_ansi_warnings",
+            "database_arithabort",
+            "database_collation",
+            "database_compatibility_level",
+            "database_concat_null_yields_null",
+            "database_containment",
+            "database_numeric_roundabort",
+            "database_quoted_identifier",
+            "edition",
+            "engine_edition",
+            "host_platform",
+            "persisted-module-settings",
+            "product_level",
+            "product_update_level",
+            "product_update_reference",
+            "product_version",
+            "server_collation",
+            "setting:ansi_null_dflt_on",
+            "setting:ansi_nulls",
+            "setting:ansi_padding",
+            "setting:ansi_warnings",
+            "setting:arithabort",
+            "setting:concat_null_yields_null",
+            "setting:datefirst",
+            "setting:dateformat",
+            "setting:language",
+            "setting:numeric_roundabort",
+            "setting:quoted_identifier",
+            "visibility:app",
+        ],
+    )];
+
+    #[test]
+    fn the_compared_facts_move_with_the_rule_identifier() {
+        let (current, pinned) = RULE_HISTORY.last().unwrap();
+        // A pair that carries an assembly too, or its family would go unpinned.
+        let mut facts = side("17.0.4075.5");
+        facts.extensions.push(ExtensionFact {
+            name: "geo".into(),
+            version: "geo, version=1.0.0.0".into(),
+            schema: "SAFE_ACCESS".into(),
+            requires: Vec::new(),
+            libraries: vec!["digest".into()],
+        });
+        let report = compare_reported(&facts, &facts);
+        let compared: std::collections::BTreeSet<&str> =
+            report.facts.keys().map(String::as_str).collect();
+        let pinned_set: std::collections::BTreeSet<&str> = pinned.iter().copied().collect();
+        assert_eq!(pinned_set.len(), pinned.len(), "a name is listed twice");
+        assert_eq!(
+            REPORTED_RULE, *current,
+            "REPORTED_RULE is not the newest entry of RULE_HISTORY: a bump appends the new \
+             identifier with the facts it compares"
+        );
+        assert_eq!(
+            compared,
+            pinned_set,
+            "the facts compared under {REPORTED_RULE} changed (only here: {:?}; only in the \
+             record: {:?}): evidence is read by the identifier alone, so give the rule a new \
+             one. Bump REPORTED_RULE, append the new identifier and its facts to RULE_HISTORY \
+             without editing the entry above it, and record it in DECISIONS 520",
+            compared.difference(&pinned_set).collect::<Vec<_>>(),
+            pinned_set.difference(&compared).collect::<Vec<_>>(),
+        );
+        // Negative: a bump that compares the same facts is not a new rule, and
+        // an identifier is not reused for another set.
+        for pair in RULE_HISTORY.windows(2) {
+            assert_ne!(pair[0].0, pair[1].0, "an identifier is reused");
+            assert_ne!(
+                pair[0].1, pair[1].1,
+                "{} compares what {} compared",
+                pair[1].0, pair[0].0
+            );
+        }
     }
 
     #[test]

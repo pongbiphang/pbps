@@ -29,12 +29,16 @@ pub fn validate_evidence(
     evidence: &pbps_model::resolver::ResolverEvidence,
 ) -> Result<(), pbps_model::resolver::EvidenceError> {
     use pbps_model::resolver::EvidenceError;
+    // The one runtime reads the facts both engines report and observes no
+    // executable (#1672); evidence naming another rule claims coverage it does
+    // not have, and the identifier moves with the set of facts compared, so an
+    // earlier one is refused by name (DECISIONS 520).
+    let rule = &evidence.qualification().rule;
+    if !compatibility::ACCEPTED_RULES.contains(&rule.as_str()) {
+        return Err(EvidenceError::Rule(rule.clone()));
+    }
     if evidence.before().adapter() != capture::INPUT_RULE
         || !matches!(evidence.before().engine_major(), 16 | 18)
-        // The one runtime reads the facts both engines report and observes
-        // no executable (#1672); evidence naming another rule claims
-        // coverage it does not have.
-        || evidence.qualification().rule != compatibility::REPORTED_RULE
         || evidence.authorization().rule != authorization::RULE
     {
         return Err(EvidenceError::Version);

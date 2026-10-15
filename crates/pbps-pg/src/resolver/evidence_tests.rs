@@ -71,16 +71,6 @@ fn saved_evidence_requires_a_supported_adapter_major_and_qualification_rule() {
             serde_json::json!("postgres-catalog-inputs-v3"),
         ),
         ("/before/engine_major", serde_json::json!(17)),
-        (
-            "/qualification/rule",
-            serde_json::json!("pg-reported-scope-v2"),
-        ),
-        // The removed measured profiles' rule: its evidence compared
-        // executables the one resolver never observes (#1636).
-        (
-            "/qualification/rule",
-            serde_json::json!("pg-analysis-scope-v1"),
-        ),
         ("/authorization/rule", serde_json::json!("pg-auth-v2")),
     ] {
         let mut changed = json.clone();
@@ -91,5 +81,41 @@ fn saved_evidence_requires_a_supported_adapter_major_and_qualification_rule() {
             Err(EvidenceError::Version),
             "{path}"
         );
+    }
+}
+
+/// The compared facts move with the rule's identifier (DECISIONS 520), so
+/// evidence naming another one is refused by that name and with the remedy,
+/// never read as this build's coverage.
+#[test]
+fn evidence_sealed_under_another_qualification_rule_is_refused_by_name() {
+    assert_eq!(compatibility::REPORTED_RULE, "pg-reported-scope-v2");
+    let json = serde_json::to_value(evidence()).unwrap();
+    let sealed_under = |rule: &str| -> ResolverEvidence {
+        let mut changed = json.clone();
+        *changed.pointer_mut("/qualification/rule").unwrap() = serde_json::json!(rule);
+        serde_json::from_value(changed).unwrap()
+    };
+    // The current identifier is read.
+    validate_evidence(&sealed_under("pg-reported-scope-v2")).unwrap();
+    for refused in [
+        // The previous identifier, which compared `setting:xmloption` (#2010):
+        // a build that required it must not be read as this one's coverage,
+        // nor this one's evidence as theirs.
+        "pg-reported-scope-v1",
+        // An identifier no build writes yet is not read on the chance that it
+        // is a superset.
+        "pg-reported-scope-v3",
+        // The removed measured profiles' rule: its evidence compared
+        // executables the one resolver never observes (#1636).
+        "pg-analysis-scope-v1",
+        // The other engine's rule is not this adapter's.
+        "mssql-reported-scope-v1",
+    ] {
+        let error = validate_evidence(&sealed_under(refused)).unwrap_err();
+        assert_eq!(error, EvidenceError::Rule(refused.into()), "{refused}");
+        let message = error.to_string();
+        assert!(message.contains(&format!("`{refused}`")), "{message}");
+        assert!(message.contains("plan again"), "{message}");
     }
 }

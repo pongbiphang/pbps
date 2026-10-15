@@ -11,8 +11,24 @@ use pbps_db::resolver::Observation;
 use pbps_db::resolver::environment::{CatalogFacts, FactStatus, RuleVersion, ScopeReport, Side};
 use std::collections::BTreeMap;
 
-/// Rule `pg-reported-scope-v1`, measured on PostgreSQL 16 and 18.
-pub const REPORTED_RULE: &str = "pg-reported-scope-v1";
+/// Rule `pg-reported-scope-v2`, measured on PostgreSQL 16 and 18.
+///
+/// The identifier moves whenever the set of facts the rule compares does:
+/// `OBSERVATIONS`, `OPTIONAL_OBSERVATIONS`, `SETTINGS`, `OPTIONAL_SETTINGS` or
+/// a family of facts `compare_reported` reports. Evidence seals the identifier,
+/// and an older build accepts evidence by it alone, so a changed set under an
+/// unchanged identifier is read by that build as the coverage it required
+/// (`xmloption` left the set under `pg-reported-scope-v1`, #2012, DECISIONS
+/// 520). `the_compared_facts_move_with_the_rule_identifier` fails when they
+/// part, naming what to change.
+pub const REPORTED_RULE: &str = "pg-reported-scope-v2";
+
+/// The identifiers `validate_evidence` reads: the current one only. An earlier
+/// identifier compared another set of facts, so evidence sealed under it is
+/// refused by name rather than read as this build's coverage. Nothing but
+/// `explain` reads a saved resolved plan today (apply refuses all of them,
+/// #616), so the remedy is a new plan.
+pub(crate) const ACCEPTED_RULES: &[&str] = &[REPORTED_RULE];
 
 /// The major versions the rule was measured on. Anything else is unknown,
 /// not incompatible: PostgreSQL 16 changed role-membership semantics and 15
@@ -56,7 +72,8 @@ const OPTIONAL_OBSERVATIONS: &[&str] = &["database_locale", "database_icu_rules"
 /// reads `content` inside the read and the database's value after it, and
 /// every read on such a target ended as "session inputs changed during target
 /// capture" — a database default, of which the scratch is given a copy, was
-/// refused as surely as a server-level value, of which it is not.
+/// refused as surely as a server-level value, of which it is not. The set
+/// changing is what made the rule `pg-reported-scope-v2` (#2012).
 pub(crate) const SETTINGS: &[&str] = &[
     "server_encoding",
     "client_encoding",
@@ -97,7 +114,7 @@ fn missing_reason(name: &str) -> String {
     }
 }
 
-/// Rule `pg-reported-scope-v1`: the catalog facts both engines report, and
+/// Rule `pg-reported-scope-v2`: the catalog facts both engines report, and
 /// no executables. The resolver observes no process and so reads no
 /// executable; the operator vouches for the build, and what each engine
 /// reports about itself is all that is compared (DEC-1528.1, #1672).
@@ -676,6 +693,116 @@ mod tests {
                 !pinned.contains(&name.to_lowercase()),
                 "{name} is pinned by the dialect or the capture, so it is not compared"
             );
+        }
+    }
+
+    /// Every identifier the rule has had, oldest first, each with the names of
+    /// the facts a matching pair is compared on (`extension:`, `collation:` and
+    /// `visibility:` stand for one fact per name the fixture carries). A change
+    /// to what is compared appends an entry and bumps `REPORTED_RULE`; an
+    /// earlier entry is a record and is never edited, because evidence sealed
+    /// under it is refused by that name (`ACCEPTED_RULES`, DECISIONS 520).
+    const RULE_HISTORY: &[(&str, &[&str])] = &[
+        // Through #2010, which removed `xmloption` from the settings.
+        (
+            "pg-reported-scope-v1",
+            &[
+                "collation:default",
+                "database_collate",
+                "database_ctype",
+                "database_encoding",
+                "database_icu_rules",
+                "database_locale",
+                "database_locale_provider",
+                "extension:hstore",
+                "server_version",
+                "server_version_num",
+                "setting:array_nulls",
+                "setting:client_encoding",
+                "setting:default_text_search_config",
+                "setting:dynamic_library_path",
+                "setting:lc_monetary",
+                "setting:lc_numeric",
+                "setting:lc_time",
+                "setting:local_preload_libraries",
+                "setting:restrict_nonsystem_relation_kind",
+                "setting:row_security",
+                "setting:server_encoding",
+                "setting:session_preload_libraries",
+                "setting:shared_preload_libraries",
+                "setting:xmloption",
+                "visibility:app",
+            ],
+        ),
+        (
+            "pg-reported-scope-v2",
+            &[
+                "collation:default",
+                "database_collate",
+                "database_ctype",
+                "database_encoding",
+                "database_icu_rules",
+                "database_locale",
+                "database_locale_provider",
+                "extension:hstore",
+                "server_version",
+                "server_version_num",
+                "setting:array_nulls",
+                "setting:client_encoding",
+                "setting:default_text_search_config",
+                "setting:dynamic_library_path",
+                "setting:lc_monetary",
+                "setting:lc_numeric",
+                "setting:lc_time",
+                "setting:local_preload_libraries",
+                "setting:restrict_nonsystem_relation_kind",
+                "setting:row_security",
+                "setting:server_encoding",
+                "setting:session_preload_libraries",
+                "setting:shared_preload_libraries",
+                "visibility:app",
+            ],
+        ),
+    ];
+
+    #[test]
+    fn the_compared_facts_move_with_the_rule_identifier() {
+        let (current, pinned) = RULE_HISTORY.last().unwrap();
+        let report = compare_reported(&side("180006"), &side("180006"));
+        let compared: std::collections::BTreeSet<&str> =
+            report.facts.keys().map(String::as_str).collect();
+        let pinned_set: std::collections::BTreeSet<&str> = pinned.iter().copied().collect();
+        assert_eq!(pinned_set.len(), pinned.len(), "a name is listed twice");
+        assert_eq!(
+            REPORTED_RULE, *current,
+            "REPORTED_RULE is not the newest entry of RULE_HISTORY: a bump appends the new \
+             identifier with the facts it compares"
+        );
+        assert_eq!(
+            compared,
+            pinned_set,
+            "the facts compared under {REPORTED_RULE} changed (only here: {:?}; only in the \
+             record: {:?}): an older build reads evidence by the identifier alone, so give the \
+             rule a new one. Bump REPORTED_RULE, append the new identifier and its facts to \
+             RULE_HISTORY without editing the entry above it, and record it in DECISIONS 520",
+            compared.difference(&pinned_set).collect::<Vec<_>>(),
+            pinned_set.difference(&compared).collect::<Vec<_>>(),
+        );
+        // Negative: a bump that compares the same facts is not a new rule, and
+        // an identifier is not reused for another set.
+        for pair in RULE_HISTORY.windows(2) {
+            assert_ne!(pair[0].0, pair[1].0, "an identifier is reused");
+            assert_ne!(
+                pair[0].1, pair[1].1,
+                "{} compares what {} compared",
+                pair[1].0, pair[0].0
+            );
+        }
+        // Only the newest identifier is read; each earlier one is refused by
+        // name, whatever it compared.
+        assert_eq!(ACCEPTED_RULES, [REPORTED_RULE]);
+        for (earlier, _) in &RULE_HISTORY[..RULE_HISTORY.len() - 1] {
+            assert!(!ACCEPTED_RULES.contains(earlier), "{earlier}");
         }
     }
 

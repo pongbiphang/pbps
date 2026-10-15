@@ -13,6 +13,17 @@ fn resolved_plan() -> SavedPlan {
 }
 
 fn resolved_plan_with(limitations: std::collections::BTreeMap<String, String>) -> SavedPlan {
+    let plan = sealed_under(pbps_pg::resolver::compatibility::REPORTED_RULE, limitations);
+    let PlanAnalysis::Resolved(evidence) = &plan.analysis else {
+        unreachable!("sealed_under resolves the plan");
+    };
+    pbps_pg::resolver::validate_evidence(evidence).unwrap();
+    plan
+}
+
+/// A plan whose evidence names `rule`, valid or not: what an earlier build
+/// sealed, with the checksum that build computed.
+fn sealed_under(rule: &str, limitations: std::collections::BTreeMap<String, String>) -> SavedPlan {
     // Synthetic, source-free reader evidence, not a claim of live qualification.
     // Use the public sealing constructors so an invalid fixture cannot turn an
     // explanation regression into an unrelated deserialization refusal.
@@ -36,7 +47,7 @@ fn resolved_plan_with(limitations: std::collections::BTreeMap<String, String>) -
     let evidence = ResolverEvidence::new(
         &changes,
         Qualification {
-            rule: pbps_pg::resolver::compatibility::REPORTED_RULE.into(),
+            rule: rule.into(),
             target_environment: "04".repeat(32),
             target_environment_after: "04".repeat(32),
             resolver_environment: "05".repeat(32),
@@ -65,7 +76,6 @@ fn resolved_plan_with(limitations: std::collections::BTreeMap<String, String>) -
         OrderingProof::new(&changes, BTreeSet::new()).unwrap(),
     )
     .unwrap();
-    pbps_pg::resolver::validate_evidence(&evidence).unwrap();
     SavedPlan::new(
         PlanOrigin::Database,
         "postgres",
@@ -318,6 +328,70 @@ fn malformed_or_unsupported_resolver_evidence_is_refused_before_presentation() {
             }
         }
     }
+}
+
+/// The qualification rule's identifier moves with the facts it compares
+/// (DECISIONS 520), so a resolved plan an earlier build sealed is refused by
+/// `explain` and by `apply` before the target is contacted, naming the rule
+/// and the remedy, and is never shown as this build's coverage. Nothing else
+/// reads such a plan today: apply refuses every resolved plan (#616).
+#[test]
+fn a_plan_sealed_under_the_previous_qualification_rule_is_refused_naming_it() {
+    let previous = sealed_under("pg-reported-scope-v1", Default::default());
+    let current = resolved_plan();
+    assert_ne!(previous.checksum(), current.checksum());
+    let artifact = Artifact::new(&serde_json::to_value(&previous).unwrap());
+    for format in ["text", "json"] {
+        let out = artifact.explain(format);
+        assert_eq!(out.status.code(), Some(1), "{format}: {out:?}");
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            error.contains("`pg-reported-scope-v1`"),
+            "{format}: {error}"
+        );
+        assert!(error.contains("plan again"), "{format}: {error}");
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("pbps apply"),
+            "{format}: {out:?}"
+        );
+    }
+    std::fs::write(artifact.0.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let connection = format!(
+        "postgres://unused@{}/unused?sslmode=disable",
+        target.local_addr().unwrap()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_pbps"))
+        .current_dir(&artifact.0)
+        .args([
+            "apply",
+            "--plan",
+            "plan.json",
+            "--db",
+            &connection,
+            "--checksum",
+            &previous.checksum(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("`pg-reported-scope-v1`"), "{error}");
+    assert!(
+        !error.contains("cannot yet enforce resolver pre/postconditions"),
+        "an unreadable rule fails validation before the capability refusal: {error}"
+    );
+    assert_eq!(
+        target.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    // Negative: the same fixture under the current rule is read, so the
+    // refusal above is the rule's and not the fixture's.
+    let readable = Artifact::new(&serde_json::to_value(&current).unwrap());
+    let out = readable.explain("text");
+    assert!(out.status.success(), "{out:?}");
 }
 
 #[test]
