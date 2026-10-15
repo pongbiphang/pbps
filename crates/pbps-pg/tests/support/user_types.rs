@@ -210,6 +210,7 @@ fn without_oids(def: &Definition) -> Definition {
                 ..
             } => Component::Range {
                 oid: 0,
+                owner: 0,
                 schema: schema.clone(),
                 name: name.clone(),
                 typtype: typtype.clone(),
@@ -222,6 +223,7 @@ fn without_oids(def: &Definition) -> Definition {
                 ..
             } => Component::Other {
                 oid: 0,
+                owner: 0,
                 schema: schema.clone(),
                 name: name.clone(),
                 typtype: typtype.clone(),
@@ -1208,12 +1210,47 @@ async fn a_range_inside_a_type_is_pinned_with_the_type_it_ranges_over() {
         }
         db.sql("ALTER DOMAIN app.pos ADD CONSTRAINT small CHECK (VALUE < 100) NOT VALID")
             .await;
+        let mut after = Vec::new();
         for (name, pin) in names.iter().zip(&before) {
+            let now = pin_of(&mut db.conn, "app", name).await;
             assert_ne!(
-                &pin_of(&mut db.conn, "app", name).await,
-                pin,
+                &now, pin,
                 "{name} on {label} kept its pin when the range's subtype changed"
             );
+            after.push(now);
+        }
+        // A new owner of the range itself is a change too, and is named.
+        let stranger = db.role("stranger", "NOLOGIN").await;
+        db.sql(&format!("ALTER TYPE app.pos_range OWNER TO {stranger}"))
+            .await;
+        // 18 gives the range's multirange the new owner as well and 16 does
+        // not (measured), so the multirange's own owner says what to expect.
+        let multirange_owner = db
+            .conn
+            .query(
+                "SELECT pg_get_userbyid(typowner)::text AS owner FROM pg_type
+                  WHERE typname = 'pos_multirange'",
+            )
+            .await
+            .unwrap()[0]
+            .try_get::<&str>("owner")
+            .unwrap()
+            .map(str::to_owned);
+        let multirange_follows = multirange_owner.as_deref() == Some(stranger.as_str());
+        for (name, pin) in names.iter().zip(&after) {
+            let read = present(&mut db.conn, "app", name).await;
+            let untrusted: Vec<&str> = read
+                .untrusted_owners()
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect();
+            if *name == "holds_multirange" && !multirange_follows {
+                assert_eq!(read.pin().as_str(), pin, "{name} on {label}");
+                assert!(untrusted.is_empty(), "{name} on {label}: {untrusted:?}");
+            } else {
+                assert_ne!(read.pin().as_str(), pin, "{name} on {label}");
+                assert_eq!(untrusted, [stranger.as_str()], "{name} on {label}");
+            }
         }
         db.drop().await;
     }

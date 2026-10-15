@@ -476,6 +476,7 @@ pub enum Component {
         name: String,
         /// `r` or `m`.
         typtype: String,
+        owner: Oid,
         subtype: Box<Component>,
     },
     /// Anything else (a built-in, an extension's type), by OID and name: it
@@ -485,6 +486,7 @@ pub enum Component {
         schema: String,
         name: String,
         typtype: String,
+        owner: Oid,
     },
 }
 
@@ -568,14 +570,24 @@ impl Component {
                 schema,
                 name,
                 typtype,
+                owner,
                 subtype,
-            } => json!(["range", oid, schema, name, typtype, subtype.canonical()]),
+            } => json!([
+                "range",
+                oid,
+                schema,
+                name,
+                typtype,
+                owner,
+                subtype.canonical()
+            ]),
             Self::Other {
                 oid,
                 schema,
                 name,
                 typtype,
-            } => json!(["other", oid, schema, name, typtype]),
+                owner,
+            } => json!(["other", oid, schema, name, typtype, owner]),
         }
     }
 
@@ -583,8 +595,13 @@ impl Component {
         match self {
             Self::Array(element) => element.collect_owners(out),
             Self::Defined(definition) => definition.collect_owners(out),
-            Self::Range { subtype, .. } => subtype.collect_owners(out),
-            Self::Other { .. } => {}
+            Self::Range { owner, subtype, .. } => {
+                out.insert(*owner);
+                subtype.collect_owners(out);
+            }
+            Self::Other { owner, .. } => {
+                out.insert(*owner);
+            }
         }
     }
 }
@@ -993,6 +1010,7 @@ impl Built {
                 schema: t.schema.clone(),
                 name: t.name.clone(),
                 typtype: t.typtype.clone(),
+                owner: t.owner,
                 subtype: Box::new(self.component(catalog, subtype)?),
             });
         }
@@ -1001,6 +1019,7 @@ impl Built {
             schema: t.schema.clone(),
             name: t.name.clone(),
             typtype: t.typtype.clone(),
+            owner: t.owner,
         })
     }
 }
@@ -1311,6 +1330,7 @@ mod tests {
             schema: "pg_catalog".to_owned(),
             name: name.to_owned(),
             typtype: "b".to_owned(),
+            owner: 10,
         }
     }
 
@@ -1415,15 +1435,15 @@ mod tests {
         );
         assert_eq!(
             domain().canonical().to_string(),
-            r#"[40002,"app","positive",10,["domain",["other",23,"pg_catalog","int4","b"],-1,0,false,"1",[["positive_check","c",true,"CHECK ((VALUE > 0))"],["small","c",true,"CHECK ((VALUE < 100))"]]]]"#
+            r#"[40002,"app","positive",10,["domain",["other",23,"pg_catalog","int4","b",10],-1,0,false,"1",[["positive_check","c",true,"CHECK ((VALUE > 0))"],["small","c",true,"CHECK ((VALUE < 100))"]]]]"#
         );
         assert_eq!(
             domain().pin().as_str(),
-            "3fd0c79846be9b817c248ca1cc309910d905e632b7779bf919e06f4f257636f8"
+            "cff3b44ec4f81f3b2a9e672a8a2e91f3ac42287d74b8f78dffb3b54c1e3329ac"
         );
         assert_eq!(
             composite().pin().as_str(),
-            "11c269673400967ab091c94f1d211f03dfba0fc431e603dfc340c0caf0985738"
+            "fc580acbe7772fc9c4a2d50eeb79d05b32e3476e3bb5d6f7e920a1182b7ff4a5"
         );
     }
 
@@ -1611,6 +1631,7 @@ mod tests {
                 schema: "pg_catalog".to_owned(),
                 name: "int4range".to_owned(),
                 typtype: "r".to_owned(),
+                owner: 10,
                 subtype: Box::new(subtype),
             };
         })
@@ -1662,12 +1683,44 @@ mod tests {
                 schema: "app".to_owned(),
                 name: "r".to_owned(),
                 typtype: "r".to_owned(),
+                owner: 10,
                 subtype: Box::new(Component::Defined(Box::new(nested))),
             };
         });
         let mut ids = BTreeSet::new();
         outer.collect_owners(&mut ids);
         assert!(ids.contains(&20), "{ids:?}");
+    }
+
+    /// Every type a type is made of is owned by someone, and a new owner of a
+    /// nested range or built-in-shaped leaf is a change, whether or not it
+    /// shows anywhere else (review of #2039).
+    #[test]
+    fn the_owner_of_a_nested_leaf_or_range_changes_the_pin_and_is_collected() {
+        let with = |ty: Component| composite_of(|c| c.attributes[1].ty = ty);
+        let leaf_owned_by = |owner| Component::Other {
+            oid: 25,
+            schema: "pg_catalog".to_owned(),
+            name: "text".to_owned(),
+            typtype: "b".to_owned(),
+            owner,
+        };
+        let range_owned_by = |owner| Component::Range {
+            oid: 3904,
+            schema: "app".to_owned(),
+            name: "r".to_owned(),
+            typtype: "r".to_owned(),
+            owner,
+            subtype: Box::new(leaf(23, "int4")),
+        };
+        for make in [&leaf_owned_by as &dyn Fn(Oid) -> Component, &range_owned_by] {
+            let (a, b) = (with(make(10)), with(make(77)));
+            assert_ne!(a.pin(), b.pin());
+            assert_eq!(a.pin(), with(make(10)).pin());
+            let mut ids = BTreeSet::new();
+            b.collect_owners(&mut ids);
+            assert!(ids.contains(&77), "{ids:?}");
+        }
     }
 
     #[test]
