@@ -50,6 +50,7 @@ limitations and deferred findings. Two groups of commands:
 | `verify` (`--format json`) | The drift check; exits 2 on drift |
 | `snapshot`, `baseline`, `bootstrap`, `state prune`, `unlock` | The state ledger |
 | `status` (`--format json`) | One screen across every configured environment |
+| `resolver externals` (`--schema` / `--out` / `--force`) | Draft a resolver's externals file from the target, for review |
 
 Every read-only command takes `--format human|json` and emits the same typed
 findings. Three exit codes, and the split matters: **0** clean, **2** the command

@@ -749,7 +749,8 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
   - No target source is retained or transferred, so the private-source
     requirements designed above no longer apply (#617 is closed).
   - Two later steps reuse the same comparison: a reviewed externals draft from
-    the target, then automatic fill of missing shapes. Fill orders each
+    the target, delivered as `pbps resolver externals` (#1778,
+    DEC-1778.1), then automatic fill of missing shapes. Fill orders each
     generated object from the target's `pg_depend`, between managed
     objects, which lifts the chain refusal for what it fills.
 - **Reading this record.** Wherever the decisions above describe

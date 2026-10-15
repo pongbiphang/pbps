@@ -1550,6 +1550,7 @@ full state.
 | `pbps state list` | This environment's history, newest first |
 | `pbps state prune --keep N` | Clean up historical snapshots |
 | `pbps status` | One screen across environments: last apply, git sha, drift state, last verified (see 9.4) |
+| `pbps resolver externals` | Draft a resolver's externals file from the target, for review: printed, or written to a new `--out` file; `--schema <name>` adds a schema's unmanaged objects (see 9.3.2, DEC-1778.1) |
 
 A target connection string names one endpoint (DECISIONS 229), and the
 connection must reach one database cluster for its whole life. A command spans
@@ -1982,8 +1983,8 @@ scratch compile (#1616).
     needs it only in a chain (below). A statement that fails is reported
     with the engine's error, which names what failed; when what it names is
     managed, the remedy is a shape view or leaving the object out. The
-    planned draft command and fill write shape views, and order by the
-    target's `pg_depend`.
+    draft command writes shape views and orders by the target's
+    `pg_depend`, as the planned fill will.
 - **Everything it leaves behind must be accounted for.**
   - Each object it creates is compared with the target before any binding
     question is answered. A mismatch, an object the target does not have,
@@ -2019,8 +2020,9 @@ scratch compile (#1616).
     evidence records it, and `explain` shows it, so a reviewer sees a plan
     whose externals file ran with `allow`. A role the target lacks is not this
     check's to find: the target-side checks catch it (#1516).
-  - **Writing one.** `pg_dump --schema-only --no-owner --no-privileges`
-    of the objects the managed set reads writes an externals file that names no
+  - **Writing one.** `pbps resolver externals --db <target>` drafts one
+    (below). `pg_dump --schema-only --no-owner --no-privileges`
+    of the objects the managed set reads also writes an externals file that names no
     role the scratch lacks. An externals file that creates an extension only a
     superuser may create needs the run-owned layout, where it runs as the
     superuser: a Docker scratch, or a server scratch whose account is a
@@ -2095,15 +2097,48 @@ scratch compile (#1616).
   resolver and keep ADR-0013's conservative rebuild.
 
 An object the externals file stages, compared with the target, is not a
-fabricated stub; an uncompared one never reaches binding evidence. Two later steps are planned:
-1. a command that drafts an externals file from the target's external shapes, for
-   review (a view is drafted as a shape view of its output columns, and a
-   routine is listed but never written);
-2. filling, at plan time, the shapes an externals file lacks, by the same rules;
-   the externals file wins on overlap. pbps generates each object itself, so it
-   can order them one by one from the target's recorded dependencies
-   (`pg_depend`), between managed objects, without parsing SQL. That lifts
-   the chain refusal for filled objects.
+fabricated stub; an uncompared one never reaches binding evidence.
+
+**`pbps resolver externals` drafts an externals file from the target, for
+review (#1778, DEC-1778.1).**
+- **What it reads.** The objects outside the managed set that the managed
+  objects the target holds depend on, from the target's `pg_depend`, with
+  the shapes those objects need in turn: a column's or attribute's type, a
+  domain's base type, what a compared key's index names, an extension
+  another requires. A part folds into what carries it, and an extension's
+  member into the extension. `--schema <name>` adds every unmanaged object
+  in a schema, for references only declarations not yet deployed make.
+- **What it writes as SQL:** tables, with their columns in order, types,
+  collations, NOT NULLs (named on 18), keys, unique indexes, owned and
+  identity sequences, and their own options; views and materialized views
+  as shape views of their output columns; enums, domains and composite
+  types; extensions with their version; standalone sequences. What only
+  guards a table (foreign keys, CHECKs, defaults, triggers, policies,
+  plain indexes) and a view's query are not compared, so it leaves them
+  out. Each schema it writes into is created `IF NOT EXISTS`, and objects
+  come in an order that creates what a shape names before the shape.
+- **What it lists rather than writes**, as comments in the file and one
+  line each on stderr:
+  - a routine, by signature, never written: pbps sends no routine source
+    to scratch;
+  - a cast, operator, collation, operator class, range or base type, a
+    partitioned table, a partition, inheritance, a typed table, a generated
+    column, a tablespace, a view `WITH CHECK OPTION`: for the operator to
+    write by hand;
+  - a foreign table, which the comparison does not qualify;
+  - a chain: an object whose shape names a managed object, or one that
+    cannot be staged, with the two remedies above.
+- **Where it goes.** stdout, or a new `--out` file; an existing file is
+  replaced only with `--force`, and never the externals file a resolver
+  entry names or a file the project reads. The file it drafts is compared
+  with the target like any other, whoever edited it.
+
+A later step is planned: filling, at plan time, the shapes an externals file
+lacks, by the same rules; the externals file wins on overlap. pbps generates
+each object itself, so it can order them one by one from the target's
+recorded dependencies (`pg_depend`), between managed objects, without
+parsing SQL. That lifts the chain refusal for filled objects. Under #1776
+that order is `Catalog` edges `settle` consumes, so fill waits for #1956.
 
 Resolved dependencies also become cross-kind ordering edges in the final typed
 plan: remove dependents before their old inputs, and establish desired inputs

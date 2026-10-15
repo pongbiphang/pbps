@@ -255,7 +255,8 @@ entry runs it on a scratch server the operator supplies (#1672, DEC-1672.1); a
 Docker entry on a container pbps starts from the entry's image and removes
 after the run (#1674, DEC-1674.1). Either kind's `externals` stages external
 objects, compared with the target (#1673, DEC-1673.1), and may be allowed to
-write outside the scratch database. Before any scratch write the resolver
+write outside the scratch database; `pbps resolver externals` drafts that file
+from the target for review (#1778, DEC-1778.1). Before any scratch write the resolver
 proves its scratch is not the target and, on the target's cluster, that its
 account is confined; then it runs the shared compatibility qualification. Its
 plan is published after the ordinary connected checks and a fresh recheck of

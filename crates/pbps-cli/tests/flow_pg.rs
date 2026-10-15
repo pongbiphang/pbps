@@ -26152,3 +26152,199 @@ CREATE EVENT TRIGGER stop_after_first ON ddl_command_end WHEN TAG IN ('ALTER TAB
     ));
     succeeds(d.run(&["verify", "--db", connection]));
 }
+
+/// `pbps resolver externals` drafts what the deployed managed view reads,
+/// lists the routine it does not write, and never replaces a file the
+/// project uses (#1778).
+#[test]
+#[ignore = "needs live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn resolver_externals_drafts_what_a_managed_view_reads_and_never_replaces_the_externals_file() {
+    let db = OwnDatabase::new(&server(), "externals1778");
+    let view = "SELECT id, ext.f(id) AS f, mood FROM ext.t";
+    on_server(
+        db.connection(),
+        &format!(
+            "CREATE SCHEMA app; CREATE SCHEMA ext; \
+             CREATE TYPE ext.mood AS ENUM ('ok'); \
+             CREATE TABLE ext.t (id integer PRIMARY KEY, mood ext.mood); \
+             CREATE TABLE ext.later (id integer); \
+             CREATE FUNCTION ext.f(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1; \
+             CREATE VIEW app.v AS {view}"
+        ),
+    );
+    let d = Demo::new("externals1778");
+    std::fs::write(
+        d.dir.join("schema/app.v.yml"),
+        format!("view: app.v\ndefinition: {view}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\nresolvers:\n  scratch:\n    kind: server\n    url_env: PBPS_FLOW_PG_UNUSED\n    externals: db/externals.sql\n",
+    )
+    .unwrap();
+    let printed = succeeds(d.run(&["resolver", "externals", "--db", db.connection()]));
+    let sql = stdout(&printed);
+    assert!(
+        sql.contains("CREATE TYPE ext.mood AS ENUM ('ok');"),
+        "{sql}"
+    );
+    assert!(
+        sql.contains("CREATE TABLE ext.t (\n    id integer"),
+        "{sql}"
+    );
+    assert!(
+        stderr(&printed).contains("listed: function ext.f(integer): listed, never written"),
+        "{}",
+        stderr(&printed)
+    );
+    // Negative: no routine source, and nothing the managed view does not read.
+    assert!(!sql.contains("RETURN $1"), "{sql}");
+    assert!(!sql.contains("ext.later"), "{sql}");
+    // `--schema` adds every unmanaged object of a schema.
+    let widened = succeeds(d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--schema",
+        "ext",
+    ]));
+    assert!(
+        stdout(&widened).contains("CREATE TABLE ext.later"),
+        "{}",
+        stdout(&widened)
+    );
+    // An absent schema is refused by name; an empty one is not.
+    let absent = d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--schema",
+        "nosuch",
+    ]);
+    assert_ne!(code(&absent), 0);
+    assert!(
+        stderr(&absent).contains("--schema nosuch: the target has no schema of that name"),
+        "{}",
+        stderr(&absent)
+    );
+    on_server(db.connection(), "CREATE SCHEMA empty");
+    succeeds(d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--schema",
+        "empty",
+    ]));
+    // `--out` writes a new file and refuses an existing one without `--force`.
+    let out = d.dir.join("draft.sql");
+    let out_arg = out.to_str().unwrap();
+    succeeds(d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--out",
+        out_arg,
+    ]));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), sql);
+    std::fs::write(&out, "-- edited\n").unwrap();
+    let refused = d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--out",
+        out_arg,
+    ]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("exists; pass --force"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "-- edited\n");
+    succeeds(d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--out",
+        out_arg,
+        "--force",
+    ]));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), sql);
+    // Nor a declaration file, even one that does not exist yet.
+    let declaration = d.dir.join("schema/app.new.yml");
+    let refused = d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--out",
+        declaration.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("is a declaration file under"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!declaration.exists());
+    // Negative: a file there the loader does not read is written.
+    let beside = d.dir.join("schema/externals.sql");
+    succeeds(d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--out",
+        beside.to_str().unwrap(),
+    ]));
+    assert_eq!(std::fs::read_to_string(&beside).unwrap(), sql);
+    // Nor through a link, dangling or not, `--force` or not.
+    #[cfg(unix)]
+    {
+        let link = d.dir.join("draft-link.sql");
+        std::os::unix::fs::symlink(&declaration, &link).unwrap();
+        let refused = d.run(&[
+            "resolver",
+            "externals",
+            "--db",
+            db.connection(),
+            "--out",
+            link.to_str().unwrap(),
+            "--force",
+        ]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("is a symbolic link"),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(!declaration.exists());
+    }
+    // The file a resolver entry names is never replaced, `--force` or not.
+    std::fs::create_dir_all(d.dir.join("db")).unwrap();
+    let named = d.dir.join("db/externals.sql");
+    std::fs::write(&named, "-- reviewed\n").unwrap();
+    let refused = d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--out",
+        named.to_str().unwrap(),
+        "--force",
+    ]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("is the externals file resolver `scratch` names"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(std::fs::read_to_string(&named).unwrap(), "-- reviewed\n");
+}
