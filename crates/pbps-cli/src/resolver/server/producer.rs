@@ -194,7 +194,7 @@ pub(super) struct Opening {
     pub driver: pbps_db::Driver,
     pub request: ScopeRequest,
     pub scope_schemas: Vec<String>,
-    /// The opening capture: its scope, which holds the baseline's staged
+    /// The opening capture: its scope, which holds the externals file's staged
     /// objects, and its dropped signatures are captured again.
     pub current: pbps_pg::resolver::capture::CapturedInputs,
     /// The `system_identifier` the planning read recorded (DEC-1685.1).
@@ -211,7 +211,7 @@ impl Unsealed {
     /// the cluster the planning read recorded (DEC-1685.1). The target's
     /// reported facts and its deployer's authorization are read again and
     /// must equal the run's opening read. The opening capture's scope,
-    /// which holds the objects the baseline staged, is captured afresh and
+    /// which holds the objects the externals file staged, is captured afresh and
     /// must equal it. Any difference refuses: the evidence would describe
     /// a target that is no longer there.
     ///

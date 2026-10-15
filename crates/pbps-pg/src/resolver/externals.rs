@@ -1,7 +1,7 @@
-//! Running a resolver's baseline on scratch, and naming what it created
+//! Running a resolver's externals file on scratch, and naming what it created
 //! (SPEC §9.3.2; #1664, #1673).
 //!
-//! The baseline is a reviewed SQL file that creates the objects outside the
+//! The externals file is a reviewed SQL file that creates the objects outside the
 //! managed set that managed objects reference. It runs on scratch only, after
 //! the authorization reproduction and before any managed object, as one
 //! script the engine itself splits (#1769), inside one transaction pbps
@@ -14,7 +14,7 @@ use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// A baseline the engine refused, with its error. Nothing it ran stays:
+/// An externals file the engine refused, with its error. Nothing it ran stays:
 /// the script runs inside one transaction, which is rolled back.
 #[derive(Debug)]
 pub struct Failed {
@@ -29,13 +29,13 @@ impl Failed {
     }
 
     /// Whether the engine found no schema to create in, or none of a name:
-    /// the baseline runs on the empty path every pbps session pins
+    /// the externals file runs on the empty path every pbps session pins
     /// (DEC-1564.1), so an unqualified name finds none.
     pub fn no_schema(&self) -> bool {
         self.error.server_error_code().as_deref() == Some("3F000")
     }
 
-    /// Whether the engine named something that does not exist. A baseline
+    /// Whether the engine named something that does not exist. An externals file
     /// runs before any managed object, so such a name may be a managed
     /// object it may not refer to.
     pub fn names_something_missing(&self) -> bool {
@@ -46,7 +46,7 @@ impl Failed {
     }
 }
 
-/// Runs the baseline as one script the engine splits (#1769), through a
+/// Runs the externals file as one script the engine splits (#1769), through a
 /// `DO` block's `EXECUTE`, inside the transaction the caller opened. Not
 /// split here: where a statement ends depends on the server's own lexer and
 /// grammar, and a client-side copy of them kept refusing valid files on ever
@@ -69,7 +69,7 @@ impl Failed {
 ///
 /// What a misread creates is still compared with the target afterwards.
 pub async fn run(conn: &mut impl ExecuteConnection, sql: &str) -> Result<(), Failed> {
-    let body = dollar_quoted(sql, "pbps_baseline");
+    let body = dollar_quoted(sql, "pbps_externals");
     let block = dollar_quoted(&format!("BEGIN EXECUTE {body}; END"), "pbps_block");
     conn.execute(&format!("DO {block}"))
         .await
@@ -89,9 +89,9 @@ fn dollar_quoted(text: &str, stem: &str) -> String {
 /// change, one row per object, each with its name: roles, role
 /// memberships, role and database settings, shared comments and security
 /// labels, tablespaces, and other databases. Read twice in one
-/// `REPEATABLE READ` transaction around the baseline, so another session's
+/// `REPEATABLE READ` transaction around the externals file, so another session's
 /// writes are in neither read (measured on 16 and 18) and only the
-/// baseline's differ. The scratch database's own settings, attributes and
+/// externals file's differ. The scratch database's own settings, attributes and
 /// comment are its own, gone with it, and its settings are read by the
 /// compatibility qualification, so they are left out. A database row keeps
 /// only what a statement changes: VACUUM rewrites its frozen-transaction
@@ -288,7 +288,7 @@ pub struct Object {
     pub described: String,
 }
 
-/// What a baseline created, taken apart into roots and what they carry.
+/// What an externals file created, taken apart into roots and what they carry.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Created {
     /// Created objects that live on no other created object: what is
@@ -296,7 +296,7 @@ pub struct Created {
     pub roots: BTreeSet<Object>,
     /// Members of an extension, whichever extension it is: compared one by
     /// one like the roots, since an extension's version says nothing of a
-    /// member altered in place, nor of one the baseline added to it (#1783).
+    /// member altered in place, nor of one the externals file added to it (#1783).
     pub members: BTreeSet<Object>,
     /// The OID of every schema it created, a root or an extension's member:
     /// the deployer's USAGE is reproduced on each.
@@ -432,9 +432,9 @@ pub async fn usage(
 
 /// Gives `deployer` USAGE on each schema where `wanted` says the target's
 /// deployer has it, and takes PUBLIC's away where it does not, as the run's
-/// administrator (#1673). A schema the baseline created is reproduced by the
-/// same answer as an in-scope one, not left to the baseline to grant: the
-/// baseline cannot know a run-owned deployer's generated name.
+/// administrator (#1673). A schema the externals file created is reproduced by the
+/// same answer as an in-scope one, not left to the externals file to grant: the
+/// file cannot know a run-owned deployer's generated name.
 pub async fn reproduce_usage(
     conn: &mut impl ExecuteConnection,
     deployer: &str,
@@ -660,7 +660,7 @@ pub fn chains(
         .filter(|link| kept(&link.binder) && !managed(&link.middle) && managed(&link.named))
         .map(|link| {
             format!(
-                "{} binds {}, whose shape names the managed {}: no baseline can stage it before \
+                "{} binds {}, whose shape names the managed {}: no externals file can stage it before \
                  the managed objects exist; adopt {} into the managed set too, or select no \
                  resolver and keep ADR-0013's conservative rebuild",
                 link.binder.described,
@@ -683,7 +683,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn what_a_baseline_created_is_its_roots_without_what_they_carry() {
+    fn what_an_externals_file_created_is_its_roots_without_what_they_carry() {
         let object = |catalog: &str, oid, described: &str, carried| {
             ((catalog.to_owned(), oid), (described.to_owned(), carried))
         };
@@ -789,7 +789,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires the pinned PostgreSQL servers"]
-    async fn a_baseline_runs_as_one_script_and_its_roots_are_found() {
+    async fn an_externals_file_runs_as_one_script_and_its_roots_are_found() {
         use pbps_db::{Conn, Driver};
         for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
             let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
@@ -806,7 +806,7 @@ mod tests {
                 .await
                 .unwrap();
             conn.execute("CREATE SCHEMA app").await.unwrap();
-            // A relation from before: it is not the baseline's however the
+            // A relation from before: it is not the externals file's however the
             // catalogs are named after it.
             conn.execute("CREATE TABLE app.kept (id int)")
                 .await

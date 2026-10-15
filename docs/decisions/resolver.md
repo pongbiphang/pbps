@@ -2648,3 +2648,32 @@ and the viewer case in `explain_resolver`; `assert_explained`,
 binding tests); the layout cases of the run-owned and confined-account
 resolver tests; and
 `a_docker_scratch_is_recorded_by_its_entry_image_and_layout` (`pbps-model`).
+
+<a id="dec-2007-1"></a>
+
+**DEC-2007.1. The resolver's baseline file is named `externals` (#2007).**
+"Baseline" named two unrelated things: `pbps baseline`, which records the
+database as it stands as the ledger's new starting point, and a resolver
+entry's SQL file that stages the external objects the declarations read, on
+scratch only. #1778's draft command would have added a third use of the
+word for the second kind.
+
+**What was decided.**
+- The entry's field is `externals:`, and the file is "the externals file"
+  in every message, remedy and document that describes current behavior.
+  The file's contents and rules are unchanged.
+- An entry still naming `baseline:` is refused by name, with the field it
+  became. No alias is kept: nothing has been released, so no configuration
+  in use depends on the old name (#1636 removed the measured profiles the
+  same way). The envelope's echo of the entry says `externals` too, so
+  set 45 is the first set the wire rule checks envelopes against
+  (DEC-1734.1).
+- Code identifiers and test names that name this file move with it; the
+  other senses keep "baseline": the plan's baseline, the ledger's
+  `baseline` state, and the capture's recorded baseline.
+- Decision records keep their words: an entry before this one that says
+  "baseline" of a resolver means this file.
+
+**Pinned by** `an_entry_naming_baseline_is_refused_with_its_new_name` and
+`a_server_entry_names_its_externals_file_relative_to_the_project`
+(`pbps-config`), and the schema/loader agreement cases in `integration`.

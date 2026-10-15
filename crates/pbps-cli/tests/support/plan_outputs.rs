@@ -258,7 +258,7 @@ fn connected_planning_refuses_output_aliases_before_contacting_the_target() {
 }
 
 #[test]
-fn snapshot_and_configured_resolver_baselines_are_protected_inputs() {
+fn snapshot_baselines_and_resolver_externals_files_are_protected_inputs() {
     for dialect in ["mssql", "postgres"] {
         let d = project("baselines", dialect, true);
         let ids: serde_json::Value =
@@ -297,7 +297,7 @@ fn snapshot_and_configured_resolver_baselines_are_protected_inputs() {
         )
         .unwrap();
         std::fs::write(d.dir.join("pbps.yml"), format!(
-            "dialect: {dialect}\nresolvers:\n  server: {{kind: server, url_env: UNUSED_RESOLVER, baseline: seeds/server.sql}}\n  docker: {{kind: docker, image: postgres:18, baseline: seeds/docker.sql}}\n"
+            "dialect: {dialect}\nresolvers:\n  server: {{kind: server, url_env: UNUSED_RESOLVER, externals: seeds/server.sql}}\n  docker: {{kind: docker, image: postgres:18, externals: seeds/docker.sql}}\n"
         )).unwrap();
         for input in ["seeds/server.sql", "seeds/docker.sql"] {
             for flag in ["--out", "--sql"] {

@@ -720,7 +720,7 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
     vouches for the scratch; pbps enforces none of them and observes no
     process. The evidence records the scratch's kind (DEC-1674.1).
 - **Decision 5, as amended.**
-  - Objects outside the managed set come from a reviewed baseline in the
+  - Objects outside the managed set come from a reviewed externals file in the
     repository, run on scratch only. It runs whole (#1664), as the setup
     role, after the deployer's authorization is reproduced and before pbps
     stages any managed object, in both layouts (DEC-1673.1).
@@ -728,8 +728,8 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
     statements therefore name nothing managed: a view over managed tables
     is written as a shape view.
   - Every object it creates is compared with the target, and sealed into
-    the manifest. A mismatch, a missing object, an uncompared object or a
-    baseline object in the managed set refuses. The comparison covers what
+    the manifest. A mismatch, a missing object, an uncompared object or
+    one in the managed set refuses. The comparison covers what
     a creation-time binding can read: an object's own class properties, and
     a relation's columns, its primary-key and unique constraints and
     indexes, and its inheritance and partition parents. It skips foreign
@@ -745,10 +745,10 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
     one. No adoption split by kind or by schema produced one across
     three measured real schemas.
   - pbps sends no routine source of its own. A question needing routine
-    source the baseline lacks refuses with the finding and two remedies.
+    source the externals file lacks refuses with the finding and two remedies.
   - No target source is retained or transferred, so the private-source
     requirements designed above no longer apply (#617 is closed).
-  - Two later steps reuse the same comparison: a reviewed baseline draft from
+  - Two later steps reuse the same comparison: a reviewed externals draft from
     the target, then automatic fill of missing shapes. Fill orders each
     generated object from the target's `pg_depend`, between managed
     objects, which lifts the chain refusal for what it fills.
@@ -774,22 +774,22 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
   - `resolver_refuses_a_same_cluster_scratch_with_an_unconfined_account`
   - `resolver_runs_in_a_precreated_database_with_a_confined_account`
   - `resolver_empties_the_supplied_database_when_the_run_refuses`
-  - `resolver_compiles_a_managed_view_over_a_baseline_table`
-  - `resolver_refuses_a_baseline_that_differs_from_the_target`
-  - `resolver_refuses_a_baseline_that_creates_a_managed_object`
-  - `resolver_runs_the_baseline_before_any_managed_object` (its `SET`s do
+  - `resolver_compiles_a_managed_view_over_an_externals_table`
+  - `resolver_refuses_an_externals_file_that_differs_from_the_target`
+  - `resolver_refuses_an_externals_file_that_creates_a_managed_object`
+  - `resolver_runs_the_externals_file_before_any_managed_object` (its `SET`s do
     not reach the compile; a setting it changes is read by the compatibility
     qualification)
-  - `resolver_refuses_a_baseline_object_left_uncompared`
+  - `resolver_refuses_an_externals_file_object_left_uncompared`
   - `resolver_compares_an_external_table_without_its_foreign_keys_and_triggers`
   - `resolver_refuses_a_chain_through_an_external_object_naming_it`
   - `resolver_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view`
   - `resolver_refuses_an_external_view_staged_as_a_table` (the computed-field
     `xmin(ext.v)` case binds differently on a table)
-  - `resolver_refuses_a_question_that_needs_routine_source_the_baseline_lacks`
+  - `resolver_refuses_a_question_that_needs_routine_source_the_externals_file_lacks`
   - `resolver_reports_a_write_through_a_shape_view_with_the_real_definition_remedy`
-  - `resolver_stages_a_cast_and_an_operator_over_external_types_in_the_baseline`
-  - `resolver_reproduces_the_deployers_usage_of_a_schema_the_baseline_creates`
+  - `resolver_stages_a_cast_and_an_operator_over_external_types_in_the_externals_file`
+  - `resolver_reproduces_the_deployers_usage_of_a_schema_the_externals_file_creates`
   - `resolver_recheck_binds_the_target_by_engine_identity`
   - `resolver_recheck_refuses_an_external_shape_changed_after_planning`
   - `resolver_recheck_refuses_a_target_changed_after_the_run` (a
@@ -797,7 +797,7 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
     the deployer's authorization, each written from a second connection)
   - `resolver_seals_an_accepted_build_limitation_and_rechecks_it`
   - `an_unstaged_external_object_of_any_class_is_refused_by_name` (a routine
-    and a relation, with no baseline: the object, the declaration and the
+    and a relation, with no externals file: the object, the declaration and the
     remedy, #1517)
   - `resolver_publishes_its_rechecked_plan_in_the_exact_order` (`flow_pg`):
     `explain` of the published plan from the file alone, and `--staged`

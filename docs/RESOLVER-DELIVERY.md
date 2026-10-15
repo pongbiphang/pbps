@@ -9,14 +9,15 @@ child follows the repository's full local verification, review and CI gates.
 
 **Re-planned by #1528 and #1636 (DEC-1528.1, DEC-1636.1).** There is one
 resolver, on a server or Docker scratch the operator vouches for (#1672,
-#1674), with external objects from a reviewed baseline (#1673). The measured
+#1674), with external objects from a reviewed externals file (#1673). The measured
 profiles (#608, #609) were removed by #1636, and the confidential source
 transfer (#617) is closed. #615 is delivered for PostgreSQL planning by
 #1514–#1517: the resolver's plan is published after the fresh
 pre-publication recheck, from the sealed order (DEC-1516.1), and `explain`
 shows its evidence offline (DEC-1517.1). The remaining order:
-1. [#1778](https://github.com/pongbiphang/pbps/issues/1778): the baseline
-   draft command, then automatic fill;
+1. [#1778](https://github.com/pongbiphang/pbps/issues/1778): the externals file
+   draft command, after [#2007](https://github.com/pongbiphang/pbps/issues/2007)
+   renames the file from `baseline`; automatic fill after #1956;
 2. [#616](https://github.com/pongbiphang/pbps/issues/616): apply under the
    deployment lock, with #618's approval-consumer checks;
 3. SQL Server: [#619](https://github.com/pongbiphang/pbps/issues/619),
@@ -126,7 +127,7 @@ and in the schema it bound into, plus every cast. Each shared surface is then
 **unresolved** with a named condition: a target candidate scratch did not
 reproduce, an engine object whose properties differ, a role in a binding or a
 compile-order ambiguity (DEC-613.2). Runtime-bound bodies are compared by
-header and listed separately. External objects come from the baseline
+header and listed separately. External objects come from the externals file
 (#1673); surfaces that could reach an object it does not stage are
 unresolved rather than guessed. The comparison is an in-memory report of
 logical identities; it publishes no plan, evidence or SQL (#614, #615).
@@ -268,8 +269,8 @@ The JSON is the field the human line and the viewer read.
 Three gates refuse by name, as `resolver.unresolved`, before deployable
 output exists: SQL Server resolution (#619, #620); `--staged` with a plan that
 needs the resolver; and a retained external object of any candidate class
-that the baseline does not stage, named with the declaration that could bind
-it, whether or not the entry has a baseline.
+that the externals file does not stage, named with the declaration that could bind
+it, whether or not the entry has an externals file.
 
 SPEC §9.3.2 is delivered for PostgreSQL planning only. Applying a resolved
 plan is #616, and this build refuses it before any DDL.

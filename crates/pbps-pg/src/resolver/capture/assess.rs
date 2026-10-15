@@ -120,10 +120,11 @@ impl Managed {
         self.relations.contains(&key) || self.indexes.contains(&key)
     }
 
-    /// Whether an object a baseline created holds a managed name: a
+    /// Whether an object an externals file created holds a managed name: a
     /// relation, index or row type the project declares (#1673). A routine
     /// is not matched by name, since an unmanaged overload may share one; a
-    /// baseline routine with a declared signature fails the compile instead,
+    /// routine the externals file creates with a declared signature fails the
+    /// compile instead,
     /// which never replaces a routine.
     pub(super) fn names(&self, object: &ObjectIdentity) -> bool {
         let [schema, name] = object.name.as_slice() else {
@@ -248,7 +249,7 @@ fn is_system(schema: &str) -> bool {
 
 /// The surfaces worth comparing: an object in a user schema that carries
 /// bindings on scratch. Scratch's user schemas hold the desired managed
-/// objects and, for the resolver, what its baseline staged, so
+/// objects and, for the resolver, what its externals file staged, so
 /// these are the managed declarations and their parts, and the staged
 /// objects with bindings, whose verdicts no declaration reads.
 fn surfaces(
@@ -400,7 +401,7 @@ fn carries(
             continue;
         }
         // The object itself first: an operator's owner is its operand type,
-        // which over built-in types is not what the baseline staged.
+        // which over built-in types is not what the externals file staged.
         if staged.holds(object) || staged.holds(owner(object)) {
             return true;
         }
@@ -439,7 +440,7 @@ pub fn assess(
     assess_with(target, desired, managed, paths, order, None)
 }
 
-/// [`assess`] where scratch also holds what a resolver baseline staged and
+/// [`assess`] where scratch also holds what a resolver's externals file staged and
 /// the comparison accepted (#1673). A staged object, and what it carries,
 /// counts as reconstructed. One with bindings is assessed as a surface too,
 /// but only a declaration's verdict is read.
@@ -505,7 +506,7 @@ pub(super) fn assess_with(
             || member.name.first().is_some_and(|schema| is_system(schema));
         if system {
             // A system schema may also hold what a superuser created
-            // there. The baseline's comparison already accepted such a
+            // there. The externals file's comparison already accepted such a
             // root by its header, without the body (SPEC §9.3.2). Only
             // the root itself: an extension's member there was compared
             // through its extension's version alone, so it is compared
@@ -521,7 +522,7 @@ pub(super) fn assess_with(
             };
         }
         // Scratch's user schemas hold only the declarations, what
-        // creating them made, and what the baseline staged, so a member
+        // creating them made, and what the externals file staged, so a member
         // only scratch has was reproduced. A target member, whether
         // scratch has the same identity or the plan drops it, must be
         // the project's own, or staged and compared.
@@ -580,10 +581,10 @@ pub(super) fn assess_with(
             Verdict::Unresolved {
                 condition: match unstaged {
                     // A retained external object, whatever its class and
-                    // whether or not the entry has a baseline (#1517).
+                    // whether or not the entry has an externals file (#1517).
                     Some(member) => format!(
-                        "{} on the target is not in the resolver's baseline, and {} could \
-                         bind it; add it to the baseline, or select no resolver and keep \
+                        "{} on the target is not in the resolver's externals file, and {} could \
+                         bind it; add it to the externals file, or select no resolver and keep \
                          ADR-0013's conservative rebuild",
                         overload(member),
                         // The declaration, not its part: a view's rule, a

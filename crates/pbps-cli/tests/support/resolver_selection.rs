@@ -2,7 +2,7 @@ use super::*;
 
 fn configure(d: &Demo, dialect: &str) {
     std::fs::write(d.dir.join("pbps.yml"), format!(
-        "dialect: {dialect}\nresolve_with: local\nresolvers:\n  local:\n    kind: docker\n    image: registry.invalid/team/engine:preloaded\n  internal:\n    kind: docker\n    image: registry.invalid/team/engine:approved\n    pull: if_missing\n    baseline: db/baseline.sql\n    outside_writes: allow\n  scratch:\n    kind: server\n    url_env: PBPS_RESOLVER_UNSET_606\nenvironments:\n  prod:\n    url_env: PBPS_TARGET_606\n    resolve_with: scratch\n    fingerprint_key_file: {}\n  stage:\n    url_env: PBPS_TARGET_606\n",
+        "dialect: {dialect}\nresolve_with: local\nresolvers:\n  local:\n    kind: docker\n    image: registry.invalid/team/engine:preloaded\n  internal:\n    kind: docker\n    image: registry.invalid/team/engine:approved\n    pull: if_missing\n    externals: db/externals.sql\n    outside_writes: allow\n  scratch:\n    kind: server\n    url_env: PBPS_RESOLVER_UNSET_606\nenvironments:\n  prod:\n    url_env: PBPS_TARGET_606\n    resolve_with: scratch\n    fingerprint_key_file: {}\n  stage:\n    url_env: PBPS_TARGET_606\n",
         key_file(d).display()
     )).unwrap();
 }
@@ -250,12 +250,12 @@ pub fn connected(server: &str, dialect: &str) {
         assert!(!key_file(&d).exists());
         assert_eq!(selected["profile"]["kind"], kind, "{value}");
         assert_eq!(selected["profile"]["pull"].as_str(), pull, "{value}");
-        // A Docker entry's baseline and outside-write choice (#1674) reach
+        // A Docker entry's externals file and outside-write choice (#1674) reach
         // the envelope, which the archived sets before 39 refuse.
         if expected_name == "internal" {
             assert_eq!(selected["profile"]["outside_writes"], "allow", "{value}");
             assert_eq!(
-                selected["profile"]["baseline"], "db/baseline.sql",
+                selected["profile"]["externals"], "db/externals.sql",
                 "{value}"
             );
         }

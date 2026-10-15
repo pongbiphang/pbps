@@ -1,12 +1,12 @@
-//! What a resolver baseline staged on scratch, compared with the target
+//! What a resolver's externals file staged on scratch, compared with the target
 //! (SPEC §9.3.2; #1673).
 //!
-//! Each object the baseline created is compared with everything that hangs
+//! Each object the externals file created is compared with everything that hangs
 //! off it, a part of a part too, except what a binding does not read:
 //! foreign keys, CHECKs and constraint triggers, defaults, triggers,
 //! policies, rules, non-unique indexes and the source of a routine's body or
 //! a view's query. A binding reads an object's shape, not how it computes or
-//! guards it, so a baseline may omit those, and a view may be staged as a
+//! guards it, so an externals file may omit those, and a view may be staged as a
 //! shape view. What is left out is listed, not what is compared, so a kind
 //! of part no one thought of refuses when it differs (#1783). An extension's
 //! members are compared each on its own: nothing is accepted for belonging
@@ -16,13 +16,13 @@
 use super::logical::Catalog;
 use super::manifest::Input;
 use super::{CaptureError, CaptureScope, CapturedInputs, Managed};
-use crate::resolver::baseline::{Created, Object};
+use crate::resolver::externals::{Created, Object};
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_db::transport::QueryConnection;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The objects a baseline staged whose own shapes the comparison accepted:
+/// The objects an externals file staged whose own shapes the comparison accepted:
 /// its roots and the members of its extensions. Their target fingerprints
 /// join the sealed capture, and the assessment takes them, and their parts,
 /// as reconstructed. Nothing is in it for being a member of something
@@ -105,7 +105,7 @@ impl Staged {
     }
 }
 
-/// Why a baseline's objects could not be accepted.
+/// Why an externals file's objects could not be accepted.
 #[derive(Debug)]
 pub enum StageError {
     /// A capture of either side failed.
@@ -114,7 +114,7 @@ pub enum StageError {
     Refused(Vec<String>),
 }
 
-/// Compares what the baseline created on `scratch`, `created` as the
+/// Compares what the externals file created on `scratch`, `created` as the
 /// inventory found it there, with the same objects on `target`: each root,
 /// and each extension member, on its own. `managed` is every side of the
 /// managed set the plan touches.
@@ -133,8 +133,8 @@ pub async fn compare(
                     resolved.insert(identity, object.described.clone());
                 }
                 None => refused.push(format!(
-                    "the baseline created {}, which the comparison with the target does not \
-                     cover; leave it out of the baseline",
+                    "the externals file created {}, which the comparison with the target does not \
+                     cover; leave it out of the externals file",
                     object.described
                 )),
             }
@@ -150,9 +150,9 @@ pub async fn compare(
                     resolved.insert(identity, object.described.clone());
                 }
                 None => refused.push(format!(
-                    "the baseline created {}, an extension's member the comparison with the \
+                    "the externals file created {}, an extension's member the comparison with the \
                      target cannot read, so no plan can seal its extension; leave the \
-                     extension out of the baseline, or select no resolver",
+                     extension out of the externals file, or select no resolver",
                     object.described
                 )),
             }
@@ -170,8 +170,8 @@ pub async fn compare(
     for (identity, described) in &resolved {
         if managed.iter().any(|m| m.names(identity)) {
             refused.push(format!(
-                "the baseline created {described}, which is in the managed set; leave it out of \
-                 the baseline, which stages only objects outside it"
+                "the externals file created {described}, which is in the managed set; leave it out of \
+                 the externals file, which stages only objects outside it"
             ));
         }
     }
@@ -196,7 +196,7 @@ pub async fn compare(
         .iter()
         .map(|identity| {
             format!(
-                "the baseline created {}, which the target does not have",
+                "the externals file created {}, which the target does not have",
                 resolved[identity]
             )
         })
@@ -490,7 +490,7 @@ fn differences(
     for (object, on_target) in target {
         match scratch.get(object) {
             None => findings.push(format!(
-                "the target has {} and the baseline does not",
+                "the target has {} and the externals file does not",
                 name(object)
             )),
             Some(staged) if staged != on_target => {
@@ -503,7 +503,7 @@ fn differences(
                     .into_iter()
                     .collect();
                 findings.push(format!(
-                    "the baseline's {} differs from the target's in {}",
+                    "the externals file's {} differs from the target's in {}",
                     name(object),
                     fields.join(", ")
                 ));
@@ -514,7 +514,7 @@ fn differences(
     for object in scratch.keys() {
         if !target.contains_key(object) && described.get(object).is_none() {
             findings.push(format!(
-                "the baseline has {} and the target does not",
+                "the externals file has {} and the target does not",
                 name(object)
             ));
         }
@@ -674,9 +674,9 @@ mod tests {
         assert_eq!(
             findings,
             [
-                "the baseline's column a of relation ext.t differs from the target's in atttypid",
-                "the target has relation ext.t_pkey and the baseline does not",
-                "the target has index ext.t_pkey and the baseline does not",
+                "the externals file's column a of relation ext.t differs from the target's in atttypid",
+                "the target has relation ext.t_pkey and the externals file does not",
+                "the target has index ext.t_pkey and the externals file does not",
             ]
         );
         // Negative: the same shape names nothing.

@@ -542,8 +542,8 @@
               "$ref": "#/$defs/PullPolicy",
               "default": "never"
             },
-            "baseline": {
-              "description": "As a server entry's: the SQL file that stages the objects outside\nthe managed set (#1673).",
+            "externals": {
+              "description": "As a server entry's: the SQL file that stages the objects outside\nthe managed set (#1673, named `externals` since #2007).",
               "type": [
                 "string",
                 "null"
@@ -583,8 +583,8 @@
                 }
               ]
             },
-            "baseline": {
-              "description": "A SQL file, relative to the project root, that creates on scratch\nthe objects outside the managed set that managed objects reference\n(#1673). It runs on scratch only, before any managed object, and\neach object it creates is compared with the target.",
+            "externals": {
+              "description": "A SQL file, relative to the project root, that creates on scratch\nthe objects outside the managed set that managed objects reference\n(#1673). It runs on scratch only, before any managed object, and\neach object it creates is compared with the target. Named\n`baseline` until #2007, a word the ledger's state reset also uses.",
               "type": [
                 "string",
                 "null"
@@ -622,10 +622,10 @@
       ]
     },
     "OutsideWrites": {
-      "description": "What a baseline may change outside the scratch database (#1674).",
+      "description": "What an externals file may change outside the scratch database (#1674).",
       "oneOf": [
         {
-          "description": "A baseline that changes catalog state outside the scratch database\n(a role, another database's settings) is rolled back and refused\n(DEC-1673.1).",
+          "description": "An externals file that changes catalog state outside the scratch database\n(a role, another database's settings) is rolled back and refused\n(DEC-1673.1).",
           "type": "string",
           "const": "refuse"
         },
@@ -1220,7 +1220,7 @@
           "type": "string"
         },
         "outside_writes": {
-          "description": "Whether the baseline's writes outside the scratch database were\n`refused` or `allowed` (and then not checked).",
+          "description": "Whether the externals file's writes outside the scratch database were\n`refused` or `allowed` (and then not checked).",
           "type": "string"
         },
         "rule": {
@@ -2278,6 +2278,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 44,
+  "x-pbps-schema-version": 45,
   "x-pbps-tool-version": "0.0.0"
 }
