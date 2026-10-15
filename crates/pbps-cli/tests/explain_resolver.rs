@@ -512,6 +512,67 @@ fn a_refusal_shows_the_files_values_escaped_and_never_raw() {
     }
 }
 
+/// The decoder repeats some of the text it stopped at raw (an unknown variant)
+/// and some behind Rust's `Debug` escapes (a string where a number belongs), and
+/// the refusal shows either with its backslashes doubled, so the two characters
+/// `\n` the file held and a line break are two different sentences (#2038). The
+/// column serde reports differs between the two files, so what pins the
+/// property is the quoted text and not the whole line.
+#[test]
+fn a_decode_refusal_tells_a_line_break_from_the_two_characters_backslash_n() {
+    let ordinary = {
+        let mut plan = resolved_plan();
+        plan.origin = PlanOrigin::Database;
+        plan.analysis = PlanAnalysis::Ordinary;
+        serde_json::to_value(&plan).unwrap()
+    };
+    let with = |pointer: &str, text: &str| {
+        let mut value = ordinary.clone();
+        *value.pointer_mut(pointer).unwrap() = serde_json::Value::String(text.into());
+        value
+    };
+    // The file holds a line break / the two characters backslash and `n`.
+    let (line_break, two_characters) = ("a\nb", "a\\nb");
+    for (what, pointer, raw_line_break, raw_two) in [
+        (
+            "an unknown variant, quoted raw",
+            "/origin",
+            "unknown variant `a\\nb`",
+            "unknown variant `a\\\\nb`",
+        ),
+        (
+            "a string where a number belongs, quoted with Debug escapes",
+            "/version",
+            "invalid type: string \"a\\\\nb\"",
+            "invalid type: string \"a\\\\\\\\nb\"",
+        ),
+    ] {
+        let first = Artifact::new(&with(pointer, line_break));
+        let second = Artifact::new(&with(pointer, two_characters));
+        for format in ["text", "json"] {
+            let first = first.explain(format);
+            let second = second.explain(format);
+            assert_inert(&first, &[raw_line_break], &format!("{what}: {format}"));
+            assert_inert(&second, &[raw_two], &format!("{what}: {format}"));
+            let (first, second) = (
+                String::from_utf8_lossy(&first.stderr).into_owned(),
+                String::from_utf8_lossy(&second.stderr).into_owned(),
+            );
+            assert_ne!(first, second, "{what}");
+            // Negative: neither refusal holds the other's quoted text, which
+            // is what a backslash left alone would make both of them show.
+            assert!(!first.contains(raw_two), "{what}: {first:?}");
+            assert!(!second.contains(raw_line_break), "{what}: {second:?}");
+        }
+        let (first_applied, second_applied) = (
+            apply_refused(&first, &"00".repeat(32)),
+            apply_refused(&second, &"00".repeat(32)),
+        );
+        assert_inert(&first_applied, &[raw_line_break], &format!("apply: {what}"));
+        assert_inert(&second_applied, &[raw_two], &format!("apply: {what}"));
+    }
+}
+
 /// Negative: only control and invisible characters are rewritten. A name that
 /// is merely not ASCII is shown as the file spells it, so the escape does not
 /// make a refusal harder to read for a valid Unicode identifier.

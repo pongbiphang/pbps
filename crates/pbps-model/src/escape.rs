@@ -31,40 +31,30 @@ use std::fmt;
 /// The backslash is escaped as well. Otherwise the two characters `\n` written
 /// in a file and the line break escaped from it would read the same, and an
 /// escape that cannot be told apart from the text is not showing what was there.
+///
+/// That holds for a decoder's sentence too, which quotes some of the text it
+/// stopped at with Rust's `Debug` escapes (`string "a\nb"`) and some raw (an
+/// unknown variant's name). Doubling the first form shows a line break as `\\n`
+/// and a backslash as `\\\\`, which reads oddly but loses nothing; leaving the
+/// backslash alone would show the raw-quoted `\n` the same whether the file held
+/// a line break or the two characters (DEC-2032.1, #2038).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Escaped<'a>(pub &'a str);
 
 impl fmt::Display for Escaped<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_inert(f, self.0, true)
+        write_inert(f, self.0)
     }
 }
 
-/// [`Escaped`] for a sentence that has already been through an escape of its
-/// own, which keeps the backslash it was given.
-///
-/// A decoder quotes the text it stopped at with Rust's `Debug` escapes
-/// (`string "a\nb"`); doubling those would show a line break as `\\n` and a
-/// reader would take the doubled form for a backslash the file held. The
-/// characters it quotes *raw* — an unknown field's name, a variant's — are
-/// still escaped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EscapedSentence<'a>(pub &'a str);
-
-impl fmt::Display for EscapedSentence<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_inert(f, self.0, false)
-    }
-}
-
-fn write_inert(f: &mut fmt::Formatter<'_>, text: &str, double_backslash: bool) -> fmt::Result {
+fn write_inert(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
     use fmt::Write as _;
     for c in text.chars() {
         match c {
             '\n' => f.write_str("\\n")?,
             '\r' => f.write_str("\\r")?,
             '\t' => f.write_str("\\t")?,
-            '\\' if double_backslash => f.write_str("\\\\")?,
+            '\\' => f.write_str("\\\\")?,
             c if hides_or_moves(c) => write!(f, "\\u{{{:x}}}", u32::from(c))?,
             c => f.write_char(c)?,
         }
@@ -96,7 +86,7 @@ fn hides_or_moves(c: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Escaped, EscapedSentence};
+    use super::Escaped;
 
     fn shown(text: &str) -> String {
         Escaped(text).to_string()
@@ -153,13 +143,30 @@ mod tests {
     }
 
     #[test]
-    fn a_decoder_sentence_keeps_the_escapes_it_already_carries() {
-        // serde quotes a string value with `Debug` escapes: they are already
-        // inert and are not doubled. What it quotes raw is escaped.
-        let sentence = "invalid type: string \"a\\nb\", unknown variant `c\nd\u{1b}`";
+    fn a_decoder_sentence_is_shown_the_same_way_whichever_way_it_quoted() {
+        // serde quotes a string value with `Debug` escapes and a variant or a
+        // field name raw. The file held a line break in the first and the two
+        // characters `\n` in the second, and each pair is told apart.
+        let quoted = |text: &str| format!("invalid type: string {text:?}, expected u32");
+        let raw = |text: &str| format!("unknown variant `{text}`, expected `x`");
+        let sentences: [&dyn Fn(&str) -> String; 2] = [&quoted, &raw];
+        for sentence in sentences {
+            let line_break = Escaped(&sentence("a\nb")).to_string();
+            let two_characters = Escaped(&sentence("a\\nb")).to_string();
+            assert_ne!(line_break, two_characters);
+            assert!(!line_break.chars().any(char::is_control), "{line_break:?}");
+        }
         assert_eq!(
-            EscapedSentence(sentence).to_string(),
-            "invalid type: string \"a\\nb\", unknown variant `c\\nd\\u{1b}`"
+            Escaped(&quoted("a\nb")).to_string(),
+            "invalid type: string \"a\\\\nb\", expected u32"
+        );
+        assert_eq!(
+            Escaped(&raw("a\nb\u{1b}")).to_string(),
+            "unknown variant `a\\nb\\u{1b}`, expected `x`"
+        );
+        assert_eq!(
+            Escaped(&raw("a\\nb")).to_string(),
+            "unknown variant `a\\\\nb`, expected `x`"
         );
     }
 
