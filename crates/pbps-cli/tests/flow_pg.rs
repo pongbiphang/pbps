@@ -8794,6 +8794,19 @@ fn doctor_keeps_fractions_of_a_second_in_a_partition_runway() {
     }
 }
 
+/// A default horizon above the largest value an integer key holds is a
+/// question `doctor` cannot ask, and says so, while one landing exactly on the
+/// largest value is asked (#2020). On 16 and 18. The whole scenario is
+/// `support/partition_runway.rs`'s.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn doctor_does_not_call_a_series_short_of_a_value_past_the_integer_maximum() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        partition_runway::integer_ceiling(server, &format!("runway-int-2020-{k}"));
+    }
+}
+
 /// `doctor` does not read a partitioned table's occupancy through a parent
 /// that row-level security filters for the account it runs as: the runway and
 /// the DEFAULT's rows are each `…-unknown`, never "no row", while the owner, a

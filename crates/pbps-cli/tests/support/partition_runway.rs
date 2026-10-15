@@ -867,6 +867,141 @@ pub fn fractions(server: &str, slug: &str) {
     );
 }
 
+/// `doctor` on integer parents whose default horizon would lie above the
+/// largest value the key's type holds (#2020): no partition can end there, so
+/// the series is not called short of it, and the finding says the question
+/// cannot be asked. A horizon landing exactly on the largest value is asked as
+/// usual, and so is a count of partitions.
+///
+/// Four parents, each a series of two partitions of one width with a row in
+/// the second, and the default horizon of twice that width:
+///
+/// | parent | key | width | the horizon reaches | what `doctor` says |
+/// |---|---|---|---|---|
+/// | `small` | `smallint` | 100 | one past 32767 | undetermined |
+/// | `plain` | `integer` | 1000 | one past 2147483647 | undetermined |
+/// | `big` | `bigint` | 1000 | one past 9223372036854775807 | undetermined |
+/// | `exact` | `integer` | 1000 | 2147483647 itself | short, to `2147483647` |
+pub fn integer_ceiling(server: &str, slug: &str) {
+    let own = OwnDatabase::new(server, slug);
+    let conn = own.connection().to_owned();
+    on_server(&conn, "CREATE SCHEMA app");
+    let d = Demo::new(slug);
+    // `held` is where the second partition starts, and the rows are in it.
+    let parent = |name: &str, ty: &str, width: i128, held: i128| {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!(
+                "table: app.{name}\ncolumns:\n  id: {{type: bigint, nullable: false}}\n  \
+                 k: {{type: {ty}, nullable: false}}\nprimary_key: [id, k]\n\
+                 partition_by: [k]\npartitions:\n  \
+                 {name}_a: {{from: ['{}'], to: ['{held}']}}\n  \
+                 {name}_b: {{from: ['{held}'], to: ['{}']}}\n",
+                held - width,
+                held + width
+            ),
+        )
+        .unwrap();
+        held
+    };
+    let rows = [
+        parent("small", "smallint", 100, i128::from(i16::MAX) - 200 + 1),
+        parent("plain", "integer", 1000, i128::from(i32::MAX) - 2000 + 1),
+        parent("big", "bigint", 1000, i128::from(i64::MAX) - 2000 + 1),
+        parent("exact", "integer", 1000, i128::from(i32::MAX) - 2000),
+    ];
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    succeeds(d.run(&["fmt"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &conn]));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    for (name, held) in ["small", "plain", "big", "exact"].iter().zip(rows) {
+        on_server(&conn, &format!("INSERT INTO app.{name} VALUES (1, {held})"));
+    }
+
+    let doctor = |conn: &str| {
+        let o = d.run(&["doctor", "--db", conn, "--format", "json"]);
+        assert_eq!(code(&o), 0, "warnings leave doctor green: {}", stdout(&o));
+        json_of(&o)
+    };
+    let found = |json: &serde_json::Value, id: &str, parent: &str| -> Vec<String> {
+        json["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{json}"))
+            .iter()
+            .filter(|f| {
+                f["id"] == id
+                    && f["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("app.{parent}'s"))
+            })
+            .map(|f| f["message"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // The default horizon.
+    let json = doctor(&conn);
+    for (parent, ty, max) in [
+        ("small", "smallint", i16::MAX.to_string()),
+        ("plain", "integer", i32::MAX.to_string()),
+        ("big", "bigint", i64::MAX.to_string()),
+    ] {
+        assert!(
+            found(&json, "doctor.partition-runway", parent).is_empty(),
+            "{parent} is not short of a value no partition can end at: {json}"
+        );
+        let unknown = found(&json, "doctor.partition-runway-unknown", parent);
+        assert_eq!(unknown.len(), 1, "{parent}: {json}");
+        for said in [
+            "the default horizon, twice the newest partition's width".to_owned(),
+            format!("reaches past the largest {ty} value, {max}"),
+            "set partition_runway to a count of partitions, as `3`".to_owned(),
+            "undetermined, not fine".to_owned(),
+        ] {
+            assert!(
+                unknown[0].contains(&said),
+                "{parent}: {said}: {}",
+                unknown[0]
+            );
+        }
+    }
+    // A target exactly at the largest value is a point a series can end at.
+    assert!(
+        found(&json, "doctor.partition-runway-unknown", "exact").is_empty(),
+        "{json}"
+    );
+    let exact = found(&json, "doctor.partition-runway", "exact");
+    assert_eq!(exact.len(), 1, "{json}");
+    assert!(
+        exact[0].contains("end at `2147482647`") && exact[0].contains("to `2147483647` at least"),
+        "{}",
+        exact[0]
+    );
+
+    // A count of partitions is no point on the axis: every parent is asked.
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        "dialect: postgres\npartition_runway: 3\n",
+    )
+    .unwrap();
+    let json = doctor(&conn);
+    for parent in ["small", "plain", "big", "exact"] {
+        assert!(
+            found(&json, "doctor.partition-runway-unknown", parent).is_empty(),
+            "{parent}: {json}"
+        );
+        let short = found(&json, "doctor.partition-runway", parent);
+        assert_eq!(short.len(), 1, "{parent}: {json}");
+        assert!(
+            short[0].contains("(3 partitions)"),
+            "{parent}: {}",
+            short[0]
+        );
+    }
+}
+
 /// Row-level security hides rows from `doctor`'s `EXISTS` through a parent, so
 /// neither question is answered as "nothing there" for an account it applies
 /// to (#1925, DEC-1925.1).
