@@ -28,6 +28,7 @@ pub fn text_dependents(
     op: &Operation,
     owners: &dyn Owners,
     before: Snapshot<'_>,
+    after: Snapshot<'_>,
     renames_block: bool,
 ) -> Result<Effects, OwnerError> {
     let mut fx = Effects::default();
@@ -37,7 +38,17 @@ pub fn text_dependents(
     let Some(table) = base_table(op, owners, before, &column.table)? else {
         return Ok(fx);
     };
+    // A dependent the plan replaces under its own name with text that no
+    // longer names the column does not stand in the way: its baseline
+    // incarnation goes, and the requirement cannot tell it from the new one.
+    let replaced = pbps_model::operation::final_table(after, &table);
     for (name, check) in &table.table.checks {
+        if replaced
+            .and_then(|t| t.checks.get(name))
+            .is_some_and(|c| !dialect.may_name(&c.expression, &column.name))
+        {
+            continue;
+        }
         if dialect.may_name(&check.expression, &column.name) {
             fx.requires.push(Requirement::Absent(
                 table.part(PartKey::Check(name.clone())),
@@ -53,6 +64,22 @@ pub fn text_dependents(
             IndexKey::Expression(text) => dialect.may_name(text, &column.name),
             IndexKey::Column(_) => false,
         });
+        let names = |index: &pbps_model::Index| {
+            index
+                .filter
+                .as_deref()
+                .is_some_and(|f| dialect.may_name(f, &column.name))
+                || index.columns.iter().any(|c| match &c.key {
+                    IndexKey::Expression(text) => dialect.may_name(text, &column.name),
+                    IndexKey::Column(_) => false,
+                })
+        };
+        if replaced
+            .and_then(|t| t.indexes.get(name))
+            .is_some_and(|i| !names(i))
+        {
+            continue;
+        }
         if filtered || expression {
             fx.requires.push(Requirement::Absent(
                 table.part(PartKey::Index(name.clone())),

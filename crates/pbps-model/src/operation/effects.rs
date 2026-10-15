@@ -482,7 +482,14 @@ impl Cx<'_> {
                 let owner = self.table(&column.table)?;
                 self.exists(ObjectKey::Table(owner.clone()));
                 let key = ColumnKey::Recorded(Recorded(uid.clone()));
-                self.exists(ObjectKey::Column(key.clone()));
+                // A source put on, or kept through a retype, follows the
+                // column's last rewrite: a sequence is created `AS` the
+                // final type. One given up goes before the retype
+                // (DEC-1889.1, rank -3 before -1), so it does not wait for
+                // the column's rewrites.
+                if matches!(to, ValueSource::Identity(_) | ValueSource::Sequence(_)) {
+                    self.exists(ObjectKey::Column(key.clone()));
+                }
                 // The engine refuses an identity on a nullable column, so a
                 // tightening goes first; and it refuses to relax an identity
                 // column, so a numbering given up goes before the relaxation
@@ -1647,6 +1654,13 @@ pub fn base_table<'a>(
         table,
         owner: Recorded(uid),
     }))
+}
+
+/// The table the plan leaves where the baseline's `base` was, by identity:
+/// what a dependent of the baseline's table becomes, or does not.
+pub fn final_table<'a>(after: Snapshot<'a>, base: &BaseTable<'_>) -> Option<&'a Table> {
+    let name = after.ids.tables.get(&base.owner.0)?;
+    after.schema.tables.get(name)
 }
 
 /// A key for a module, so a dialect need not name `ObjectKey` variants.

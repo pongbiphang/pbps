@@ -466,6 +466,13 @@ pub fn graph(
         let Some(enders) = index.removers.get(key) else {
             continue;
         };
+        // Only the baseline's incarnation is ended before a new one is made.
+        // A key the baseline does not hold is ended by an operation that ends
+        // what a plan step made, so that step comes first (a detach makes a
+        // table's own default, which a later change of it then ends).
+        if checks.baseline && held(key) == Some(false) {
+            continue;
+        }
         if let Some(&first) = enders.iter().min_by_key(|&&i| operations[i].id()) {
             for &made in makers {
                 edge(first, made, Source::Effect, Because::Replaces(key.clone()));

@@ -44,6 +44,12 @@ fn setup() -> (Schema, IdsFile, ModuleId, Module) {
 }
 
 fn violations(logical: Vec<Change>, order: &[usize]) -> Vec<Violation> {
+    let (schema, _, _, _) = setup();
+    violations_ending_in(&schema, logical, order)
+}
+
+/// [`violations`] for a plan that ends in `after` rather than where it began.
+fn violations_ending_in(after: &Schema, logical: Vec<Change>, order: &[usize]) -> Vec<Violation> {
     let (schema, ids, _, _) = setup();
     let logical: Vec<PlannedChange> = logical.into_iter().map(PlannedChange::new).collect();
     let ops = Operations::of_plan(&logical, ModuleEdits::InPlace);
@@ -54,7 +60,11 @@ fn violations(logical: Vec<Change>, order: &[usize]) -> Vec<Violation> {
         ids: &ids,
     };
     let baseline = Baseline::of(snapshot, &owners);
-    let shadowed = analyse(&ops, &owners, snapshot, snapshot, &Mssql);
+    let ending = Snapshot {
+        schema: after,
+        ids: &ids,
+    };
+    let shadowed = analyse(&ops, &owners, snapshot, ending, &Mssql);
     assert!(shadowed.unowned.is_empty(), "{:?}", shadowed.unowned);
     let ordered = ops.reordered(order);
     let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
@@ -201,4 +211,52 @@ fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
     assert_eq!(verdict(true), []);
     // Negative: a key that stands throughout wants its parent row first.
     assert!(!verdict(false).is_empty());
+}
+
+#[test]
+fn a_computed_column_rewritten_off_a_function_does_not_hold_the_function_back() {
+    let (schema, _, id, module) = setup();
+    let computed = |expression: &str| ComputedColumn {
+        expression: expression.into(),
+        persisted: false,
+        not_null: false,
+    };
+    let plan = |new: &str| {
+        vec![
+            Change::DropComputedColumn {
+                table: t(),
+                name: "c".into(),
+                computed: computed("dbo.f(a)"),
+            },
+            Change::AddComputedColumn {
+                table: t(),
+                name: "c".into(),
+                computed: computed(new),
+            },
+            Change::AlterModule {
+                id: id.clone(),
+                module: Box::new(module.clone()),
+            },
+        ]
+    };
+    let ending = |new: &str| {
+        let mut after = schema.clone();
+        after
+            .tables
+            .get_mut(&t())
+            .unwrap()
+            .computed
+            .insert("c".into(), computed(new));
+        after
+    };
+    // Rewritten to read the column alone, the function is free to change
+    // once the old column is gone, after the new one is back.
+    assert_eq!(
+        violations_ending_in(&ending("a + 1"), plan("a + 1"), &[0, 1, 2]),
+        []
+    );
+    // Negative: rewritten to read the function again, the column back before
+    // the alter would call the old function.
+    let late = violations_ending_in(&ending("dbo.f(a)"), plan("dbo.f(a)"), &[0, 1, 2]);
+    assert!(!late.is_empty(), "{late:?}");
 }

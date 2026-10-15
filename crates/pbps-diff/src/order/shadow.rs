@@ -445,7 +445,23 @@ fn sink(operations: &Operations, lines: &[String], fail: bool) {
                 panic!("the order report is incomplete: {error}");
             }
         }
-        None if fail => panic!("the effects contradict this order:\n{}", lines.join("\n")),
+        None if fail => {
+            // The order itself, so the finding can be read without a rerun.
+            let order: Vec<String> = operations
+                .as_slice()
+                .iter()
+                .map(|op| {
+                    let mut text = format!("{} {:?}", op.id(), op.change());
+                    clip(&mut text, 330);
+                    text
+                })
+                .collect();
+            panic!(
+                "the effects contradict this order:\n{}\nthe order:\n{}",
+                lines.join("\n"),
+                order.join("\n")
+            )
+        }
         None => {}
     }
 }
@@ -494,7 +510,7 @@ pub(crate) fn observe_constraints(
     let ops = operations.as_slice();
     let name = |i: usize| {
         let mut text = format!("{}:{:?}", ops[i].id(), ops[i].change());
-        clip(&mut text, 110);
+        clip(&mut text, 330);
         text
     };
     let mut lines = Vec::new();

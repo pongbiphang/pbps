@@ -71,11 +71,26 @@ impl Dialect for Mssql {
         op: &pbps_model::operation::Operation,
         owners: &dyn pbps_model::operation::Owners,
         before: pbps_model::operation::Snapshot<'_>,
-        _after: pbps_model::operation::Snapshot<'_>,
+        after: pbps_model::operation::Snapshot<'_>,
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         use pbps_model::Change;
-        use pbps_model::operation::{PartKey, Requirement, base_table, base_table_named};
-        let mut fx = pbps_dialect::engine_effects::text_dependents(self, op, owners, before, true)?;
+        use pbps_model::operation::{
+            PartKey, Requirement, base_table, base_table_named, final_table,
+        };
+        let mut fx =
+            pbps_dialect::engine_effects::text_dependents(self, op, owners, before, after, true)?;
+        // A computed column the plan replaces under its own name with an
+        // expression that no longer reads what the step changes does not
+        // stand in its way: its baseline incarnation goes, and a requirement
+        // cannot tell it from the new one. A replacement that still reads it
+        // keeps the requirement, so the step runs between the two.
+        let replaced_off = |base: &pbps_model::operation::BaseTable<'_>,
+                            column: &str,
+                            reads: &dyn Fn(&str) -> bool| {
+            final_table(after, base)
+                .and_then(|t| t.computed.get(column))
+                .is_some_and(|c| !reads(&c.expression))
+        };
         #[allow(clippy::wildcard_enum_match_arm)]
         match op.change() {
             Change::AlterModule { .. } | Change::DropModule { .. } => {
@@ -103,7 +118,9 @@ impl Dialect for Mssql {
                             continue;
                         };
                         for (column, computed) in &table.computed {
-                            if self.may_name_qualified(&computed.expression, schema, function) {
+                            let reads =
+                                |text: &str| self.may_name_qualified(text, schema, function);
+                            if reads(&computed.expression) && !replaced_off(&base, column, &reads) {
                                 fx.requires.push(Requirement::Absent(
                                     base.part(PartKey::Computed(column.clone())),
                                 ));
@@ -117,7 +134,8 @@ impl Dialect for Mssql {
             | Change::AlterColumnNullability { column, .. } => {
                 if let Some(table) = base_table(op, owners, before, &column.table)? {
                     for (name, computed) in &table.table.computed {
-                        if self.may_name(&computed.expression, &column.name) {
+                        let reads = |text: &str| self.may_name(text, &column.name);
+                        if reads(&computed.expression) && !replaced_off(&table, name, &reads) {
                             fx.requires.push(Requirement::Absent(
                                 table.part(PartKey::Computed(name.clone())),
                             ));
@@ -128,7 +146,8 @@ impl Dialect for Mssql {
             Change::RenameColumn { table, from, .. } => {
                 if let Some(base) = base_table(op, owners, before, table)? {
                     for (name, computed) in &base.table.computed {
-                        if self.may_name(&computed.expression, from) {
+                        let reads = |text: &str| self.may_name(text, from);
+                        if reads(&computed.expression) && !replaced_off(&base, name, &reads) {
                             fx.requires.push(Requirement::Absent(
                                 base.part(PartKey::Computed(name.clone())),
                             ));

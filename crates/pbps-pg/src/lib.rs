@@ -1768,12 +1768,12 @@ impl Dialect for Postgres {
         op: &pbps_model::operation::Operation,
         owners: &dyn pbps_model::operation::Owners,
         before: pbps_model::operation::Snapshot<'_>,
-        _after: pbps_model::operation::Snapshot<'_>,
+        after: pbps_model::operation::Snapshot<'_>,
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         use pbps_model::Change;
         use pbps_model::operation::{Incarnation, PartKey, Resource, base_table};
         let mut fx =
-            pbps_dialect::engine_effects::text_dependents(self, op, owners, before, false)?;
+            pbps_dialect::engine_effects::text_dependents(self, op, owners, before, after, false)?;
         if let Change::RenameTable { from, to, .. } = op.change()
             && from.schema != to.schema
             && let Some(base) = base_table(op, owners, before, from)?

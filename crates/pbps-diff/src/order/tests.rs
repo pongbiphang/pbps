@@ -1598,3 +1598,109 @@ fn the_scheduled_observer_accepts_the_right_order_and_refuses_a_wrong_one() {
     assert!(!run(&[1, 0], Stage::Final), "the parent first is refused");
     assert!(!run(&[1, 0], Stage::Differ));
 }
+
+/// `t.id` retyped to `bigint` and its numbering source changed from `from`
+/// to `to`, the numbering listed first.
+fn numbered_and_retyped(from: pbps_model::ValueSource, to: pbps_model::ValueSource) -> Plan {
+    let table = |source: pbps_model::ValueSource, ty: &str| {
+        let mut table = Table::default();
+        let mut column = Column::new(ty.parse().unwrap());
+        column.nullable = false;
+        column.value_source = source;
+        table.columns.insert("id".into(), column);
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table(from.clone(), "int"));
+    after.tables.insert(t("t"), table(to.clone(), "bigint"));
+    let id = uid(UidKind::Column, "t.id");
+    let ids = Plan::ids(&["t"], &[("t", "id")]);
+    Plan {
+        logical: vec![
+            p(Change::AlterColumnNumbering {
+                uid: id.clone(),
+                column: t("t").column("id"),
+                ty: "bigint".parse().unwrap(),
+                from,
+                to,
+            }),
+            p(Change::AlterColumnType {
+                uid: id,
+                column: t("t").column("id"),
+                from: int(),
+                to: "bigint".parse().unwrap(),
+                from_nullable: false,
+                to_nullable: false,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+            }),
+        ],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    }
+}
+
+#[test]
+fn a_numbering_source_given_up_goes_before_the_retype_and_one_put_on_goes_after() {
+    use pbps_model::{Identity, ValueSource};
+    let identity = ValueSource::Identity(Identity {
+        seed: 1,
+        increment: 1,
+    });
+    let none = ModuleDeps::new();
+    // Given up for a default the new type takes (DEC-1889.1, rank -3 before -1).
+    let plan = numbered_and_retyped(identity.clone(), ValueSource::Default("0".into()));
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL),
+        [],
+        "the numbering first is accepted"
+    );
+    // Negative: put on a column the plan retypes, the sequence is created
+    // `AS` the final type, so the numbering first is refused and the retype
+    // first accepted.
+    let plan = numbered_and_retyped(ValueSource::None, identity);
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        !run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL).is_empty(),
+        "a source put on before the retype is refused"
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+#[test]
+fn a_key_the_baseline_lacks_is_ended_after_the_step_that_makes_it() {
+    // A step makes a key and a later one ends it: the baseline held none, so
+    // the ending cannot be of an older incarnation the maker replaces.
+    let (ops, fx, baseline) = create_then_add_column().analysed(ModuleEdits::InPlace);
+    // The added column's own key, which the baseline does not hold.
+    let key = fx[1]
+        .creates
+        .iter()
+        .find_map(|r| match r {
+            Resource::Column(key) => Some(key.clone()),
+            Resource::Object(..) => None,
+        })
+        .expect("the column the second step adds");
+    let make = Effects {
+        creates: vec![Resource::Object(key.clone(), Incarnation::Final)],
+        ..Effects::default()
+    };
+    let end = Effects {
+        removes: vec![Resource::Object(key.clone(), Incarnation::Base)],
+        ..Effects::default()
+    };
+    let fx = [make.clone(), end.clone()];
+    let none = ModuleDeps::new();
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // Negative: with the baseline guard off the key counts as held by it, and
+    // the ending must precede the making.
+    let held = Checks {
+        baseline: false,
+        ..Checks::ALL
+    };
+    assert!(!run(&ops, &fx, &baseline, &[0, 1], &none, held).is_empty());
+}
