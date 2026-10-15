@@ -202,6 +202,19 @@ fn without_oids(def: &Definition) -> Definition {
         match c {
             Component::Array(e) => Component::Array(Box::new(component(e))),
             Component::Defined(d) => Component::Defined(Box::new(without_oids(d))),
+            Component::Range {
+                schema,
+                name,
+                typtype,
+                subtype,
+                ..
+            } => Component::Range {
+                oid: 0,
+                schema: schema.clone(),
+                name: name.clone(),
+                typtype: typtype.clone(),
+                subtype: Box::new(component(subtype)),
+            },
             Component::Other {
                 schema,
                 name,
@@ -1132,6 +1145,65 @@ async fn an_owner_is_trusted_only_when_it_can_become_the_deployer_or_is_a_superu
         assert!(names(&su_own).is_empty());
 
         std::mem::drop(me);
+        db.drop().await;
+    }
+}
+
+/// A range inside a type is pinned with the type it ranges over: the range
+/// keeps its identity when that type gains a CHECK (review of #2039). So does
+/// a multirange, and a domain over the range.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_range_inside_a_type_is_pinned_with_the_type_it_ranges_over() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "ranges").await;
+        db.sql(
+            "CREATE SCHEMA app;
+             CREATE DOMAIN app.pos AS integer CHECK (VALUE > 0);
+             CREATE TYPE app.pos_range AS RANGE (subtype = app.pos);
+             CREATE TYPE app.holds_range AS (r app.pos_range);
+             CREATE TYPE app.holds_multirange AS (m app.pos_multirange);
+             CREATE TYPE app.holds_array AS (a app.pos_range[]);
+             CREATE DOMAIN app.over_range AS app.pos_range;",
+        )
+        .await;
+        let label = server.label;
+        let names = [
+            "holds_range",
+            "holds_multirange",
+            "holds_array",
+            "over_range",
+        ];
+        let mut before = Vec::new();
+        for name in names {
+            before.push(pin_of(&mut db.conn, "app", name).await);
+        }
+        // The nested range is read with its subtype, and shows it.
+        let holds = present(&mut db.conn, "app", "holds_range").await;
+        let Body::Composite(c) = &holds.definition().body else {
+            panic!("{:?}", holds.definition())
+        };
+        assert!(
+            matches!(&c.attributes[0].ty, Component::Range { name, typtype, subtype, .. }
+                if name == "pos_range" && typtype == "r"
+                    && matches!(&**subtype, Component::Defined(d) if d.name == "pos")),
+            "{:?} on {label}",
+            c.attributes[0].ty
+        );
+        // A no-op leaves every pin as it was.
+        db.sql("COMMENT ON DOMAIN app.pos IS 'positive'").await;
+        for (name, pin) in names.iter().zip(&before) {
+            assert_eq!(&pin_of(&mut db.conn, "app", name).await, pin, "{name}");
+        }
+        db.sql("ALTER DOMAIN app.pos ADD CONSTRAINT small CHECK (VALUE < 100) NOT VALID")
+            .await;
+        for (name, pin) in names.iter().zip(&before) {
+            assert_ne!(
+                &pin_of(&mut db.conn, "app", name).await,
+                pin,
+                "{name} on {label} kept its pin when the range's subtype changed"
+            );
+        }
         db.drop().await;
     }
 }

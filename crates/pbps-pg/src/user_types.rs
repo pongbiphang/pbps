@@ -467,8 +467,19 @@ pub enum Component {
     /// An enum, a domain or a composite (a table's row type included), read
     /// in full, since a change to it is a change to what this one means.
     Defined(Box<Definition>),
-    /// Anything else (a built-in, an extension's type, a range), by OID and
-    /// name: it cannot be changed in place.
+    /// A range or multirange type, with the type it ranges over read in
+    /// full: the range keeps its identity when that type gains a CHECK, and
+    /// what a value of it means has changed.
+    Range {
+        oid: Oid,
+        schema: String,
+        name: String,
+        /// `r` or `m`.
+        typtype: String,
+        subtype: Box<Component>,
+    },
+    /// Anything else (a built-in, an extension's type), by OID and name: it
+    /// cannot be changed in place.
     Other {
         oid: Oid,
         schema: String,
@@ -552,6 +563,13 @@ impl Component {
         match self {
             Self::Array(element) => json!(["array", element.canonical()]),
             Self::Defined(definition) => json!(["type", definition.canonical()]),
+            Self::Range {
+                oid,
+                schema,
+                name,
+                typtype,
+                subtype,
+            } => json!(["range", oid, schema, name, typtype, subtype.canonical()]),
             Self::Other {
                 oid,
                 schema,
@@ -565,6 +583,7 @@ impl Component {
         match self {
             Self::Array(element) => element.collect_owners(out),
             Self::Defined(definition) => definition.collect_owners(out),
+            Self::Range { subtype, .. } => subtype.collect_owners(out),
             Self::Other { .. } => {}
         }
     }
@@ -812,6 +831,8 @@ struct Catalog {
     labels: BTreeMap<Oid, Vec<String>>,
     constraints: BTreeMap<Oid, Vec<DomainConstraint>>,
     attributes: BTreeMap<Oid, Vec<AttributeRow>>,
+    /// A range's or multirange's type, by the OID of the range or multirange.
+    subtypes: BTreeMap<Oid, Oid>,
 }
 
 /// An OID list as SQL. The values are integers this module read, never text.
@@ -844,6 +865,15 @@ async fn define(conn: &mut Conn, top: Oid) -> Result<Definition, DbError> {
             } else if t.typtype == "d" {
                 wanted.push(t.base);
             }
+        }
+        let ranged: Vec<Oid> = fetched
+            .iter()
+            .filter(|t| matches!(t.typtype.as_str(), "r" | "m"))
+            .map(|t| t.oid)
+            .collect();
+        if !ranged.is_empty() {
+            fetch_subtypes(conn, &ranged, &mut catalog).await?;
+            wanted.extend(ranged.iter().filter_map(|oid| catalog.subtypes.get(oid)));
         }
         for t in fetched {
             catalog.types.insert(t.oid, t);
@@ -948,6 +978,24 @@ impl Built {
         if t.is_defined_kind() {
             return Ok(Component::Defined(Box::new(self.definition(catalog, oid)?)));
         }
+        if matches!(t.typtype.as_str(), "r" | "m") {
+            self.nodes += 1;
+            if self.nodes > MAX_TYPES * 10 {
+                return Err(DbError::BadRow(
+                    "a type's definition is too large to pin".to_owned(),
+                ));
+            }
+            let subtype = *catalog.subtypes.get(&oid).ok_or_else(|| {
+                DbError::BadRow(format!("range type {oid} has no `pg_range` row"))
+            })?;
+            return Ok(Component::Range {
+                oid,
+                schema: t.schema.clone(),
+                name: t.name.clone(),
+                typtype: t.typtype.clone(),
+                subtype: Box::new(self.component(catalog, subtype)?),
+            });
+        }
         Ok(Component::Other {
             oid,
             schema: t.schema.clone(),
@@ -1011,6 +1059,25 @@ async fn fetch_types(conn: &mut Conn, oids: &[Oid]) -> Result<Vec<TypeRow>, DbEr
         }
     }
     Ok(found)
+}
+
+/// The type each range, and each multirange, is over.
+async fn fetch_subtypes(conn: &mut Conn, oids: &[Oid], into: &mut Catalog) -> Result<(), DbError> {
+    let list = oid_array(oids);
+    let rows = conn
+        .query(&format!(
+            "SELECT rngtypid::pg_catalog.int8 AS typ, rngsubtype::pg_catalog.int8 AS subtype
+               FROM pg_catalog.pg_range WHERE rngtypid = ANY({list})
+             UNION ALL
+             SELECT rngmultitypid::pg_catalog.int8, rngsubtype::pg_catalog.int8
+               FROM pg_catalog.pg_range WHERE rngmultitypid = ANY({list})"
+        ))
+        .await?;
+    for row in &rows {
+        into.subtypes
+            .insert(need(row, "typ")?, need(row, "subtype")?);
+    }
+    Ok(())
 }
 
 async fn fetch_labels(conn: &mut Conn, oids: &[Oid], into: &mut Catalog) -> Result<(), DbError> {
@@ -1537,6 +1604,19 @@ mod tests {
 
     /// An array of a type is not the type, and a type held in full is not
     /// the same type named opaquely.
+    fn range_over(subtype: Component) -> Pin {
+        composite_of(|c| {
+            c.attributes[1].ty = Component::Range {
+                oid: 3904,
+                schema: "pg_catalog".to_owned(),
+                name: "int4range".to_owned(),
+                typtype: "r".to_owned(),
+                subtype: Box::new(subtype),
+            };
+        })
+        .pin()
+    }
+
     #[test]
     fn the_shape_of_a_component_is_part_of_the_pin() {
         let with = |ty: Component| composite_of(|c| c.attributes[1].ty = ty).pin();
@@ -1551,9 +1631,43 @@ mod tests {
             with(Component::Array(Box::new(Component::Defined(Box::new(
                 enumeration(&["x"]),
             ))))),
+            range_over(leaf(23, "int4")),
+            range_over(leaf(20, "int8")),
+            range_over(Component::Defined(Box::new(domain()))),
         ];
         let distinct: BTreeSet<&Pin> = pins.iter().collect();
         assert_eq!(distinct.len(), pins.len(), "{pins:?}");
+    }
+
+    /// A range keeps its OID when the type it ranges over changes, so the
+    /// subtype is read in full, however deep the change is (review of #2039).
+    #[test]
+    fn a_change_inside_the_type_a_range_is_over_changes_the_outer_pin() {
+        let over_domain =
+            |edit: fn(&mut Domain)| range_over(Component::Defined(Box::new(domain_of(edit))));
+        assert_eq!(over_domain(|_| {}), over_domain(|_| {}));
+        assert_ne!(over_domain(|_| {}), over_domain(|d| d.not_null = true));
+        assert_ne!(
+            over_domain(|_| {}),
+            over_domain(|d| d
+                .constraints
+                .push(constraint("extra", false, "CHECK (true)")))
+        );
+        // And its owners are counted with the type's.
+        let mut nested = domain();
+        nested.owner = 20;
+        let outer = composite_of(|c| {
+            c.attributes[1].ty = Component::Range {
+                oid: 1,
+                schema: "app".to_owned(),
+                name: "r".to_owned(),
+                typtype: "r".to_owned(),
+                subtype: Box::new(Component::Defined(Box::new(nested))),
+            };
+        });
+        let mut ids = BTreeSet::new();
+        outer.collect_owners(&mut ids);
+        assert!(ids.contains(&20), "{ids:?}");
     }
 
     #[test]

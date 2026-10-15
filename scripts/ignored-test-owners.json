@@ -1534,6 +1534,7 @@
         "user_types_tests::each_change_to_a_type_changes_its_pin_and_a_no_op_does_not",
         "user_types_tests::other_kinds_of_type_are_refused_by_name",
         "user_types_tests::reading_a_type_runs_none_of_its_code",
+        "user_types_tests::a_range_inside_a_type_is_pinned_with_the_type_it_ranges_over",
         "user_types_tests::the_closure_names_what_a_type_reaches"
       ]
     },
