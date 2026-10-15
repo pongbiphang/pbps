@@ -305,8 +305,8 @@ indexes:
   partition `{modulus: m, remainder: r}`. Validation refuses what the engine
   does: a LIST key of more than one column, a value two partitions take, a
   bound of another strategy than its parent's, a DEFAULT under HASH, a
-  remainder not below its modulus, a modulus that is not a factor of the
-  next larger, and hash partitions that overlap. A tree's strategy never
+  remainder not below its modulus, a modulus above 2147483647, a modulus that
+  is not a factor of the next larger, and hash partitions that overlap. A tree's strategy never
   changes in a plan (DEC-1632.1). A partition in
   another schema is named qualified. A partition is a table of its own, with
   an identity. Its columns and keys are its parent's, and so are the clones of

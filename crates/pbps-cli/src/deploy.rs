@@ -2666,7 +2666,26 @@ pub(crate) async fn refuse_misspelt(
         && found.defaults_as_parents.is_empty()
         && found.ambiguous.is_empty()
     {
-        return Ok(as_read(schema, &cells, &bounds));
+        let read = as_read(schema, &cells, &bounds);
+        // Two list values spelt apart and read as one, such as `2026-01-01`
+        // and `2026-01-01 00:00:00` in two partitions of a timestamp key,
+        // pass the declared check and route one value twice, which the
+        // engine refuses at the second partition. The declared schema's own
+        // problems are validation's; only the reading's new ones are here
+        // (#1632).
+        let declared = pbps_dialect::check_partitions(schema);
+        let new: Vec<String> = pbps_dialect::check_partitions(&read)
+            .into_iter()
+            .filter(|p| !declared.contains(p))
+            .collect();
+        if !new.is_empty() {
+            bail!(
+                "the partition bounds, as the engine reads their date/time values, \
+                 collide:\n  {}",
+                new.join("\n  ")
+            );
+        }
+        return Ok(read);
     }
     // Two keys the engine reads as one row would insert twice and fail on
     // the second; the alias check (74) cannot see them on a table that holds

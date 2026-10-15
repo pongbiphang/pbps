@@ -5170,9 +5170,13 @@ they carry a range (#1776).
 another strategy than its parent's. LIST values are compared as declared
 text: two spellings of one value are both accepted here, and the connected
 spelling check names the one the engine spells otherwise, as for a range
-(DEC-1170.1). Hash overlap is decided exactly: two partitions overlap when
-the remainder of the larger modulus, taken by the smaller, is the smaller's
-remainder.
+(DEC-1170.1). A date or time is taken as the engine reads it (DEC-1883.1),
+so the connected check runs validation again on what it read: two values
+spelt apart in two partitions and read as one are refused there, as a value
+two partitions take. Hash overlap is decided exactly: two partitions overlap
+when the remainder of the larger modulus, taken by the smaller, is the
+smaller's remainder. A modulus is at most 2147483647: the grammar reads it as
+a signed int, and a larger one is a syntax error (measured on 16 and 18).
 
 **A strategy change is refused**, as a changed key or bound is: "change its
 partitioning". The engine has no statement for it.

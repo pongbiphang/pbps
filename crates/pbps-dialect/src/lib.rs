@@ -3079,6 +3079,18 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
                     ));
                     continue;
                 }
+                // The grammar reads both as a signed int: measured on 16 and
+                // 18, a modulus of 2147483647 is taken and 2147483648 is a
+                // syntax error. A remainder is below its modulus, so the
+                // modulus is the one to bound.
+                if i32::try_from(*modulus).is_err() {
+                    problems.push(format!(
+                        "`{child}` takes modulus {modulus}, and PostgreSQL takes a modulus up \
+                         to {}",
+                        i32::MAX
+                    ));
+                    continue;
+                }
                 hashed
                     .entry(&of.parent)
                     .or_default()
@@ -4582,8 +4594,8 @@ mod tests {
     /// LIST and HASH trees are held to what the engine takes, measured on 16
     /// and 18 (#1632, DEC-1632.1): a LIST key of one column, values no two
     /// partitions share, a bound of its parent's kind, no DEFAULT under HASH,
-    /// a remainder below its modulus, moduli each a factor of the next, and
-    /// hash partitions that do not overlap. A DEFAULT under LIST, NULL in one
+    /// a remainder below its modulus, a modulus the engine's int takes, moduli
+    /// each a factor of the next, and hash partitions that do not overlap. A DEFAULT under LIST, NULL in one
     /// list, and hash partitions of mixed moduli that do not overlap are
     /// accepted.
     #[test]
@@ -4628,6 +4640,9 @@ mod tests {
             ("app.h0", of("app.h", hash(4, 0))),
             ("app.h1", of("app.h", hash(2, 1))),
             ("app.h2", of("app.h", hash(4, 2))),
+            // The largest modulus the engine takes.
+            ("app.g", partitioned(S::Hash, &["a"])),
+            ("app.g0", of("app.g", hash(2_147_483_647, 2_147_483_646))),
         ]);
         assert!(
             check_partitions(&ok).is_empty(),
@@ -4681,6 +4696,10 @@ mod tests {
             (
                 "both take rows of `app.h`",
                 with(vec![("app.h3", of("app.h", hash(8, 5)))]),
+            ),
+            (
+                "PostgreSQL takes a modulus up to 2147483647",
+                with(vec![("app.g1", of("app.g", hash(2_147_483_648, 0)))]),
             ),
         ] {
             let found = check_partitions(&schema);
