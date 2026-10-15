@@ -700,8 +700,10 @@ mod tests {
     /// `visibility:` stand for one fact per name the fixture carries). A change
     /// to what is compared appends an entry and bumps `REPORTED_RULE`; an
     /// earlier entry is a record and is never edited, because evidence sealed
-    /// under it is refused by that name (`ACCEPTED_RULES`, DEC-2012.1).
-    const RULE_HISTORY: &[(&str, &[&str])] = &[
+    /// under it is refused by that name (`ACCEPTED_RULES`, DEC-2012.1). The third
+    /// field names the fact whose verdict the entry changed under the same name,
+    /// `None` for an entry that changes the set of names (#2047).
+    const RULE_HISTORY: &[(&str, &[&str], Option<&str>)] = &[
         // Through #2010, which removed `xmloption` from the settings.
         (
             "pg-reported-scope-v1",
@@ -732,6 +734,7 @@ mod tests {
                 "setting:xmloption",
                 "visibility:app",
             ],
+            None,
         ),
         (
             "pg-reported-scope-v2",
@@ -761,6 +764,7 @@ mod tests {
                 "setting:shared_preload_libraries",
                 "visibility:app",
             ],
+            None,
         ),
     ];
 
@@ -768,11 +772,14 @@ mod tests {
     /// are read as a set: the list order is only how the history is written, so
     /// a later entry that reorders the names before it compares nothing new
     /// and would invalidate every saved plan under the earlier identifier for
-    /// no change (#2034).
-    fn refuse_history(history: &[(&str, &[&str])]) -> Result<(), String> {
+    /// no change (#2034). An entry over the same set is a new rule only by
+    /// declaring the fact whose verdict it changed, and that fact has to be one
+    /// both it and the entry before it list: the name alone cannot say "same
+    /// facts, changed verdict" (#2047, DEC-2012.1).
+    fn refuse_history(history: &[(&str, &[&str], Option<&str>)]) -> Result<(), String> {
         let sets: Vec<std::collections::BTreeSet<&str>> = history
             .iter()
-            .map(|(identifier, names)| {
+            .map(|(identifier, names, _)| {
                 let set: std::collections::BTreeSet<&str> = names.iter().copied().collect();
                 if set.len() == names.len() {
                     Ok(set)
@@ -781,15 +788,30 @@ mod tests {
                 }
             })
             .collect::<Result<_, _>>()?;
+        if let Some((identifier, _, Some(fact))) = history.first() {
+            return Err(format!(
+                "{identifier} revises {fact}, but no entry before it compared it"
+            ));
+        }
         for (pair, sets) in history.windows(2).zip(sets.windows(2)) {
             if pair[0].0 == pair[1].0 {
                 return Err(format!("{} is reused", pair[1].0));
             }
-            if sets[0] == sets[1] {
-                return Err(format!(
-                    "{} compares what {} compared",
-                    pair[1].0, pair[0].0
-                ));
+            match pair[1].2 {
+                Some(fact) if sets[0].contains(fact) && sets[1].contains(fact) => {}
+                Some(fact) => {
+                    return Err(format!(
+                        "{} revises {fact}, which {} and {} do not both list",
+                        pair[1].0, pair[0].0, pair[1].0
+                    ));
+                }
+                None if sets[0] == sets[1] => {
+                    return Err(format!(
+                        "{} compares what {} compared and declares no revised fact",
+                        pair[1].0, pair[0].0
+                    ));
+                }
+                None => {}
             }
         }
         Ok(())
@@ -799,20 +821,48 @@ mod tests {
     fn a_history_entry_that_only_reorders_or_repeats_names_is_refused() {
         // Negative: the same facts in another order are not a new rule, and
         // neither is a name listed twice or an identifier used twice.
-        assert!(refuse_history(&[("a", &["x", "y"]), ("b", &["y", "x"])]).is_err());
-        assert!(refuse_history(&[("a", &["x", "y"]), ("b", &["x", "x", "y"])]).is_err());
-        assert!(refuse_history(&[("a", &["x", "x"]), ("b", &["y"])]).is_err());
-        assert!(refuse_history(&[("a", &["x"]), ("a", &["y"])]).is_err());
+        assert!(refuse_history(&[("a", &["x", "y"], None), ("b", &["y", "x"], None)]).is_err());
+        assert!(
+            refuse_history(&[("a", &["x", "y"], None), ("b", &["x", "x", "y"], None)]).is_err()
+        );
+        assert!(refuse_history(&[("a", &["x", "x"], None), ("b", &["y"], None)]).is_err());
+        assert!(refuse_history(&[("a", &["x"], None), ("a", &["y"], None)]).is_err());
         // Positive: a changed set is accepted in either direction, whatever
         // the order it is written in.
-        assert!(refuse_history(&[("a", &["x", "y"]), ("b", &["y"])]).is_ok());
-        assert!(refuse_history(&[("a", &["y"]), ("b", &["z", "y"])]).is_ok());
-        assert!(refuse_history(&[("a", &["x"])]).is_ok());
+        assert!(refuse_history(&[("a", &["x", "y"], None), ("b", &["y"], None)]).is_ok());
+        assert!(refuse_history(&[("a", &["y"], None), ("b", &["z", "y"], None)]).is_ok());
+        assert!(refuse_history(&[("a", &["x"], None)]).is_ok());
+    }
+
+    #[test]
+    fn a_history_entry_over_the_same_names_is_accepted_only_for_a_declared_revision() {
+        // Positive: the same names under a new identifier are a new rule when
+        // the entry declares which fact's verdict changed, whatever the order.
+        assert!(
+            refuse_history(&[
+                ("a", &["x", "y"], None),
+                ("b", &["y", "x"], Some("x")),
+                ("c", &["x", "y"], Some("y")),
+            ])
+            .is_ok()
+        );
+        // A declaration beside a changed set is fine for a fact both list.
+        assert!(refuse_history(&[("a", &["x", "y"], None), ("b", &["x"], Some("x"))]).is_ok());
+        // Negative: no declaration, so the entry still compares nothing new.
+        assert!(refuse_history(&[("a", &["x", "y"], None), ("b", &["x", "y"], None)]).is_err());
+        // Negative: the declared fact is not one the entry lists.
+        assert!(
+            refuse_history(&[("a", &["x", "y"], None), ("b", &["x", "y"], Some("z"))]).is_err()
+        );
+        // Negative: nor one the entry before it compared, so nothing was
+        // revised; and the oldest entry has nothing to revise.
+        assert!(refuse_history(&[("a", &["x"], None), ("b", &["x", "z"], Some("z"))]).is_err());
+        assert!(refuse_history(&[("a", &["x"], Some("x"))]).is_err());
     }
 
     #[test]
     fn the_compared_facts_move_with_the_rule_identifier() {
-        let (current, pinned) = RULE_HISTORY.last().unwrap();
+        let (current, pinned, _) = RULE_HISTORY.last().unwrap();
         let report = compare_reported(&side("180006"), &side("180006"));
         let compared: std::collections::BTreeSet<&str> =
             report.facts.keys().map(String::as_str).collect();
@@ -832,13 +882,14 @@ mod tests {
             compared.difference(&pinned_set).collect::<Vec<_>>(),
             pinned_set.difference(&compared).collect::<Vec<_>>(),
         );
-        // A bump that compares the same facts is not a new rule, an identifier
-        // is not reused for another set, and no entry lists a name twice.
+        // A bump that compares the same facts is not a new rule unless it
+        // declares the fact whose verdict changed, an identifier is not reused
+        // for another set, and no entry lists a name twice.
         assert_eq!(refuse_history(RULE_HISTORY), Ok(()));
         // Only the newest identifier is read; each earlier one is refused by
         // name, whatever it compared.
         assert_eq!(ACCEPTED_RULES, [REPORTED_RULE]);
-        for (earlier, _) in &RULE_HISTORY[..RULE_HISTORY.len() - 1] {
+        for (earlier, _, _) in &RULE_HISTORY[..RULE_HISTORY.len() - 1] {
             assert!(!ACCEPTED_RULES.contains(earlier), "{earlier}");
         }
     }
