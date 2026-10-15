@@ -308,8 +308,12 @@ impl Cx<'_> {
                 let owner = Recorded(uid.clone());
                 if let Some(of) = &table.partition_of {
                     let parent = self.table(&of.parent)?;
+                    // The parent's columns and defaults are not required: a
+                    // partition created first is reached by the parent's own
+                    // `ADD COLUMN` and `SET DEFAULT`, which recurse, and one
+                    // created after copies them; both orders are valid
+                    // (DEC-1954.9).
                     self.exists(ObjectKey::Table(parent));
-                    self.relies_on_parent_columns(&of.parent)?;
                 }
                 for fk in table.foreign_keys.values() {
                     if fk.references_table != *name {
@@ -597,7 +601,6 @@ impl Cx<'_> {
                 parent,
                 column,
                 to,
-                fallback,
                 ..
             } => {
                 self.exists(ObjectKey::Table(Recorded(uid.clone())));
@@ -610,7 +613,13 @@ impl Cx<'_> {
                 // partition's default follows whatever the plan does to the
                 // parent's (DEC-1687.1, DEC-1954.5). Its release has nothing
                 // to keep.
-                if to.is_some() || fallback.is_some() {
+                //
+                // Only an own default (`to`) can be overwritten into a
+                // different value. A step with `to: None` writes only the
+                // `fallback`, the parent's final text, so the parent's
+                // recursion writes the same value in either order
+                // (DEC-1954.9).
+                if to.is_some() {
                     self.after_parent(parent, column, ParentAttribute::Default);
                 }
             }
@@ -939,35 +948,6 @@ impl Cx<'_> {
     /// A constraint over the rows validates them as the plan leaves them.
     fn requires_valid_data(&mut self, owner: &Recorded) {
         self.requires(Requirement::Reads(ObjectKey::Table(owner.clone())));
-    }
-
-    /// A partition is created with its own entries on its parent's columns as
-    /// they end (DEC-1687.1).
-    fn relies_on_parent_columns(&mut self, parent: &TableName) -> Result<(), OwnerError> {
-        let Some(parent_table) = self.after.schema.tables.get(parent) else {
-            // The parent as the desired state names it, or as the plan names
-            // it at this position: either way a missing table has no
-            // columns to rely on.
-            let by_uid = self.table(parent).ok().and_then(|o| self.final_of(&o));
-            return match by_uid {
-                Some((name, t)) => self.relies_on(name, t),
-                None => Ok(()),
-            };
-        };
-        self.relies_on(parent, parent_table)
-    }
-
-    fn relies_on(&mut self, parent: &TableName, table: &Table) -> Result<(), OwnerError> {
-        for (name, column) in &table.columns {
-            let Some(key) = self.final_column(&parent.column(name.as_str())) else {
-                continue;
-            };
-            self.exists(ObjectKey::Column(key.clone()));
-            if has_expression(&column.value_source) {
-                self.exists(ObjectKey::Default(key));
-            }
-        }
-        Ok(())
     }
 
     fn attach_rewrites(&mut self, owner: &Recorded, shape: &Table) -> Result<(), OwnerError> {

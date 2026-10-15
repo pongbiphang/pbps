@@ -5397,3 +5397,34 @@ default gone. The retype, the owned sequence's names and the rows the new
 source numbers stay with the class ranks DEC-1889.1 gave them: reading the
 column's values would order every row write before the numbering, which the
 engine does not require.
+
+<a id="dec-1954-9"></a>
+
+**DEC-1954.9. The verifier on the order that runs refused six kinds of valid
+order; each effect is narrowed to what the engine requires.** The first live
+run of the final-order check (`Stage::Final`) failed nine tests that pass on
+`master`, none a misorder:
+
+- A computed column, check or filtered index the plan replaces under its own
+  name with text that no longer reads what the step changes does not hold the
+  step back: a requirement that its baseline incarnation be gone could not
+  tell it from the new one. A replacement that still reads it keeps the
+  requirement.
+- A numbering source given up goes before the column's retype (DEC-1889.1,
+  rank -3 before -1), so only one put on waits for the column's rewrites.
+- `Replaces` orders an ending before a making only for a key the baseline
+  holds. For any other key the ending ends what a plan step made, so that step
+  comes first (a detach makes a table's own default, which a later change ends).
+- A `SetPartitionDefault` follows the parent's change only when it writes a
+  default of its own. A step with no own default writes only its fallback, the
+  parent's final text, which the parent's recursive `SET DEFAULT` writes again
+  in either order. Measured as emitted: the parent's change is plain `ALTER
+  TABLE`, not `ONLY`, so an own default is still overwritten by a later one.
+- A partition's `CREATE` requires its parent table and nothing of its columns
+  or defaults. Created before the parent's `ADD COLUMN` or `SET DEFAULT`, the
+  partition is reached by the recursion; created after, it copies them. Both
+  orders run on the engine (`partitions_are_added_and_dropped_through_the_cli`,
+  `a_partitions_default_taken_back_resolves_under_its_parents_schema`).
+
+What the narrowing gives up is recorded in #1998: a rewritten computed column
+whose function is altered before its drop is not refused.

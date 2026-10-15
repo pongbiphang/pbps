@@ -1704,3 +1704,150 @@ fn a_key_the_baseline_lacks_is_ended_after_the_step_that_makes_it() {
     };
     assert!(!run(&ops, &fx, &baseline, &[0, 1], &none, held).is_empty());
 }
+
+/// `par.v` has its default changed from `1` to `2`, and the standing
+/// partition `pt` is set to the parent's text (op 1) and to a default of its
+/// own (op 2): ops 0 (parent), 1 (take back), 2 (own).
+fn parent_default_changes_under_a_partition() -> Plan {
+    use pbps_model::{PartitionBound, PartitionColumn, PartitionOf, ValueSource};
+    let parent = |default: &str| {
+        let mut table = table_with(&[]);
+        let mut column = Column::new(int());
+        column.value_source = ValueSource::Default(default.into());
+        table.columns.insert("v".into(), column);
+        table
+    };
+    let member = |own: Option<&str>| {
+        let mut table = table_with(&[]);
+        table.partition_of = Some(PartitionOf {
+            parent: t("par"),
+            bound: PartitionBound::Default,
+            columns: own
+                .map(|d| {
+                    (
+                        "v".to_owned(),
+                        PartitionColumn {
+                            default: Some(d.into()),
+                            not_null: false,
+                        },
+                    )
+                })
+                .into_iter()
+                .collect(),
+        });
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("par"), parent("1"));
+    before.tables.insert(t("pt"), member(None));
+    after.tables.insert(t("par"), parent("2"));
+    after.tables.insert(t("pt"), member(Some("9")));
+    let ids = Plan::ids(&["par", "pt"], &[("par", "v")]);
+    let pt = uid(UidKind::Table, "pt");
+    let set = |to: Option<&str>| {
+        p(Change::SetPartitionDefault {
+            uid: pt.clone(),
+            table: t("pt"),
+            parent: t("par"),
+            column: "v".into(),
+            from: None,
+            to: to.map(Into::into),
+            fallback: Some("2".into()),
+        })
+    };
+    Plan {
+        logical: vec![
+            p(Change::AlterColumnDefault {
+                uid: uid(UidKind::Column, "par.v"),
+                column: t("par").column("v"),
+                from: Some("1".into()),
+                to: Some("2".into()),
+            }),
+            set(None),
+            set(Some("9")),
+        ],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    }
+}
+
+#[test]
+fn a_partition_taking_back_its_parents_default_does_not_wait_for_the_parents_change() {
+    let (ops, fx, baseline) =
+        parent_default_changes_under_a_partition().analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    // The take-back writes the parent's own text, which the parent's
+    // recursion writes again whichever runs first (DEC-1954.9).
+    for order in [[0, 1, 2], [1, 0, 2]] {
+        assert_eq!(
+            run(&ops, &fx, &baseline, &order, &none, Checks::ALL),
+            [],
+            "{order:?}"
+        );
+    }
+    // Negative: a default of the partition's own is overwritten by the
+    // parent's change, so it still follows it.
+    let early = run(&ops, &fx, &baseline, &[2, 0, 1], &none, Checks::ALL);
+    assert!(!early.is_empty(), "{early:?}");
+}
+
+#[test]
+fn a_partition_created_beside_a_parent_column_add_runs_in_either_order() {
+    use pbps_model::{PartitionBound, PartitionOf};
+    let member = {
+        let mut table = table_with(&[]);
+        table.partition_of = Some(PartitionOf {
+            parent: t("par"),
+            bound: PartitionBound::Default,
+            columns: Default::default(),
+        });
+        table
+    };
+    let mut after = Schema::default();
+    after.tables.insert(t("par"), table_with(&["id", "extra"]));
+    after.tables.insert(t("pt"), member.clone());
+    let plan = Plan {
+        logical: vec![
+            p(Change::CreateTable {
+                uid: uid(UidKind::Table, "par"),
+                name: t("par"),
+                table: Box::new(table_with(&["id"])),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+            p(Change::CreateTable {
+                uid: uid(UidKind::Table, "pt"),
+                name: t("pt"),
+                table: Box::new(member),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+            p(Change::AddColumn {
+                uid: uid(UidKind::Column, "par.extra"),
+                table: t("par"),
+                name: "extra".into(),
+                column: Box::new(Column::new(int())),
+            }),
+        ],
+        before: Schema::default(),
+        after,
+        before_ids: IdsFile::default(),
+        after_ids: Plan::ids(&["par", "pt"], &[("par", "id"), ("par", "extra")]),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    // The parent's column add recurses into a partition created before it, and
+    // a partition created after copies the column (DEC-1954.9).
+    for order in [[0, 1, 2], [0, 2, 1]] {
+        assert_eq!(
+            run(&ops, &fx, &baseline, &order, &none, Checks::ALL),
+            [],
+            "{order:?}"
+        );
+    }
+    // Negative: the parent table itself must exist first.
+    let early = run(&ops, &fx, &baseline, &[1, 0, 2], &none, Checks::ALL);
+    assert!(!early.is_empty(), "{early:?}");
+}
