@@ -770,6 +770,37 @@ mod tests {
         assert!(e.contains("has no type"), "{e}");
     }
 
+    /// The model holds a part of any length (#2021), so a reference longer than
+    /// PostgreSQL's 63 bytes reaches this dialect, which refuses every reference
+    /// by name. It is not a truncation message, and not the identifier limit's
+    /// own: `dbo.<name>` of 100 bytes is a valid SQL Server name, and the
+    /// reference is what is not supported.
+    #[test]
+    fn a_long_user_type_reference_is_refused_by_name_and_not_by_length() {
+        let name = "p".repeat(100);
+        let max = "p".repeat(128);
+        for declared in [
+            format!("dbo.{name}"),
+            format!("{name}.phone"),
+            format!("\"{name}\".\"{name}\""),
+            format!("dbo.{name}[]"),
+            format!("dbo.{max}"),
+            format!("{max}.{max}"),
+        ] {
+            let e = normalize(&ty(&declared)).expect_err(&declared).to_string();
+            assert!(
+                e.contains("references to user-defined types are not supported"),
+                "{declared}: {e}"
+            );
+            assert!(
+                !e.contains("PostgreSQL") && !e.contains("truncat"),
+                "{declared}: {e}"
+            );
+        }
+        // Negative: a built-in still normalizes beside them.
+        assert!(normalize(&ty("nvarchar(10)")).is_ok());
+    }
+
     include!("../tests/support/estimate_types.rs");
 
     #[test]
