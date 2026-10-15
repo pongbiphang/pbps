@@ -205,6 +205,10 @@ pub struct RawIdentity {
     /// takes `n` values at once, so a restart skips the ones it had not used
     /// and two sessions interleave in blocks rather than one at a time.
     pub cache: i64,
+    /// Whether the sequence is `AS` the column's type, as the engine makes
+    /// it. One altered to another type has bounds this model would read as
+    /// declared for the column's (#2013 review).
+    pub same_type: bool,
 }
 
 /// One row of `pg_constraint`, whatever its kind.
@@ -2440,12 +2444,32 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                 ),
             );
         }
-        // Its bounds, cycle and cache are held (#1921, DEC-1921.1).
+        // Its bounds, cycle and cache are held (#1921, DEC-1921.1), where
+        // its sequence is the column's type, as the engine makes it. One
+        // `ALTER SEQUENCE … AS` another type has bounds that type sets, and
+        // a retune the engine would refuse within it; it is named, and reads
+        // back with the engine's defaults, as before #1921 (#2013 review).
+        let options = if id.same_type {
+            sequence_options(&ty, id.increment, id.min, id.max, id.cycles, id.cache)
+        } else {
+            None
+        };
+        if options.is_none() {
+            note(
+                pulled,
+                &parts.name,
+                format!(
+                    "column `{}`.`{}` is an identity whose sequence is not `AS` the column's \
+                     type `{}`, which this model cannot hold. Its bounds, cycle and cache read \
+                     back as the engine's defaults for the column's type.",
+                    parts.name, raw.name, raw.ty
+                ),
+            );
+        }
         Identity {
             seed: id.seed,
             increment: id.increment,
-            options: sequence_options(&ty, id.increment, id.min, id.max, id.cycles, id.cache)
-                .unwrap_or_default(),
+            options: options.unwrap_or_default(),
         }
     });
 
@@ -5782,6 +5806,7 @@ mod tests {
                 max: i64::from(i32::MAX),
                 cycles: false,
                 cache: 1,
+                same_type: true,
             });
             let raw = RawCatalog {
                 tables: vec![table(1, "t")],
@@ -6327,7 +6352,8 @@ mod tests {
     /// An identity's sequence is held whole (#1921, DEC-1921.1): its bounds
     /// where they are not the type's defaults, its cycle and its cache, with
     /// nothing named. Before, all but the seed and increment were a named
-    /// limitation that read back as the engine's defaults.
+    /// limitation that read back as the engine's defaults, as they still are
+    /// where the sequence is not the column's type.
     #[test]
     fn an_identity_holds_its_sequences_bounds_cycle_and_cache() {
         let default_max = i64::from(i32::MAX);
@@ -6354,6 +6380,7 @@ mod tests {
                 max,
                 cycles,
                 cache,
+                same_type: true,
             });
             let raw = RawCatalog {
                 tables: vec![table(1, "t")],
@@ -6378,6 +6405,40 @@ mod tests {
                 "{min}..={max} cycles={cycles} cache={cache}"
             );
         }
+        // A sequence altered `AS` another type than its column's is named,
+        // and its bounds are not read as declared for the column's type
+        // (#2013 review).
+        let mut column = col(1, 1, "id", "integer");
+        column.nullable = false;
+        column.identity = Some(RawIdentity {
+            always: true,
+            seed: 1,
+            increment: 1,
+            min: 1,
+            max: i64::from(i16::MAX),
+            cycles: false,
+            cache: 1,
+            same_type: false,
+        });
+        let pulled = assemble(&RawCatalog {
+            tables: vec![table(1, "t")],
+            columns: vec![column],
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+            ..RawCatalog::default()
+        });
+        assert_eq!(
+            only(&pulled).columns["id"].value_source,
+            pbps_model::ValueSource::Identity(pbps_model::Identity::new(1, 1))
+        );
+        assert!(
+            pulled
+                .warnings
+                .iter()
+                .any(|w| w.contains("not `AS` the column's type")),
+            "{:?}",
+            pulled.warnings
+        );
     }
 
     /// `ON DELETE SET NULL (a)` nulls one column; `SetNull` nulls all of them.

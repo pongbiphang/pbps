@@ -1499,6 +1499,41 @@ fn diff_partial_rebuilding(
             }
         })
         .collect();
+    // A kept identity on a column this plan narrows: its sequence is
+    // retuned before the retype (#2013 review, DEC-1921.1). The engine moves
+    // an identity's sequence with its column, and measured on 16 and 18 it
+    // refuses the retype while a bound set for the wider type stands. An
+    // identity's column is an integer, so a retype that is not safe narrows
+    // its range, and bounds declared for the narrower type fit the wider one
+    // too; a widening keeps the retype first, where the old bounds fit.
+    let bounds_first: BTreeSet<ColumnRef> = planned
+        .iter()
+        .filter_map(|p| {
+            if let Change::AlterColumnType {
+                column, from, to, ..
+            } = &p.change
+                && dialect.type_change_risk(from, to) != pbps_dialect::TypeChangeRisk::Safe
+            {
+                Some(column)
+            } else {
+                None
+            }
+        })
+        .filter(|column| {
+            planned.iter().any(|p| {
+                matches!(
+                    &p.change,
+                    Change::AlterColumnNumbering {
+                        column: c,
+                        from: ValueSource::Identity(_),
+                        to: ValueSource::Identity(_),
+                        ..
+                    } if c == *column
+                )
+            })
+        })
+        .cloned()
+        .collect();
     let (early_release, sequence_cycles) =
         sequence_release_depths(planned.iter().map(|p| &p.change), &held_back);
     for renames in sequence_cycles {
@@ -1628,6 +1663,11 @@ fn diff_partial_rebuilding(
             .is_some_and(|of| parent_moved.contains(&(of.parent.clone(), column.clone())))
     };
     let sort_class = |c: &Change| -> (u8, usize) {
+        if let Change::AlterColumnNumbering { column, .. } = c
+            && bounds_first.contains(column)
+        {
+            return (COLUMN_ALTERATIONS, 0);
+        }
         if let Change::AttachPartition { table, .. } = c
             && late_attach.contains_key(table)
         {

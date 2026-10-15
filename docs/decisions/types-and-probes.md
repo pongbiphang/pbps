@@ -2210,6 +2210,11 @@ stored number would not. Spelling the default (`min: 1` counting up, a
 `cache: 1`) is refused with "leave out", so one sequence has one
 declaration and a pull of it plans to nothing.
 
+**Read** only where the engine made the sequence: an identity's sequence
+altered `AS` another type than its column's has that type's bounds, which
+read as declared would let a retune through that the engine refuses. It is
+named, and reads back with the engine's defaults, as before.
+
 **Validated** against what the engine refuses or reads back otherwise: a
 bound outside the type, bounds that do not cross (`min < max`), a start
 outside the declared bounds (the engine's `START value … cannot be less than
@@ -2222,12 +2227,22 @@ column under no key it is accepted. SQL Server's `IDENTITY` has only a seed
 and an increment, and refuses every option by name.
 
 **Changed in place.** A create, an added column and a source put on write
-the options into the `CREATE SEQUENCE` or the identity clause. A retune
+the options into the `CREATE SEQUENCE` or the identity clause. A source
+that cycles, continued past its bound by the values or the old counter,
+starts at its other bound, as `nextval` would, rather than having `setval`
+refused; nothing it reaches again can collide, since a cycle is never under
+a key. A retune
 writes only the options that change, a returning one as `NO MINVALUE`, `NO
 MAXVALUE`, `NO CYCLE` or `CACHE 1`, which measured reset each to the
 engine's own; a retune of start or increment alone reads as before. No new
-change kind, rank or pass: options travel on `CreateTable`, `AddColumn` and
-`AlterColumnNumbering` (#1776).
+change kind or pass: options travel on `CreateTable`, `AddColumn` and
+`AlterColumnNumbering` (#1776). One rank: a kept identity on a column this
+plan narrows is retuned first in class 9, before the retype. Measured on 16
+and 18, the engine moves an identity's sequence with its column and refuses
+the retype while a bound set for the wider type stands; an identity's
+column is an integer, so a retype that is not safe narrows, and bounds
+declared for the narrower type fit the wider. A widening keeps the retype
+first, where the old bounds fit (ORDERING.md).
 
 **Gated** (maintainer, 2026-10-14) as `numbering` only where a writer
 working today fails sooner: the bound the sequence counts toward set or
@@ -2238,11 +2253,14 @@ none can fail an insert that succeeds now.
 **Probed.** Measured, the engine refuses a bound the counter is already
 past (`RESTART value (10) cannot be greater than MAXVALUE (5)`), mid-apply.
 The pre-flight counts a kept source whose bounds move with its counter
-outside them. `pg_sequence_last_value` answers NULL for a counter this
-session cannot read as for one never called, so the privilege is asked
-first and an unreadable counter counts as in the way (DECISIONS 335); one
-never called is at its start. A source put on now continues up to its
-declared bound, not the type's, and the values probe counts against that.
+outside them. The counter the engine checks is the stored `last_value`,
+called or not: `setval(…, false)`, which a source put on by this tool
+leaves, moves it with no call, so `pg_sequence_last_value` (NULL until
+called) and the start are both wrong readings. The probe reads the sequence
+itself through `query_to_xml`, as the other counts do, and one this session
+may not `SELECT` counts as in the way (DECISIONS 335). A source put on now
+continues up to its declared bound, not the type's, and the values probe
+counts against that; one that cycles has nothing in its way.
 Both read the counter or the values before apply, which no earlier change
 in a plan moves: a column has one numbering change, and no statement a plan
 runs before it calls the sequence.

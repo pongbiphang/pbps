@@ -1022,7 +1022,7 @@ fn numbering(
         ));
     }
     // Put on the new one.
-    let (start, increment) = match to {
+    let (start, increment, options) = match to {
         ValueSource::Sequence(sequence) => {
             let q = qualified(&owned_sequence(table, &column.name, sequence))?;
             body.push(format!(
@@ -1038,7 +1038,7 @@ fn numbering(
                 "{alter} SET DEFAULT pg_catalog.nextval({}::regclass);",
                 literal(&q)
             ));
-            (sequence.start, sequence.increment)
+            (sequence.start, sequence.increment, sequence.options)
         }
         ValueSource::Identity(id) => {
             body.push(format!(
@@ -1047,7 +1047,7 @@ fn numbering(
                 id.increment,
                 created_options(&id.options)
             ));
-            (id.seed, id.increment)
+            (id.seed, id.increment, id.options)
         }
         ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
             return block(&body, &variables);
@@ -1066,12 +1066,32 @@ fn numbering(
     } else {
         ""
     };
+    // A source that cycles hands out its other bound once it passes one,
+    // so a continuation past its bound starts there, as `nextval` would,
+    // rather than being refused by `setval` (#2013 review, DEC-1921.1). A
+    // cycle is never under a key, where the number it reaches again would
+    // collide.
+    let wrap = match types::sequence_range(ty, increment, &options) {
+        Some(bounds) if options.cycle && increment < 0 => format!(
+            "IF pbps.pbps_next OPERATOR(pg_catalog.<) {}::pg_catalog.int8 THEN \
+             pbps.pbps_next := {}::pg_catalog.int8; END IF;\n",
+            bounds.start(),
+            bounds.end()
+        ),
+        Some(bounds) if options.cycle => format!(
+            "IF pbps.pbps_next OPERATOR(pg_catalog.>) {}::pg_catalog.int8 THEN \
+             pbps.pbps_next := {}::pg_catalog.int8; END IF;\n",
+            bounds.end(),
+            bounds.start()
+        ),
+        Some(_) | None => String::new(),
+    };
     variables.extend([("pbps_edge", "bigint"), ("pbps_next", "bigint")]);
     body.push(on_catalog_path(&format!(
         "SELECT pg_catalog.{edge}(r.{c}) INTO pbps.pbps_edge FROM {t} AS r;\n\
          pbps.pbps_next := {pick}({start}::pg_catalog.int8, pbps.pbps_edge \
          OPERATOR(pg_catalog.+) {increment}::pg_catalog.int8{counter});\n\
-         PERFORM pg_catalog.setval({owned}::pg_catalog.regclass, pbps.pbps_next, false);"
+         {wrap}PERFORM pg_catalog.setval({owned}::pg_catalog.regclass, pbps.pbps_next, false);"
     )));
     block(&body, &variables)
 }

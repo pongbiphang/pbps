@@ -3322,10 +3322,15 @@ fn build<'v, 'p: 'v>(
         // already past ("RESTART value (10) cannot be greater than MAXVALUE
         // (5)"), mid-apply. Counted here: the sequence's counter outside the
         // bounds the change gives it, or a counter this session cannot read.
-        // `pg_sequence_last_value` reads an unreadable counter as NULL, as it
-        // does one never called, so the privilege is asked first and a hidden
-        // counter is counted as in the way (DECISIONS 335). Never called, the
-        // counter the engine checks is the sequence's start.
+        // The counter the engine checks is the stored `last_value`, called
+        // or not: `setval(…, false)`, which a source put on by this tool
+        // leaves, sets it with no call (#2013 review). `pg_sequence_last_value`
+        // answers NULL for a counter not yet called, so it is read from the
+        // sequence itself, through `query_to_xml` since the probe is one
+        // query and the sequence is found at run time. A sequence this
+        // session may not `SELECT` is counted as in the way, never read as
+        // inside the bounds (DECISIONS 335); the `CASE` keeps the read from
+        // running, and failing, on one it may not.
         Change::AlterColumnNumbering {
             column, ty, from, to, ..
         } if moved_bounds(from, to).is_some() => {
@@ -3338,8 +3343,9 @@ fn build<'v, 'p: 'v>(
             let Some(stored) = names.column(column) else {
                 return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
-            let counter =
-                "COALESCE(pg_catalog.pg_sequence_last_value(q.seqrelid), q.seqstart)";
+            let counter = "(pg_catalog.xpath('/row/last_value/text()', \
+                 pg_catalog.query_to_xml(pg_catalog.format('SELECT last_value FROM %s', \
+                 q.seqrelid::pg_catalog.regclass), false, true, '')))[1]::text::numeric";
             Ok(vec![Probe::new(
                 format!(
                     "the counter of {column}'s sequence outside the bounds {}..={} this plan \
@@ -3351,9 +3357,9 @@ fn build<'v, 'p: 'v>(
                     "SELECT {} AS n FROM pg_catalog.pg_sequence q \
                      WHERE q.seqrelid OPERATOR(pg_catalog.=) \
                      pg_catalog.pg_get_serial_sequence({}, {})::pg_catalog.regclass \
-                     AND (NOT pg_catalog.has_sequence_privilege(q.seqrelid, 'SELECT, USAGE') \
-                     OR NOT ({counter} OPERATOR(pg_catalog.>=) {} \
-                     AND {counter} OPERATOR(pg_catalog.<=) {}));",
+                     AND CASE WHEN NOT pg_catalog.has_sequence_privilege(q.seqrelid, 'SELECT') \
+                     THEN true ELSE NOT ({counter} OPERATOR(pg_catalog.>=) {} \
+                     AND {counter} OPERATOR(pg_catalog.<=) {}) END;",
                     saturated_count("count(*)"),
                     value_literal(&qualified(&stored.table)?),
                     value_literal(&stored.name),
@@ -3386,6 +3392,11 @@ fn build<'v, 'p: 'v>(
                     return Ok(Vec::new());
                 }
             };
+            // One that cycles continues at its other bound instead, as
+            // `nextval` would, and nothing is in its way (#2013 review).
+            if options.cycle {
+                return Ok(Vec::new());
+            }
             let Some(held) = crate::types::identity_range(ty) else {
                 return Ok(Vec::new());
             };

@@ -2139,6 +2139,8 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
                  id integer GENERATED ALWAYS AS IDENTITY (MINVALUE 5 MAXVALUE 99 CYCLE));
              CREATE TABLE {s}.cached (
                  id integer GENERATED ALWAYS AS IDENTITY (CACHE 100));
+             CREATE TABLE {s}.narrowed (id integer GENERATED ALWAYS AS IDENTITY);
+             ALTER SEQUENCE {s}.narrowed_id_seq AS smallint;
              CREATE TABLE {s}.setnull (a integer, b integer,
                  CONSTRAINT setnull_fk FOREIGN KEY (a) REFERENCES {s}.odd (id)
                      ON DELETE SET NULL (a));
@@ -2299,6 +2301,9 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         ".collated`.`b` is `COLLATE \"C\"`",
         // A `SET NULL` that names its columns.
         "ON DELETE SET",
+        // An identity whose sequence is another type than its column's,
+        // whose bounds are that type's (#2013 review).
+        "narrowed`.`id` is an identity whose sequence is not `AS`",
         // An operator class that is not the column's own — on `text`, where
         // the type has a default operator class of its own, and on `varchar`,
         // where it does not and the engine resolves one through a preferred
@@ -2624,6 +2629,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "full_match"),
             pbps_model::TableName::new(&s, "half_built"),
             pbps_model::TableName::new(&s, "leaning"),
+            pbps_model::TableName::new(&s, "narrowed"),
             pbps_model::TableName::new(&s, "nulls"),
             pbps_model::TableName::new(&s, "odd"),
             pbps_model::TableName::new(&s, "partly"),
@@ -3947,7 +3953,15 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
          CREATE TABLE {s}.c (id integer GENERATED ALWAYS AS IDENTITY (MAXVALUE 99 CYCLE));
          CREATE TABLE {s}.c2 (id integer GENERATED ALWAYS AS IDENTITY (MAXVALUE 99));
          CREATE TABLE {s}.d (id serial);
-         CREATE TABLE {s}.e (id integer NOT NULL); INSERT INTO {s}.e VALUES (7);"
+         CREATE TABLE {s}.e (id integer NOT NULL); INSERT INTO {s}.e VALUES (7);
+         CREATE TABLE {s}.g (id serial);
+         SELECT setval(pg_get_serial_sequence('{s}.g', 'id'), 8, false);
+         CREATE TABLE {s}.h (id integer GENERATED ALWAYS AS IDENTITY (MAXVALUE 100000));
+         CREATE TABLE {s}.i (id smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 100));
+         CREATE TABLE {s}.j (id serial);
+         ALTER SEQUENCE {s}.j_id_seq MAXVALUE 3 CYCLE;
+         SELECT setval(pg_get_serial_sequence('{s}.j', 'id'), 3);
+         CREATE TABLE {s}.k (id integer NOT NULL); INSERT INTO {s}.k VALUES (1), (2), (3);"
     ))
     .await
     .expect("the tables");
@@ -4041,12 +4055,45 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
         ("c2", identity(1, o(None, Some(500), true, None))),
         ("d", serial(o(None, Some(10), false, None))),
         ("e", serial(o(None, Some(100), false, Some(5)))),
+        // A cycling source continued past its bound wraps, as `nextval`
+        // would: `j`'s old counter stands at its maximum, `k`'s values
+        // reach it (#2013 review).
+        ("j", identity(1, o(None, Some(3), true, None))),
+        ("k", serial(o(None, Some(3), true, None))),
+        // Set by `setval(…, false)` and never called since, as a source this
+        // tool puts on is left: the counter is 8, not the start of 1, and a
+        // minimum of 5 is inside it (#2013 review).
+        (
+            "g",
+            ValueSource::Sequence(OwnedSequence {
+                start: 5,
+                options: o(Some(5), None, false, None),
+                ..OwnedSequence::serial()
+            }),
+        ),
     ]);
     let mut f = pbps_model::Column::new("integer".parse().unwrap()).not_null();
     f.value_source = identity(5, o(Some(5), Some(1000), true, Some(20)));
     let mut created = pbps_model::Table::default();
     created.columns.insert("id".into(), f);
     declared.tables.insert(TableName::new(&s, "f"), created);
+    // Retyped with their bounds: narrowed, the bound goes first, since the
+    // engine moves the sequence with the column and refuses a bound left
+    // outside its new type; widened, the retype goes first (#2013 review).
+    for (table, ty, options) in [
+        ("h", "smallint", o(None, Some(100), false, None)),
+        ("i", "integer", o(None, Some(100000), false, None)),
+    ] {
+        let column = declared
+            .tables
+            .get_mut(&TableName::new(&s, table))
+            .unwrap()
+            .columns
+            .get_mut("id")
+            .unwrap();
+        column.ty = ty.parse().unwrap();
+        column.value_source = identity(1, options);
+    }
     let declared_ids = mint_ids(&declared, &ids, &[]);
     let cs = plan(&base, &ids, &declared, &declared_ids);
     let gated: std::collections::BTreeSet<String> = cs
@@ -4056,10 +4103,27 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
         .filter_map(|p| p.change.table().map(|t| t.name.clone()))
         .collect();
     // Negative: `c2` raises its bound and turns its cycle on; `f` is new;
-    // `e` is put on a column under no key, as #1889 leaves ungated.
-    assert_eq!(gated, ["a", "c", "d"].map(str::to_owned).into(), "{cs:#?}");
+    // `e` is put on a column under no key, as #1889 leaves ungated; `i`
+    // raises its bound.
+    assert_eq!(
+        gated,
+        ["a", "c", "d", "h", "j"].map(str::to_owned).into(),
+        "{cs:#?}"
+    );
+    let at = |table: &str, numbering: bool| {
+        cs.changes
+            .iter()
+            .position(|p| {
+                p.change.table().is_some_and(|t| t.name == table)
+                    && matches!(p.change, pbps_model::Change::AlterColumnNumbering { .. })
+                        == numbering
+            })
+            .unwrap()
+    };
+    assert!(at("h", true) < at("h", false), "{cs:#?}");
+    assert!(at("i", false) < at("i", true), "{cs:#?}");
     // Nothing in the way: `a`'s counter is 3, `d`'s never called and at its
-    // start, `e`'s value far from its new bound.
+    // start, `e`'s value far from its new bound, `g`'s set to 8 uncalled.
     let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &declared_ids).unwrap();
     let probes = Postgres::new().preflight(&names).probes;
     assert!(
@@ -4111,7 +4175,7 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
         | ValueSource::Identity(_)
         | ValueSource::Generated(_)) => other,
     };
-    for table in ["a", "c", "c2", "d", "e", "f"] {
+    for table in ["a", "c", "c2", "d", "e", "f", "g", "h", "i", "j", "k"] {
         assert_eq!(
             unnamed(source(&after, table)),
             source(&declared, table),
@@ -4125,6 +4189,9 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
     assert_eq!(number(&mut db, &next("d")).await, 1);
     assert_eq!(number(&mut db, &next("e")).await, 8);
     assert_eq!(number(&mut db, &next("f")).await, 5);
+    assert_eq!(number(&mut db, &next("g")).await, 8);
+    assert_eq!(number(&mut db, &next("j")).await, 1);
+    assert_eq!(number(&mut db, &next("k")).await, 1);
     let held = |table: &str| {
         format!(
             "SELECT (seqmin = 1 AND seqmax = 1000 AND seqcache = 20 AND NOT seqcycle)::int \
