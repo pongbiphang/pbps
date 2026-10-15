@@ -1002,7 +1002,7 @@ command that reads the date against one that does not.
   generated, and the whole project is then run through the declaration checks `plan` and
   `validate` share before a byte is written. The `policies:` rules are not among them, so
   `validate` could still refuse a generated name a naming rule rejects; #1904 closed that,
-  and what it refuses and what it lets through is DEC-1904.1. A tree that already fails those
+  and what it refuses and what it lets through is DEC-1941.1. A tree that already fails those
   checks is refused first, so that what they say afterwards is about this change alone.
 - **What it leaves alone.** The ids file: `plan` gives the partitions identities as it does
   for any table added by hand (SPEC 6.2), and a flag that supplied them would be identity
@@ -1119,7 +1119,7 @@ write failure or claim that Unix permission bits deny a root process.
 
 **DEC-1942.1. `partitions extend` refuses while the `policies:` block is invalid; it
 does not read the invalid block as "no findings".** The command refuses a series that
-adds an error-severity policy finding the tree did not already carry (DEC-1904.1). The
+adds an error-severity policy finding the tree did not already carry (DEC-1941.1). The
 evaluator skips a rule it cannot run, so a block with `naming.table: {severity: error}`
 and no pattern leaves both finding sets empty, their delta empty, and the command wrote
 while `validate` named the project `policy.invalid`: an empty answer taken from a
@@ -1140,7 +1140,7 @@ there is nothing to add; an engine refusal still said first).
 **DEC-1943.1. A command that compares two policy evaluations asks both at one instant,
 which is an argument of the shared function, not a clock it reads.** `partitions extend`
 refuses an error-severity finding the extended tree has and the tree before did not
-(DEC-1904.1). Each call of `declaration_policy_findings` read the clock for the policy
+(DEC-1941.1). Each call of `declaration_policy_findings` read the clock for the policy
 context, and a suppression's `until` is compared with that date, so two reads could
 straddle the instant one expires: the finding was suppressed in the first set, live in the
 second, and counted as added by a series that did not touch it. The window was a few
@@ -1157,9 +1157,9 @@ empty at every instant asked of both trees, the shared function's answer changes
 expiry (the hazard is real and `now` is honoured), and a partition that does break the rule
 is named at any instant.
 
-<a id="dec-1904-1"></a>
+<a id="dec-1941-1"></a>
 
-**DEC-1904.1. `partitions extend` refuses only an error-severity policy finding the series
+**DEC-1941.1. `partitions extend` refuses only an error-severity policy finding the series
 adds; a finding the tree already carried and a rule below `error` do not stop it (#1904).**
 `validate` runs the project's `policies:` over the declarations, and `partitions extend`
 originally ran only the declaration checks `plan` and `validate` share (DEC-1789.1). A
@@ -1167,6 +1167,7 @@ originally ran only the declaration checks `plan` and `validate` share (DEC-1789
 the next `validate` failed on a file the command had just produced. #1904 closed that
 gap; review on #1939 asked that the rule be written down here, as an entry of its own,
 rather than as an edit of DEC-1789.1, which keeps the wording of the issue it records.
+#1941 wrote it, so it is numbered after #1941, not after the issue whose rule it records.
 
 - **One question, asked of two trees.** After the extended project has passed the
   declaration checks and before a byte is written, the rules are asked of the schema as it

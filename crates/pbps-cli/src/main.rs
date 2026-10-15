@@ -2243,7 +2243,7 @@ fn validate_inspected(
 ///
 /// One function for `validate` and for every command that writes declarations
 /// and must not hand the next `validate` a finding it could have named first
-/// (`partitions extend`, #1904, DEC-1904.1). A second copy of this would drift in what it
+/// (`partitions extend`, #1904, DEC-1941.1). A second copy of this would drift in what it
 /// spells, which is how a rule is bypassed by an alias.
 pub(crate) fn declaration_policy_findings(
     project: &Project,
