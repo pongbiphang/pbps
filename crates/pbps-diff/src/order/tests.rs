@@ -1673,18 +1673,18 @@ fn a_numbering_source_given_up_goes_before_the_retype_and_one_put_on_goes_after(
 
 #[test]
 fn a_key_the_baseline_lacks_is_ended_after_the_step_that_makes_it() {
-    // A step makes a key and a later one ends it: the baseline held none, so
-    // the ending cannot be of an older incarnation the maker replaces.
-    let (ops, fx, baseline) = create_then_add_column().analysed(ModuleEdits::InPlace);
-    // The added column's own key, which the baseline does not hold.
-    let key = fx[1]
-        .creates
+    // Three steps over a key the baseline does not hold: 0 makes it, 1 ends it,
+    // 2 makes it again, as a default dropped and set around a module change.
+    let (ops, fx, baseline) = attached_partition().analysed(ModuleEdits::InPlace);
+    let key = fx
         .iter()
+        .flat_map(|e| e.creates.iter().chain(&e.removes))
         .find_map(|r| match r {
-            Resource::Column(key) => Some(key.clone()),
-            Resource::Object(..) => None,
+            Resource::Object(key, _) | Resource::Column(key) => {
+                (baseline.holds(key) == Some(false)).then(|| key.clone())
+            }
         })
-        .expect("the column the second step adds");
+        .expect("a key the plan makes and the baseline lacks");
     let make = Effects {
         creates: vec![Resource::Object(key.clone(), Incarnation::Final)],
         ..Effects::default()
@@ -1693,16 +1693,26 @@ fn a_key_the_baseline_lacks_is_ended_after_the_step_that_makes_it() {
         removes: vec![Resource::Object(key.clone(), Incarnation::Base)],
         ..Effects::default()
     };
-    let fx = [make.clone(), end.clone()];
+    let fx = [make.clone(), end, make];
     let none = ModuleDeps::new();
-    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // The second making is a later incarnation, so it follows the ending.
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
+    // Negative: the ending cannot come before the making it ends.
+    let reversed = run(&ops, &fx, &baseline, &[1, 0, 2], &none, Checks::ALL);
+    assert!(
+        reversed.iter().any(|v| matches!(v, Violation::Edge { .. })),
+        "{reversed:?}"
+    );
     // Negative: with the baseline guard off the key counts as held by it, and
     // the ending must precede the making.
     let held = Checks {
         baseline: false,
         ..Checks::ALL
     };
-    assert!(!run(&ops, &fx, &baseline, &[0, 1], &none, held).is_empty());
+    assert!(!run(&ops, &fx, &baseline, &[0, 1, 2], &none, held).is_empty());
 }
 
 /// `par.v` has its default changed from `1` to `2`, and the standing

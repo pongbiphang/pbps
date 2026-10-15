@@ -5413,8 +5413,11 @@ run of the final-order check (`Stage::Final`) failed nine tests that pass on
 - A numbering source given up goes before the column's retype (DEC-1889.1,
   rank -3 before -1), so only one put on waits for the column's rewrites.
 - `Replaces` orders an ending before a making only for a key the baseline
-  holds. For any other key the ending ends what a plan step made, so that step
-  comes first (a detach makes a table's own default, which a later change ends).
+  holds. For any other key the ending ends what a plan step made, so an edge
+  runs from each making that precedes the ending in the plan's own order to the
+  ending (a detach makes a table's own default, which a later change ends); a
+  making after it is a later incarnation, as a default dropped and set again
+  around a module change.
 - A `SetPartitionDefault` follows the parent's change only when it writes a
   default of its own. A step with no own default writes only its fallback, the
   parent's final text, which the parent's recursive `SET DEFAULT` writes again
