@@ -4728,6 +4728,131 @@ fn pull_refuses_an_invalid_policies_block_before_it_connects_or_overwrites() {
     }
 }
 
+/// A project whose `staging` environment reads its connection string from a
+/// variable no test sets, under `policies`: the target `pull` is asked to
+/// resolve fails, and how it fails is what the two #2027 tests below compare.
+const PULL_UNSET_URL_VAR: &str = "PBPS_FLOW_PG_PULL_POLICIES_UNSET_2027";
+
+fn pull_unresolvable_target_project(policies: &str) -> String {
+    format!(
+        "dialect: postgres\nenvironments:\n  staging:\n    url_env: {PULL_UNSET_URL_VAR}\n\
+         {policies}"
+    )
+}
+
+/// Issue #2027. `pull` resolved its target before `cmd_pull` refused an
+/// invalid `policies:` block, so with the environment's `url_env` variable
+/// unset it named the variable and said nothing of the block until the variable
+/// was exported. Both are refusals and nothing is written either way, so this
+/// is only the order of two independent errors; the block is a fact about the
+/// project and the variable about the machine, and the project's is said first.
+/// Every way the target can fail to resolve is behind the block: the unset
+/// variable, an environment the project does not declare, `--db` and `--env`
+/// together, and no target at all.
+#[test]
+fn pull_names_an_invalid_policies_block_before_it_resolves_the_target() {
+    let d = Demo::new("pull-policies-before-target");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        pull_unresolvable_target_project(
+            "policies:\n  rules:\n    naming.table: {severity: error}\n",
+        ),
+    )
+    .unwrap();
+    // The premise: the project is one `validate` refuses, by this finding, and
+    // the variable really is unset.
+    let v = d.run(&["validate", "--format", "json"]);
+    assert_ne!(code(&v), 0, "{}{}", stdout(&v), stderr(&v));
+    assert!(stdout(&v).contains("\"policy.invalid\""), "{}", stdout(&v));
+    assert!(std::env::var_os(PULL_UNSET_URL_VAR).is_none());
+
+    for args in [
+        vec!["pull", "--env", "staging"],
+        vec!["pull", "--force", "--env", "staging"],
+        vec!["pull", "--env", "missing"],
+        vec![
+            "pull",
+            "--db",
+            "postgres://pbps@127.0.0.1:1/none",
+            "--env",
+            "staging",
+        ],
+        vec!["pull"],
+    ] {
+        let o = d.run(&args);
+        assert_eq!(code(&o), 1, "{args:?}: {}{}", stdout(&o), stderr(&o));
+        let said = stderr(&o);
+        assert!(
+            said.contains("policy.invalid")
+                && said.contains("naming.table")
+                && said.contains("nothing was written")
+                && !said.contains(PULL_UNSET_URL_VAR)
+                && !said.contains("no environment named")
+                && !said.contains("name the same thing")
+                && !said.contains("needs a database"),
+            "{args:?}: {said}"
+        );
+        assert!(
+            declarations_and_ids(&d.dir).is_empty(),
+            "{args:?}: a refused pull wrote a file"
+        );
+    }
+}
+
+/// The twin of the test above, for a block that is valid: with nothing to
+/// refuse there, each target failure is still the one `pull` reports, in the
+/// words it used before, so moving the refusal ahead of the resolution hides no
+/// target error from a project that has no problem with its block.
+#[test]
+fn pull_still_reports_an_unresolvable_target_under_a_valid_policies_block() {
+    let d = Demo::new("pull-policies-valid-target");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        pull_unresolvable_target_project(
+            "policies:\n  rules:\n    naming.table: {severity: error, pattern: \"^[a-z][a-z0-9_]*$\"}\n",
+        ),
+    )
+    .unwrap();
+    let v = d.run(&["validate"]);
+    assert_eq!(code(&v), 0, "{}{}", stdout(&v), stderr(&v));
+    assert!(std::env::var_os(PULL_UNSET_URL_VAR).is_none());
+
+    for (args, expected) in [
+        (vec!["pull", "--env", "staging"], PULL_UNSET_URL_VAR),
+        (
+            vec!["pull", "--force", "--env", "staging"],
+            PULL_UNSET_URL_VAR,
+        ),
+        (
+            vec!["pull", "--env", "missing"],
+            "no environment named `missing`",
+        ),
+        (
+            vec![
+                "pull",
+                "--db",
+                "postgres://pbps@127.0.0.1:1/none",
+                "--env",
+                "staging",
+            ],
+            "name the same thing",
+        ),
+        (vec!["pull"], "needs a database"),
+    ] {
+        let o = d.run(&args);
+        assert_eq!(code(&o), 1, "{args:?}: {}{}", stdout(&o), stderr(&o));
+        let said = stderr(&o);
+        assert!(
+            said.contains(expected) && !said.contains("policy.invalid"),
+            "{args:?}: {said}"
+        );
+        assert!(
+            declarations_and_ids(&d.dir).is_empty(),
+            "{args:?}: a refused pull wrote a file"
+        );
+    }
+}
+
 /// Issue #1983, against the engine. The same database pulled into the same
 /// project: refused with the block invalid, forced or not, and written once
 /// the block is valid, which the next `validate` accepts. The controls are the

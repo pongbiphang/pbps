@@ -1219,13 +1219,20 @@ empty list without evaluating anything, so an unforced or forced `pull` wrote ta
 rule had been asked about while `validate` named the project `policy.invalid`. The
 refusal is one function, `refuse_invalid_policies`, that `partitions extend` and `pull`
 both call, so the two commands name the problems in the same words and a second copy of
-the message cannot drift. In `pull` it runs after the command line is parsed and before
-anything else: before the identity file is read, before the overwrite guard, and so before
-a connection. Before the guard because that guard answers an unforced pull over existing
-declarations with "re-run with `--force`", and a `--force` pull is refused for the block
-just the same, so the advice would send the user to a second refusal; before the
-connection because the block is a fact about the project, and a pull that introspected a
-database first would tell the user about a local file only after that round trip.
+the message cannot drift. In `pull` it runs in `run`, before the target is resolved
+(#2027), and so before anything else: before the environment's `url_env` variable is read,
+before the identity file is read, before the overwrite guard, and so before a connection.
+Before the target because the block is a fact about the project and the target one about
+this machine, and a pull whose variable is unset and whose block is invalid has two
+refusals and nothing written either way; naming the variable first meant the block was
+named only once it was exported, so the block is said first and every way the target can
+fail to resolve (an unset variable, an unknown environment, `--db` with `--env`, no
+target) follows it. The call is not repeated in `cmd_pull`, whose only caller is `run`.
+Before the guard because that guard answers an unforced pull over existing declarations
+with "re-run with `--force`", and a `--force` pull is refused for the block just the same,
+so the advice would send the user to a second refusal; before the connection because the
+block is a fact about the project, and a pull that introspected a database first would
+tell the user about a local file only after that round trip.
 `--force` replaces declarations and does not excuse a configuration `validate` calls
 invalid, so forced and unforced pulls are refused alike. `refuse_policy_errors` calls the
 same function first, which is no second user-facing check (`pull` has already refused) but
@@ -1241,7 +1248,9 @@ refused as "already inside the pbps project" before any of this runs. `validate`
 still reports the block's problems beside the findings of the rules that can run, since it
 reports and refuses nothing it would write. Pinned by `flow_pg.rs`: offline, a refusal that
 names `policy.invalid` with an unreachable database, over existing declarations forced and
-unforced, which are left byte for byte; live, the same refusal against a real database, the
+unforced, which are left byte for byte; offline, the same refusal ahead of each way the
+target fails to resolve, and its twin with a valid block, which reports each target failure
+as before; live, the same refusal against a real database, the
 repaired block asking its rule (the refusal then names the table and not the block), and a
 rule `off` and a rule at `warning` writing and passing `validate`; and the unit test in
 `adopt.rs` for the function's own refusal.

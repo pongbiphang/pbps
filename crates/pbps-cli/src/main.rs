@@ -1149,6 +1149,16 @@ fn run() -> anyhow::Result<()> {
             data,
             partitions_external,
         } => {
+            // The project's rules must be runnable before they can be asked
+            // about what is pulled, and the block is a fact about the project
+            // where the target is a fact about this machine: an invalid
+            // `policies:` block (`validate` reports it as `policy.invalid`)
+            // is said first, whichever way the target would then fail to
+            // resolve (an unset `url_env`, an unknown environment, `--db`
+            // with `--env`, no target). Refused here and not in `cmd_pull`,
+            // which only runs once the target has resolved, so that the one
+            // call precedes every path (DEC-1983.1, #2027).
+            refuse_invalid_policies(&project, "the declarations a pull would write")?;
             let target = target.resolve(&project)?;
             cmd_pull(&project, &target, force, &data, &partitions_external)
         }
@@ -1273,16 +1283,9 @@ fn cmd_pull(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    // The project's rules must be runnable before they can be asked about
-    // what is pulled. With an invalid `policies:` block (`validate` reports it
-    // as `policy.invalid`) the evaluator skips the rules it cannot run and the
-    // rest of the block with them, so a pull would write declarations no rule
-    // was asked about and read "nothing wrong" from it (DEC-1983.1). Refused
-    // here, before anything connects, and before the overwrite guard below,
-    // whose advice to re-run with `--force` would send the user to a pull this
-    // refuses just the same: `--force` replaces declarations, it does not
-    // excuse a configuration `validate` calls invalid.
-    refuse_invalid_policies(project, "the declarations a pull would write")?;
+    // An invalid `policies:` block is already refused: `run` does it before it
+    // resolves the target, so this function is never reached with one
+    // (DEC-1983.1). Not repeated here, since `run` is the only caller.
 
     let dir = project.schema_dir();
     // Force authorizes replacing declarations, not forgetting identity. Read
