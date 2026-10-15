@@ -5134,7 +5134,7 @@ Measured on 16.15 and 18.6:
 - `pg_get_partkeydef` prints `LIST (k)` and `HASH (a, b)`; `partstrat` is
   `l` and `h`.
 - `pg_get_expr(relpartbound)` prints `FOR VALUES IN (…)` with the values in
-  the order written, `NULL` bare, a boolean bare (`true`) and every other
+  the order written and a repeated one dropped, `NULL` bare, a boolean bare (`true`) and every other
   value quoted, a number included (`'-5'`, `'1.5'`); and `FOR VALUES WITH
   (modulus 4, remainder 0)` in lower case.
 - The engine refuses a LIST key of more than one column ("cannot use "list"
@@ -5152,8 +5152,13 @@ Measured on 16.15 and 18.6:
 
 **The model.** `PartitionBy` gains a `strategy`, RANGE by default and not
 written when RANGE, so every existing file, plan and state reads as before.
-`PartitionBound` gains `List { values }`, each value the engine's text or
-NULL, and `Hash { modulus, remainder }`. In YAML, `partition_by: [ts]` stays
+`PartitionBound` gains `List { values }`, a set of values, each the
+engine's text or NULL, and `Hash { modulus, remainder }`. A set because
+neither order nor a repeat changes which rows a partition takes: a list
+written in another order is the same bound, and plans nothing, where a
+sequence would compare unequal and refuse the plan as a changed
+partitioning (#1632 review). The values are written and emitted in the
+set's order. In YAML, `partition_by: [ts]` stays
 RANGE, and `{list: [k]}` and `{hash: [a, b]}` name the others; a partition is
 `{in: [...]}` or `{modulus: m, remainder: r}`. A whole number or a boolean
 may be written bare, and YAML `null` is SQL NULL: `'NULL'` quoted is the

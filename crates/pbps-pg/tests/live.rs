@@ -5679,32 +5679,32 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
             (
                 "l_ab",
                 B::List {
-                    values: vec![v("a"), v("it's")],
+                    values: vec![v("a"), v("it's")].into_iter().collect(),
                 },
             ),
             (
                 "l_null",
                 B::List {
-                    values: vec![L::Null, v("c")],
+                    values: vec![L::Null, v("c")].into_iter().collect(),
                 },
             ),
             ("l_rest", B::Default),
             (
                 "d_1",
                 B::List {
-                    values: vec![v("2025-01-01"), v("2024-12-31")],
+                    values: vec![v("2025-01-01"), v("2024-12-31")].into_iter().collect(),
                 },
             ),
             (
                 "i_1",
                 B::List {
-                    values: vec![v("-5"), v("7")],
+                    values: vec![v("-5"), v("7")].into_iter().collect(),
                 },
             ),
             (
                 "b_t",
                 B::List {
-                    values: vec![v("true")],
+                    values: vec![v("true")].into_iter().collect(),
                 },
             ),
             (
@@ -5731,7 +5731,7 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
         misspelt.tables.get_mut(&t("d_1")).unwrap().partition_of = Some(PartitionOf {
             parent: t("d"),
             bound: B::List {
-                values: vec![v("2025-1-1"), v("2024-12-31")],
+                values: vec![v("2025-1-1"), v("2024-12-31")].into_iter().collect(),
             },
             columns: Default::default(),
         });
@@ -5756,7 +5756,7 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
         ambiguous.tables.get_mut(&t("d_1")).unwrap().partition_of = Some(PartitionOf {
             parent: t("d"),
             bound: B::List {
-                values: vec![v("01/02/2026")],
+                values: vec![v("01/02/2026")].into_iter().collect(),
             },
             columns: Default::default(),
         });
@@ -5836,7 +5836,7 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
                 partition_of: Some(PartitionOf {
                     parent: t("l"),
                     bound: B::List {
-                        values: vec![v("d")],
+                        values: vec![v("d")].into_iter().collect(),
                     },
                     columns: Default::default(),
                 }),
@@ -5979,7 +5979,7 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
                 "l_e",
                 "l",
                 B::List {
-                    values: vec![v("e")],
+                    values: vec![v("e")].into_iter().collect(),
                 },
                 2,
                 format!("DELETE FROM {s}.l_e WHERE k IS DISTINCT FROM 'e'"),

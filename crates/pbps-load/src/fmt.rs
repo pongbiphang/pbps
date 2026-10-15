@@ -316,7 +316,7 @@ pub fn render_partitioned(
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
-                let values = |d: &[pbps_model::ListDatum]| {
+                let values = |d: &std::collections::BTreeSet<pbps_model::ListDatum>| {
                     d.iter()
                         .map(|v| match v {
                             pbps_model::ListDatum::Value(text) => bound_value(text),
@@ -2114,13 +2114,13 @@ indexes:
         assert_eq!(
             bound(0),
             Some(B::List {
-                values: vec![v("a"), v("it's")]
+                values: vec![v("a"), v("it's")].into_iter().collect()
             })
         );
         assert_eq!(
             bound(1),
             Some(B::List {
-                values: vec![L::Null, v("NULL")]
+                values: vec![L::Null, v("NULL")].into_iter().collect()
             })
         );
         assert_eq!(bound(2), Some(B::Default));
@@ -2144,6 +2144,28 @@ indexes:
             })
         );
 
+        // The values are a set: written in another order, or with one
+        // repeated, the bound is the same one and renders the same, so a
+        // reordered list plans nothing (#1632 review).
+        let load = |values: &str| {
+            crate::load_table_str(
+                Path::new("t.yml"),
+                &format!(
+                    "table: app.l\ncolumns:\n  k: {{type: text}}\npartition_by: {{list: [k]}}\npartitions:\n  l1: {{in: [{values}]}}\n"
+                ),
+            )
+            .unwrap()
+        };
+        let (written, reordered) = (load("a, b"), load("b, a, b"));
+        assert_eq!(written.partitions, reordered.partitions);
+        let render_of = |t: &crate::LoadedTable| {
+            let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
+            render_partitioned(&t.name, &t.table, &partitions, &[], None)
+        };
+        assert_eq!(render_of(&written), render_of(&reordered));
+        // Negative: another value is another bound.
+        assert_ne!(written.partitions, load("a, c").partitions);
+
         // Bare numbers and booleans are their text.
         let t = crate::load_table_str(
             Path::new("t.yml"),
@@ -2157,7 +2179,7 @@ indexes:
                 .as_ref()
                 .map(|p| p.bound.clone()),
             Some(B::List {
-                values: vec![v("-5"), v("7"), v("true")]
+                values: vec![v("-5"), v("7"), v("true")].into_iter().collect()
             })
         );
 

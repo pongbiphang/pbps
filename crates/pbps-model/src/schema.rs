@@ -603,9 +603,12 @@ pub enum PartitionBound {
         from: Vec<BoundDatum>,
         to: Vec<BoundDatum>,
     },
-    /// `FOR VALUES IN (…)`, in the order written, which the engine keeps.
+    /// `FOR VALUES IN (…)`. A set: the engine keeps the order written and
+    /// drops a repeated value (measured on 16 and 18), and neither changes
+    /// which rows the partition takes, so two lists of the same values are
+    /// one bound however they are written (#1632 review).
     List {
-        values: Vec<ListDatum>,
+        values: std::collections::BTreeSet<ListDatum>,
     },
     /// `FOR VALUES WITH (MODULUS m, REMAINDER r)`.
     Hash {

@@ -820,11 +820,27 @@
       "additionalProperties": false,
       "oneOf": [
         {
+          "properties": {
+            "list": {
+              "type": "array"
+            },
+            "hash": {
+              "type": "null"
+            }
+          },
           "required": [
             "list"
           ]
         },
         {
+          "properties": {
+            "hash": {
+              "type": "array"
+            },
+            "list": {
+              "type": "null"
+            }
+          },
           "required": [
             "hash"
           ]
@@ -959,6 +975,15 @@
             "to": {
               "type": "array"
             },
+            "in": {
+              "type": "null"
+            },
+            "modulus": {
+              "type": "null"
+            },
+            "remainder": {
+              "type": "null"
+            },
             "default": {
               "const": false
             }
@@ -978,6 +1003,15 @@
             },
             "to": {
               "type": "null"
+            },
+            "in": {
+              "type": "null"
+            },
+            "modulus": {
+              "type": "null"
+            },
+            "remainder": {
+              "type": "null"
             }
           },
           "required": [
@@ -989,6 +1023,18 @@
             "in": {
               "type": "array"
             },
+            "from": {
+              "type": "null"
+            },
+            "to": {
+              "type": "null"
+            },
+            "modulus": {
+              "type": "null"
+            },
+            "remainder": {
+              "type": "null"
+            },
             "default": {
               "const": false
             }
@@ -999,6 +1045,21 @@
         },
         {
           "properties": {
+            "modulus": {
+              "type": "integer"
+            },
+            "remainder": {
+              "type": "integer"
+            },
+            "from": {
+              "type": "null"
+            },
+            "to": {
+              "type": "null"
+            },
+            "in": {
+              "type": "null"
+            },
             "default": {
               "const": false
             }

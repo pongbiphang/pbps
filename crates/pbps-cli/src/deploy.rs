@@ -2822,10 +2822,8 @@ fn as_read(
             }
             // Every value of a list is its one key column's (#1632).
             Some(pbps_model::PartitionBound::List { values }) if position == 0 => {
-                for datum in values.iter_mut() {
-                    if *datum == pbps_model::ListDatum::Value(b.declared.clone()) {
-                        *datum = pbps_model::ListDatum::Value(canonical.clone());
-                    }
+                if values.remove(&pbps_model::ListDatum::Value(b.declared.clone())) {
+                    values.insert(pbps_model::ListDatum::Value(canonical.clone()));
                 }
             }
             _ => {}
@@ -10080,7 +10078,9 @@ mod tests {
                     pbps_model::ListDatum::Null,
                     pbps_model::ListDatum::Value("2026-02-01".into()),
                     pbps_model::ListDatum::Value("2026-03-01".into()),
-                ],
+                ]
+                .into_iter()
+                .collect(),
             },
             columns: Default::default(),
         });
@@ -10100,7 +10100,9 @@ mod tests {
                     pbps_model::ListDatum::Null,
                     pbps_model::ListDatum::Value("2026-02-01 00:00:00".into()),
                     pbps_model::ListDatum::Value("2026-03-01".into()),
-                ],
+                ]
+                .into_iter()
+                .collect(),
             })
         );
         // Negative: a list has no second key column to replace a value on.

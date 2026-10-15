@@ -5481,13 +5481,15 @@ mod tests {
         let sql = create(
             "app.p1",
             &of(B::List {
-                values: vec![L::Value("it's".into()), L::Null, L::Value("NULL".into())],
+                values: vec![L::Value("it's".into()), L::Null, L::Value("NULL".into())]
+                    .into_iter()
+                    .collect(),
             }),
         );
         assert!(
             sql[0].contains(
                 "CREATE TABLE \"app\".\"p1\" PARTITION OF \"app\".\"p\" FOR VALUES IN \
-                 (E'it''s', NULL, E'NULL') USING heap;"
+                 (NULL, E'NULL', E'it''s') USING heap;"
             ),
             "{sql:?}"
         );

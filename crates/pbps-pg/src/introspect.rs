@@ -2594,7 +2594,7 @@ pub(crate) fn parse_bound(text: &str) -> Option<pbps_model::PartitionBound> {
                 }
                 Token::Word(_) => None,
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Option<std::collections::BTreeSet<_>>>()?;
         return Some(pbps_model::PartitionBound::List { values });
     }
     if let Some(rest) = text.strip_prefix("FOR VALUES WITH (modulus ") {
@@ -3514,25 +3514,27 @@ mod tests {
             (
                 "FOR VALUES IN ('2025-01-01', '2024-12-31')",
                 B::List {
-                    values: vec![l("2025-01-01"), l("2024-12-31")],
+                    values: vec![l("2025-01-01"), l("2024-12-31")].into_iter().collect(),
                 },
             ),
             (
                 "FOR VALUES IN (NULL, 'NULL', 1.50, '-2')",
                 B::List {
-                    values: vec![L::Null, l("NULL"), l("1.50"), l("-2")],
+                    values: vec![L::Null, l("NULL"), l("1.50"), l("-2")]
+                        .into_iter()
+                        .collect(),
                 },
             ),
             (
                 "FOR VALUES IN ('it''s, (x)', 'minvalue')",
                 B::List {
-                    values: vec![l("it's, (x)"), l("minvalue")],
+                    values: vec![l("it's, (x)"), l("minvalue")].into_iter().collect(),
                 },
             ),
             (
                 "FOR VALUES IN (true, NULL)",
                 B::List {
-                    values: vec![l("true"), L::Null],
+                    values: vec![l("true"), L::Null].into_iter().collect(),
                 },
             ),
             (

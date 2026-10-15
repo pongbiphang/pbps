@@ -619,10 +619,12 @@ pub enum PartitionDto {
     Entry(PartitionEntryDto),
 }
 
-// One bound or the other, as the loader takes them: `from:` and `to:` both, or
-// `default: true` alone. Optional fields alone would bless `{}` and `{from:
-// [1]}`, which `convert` refuses; written out as `ModuleDto`'s exclusions are,
-// with `null` for a key YAML leaves empty, which serde reads as absent.
+// One bound, as the loader takes them: `from:` and `to:` both, `in:`,
+// `modulus:` and `remainder:` both (#1632), or `default: true` alone. Optional
+// fields alone would bless `{}` and `{from: [1]}`, which `convert` refuses;
+// written out as `ModuleDto`'s exclusions are, each alternative's own keys
+// set and every other bound's key absent or `null`, which serde reads as
+// absent, so that exactly one alternative matches what the loader takes.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("oneOf" = [
@@ -630,6 +632,7 @@ pub enum PartitionDto {
         "required": ["from", "to"],
         "properties": {
             "from": {"type": "array"}, "to": {"type": "array"},
+            "in": {"type": "null"}, "modulus": {"type": "null"}, "remainder": {"type": "null"},
             "default": {"const": false},
         },
     }),
@@ -638,15 +641,25 @@ pub enum PartitionDto {
         "properties": {
             "default": {"const": true},
             "from": {"type": "null"}, "to": {"type": "null"},
+            "in": {"type": "null"}, "modulus": {"type": "null"}, "remainder": {"type": "null"},
         },
     }),
     serde_json::json!({
         "required": ["in"],
-        "properties": {"in": {"type": "array"}, "default": {"const": false}},
+        "properties": {
+            "in": {"type": "array"},
+            "from": {"type": "null"}, "to": {"type": "null"},
+            "modulus": {"type": "null"}, "remainder": {"type": "null"},
+            "default": {"const": false},
+        },
     }),
     serde_json::json!({
         "required": ["modulus", "remainder"],
-        "properties": {"default": {"const": false}},
+        "properties": {
+            "modulus": {"type": "integer"}, "remainder": {"type": "integer"},
+            "from": {"type": "null"}, "to": {"type": "null"}, "in": {"type": "null"},
+            "default": {"const": false},
+        },
     }),
 ]))]
 pub struct PartitionEntryDto {
@@ -883,9 +896,18 @@ pub enum PartitionByDto {
 /// `{list: [k]}` or `{hash: [a, b]}`: one of the two.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+// The one named is a list and the other absent or `null`, which serde reads
+// as absent: `required` alone matched both alternatives for `{list: [k],
+// hash: null}`, which the loader takes (#1632 review).
 #[schemars(extend("oneOf" = [
-    serde_json::json!({"required": ["list"]}),
-    serde_json::json!({"required": ["hash"]}),
+    serde_json::json!({
+        "required": ["list"],
+        "properties": {"list": {"type": "array"}, "hash": {"type": "null"}},
+    }),
+    serde_json::json!({
+        "required": ["hash"],
+        "properties": {"hash": {"type": "array"}, "list": {"type": "null"}},
+    }),
 ]))]
 pub struct PartitionStrategyDto {
     #[serde(default)]
