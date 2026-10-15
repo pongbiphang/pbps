@@ -331,7 +331,7 @@ fn malformed_or_unsupported_resolver_evidence_is_refused_before_presentation() {
 }
 
 /// The qualification rule's identifier moves with the facts it compares
-/// (DECISIONS 520), so a resolved plan an earlier build sealed is refused by
+/// (DEC-2012.1), so a resolved plan an earlier build sealed is refused by
 /// `explain` and by `apply` before the target is contacted, naming the rule
 /// and the remedy, and is never shown as this build's coverage. Nothing else
 /// reads such a plan today: apply refuses every resolved plan (#616).

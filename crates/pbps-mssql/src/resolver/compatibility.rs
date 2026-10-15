@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 /// `compare_reported` reports. Evidence would seal the identifier, and an older
 /// build would accept evidence by it alone, so a changed set under an
 /// unchanged identifier would be read by that build as the coverage it
-/// required (#2012, DECISIONS 520). No evidence seals this rule yet (#620), so
+/// required (DEC-2012.1). No evidence seals this rule yet (#620), so
 /// nothing reads it and no earlier identifier is refused;
 /// `the_compared_facts_move_with_the_rule_identifier` is what keeps the first
 /// reader from inheriting a set that moved unnoticed.
@@ -434,7 +434,7 @@ mod tests {
     /// the facts a matching pair is compared on (`assembly:` and `visibility:`
     /// stand for one fact per name the fixture carries). A change to what is
     /// compared appends an entry and bumps `REPORTED_RULE`; an earlier entry is
-    /// a record and is never edited (DECISIONS 520).
+    /// a record and is never edited (DEC-2012.1).
     const RULE_HISTORY: &[(&str, &[&str])] = &[(
         "mssql-reported-scope-v1",
         &[
@@ -502,7 +502,7 @@ mod tests {
             "the facts compared under {REPORTED_RULE} changed (only here: {:?}; only in the \
              record: {:?}): evidence is read by the identifier alone, so give the rule a new \
              one. Bump REPORTED_RULE, append the new identifier and its facts to RULE_HISTORY \
-             without editing the entry above it, and record it in DECISIONS 520",
+             without editing the entry above it, and record it in DEC-2012.1",
             compared.difference(&pinned_set).collect::<Vec<_>>(),
             pinned_set.difference(&compared).collect::<Vec<_>>(),
         );

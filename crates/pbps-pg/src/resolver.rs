@@ -32,7 +32,7 @@ pub fn validate_evidence(
     // The one runtime reads the facts both engines report and observes no
     // executable (#1672); evidence naming another rule claims coverage it does
     // not have, and the identifier moves with the set of facts compared, so an
-    // earlier one is refused by name (DECISIONS 520).
+    // earlier one is refused by name (DEC-2012.1).
     let rule = &evidence.qualification().rule;
     if !compatibility::ACCEPTED_RULES.contains(&rule.as_str()) {
         return Err(EvidenceError::Rule(rule.clone()));

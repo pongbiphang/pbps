@@ -348,43 +348,10 @@ how to add an entry here.
      the capture session. The list is checked against the dialect's pins and
      the capture's, so a setting pinned later cannot stay in it.*
 
-     *Amended (#2012): the rule's identifier moves with the set of facts it
-     compares.* Evidence seals the identifier and a reader accepts evidence by
-     the identifier alone, so a changed set under an unchanged identifier was
-     read by an older build as the coverage it required: `xmloption` left the
-     set above while it was still `pg-reported-scope-v1`, as nine pinned
-     settings had left `pg-analysis-scope-v1` before it, and an older build
-     went on accepting evidence that no longer compared what it demanded. The
-     policy, for both rules (`pg-reported-scope-v<n>`, and the twin's
-     `mssql-reported-scope-v<n>`): a name added to or removed from the
-     observations, the settings or a family of facts the comparison reports
-     (extensions, collations, visibility, assemblies) gives the rule the next
-     identifier. This build moves PostgreSQL's to `pg-reported-scope-v2`.
-     SQL Server's stays `v1`: no evidence seals it yet (#620), so no reader
-     holds the identifier, and its set is pinned from here.
-     - **A reader reads the newest identifier only.** `validate_evidence`
-       lists the identifiers it accepts (`compatibility::ACCEPTED_RULES`),
-       which is one. Evidence under an earlier one is refused by name, with
-       the remedy: `EvidenceError::Rule` says which rule sealed it and that the
-       plan is made again with this build. An older build refuses the newer
-       identifier as an unknown rule, so it never reads evidence whose set it
-       did not compare. Nothing is accepted on the chance that a later set is a
-       superset.
-     - **Saved plans.** A resolved plan sealed under `v1` is refused by this
-       build's `explain` and `apply` and has to be planned again. No plan that
-       could be applied is lost: `apply` refuses every resolved plan until
-       #616, and the plan-format version stays, because an older reader still
-       decodes the same shape and refuses the rule by name. Builds between
-       #2010 and this change sealed `v1` over the smaller set; an older build
-       still accepts those, which cannot be undone, and no build after this
-       one does.
-     - **The guard.** `the_compared_facts_move_with_the_rule_identifier`, in
-       each dialect, pins the names a matching pair is compared on beside the
-       identifier in `RULE_HISTORY`, and fails when either moves alone,
-       naming the facts that differ and what to change. It cannot see a fact
-       whose verdict changes under the same name, as the build string did when
-       it became a limitation; such a change is a new identifier too, and
-       review is what catches it.
+     *Amended (#2012) by [DEC-2012.1](#dec-2012-1): the rule's identifier moves
+     whenever the set of facts it compares does, and a reader accepts only
+     the identifiers it lists. Its PostgreSQL identifier is now
+     `pg-reported-scope-v2`.*
 
 <a id="decision-521"></a>
 
@@ -2762,3 +2729,61 @@ therefore pinned with a hand-built plan.
 - `a_plan_whose_names_cannot_be_followed_is_refused`;
 - the rename chain and reused name cases of DEC-1498.1, which each fail when
   one role's spelling is changed.
+
+<a id="dec-2012-1"></a>
+
+**DEC-2012.1. The reported-scope rule's identifier moves whenever the set of
+facts it compares changes, and a reader accepts only the identifiers listed in
+`ACCEPTED_RULES` (#2012).**
+
+Evidence seals the rule's identifier, and a reader accepts evidence by that
+identifier alone. #2010 removed `xmloption` from the compared settings
+(DEC-1634.1) and left `pg-reported-scope-v1`, as nine pinned settings had left
+`pg-analysis-scope-v1` before it. A build from before the change then went on
+accepting evidence sealed by one that no longer compared what it demanded
+(DECISIONS 520 defines the rule as comparing what the dialect does not pin,
+and that is why each list was right to change; the identifier did not follow).
+
+**What was decided.**
+- **The policy, for both rules** (`pg-reported-scope-v<n>` and the twin's
+  `mssql-reported-scope-v<n>`, DECISIONS 521). A name added to or removed from
+  the observations, the settings or a family of facts the comparison reports
+  (extensions, collations, visibility, assemblies) gives the rule the next
+  identifier. PostgreSQL's is now `pg-reported-scope-v2`. SQL Server's stays
+  `v1`: no evidence seals it yet (#620), so no reader holds the identifier,
+  and its set is pinned from here.
+- **A reader reads the newest identifier only.** `validate_evidence` lists
+  the identifiers it accepts (`compatibility::ACCEPTED_RULES`), which is one.
+  Evidence under an earlier one is refused by name with the remedy:
+  `EvidenceError::Rule` says which rule sealed it and that the plan is made
+  again with this build. An older build refuses the newer identifier as an
+  unknown rule, so it never reads evidence whose set it did not compare.
+  Nothing is accepted on the chance that a later set is a superset.
+- **Saved plans.** A resolved plan sealed under `v1` is refused by `explain`
+  and `apply` and has to be planned again. No plan that could be applied is
+  lost: `apply` refuses every resolved plan until #616. The plan-format version
+  stays, because the evidence's shape is unchanged and an older reader refuses
+  the rule by name. Builds between #2010 and this change sealed `v1` over the
+  smaller set; an older build still accepts those, which cannot be undone, and
+  no build after this one does.
+- **The guard.** `the_compared_facts_move_with_the_rule_identifier`, in each
+  dialect, pins the names a matching pair is compared on beside the
+  identifier in `RULE_HISTORY`, and fails when either moves alone, naming the
+  facts that differ and what to change. It cannot see a fact whose verdict
+  changes under the same name, as the build string did when it became a
+  limitation (DEC-1672.1); such a change is a new identifier too, and review
+  is what catches it.
+
+**Why not the alternatives.**
+- **Keep the identifier and rely on the evidence version.** The evidence
+  version (`EVIDENCE_VERSION`) covers the evidence's shape, which did not
+  change; bumping it, or the plan-format version, would refuse every plan to
+  record that one list moved.
+- **Accept the earlier identifier.** That is the defect: the evidence names a
+  set this build does not compare.
+
+**Pinned by** `evidence_sealed_under_another_qualification_rule_is_refused_by_name`
+(`pbps-pg` evidence tests), `the_compared_facts_move_with_the_rule_identifier`
+(`pbps-pg` and `pbps-mssql`), and
+`a_plan_sealed_under_the_previous_qualification_rule_is_refused_naming_it`
+(`explain_resolver`).

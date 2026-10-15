@@ -18,8 +18,7 @@ use std::collections::BTreeMap;
 /// a family of facts `compare_reported` reports. Evidence seals the identifier,
 /// and an older build accepts evidence by it alone, so a changed set under an
 /// unchanged identifier is read by that build as the coverage it required
-/// (`xmloption` left the set under `pg-reported-scope-v1`, #2012, DECISIONS
-/// 520). `the_compared_facts_move_with_the_rule_identifier` fails when they
+/// (`xmloption` left the set under `pg-reported-scope-v1`, #2012, DEC-2012.1). `the_compared_facts_move_with_the_rule_identifier` fails when they
 /// part, naming what to change.
 pub const REPORTED_RULE: &str = "pg-reported-scope-v2";
 
@@ -701,7 +700,7 @@ mod tests {
     /// `visibility:` stand for one fact per name the fixture carries). A change
     /// to what is compared appends an entry and bumps `REPORTED_RULE`; an
     /// earlier entry is a record and is never edited, because evidence sealed
-    /// under it is refused by that name (`ACCEPTED_RULES`, DECISIONS 520).
+    /// under it is refused by that name (`ACCEPTED_RULES`, DEC-2012.1).
     const RULE_HISTORY: &[(&str, &[&str])] = &[
         // Through #2010, which removed `xmloption` from the settings.
         (
@@ -784,7 +783,7 @@ mod tests {
             "the facts compared under {REPORTED_RULE} changed (only here: {:?}; only in the \
              record: {:?}): an older build reads evidence by the identifier alone, so give the \
              rule a new one. Bump REPORTED_RULE, append the new identifier and its facts to \
-             RULE_HISTORY without editing the entry above it, and record it in DECISIONS 520",
+             RULE_HISTORY without editing the entry above it, and record it in DEC-2012.1",
             compared.difference(&pinned_set).collect::<Vec<_>>(),
             pinned_set.difference(&compared).collect::<Vec<_>>(),
         );

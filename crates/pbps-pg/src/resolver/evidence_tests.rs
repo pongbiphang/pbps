@@ -84,7 +84,7 @@ fn saved_evidence_requires_a_supported_adapter_major_and_qualification_rule() {
     }
 }
 
-/// The compared facts move with the rule's identifier (DECISIONS 520), so
+/// The compared facts move with the rule's identifier (DEC-2012.1), so
 /// evidence naming another one is refused by that name and with the remedy,
 /// never read as this build's coverage.
 #[test]

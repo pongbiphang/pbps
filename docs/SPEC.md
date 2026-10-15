@@ -1754,7 +1754,7 @@ DEC-1674.1).**
     every resolver environment, under rule `pg-reported-scope-v2`. Its
     identifier changes whenever the set of facts it compares does, and
     evidence sealed under another identifier is refused by name
-    (DECISIONS 520). It compares the facts both engines report: version
+    (DEC-2012.1). It compares the facts both engines report: version
     number, extensions and their versions, encoding, collation and the
     deployment context. An incompatible or unreadable fact refuses. The
     build string (`server_version`) names the packaging too, so a difference
