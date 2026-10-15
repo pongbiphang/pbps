@@ -3311,7 +3311,10 @@ pub fn validate_plan_analysis(plan: &pbps_model::SavedPlan) -> anyhow::Result<()
     if let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis {
         match plan.dialect.as_str() {
             "postgres" => pbps_pg::resolver::validate_evidence(evidence)?,
-            engine => anyhow::bail!("this build cannot enforce resolver evidence for {engine}"),
+            engine => anyhow::bail!(
+                "this build cannot enforce resolver evidence for {}",
+                pbps_model::escape::Escaped(engine)
+            ),
         }
     }
     Ok(())

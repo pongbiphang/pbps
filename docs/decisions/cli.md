@@ -1245,3 +1245,50 @@ unforced, which are left byte for byte; live, the same refusal against a real da
 repaired block asking its rule (the refusal then names the table and not the block), and a
 rule `off` and a rule at `warning` writing and passing `validate`; and the unit test in
 `adopt.rs` for the function's own refusal.
+
+<a id="dec-2032-1"></a>
+
+**DEC-2032.1. A refusal shows the file's text escaped; it does not refuse the
+file for holding it.** `explain` and `apply` print, in a sentence of their own, a
+value they read out of a saved plan: the qualification rule of the resolver
+evidence (`EvidenceError::Rule`), the engine the evidence names
+(`validate_plan_analysis`), the dialect (`explain`'s "cannot explain", `apply`'s
+"was computed for"), and the text serde repeats when the plan does not decode
+(an unknown variant, an unknown field, a name a type refused). A hand-made plan
+could put a line break in any of them, which starts a line the tool never wrote,
+or an escape sequence, which erases or rewrites the lines before it (#2032,
+from the review of #2028). Each of these goes through
+`pbps_model::escape::Escaped` (`EscapedSentence` for serde's sentence, which
+already carries `Debug` escapes of its own): the control characters, the line
+and paragraph separators, and the zero-width and bidirectional marks are shown
+as `\n`, `\r`, `\t` or `\u{..}`, the backslash is doubled so that an escape
+cannot be mistaken for text the file held, and every other character, every
+non-ASCII letter included, is left as the file spells it.
+
+The alternative was to refuse a control character when the plan is decoded, so
+that no printer downstream could ever print one, and for the three
+tool-vocabulary strings it would have been defensible. It was not taken because
+it cannot be the rule for the rest. SPEC §4.3 keeps scalar text verbatim,
+control characters included, and nothing in the loader or in `TableName` refuses
+one in an identifier, so a plan that names such a table is a valid plan, and a
+decode-time refusal would reject it for a name nothing is wrong with. Even for
+the three strings it would still have needed the escape: the refusal has to say
+what the file held, or the reviewer is told "invalid" about text they cannot see.
+Escaping changes how a value is shown and nothing else; the file is read the same
+way and the checksum does not move. `EvidenceError::Rule` formats its field
+through `Escaped` in its own `Display`, so no caller of that error can print the
+identifier raw.
+
+What this does not cover, on purpose: object names (tables, columns, modules)
+that a later refusal names, and the strings `explain` prints when it succeeds
+(its text report shows a plan's names, limitations and entry as they are).
+Those are valid values that may hold a control character, there are hundreds of
+sites, and `--format json` already escapes them; they are the subject of #2035
+rather than extra diff here. Pinned by
+`explain_resolver.rs::a_refusal_shows_the_files_values_escaped_and_never_raw`
+(a rule, the dialect of a resolved and of an ordinary plan, and an unknown
+variant, each carrying a line break, a terminal sequence, a carriage return and
+a right-to-left override, through `explain` in both formats and through `apply`:
+stderr is one line with no raw control character but its final newline, and
+the escaped value is in it), by `a_refusal_names_a_unicode_value_as_the_file_spells_it`
+(a non-ASCII rule is shown unchanged) and by the unit tests in `escape.rs`.

@@ -29,6 +29,7 @@ pub mod data;
 pub mod declared;
 pub mod diagnostic;
 pub mod drift;
+pub mod escape;
 pub mod finding;
 pub mod ids;
 pub mod intent;
