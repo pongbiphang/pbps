@@ -75,6 +75,14 @@
 //! is read from `typnotnull` and read the same on 16. What it leaves out is
 //! the ACL, which [`Unreadable`] answers, and a comment.
 //!
+//! # One read
+//!
+//! A read is two passes that must agree. The queries of one pass are separate
+//! statements, and in a caller's READ COMMITTED transaction they do not share a
+//! snapshot (DECISIONS 423), so a type changed between them could be returned
+//! as a definition it never had. A pass that differs from the one before it is
+//! [`Unreadable::Failed`], which the caller refuses and retries.
+//!
 //! The replay checks at DEC-319.1's three points, and the `type_pins` field
 //! of a plan, are not here.
 
@@ -682,9 +690,29 @@ async fn read_each(conn: &mut Conn, references: &[TypeRef]) -> Result<Vec<TypeRe
         .await?;
     let mut reads = Vec::with_capacity(references.len());
     for reference in references {
-        reads.push(read_one(conn, reference).await?);
+        // Read twice and compare. In the caller's READ COMMITTED transaction a
+        // savepoint gives the separate catalog queries of one read no common
+        // snapshot (DECISIONS 423), and even in a snapshot of our own the
+        // deparsing functions see the latest catalog. A type that changed
+        // between the queries would otherwise come back as a definition that
+        // never existed, with a pin to match. Optimistic, like 423's
+        // revalidation: a change after the second read is the replay's to see.
+        let first = read_one(conn, reference).await?;
+        let second = read_one(conn, reference).await?;
+        reads.push(settled(first, second));
     }
     Ok(reads)
+}
+
+/// The read both passes agree on, or a failed read when they do not.
+fn settled(first: TypeRead, second: TypeRead) -> TypeRead {
+    if first == second {
+        first
+    } else {
+        TypeRead::Unreadable(Unreadable::Failed(
+            "the type changed while it was being read".to_owned(),
+        ))
+    }
 }
 
 /// The row a lookup by name returns.
@@ -1194,7 +1222,9 @@ async fn fetch_attributes(
 /// composite relation, a domain's constraints). Owned parts are flagged and
 /// left out of the answer, and so are types and constraints themselves; what
 /// they reference is in it.
-const CLOSURE: &str = "
+fn closure_query() -> String {
+    format!(
+        "
     WITH RECURSIVE reach(classid, objid, part) AS (
         SELECT 'pg_catalog.pg_type'::pg_catalog.regclass::pg_catalog.oid,
                ($1::pg_catalog.int8)::pg_catalog.oid, true
@@ -1234,33 +1264,94 @@ const CLOSURE: &str = "
              ELSE i.name
            END AS name,
            COALESCE(i.identity, n.objid::pg_catalog.text) AS identity,
-           CASE n.classid
-             WHEN 'pg_catalog.pg_proc'::pg_catalog.regclass
-               THEN (SELECT p.proowner::pg_catalog.int8 FROM pg_catalog.pg_proc p WHERE p.oid = n.objid)
-             WHEN 'pg_catalog.pg_class'::pg_catalog.regclass
-               THEN (SELECT k.relowner::pg_catalog.int8 FROM pg_catalog.pg_class k WHERE k.oid = n.objid)
-             WHEN 'pg_catalog.pg_operator'::pg_catalog.regclass
-               THEN (SELECT o.oprowner::pg_catalog.int8 FROM pg_catalog.pg_operator o WHERE o.oid = n.objid)
-             WHEN 'pg_catalog.pg_collation'::pg_catalog.regclass
-               THEN (SELECT k.collowner::pg_catalog.int8 FROM pg_catalog.pg_collation k WHERE k.oid = n.objid)
-             WHEN 'pg_catalog.pg_extension'::pg_catalog.regclass
-               THEN (SELECT x.extowner::pg_catalog.int8 FROM pg_catalog.pg_extension x WHERE x.oid = n.objid)
-           END AS owner
+           {owner} AS owner
       FROM nodes n
       JOIN pg_catalog.pg_class c ON c.oid = n.classid
      CROSS JOIN LATERAL pg_catalog.pg_identify_object(n.classid, n.objid, 0) i
      WHERE NOT n.part
        AND n.classid NOT IN ('pg_catalog.pg_type'::pg_catalog.regclass,
                              'pg_catalog.pg_constraint'::pg_catalog.regclass)
-     ORDER BY 1, 4, 6";
+     ORDER BY 1, 4, 6",
+        owner = owner_expression()
+    )
+}
+
+/// The catalogs whose rows have an owner, and the column that holds it. A
+/// closure can reach an object of any of them: a function, an operator, a
+/// relation, a collation, an extension, and what a CHECK or a DEFAULT names
+/// beside them, such as a text search configuration or dictionary, whose
+/// owner can change their mappings in place.
+const OWNED_CATALOGS: &[(&str, &str)] = &[
+    ("pg_proc", "proowner"),
+    ("pg_class", "relowner"),
+    ("pg_operator", "oprowner"),
+    ("pg_collation", "collowner"),
+    ("pg_extension", "extowner"),
+    ("pg_ts_config", "cfgowner"),
+    ("pg_ts_dict", "dictowner"),
+    ("pg_conversion", "conowner"),
+    ("pg_opclass", "opcowner"),
+    ("pg_opfamily", "opfowner"),
+    ("pg_statistic_ext", "stxowner"),
+    ("pg_foreign_data_wrapper", "fdwowner"),
+    ("pg_foreign_server", "srvowner"),
+    ("pg_language", "lanowner"),
+    ("pg_event_trigger", "evtowner"),
+    ("pg_largeobject_metadata", "lomowner"),
+    ("pg_publication", "pubowner"),
+    ("pg_subscription", "subowner"),
+];
+
+/// The catalogs whose rows have no owner of their own. A closure that reaches
+/// a catalog in neither list is a read that failed: an object whose owner is
+/// not found would otherwise read as one nobody can change.
+const UNOWNED_CATALOGS: &[&str] = &[
+    "pg_cast",
+    "pg_attrdef",
+    "pg_trigger",
+    "pg_rewrite",
+    "pg_policy",
+    "pg_amop",
+    "pg_amproc",
+    "pg_transform",
+    "pg_default_acl",
+    "pg_ts_parser",
+    "pg_ts_template",
+    "pg_enum",
+    "pg_range",
+    "pg_user_mapping",
+    "pg_publication_namespace",
+    "pg_publication_rel",
+];
+
+/// A `CASE` over the object's catalog that picks the owner column of its row.
+fn owner_expression() -> String {
+    let mut out = String::from("CASE n.classid");
+    for (catalog, column) in OWNED_CATALOGS {
+        out.push_str(&format!(
+            " WHEN 'pg_catalog.{catalog}'::pg_catalog.regclass THEN (SELECT k.{column}::pg_catalog.int8 FROM pg_catalog.{catalog} k WHERE k.oid = n.objid)"
+        ));
+    }
+    out.push_str(" END");
+    out
+}
 
 async fn closure(conn: &mut Conn, oid: Oid) -> Result<Vec<Reached>, DbError> {
-    let rows = conn.query_with(CLOSURE, &[Param::I64(oid)]).await?;
+    let rows = conn
+        .query_with(&closure_query(), &[Param::I64(oid)])
+        .await?;
     rows.iter()
         .map(|row| {
+            let catalog = need::<&str>(row, "catalog")?;
+            if !OWNED_CATALOGS.iter().any(|(c, _)| *c == catalog) && !UNOWNED_CATALOGS.contains(&catalog) {
+                return Err(DbError::BadRow(format!(
+                    "the type reaches `{}`, an object of the catalog `{catalog}`, whose owner this read cannot find",
+                    need::<&str>(row, "identity")?
+                )));
+            }
             Ok(Reached {
                 oid: need(row, "oid")?,
-                catalog: need::<&str>(row, "catalog")?.to_owned(),
+                catalog: catalog.to_owned(),
                 kind: need::<&str>(row, "kind")?.to_owned(),
                 schema: row.try_get::<&str>("schema")?.map(str::to_owned),
                 name: row.try_get::<&str>("name")?.map(str::to_owned),
@@ -1847,6 +1938,71 @@ mod tests {
         assert!(messages[3].contains("USAGE on the type"));
         assert!(messages[6].contains("view"));
         assert!(messages[1].contains("shell type"));
+    }
+
+    fn present_of(definition: Definition) -> TypeRead {
+        let pin = definition.pin();
+        let owner = definition.owner;
+        TypeRead::Present(Box::new(UserType {
+            reference: TypeRef::new("app", "mood").unwrap(),
+            owners: BTreeMap::from([(
+                owner,
+                Owner {
+                    oid: owner,
+                    name: "postgres".to_owned(),
+                    trusted: true,
+                },
+            )]),
+            definition,
+            reached: Vec::new(),
+            pin,
+        }))
+    }
+
+    /// Two passes over a type that changed between them are not a read of it.
+    #[test]
+    fn two_passes_that_differ_are_a_failed_read_and_two_that_agree_are_the_read() {
+        let before = present_of(enumeration(&["a"]));
+        let after = present_of(enumeration(&["a", "b"]));
+        assert_eq!(settled(before.clone(), before.clone()), before);
+        assert_eq!(
+            settled(TypeRead::Absent, TypeRead::Absent),
+            TypeRead::Absent
+        );
+        for (first, second) in [
+            (before.clone(), after.clone()),
+            (before.clone(), TypeRead::Absent),
+            (TypeRead::Absent, after),
+            (TypeRead::NotDefined, TypeRead::Absent),
+        ] {
+            let read = settled(first, second);
+            assert!(
+                matches!(&read, TypeRead::Unreadable(Unreadable::Failed(why))
+                    if why.contains("changed while")),
+                "{read:?}"
+            );
+            assert_ne!(read, TypeRead::Absent);
+        }
+    }
+
+    #[test]
+    fn every_owned_catalog_has_its_own_owner_column_and_none_is_also_unowned() {
+        let catalogs: BTreeSet<&str> = OWNED_CATALOGS.iter().map(|(c, _)| *c).collect();
+        assert_eq!(catalogs.len(), OWNED_CATALOGS.len());
+        for (catalog, column) in OWNED_CATALOGS {
+            assert!(!UNOWNED_CATALOGS.contains(catalog), "{catalog}");
+            assert!(!column.is_empty());
+        }
+        // The configurations and dictionaries a CHECK can name are covered.
+        for catalog in ["pg_ts_config", "pg_ts_dict", "pg_opclass", "pg_proc"] {
+            assert!(catalogs.contains(catalog), "{catalog}");
+        }
+        let sql = owner_expression();
+        for (catalog, column) in OWNED_CATALOGS {
+            assert!(sql.contains(&format!(
+                "k.{column}::pg_catalog.int8 FROM pg_catalog.{catalog} k"
+            )));
+        }
     }
 
     #[test]

@@ -1076,6 +1076,7 @@ async fn an_owner_is_trusted_only_when_it_can_become_the_deployer_or_is_a_superu
         let becomes = db.role("becomes", "NOLOGIN").await;
         let inherits = db.role("inherits", "NOLOGIN").await;
         let stranger = db.role("stranger", "NOLOGIN").await;
+        let other_stranger = db.role("stranger2", "NOLOGIN").await;
         db.sql(&format!(
             "GRANT {deployer} TO {becomes} WITH SET TRUE, INHERIT FALSE;
              GRANT {deployer} TO {inherits} WITH SET FALSE, INHERIT TRUE;
@@ -1104,6 +1105,15 @@ async fn an_owner_is_trusted_only_when_it_can_become_the_deployer_or_is_a_superu
              ALTER DOMAIN app.strangers OWNER TO {stranger};
              CREATE TYPE app.holds_strangers AS (s app.strangers, m app.mine);
              ALTER TYPE app.holds_strangers OWNER TO {deployer};
+             CREATE TEXT SEARCH DICTIONARY app.dict (TEMPLATE = pg_catalog.simple);
+             ALTER TEXT SEARCH DICTIONARY app.dict OWNER TO {other_stranger};
+             CREATE TEXT SEARCH CONFIGURATION app.cfg (COPY = pg_catalog.simple);
+             ALTER TEXT SEARCH CONFIGURATION app.cfg
+                 ALTER MAPPING FOR asciiword WITH app.dict;
+             ALTER TEXT SEARCH CONFIGURATION app.cfg OWNER TO {stranger};
+             CREATE DOMAIN app.searches AS text
+                 CHECK (pg_catalog.to_tsvector('app.cfg'::pg_catalog.regconfig, VALUE) IS NOT NULL);
+             ALTER DOMAIN app.searches OWNER TO {deployer};
              "
         ))
         .await;
@@ -1148,6 +1158,24 @@ async fn an_owner_is_trusted_only_when_it_can_become_the_deployer_or_is_a_superu
         assert!(holds.owner().trusted);
         assert_eq!(names(&holds), [stranger.as_str()], "on {label}");
         assert!(holds.owners().count() >= 2);
+        // A text search configuration and the dictionary it maps to are not
+        // routines, and their owners can change what a CHECK means in place.
+        let searches = present(&mut me, "app", "searches").await;
+        assert!(searches.owner().trusted);
+        assert_eq!(
+            names(&searches),
+            [other_stranger.as_str(), stranger.as_str()],
+            "on {label}"
+        );
+        let catalogs: BTreeSet<&str> = searches
+            .reached()
+            .iter()
+            .map(|r| r.catalog.as_str())
+            .collect();
+        assert!(
+            catalogs.contains("pg_ts_config") && catalogs.contains("pg_ts_dict"),
+            "{catalogs:?}"
+        );
         // Read as the superuser that made the fixture, the question changes
         // with the deployer: a type the deployer owns is a stranger's now,
         // since the deployer cannot become a superuser, and a superuser's is
