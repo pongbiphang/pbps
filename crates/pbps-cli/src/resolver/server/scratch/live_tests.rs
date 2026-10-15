@@ -4418,6 +4418,8 @@ fn drafting_target(a: &str) -> Vec<String> {
         format!("CREATE SEQUENCE {EXTERNAL}.t_id_seq AS integer OWNED BY {EXTERNAL}.t.id"),
         // An identity sequence given a type of its own.
         format!("ALTER SEQUENCE {EXTERNAL}.t_j_seq AS integer"),
+        // And one given a persistence of its own.
+        format!("ALTER SEQUENCE {EXTERNAL}.t_k_seq SET UNLOGGED"),
         format!("CREATE UNIQUE INDEX t_k ON {EXTERNAL}.t (k) WHERE k > 0"),
         format!("CREATE INDEX t_amount ON {EXTERNAL}.t (amount)"),
         format!("ALTER TABLE {EXTERNAL}.t ALTER COLUMN tags SET STORAGE MAIN"),

@@ -1105,6 +1105,16 @@ fn table(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'stati
                     sequence_options(sequence)
                 ));
             }
+            // An identity sequence takes its table's persistence unless it
+            // was set apart (`ALTER SEQUENCE ... SET UNLOGGED`, measured on
+            // 16 and 18).
+            if sequence.unlogged != relation.unlogged {
+                after.push(format!(
+                    "ALTER SEQUENCE {} SET {}LOGGED;\n",
+                    sequence.qualified,
+                    if sequence.unlogged { "UN" } else { "" }
+                ));
+            }
         }
         match facts.not_nulls.get(&(oid, column.number)) {
             Some(constraint) if !constraint.plain => {
