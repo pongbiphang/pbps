@@ -177,7 +177,7 @@ pub fn cmd_extend(
     }
 
     // And the project's own rules, which `validate` runs and the checks above
-    // do not (ADR-0008, #1904). Only an error the tree did not already carry
+    // do not (ADR-0008, #1904, DEC-1904.1). Only an error the tree did not already carry
     // refuses: a finding it had before is not this change's, and a rule left
     // at `warning` or `note` is advice that `validate` prints beside a valid
     // project. A rule whose pattern the existing partitions break must not

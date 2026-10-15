@@ -999,11 +999,10 @@ command that reads the date against one that does not.
   anything else would put a reformatting of the whole file into the diff beside the new
   entries, so the remedy is `pbps fmt` first. The new entries are added and the file
   re-rendered by the same function `fmt` uses, read back and compared with what was
-  generated, and the whole project is then checked as `validate` checks it before a byte is
-  written: the declaration checks `plan` and `validate` share, and the project's `policies:`
-  rules through the one function `validate` calls (#1904). Of the rules, only an error the
-  tree did not already carry refuses, and it is named; a finding the tree had before, and a
-  rule set below `error`, do not stop the series. A tree that already fails the declaration
+  generated, and the whole project is then run through the declaration checks `plan` and
+  `validate` share before a byte is written. The `policies:` rules are not among them, so
+  `validate` could still refuse a generated name a naming rule rejects; #1904 closed that,
+  and what it refuses and what it lets through is DEC-1904.1. A tree that already fails those
   checks is refused first, so that what they say afterwards is about this change alone.
 - **What it leaves alone.** The ids file: `plan` gives the partitions identities as it does
   for any table added by hand (SPEC 6.2), and a flag that supplied them would be identity
@@ -1015,9 +1014,8 @@ command that reads the date against one that does not.
 Pinned by the unit tests in `partition_series.rs` (a year end, a leap February, daily,
 weekly, monthly, yearly, `timestamp`, `timestamptz` and `bigint` series, and each refusal
 above), by `tests/partitions_extend.rs` without a database (canonical output, a no-op rerun,
-other files untouched, a file not canonical, a taken name, a tree already invalid, a
-naming rule at `error` that the generated names break or keep, one the tree already broke,
-the same rule at `warning`, SQL Server), and on 16 and 18 by `a_generated_series_is_planned_applied_and_verified_through_the_cli`.
+other files untouched, a file not canonical, a taken name, a tree already invalid, SQL
+Server), and on 16 and 18 by `a_generated_series_is_planned_applied_and_verified_through_the_cli`.
 
 <a id="dec-1799-1"></a>
 
@@ -1121,7 +1119,7 @@ write failure or claim that Unix permission bits deny a root process.
 
 **DEC-1942.1. `partitions extend` refuses while the `policies:` block is invalid; it
 does not read the invalid block as "no findings".** The command refuses a series that
-adds an error-severity policy finding the tree did not already carry (DEC-1789.1). The
+adds an error-severity policy finding the tree did not already carry (DEC-1904.1). The
 evaluator skips a rule it cannot run, so a block with `naming.table: {severity: error}`
 and no pattern leaves both finding sets empty, their delta empty, and the command wrote
 while `validate` named the project `policy.invalid`: an empty answer taken from a
@@ -1142,7 +1140,7 @@ there is nothing to add; an engine refusal still said first).
 **DEC-1943.1. A command that compares two policy evaluations asks both at one instant,
 which is an argument of the shared function, not a clock it reads.** `partitions extend`
 refuses an error-severity finding the extended tree has and the tree before did not
-(DEC-1789.1). Each call of `declaration_policy_findings` read the clock for the policy
+(DEC-1904.1). Each call of `declaration_policy_findings` read the clock for the policy
 context, and a suppression's `until` is compared with that date, so two reads could
 straddle the instant one expires: the finding was suppressed in the first set, live in the
 second, and counted as added by a series that did not touch it. The window was a few
@@ -1158,3 +1156,49 @@ tests in `partitions.rs`: a suppression expiring between two instants leaves the
 empty at every instant asked of both trees, the shared function's answer changes across the
 expiry (the hazard is real and `now` is honoured), and a partition that does break the rule
 is named at any instant.
+
+<a id="dec-1904-1"></a>
+
+**DEC-1904.1. `partitions extend` refuses only an error-severity policy finding the series
+adds; a finding the tree already carried and a rule below `error` do not stop it (#1904).**
+`validate` runs the project's `policies:` over the declarations, and `partitions extend`
+originally ran only the declaration checks `plan` and `validate` share (DEC-1789.1). A
+`naming.table` rule at `error` that the generated names break was therefore written, and
+the next `validate` failed on a file the command had just produced. #1904 closed that
+gap; review on #1939 asked that the rule be written down here, as an entry of its own,
+rather than as an edit of DEC-1789.1, which keeps the wording of the issue it records.
+
+- **One question, asked of two trees.** After the extended project has passed the
+  declaration checks and before a byte is written, the rules are asked of the schema as it
+  was and of the schema with the generated partitions in it. Both answers come from
+  `declaration_policy_findings`, the function `validate` calls for the same half of its
+  work, with the types in the dialect's own spelling. A second copy would drift in what it
+  spells, which is how a rule is bypassed by an alias (DECISIONS 187). The comparison is
+  over the whole schema, not the new partitions alone, because the evaluator is asked of a
+  schema, and a finding is identified by its rule and its message.
+- **Only an error the tree did not already carry refuses.** The finding is named with its
+  rule id, nothing is written, and the message points at the `policies:` block (a
+  suppression with a reason, a different severity or pattern) or at declaring the
+  partitions by hand. A finding the tree had before is not this change's: a rule whose
+  pattern the existing partitions break must not make the series impossible to extend, nor
+  be named as if the series had caused it. This is the reasoning the declaration checks
+  already follow, where a tree that fails them is refused first so that what they say
+  afterwards is about this change alone.
+- **A rule below `error` is advice.** `validate` prints a `warning` or a `note` beside a
+  valid project and exits clean, and the command that writes the file must not be stricter
+  than the command that judges it. The delta is therefore taken over the error-severity
+  findings alone.
+- **What the two decisions that followed add.** The rules must be runnable before they are
+  asked anything: an invalid `policies:` block is refused first, since a skipped rule would
+  read as an empty delta (DEC-1942.1). The two trees are asked at one instant, since a
+  suppression that expires between two clock reads would count as added (DEC-1943.1).
+  Neither changes the rule above.
+
+Pinned by `tests/partitions_extend.rs`: a generated name an error rule rejects is refused
+with the finding named and every file byte-identical; the same project and rule with a
+series whose names the rule accepts is written, and the `validate` after it is clean; a
+finding the tree already had does not block the command, a finding the series does add
+still does and `ev_rest` (the old finding) is not named beside it, and `validate` after
+a written series names only the finding it had; and the same rule at `warning` writes, with
+`validate` printing the finding as advice. The one-instant property is pinned by the unit
+tests in `partitions.rs` (DEC-1943.1).
