@@ -17281,6 +17281,9 @@ mod key_spelling;
 #[path = "live/doctor_select.rs"]
 mod doctor_select;
 
+#[path = "live/binding619.rs"]
+mod binding619;
+
 /// #351. Every declared and recorded schema used to be bound into one
 /// schema-permission statement, so an estate with more schemas than the
 /// server's parameter ceiling read the whole schema answer as unreadable. The

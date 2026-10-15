@@ -70,7 +70,7 @@ async fn resolver_discovery_reads_product_database_and_restricted_session_withou
 }
 
 /// The `PBPS_TEST_DB` server as another login, in one database.
-fn login_url(user: &str, password: &str, database: &str) -> String {
+pub(crate) fn login_url(user: &str, password: &str, database: &str) -> String {
     let server: Vec<String> = conn_str()
         .split(';')
         .filter(|part| {
