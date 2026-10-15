@@ -5177,6 +5177,9 @@ two partitions take. Hash overlap is decided exactly: two partitions overlap
 when the remainder of the larger modulus, taken by the smaller, is the
 smaller's remainder. A modulus is at most 2147483647: the grammar reads it as
 a signed int, and a larger one is a syntax error (measured on 16 and 18).
+A partition key of any strategy is at most 32 columns, the engine's
+`PARTITION_MAX_KEYS`; a range key had the same limit unchecked since
+DEC-1170.1, and one check now covers all three.
 
 **A strategy change is refused**, as a changed key or bound is: "change its
 partitioning". The engine has no statement for it.

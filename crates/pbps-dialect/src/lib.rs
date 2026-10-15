@@ -2958,15 +2958,18 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
     problems
 }
 
+/// The most columns a partition key may have on a standard build.
+const PARTITION_MAX_KEYS: usize = 32;
+
 /// What only the whole schema can say about partitions (#1170, #1632): a
 /// partition's parent is a declared partitioned table, and not itself a
 /// partition (nested partitioning is not held); its bound is of its parent's
 /// strategy, a range with one datum per key column at each end; and a parent
 /// has one default partition at most. Measured on 16 and 18, the engine
-/// refuses, mid-apply, a LIST key of more than one column, a DEFAULT under
-/// HASH, a LIST value two partitions both take, and hash partitions that
-/// overlap or whose moduli do not each divide the next larger one; each is
-/// named here instead (DEC-1632.1).
+/// refuses, mid-apply, a key of more than 32 columns, a LIST key of more
+/// than one column, a DEFAULT under HASH, a LIST value two partitions both
+/// take, and hash partitions that overlap or whose moduli do not each divide
+/// the next larger one; each is named here instead (DEC-1632.1).
 pub fn check_partitions(schema: &Schema) -> Vec<String> {
     let mut problems = Vec::new();
     let mut defaults: BTreeMap<&TableName, &TableName> = BTreeMap::new();
@@ -2979,6 +2982,18 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
         {
             problems.push(format!(
                 "`{name}` is partitioned by LIST over {} columns, and a LIST key is one column",
+                by.columns.len()
+            ));
+        }
+        // The engine's PARTITION_MAX_KEYS, fixed when it is built: measured
+        // on 16 and 18, a RANGE or HASH key of 32 columns is taken and one of
+        // 33 refused ("cannot partition using more than 32 columns").
+        if let Some(by) = &table.partition_by
+            && by.columns.len() > PARTITION_MAX_KEYS
+        {
+            problems.push(format!(
+                "`{name}` is partitioned over {} columns, and PostgreSQL partitions over at \
+                 most {PARTITION_MAX_KEYS}",
                 by.columns.len()
             ));
         }
@@ -4594,10 +4609,10 @@ mod tests {
     /// LIST and HASH trees are held to what the engine takes, measured on 16
     /// and 18 (#1632, DEC-1632.1): a LIST key of one column, values no two
     /// partitions share, a bound of its parent's kind, no DEFAULT under HASH,
-    /// a remainder below its modulus, a modulus the engine's int takes, moduli
-    /// each a factor of the next, and hash partitions that do not overlap. A DEFAULT under LIST, NULL in one
-    /// list, and hash partitions of mixed moduli that do not overlap are
-    /// accepted.
+    /// a key of at most 32 columns, a remainder below its modulus, a modulus
+    /// the engine's int takes, moduli each a factor of the next, and hash
+    /// partitions that do not overlap. A DEFAULT under LIST, NULL in one list,
+    /// and hash partitions of mixed moduli that do not overlap are accepted.
     #[test]
     fn list_and_hash_partitions_are_held_to_what_the_engine_takes() {
         use pbps_model::{ListDatum as L, PartitionBound as B, PartitionStrategy as S};
@@ -4624,6 +4639,8 @@ mod tests {
                 .collect(),
         };
         let hash = |modulus, remainder| B::Hash { modulus, remainder };
+        // Only the key's width is asked, so one column name repeated serves.
+        const WIDE: &str = "k";
         let schema = |tables: Vec<(&str, Table)>| {
             let mut s = Schema::default();
             for (name, t) in tables {
@@ -4640,6 +4657,8 @@ mod tests {
             ("app.h0", of("app.h", hash(4, 0))),
             ("app.h1", of("app.h", hash(2, 1))),
             ("app.h2", of("app.h", hash(4, 2))),
+            // The widest key the engine takes.
+            ("app.w", partitioned(S::Hash, &[WIDE; 32])),
             // The largest modulus the engine takes.
             ("app.g", partitioned(S::Hash, &["a"])),
             ("app.g0", of("app.g", hash(2_147_483_647, 2_147_483_646))),
@@ -4696,6 +4715,14 @@ mod tests {
             (
                 "both take rows of `app.h`",
                 with(vec![("app.h3", of("app.h", hash(8, 5)))]),
+            ),
+            (
+                "partitioned over 33 columns, and PostgreSQL partitions over at most 32",
+                with(vec![("app.w", partitioned(S::Hash, &[WIDE; 33]))]),
+            ),
+            (
+                "partitioned over 33 columns, and PostgreSQL partitions over at most 32",
+                with(vec![("app.w", partitioned(S::Range, &[WIDE; 33]))]),
             ),
             (
                 "PostgreSQL takes a modulus up to 2147483647",

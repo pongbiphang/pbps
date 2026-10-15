@@ -303,12 +303,12 @@ indexes:
   partition `{in: [...]}`, its values the engine's text and YAML `null` for
   SQL NULL, and `partition_by: {hash: [a, b]}` HASH-partitioned, each
   partition `{modulus: m, remainder: r}`. Validation refuses what the engine
-  does: a LIST key of more than one column, a value two partitions take, a
-  bound of another strategy than its parent's, a DEFAULT under HASH, a
-  remainder not below its modulus, a modulus above 2147483647, a modulus that
-  is not a factor of the next larger, and hash partitions that overlap. A tree's strategy never
-  changes in a plan (DEC-1632.1). A partition in
-  another schema is named qualified. A partition is a table of its own, with
+  does: a key of more than 32 columns, a LIST key of more than one column, a
+  value two partitions take, a bound of another strategy than its parent's,
+  a DEFAULT under HASH, a remainder not below its modulus, a modulus above
+  2147483647, a modulus that is not a factor of the next larger, and hash
+  partitions that overlap. A tree's strategy never changes in a plan
+  (DEC-1632.1). A partition in another schema is named qualified. A partition is a table of its own, with
   an identity. Its columns and keys are its parent's, and so are the clones of
   its parent's checks and indexes. It may declare checks and indexes of its
   own: its entry is then a block of `from:` and `to:`, or `default: true`, with
