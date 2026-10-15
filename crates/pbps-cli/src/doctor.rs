@@ -1492,6 +1492,9 @@ fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
             Some(Runway::Short(short)) => {
                 let reach = match &short.reach {
                     Reach::Until(value) => format!("to `{value}` at least"),
+                    Reach::Beyond(edge) => format!(
+                        "past {edge}, which only a partition with no upper end (MAXVALUE) reaches"
+                    ),
                     Reach::Partitions(1) => {
                         "for 1 partition, the one holding the newest rows".to_owned()
                     }
@@ -3059,6 +3062,50 @@ mod tests {
             finding.message
         );
         assert!(!finding.message.contains("extend"), "{}", finding.message);
+    }
+
+    /// A horizon whose target is past the key's axis names the edge it
+    /// passes and never a target value, which does not exist (#2036). The
+    /// declarations that reach it are a plan to apply.
+    #[test]
+    fn a_horizon_past_the_keys_axis_names_the_edge_and_not_a_target() {
+        for (edge, said) in [
+            (
+                "year 9999, the last the calendar supports",
+                "should run past year 9999, the last the calendar supports, which only a \
+                 partition with no upper end (MAXVALUE) reaches, and",
+            ),
+            (
+                "the largest integer value, 2147483647",
+                "should run past the largest integer value, 2147483647, which only a \
+                 partition with no upper end (MAXVALUE) reaches, and",
+            ),
+        ] {
+            let mut runway = short(true, None);
+            if let pbps_db::doctor::Runway::Short(short) = &mut runway {
+                short.reach = pbps_db::doctor::Reach::Beyond(edge.to_owned());
+            }
+            let d = partitioned(pbps_db::doctor::RunwayReport {
+                parents: vec![pbps_db::doctor::ParentRunway {
+                    parent: name("app.ev"),
+                    runway: Some(runway),
+                    default_rows: None,
+                }],
+            });
+            let findings = parent_findings(&d);
+            assert_eq!(findings.len(), 1, "{findings:?}");
+            let finding = &findings[0];
+            assert_eq!(finding.id, "doctor.partition-runway");
+            assert_eq!(finding.severity, output::Severity::Warning);
+            assert!(finding.message.contains(said), "{}", finding.message);
+            assert!(
+                finding.message.contains("a plan applied here")
+                    && !finding.message.contains("at least"),
+                "{}",
+                finding.message
+            );
+            assert_eq!(finding.remedy.as_deref(), Some("pbps plan --env prod"));
+        }
     }
 
     /// The step the remedy needs is the newest partition's, and one that has

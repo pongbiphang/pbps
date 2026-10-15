@@ -154,8 +154,10 @@ count of partitions (`3`) or, for a date or time key, a width in the grammar of
 partition's width (DEC-1789.2). A width whose target would lie past year 9999,
 the last the calendar supports, and the default horizon of an integer key whose
 target would lie above the largest value its type holds, are horizons `doctor`
-cannot ask of the series and says so (`doctor.partition-runway-unknown`); a count
-of partitions has no calendar or type to leave.
+cannot ask of a series that ends and says so (`doctor.partition-runway-unknown`),
+unless the declarations already add a partition with no upper end, which reaches any
+target: the finding is then `doctor.partition-runway` with the `pbps plan` remedy
+(#2036). A count of partitions has no calendar or type to leave.
 
 The `policies:` block selects built-in rules and their severities and records
 suppressions — a rule id, a reason and an optional expiry — with parameters
@@ -2411,9 +2413,10 @@ steps. They are `doctor`'s and not a plan's because a plan reads no data (7.2):
   newest partition that holds a row. The measure is that occupancy, not a clock,
   so it works for an integer key and gives the same answer on every day it is
   asked. The horizon is `partition_runway:` (4.1). The remedy is `pbps partitions
-  extend`, or `pbps plan` when the declarations already reach the horizon and what
-  is missing is a plan applied here. A table with no row in a range partition, and
-  a series that reaches the horizon, report nothing.
+  extend`, or `pbps plan` when the declarations already reach the horizon (a
+  declared partition with no upper end reaches any horizon, even one past the key's
+  calendar or type) and what is missing is a plan applied here. A table with no row
+  in a range partition, and a series that reaches the horizon, report nothing.
 - `doctor.partition-default-rows`: the DEFAULT holds a row inside the range of a
   declared partition the database does not have yet, which creating it will move
   (DEC-1547.1), only as far as `pbps move-rows` allowed (DEC-1788.1). A row outside

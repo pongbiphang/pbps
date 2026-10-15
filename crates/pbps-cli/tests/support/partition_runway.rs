@@ -1002,6 +1002,245 @@ pub fn integer_ceiling(server: &str, slug: &str) {
     }
 }
 
+/// `doctor` on parents whose default horizon lies past the key's axis (#2036):
+/// a finite series cannot be called short of a value that does not exist, but
+/// declarations that already add a partition with no upper end reach it, and
+/// then what is missing is a plan applied here.
+///
+/// Six parents, each a series of two partitions of one width with a row in the
+/// second, and the default horizon of twice that width, which lands past year
+/// 9999 for the `date` ones and above 2147483647 for the `integer` ones:
+///
+/// | parent | live series | declared further | what `doctor` says |
+/// |---|---|---|---|
+/// | `cal`, `num` | ends | with a `MAXVALUE` partition | short: plan it |
+/// | `calfin`, `numfin` | ends | not at all | undetermined |
+/// | `calopen`, `numopen` | has a `MAXVALUE` partition | | nothing |
+///
+/// Then the plan applied (the findings leave), and a count of partitions.
+pub fn open_ended_declarations(server: &str, slug: &str) {
+    let own = OwnDatabase::new(server, slug);
+    let conn = own.connection().to_owned();
+    on_server(&conn, "CREATE SCHEMA app");
+    let d = Demo::new(slug);
+    // Two partitions of `width` ending at `top`, and a third with no upper
+    // end if `open` says so.
+    let parent = |name: &str, ty: &str, bounds: [&str; 3], open: bool| {
+        let tail = if open {
+            format!(
+                "  {name}_open: {{from: ['{}'], to: [MAXVALUE]}}\n",
+                bounds[2]
+            )
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!(
+                "table: app.{name}\ncolumns:\n  id: {{type: bigint, nullable: false}}\n  \
+                 k: {{type: {ty}, nullable: false}}\nprimary_key: [id, k]\n\
+                 partition_by: [k]\npartitions:\n  \
+                 {name}_a: {{from: ['{}'], to: ['{}']}}\n  \
+                 {name}_b: {{from: ['{}'], to: ['{}']}}\n{tail}",
+                bounds[0], bounds[1], bounds[1], bounds[2]
+            ),
+        )
+        .unwrap();
+    };
+    let years = ["9997-01-01", "9998-01-01", "9999-01-01"];
+    let ints = ["2147480648", "2147481648", "2147482648"];
+    parent("cal", "date", years, false);
+    parent("calfin", "date", years, false);
+    parent("calopen", "date", years, true);
+    parent("num", "integer", ints, false);
+    parent("numfin", "integer", ints, false);
+    parent("numopen", "integer", ints, true);
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    succeeds(d.run(&["fmt"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &conn]));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    on_server(
+        &conn,
+        "INSERT INTO app.cal VALUES (1, '9998-06-01'); \
+         INSERT INTO app.calfin VALUES (1, '9998-06-01'); \
+         INSERT INTO app.calopen VALUES (1, '9998-06-01'); \
+         INSERT INTO app.num VALUES (1, 2147481700); \
+         INSERT INTO app.numfin VALUES (1, 2147481700); \
+         INSERT INTO app.numopen VALUES (1, 2147481700)",
+    );
+    // Declared further than the database has, a partition with no upper end
+    // that no plan has applied here.
+    parent("cal", "date", years, true);
+    parent("num", "integer", ints, true);
+    succeeds(d.run(&["fmt"]));
+    succeeds(d.run(&["plan"]));
+
+    let doctor = |conn: &str| {
+        let o = d.run(&["doctor", "--db", conn, "--format", "json"]);
+        assert_eq!(code(&o), 0, "warnings leave doctor green: {}", stdout(&o));
+        json_of(&o)
+    };
+    let found = |json: &serde_json::Value, id: &str, parent: &str| -> Vec<serde_json::Value> {
+        json["findings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{json}"))
+            .iter()
+            .filter(|f| {
+                f["id"] == id
+                    && f["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("app.{parent}'s"))
+            })
+            .cloned()
+            .collect()
+    };
+
+    // 1. The default horizon.
+    let json = doctor(&conn);
+    for (parent, frontier, held, edge) in [
+        (
+            "cal",
+            "9999-01-01",
+            "9998-01-01",
+            "year 9999, the last the calendar supports",
+        ),
+        (
+            "num",
+            "2147482648",
+            "2147481648",
+            "the largest integer value, 2147483647",
+        ),
+    ] {
+        assert!(
+            found(&json, "doctor.partition-runway-unknown", parent).is_empty(),
+            "{parent} is a plan to apply, not an unanswerable question: {json}"
+        );
+        let short = found(&json, "doctor.partition-runway", parent);
+        assert_eq!(short.len(), 1, "{parent}: {json}");
+        let message = short[0]["message"].as_str().unwrap();
+        for said in [
+            format!("end at `{frontier}`"),
+            format!("the partition from `{held}`"),
+            "twice the newest partition's width".to_owned(),
+            format!("past {edge}, which only a partition with no upper end (MAXVALUE) reaches"),
+            "The declarations already reach that far, so what is missing is a plan applied here"
+                .to_owned(),
+        ] {
+            assert!(message.contains(&said), "{parent}: {said}: {message}");
+        }
+        assert!(
+            !message.contains("at least"),
+            "no target value is named: {message}"
+        );
+        assert!(
+            short[0]["remedy"]
+                .as_str()
+                .unwrap()
+                .starts_with("pbps plan --db "),
+            "{parent}: {}",
+            short[0]
+        );
+    }
+    // Declarations that stay finite leave the question unanswerable.
+    for (parent, said) in [
+        ("calfin", "reaches past the supported calendar"),
+        (
+            "numfin",
+            "reaches past the largest integer value, 2147483647",
+        ),
+    ] {
+        assert!(
+            found(&json, "doctor.partition-runway", parent).is_empty(),
+            "{parent} is not short of a value nothing can reach: {json}"
+        );
+        let unknown = found(&json, "doctor.partition-runway-unknown", parent);
+        assert_eq!(unknown.len(), 1, "{parent}: {json}");
+        let message = unknown[0]["message"].as_str().unwrap();
+        assert!(
+            message.contains(said) && message.contains("undetermined, not fine"),
+            "{parent}: {message}"
+        );
+    }
+    // A live series with a partition of no upper end has nothing to run out
+    // of, whatever the horizon lands on.
+    for parent in ["calopen", "numopen"] {
+        for id in ["doctor.partition-runway", "doctor.partition-runway-unknown"] {
+            assert!(found(&json, id, parent).is_empty(), "{parent} {id}: {json}");
+        }
+    }
+
+    // 2. A configured width that leaves the calendar is the same question for
+    //    the date parents, and a count of partitions is no point on the axis.
+    let configured = |setting: &str| {
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!("dialect: postgres\npartition_runway: {setting}\n"),
+        )
+        .unwrap();
+        doctor(&conn)
+    };
+    let json = configured("9000year");
+    let short = found(&json, "doctor.partition-runway", "cal");
+    assert_eq!(short.len(), 1, "{json}");
+    assert!(
+        short[0]["message"].as_str().unwrap().contains("(9000year)")
+            && short[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("past year 9999, the last the calendar supports"),
+        "{json}"
+    );
+    let unknown = found(&json, "doctor.partition-runway-unknown", "calfin");
+    assert_eq!(unknown.len(), 1, "{json}");
+    assert!(
+        unknown[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("partition_runway `9000year`"),
+        "{json}"
+    );
+    let json = configured("3");
+    for parent in ["cal", "calfin", "num", "numfin"] {
+        assert!(
+            found(&json, "doctor.partition-runway-unknown", parent).is_empty(),
+            "{parent}: {json}"
+        );
+        let short = found(&json, "doctor.partition-runway", parent);
+        assert_eq!(short.len(), 1, "{parent}: {json}");
+        assert!(
+            short[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("(3 partitions)"),
+            "{parent}: {json}"
+        );
+    }
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+
+    // 3. The plan the finding names, applied: the partitions with no upper end
+    //    are the database's, and `cal` and `num` stop being findings.
+    d.commit();
+    let plan = d.dir.join("runway-2036.json");
+    succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, &conn, &plan, &[]));
+    let json = doctor(&conn);
+    for parent in ["cal", "num", "calopen", "numopen"] {
+        for id in ["doctor.partition-runway", "doctor.partition-runway-unknown"] {
+            assert!(found(&json, id, parent).is_empty(), "{parent} {id}: {json}");
+        }
+    }
+    for parent in ["calfin", "numfin"] {
+        assert_eq!(
+            found(&json, "doctor.partition-runway-unknown", parent).len(),
+            1,
+            "{parent} has had nothing done for it: {json}"
+        );
+    }
+}
+
 /// Row-level security hides rows from `doctor`'s `EXISTS` through a parent, so
 /// neither question is answered as "nothing there" for an account it applies
 /// to (#1925, DEC-1925.1).

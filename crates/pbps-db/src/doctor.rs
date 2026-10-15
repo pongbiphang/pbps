@@ -440,6 +440,12 @@ pub enum Reach {
     /// This many partitions should end after where the newest rows start, the
     /// one holding them the first.
     Partitions(u32),
+    /// The series should run past this edge of the key's axis (the last year
+    /// the calendar supports, or the largest value of the key's type), which
+    /// no partition with an upper end can reach: the horizon asks for a
+    /// partition with no upper end (#2036). The edge is worded for the
+    /// finding.
+    Beyond(String),
 }
 
 /// Rows in a parent's DEFAULT partition that belong to partitions the

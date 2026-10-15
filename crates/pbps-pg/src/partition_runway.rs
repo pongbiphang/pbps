@@ -264,6 +264,23 @@ enum Need {
     Partitions(u32),
     /// Some partition ends at or after this value.
     Until(Val),
+    /// A point past the key's axis, which no partition can end at: only a
+    /// series with no upper end reaches it (#2036).
+    Beyond(Beyond),
+}
+
+/// A horizon whose target lies past the key's axis, the calendar's year 9999
+/// or the largest value of the key's integer type. There is no value to name
+/// as the target, so none is built: what is kept is the edge it passes and
+/// the reason it is undetermined for a series that ends (#1924, #2020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Beyond {
+    /// The edge the target passes, as the finding says it: the series should
+    /// run past it.
+    edge: String,
+    /// Why the question cannot be asked of a series that ends, which is
+    /// `assess`'s `Err` unless the declarations have no upper end.
+    undetermined: String,
 }
 
 /// `c` as `key` prints a bound, which is the spelling [`parse_civil`] reads
@@ -298,29 +315,35 @@ fn plural(n: u32) -> String {
     format!("{n} partition{}", if n == 1 { "" } else { "s" })
 }
 
-/// Why a horizon cannot be asked of a series whose newest rows start at
-/// `held_from`: its target is a value past the calendar, so there is no point
-/// to say the series falls short of (#1924). The reason reads inside the
-/// `…-unknown` finding's parentheses, like the others.
-fn past_the_calendar(horizon: &str, held_from: &str, remedy: &str) -> String {
-    format!(
-        "{horizon}, counted from `{held_from}`, reaches past the supported calendar, which ends \
-         in year 9999: {remedy}"
-    )
+/// A horizon whose target is a value past the calendar, for a series whose
+/// newest rows start at `held_from`: there is no point to say a series that
+/// ends falls short of (#1924). The reason reads inside the `…-unknown`
+/// finding's parentheses, like the others.
+fn past_the_calendar(horizon: &str, held_from: &str, remedy: &str) -> Beyond {
+    Beyond {
+        edge: "year 9999, the last the calendar supports".to_owned(),
+        undetermined: format!(
+            "{horizon}, counted from `{held_from}`, reaches past the supported calendar, which \
+             ends in year 9999: {remedy}"
+        ),
+    }
 }
 
-/// Why a horizon cannot be asked of a series whose newest rows start at
-/// `held_from`: its target is an integer above the largest the key's type
-/// holds, so no partition can end there and there is no point to say the
-/// series falls short of (#2020). The same shape as [`past_the_calendar`], and
-/// the wording of the generator's own refusal (#1905: "no larger value fits a
-/// bigint"). The reason reads inside the `…-unknown` finding's parentheses.
-fn past_the_largest(horizon: &str, held_from: &str, int: Int, remedy: &str) -> String {
-    format!(
-        "{horizon}, counted from `{held_from}`, reaches past the largest {} value, {}, and no \
-         larger value fits: {remedy}",
-        int.name, int.max
-    )
+/// A horizon whose target is an integer above the largest the key's type
+/// holds, for a series whose newest rows start at `held_from`: no partition
+/// can end there, so there is no point to say a series that ends falls short
+/// of (#2020). The same shape as [`past_the_calendar`], and the wording of the
+/// generator's own refusal (#1905: "no larger value fits a bigint"). The
+/// reason reads inside the `…-unknown` finding's parentheses.
+fn past_the_largest(horizon: &str, held_from: &str, int: Int, remedy: &str) -> Beyond {
+    Beyond {
+        edge: format!("the largest {} value, {}", int.name, int.max),
+        undetermined: format!(
+            "{horizon}, counted from `{held_from}`, reaches past the largest {} value, {}, and \
+             no larger value fits: {remedy}",
+            int.name, int.max
+        ),
+    }
 }
 
 /// The need, and the horizon in words for the message.
@@ -329,8 +352,9 @@ fn past_the_largest(horizon: &str, held_from: &str, int: Int, remedy: &str) -> S
 /// key's axis, so it has no calendar or type to leave and serves every key
 /// type, however large (it is at most `u32::MAX`). A target on the axis of a
 /// date or time key can leave the calendar, and one on an integer key can
-/// leave the key's type; either is an `Err`: undetermined, not a series that
-/// is short of a point nothing can reach.
+/// leave the key's type; either is a [`Need::Beyond`], not a series that is
+/// short of a point nothing can reach, and `assess` decides what it is for the
+/// series at hand. `Err` is a horizon that is no question of this key at all.
 fn need(
     key: Key,
     horizon: &Horizon,
@@ -341,13 +365,14 @@ fn need(
         Horizon::Partitions(k) => Ok((Need::Partitions(*k), plural(*k))),
         Horizon::Width { step, text } => match &reference.val {
             Val::Time(c) => {
-                let until = add(c, width_of(step), 1).ok_or_else(|| {
-                    past_the_calendar(
+                let Some(until) = add(c, width_of(step), 1) else {
+                    let beyond = past_the_calendar(
                         &format!("partition_runway `{text}`"),
                         &reference.text,
                         "write a shorter width, or a count of partitions, as `3`",
-                    )
-                })?;
+                    );
+                    return Ok((Need::Beyond(beyond), text.clone()));
+                };
                 Ok((Need::Until(Val::Time(until)), text.clone()))
             }
             Val::Int(_) => Err(format!(
@@ -361,13 +386,17 @@ fn need(
             let twice = match (newest.lo.as_ref(), newest.hi.as_ref(), &reference.val) {
                 (Some(lo), Some(hi), Val::Time(c)) => match (&lo.val, &hi.val) {
                     (Val::Time(a), Val::Time(b)) => match width_between(a, b) {
-                        Some(w) => Some(Val::Time(add(c, w, 2).ok_or_else(|| {
-                            past_the_calendar(
-                                &format!("the default horizon, {words}"),
-                                &reference.text,
-                                "set partition_runway to a count of partitions, as `3`",
-                            )
-                        })?)),
+                        Some(w) => {
+                            let Some(until) = add(c, w, 2) else {
+                                let beyond = past_the_calendar(
+                                    &format!("the default horizon, {words}"),
+                                    &reference.text,
+                                    "set partition_runway to a count of partitions, as `3`",
+                                );
+                                return Ok((Need::Beyond(beyond), words));
+                            };
+                            Some(Val::Time(until))
+                        }
                         None => None,
                     },
                     _ => None,
@@ -383,12 +412,13 @@ fn need(
                         // can end there.
                         let target = r + 2 * (b - a);
                         if target > int.max {
-                            return Err(past_the_largest(
+                            let beyond = past_the_largest(
                                 &format!("the default horizon, {words}"),
                                 &reference.text,
                                 int,
                                 "set partition_runway to a count of partitions, as `3`",
-                            ));
+                            );
+                            return Ok((Need::Beyond(beyond), words));
                         }
                         Some(Val::Int(target))
                     }
@@ -419,6 +449,9 @@ fn covers(ranges: &[Range], reference: &Val, need: &Need) -> bool {
                 >= usize::try_from(*k).unwrap_or(usize::MAX)
         }
         Need::Until(value) => ends.any(|hi| hi.val >= *value),
+        // Every upper end is a value of the key, so none is past its axis:
+        // only a series with no upper end, answered above, reaches it.
+        Need::Beyond(_) => false,
     }
 }
 
@@ -454,7 +487,12 @@ pub(crate) enum Verdict {
 /// `occupied`, one of them: the newest that holds a row. `declared` is what
 /// the declarations give, to say whether what is missing is a plan applied.
 ///
-/// `Err` is a horizon this key cannot be asked for, and never a verdict.
+/// `Err` is a horizon this key cannot be asked for, and never a verdict: a
+/// width of time on an integer key, or a target past the key's axis (#1924,
+/// #2020) that a finite series cannot be called short of and that the
+/// declarations do not reach either. Declarations with a partition that has
+/// no upper end do reach it (#2036): the series is short of what the live
+/// catalog lacks, and the plan that adds it is the remedy.
 pub(crate) fn assess(
     key: Key,
     catalog: &[Range],
@@ -481,6 +519,15 @@ pub(crate) fn assess(
     if covers(catalog, &reference.val, &needed) {
         return Ok(Verdict::Covered);
     }
+    // Asked before the target is turned into a value, because a target past
+    // the axis has none (#2036): the declarations are what say whether it is
+    // a question about the series at all.
+    let declared_covers = covers(declared, &reference.val, &needed);
+    if let Need::Beyond(beyond) = &needed
+        && !declared_covers
+    {
+        return Err(beyond.undetermined.clone());
+    }
     let every = match (&newest.lo, &newest.hi) {
         (Some(lo), Some(hi)) => match (&lo.val, &hi.val) {
             (Val::Time(a), Val::Time(b)) => width_between(a, b).and_then(every_of),
@@ -493,6 +540,7 @@ pub(crate) fn assess(
         Need::Partitions(k) => Reach::Partitions(*k),
         Need::Until(Val::Time(c)) => Reach::Until(fmt_civil(key, c)),
         Need::Until(Val::Int(i)) => Reach::Until(i.to_string()),
+        Need::Beyond(beyond) => Reach::Beyond(beyond.edge.clone()),
     };
     Ok(Verdict::Short(Short {
         frontier: newest
@@ -504,7 +552,7 @@ pub(crate) fn assess(
         reach,
         horizon: words,
         every,
-        declared_covers: covers(declared, &reference.val, &needed),
+        declared_covers,
     }))
 }
 
@@ -1503,5 +1551,264 @@ mod tests {
             ));
             assert_eq!(s.reach, Reach::Partitions(2), "{}", int.name);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // A target past the axis, and declarations with no upper end (#2036)
+    // -----------------------------------------------------------------------
+
+    /// `ranges` and a partition from `from` with no upper end, which is what a
+    /// declaration adds that no plan has applied here.
+    fn with_open_end(ranges: &[Range], key: Key, from: &str) -> Vec<Range> {
+        let mut declared = ranges.to_vec();
+        declared.push(Range {
+            lo: Some(end(key, from).unwrap()),
+            hi: None,
+        });
+        declared
+    }
+
+    /// What a date key near year 9999 is asked: a default horizon whose target
+    /// is the year 10000, and a configured width that leaves the calendar.
+    fn near_the_calendar_end() -> (Vec<Range>, Vec<Horizon>) {
+        let ranges = months(&[("9997-01-01", "9998-01-01"), ("9998-01-01", "9999-01-01")]);
+        (
+            ranges,
+            vec![Horizon::Default, width("2year"), width("9000year")],
+        )
+    }
+
+    #[test]
+    fn declarations_with_no_upper_end_reach_a_date_target_past_the_calendar() {
+        let (ranges, horizons) = near_the_calendar_end();
+        let declared = with_open_end(&ranges, Key::Date, "9999-01-01");
+        for horizon in horizons {
+            let s = short(assess(Key::Date, &ranges, &declared, &ranges[1], &horizon));
+            assert!(s.declared_covers, "{horizon:?}");
+            // The target is not built, so the reach names the edge it passes.
+            assert_eq!(
+                s.reach,
+                Reach::Beyond("year 9999, the last the calendar supports".into()),
+                "{horizon:?}"
+            );
+            assert_eq!(s.frontier, "9999-01-01");
+            assert_eq!(s.held_from, "9998-01-01");
+            assert_eq!(s.every.as_deref(), Some("1year"));
+        }
+        let s = short(assess(
+            Key::Date,
+            &ranges,
+            &declared,
+            &ranges[1],
+            &Horizon::Default,
+        ));
+        assert_eq!(s.horizon, "twice the newest partition's width");
+        let s = short(assess(
+            Key::Date,
+            &ranges,
+            &declared,
+            &ranges[1],
+            &width("9000year"),
+        ));
+        assert_eq!(s.horizon, "9000year");
+    }
+
+    #[test]
+    fn finite_declarations_leave_a_date_target_past_the_calendar_undetermined() {
+        let (ranges, horizons) = near_the_calendar_end();
+        // Declared as far as the calendar goes, and still a series that ends.
+        let mut declared = ranges.clone();
+        declared.extend(months(&[("9999-01-01", "9999-12-31")]));
+        for horizon in horizons {
+            for declared in [&[][..], &ranges, &declared] {
+                let reason =
+                    undetermined(assess(Key::Date, &ranges, declared, &ranges[1], &horizon));
+                assert!(
+                    reason.contains("counted from `9998-01-01`")
+                        && reason.contains("reaches past the supported calendar"),
+                    "{horizon:?}: {reason}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn declarations_with_no_upper_end_reach_a_time_target_past_the_calendar() {
+        for (key, suffix) in [(Key::Timestamp, ""), (Key::TimestampTz, "+00")] {
+            let at = |text: &str| format!("{text}{suffix}");
+            let held = stamp(
+                key,
+                &at("9999-12-30 23:59:59.999999"),
+                &at("9999-12-31 00:00:00"),
+            );
+            let ranges = [held.clone()];
+            let declared = with_open_end(&ranges, key, &at("9999-12-31 00:00:00"));
+            let finite = [
+                held.clone(),
+                stamp(key, &at("9999-12-31 00:00:00"), &at("9999-12-31 12:00:00")),
+            ];
+            for horizon in [width("2day"), width("9000year")] {
+                let s = short(assess(key, &ranges, &declared, &held, &horizon));
+                assert!(s.declared_covers, "{key:?} {horizon:?}");
+                assert_eq!(
+                    s.reach,
+                    Reach::Beyond("year 9999, the last the calendar supports".into()),
+                    "{key:?} {horizon:?}"
+                );
+                assert_eq!(s.held_from, at("9999-12-30 23:59:59.999999"));
+                // Negative: the same series declared finite stays undetermined.
+                for declared in [&[][..], &ranges, &finite] {
+                    let reason = undetermined(assess(key, &ranges, declared, &held, &horizon));
+                    assert!(
+                        reason.contains("reaches past the supported calendar"),
+                        "{key:?} {horizon:?}: {reason}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn declarations_with_no_upper_end_reach_an_integer_target_above_the_largest() {
+        for (int, w) in [(SMALLINT, 100), (INTEGER, 1000), (BIGINT_KEY, 1000)] {
+            let key = Key::Integer(int);
+            // One past what the type holds: twice the width on from here.
+            let from = int.max - 2 * w + 1;
+            let held = whole(int, from, from + w);
+            let ranges = [held.clone()];
+            let declared = with_open_end(&ranges, key, &(from + w).to_string());
+            let s = short(assess(key, &ranges, &declared, &held, &Horizon::Default));
+            assert!(s.declared_covers, "{}", int.name);
+            assert_eq!(
+                s.reach,
+                Reach::Beyond(format!("the largest {} value, {}", int.name, int.max)),
+                "{}",
+                int.name
+            );
+            assert_eq!(s.frontier, (from + w).to_string());
+            assert_eq!(s.held_from, from.to_string());
+            assert_eq!(s.every, Some(w.to_string()));
+            // Negative: declared finite, even up to the largest value, it is
+            // the undetermined horizon it was.
+            let finite = [held.clone(), whole(int, from + w, int.max)];
+            for declared in [&[][..], &ranges, &finite] {
+                let reason = undetermined(assess(key, &ranges, declared, &held, &Horizon::Default));
+                assert!(
+                    reason.contains(&format!("reaches past the largest {} value", int.name)),
+                    "{}: {reason}",
+                    int.name
+                );
+            }
+        }
+    }
+
+    /// The edge is a property of the target. A horizon that lands on the axis
+    /// is short or covered as before, with declarations that have no upper end
+    /// or without them, and a count of partitions has no axis to leave.
+    #[test]
+    fn declarations_with_no_upper_end_change_nothing_for_a_target_on_the_axis() {
+        let ranges = series(12);
+        let december = ranges[11].clone();
+        let declared = with_open_end(&ranges, Key::Date, "2027-01-01");
+        let s = short(assess(
+            Key::Date,
+            &ranges,
+            &declared,
+            &december,
+            &Horizon::Default,
+        ));
+        assert!(s.declared_covers);
+        assert_eq!(s.reach, Reach::Until("2027-02-01".into()));
+        let s = short(assess(
+            Key::Date,
+            &ranges,
+            &declared,
+            &december,
+            &Horizon::Partitions(3),
+        ));
+        assert_eq!(s.reach, Reach::Partitions(3));
+        let held = whole(INTEGER, 2_147_482_000, 2_147_483_000);
+        let ints = [held.clone()];
+        let open = with_open_end(&ints, Key::Integer(INTEGER), "2147483000");
+        let s = short(assess(
+            Key::Integer(INTEGER),
+            &ints,
+            &open,
+            &held,
+            &Horizon::Partitions(3),
+        ));
+        assert!(s.declared_covers);
+        assert_eq!(s.reach, Reach::Partitions(3));
+        // A target exactly at the largest value is a point, not an edge.
+        let from = i128::from(i32::MAX) - 2000;
+        let held = whole(INTEGER, from, from + 1000);
+        let s = short(assess(
+            Key::Integer(INTEGER),
+            std::slice::from_ref(&held),
+            &[],
+            &held,
+            &Horizon::Default,
+        ));
+        assert_eq!(s.reach, Reach::Until(i32::MAX.to_string()));
+    }
+
+    /// A horizon that is no question of the key is not answered by
+    /// declarations that have no upper end: the setting is what is wrong.
+    #[test]
+    fn declarations_with_no_upper_end_do_not_answer_a_width_of_time_on_a_number() {
+        let held = whole(INTEGER, 0, 1000);
+        let declared = with_open_end(std::slice::from_ref(&held), Key::Integer(INTEGER), "1000");
+        let refused = assess(
+            Key::Integer(INTEGER),
+            std::slice::from_ref(&held),
+            &declared,
+            &held,
+            &width("2month"),
+        )
+        .unwrap_err();
+        assert!(refused.contains("a width of time"), "{refused}");
+    }
+
+    /// A live catalog with a partition that has no upper end has nothing to
+    /// run out of, whatever the horizon asks and wherever it lands.
+    #[test]
+    fn a_catalog_with_no_upper_end_is_covered_whatever_the_target() {
+        let dates = vec![
+            Range {
+                lo: Some(d("9998-01-01")),
+                hi: Some(d("9999-01-01")),
+            },
+            Range {
+                lo: Some(d("9999-01-01")),
+                hi: None,
+            },
+        ];
+        for horizon in [Horizon::Default, width("9000year"), Horizon::Partitions(9)] {
+            for declared in [&[][..], &dates] {
+                assert_eq!(
+                    assess(Key::Date, &dates, declared, &dates[1], &horizon),
+                    Ok(Verdict::Covered),
+                    "{horizon:?}"
+                );
+            }
+        }
+        let from = i128::from(i32::MAX) - 1500;
+        let ints = vec![
+            whole(INTEGER, from - 1000, from),
+            Range {
+                lo: Some(end(Key::Integer(INTEGER), &from.to_string()).unwrap()),
+                hi: None,
+            },
+        ];
+        assert_eq!(
+            assess(
+                Key::Integer(INTEGER),
+                &ints,
+                &[],
+                &ints[0],
+                &Horizon::Default
+            ),
+            Ok(Verdict::Covered)
+        );
     }
 }

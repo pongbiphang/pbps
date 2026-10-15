@@ -1221,7 +1221,16 @@ question about a live database, and the maintainer settled where it is asked
   asked as usual, since a series can end there. There is no edge at the bottom: a
   partition's lower end is below its upper end, so the target is above rows that
   are no lower than the type's minimum. A count of partitions is never a point on
-  the key's axis, so it has no calendar or type to leave, however large.
+  the key's axis, so it has no calendar or type to leave, however large. **Either edge
+  is `…-unknown` only for a series that ends (#2036).** The declarations are asked
+  before the target is, and a declared partition with no upper end reaches any target,
+  one past the axis included: a live series that ends, with such a partition declared
+  and no plan applied here, gets `doctor.partition-runway` with the `pbps plan` remedy,
+  whose reach says the series should run past the edge (year 9999, or the largest value
+  of the type) and names no target, since there is none. A live series that already has
+  the partition reports nothing, as for any horizon. Declarations that stay finite leave
+  the finding `…-unknown` as before, and so does a width of time on a number, which is
+  the setting being wrong and not a series being short.
 - **The DEFAULT's rows.** `EXISTS` of a row in the DEFAULT inside the range of any
   declared partition the database does not have. A range the database has cannot have
   a row there, so only the declared ranges it lacks are asked about, compared by their

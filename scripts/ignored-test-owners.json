@@ -723,6 +723,7 @@
         "doctor_keeps_fractions_of_a_second_in_a_partition_runway",
         "doctor_does_not_read_partition_occupancy_through_row_level_security",
         "doctor_does_not_call_a_series_short_of_a_value_past_the_integer_maximum",
+        "doctor_names_the_plan_when_declarations_with_no_upper_end_reach_a_horizon_past_the_axis",
         "a_date_or_time_is_taken_as_the_value_the_engine_reads",
         "blank_baseline_reasons_leave_the_live_ledger_unchanged",
         "forced_pull_with_multiple_decisions_provides_a_complete_batch_remedy",
