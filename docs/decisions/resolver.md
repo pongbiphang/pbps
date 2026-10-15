@@ -2787,3 +2787,46 @@ and that is why each list was right to change; the identifier did not follow).
 (`pbps-pg` and `pbps-mssql`), and
 `a_plan_sealed_under_the_previous_qualification_rule_is_refused_naming_it`
 (`explain_resolver`).
+
+<a id="dec-1778-1"></a>
+
+**DEC-1778.1. `pbps resolver externals` drafts the externals file from the
+target, shapes only (#1778).** The externals file (DEC-1673.1) was written
+by hand. The draft is its starting point, and the decisions below are the
+maintainer's (2026-10-15).
+
+**What was decided.**
+- **Scope:** the dependency closure of the managed objects the target
+  holds, read from its `pg_depend`, with the shapes those objects need in
+  turn. A part folds into what carries it (`i`, `a`), an extension's member
+  into the extension. A managed object's every dependency counts, since the
+  compile creates it whole on scratch; an external object's only through
+  the parts the comparison reads (#1783), since it is staged as its shape.
+  `--schema <name>` adds every unmanaged object of a schema.
+- **Written as SQL:** tables (columns, types, order, keys, NOT NULL
+  constraints by name, owned and identity sequences, own options), views
+  as shape views, enums, domains, composite types, extensions with their
+  version. These are the common classes, and the shapes the comparison
+  reads of each are known.
+- **Listed, never written:** routines by signature, since pbps sends no
+  routine source to scratch; casts, operators, collations, operator
+  classes and the table structures the draft does not write, for the
+  operator to write by hand. Whatever the file holds is compared with the
+  target the same way, whoever wrote it.
+- **A chain** is listed with its reason and the two remedies, and written
+  as no SQL; so is an object whose shape names one that cannot be staged.
+- **Output:** stdout, or a new `--out` file. An existing file is replaced
+  only with `--force`, and the file a resolver entry names never is, nor
+  one the project reads: it is reviewed and may hold what was written by
+  hand.
+- The reader is new code in `pbps-pg`: the plan model and emitter hold no
+  types, domains, enums, extensions or shape views.
+
+Fill, the second step, waits for #1956: its order is `Catalog` edges
+`settle` consumes under #1776, not a new pass.
+
+**Pinned by** `resolver_stages_an_externals_file_drafted_from_the_target_unchanged`
+and `resolver_draft_lists_a_routine_and_a_chain_and_writes_neither` (live,
+16 and 18), the `resolver::draft` unit tests, and
+`resolver_externals_drafts_what_a_managed_view_reads_and_never_replaces_the_externals_file`
+(`flow_pg`).

@@ -16,8 +16,9 @@ transfer (#617) is closed. #615 is delivered for PostgreSQL planning by
 pre-publication recheck, from the sealed order (DEC-1516.1), and `explain`
 shows its evidence offline (DEC-1517.1). The remaining order:
 1. [#1778](https://github.com/pongbiphang/pbps/issues/1778): the externals file
-   draft command, after [#2007](https://github.com/pongbiphang/pbps/issues/2007)
-   renames the file from `baseline`; automatic fill after #1956;
+   draft command, `pbps resolver externals` (DEC-1778.1), after
+   [#2007](https://github.com/pongbiphang/pbps/issues/2007) renamed the file
+   from `baseline`; automatic fill after #1956;
 2. [#616](https://github.com/pongbiphang/pbps/issues/616): apply under the
    deployment lock, with #618's approval-consumer checks;
 3. SQL Server: [#619](https://github.com/pongbiphang/pbps/issues/619),
