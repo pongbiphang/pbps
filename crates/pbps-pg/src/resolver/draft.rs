@@ -121,7 +121,8 @@ struct Object {
 
 /// One `pg_depend` row. `shape` says whether the dependent is a part the
 /// comparison reads: not a view's query, a default, a trigger, a policy, a
-/// foreign key, a CHECK or a plain index (SPEC §9.3.2, #1783).
+/// foreign key, a CHECK or a plain index (SPEC §9.3.2, #1783), and of a
+/// routine only the types its signature names, never what its body reads.
 #[derive(Debug, Clone)]
 struct Depend {
     dependent: Key,
@@ -211,6 +212,9 @@ struct Type {
     qualified: String,
     relation: u32,
     base: String,
+    /// The base's declared array dimensions, which `format_type` does not
+    /// spell.
+    dimensions: i32,
     not_null: bool,
     collation: Option<String>,
 }
@@ -381,6 +385,7 @@ async fn read_in(conn: &mut impl QueryConnection) -> Result<Facts, DbError> {
                 qualified: text(&row, "qualified")?,
                 relation: number(&row, "relation")?,
                 base: optional(&row, "base")?.unwrap_or_default(),
+                dimensions: signed(&row, "dimensions")?,
                 not_null: flag(&row, "not_null")?,
                 collation: optional(&row, "collation")?,
             },
@@ -420,6 +425,12 @@ SELECT (SELECT c.relname::text FROM pg_catalog.pg_class c WHERE c.oid = d.classi
           WHEN 'pg_catalog.pg_constraint'::pg_catalog.regclass THEN \
             coalesce((SELECT k.contype IN ('p', 'u', 'x', 'n') FROM pg_catalog.pg_constraint k \
                        WHERE k.oid = d.objid), false) \
+          WHEN 'pg_catalog.pg_proc'::pg_catalog.regclass THEN \
+            d.refclassid = 'pg_catalog.pg_type'::pg_catalog.regclass \
+            AND EXISTS (SELECT FROM pg_catalog.pg_proc p WHERE p.oid = d.objid \
+                          AND (d.refobjid = p.prorettype \
+                               OR d.refobjid = ANY (p.proargtypes::pg_catalog.oid[]) \
+                               OR d.refobjid = ANY (coalesce(p.proallargtypes, '{}')))) \
           WHEN 'pg_catalog.pg_class'::pg_catalog.regclass THEN \
             NOT EXISTS (SELECT FROM pg_catalog.pg_index i \
                          WHERE i.indexrelid = d.objid AND NOT i.indisunique \
@@ -521,7 +532,7 @@ SELECT t.oid::text AS oid, t.typtype::text AS kind, \
        t.typrelid::text AS relation, \
        CASE WHEN t.typtype = 'd' THEN pg_catalog.format_type(t.typbasetype, t.typtypmod) END \
          AS base, \
-       t.typnotnull::text AS not_null, \
+       t.typnotnull::text AS not_null, t.typndims::text AS dimensions, \
        CASE WHEN t.typtype = 'd' AND t.typcollation <> 0 AND t.typcollation <> \
                  (SELECT b.typcollation FROM pg_catalog.pg_type b WHERE b.oid = t.typbasetype) THEN \
          (SELECT pg_catalog.quote_ident(cn.nspname) || '.' || pg_catalog.quote_ident(co.collname) \
@@ -904,7 +915,7 @@ fn item(facts: &Facts, key: &Key, described: &str) -> Item {
                 Some(format!(
                     "CREATE DOMAIN {} AS {}{}{not_null};\n",
                     t.qualified,
-                    t.base,
+                    dimensioned(&t.base, t.dimensions),
                     collate(t.collation.as_deref())
                 ))
             }
@@ -921,7 +932,7 @@ fn item(facts: &Facts, key: &Key, described: &str) -> Item {
                         .map(|c| format!(
                             "{} {}{}",
                             c.name,
-                            c.spelled,
+                            dimensioned(&c.spelled, c.dimensions),
                             collate(c.collation.as_deref())
                         ))
                         .collect::<Vec<_>>()
@@ -1015,10 +1026,9 @@ fn table(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'stati
             return Err("inheritance");
         }
         let mut definition = format!(
-            "    {} {}{}{}",
+            "    {} {}{}",
             column.name,
-            column.spelled,
-            "[]".repeat(usize::try_from(column.dimensions - 1).unwrap_or(0)),
+            dimensioned(&column.spelled, column.dimensions),
             collate(column.collation.as_deref())
         );
         if let Some(how) = column.identity {
@@ -1044,30 +1054,7 @@ fn table(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'stati
             None => {}
         }
         definitions.push(definition);
-        let alter = format!(
-            "ALTER TABLE {} ALTER COLUMN {}",
-            relation.qualified, column.name
-        );
-        if let Some(storage) = column.storage {
-            after.push(format!(
-                "{alter} SET STORAGE {};\n",
-                match storage {
-                    'p' => "PLAIN",
-                    'e' => "EXTERNAL",
-                    'm' => "MAIN",
-                    _ => "EXTENDED",
-                }
-            ));
-        }
-        if let Some(compression) = column.compression {
-            after.push(format!(
-                "{alter} SET COMPRESSION {};\n",
-                if compression == 'l' { "lz4" } else { "pglz" }
-            ));
-        }
-        if !column.options.is_empty() {
-            after.push(format!("{alter} SET ({});\n", column.options));
-        }
+        after.push(column_settings(relation, column));
     }
     let mut sql = format!(
         "CREATE {}TABLE {} (\n{}\n){}{};\n",
@@ -1156,12 +1143,16 @@ fn shape_view(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'
     };
     Ok(if relation.kind == 'm' {
         format!(
-            "CREATE MATERIALIZED VIEW {}{}{} AS {select} WITH {}DATA;\n{}",
+            "CREATE MATERIALIZED VIEW {}{}{} AS {select} WITH {}DATA;\n{}{}",
             relation.qualified,
             using(&relation.method),
             with(&relation.options),
             if relation.populated { "" } else { "NO " },
-            indexes(facts, oid, relation)
+            indexes(facts, oid, relation),
+            columns
+                .iter()
+                .map(|column| column_settings(relation, column))
+                .collect::<String>()
         )
     } else {
         format!(
@@ -1182,8 +1173,10 @@ fn indexes(facts: &Facts, oid: u32, relation: &Relation) -> String {
         }
         if index.clustered {
             sql.push_str(&format!(
-                "ALTER TABLE {} CLUSTER ON {};\n",
-                relation.qualified, index.name
+                "ALTER {} {} CLUSTER ON {};\n",
+                altered(relation),
+                relation.qualified,
+                index.name
             ));
         }
         if index.replica_identity {
@@ -1194,6 +1187,59 @@ fn indexes(facts: &Facts, oid: u32, relation: &Relation) -> String {
         }
     }
     sql
+}
+
+/// What a table's or materialized view's column says beyond its type: its
+/// storage, compression and options, each compared (#1783).
+fn column_settings(relation: &Relation, column: &Column) -> String {
+    let alter = format!(
+        "ALTER {} {} ALTER COLUMN {}",
+        altered(relation),
+        relation.qualified,
+        column.name
+    );
+    let mut sql = String::new();
+    if let Some(storage) = column.storage {
+        sql.push_str(&format!(
+            "{alter} SET STORAGE {};\n",
+            match storage {
+                'p' => "PLAIN",
+                'e' => "EXTERNAL",
+                'm' => "MAIN",
+                _ => "EXTENDED",
+            }
+        ));
+    }
+    if let Some(compression) = column.compression {
+        sql.push_str(&format!(
+            "{alter} SET COMPRESSION {};\n",
+            if compression == 'l' { "lz4" } else { "pglz" }
+        ));
+    }
+    if !column.options.is_empty() {
+        sql.push_str(&format!("{alter} SET ({});\n", column.options));
+    }
+    sql
+}
+
+/// The `ALTER` a relation of this kind takes: `ALTER TABLE` refuses a
+/// materialized view.
+fn altered(relation: &Relation) -> &'static str {
+    if relation.kind == 'm' {
+        "MATERIALIZED VIEW"
+    } else {
+        "TABLE"
+    }
+}
+
+/// A type as `format_type` spells it, with the array dimensions it was
+/// declared with: `format_type` writes one `[]` however many there are, and
+/// the comparison reads the declared count.
+fn dimensioned(spelled: &str, dimensions: i32) -> String {
+    format!(
+        "{spelled}{}",
+        "[]".repeat(usize::try_from(dimensions - 1).unwrap_or(0))
+    )
 }
 
 fn sequence_options(sequence: &Sequence) -> String {
