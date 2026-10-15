@@ -1646,10 +1646,7 @@ fn numbered_and_retyped(from: pbps_model::ValueSource, to: pbps_model::ValueSour
 #[test]
 fn a_numbering_source_given_up_goes_before_the_retype_and_one_put_on_goes_after() {
     use pbps_model::{Identity, ValueSource};
-    let identity = ValueSource::Identity(Identity {
-        seed: 1,
-        increment: 1,
-    });
+    let identity = ValueSource::Identity(Identity::new(1, 1));
     let none = ModuleDeps::new();
     // Given up for a default the new type takes (DEC-1889.1, rank -3 before -1).
     let plan = numbered_and_retyped(identity.clone(), ValueSource::Default("0".into()));
@@ -1660,11 +1657,7 @@ fn a_numbering_source_given_up_goes_before_the_retype_and_one_put_on_goes_after(
         "the numbering first is accepted"
     );
     // An identity turned into an owned sequence goes first too (rank -3).
-    let serial = ValueSource::Sequence(pbps_model::OwnedSequence {
-        start: 1,
-        increment: 1,
-        name: None,
-    });
+    let serial = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
     let plan = numbered_and_retyped(identity.clone(), serial);
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     assert_eq!(

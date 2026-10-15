@@ -466,10 +466,7 @@ mod effects_of_each_kind {
                     column: xref.clone(),
                     ty: int(),
                     from: ValueSource::Default("1".into()),
-                    to: ValueSource::Identity(Identity {
-                        seed: 1,
-                        increment: 1,
-                    }),
+                    to: ValueSource::Identity(Identity::new(1, 1)),
                 },
             ),
             (
@@ -478,10 +475,7 @@ mod effects_of_each_kind {
                     uid: y.clone(),
                     column: yref.clone(),
                     ty: int(),
-                    from: ValueSource::Identity(Identity {
-                        seed: 1,
-                        increment: 1,
-                    }),
+                    from: ValueSource::Identity(Identity::new(1, 1)),
                     to: ValueSource::None,
                 },
             ),
