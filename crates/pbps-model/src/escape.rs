@@ -74,9 +74,10 @@ fn write_inert(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
 /// directional marks, the embeddings, overrides and isolates, the byte order
 /// mark, and the rest of the default-ignorable set that draws nothing by
 /// itself (the grapheme joiner, the Hangul and Khmer fillers, the Mongolian
-/// vowel separator, the interlinear and shorthand and musical format controls,
-/// the tag characters). A hand-made name carrying one would otherwise read the
-/// same as one without it (#2040).
+/// vowel separator, the reserved U+FFF0..=U+FFF8, the shorthand and musical
+/// format controls, the tag characters). The interlinear annotation marks
+/// (U+FFF9..=U+FFFB) are not default-ignorable and are left alone. A hand-made
+/// name carrying one would otherwise read the same as one without it (#2040).
 ///
 /// The variation selectors (U+FE00..=U+FE0F, the Mongolian U+180B..=U+180D and
 /// U+180F, and U+E0100..=U+E01EF) are left alone on purpose. Each follows a
@@ -177,6 +178,7 @@ mod tests {
             "\u{180a}\u{1810}",
             "\u{1161}\u{17b6}\u{3165}\u{ffa1}",
             "\u{1bc9f}\u{1d172}\u{1d17b}",
+            "\u{fff9}\u{fffa}\u{fffb}",
         ] {
             assert_eq!(shown(name), name);
         }

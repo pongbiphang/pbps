@@ -1275,12 +1275,13 @@ non-ASCII letter included, is left as the file spells it.
 
 The same list takes the other default-ignorable characters that draw nothing by
 themselves: the grapheme joiner (U+034F), the Hangul and Khmer fillers, the
-Mongolian vowel separator (U+180E), the interlinear, shorthand and musical
-format controls, and the tag characters (#2040). The variation selectors
-(U+FE00..=U+FE0F, the Mongolian U+180B..=U+180D and U+180F, and
-U+E0100..=U+E01EF) are the exception and stay as the file spells them: each
-follows a visible base character in valid text, as U+FE0F does in an emoji
-presentation sequence and an ideographic selector does in a CJK name, so
+Mongolian vowel separator (U+180E), the reserved U+FFF0..=U+FFF8, the shorthand
+and musical format controls, and the tag characters (#2040). The interlinear
+annotation marks (U+FFF9..=U+FFFB) are not default-ignorable and stay as written.
+The variation selectors (U+FE00..=U+FE0F, the Mongolian U+180B..=U+180D and
+U+180F, and U+E0100..=U+E01EF) are the exception and stay as the file spells
+them: each follows a visible base character in valid text, as U+FE0F does in an
+emoji presentation sequence and an ideographic selector does in a CJK name, so
 escaping them would rewrite names that are valid. A selector with no base
 character is therefore not shown; telling it apart would need context, and the
 rule here looks at one character.
