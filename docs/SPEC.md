@@ -1288,8 +1288,9 @@ alone; no resolver, scratch or Docker socket is reached.
   statements' routines and schemas take: the target's reported facts, the
   deployer's authorization and the complete opening manifest are captured in
   the apply's own `READ COMMITTED` transaction and must equal the sealed ones
-  — every candidate's properties and membership, the runtime-bound routines
-  and each signature lookup's answer.
+  — every candidate's properties and membership, the runtime-bound routines,
+  each signature lookup's answer, and the built-in objects the plan's new
+  objects will reach, such as a first `gin` index's operator class.
 - **After the last statement, before recording:** the closing capture, which
   sees the transaction's own objects, must match the closing manifest sealed
   from the approved typed changes. An untouched record keeps its properties

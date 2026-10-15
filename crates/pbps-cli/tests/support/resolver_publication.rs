@@ -964,6 +964,47 @@ pub fn renamed_parent(server: &str) {
     assert_eq!(value["data"]["changes"], 0, "{value}");
 }
 
+/// What a plan newly reaches closes too (#616): the first `gin` index on
+/// the target reaches the existing access method and operator classes
+/// nothing reached before, and a new partitioned table brings its partition
+/// key. (A partition's bound is a stored expression the capture does not
+/// cover yet, so a resolved plan cannot create one.) The plan applies, records, and the next plan is
+/// empty.
+pub fn newly_reached(server: &str) {
+    let doc = "table: app.doc\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+               body: {type: jsonb}\nprimary_key: {name: pk_doc, columns: [id]}\n";
+    let indexed = format!("{doc}indexes:\n  doc_gin:\n    columns: [body]\n    method: gin\n");
+    let sealed = Sealed::revised(
+        server,
+        "reach616",
+        Revision {
+            bootstrapped: &[("app.doc.yml", doc)],
+            files: &[
+                ("app.doc.yml", &indexed),
+                (
+                    "app.ev.yml",
+                    "table: app.ev\ncolumns:\n  ts: {type: date, nullable: false}\n  \
+                 id: {type: integer}\npartition_by: [ts]\n",
+                ),
+            ],
+            ..Revision::default()
+        },
+    );
+    let before = sealed.untouched();
+    successful(sealed.apply(&sealed.artifact));
+    assert_eq!(sealed.untouched(), (before.0 + 1, 1));
+    let next = successful(run(
+        &sealed.d,
+        &["plan", "--env", "prod", "--format", "json"],
+        Some(&Targets {
+            target: sealed.connection(),
+            scratch: &sealed._scratch.connection,
+        }),
+    ));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&next)).unwrap();
+    assert_eq!(value["data"]["changes"], 0, "{value}");
+}
+
 /// Every input the evidence seals refuses, before the first statement, when
 /// it differs; each refusal names it, runs no DDL and writes no ledger entry
 /// (#616 steps 1-5). The unchanged plan then applies.

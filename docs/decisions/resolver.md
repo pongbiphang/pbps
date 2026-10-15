@@ -2894,7 +2894,16 @@ Measured on PostgreSQL 16.15 and 18.6 with two sessions (the table is on
   as another table's foreign key a rename rewrites, with its RI triggers. A generated relation's
   system attributes go with it, as a declared table's do: the closing read
   finds an identity sequence the target named `n_id_seq1` while the scratch
-  named it `n_id_seq`.
+  named it `n_id_seq`. A partitioned table's key row and a partition's
+  inheritance row are their table's.
+- **The opening seals what the plan will newly reach.** The planning target
+  capture retains every built-in object the desired managed objects reach on
+  scratch: the first `gin` index reaches the access method, its operator
+  class and their operators and support routines, which nothing on the
+  target reached before. Unsealed, the closing read would find them arriving
+  with no owner and refuse a valid plan. They are the engine's own and
+  present on every target; anything else reached outside the managed set is
+  what the externals file stages, already retained.
 - **Platforms.** Every recheck reads the target connection: no native
   inspection, resolver, scratch or Docker socket is needed, so resolved apply
   has no platform limitation of its own.
@@ -2916,6 +2925,7 @@ and `a_record_another_tables_change_carries_as_a_reference_is_the_plans`
 `resolver_plans_apply_with_their_sealed_checks`,
 `a_resolved_plan_is_refused_before_ddl_when_a_sealed_input_moved`,
 `a_resolved_plan_rolls_back_when_its_closing_check_finds_another_writer`,
-`a_resolved_plan_closes_over_what_it_installs_under_the_targets_names` and
-`a_resolved_plan_renaming_a_referenced_table_closes`
+`a_resolved_plan_closes_over_what_it_installs_under_the_targets_names`,
+`a_resolved_plan_renaming_a_referenced_table_closes` and
+`a_resolved_plan_closes_over_what_it_newly_reaches`
 (`flow_pg`).

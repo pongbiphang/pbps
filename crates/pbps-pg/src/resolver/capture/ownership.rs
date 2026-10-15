@@ -558,7 +558,11 @@ pub(super) fn classify(
             // Defaults and rewrite rules need their own independently proven
             // surface or measured internal edge above. Their containing
             // column/relation is insufficient authority.
-            "pg_index" | "pg_sequence" | "pg_depend" => object.signature.first(),
+            // A partitioned table's key, and a partition's place under its
+            // parent, are its own: the partition's, not the parent's (#616).
+            "pg_index" | "pg_sequence" | "pg_depend" | "pg_partitioned_table" | "pg_inherits" => {
+                object.signature.first()
+            }
             _ => None,
         };
         if let Some(owner) = subject.and_then(|subject| owned.get(subject)).cloned() {
