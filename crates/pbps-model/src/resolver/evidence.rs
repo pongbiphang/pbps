@@ -151,6 +151,14 @@ pub struct ResolverEvidence {
 pub enum EvidenceError {
     #[error("unsupported resolver evidence version or qualification")]
     Version,
+    /// The compared set of facts moves with the rule's identifier, so evidence
+    /// sealed under another one claims coverage this build does not give it
+    /// (DEC-2012.1). The name is in the message because the remedy depends
+    /// on it: a new plan, which seals the current identifier.
+    #[error(
+        "resolver evidence was sealed under the qualification rule `{0}`, which this build does not read; plan again with this build to seal it under the current rule"
+    )]
+    Rule(String),
     #[error("resolver evidence omits or contradicts a required binding or authorization condition")]
     Incomplete,
     #[error("resolver evidence does not derive its closing manifest from the approved changes")]
