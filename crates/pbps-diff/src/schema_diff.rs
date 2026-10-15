@@ -16036,6 +16036,77 @@ mod tests {
         assert!(cycles(&folded).is_empty(), "{:?}", folded.errors);
     }
 
+    /// #1971: a long chain of table renames plans in time. Nearly every
+    /// rename of a chain waits for the next, and a pairwise search for cycles
+    /// over them was cubic in their number. A chain has no cycle, so nothing
+    /// is refused, and the far end still goes first.
+    #[test]
+    fn a_long_rename_chain_is_searched_for_cycles_in_linear_time() {
+        const N: usize = 5000;
+        let name = |k: usize| format!("app.t{k}");
+        let schema = |range: std::ops::Range<usize>, shift: usize| {
+            let mut s = Schema::default();
+            for k in range {
+                // Each table keeps its own column, so it is one table moving.
+                let column = format!("c{}", k + shift);
+                s.tables.insert(
+                    name(k).parse().unwrap(),
+                    table(&[(&column, Column::new(ty("int")))]),
+                );
+            }
+            s
+        };
+        // One revision cannot rename into a name its baseline still holds,
+        // so a chain builds up over revisions (DEC-536.1). The identities
+        // those revisions leave are written directly: each table renamed to
+        // the name the one before it has just left.
+        let base = schema(1..N + 1, 0);
+        let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let mut ids = base_ids.clone();
+        for k in 1..=N {
+            ids.rename_table(&name(k).parse().unwrap(), &name(k - 1).parse().unwrap());
+        }
+        let desired = schema(0..N, 1);
+        let started = std::time::Instant::now();
+        let chain = diff_partial_rebuilding(
+            Side {
+                schema: &base,
+                ids: &base_ids,
+            },
+            Side {
+                schema: &desired,
+                ids: &ids,
+            },
+            &MinimalDialect,
+            &Hints::default(),
+            &BTreeSet::new(),
+            Rebinding::Candidates,
+            Screen::Text,
+            None,
+        );
+        let took = started.elapsed();
+        assert!(chain.errors.is_empty(), "{:?}", chain.errors);
+        let steps: Vec<String> = chain
+            .changes
+            .changes
+            .iter()
+            .filter_map(|p| match &p.change {
+                Change::RenameTable { from, to, .. } => Some(format!("{from} -> {to}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps.len(), N);
+        assert_eq!(steps[0], "app.t1 -> app.t0");
+        assert_eq!(steps[N - 1], format!("app.t{N} -> app.t{}", N - 1));
+        eprintln!("{N} chained renames planned in {took:?}");
+        assert!(
+            took < std::time::Duration::from_secs(60),
+            "{N} chained renames took {took:?}"
+        );
+    }
+
     /// DEC-1118.1: a trigger keyed by a name that passes to another table is
     /// two triggers under one id. The doomed table's goes first; the one
     /// declared on the new occupant is created after the rename. Compared by
