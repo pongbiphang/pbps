@@ -1201,20 +1201,7 @@ fn run() -> anyhow::Result<()> {
             force,
             data,
             partitions_external,
-        } => {
-            // The project's rules must be runnable before they can be asked
-            // about what is pulled, and the block is a fact about the project
-            // where the target is a fact about this machine: an invalid
-            // `policies:` block (`validate` reports it as `policy.invalid`)
-            // is said first, whichever way the target would then fail to
-            // resolve (an unset `url_env`, an unknown environment, `--db`
-            // with `--env`, no target). Refused here and not in `cmd_pull`,
-            // which only runs once the target has resolved, so that the one
-            // call precedes every path (DEC-1983.1, #2027).
-            refuse_invalid_policies(&project, "the declarations a pull would write")?;
-            let target = target.resolve(&project)?;
-            cmd_pull(&project, &target, force, &data, &partitions_external)
-        }
+        } => cmd_pull(&project, &target, force, &data, &partitions_external),
         Command::Docs { format, out, title } => cmd_docs(&project, format, out.as_deref(), &title),
         Command::Verify { target, format } => {
             let json = format == OutputFormat::Json;
@@ -1312,15 +1299,30 @@ fn cmd_docs(
 /// database has and the model can express becomes YAML, everything it cannot
 /// express is printed as a warning. Existing identities survive exact-name
 /// matches; a disappearance still needs the user's recorded intent.
+///
+/// Every refusal `pull` makes before it writes is made in one order, here, so
+/// that two independent errors are always said in the same order and a new
+/// refusal has one place to go (DEC-1983.1; #1983, #2027, #2042):
+///
+/// 1. the command line: the table names of `--data` and `--partitions-external`;
+/// 2. the project: the `policies:` block, the identity file, the overwrite guard;
+/// 3. the target: `--db` with `--env`, no target, an unknown environment, an
+///    unset `url_env` variable, which are facts about this machine;
+/// 4. the database, last: the connection and everything read from it.
+///
+/// The order runs from what a user can see in their own command and files to
+/// what only the machine or a round trip can tell. Discovering the project
+/// precedes all of it, in `run`, as for every command.
 fn cmd_pull(
     project: &Project,
-    target: &db::Target,
+    target: &TargetArgs,
     force: bool,
     data: &[String],
     partitions_external: &[String],
 ) -> anyhow::Result<()> {
-    // Parsed before anything connects: a misspelt table name is a fact about
-    // the command line, and it should not cost a round trip to find out.
+    // 1. Parsed before anything else: a misspelt table name is a fact about
+    // the command line alone, and it should cost neither a look at the
+    // project's rules and files nor a round trip to find out.
     let data: Vec<TableName> = data
         .iter()
         .map(|raw| {
@@ -1336,9 +1338,14 @@ fn cmd_pull(
         })
         .collect::<anyhow::Result<_>>()?;
 
-    // An invalid `policies:` block is already refused: `run` does it before it
-    // resolves the target, so this function is never reached with one
-    // (DEC-1983.1). Not repeated here, since `run` is the only caller.
+    // 2. The project's rules must be runnable before they can be asked about
+    // what is pulled, and an invalid `policies:` block (`validate` reports it
+    // as `policy.invalid`) is refused first among the project's own facts: a
+    // `--force` pull is refused for it just the same, so the overwrite guard's
+    // advice to re-run with `--force` would only lead to a second refusal.
+    // Before the target, which is a fact about this machine and not the project
+    // (#2027).
+    refuse_invalid_policies(project, "the declarations a pull would write")?;
 
     let dir = project.schema_dir();
     // Force authorizes replacing declarations, not forgetting identity. Read
@@ -1393,8 +1400,12 @@ fn cmd_pull(
     // plain-propagating command gets, and `introspect`'s own `DbError` cannot
     // hold that.
     let dialect = dialect(project)?;
+    // 3. Resolved only now, with every fact of the command line and the
+    // project already said: it reads the environment's `url_env` variable,
+    // which is the one thing here that depends on the machine.
+    let target = target.resolve(project)?;
     let pulled = db::runtime()?.block_on(async {
-        let mut conn = db::connect(target).await?;
+        let mut conn = db::connect(&target).await?;
         let mut pulled =
             crate::engine::introspect(&mut conn, crate::engine::Read::Snapshot).await?;
         // Before the rows are read: a table `validate` would refuse is left

@@ -4853,6 +4853,210 @@ fn pull_still_reports_an_unresolvable_target_under_a_valid_policies_block() {
     }
 }
 
+/// The command lines that `pull` cannot take whatever the project holds: a
+/// table name `--data` or `--partitions-external` cannot parse (it has no
+/// schema part), with the message `pull` gives for each. The second of each
+/// pair follows a valid name, so a bad value later in the list is found too.
+const PULL_MALFORMED_TABLE_ARGS: [(&[&str], &str); 4] = [
+    (&["--data", "app"], "--data app:"),
+    (
+        &["--partitions-external", "app"],
+        "--partitions-external app:",
+    ),
+    (&["--data", "app.t", "--data", "app"], "--data app:"),
+    (
+        &[
+            "--partitions-external",
+            "app.t",
+            "--partitions-external",
+            "app",
+        ],
+        "--partitions-external app:",
+    ),
+];
+
+/// Issue #2042. `pull` named an invalid `policies:` block before it parsed
+/// `--data` and `--partitions-external` as table names, because #2027 moved
+/// the block ahead of the target and the names were parsed behind the target.
+/// A malformed value is a fact about the command line alone, which the user
+/// can see without opening any file, so it is said first: command line, then
+/// the project, then the target (DEC-1983.1). Pinned against an invalid block
+/// and against every way the target fails to resolve, and an invalid block
+/// with well-formed names is still the block's refusal.
+#[test]
+fn pull_names_a_malformed_table_argument_before_the_policies_block_and_the_target() {
+    let d = Demo::new("pull-arguments-before-policies");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        pull_unresolvable_target_project(
+            "policies:\n  rules:\n    naming.table: {severity: error}\n",
+        ),
+    )
+    .unwrap();
+    // The premise: the block really is invalid, and the variable really unset.
+    let v = d.run(&["validate", "--format", "json"]);
+    assert_ne!(code(&v), 0, "{}{}", stdout(&v), stderr(&v));
+    assert!(stdout(&v).contains("\"policy.invalid\""), "{}", stdout(&v));
+    assert!(std::env::var_os(PULL_UNSET_URL_VAR).is_none());
+
+    for (bad, expected) in PULL_MALFORMED_TABLE_ARGS {
+        for target in [
+            vec!["--env", "staging"],
+            vec!["--env", "missing"],
+            vec![
+                "--db",
+                "postgres://pbps@127.0.0.1:1/none",
+                "--env",
+                "staging",
+            ],
+            vec!["--db", "postgres://pbps@127.0.0.1:1/none"],
+            vec![],
+        ] {
+            for force in [false, true] {
+                let mut args = vec!["pull"];
+                args.extend(force.then_some("--force"));
+                args.extend(target.iter().copied());
+                args.extend(bad.iter().copied());
+                let o = d.run(&args);
+                assert_eq!(code(&o), 1, "{args:?}: {}{}", stdout(&o), stderr(&o));
+                let said = stderr(&o);
+                assert!(
+                    said.contains(expected)
+                        && !said.contains("policy.invalid")
+                        && !said.contains(PULL_UNSET_URL_VAR)
+                        && !said.contains("no environment named")
+                        && !said.contains("name the same thing")
+                        && !said.contains("needs a database")
+                        && !said.to_lowercase().contains("cannot connect"),
+                    "{args:?}: {said}"
+                );
+                assert!(
+                    declarations_and_ids(&d.dir).is_empty(),
+                    "{args:?}: a refused pull wrote a file"
+                );
+            }
+        }
+    }
+
+    // The neighbour: names that parse leave the block's refusal where #2027
+    // put it, ahead of the target.
+    let o = d.run(&[
+        "pull",
+        "--env",
+        "staging",
+        "--data",
+        "app.t",
+        "--partitions-external",
+        "app.p",
+    ]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let said = stderr(&o);
+    assert!(
+        said.contains("policy.invalid") && !said.contains(PULL_UNSET_URL_VAR),
+        "{said}"
+    );
+}
+
+/// The twin of the test above, for a block that is valid: the malformed value
+/// is the refusal `pull` gave before the order moved, in the same words,
+/// whether or not the target resolves, so putting the arguments first hides
+/// nothing from a project whose block has no problem.
+#[test]
+fn pull_still_reports_a_malformed_table_argument_under_a_valid_policies_block() {
+    let d = Demo::new("pull-arguments-valid-policies");
+    std::fs::write(
+        d.dir.join("pbps.yml"),
+        pull_unresolvable_target_project(
+            "policies:\n  rules:\n    naming.table: {severity: error, pattern: \"^[a-z][a-z0-9_]*$\"}\n",
+        ),
+    )
+    .unwrap();
+    let v = d.run(&["validate"]);
+    assert_eq!(code(&v), 0, "{}{}", stdout(&v), stderr(&v));
+    assert!(std::env::var_os(PULL_UNSET_URL_VAR).is_none());
+
+    for (bad, expected) in PULL_MALFORMED_TABLE_ARGS {
+        // The first target resolves, which is the case this refusal was
+        // always given in; the others do not, which is the order that moved.
+        for target in [
+            vec!["--db", "postgres://pbps@127.0.0.1:1/none"],
+            vec!["--env", "staging"],
+            vec![],
+        ] {
+            let mut args = vec!["pull"];
+            args.extend(target.iter().copied());
+            args.extend(bad.iter().copied());
+            let o = d.run(&args);
+            assert_eq!(code(&o), 1, "{args:?}: {}{}", stdout(&o), stderr(&o));
+            let said = stderr(&o);
+            assert!(
+                said.contains(expected)
+                    && !said.contains("policy.invalid")
+                    && !said.contains(PULL_UNSET_URL_VAR)
+                    && !said.contains("needs a database")
+                    && !said.to_lowercase().contains("cannot connect"),
+                "{args:?}: {said}"
+            );
+            assert!(
+                declarations_and_ids(&d.dir).is_empty(),
+                "{args:?}: a refused pull wrote a file"
+            );
+        }
+    }
+}
+
+/// Issue #2042, the rest of the order. The project's own facts that `pull`
+/// reads before it connects, the identity file (DEC-1790.1) and the overwrite
+/// guard, are said before the target is resolved, as the block is: they are
+/// read from the project and say the same on every machine, where the target's
+/// variable is read from this one. A pull whose variable is unset and whose
+/// declarations are in the way has two refusals and nothing is written either
+/// way, so the order is fixed and not left to which function happened to run
+/// first. `--force` passes the guard and reaches the target.
+#[test]
+fn pull_reads_the_identity_file_and_the_overwrite_guard_before_it_resolves_the_target() {
+    let d = Demo::new("pull-project-before-target");
+    std::fs::write(d.dir.join("pbps.yml"), pull_unresolvable_target_project("")).unwrap();
+    assert!(std::env::var_os(PULL_UNSET_URL_VAR).is_none());
+    d.table("table: app.t\ncolumns:\n  id: {type: integer}\n");
+    let before = declarations_and_ids(&d.dir);
+
+    // The guard: declarations that a pull would overwrite.
+    let o = d.run(&["pull", "--env", "staging"]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let said = stderr(&o);
+    assert!(
+        said.contains("already has declarations") && !said.contains(PULL_UNSET_URL_VAR),
+        "{said}"
+    );
+    // Forced, the guard is passed and the target is what fails.
+    let o = d.run(&["pull", "--force", "--env", "staging"]);
+    assert_eq!(code(&o), 1, "{}{}", stdout(&o), stderr(&o));
+    let said = stderr(&o);
+    assert!(
+        said.contains(PULL_UNSET_URL_VAR) && !said.contains("already has declarations"),
+        "{said}"
+    );
+    assert_eq!(declarations_and_ids(&d.dir), before);
+
+    // The identity file, damaged: refused forced or not, ahead of the target.
+    std::fs::write(d.dir.join("schema.ids.json"), b"not JSON").unwrap();
+    let before = declarations_and_ids(&d.dir);
+    for args in [
+        vec!["pull", "--env", "staging"],
+        vec!["pull", "--force", "--env", "staging"],
+    ] {
+        let o = d.run(&args);
+        assert_eq!(code(&o), 1, "{args:?}: {}{}", stdout(&o), stderr(&o));
+        let said = stderr(&o);
+        assert!(
+            said.contains("pull cannot preserve identities") && !said.contains(PULL_UNSET_URL_VAR),
+            "{args:?}: {said}"
+        );
+        assert_eq!(declarations_and_ids(&d.dir), before, "{args:?}");
+    }
+}
+
 /// Issue #1983, against the engine. The same database pulled into the same
 /// project: refused with the block invalid, forced or not, and written once
 /// the block is valid, which the next `validate` accepts. The controls are the

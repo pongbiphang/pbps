@@ -1219,20 +1219,58 @@ empty list without evaluating anything, so an unforced or forced `pull` wrote ta
 rule had been asked about while `validate` named the project `policy.invalid`. The
 refusal is one function, `refuse_invalid_policies`, that `partitions extend` and `pull`
 both call, so the two commands name the problems in the same words and a second copy of
-the message cannot drift. In `pull` it runs in `run`, before the target is resolved
-(#2027), and so before anything else: before the environment's `url_env` variable is read,
-before the identity file is read, before the overwrite guard, and so before a connection.
+the message cannot drift. In `pull` it runs in `cmd_pull`, after the table names are
+parsed and before the target is resolved (#2027, #2042): before the environment's
+`url_env` variable is read, before the identity file is read, before the overwrite
+guard, and so before a connection. `cmd_pull`'s only caller is `run`, so no path
+reaches it without the call.
+
+The order of every refusal `pull` makes before it writes is fixed in one place, the head
+of `cmd_pull`, and is *the command line, then the project, then the target, then the
+database*: from what the user can see in their own command and files to what only the
+machine or a round trip can tell. Two independent refusals are always said in that order
+and nothing is written by either, so the second is reported once the first is fixed; the
+order is decided here so that it is not decided again by whichever function happens to run
+first (#1983, #2027 and #2042 were each that question for one more pair). In order:
+
+1. Before `cmd_pull`, shared with every command: clap's own parse of the flags and values,
+   and discovery of the project (`pbps.yml` absent or unreadable). The project is found
+   before any argument is looked at, as for `drop-table` or `move-rows`.
+2. The command line: the table names of `--data` and `--partitions-external`, each parsed as
+   `schema.table`, and a bad one in a list is found as well as a bad first. These are the
+   only values `pull` parses; `--force` is a flag, and `--db` and `--env` are not parsed as
+   values but resolved in step 4. A malformed name is a fact about the command line alone,
+   which the user can read without opening a file, so it comes before the project's own
+   facts; #2027 had moved the block ahead of the names by moving it ahead of the target,
+   which the names then followed (#2042). They are parsed here and not by a clap value
+   parser, which would say them before the project is even discovered and exit 2 where
+   `drop-table` and `move-rows` parse their table names after discovery and exit 1.
+3. The project, in this order: the `policies:` block (this entry), the identity file
+   (DEC-1790.1), and the overwrite guard that answers an unforced pull over existing
+   declarations with "re-run with `--force`". All three are read from the project and say
+   the same on every machine. The identity file and the guard were read after the target
+   until #2042: they are the same kind of fact as the block, and left behind the target
+   they would have been the next pair reported in the wrong order.
+4. The target, a fact about this machine: `--db` with `--env`, neither of them, an environment the
+   project does not declare, and an unset `url_env` variable. `--db` with `--env` and no
+   target are shapes of the command line, but they are refusals of the target as a whole,
+   they were placed behind the block by #2027 and pinned there, and a pull that gave a
+   target twice or none has not named a database for step 5 to be about, so they stay with
+   the resolution they belong to.
+5. The database: the connection, what is read from it, a `--data` table it does not have,
+   the identities that cannot be minted, the staged declarations, and the findings of the
+   project's rules at `error`.
+
 Before the target because the block is a fact about the project and the target one about
 this machine, and a pull whose variable is unset and whose block is invalid has two
 refusals and nothing written either way; naming the variable first meant the block was
 named only once it was exported, so the block is said first and every way the target can
 fail to resolve (an unset variable, an unknown environment, `--db` with `--env`, no
-target) follows it. The call is not repeated in `cmd_pull`, whose only caller is `run`.
-Before the guard because that guard answers an unforced pull over existing declarations
-with "re-run with `--force`", and a `--force` pull is refused for the block just the same,
-so the advice would send the user to a second refusal; before the connection because the
-block is a fact about the project, and a pull that introspected a database first would
-tell the user about a local file only after that round trip.
+target) follows it. Before the guard because that guard answers an unforced pull over
+existing declarations with "re-run with `--force`", and a `--force` pull is refused for the
+block just the same, so the advice would send the user to a second refusal; before the
+connection because the block is a fact about the project, and a pull that introspected a
+database first would tell the user about a local file only after that round trip.
 `--force` replaces declarations and does not excuse a configuration `validate` calls
 invalid, so forced and unforced pulls are refused alike. `refuse_policy_errors` calls the
 same function first, which is no second user-facing check (`pull` has already refused) but
@@ -1250,10 +1288,14 @@ reports and refuses nothing it would write. Pinned by `flow_pg.rs`: offline, a r
 names `policy.invalid` with an unreachable database, over existing declarations forced and
 unforced, which are left byte for byte; offline, the same refusal ahead of each way the
 target fails to resolve, and its twin with a valid block, which reports each target failure
-as before; live, the same refusal against a real database, the
-repaired block asking its rule (the refusal then names the table and not the block), and a
-rule `off` and a rule at `warning` writing and passing `validate`; and the unit test in
-`adopt.rs` for the function's own refusal.
+as before; offline, a malformed `--data` or `--partitions-external` value said ahead of
+the invalid block and of each way the target fails to resolve, the block still named for
+names that parse, and the twin with a valid block, which reports the value as it always
+did; offline, the overwrite guard and a damaged identity file said ahead of an unresolved
+target, and `--force` passing the guard to reach it; live, the same refusal against a
+real database, the repaired block asking its rule (the refusal then names the table and
+not the block), and a rule `off` and a rule at `warning` writing and passing `validate`;
+and the unit test in `adopt.rs` for the function's own refusal.
 
 <a id="dec-2032-1"></a>
 
