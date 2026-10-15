@@ -2981,3 +2981,242 @@ the role catalog, about 1.5 ms a role.
 and `recon2049::a_batch_the_shared_lock_table_cannot_hold_is_sent_in_halves`
 (live, `pbps-pg`), and the unit test
 `the_logical_role_of_a_run_local_one_is_a_lookup_not_a_scan`.
+
+<a id="dec-619-1"></a>
+
+**DEC-619.1. A SQL Server capture reads the catalog with plain statements,
+one component at a time, and is compared at the opening and at the closing
+read after the last statement; no witness object and no schema lock is
+added (#619).**
+
+SQL Server's catalog metadata is not versioned, and nothing on the reading
+side holds it. Measured on 17.0 with two sessions
+(`docs/RESOLVER-MSSQL.md` §3, `crates/pbps-mssql/tests/live/binding619.rs`):
+
+- **No isolation level or hint.** A `SERIALIZABLE` transaction reading
+  `sys.objects`, `sys.sql_modules`, `sys.database_permissions`,
+  `sys.database_role_members` and `sys.sql_expression_dependencies` with
+  `HOLDLOCK` holds only a shared database lock. Another session's `CREATE`,
+  `ALTER VIEW`, `GRANT`, role-membership change and `DROP` all commit at
+  once, and the next read sees them. Under `SNAPSHOT` the catalog views see
+  the new object too, and touching it dooms the transaction (3961).
+- **No single statement.** Two scans of `sys.objects` in one `SELECT`,
+  around a spinning scalar function, see a table committed between them.
+- **No change marker.** `modify_date` moves on a rename and rename back and
+  on an `ALTER` to the same text, but a grant and its revoke leave it as it
+  was. A transient object created and dropped between two reads leaves
+  nothing to compare. So an optimistic double read keyed on it does not
+  observe a change-and-restore.
+
+Two mechanisms that do hold or witness the catalog were measured and
+rejected by the maintainer (2026-10-16):
+
+- **A schema lock.** `ALTER AUTHORIZATION` of a schema to its own owner,
+  inside the apply transaction, holds a schema modification lock to the end:
+  another session cannot create, alter or grant in that schema, and cannot
+  read it either. It needs `TAKE OWNERSHIP`, which a deployer with `ALTER` on
+  the schema does not hold, nor does `db_ddladmin` (15151). It holds nothing
+  at database scope: a role membership changes beside it. A new permission
+  demand, an outage of every read of the schema for the apply's length, and
+  still not the whole manifest.
+- **A DDL witness on the target.** A database DDL trigger writing a row to
+  an IDENTITY log counts every change and restore of an object, grant, role
+  membership, default schema, synonym and database-scoped configuration. The
+  witness has to count every row, with `READCOMMITTEDLOCK`, because
+  `MAX(id)` misses a lower identity committed after a higher one. But it
+  counts no `ALTER DATABASE` option and no `sp_refreshview`, which changes a
+  view's columns. And it is a failure point for everyone's DDL: the trigger
+  runs as the caller, so every user needs `INSERT` on the log, and once a
+  user may no longer write it — a `REVOKE` from `public`, a `DENY`, a full
+  or read-only filegroup — that user's DDL fails and rolls back. Dropping or
+  renaming the log while the trigger is enabled rolls itself back. pbps
+  would have to install the trigger before planning, exclude it from every
+  read, and leave an object on the target that other tools see.
+
+**Why plain reads are enough.** The PostgreSQL bracket of DEC-616.1 makes
+one capture represent one instant, which PostgreSQL offers almost free. On
+SQL Server a capture is a run of component reads a few milliseconds apart,
+and a commit between two of them does one of three things:
+
+- **It reaches a later component.** That component then differs from the
+  seal, and the comparison refuses. This is the safe direction.
+- **It touches only components already read.** That is a change after
+  their last observation, which SPEC §7.6 already excludes for both engines:
+  the guard is a detector, not a lock, and no capture promises anything after
+  its last read. The difference is only that this observation boundary is
+  each component's last read rather than the capture's end.
+- **It is changed and restored between the reads.** Nothing lasting
+  remains.
+
+The closing capture runs after the apply's last statement, before the
+commit, and compares everything again. So a change with a lasting effect
+before a component's last read is found, and a mismatch rolls the apply back.
+A lasting effect a transient object leaves on the apply's own statements is
+read by the closing capture itself, because it is a property of what the
+apply created: a column keeps the type it bound to. A seal taken at planning
+from a mixed read can only be matched by a real state: apply compares the
+actual target with it, opening and closing.
+
+This is ADR-0016 case 9 on SQL Server: a collection need not be one
+instant, but no comparison may pass on a state that differs before the
+compared component's last read.
+
+**Pinned by** `no_isolation_level_or_hint_holds_the_catalog_against_another_session`,
+`one_statement_does_not_read_the_catalog_at_one_instant`,
+`modify_date_moves_on_a_restored_definition_but_not_on_a_restored_grant`,
+`a_schema_lock_needs_ownership_a_deployer_lacks_and_misses_database_scope_changes`,
+`a_ddl_witness_trigger_misses_some_changes_and_fails_other_users_ddl`,
+`a_commit_between_component_reads_reaches_a_later_read_or_follows_the_earlier_one`
+and `the_apply_transaction_reads_its_own_ddl_and_does_not_lock_out_another_writer`.
+
+<a id="dec-619-2"></a>
+
+**DEC-619.2. On SQL Server a one-part name in a module body that is not
+schema-bound is runtime-bound: its candidates are the name in the module's
+schema and in `dbo`, of every object type, and the resolver reports what a
+plan-created object captures instead of deciding a rebuild (#619).**
+
+PostgreSQL binds a view's relation reference at creation, so a rebuild
+decision exists there. SQL Server does not:
+
+- **A body re-resolves when it runs.** A table arriving in a view's own
+  schema changes what the unchanged view reads, with no DDL on it. A
+  procedure follows the same way.
+- **The catalog stores no creation-time binding.**
+  `sys.sql_expression_dependencies.referenced_id` for a one-part name is
+  resolved when the catalog is read: it follows an arrival without a compile
+  and returns after a drop. `dm_sql_referenced_entities` reports no schema.
+- **The path is the module's schema, then `dbo`.** Neither the caller's
+  default schema nor `EXECUTE AS` changes it.
+- **Every object type occupies the name.** A scalar function arriving under
+  a table's name breaks the view (208), rather than being passed over.
+
+So rebuilding cannot pin such a reference, and there is nothing to decide.
+What the resolver can find is a plan-created object that captures one:
+
+- a captured **managed** module is reported as that module's binding
+  change, with no statement;
+- a captured **unmanaged** module refuses, as PostgreSQL's
+  unmanaged-dependent gate does.
+
+Creation-bound references are compared by id, as PostgreSQL's are. They are:
+
+- `WITH SCHEMABINDING` modules;
+- the function a computed column, DEFAULT or CHECK calls, which must be
+  two-part;
+- types.
+
+The rest is fixed as follows:
+
+- A statement-level one-part name, outside a module, resolves in the
+  executing user's default schema, so scratch reproduces it.
+- `QUOTED_IDENTIFIER` and `ANSI_NULLS` are fixed at creation and enter the
+  module fingerprint.
+- A built-in function is never shadowed.
+- A synonym is named in the dependency and followed when the module runs, so
+  its `base_object_name` is part of the manifest.
+- A cross-database name refuses by name.
+- The schema-bound blocks become SQL Server `engine_effects` and `Catalog`
+  edges for `settle` (#1776, #1959): 5074/4922 on a read column, 3729 on a
+  dropped target or a called function. No reorder pass is written, as the
+  maintainer decided on 2026-10-14.
+
+**Pinned by** `an_arrival_in_a_modules_own_schema_rebinds_its_one_part_names_and_no_other_arrival_does`,
+`a_modules_one_part_names_resolve_in_its_schema_and_a_statements_in_the_users`,
+`the_dependency_catalog_resolves_a_one_part_name_when_it_is_read`,
+`schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not`,
+`a_modules_set_options_are_fixed_when_it_is_created` and
+`synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed`.
+
+<a id="dec-619-3"></a>
+
+**DEC-619.3. SQL Server scratch is told from the target by a live global
+temporary marker, not by a reported identifier; a same-instance scratch
+needs a confined account in the supplied layout, and is proven empty
+against the measured fresh-install inventory as `db_owner` (#619).**
+
+- **No reported identifier proves separation.** `master`'s `family_guid`
+  differs between two installations of one image, but a `podman commit`
+  copy of an installation keeps it, with `@@SERVERNAME`. `master`'s
+  `database_guid` and `msdb`'s broker GUID are the image's own and equal
+  everywhere. `MachineName` and the start time differ in the copy, but they
+  are not identities: two containers started 4 ms apart.
+- **The evidence seals `master`'s `family_guid` as the target identity.**
+  Like PostgreSQL's `system_identifier` (DEC-1685.1), it names a lineage,
+  and a copy passes. The opening manifest comparison then judges the copy's
+  state.
+- **A global temporary table is visible to every login on its instance,
+  and to no other.** The scratch session creates `##pbps_<nonce>` before
+  any other scratch write, and the target session looks for it.
+  - It needs no privilege: a login with only `CONNECT SQL` sees it.
+  - It ends with its session, so a stale marker cannot match.
+  - Seen means one instance. Then scratch is not the target database, and
+    the account must be confined.
+- **A login reads its own server reach without privilege.** It reads
+  `fn_my_permissions(NULL, 'SERVER')` and `sys.login_token`:
+  - Confined means `CONNECT SQL` and `VIEW ANY DATABASE` only, and no
+    server role but `public`.
+  - The run-owned layout needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`
+    (`securityadmin`, `dbcreator`), so it never runs on the target's
+    instance.
+- **An empty scratch is the fresh-install inventory**
+  (`docs/RESOLVER-MSSQL.md` §7), measured from a pristine installation of
+  the pinned build, identical on Developer and Express. A table or user
+  added to `model` appears in the next database.
+- **The check reads as `db_owner`.** Metadata visibility shows a non-owner
+  no user object where one exists, so its "empty" is hidden, not absent. The
+  supplied account must be `db_owner` of its database, and a check that
+  cannot read as one refuses.
+
+**Pinned by** `a_global_temporary_table_marks_one_instance_to_every_login_on_it`,
+`a_login_reads_its_own_server_reach_without_privilege`,
+`a_database_born_from_model_holds_only_the_fresh_install_inventory` and
+`an_account_that_is_not_db_owner_cannot_see_what_its_database_holds`.
+
+<a id="dec-619-4"></a>
+
+**DEC-619.4. The SQL Server externals file is compared on what a
+creation-time binding reads, a cross-database reference refuses by name,
+and the reported-facts rule stops comparing CLR assemblies: a CLR object a
+managed object reaches is an unstaged external object (#619).**
+
+The comparison is #1673's (DEC-1673.1) with SQL Server's shapes:
+
+- every object's schema, name and object type, since every kind occupies a
+  name;
+- columns: type (a user type by `schema.name`), length, precision, scale,
+  nullability, collation, and whether the column is computed;
+- function and procedure parameters and return types, and a function's kind
+  and `is_schema_bound`, since a schema-bound caller refuses a function that
+  is not (4513);
+- a user type's base and facets;
+- a synonym's `base_object_name`;
+- schemas.
+
+Bodies, indexes, keys, CHECKs, defaults, foreign keys and triggers are not
+compared: no creation-time binding reads them on SQL Server.
+
+A three-part or four-part name is recorded with no id. An externals file
+stages one database and cannot stand in for another, so such a reference
+refuses by name.
+
+**CLR assemblies.** DECISIONS 521 compared user CLR assemblies by content
+as a reported fact. In the one-resolver model that comparison decides
+nothing:
+
+- The scratch database is empty (DEC-619.3), so equality means "none on
+  either side", and any target assembly refuses the whole target.
+- Content equality is not what makes a binding right. A CLR object a managed
+  object reaches is an external object the externals file must stage. It
+  cannot stage one without the assembly's binary, so the object refuses by
+  name as an unstaged external object (#1517).
+- An assembly nothing reaches binds nothing.
+
+So the rule drops assemblies, and with them the two open gaps of its
+inventory read: #721, where an identity covered only the manifest file, and
+#718, where an assembly the deployer cannot see read as absent. #620 (b)
+makes the change, which moves the rule identifier (DEC-2012.1).
+
+**Pinned by** `schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not`
+(4513) and `synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed`
+(the three-part name).

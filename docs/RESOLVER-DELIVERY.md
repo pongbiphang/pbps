@@ -19,8 +19,8 @@ shows its evidence offline (DEC-1517.1). #616 applies it in one transaction
 1. [#1778](https://github.com/pongbiphang/pbps/issues/1778): automatic fill of
    the externals file after #1956; its draft command, `pbps resolver
    externals` (DEC-1778.1), is delivered;
-2. SQL Server: [#619](https://github.com/pongbiphang/pbps/issues/619),
-   then [#620](https://github.com/pongbiphang/pbps/issues/620), then
+2. SQL Server: [#620](https://github.com/pongbiphang/pbps/issues/620)
+   implements [the measured design](RESOLVER-MSSQL.md) #619 delivered, then
    [#621](https://github.com/pongbiphang/pbps/issues/621).
 
 The sections below record each delivered step as it shipped. Where one
@@ -164,7 +164,7 @@ delivered, #608's and #609's profiles were removed by #1636, and #617 and
 | 11 | [#616](https://github.com/pongbiphang/pbps/issues/616) | verify sealed prerequisites and closing bindings during apply: delivered for PostgreSQL |
 | 12 | [#617](https://github.com/pongbiphang/pbps/issues/617) | closed: the baseline replaces a source transfer (#1673) |
 | 13 | [#618](https://github.com/pongbiphang/pbps/issues/618) | closed: its checks go to #616 and #621 |
-| 14 | [#619](https://github.com/pongbiphang/pbps/issues/619) | design creation binding coverage and catalog consistency |
+| 14 | [#619](https://github.com/pongbiphang/pbps/issues/619) | design creation binding coverage and catalog consistency: delivered as [the SQL Server design](RESOLVER-MSSQL.md) |
 | 15 | [#620](https://github.com/pongbiphang/pbps/issues/620) | implement qualified binding planning and transactional apply |
 | 16 | [#621](https://github.com/pongbiphang/pbps/issues/621) | complete the cross-engine acceptance matrix and delivery documentation |
 

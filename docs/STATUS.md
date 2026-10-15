@@ -274,7 +274,8 @@ order and the prerequisites. SQL Server resolution, `--staged` and a
 retained external object the externals file does not stage refuse by name (#1517,
 DEC-1517.1). PostgreSQL planning and transactional apply are delivered
 (#616). [Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order:
-the rest of #1778, then SQL Server's #619, #620 and #621.
+the rest of #1778, then SQL Server's #620 and #621, implementing
+[the measured SQL Server design](RESOLVER-MSSQL.md) of #619.
 
 Delivery is split into three stages:
 
