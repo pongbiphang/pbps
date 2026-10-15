@@ -202,6 +202,9 @@ struct Index {
     keyed: bool,
     clustered: bool,
     replica_identity: bool,
+    /// False for an index a failed concurrent build left: a statement
+    /// builds a valid one, and the comparison reads which it is.
+    valid: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -368,6 +371,7 @@ async fn read_in(conn: &mut impl QueryConnection) -> Result<Facts, DbError> {
                 keyed: flag(&row, "keyed")?,
                 clustered: flag(&row, "clustered")?,
                 replica_identity: flag(&row, "replica_identity")?,
+                valid: flag(&row, "valid")?,
             });
     }
     for row in conn.query(SEQUENCES).await? {
@@ -525,7 +529,8 @@ SELECT i.indrelid::text AS relation, pg_catalog.quote_ident(c.relname) AS name, 
        EXISTS (SELECT FROM pg_catalog.pg_constraint k \
                 WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid \
                   AND k.contype IN ('p', 'u', 'x'))::text AS keyed, \
-       i.indisclustered::text AS clustered, i.indisreplident::text AS replica_identity \
+       i.indisclustered::text AS clustered, i.indisreplident::text AS replica_identity, \
+       i.indisvalid::text AS valid \
   FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
  WHERE i.indrelid >= 16384 \
    AND (i.indisunique OR EXISTS (SELECT FROM pg_catalog.pg_constraint k \
@@ -1048,6 +1053,9 @@ fn table(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'stati
     if relation.tablespace {
         return Err("tablespace");
     }
+    if invalid_index(facts, oid) {
+        return Err("invalid unique index");
+    }
     let columns = facts.columns.get(&oid).map_or(&[][..], Vec::as_slice);
     let owned: Vec<&Sequence> = facts
         .sequences
@@ -1074,12 +1082,29 @@ fn table(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'stati
                 .iter()
                 .find(|s| s.owner == Some((oid, column.number, 'i')))
                 .ok_or("identity column without its sequence")?;
-            definition.push_str(&format!(
-                " GENERATED {} AS IDENTITY (SEQUENCE NAME {} {})",
-                if how == 'a' { "ALWAYS" } else { "BY DEFAULT" },
-                sequence.qualified,
-                sequence_options(sequence)
-            ));
+            let always = if how == 'a' { "ALWAYS" } else { "BY DEFAULT" };
+            if sequence.spelled == column.spelled {
+                definition.push_str(&format!(
+                    " GENERATED {always} AS IDENTITY (SEQUENCE NAME {} {})",
+                    sequence.qualified,
+                    sequence_options(sequence)
+                ));
+            } else {
+                // Its own type, set apart from the column's (`ALTER
+                // SEQUENCE ... AS`): identity options refuse `AS`, and its
+                // bounds may not fit the column's type until it has its own
+                // (measured on 16 and 18).
+                definition.push_str(&format!(
+                    " GENERATED {always} AS IDENTITY (SEQUENCE NAME {})",
+                    sequence.qualified
+                ));
+                after.push(format!(
+                    "ALTER SEQUENCE {} AS {} {};\n",
+                    sequence.qualified,
+                    sequence.spelled,
+                    sequence_options(sequence)
+                ));
+            }
         }
         match facts.not_nulls.get(&(oid, column.number)) {
             Some(constraint) if !constraint.plain => {
@@ -1161,6 +1186,9 @@ fn shape_view(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'
     if relation.tablespace {
         return Err("tablespace");
     }
+    if invalid_index(facts, oid) {
+        return Err("invalid unique index");
+    }
     let columns = facts.columns.get(&oid).map_or(&[][..], Vec::as_slice);
     let select = columns
         .iter()
@@ -1199,6 +1227,17 @@ fn shape_view(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'
             with(&relation.options)
         )
     })
+}
+
+/// Whether a compared index of the relation is invalid, which no statement
+/// that builds one reproduces.
+fn invalid_index(facts: &Facts, oid: u32) -> bool {
+    facts
+        .indexes
+        .get(&oid)
+        .into_iter()
+        .flatten()
+        .any(|index| !index.valid)
 }
 
 /// The unique indexes no key owns, and what the relation says of any

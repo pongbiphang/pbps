@@ -376,15 +376,15 @@ fn a_serial_and_an_identity_column_are_drafted_with_their_sequences() {
         &[("id", "integer"), ("k", "bigint")],
     );
     target.facts.columns.get_mut(&20600).unwrap()[1].identity = Some('d');
-    for (oid, name, column, how) in [
-        (20610, "ext.t_id_seq", 1, 'a'),
-        (20620, "ext.t_k_seq", 2, 'i'),
+    for (oid, name, column, how, spelled) in [
+        (20610, "ext.t_id_seq", 1, 'a', "integer"),
+        (20620, "ext.t_k_seq", 2, 'i', "bigint"),
     ] {
         target.facts.sequences.insert(
             oid,
             Sequence {
                 qualified: name.into(),
-                spelled: "integer".into(),
+                spelled: spelled.into(),
                 start: "1".into(),
                 increment: "1".into(),
                 min: "1".into(),
@@ -472,4 +472,39 @@ fn a_shape_that_names_a_foreign_table_is_listed_and_not_written() {
     );
     // Negative: the view is not written over a type no file can stage.
     assert!(!draft.sql.contains("CREATE VIEW ext.v"), "{}", draft.sql);
+}
+
+#[test]
+fn a_table_with_an_invalid_unique_index_is_listed_for_writing_by_hand() {
+    let (mut target, table, _, managed) = reading_a_view();
+    target.depend(&managed, &table, 'n', false);
+    let index = |valid| Index {
+        name: "t_name".into(),
+        definition: "CREATE UNIQUE INDEX t_name ON ext.t USING btree (name)".into(),
+        keyed: false,
+        clustered: false,
+        replica_identity: false,
+        valid,
+    };
+    target.facts.indexes.insert(20000, vec![index(false)]);
+    let draft = target.draft(&[]);
+    assert!(
+        draft.listed.contains(
+            &"table ext.t: write it here by hand if a binding needs it; the draft writes no invalid unique index"
+                .to_owned()
+        ),
+        "{:?}",
+        draft.listed
+    );
+    assert!(!draft.sql.contains("CREATE TABLE ext.t"), "{}", draft.sql);
+    // Negative: a valid one is written.
+    target.facts.indexes.insert(20000, vec![index(true)]);
+    let draft = target.draft(&[]);
+    assert!(
+        draft
+            .sql
+            .contains("CREATE UNIQUE INDEX t_name ON ext.t USING btree (name);\n"),
+        "{}",
+        draft.sql
+    );
 }
