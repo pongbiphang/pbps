@@ -2772,7 +2772,12 @@ and that is why each list was right to change; the identifier did not follow).
   facts that differ and what to change. It cannot see a fact whose verdict
   changes under the same name, as the build string did when it became a
   limitation (DEC-1672.1); such a change is a new identifier too, and review
-  is what catches it.
+  is what catches it. Once review has, the entry says so (#2047): `RULE_HISTORY`
+  gives each entry a third field, the fact whose verdict the entry changed, and
+  `refuse_history` accepts an entry over the same names only when it declares
+  one that it and the entry before it both list. An entry over the same names
+  without it is refused, as is a fact outside either set or on the oldest entry.
+  The declaration records a revision; it does not detect one.
 
 **Why not the alternatives.**
 - **Keep the identifier and rely on the evidence version.** The evidence
@@ -2784,6 +2789,7 @@ and that is why each list was right to change; the identifier did not follow).
 
 **Pinned by** `evidence_sealed_under_another_qualification_rule_is_refused_by_name`
 (`pbps-pg` evidence tests), `the_compared_facts_move_with_the_rule_identifier`
+and `a_history_entry_over_the_same_names_is_accepted_only_for_a_declared_revision`
 (`pbps-pg` and `pbps-mssql`), and
 `a_plan_sealed_under_the_previous_qualification_rule_is_refused_naming_it`
 (`explain_resolver`).
