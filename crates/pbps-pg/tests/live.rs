@@ -3961,7 +3961,11 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
          CREATE TABLE {s}.j (id serial);
          ALTER SEQUENCE {s}.j_id_seq MAXVALUE 3 CYCLE;
          SELECT setval(pg_get_serial_sequence('{s}.j', 'id'), 3);
-         CREATE TABLE {s}.k (id integer NOT NULL); INSERT INTO {s}.k VALUES (1), (2), (3);"
+         CREATE TABLE {s}.k (id integer NOT NULL); INSERT INTO {s}.k VALUES (1), (2), (3);
+         CREATE TABLE {s}.l (id bigint NOT NULL);
+         INSERT INTO {s}.l VALUES (9223372036854775807);
+         CREATE TABLE {s}.m (id bigserial); ALTER SEQUENCE {s}.m_id_seq CYCLE;
+         SELECT setval(pg_get_serial_sequence('{s}.m', 'id'), 9223372036854775807);"
     ))
     .await
     .expect("the tables");
@@ -4060,6 +4064,9 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
         // reach it (#2013 review).
         ("j", identity(1, o(None, Some(3), true, None))),
         ("k", serial(o(None, Some(3), true, None))),
+        // And at the end of `bigint`, where one step past is no `int8`.
+        ("l", serial(o(None, None, true, None))),
+        ("m", identity(1, o(None, None, true, None))),
         // Set by `setval(…, false)` and never called since, as a source this
         // tool puts on is left: the counter is 8, not the start of 1, and a
         // minimum of 5 is inside it (#2013 review).
@@ -4107,7 +4114,7 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
     // raises its bound.
     assert_eq!(
         gated,
-        ["a", "c", "d", "h", "j"].map(str::to_owned).into(),
+        ["a", "c", "d", "h", "j", "m"].map(str::to_owned).into(),
         "{cs:#?}"
     );
     let at = |table: &str, numbering: bool| {
@@ -4175,7 +4182,9 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
         | ValueSource::Identity(_)
         | ValueSource::Generated(_)) => other,
     };
-    for table in ["a", "c", "c2", "d", "e", "f", "g", "h", "i", "j", "k"] {
+    for table in [
+        "a", "c", "c2", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    ] {
         assert_eq!(
             unnamed(source(&after, table)),
             source(&declared, table),
@@ -4192,6 +4201,10 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
     assert_eq!(number(&mut db, &next("g")).await, 8);
     assert_eq!(number(&mut db, &next("j")).await, 1);
     assert_eq!(number(&mut db, &next("k")).await, 1);
+    for table in ["l", "m"] {
+        let sql = format!("INSERT INTO {s}.{table} DEFAULT VALUES RETURNING id::int4");
+        assert_eq!(number(&mut db, &sql).await, 1, "{table}");
+    }
     let held = |table: &str| {
         format!(
             "SELECT (seqmin = 1 AND seqmax = 1000 AND seqcache = 20 AND NOT seqcycle)::int \

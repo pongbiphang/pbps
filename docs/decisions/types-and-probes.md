@@ -2231,7 +2231,8 @@ the options into the `CREATE SEQUENCE` or the identity clause. A source
 that cycles, continued past its bound by the values or the old counter,
 starts at its other bound, as `nextval` would, rather than having `setval`
 refused; nothing it reaches again can collide, since a cycle is never under
-a key. A retune
+a key. The continuation is computed in `numeric`, so a step past
+the end of `bigint` is a number to wrap, not an overflow. A retune
 writes only the options that change, a returning one as `NO MINVALUE`, `NO
 MAXVALUE`, `NO CYCLE` or `CACHE 1`, which measured reset each to the
 engine's own; a retune of start or increment alone reads as before. No new
@@ -2265,7 +2266,7 @@ Both read the counter or the values before apply, which no earlier change
 in a plan moves: a column has one numbering change, and no statement a plan
 runs before it calls the sequence.
 
-Plan format 40, state 24 and schema set 45 carry the options; an older
+Plan format 40, state 24 and schema set 46 carry the options; an older
 build would read them and drop them.
 
 Pinned by `sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted`

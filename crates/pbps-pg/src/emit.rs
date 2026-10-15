@@ -991,10 +991,13 @@ fn numbering(
         if let (Some(was), Some(now)) = (increment_of(from), increment_of(to))
             && (was < 0) == (now < 0)
         {
-            variables.push(("pbps_counter", "bigint"));
+            // In `numeric`: one step past a counter at the end of `bigint`
+            // is past `int8`, and a cycling source then wraps (#2013 review).
+            variables.push(("pbps_counter", "numeric"));
             steps.push_str(
-                "\nEXECUTE pg_catalog.format('SELECT CASE WHEN s.is_called THEN s.last_value \
-                 OPERATOR(pg_catalog.+) q.seqincrement ELSE s.last_value END FROM %s AS s, \
+                "\nEXECUTE pg_catalog.format('SELECT CASE WHEN s.is_called THEN \
+                 s.last_value::pg_catalog.numeric OPERATOR(pg_catalog.+) q.seqincrement \
+                 ELSE s.last_value END FROM %s AS s, \
                  pg_catalog.pg_sequence AS q WHERE q.seqrelid OPERATOR(pg_catalog.=) \
                  %L::pg_catalog.regclass', pbps.pbps_seq, pbps.pbps_seq) INTO pbps.pbps_counter;",
             );
@@ -1061,7 +1064,7 @@ fn numbering(
     } else {
         ("max", "GREATEST")
     };
-    let counter = if variables.contains(&("pbps_counter", "bigint")) {
+    let counter = if variables.contains(&("pbps_counter", "numeric")) {
         ", pbps.pbps_counter"
     } else {
         ""
@@ -1073,25 +1076,29 @@ fn numbering(
     // collide.
     let wrap = match types::sequence_range(ty, increment, &options) {
         Some(bounds) if options.cycle && increment < 0 => format!(
-            "IF pbps.pbps_next OPERATOR(pg_catalog.<) {}::pg_catalog.int8 THEN \
-             pbps.pbps_next := {}::pg_catalog.int8; END IF;\n",
+            "IF pbps.pbps_next OPERATOR(pg_catalog.<) {}::pg_catalog.numeric THEN \
+             pbps.pbps_next := {}::pg_catalog.numeric; END IF;\n",
             bounds.start(),
             bounds.end()
         ),
         Some(bounds) if options.cycle => format!(
-            "IF pbps.pbps_next OPERATOR(pg_catalog.>) {}::pg_catalog.int8 THEN \
-             pbps.pbps_next := {}::pg_catalog.int8; END IF;\n",
+            "IF pbps.pbps_next OPERATOR(pg_catalog.>) {}::pg_catalog.numeric THEN \
+             pbps.pbps_next := {}::pg_catalog.numeric; END IF;\n",
             bounds.end(),
             bounds.start()
         ),
         Some(_) | None => String::new(),
     };
-    variables.extend([("pbps_edge", "bigint"), ("pbps_next", "bigint")]);
+    // The continuation in `numeric`, so a step past the end of `bigint` is
+    // a number to wrap or refuse, not an overflow (#2013 review).
+    variables.extend([("pbps_edge", "bigint"), ("pbps_next", "numeric")]);
     body.push(on_catalog_path(&format!(
         "SELECT pg_catalog.{edge}(r.{c}) INTO pbps.pbps_edge FROM {t} AS r;\n\
-         pbps.pbps_next := {pick}({start}::pg_catalog.int8, pbps.pbps_edge \
-         OPERATOR(pg_catalog.+) {increment}::pg_catalog.int8{counter});\n\
-         {wrap}PERFORM pg_catalog.setval({owned}::pg_catalog.regclass, pbps.pbps_next, false);"
+         pbps.pbps_next := {pick}({start}::pg_catalog.numeric, \
+         pbps.pbps_edge::pg_catalog.numeric OPERATOR(pg_catalog.+) \
+         {increment}::pg_catalog.numeric{counter});\n\
+         {wrap}PERFORM pg_catalog.setval({owned}::pg_catalog.regclass, \
+         pbps.pbps_next::pg_catalog.int8, false);"
     )));
     block(&body, &variables)
 }
