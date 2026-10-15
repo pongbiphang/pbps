@@ -4517,6 +4517,113 @@ mod tests {
         assert!(message.contains("has no type"), "{message}");
     }
 
+    /// The engine truncates an identifier over [`MAX_IDENT_BYTES`] without an
+    /// error, so a reference with such a part would name a different type from
+    /// the one written (#2021). The model holds the length; this dialect refuses
+    /// it, before the refusal every reference gets until they are admitted, and
+    /// counts bytes and not characters (**measured** on 16.15 and 18.6: 32 `é`,
+    /// which is 64 bytes, are stored as 31).
+    #[test]
+    fn a_type_reference_part_over_the_identifier_limit_is_refused_by_length() {
+        let limit = "a".repeat(MAX_IDENT_BYTES);
+        let over = "a".repeat(MAX_IDENT_BYTES + 1);
+        // 31 `é` and an `a` are 63 bytes in 32 characters; 32 `é` are 64.
+        let multibyte_fits = format!("{}a", "\u{e9}".repeat(31));
+        let multibyte_over = "\u{e9}".repeat(32);
+        for part in [&over, &multibyte_over] {
+            for declared in [
+                format!("app.{part}"),
+                format!("{part}.mood"),
+                format!("\"App\".\"{part}\""),
+                format!("app.{part}[]"),
+                format!("{}.{part}", "b".repeat(100)),
+            ] {
+                let message = Postgres::new()
+                    .normalize_type(&ty(&declared))
+                    .expect_err(&declared)
+                    .to_string();
+                assert!(
+                    message.contains("PostgreSQL keeps 63 bytes of an identifier")
+                        && message.contains("truncating the rest without an error"),
+                    "{declared}: {message}"
+                );
+                assert!(
+                    !message.contains("not supported yet"),
+                    "the length refusal comes first: {message}"
+                );
+                assert_eq!(
+                    message.contains("[]"),
+                    declared.ends_with("[]"),
+                    "{message}"
+                );
+            }
+        }
+        // The size is named, and the schema is the part named when both are over.
+        let message = Postgres::new()
+            .normalize_type(&ty(&format!("{}.{over}", "b".repeat(100))))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("whose schema is 100 bytes"), "{message}");
+        let message = Postgres::new()
+            .normalize_type(&ty(&format!("app.{over}")))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("whose name is 64 bytes"), "{message}");
+        // Negative: a part of exactly the limit passes the length check and gets
+        // the refusal every reference still gets, in bytes and not characters.
+        for part in [&limit, &multibyte_fits] {
+            for declared in [
+                format!("app.{part}"),
+                format!("{part}.mood"),
+                format!("\"{part}\".\"{part}\""),
+                format!("app.{part}[]"),
+            ] {
+                let message = Postgres::new()
+                    .normalize_type(&ty(&declared))
+                    .expect_err(&declared)
+                    .to_string();
+                assert!(
+                    message.contains("references to user-defined types are not supported yet"),
+                    "{declared}: {message}"
+                );
+                assert!(!message.contains("truncating"), "{declared}: {message}");
+            }
+        }
+        // And a built-in is untouched by the check.
+        assert!(Postgres::new().normalize_type(&ty("text[]")).is_ok());
+    }
+
+    /// Where `validate` looks at the declaration, a long reference is named with
+    /// the length refusal, and a column of the limit with the generic one (#2021).
+    #[test]
+    fn validating_a_table_refuses_a_long_type_reference_by_length() {
+        let mut table = Table::default();
+        for (column, spelling) in [
+            ("long", format!("app.{}", "a".repeat(MAX_IDENT_BYTES + 1))),
+            ("limit", format!("app.{}", "a".repeat(MAX_IDENT_BYTES))),
+        ] {
+            table
+                .columns
+                .insert(column.to_owned(), pbps_model::Column::new(ty(&spelling)));
+        }
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
+        let messages: Vec<String> = found.iter().map(ToString::to_string).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(
+            messages.iter().filter(|m| m.contains("truncating")).count(),
+            1,
+            "{messages:?}"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.contains("not supported yet"))
+                .count(),
+            1,
+            "{messages:?}"
+        );
+    }
+
     /// Where a user looks at the declaration, `validate` names the column's
     /// type once, beside the other columns, which it leaves alone (#1523).
     #[test]

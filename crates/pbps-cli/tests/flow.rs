@@ -5825,6 +5825,67 @@ fn a_user_type_reference_is_refused_by_the_dialect_and_not_the_loader() {
     assert!(err.contains("a name of three parts"), "{err}");
 }
 
+/// The identifier limit is an engine's, not the loader's (#2021): a type
+/// reference whose part is 64 to 128 units loads in either project, and each
+/// dialect refuses it in its own words. PostgreSQL names the length, which the
+/// server would truncate without an error; SQL Server names the reference,
+/// which it does not take, and says nothing of PostgreSQL.
+#[test]
+fn a_long_type_reference_is_refused_by_the_dialect_in_its_own_words() {
+    let d = Demo::new("user-type-reference-length");
+    let long = "p".repeat(100);
+    let table = |ty: &str| {
+        format!(
+            "table: app.t\ncolumns:\n  id: {{type: bigint, nullable: false}}\n  c: {{type: {ty}}}\n"
+        )
+    };
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: postgres\n").unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.t.yml"),
+        table(&format!("dbo.{long}")),
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("whose name is 100 bytes")
+            && err.contains("PostgreSQL keeps 63 bytes of an identifier"),
+        "{err}"
+    );
+    assert!(!err.contains("not supported yet"), "{err}");
+    assert!(!err.contains("not a user-defined type reference"), "{err}");
+
+    std::fs::write(d.dir.join("pbps.yml"), "dialect: mssql\n").unwrap();
+    let o = d.run(&["validate"]);
+    assert_eq!(code(&o), FINDING, "{}{}", stdout(&o), stderr(&o));
+    let err = stderr(&o);
+    assert!(
+        err.contains("references to user-defined types are not supported;"),
+        "{err}"
+    );
+    assert!(
+        !err.contains("PostgreSQL") && !err.contains("truncat"),
+        "{err}"
+    );
+    assert!(!err.contains("not a user-defined type reference"), "{err}");
+
+    // Negative: a shape no dialect could read is still the loader's refusal,
+    // however long its parts are.
+    std::fs::write(
+        d.dir.join("schema/app.t.yml"),
+        table(&format!("{long}.{long}.{long}")),
+    )
+    .unwrap();
+    let o = d.run(&["validate"]);
+    assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
+    assert!(
+        stderr(&o).contains("a name of three parts"),
+        "{}",
+        stderr(&o)
+    );
+}
+
 /// A connected command on a `postgres` project reaches the connection: what
 /// stops it is the target, reported in the envelope as an unreachable
 /// environment, and never the dialect.

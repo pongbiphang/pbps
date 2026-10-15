@@ -247,10 +247,12 @@ indexes:
   quotes (`"App"."Mood"`, which `fmt` writes in single quotes), optionally
   followed by `[]`. It is always qualified and takes no arguments. An unquoted
   part is folded to lowercase and a quoted one is kept, so `APP.Mood` is
-  `app.mood` and `"App"."Mood"` is another type. A part over 63 bytes, a type
-  name starting with `_`, a temporary schema, `U&"…"` and a name of three
-  parts are refused by the loader. Both dialects still refuse the reference by
-  name until the references are admitted (#1523).
+  `app.mood` and `"App"."Mood"` is another type. A type name starting with
+  `_`, a temporary schema, `U&"…"` and a name of three parts are refused by the
+  loader. The loader holds a part of any length, because the identifier limit
+  is the engine's: PostgreSQL refuses a part over 63 bytes, which the server
+  would truncate without an error (#2021). Both dialects still refuse the
+  reference by name until the references are admitted (#1523).
 - **`deprecated` needs only a reason**; the date comes from git and is not written
   by hand.
 - **`collation` on a SQL Server column names an explicit collation**; absent

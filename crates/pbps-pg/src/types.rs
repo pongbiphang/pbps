@@ -37,7 +37,7 @@
 use std::ops::RangeInclusive;
 
 use pbps_dialect::{DialectError, TypeChangeRisk};
-use pbps_model::{ColumnType, RoutineArg, TypeArg};
+use pbps_model::{ColumnType, RoutineArg, TypeArg, TypeRef};
 
 pub const DIALECT: &str = "postgres";
 
@@ -314,6 +314,36 @@ pub fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectErr
     })
 }
 
+/// Refuses a type reference with a part over the engine's identifier limit.
+///
+/// The model holds a part of any length (#2021), because the limit is an
+/// engine's and SQL Server's is 128. PostgreSQL keeps [`crate::MAX_IDENT_BYTES`]
+/// bytes of an identifier and **truncates the rest without an error**
+/// (**measured** on 16.15 and 18.6: `max_identifier_length` is 63, a 64-byte
+/// name is stored as its first 63, and 32 `é` are stored as 31, cut on a
+/// character boundary). A reference that was let through would name a
+/// different type from the one written, or none.
+///
+/// Counted in bytes, on the part as the engine would keep it, so a quote that is
+/// doubled in the spelling counts once. The schema is checked before the name.
+fn refuse_overlong_reference(ty: &ColumnType, user: &TypeRef) -> Result<(), DialectError> {
+    for (which, part) in [("schema", user.schema()), ("name", user.name())] {
+        if part.len() > crate::MAX_IDENT_BYTES {
+            return Err(DialectError::Invalid {
+                dialect: DIALECT,
+                message: format!(
+                    "`{ty}` names a user-defined type whose {which} is {} bytes, and PostgreSQL \
+                     keeps {} bytes of an identifier, truncating the rest without an error, so \
+                     the reference would name a different type from the one written",
+                    part.len(),
+                    crate::MAX_IDENT_BYTES
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Expands aliases, fills in the arguments PostgreSQL fills in itself, and
 /// resolves the spellings the engine resolves.
 pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
@@ -321,7 +351,10 @@ pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
     // here, before the array rule so that the message names `app.mood[]` and
     // not its element. The catalogue is closed, and a reference needs what a
     // catalogue cannot give it: the kind of the type, read from the database.
-    if ty.type_ref().is_some() {
+    if let Some(user) = ty.type_ref() {
+        // The length comes first: it is the more specific refusal, and it is the
+        // one that stays when references are admitted.
+        refuse_overlong_reference(ty, user)?;
         return Err(DialectError::Invalid {
             dialect: DIALECT,
             message: format!(

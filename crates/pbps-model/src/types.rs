@@ -310,18 +310,17 @@ fn names_a_type_reference(s: &str) -> bool {
             .is_some_and(|name| name.contains(['.', '"']))
 }
 
-/// The most bytes PostgreSQL keeps of an identifier (`NAMEDATALEN` - 1,
-/// **measured** as `max_identifier_length` on 16 and 18). A longer name is
-/// truncated by the server without an error, so a reference to it would name a
-/// different type from the one written.
-const MAX_PART_BYTES: usize = 63;
-
 /// A user-defined type named by schema and name (#1523): `app.mood`, or
 /// `"App"."Mood"` where the case is kept.
 ///
 /// The model stays syntactic. It checks the shape that makes a reference
 /// unambiguous and leaves what the type is, and whether it may be used, to the
-/// dialect: PostgreSQL decides the kind, SQL Server refuses it.
+/// dialect: PostgreSQL decides the kind, SQL Server refuses it. **It holds a
+/// part of any length**, as [`crate::RoutineArg`] does, because the identifier
+/// limit is an engine's (PostgreSQL keeps 63 bytes, SQL Server 128 UTF-16 units)
+/// and a shared parser that enforced one would refuse the other's references
+/// with the wrong engine's words before its dialect could speak (#2021).
+/// PostgreSQL's `normalize` refuses a part over its limit.
 ///
 /// A reference is **always qualified**, because the plan runs under an empty
 /// `search_path` (DEC-1564.1) where a bare name resolves to nothing, and it
@@ -331,7 +330,6 @@ const MAX_PART_BYTES: usize = 63;
 /// `app.mood` and `"App"."Mood"` does not.
 ///
 /// Refused, each with its reason:
-/// - a part longer than 63 bytes, which the engine truncates silently;
 /// - a name starting with `_`, which is how the engine spells the array type of
 ///   the name that follows, so `app._mood` could not be told from `app.mood[]`;
 /// - a temporary schema (`pg_temp`, `pg_temp_3`), whose types belong to one
@@ -417,13 +415,6 @@ fn check_part(part: &str, is_schema: bool) -> Result<(), String> {
     }
     if part.contains('\0') {
         return Err("a name part holds a NUL byte".to_owned());
-    }
-    if part.len() > MAX_PART_BYTES {
-        return Err(format!(
-            "`{part}` is {} bytes, and PostgreSQL keeps {MAX_PART_BYTES} of an identifier, \
-             truncating the rest without an error",
-            part.len()
-        ));
     }
     if is_schema {
         let numbered = |prefix: &str| {
@@ -819,9 +810,6 @@ mod tests {
 
     #[test]
     fn a_type_reference_is_refused_where_it_cannot_name_one_type() {
-        let long = "a".repeat(64);
-        let longest = "a".repeat(63);
-        let multibyte = "\u{e9}".repeat(32);
         for (spelling, why) in [
             ("a.b.c", "three parts"),
             ("\"a\".\"b\".\"c\"", "three quoted parts"),
@@ -860,13 +848,6 @@ mod tests {
             ("app.mo;od", "a semicolon"),
             ("app.mo od", "a space in a bare name"),
             ("app.mood;", "a trailing semicolon"),
-            (&format!("{long}.mood"), "a 64-byte schema"),
-            (&format!("app.{long}"), "a 64-byte name"),
-            (&format!("app.\"{long}\""), "a 64-byte quoted name"),
-            (
-                &format!("app.\"{multibyte}x\""),
-                "64 bytes in 33 characters",
-            ),
             ("app.\"a\0b\"", "a NUL byte"),
         ] {
             let error = spelling
@@ -884,18 +865,69 @@ mod tests {
                 "{why}: {message}"
             );
         }
-        // The limit is 63 bytes, inclusive, in bytes and not in characters.
-        assert!(format!("{longest}.mood").parse::<ColumnType>().is_ok());
-        assert!(format!("app.{longest}").parse::<ColumnType>().is_ok());
-        assert!(
-            format!("app.\"{}\"", "\u{e9}".repeat(31))
-                .parse::<ColumnType>()
-                .is_ok()
-        );
         // A schema may start with an underscore; only a type name may not.
         assert!("_app.mood".parse::<ColumnType>().is_ok());
         assert!("pg_temporary.mood".parse::<ColumnType>().is_ok());
         assert!("pg_temp_x.mood".parse::<ColumnType>().is_ok());
+    }
+
+    /// The model holds a part of any length (#2021): the identifier limit is an
+    /// engine's, and each dialect's `normalize` applies its own, so a part PostgreSQL
+    /// would truncate (64 bytes) or SQL Server would refuse (129 units) still
+    /// parses, keeps its whole text, and reads back as the same reference.
+    #[test]
+    fn a_type_reference_holds_a_part_of_any_length() {
+        let multibyte = "\u{e9}".repeat(32);
+        for part in [
+            "a".repeat(63),
+            "a".repeat(64),
+            "a".repeat(128),
+            "a".repeat(129),
+            "a".repeat(1000),
+            multibyte,
+        ] {
+            for spelling in [
+                format!("app.{part}"),
+                format!("{part}.mood"),
+                format!("\"{part}\".\"{part}\""),
+                format!("app.{part}[]"),
+            ] {
+                let ty = reference(&spelling);
+                let user = ty.type_ref().expect("a reference");
+                assert!(user.schema() == part || user.name() == part, "{spelling}");
+                // The whole part survives, uncut, and the canonical text reads
+                // back as the same value.
+                assert!(ty.to_string().contains(&part), "{spelling}");
+                assert_eq!(reference(&ty.to_string()), ty, "{spelling}");
+                assert_eq!(
+                    serde_json::from_str::<ColumnType>(&serde_json::to_string(&ty).unwrap())
+                        .unwrap(),
+                    ty,
+                    "{spelling}"
+                );
+            }
+            // The same parts built from a catalogue's own, as a connected read
+            // will.
+            let user = TypeRef::new(part.clone(), part.clone()).unwrap();
+            assert_eq!((user.schema(), user.name()), (part.as_str(), part.as_str()));
+            assert_eq!(reference(&user.to_string()).type_ref(), Some(&user));
+        }
+        // The other rules do not depend on length: a long temporary schema and a
+        // long `_` name are still refused, and so is an empty part.
+        assert!(TypeRef::new(format!("pg_temp_{}", "1".repeat(100)), "mood").is_err());
+        assert!(TypeRef::new("app", format!("_{}", "a".repeat(100))).is_err());
+        assert!(TypeRef::new("a".repeat(100), "").is_err());
+        // An unterminated or malformed long name is still the shape's refusal.
+        assert!(
+            format!("app.\"{}", "a".repeat(100))
+                .parse::<ColumnType>()
+                .is_err()
+        );
+        assert!(
+            format!("{0}.{0}.{0}", "a".repeat(100))
+                .parse::<ColumnType>()
+                .is_err()
+        );
     }
 
     /// A reference is told from a built-in by the name before any argument, so a
