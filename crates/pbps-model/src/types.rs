@@ -38,6 +38,13 @@ pub enum TypeParseError {
          every array back"
     )]
     BadArray(String),
+    /// A schema-qualified type name that is not a reference pbps can hold
+    /// (#1523): the reason says which rule it broke.
+    #[error(
+        "`{whole}` is not a user-defined type reference pbps can hold: {reason}. Write \
+         `schema.name`, each part optionally in double quotes, optionally followed by `[]`"
+    )]
+    BadTypeReference { whole: String, reason: String },
 }
 
 /// A type argument.
@@ -72,6 +79,12 @@ impl fmt::Display for TypeArg {
 /// Normalization does exactly two things: lowercase everything and strip
 /// whitespace. **Aliases are not expanded here** (`integer` does not become
 /// `int`), because which names alias which is dialect knowledge.
+///
+/// A user-defined type named as `schema.name` is held beside that, as a
+/// [`TypeRef`] (#1523). Its canonical qualified text is also `base`, which
+/// therefore always contains a `.` and never equals a catalogue name, so a
+/// check such as `ty.base == "jsonb"` fails closed for it. The model only
+/// holds the reference: whether the dialect admits one is the dialect's call.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -85,6 +98,12 @@ pub struct ColumnType {
     // An array of this type (#1167): a marker, not a rank, since the engine
     // enforces neither a size nor a dimension count.
     array: bool,
+    // The type this names, when it is a user-defined type referenced by name
+    // (#1523). Private so that no caller builds a `base` that disagrees with
+    // it; `base` carries the same canonical text. Boxed: nearly every column
+    // type is a built-in, and an inline `TypeRef` (two strings) would grow every
+    // one of them, and every enum that holds two, by its size.
+    user: Option<Box<TypeRef>>,
 }
 
 impl ColumnType {
@@ -94,7 +113,27 @@ impl ColumnType {
             args,
             args_after_word: None,
             array: false,
+            user: None,
         }
+    }
+
+    /// A user-defined type named by reference (#1523). `base` is the
+    /// reference's canonical text, which has a `.` in it and so is never a
+    /// catalogue name.
+    pub fn reference(user: TypeRef) -> Self {
+        Self {
+            base: user.to_string(),
+            args: Vec::new(),
+            args_after_word: None,
+            array: false,
+            user: Some(Box::new(user)),
+        }
+    }
+
+    /// The user-defined type this names, or `None` for a built-in or opaque
+    /// spelling (#1523). Of an array, the element's.
+    pub fn type_ref(&self) -> Option<&TypeRef> {
+        self.user.as_deref()
     }
 
     /// An array of this type, `T[]` (#1167).
@@ -187,6 +226,13 @@ impl FromStr for ColumnType {
         if s.is_empty() {
             return Err(TypeParseError::Empty);
         }
+        // A schema-qualified or quoted name is a type reference (#1523). Decided
+        // on the text before the first `(` or `[`, so a `.` or a quote inside
+        // an argument (`numeric(10.5)`) keeps its old reading, and before the
+        // array rules, which would refuse the `[` or `]` of a quoted name.
+        if names_a_type_reference(s) {
+            return parse_reference(s);
+        }
         // One trailing `[]` and nothing else of an array's other spellings
         // (#1167): a size, a second pair, `ARRAY` or the engine's `_T`.
         if let Some(element) = s.strip_suffix("[]") {
@@ -252,6 +298,239 @@ impl FromStr for ColumnType {
                 .with_args_after_word(prefix.base.split_whitespace().count())
         }
     }
+}
+
+/// Whether the text can only be a user-defined type reference: it starts with
+/// a quote, or its name (up to the first `(` or `[`) holds a `.` or a quote.
+/// Every such text was `BadBaseName` before (#1523).
+fn names_a_type_reference(s: &str) -> bool {
+    s.starts_with('"')
+        || s.split(['(', '['])
+            .next()
+            .is_some_and(|name| name.contains(['.', '"']))
+}
+
+/// The most bytes PostgreSQL keeps of an identifier (`NAMEDATALEN` - 1,
+/// **measured** as `max_identifier_length` on 16 and 18). A longer name is
+/// truncated by the server without an error, so a reference to it would name a
+/// different type from the one written.
+const MAX_PART_BYTES: usize = 63;
+
+/// A user-defined type named by schema and name (#1523): `app.mood`, or
+/// `"App"."Mood"` where the case is kept.
+///
+/// The model stays syntactic. It checks the shape that makes a reference
+/// unambiguous and leaves what the type is, and whether it may be used, to the
+/// dialect: PostgreSQL decides the kind, SQL Server refuses it.
+///
+/// A reference is **always qualified**, because the plan runs under an empty
+/// `search_path` (DEC-1564.1) where a bare name resolves to nothing, and it
+/// takes no arguments. Equality is structural over the two parts as the
+/// engine would keep them: unquoted parts are folded to lowercase (ASCII only,
+/// as the engine does), quoted parts are kept as written, so `APP.Mood` equals
+/// `app.mood` and `"App"."Mood"` does not.
+///
+/// Refused, each with its reason:
+/// - a part longer than 63 bytes, which the engine truncates silently;
+/// - a name starting with `_`, which is how the engine spells the array type of
+///   the name that follows, so `app._mood` could not be told from `app.mood[]`;
+/// - a temporary schema (`pg_temp`, `pg_temp_3`), whose types belong to one
+///   session;
+/// - `U&"…"` escapes, three-part names and a part that is empty.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TypeRef {
+    schema: String,
+    name: String,
+}
+
+impl TypeRef {
+    /// A reference from two parts exactly as the engine keeps them, with no
+    /// folding: the catalog's own `nspname` and `typname`.
+    pub fn new(schema: impl Into<String>, name: impl Into<String>) -> Result<Self, TypeParseError> {
+        let user = Self::unchecked(schema.into(), name.into());
+        match user.problem() {
+            Some(reason) => Err(bad_reference(&user.to_string(), reason)),
+            None => Ok(user),
+        }
+    }
+
+    fn unchecked(schema: String, name: String) -> Self {
+        Self { schema, name }
+    }
+
+    /// Why these two parts cannot name one type, or `None`.
+    fn problem(&self) -> Option<String> {
+        check_part(&self.schema, true)
+            .and(check_part(&self.name, false))
+            .err()
+    }
+
+    /// The schema, as the engine keeps it.
+    #[must_use]
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
+    /// The type's name, as the engine keeps it.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// The canonical text: a part is bare when it would read back as itself
+/// unquoted, and double-quoted (with `"` doubled) otherwise, so one reference
+/// has one spelling.
+impl fmt::Display for TypeRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_part(f, &self.schema)?;
+        f.write_str(".")?;
+        write_part(f, &self.name)
+    }
+}
+
+fn write_part(f: &mut fmt::Formatter<'_>, part: &str) -> fmt::Result {
+    let bare = part
+        .chars()
+        .next()
+        .is_some_and(|c| matches!(c, 'a'..='z' | '_'))
+        && part
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '_' | '$'));
+    if bare {
+        return f.write_str(part);
+    }
+    f.write_str("\"")?;
+    for c in part.chars() {
+        if c == '"' {
+            f.write_str("\"")?;
+        }
+        write!(f, "{c}")?;
+    }
+    f.write_str("\"")
+}
+
+/// Why a part cannot be half of a reference, or `Ok`.
+fn check_part(part: &str, is_schema: bool) -> Result<(), String> {
+    if part.is_empty() {
+        return Err("a name part is empty".to_owned());
+    }
+    if part.contains('\0') {
+        return Err("a name part holds a NUL byte".to_owned());
+    }
+    if part.len() > MAX_PART_BYTES {
+        return Err(format!(
+            "`{part}` is {} bytes, and PostgreSQL keeps {MAX_PART_BYTES} of an identifier, \
+             truncating the rest without an error",
+            part.len()
+        ));
+    }
+    if is_schema {
+        let numbered = |prefix: &str| {
+            part.strip_prefix(prefix)
+                .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        if part == "pg_temp" || numbered("pg_temp_") || numbered("pg_toast_temp_") {
+            return Err(format!(
+                "`{part}` is a temporary schema, and its types belong to one session"
+            ));
+        }
+    } else if let Some(element) = part.strip_prefix('_') {
+        return Err(format!(
+            "`{part}` starts with `_`, which is how PostgreSQL spells the array type of \
+             `{element}`, so it could not be told from `{element}[]`"
+        ));
+    }
+    Ok(())
+}
+
+fn bad_reference(whole: &str, reason: impl Into<String>) -> TypeParseError {
+    TypeParseError::BadTypeReference {
+        whole: whole.to_owned(),
+        reason: reason.into(),
+    }
+}
+
+/// Reads `schema.name` or `schema.name[]`, each part bare or double-quoted.
+fn parse_reference(whole: &str) -> Result<ColumnType, TypeParseError> {
+    let fail = |reason: &str| bad_reference(whole, reason);
+    let (schema, rest) = take_part(whole, whole)?;
+    let Some(rest) = rest.strip_prefix('.') else {
+        return Err(fail(if rest.is_empty() {
+            "the name is not qualified, and a type is always named with its schema"
+        } else if rest.starts_with('(') {
+            "a user-defined type takes no arguments"
+        } else {
+            "expected `.` between the schema and the name, with no space around it"
+        }));
+    };
+    let (name, rest) = take_part(whole, rest)?;
+    let rest = rest.trim_start();
+    let array = match rest {
+        "" => false,
+        "[]" => true,
+        _ if rest.starts_with('.') => {
+            return Err(fail("a name of three parts is not a type reference"));
+        }
+        _ if rest.starts_with('(') => return Err(fail("a user-defined type takes no arguments")),
+        _ if rest.starts_with('[') => return Err(TypeParseError::BadArray(whole.to_owned())),
+        _ => return Err(fail("unexpected text after the name")),
+    };
+    let user = TypeRef::unchecked(schema, name);
+    if let Some(reason) = user.problem() {
+        return Err(fail(&reason));
+    }
+    let ty = ColumnType::reference(user);
+    Ok(if array { ty.into_array() } else { ty })
+}
+
+/// One name part from the front of `text`, and what follows it. A bare part is
+/// folded to lowercase (ASCII only, which is the engine's rule); a quoted part
+/// is kept, and `""` inside it is one quote.
+fn take_part<'a>(whole: &str, text: &'a str) -> Result<(String, &'a str), TypeParseError> {
+    if text
+        .get(..2)
+        .is_some_and(|head| head.eq_ignore_ascii_case("u&"))
+    {
+        return Err(bad_reference(
+            whole,
+            "a `U&\"…\"` escaped name is not supported; write the name itself in double quotes",
+        ));
+    }
+    if let Some(quoted) = text.strip_prefix('"') {
+        let mut part = String::new();
+        let mut chars = quoted.char_indices();
+        while let Some((i, c)) = chars.next() {
+            if c != '"' {
+                part.push(c);
+            } else if quoted[i + 1..].starts_with('"') {
+                part.push('"');
+                chars.next();
+            } else {
+                if part.is_empty() {
+                    return Err(bad_reference(whole, "a quoted name is empty (`\"\"`)"));
+                }
+                return Ok((part, &quoted[i + 1..]));
+            }
+        }
+        return Err(bad_reference(whole, "a quoted name is not closed"));
+    }
+    // The engine's `ident_start` and `ident_cont`: a digit and `$` continue a
+    // name and cannot begin one, and every non-ASCII character is a letter.
+    let starts = |c: char| c.is_ascii_alphabetic() || c == '_' || !c.is_ascii();
+    let continues = |c: char| starts(c) || c.is_ascii_digit() || c == '$';
+    if !text.chars().next().is_some_and(starts) {
+        return Err(bad_reference(
+            whole,
+            if text.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                "a name starting with a digit must be in double quotes"
+            } else {
+                "a name part is empty or does not start like an identifier"
+            },
+        ));
+    }
+    let end = text.find(|c: char| !continues(c)).unwrap_or(text.len());
+    Ok((text[..end].to_ascii_lowercase(), &text[end..]))
 }
 
 fn finish_base(whole: &str, base: &str, args: Vec<TypeArg>) -> Result<ColumnType, TypeParseError> {
@@ -447,6 +726,226 @@ mod tests {
         assert!("nvarchar(100) junk;".parse::<ColumnType>().is_err());
         assert!("nvarchar(,)".parse::<ColumnType>().is_err());
         assert!("nvarchar()".parse::<ColumnType>().is_err());
+    }
+
+    // -- type references (#1523) --
+
+    fn reference(spelling: &str) -> ColumnType {
+        spelling
+            .parse()
+            .unwrap_or_else(|e| panic!("{spelling}: {e}"))
+    }
+
+    /// The canonical text is the whole identity: it is what `Display` writes,
+    /// what `base` carries, and what reads back as the same value.
+    #[test]
+    fn a_type_reference_round_trips_in_its_canonical_text() {
+        for (spelling, canonical) in [
+            ("app.mood", "app.mood"),
+            ("APP.Mood", "app.mood"),
+            ("app.mood[]", "app.mood[]"),
+            ("app.mood []", "app.mood[]"),
+            ("\"app\".\"mood\"", "app.mood"),
+            ("\"App\".\"Mood\"", "\"App\".\"Mood\""),
+            ("\"App\".\"Mood\"[]", "\"App\".\"Mood\"[]"),
+            ("app.\"Mood\"", "app.\"Mood\""),
+            ("\"a\"\"b\".c", "\"a\"\"b\".c"),
+            ("\"a.b\".\"c d\"", "\"a.b\".\"c d\""),
+            ("_app.mood$1", "_app.mood$1"),
+            ("app.\"1st\"", "app.\"1st\""),
+            ("app.\u{c4}type", "app.\"\u{c4}type\""),
+        ] {
+            let ty = reference(spelling);
+            assert_eq!(ty.to_string(), canonical, "{spelling}");
+            assert_eq!(reference(canonical), ty, "{spelling}");
+            assert!(ty.type_ref().is_some(), "{spelling}");
+            assert!(ty.args.is_empty() && ty.args_after_word().is_none());
+            assert_eq!(ty.is_array(), canonical.ends_with("[]"), "{spelling}");
+            // `base` is the canonical text without the marker, and it always
+            // has a `.`, so no catalogue name can equal it.
+            assert_eq!(ty.base, canonical.trim_end_matches("[]"), "{spelling}");
+            assert!(ty.base.contains('.'), "{spelling}");
+            let json = serde_json::to_string(&ty).unwrap();
+            assert_eq!(
+                json,
+                serde_json::to_string(canonical).unwrap(),
+                "{spelling}"
+            );
+            assert_eq!(serde_json::from_str::<ColumnType>(&json).unwrap(), ty);
+        }
+    }
+
+    /// An unquoted part folds as the engine folds it, a quoted one is kept, and
+    /// equality is over the two parts.
+    #[test]
+    fn a_type_reference_is_equal_by_its_parts() {
+        assert_eq!(reference("APP.Mood"), reference("app.mood"));
+        assert_eq!(reference("\"app\".\"mood\""), reference("app.mood"));
+        assert_ne!(reference("\"App\".\"Mood\""), reference("app.mood"));
+        assert_ne!(reference("app.\"Mood\""), reference("app.mood"));
+        assert_ne!(reference("app.mood"), reference("app.moods"));
+        assert_ne!(reference("app.mood"), reference("other.mood"));
+        // An array is not its element, and a reference is not a built-in.
+        assert_ne!(reference("app.mood[]"), reference("app.mood"));
+        assert_ne!(reference("app.mood"), ColumnType::simple("app.mood"));
+        assert_eq!(reference("app.mood[]").element(), reference("app.mood"));
+        let kept = reference("\"App\".\"Mood\"");
+        let user = kept.type_ref().unwrap();
+        assert_eq!((user.schema(), user.name()), ("App", "Mood"));
+        let folded = reference("APP.Mood");
+        let user = folded.type_ref().unwrap();
+        assert_eq!((user.schema(), user.name()), ("app", "mood"));
+        // A part is folded in ASCII only: the engine leaves other letters alone.
+        assert_eq!(
+            reference("app.\u{c4}x").type_ref().unwrap().name(),
+            "\u{c4}x"
+        );
+    }
+
+    /// A reference built from the catalog's own parts holds them as given, and
+    /// reads back from its text.
+    #[test]
+    fn a_type_reference_built_from_parts_keeps_them_unfolded() {
+        let user = TypeRef::new("App", "Mood").unwrap();
+        let ty = ColumnType::reference(user.clone());
+        assert_eq!(ty.to_string(), "\"App\".\"Mood\"");
+        assert_eq!(ty.type_ref(), Some(&user));
+        assert_eq!(reference(&ty.to_string()), ty);
+        assert!(TypeRef::new("app", "").is_err());
+        assert!(TypeRef::new("", "mood").is_err());
+        assert!(TypeRef::new("pg_temp", "mood").is_err());
+        assert!(TypeRef::new("app", "_mood").is_err());
+    }
+
+    #[test]
+    fn a_type_reference_is_refused_where_it_cannot_name_one_type() {
+        let long = "a".repeat(64);
+        let longest = "a".repeat(63);
+        let multibyte = "\u{e9}".repeat(32);
+        for (spelling, why) in [
+            ("a.b.c", "three parts"),
+            ("\"a\".\"b\".\"c\"", "three quoted parts"),
+            (".mood", "no schema"),
+            ("app.", "no name"),
+            ("\"\"", "an empty quoted name"),
+            ("app.\"\"", "an empty quoted name"),
+            ("\"\".mood", "an empty quoted schema"),
+            ("app._mood", "the array type's own name"),
+            ("app.\"_mood\"", "the array type's own name, quoted"),
+            ("app.mood(3)", "an argument"),
+            ("app.mood (3)", "an argument after a space"),
+            ("app.mood(3)[]", "an argument on an array"),
+            ("app.mood[3]", "an array with a size"),
+            ("app.mood[][]", "two pairs of brackets"),
+            ("app.mood[", "an open bracket"),
+            ("app.mood ARRAY", "the SQL array spelling"),
+            ("app.mood[]x", "trailing text"),
+            ("app.mood x", "trailing words"),
+            ("app . mood", "a space around the dot"),
+            ("app. mood", "a space after the dot"),
+            ("pg_temp.mood", "the temporary schema"),
+            ("PG_TEMP.mood", "the temporary schema, upper case"),
+            ("\"pg_temp\".mood", "the temporary schema, quoted"),
+            ("pg_temp_3.mood", "a numbered temporary schema"),
+            ("pg_toast_temp_3.mood", "a numbered toast temporary schema"),
+            ("U&\"mo\\0064\".x", "an escaped schema"),
+            ("app.U&\"mo\\0064\"", "an escaped name"),
+            ("u&\"x\".y", "an escaped schema, lower case"),
+            ("\"app.mood", "an open quote"),
+            ("app.\"mood", "an open quote in the name"),
+            ("app.\"mo\"od", "text after a closing quote"),
+            ("1app.mood", "a schema starting with a digit"),
+            ("app.1mood", "a name starting with a digit"),
+            ("app.mo-od", "a character no bare name holds"),
+            ("app.mo;od", "a semicolon"),
+            ("app.mo od", "a space in a bare name"),
+            ("app.mood;", "a trailing semicolon"),
+            (&format!("{long}.mood"), "a 64-byte schema"),
+            (&format!("app.{long}"), "a 64-byte name"),
+            (&format!("app.\"{long}\""), "a 64-byte quoted name"),
+            (
+                &format!("app.\"{multibyte}x\""),
+                "64 bytes in 33 characters",
+            ),
+            ("app.\"a\0b\"", "a NUL byte"),
+        ] {
+            let error = spelling
+                .parse::<ColumnType>()
+                .expect_err(&format!("{why}: `{spelling}`"));
+            // The refusal is the model's own, not the old base-name one, and it
+            // names what the user wrote.
+            let message = error.to_string();
+            assert!(
+                !matches!(error, TypeParseError::BadBaseName(_)),
+                "{why}: {message}"
+            );
+            assert!(
+                message.contains(spelling.trim()) || spelling.is_empty(),
+                "{why}: {message}"
+            );
+        }
+        // The limit is 63 bytes, inclusive, in bytes and not in characters.
+        assert!(format!("{longest}.mood").parse::<ColumnType>().is_ok());
+        assert!(format!("app.{longest}").parse::<ColumnType>().is_ok());
+        assert!(
+            format!("app.\"{}\"", "\u{e9}".repeat(31))
+                .parse::<ColumnType>()
+                .is_ok()
+        );
+        // A schema may start with an underscore; only a type name may not.
+        assert!("_app.mood".parse::<ColumnType>().is_ok());
+        assert!("pg_temporary.mood".parse::<ColumnType>().is_ok());
+        assert!("pg_temp_x.mood".parse::<ColumnType>().is_ok());
+    }
+
+    /// A reference is told from a built-in by the name before any argument, so a
+    /// dot or a quote inside an argument keeps the reading it always had.
+    #[test]
+    fn a_dot_or_quote_inside_an_argument_is_not_a_reference() {
+        for spelling in ["numeric(1.5)", "foo(\"x\")", "foo(a.b)", "foo(1) bar"] {
+            let ty = reference(spelling);
+            assert!(ty.type_ref().is_none(), "{spelling}");
+            assert!(!ty.base.contains('.'), "{spelling}");
+        }
+        assert!("foo(a.b".parse::<ColumnType>().is_err());
+    }
+
+    /// Nothing that loaded before changes: every existing scalar and array
+    /// spelling holds no reference and serializes as it did.
+    #[test]
+    fn existing_spellings_hold_no_reference_and_serialize_as_before() {
+        for (spelling, written) in [
+            ("bigint", "bigint"),
+            ("INTEGER", "integer"),
+            ("nvarchar(max)", "nvarchar(max)"),
+            ("decimal(18, 2)", "decimal(18, 2)"),
+            ("double precision", "double precision"),
+            ("character varying(10)", "character varying(10)"),
+            ("timestamp(3) with time zone", "timestamp(3) with time zone"),
+            ("time(3) without time zone", "time(3) without time zone"),
+            ("text[]", "text[]"),
+            ("varchar(10)[]", "varchar(10)[]"),
+            ("numeric(10, 2) []", "numeric(10, 2)[]"),
+            (
+                "timestamp(3) with time zone[]",
+                "timestamp(3) with time zone[]",
+            ),
+            ("jsonb", "jsonb"),
+            ("bit varying(3)", "bit varying(3)"),
+        ] {
+            let ty = reference(spelling);
+            assert!(ty.type_ref().is_none(), "{spelling}");
+            assert_eq!(ty.to_string(), written, "{spelling}");
+            assert_eq!(
+                serde_json::to_string(&ty).unwrap(),
+                format!("\"{written}\""),
+                "{spelling}"
+            );
+        }
+        // And what was refused as a base name for its punctuation still is.
+        for spelling in ["a-b", "foo;", "a b;c", "text]", "[]", "int[3]"] {
+            assert!(spelling.parse::<ColumnType>().is_err(), "{spelling}");
+        }
     }
 
     /// Expanding aliases is the dialect's job; this layer must not decide on its
