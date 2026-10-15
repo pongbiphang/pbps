@@ -485,9 +485,11 @@ pub struct ColumnDto {
     #[serde(default)]
     pub default: Option<String>,
 
-    /// `[seed, increment]`
+    /// `[seed, increment]`, or a mapping where the identity's sequence has
+    /// more to say: `{seed, increment, min, max, cycle, cache}` (PostgreSQL,
+    /// #1921).
     #[serde(default)]
-    pub identity: Option<[i64; 2]>,
+    pub identity: Option<IdentityDto>,
 
     /// What a `serial` column's sequence says other than `serial`'s own: its
     /// `start`, its `increment`, and a `name` other than the engine's
@@ -914,6 +916,83 @@ pub struct SequenceDto {
     /// engine generates.
     #[serde(default)]
     pub name: Option<String>,
+    /// The lowest value. Absent is the engine's for the type and direction.
+    #[serde(default)]
+    pub min: Option<i64>,
+    /// The highest value. Absent is the engine's for the type and direction.
+    #[serde(default)]
+    pub max: Option<i64>,
+    /// Whether the sequence starts again at the other bound once it reaches
+    /// one. Absent is `false`.
+    #[serde(default)]
+    pub cycle: bool,
+    /// How many numbers a session takes at once. Absent is 1.
+    #[serde(default)]
+    pub cache: Option<i64>,
+}
+
+/// A column's `identity:`: `[seed, increment]`, or a mapping (#1921).
+#[derive(Debug, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum IdentityDto {
+    Pair([i64; 2]),
+    Options(IdentityOptionsDto),
+}
+
+/// An `identity:` written as a mapping, with its sequence's options
+/// (PostgreSQL, #1921).
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityOptionsDto {
+    /// The first value. Absent is 1.
+    #[serde(default)]
+    pub seed: Option<i64>,
+    /// The step. Absent is 1.
+    #[serde(default)]
+    pub increment: Option<i64>,
+    /// The lowest value. Absent is the engine's for the type and direction.
+    #[serde(default)]
+    pub min: Option<i64>,
+    /// The highest value. Absent is the engine's for the type and direction.
+    #[serde(default)]
+    pub max: Option<i64>,
+    /// Whether the sequence starts again at the other bound once it reaches
+    /// one. Absent is `false`.
+    #[serde(default)]
+    pub cycle: bool,
+    /// How many numbers a session takes at once. Absent is 1.
+    #[serde(default)]
+    pub cache: Option<i64>,
+}
+
+impl<'de> serde::Deserialize<'de> for IdentityDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // A pair or a mapping, told apart by what the document holds, as
+        // `PartitionsDto` is: an untagged derive would report a misspelt
+        // option as "matches no variant", not by its own error.
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = IdentityDto;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("`[seed, increment]`, or a mapping of `seed`, `increment`, `min`, `max`, `cycle` and `cache`")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<IdentityDto, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(IdentityDto::Pair)
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<IdentityDto, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(IdentityDto::Options)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

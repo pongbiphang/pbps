@@ -1373,6 +1373,7 @@ async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
         column.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         declaration.columns.insert("id".to_owned(), column);
         let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &declaration);
@@ -1434,8 +1435,11 @@ async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
         let mut declaration = pbps_model::Table::default();
         let mut column = pbps_model::Column::new(declared.parse::<ColumnType>().expect("parses"));
         column.nullable = false;
-        column.value_source =
-            pbps_model::ValueSource::Identity(pbps_model::Identity { seed, increment });
+        column.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
+            seed,
+            increment,
+            options: Default::default(),
+        });
         declaration.columns.insert("id".to_owned(), column);
         let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &declaration);
 
@@ -1764,7 +1768,8 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
         parent.columns["id"].value_source,
         pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
-            increment: 1
+            increment: 1,
+            options: Default::default(),
         })
     );
     assert!(!parent.columns["id"].nullable);
@@ -2085,7 +2090,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
              ALTER TABLE {s}.unchecked ADD CONSTRAINT unchecked_fk
                  FOREIGN KEY (oid_) REFERENCES {s}.odd (id) NOT VALID;
              CREATE TABLE {s}.serialised (id serial PRIMARY KEY, note text);
-             ALTER SEQUENCE {s}.serialised_id_seq CACHE 20;
+             ALTER SEQUENCE {s}.serialised_id_seq AS bigint;
              CREATE TABLE {s}.full_match (a integer, b integer, UNIQUE (a, b));
              CREATE TABLE {s}.partly (a integer, b integer,
                  CONSTRAINT partly_fk FOREIGN KEY (a, b)
@@ -2134,6 +2139,8 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
                  id integer GENERATED ALWAYS AS IDENTITY (MINVALUE 5 MAXVALUE 99 CYCLE));
              CREATE TABLE {s}.cached (
                  id integer GENERATED ALWAYS AS IDENTITY (CACHE 100));
+             CREATE TABLE {s}.narrowed (id integer GENERATED ALWAYS AS IDENTITY);
+             ALTER SEQUENCE {s}.narrowed_id_seq AS smallint;
              CREATE TABLE {s}.setnull (a integer, b integer,
                  CONSTRAINT setnull_fk FOREIGN KEY (a) REFERENCES {s}.odd (id)
                      ON DELETE SET NULL (a));
@@ -2292,18 +2299,17 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         // message says `COLLATE` too, and the table is named schema-qualified,
         // so a bare "`collated`" matches nothing.
         ".collated`.`b` is `COLLATE \"C\"`",
-        // An identity that runs out, or wraps, somewhere else.
-        "and cycles",
         // A `SET NULL` that names its columns.
         "ON DELETE SET",
+        // An identity whose sequence is another type than its column's,
+        // whose bounds are that type's (#2013 review).
+        "narrowed`.`id` is an identity whose sequence is not `AS`",
         // An operator class that is not the column's own — on `text`, where
         // the type has a default operator class of its own, and on `varchar`,
         // where it does not and the engine resolves one through a preferred
         // type it is binary coercible to.
         "operator class",
         "`collated_vpat` on",
-        // A sequence that hands out values in blocks.
-        "`CACHE 100`",
         // The sequence a column owns without defaulting from it.
         "`spare`",
         // A key that asks about ranges, wearing an ordinary key's `contype`.
@@ -2337,8 +2343,9 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         // foreign key that has nothing to point at once it is gone.
         "INCLUDE",
         "`leaning_fk` on",
-        // A sequence a column owns in a shape `serial` does not make (a
-        // cache), which this model cannot hold (#1631).
+        // A sequence a column owns in a shape `serial` does not make (`AS`
+        // a wider type than the column's), which this model cannot hold
+        // (#1631). A cache, bounds or a cycle are held since #1921.
         "serialised`.`id` defaults from the sequence",
         // A check the rows already there were never checked against, and a
         // foreign key likewise — the constraint's own name, because `NOT
@@ -2550,6 +2557,37 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
         "{:?}",
         serialised.columns["id"].value_source
     );
+    // An identity's bounds, cycle and cache are held, not named (#1921,
+    // DEC-1921.1): only the bounds that are not the type's own.
+    for (table, options) in [
+        (
+            "bounded",
+            pbps_model::SequenceOptions {
+                min: Some(5),
+                max: Some(99),
+                cycle: true,
+                cache: None,
+            },
+        ),
+        (
+            "cached",
+            pbps_model::SequenceOptions {
+                cache: Some(100),
+                ..Default::default()
+            },
+        ),
+    ] {
+        let id = &pulled.schema.tables[&pbps_model::TableName::new(&s, table)].columns["id"];
+        assert!(
+            matches!(&id.value_source, pbps_model::ValueSource::Identity(i) if i.options == options),
+            "{table}: {:?}",
+            id.value_source
+        );
+        assert!(
+            !all.contains(&format!("{table}`.`id`")),
+            "{table} is held, not named: {all}"
+        );
+    }
     // And a referenced column whose name contains the `)` that a parse of
     // `pg_get_constraintdef` would have stopped inside of.
     let pointing = &pulled.schema.tables[&pbps_model::TableName::new(&s, "pointing")];
@@ -2591,6 +2629,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
             pbps_model::TableName::new(&s, "full_match"),
             pbps_model::TableName::new(&s, "half_built"),
             pbps_model::TableName::new(&s, "leaning"),
+            pbps_model::TableName::new(&s, "narrowed"),
             pbps_model::TableName::new(&s, "nulls"),
             pbps_model::TableName::new(&s, "odd"),
             pbps_model::TableName::new(&s, "partly"),
@@ -3605,9 +3644,16 @@ async fn numbering_sources_change_in_place_and_continue_past_the_rows() {
             start,
             increment,
             name: name.map(str::to_owned),
+            options: Default::default(),
         })
     };
-    let identity = |seed, increment| ValueSource::Identity(Identity { seed, increment });
+    let identity = |seed, increment| {
+        ValueSource::Identity(Identity {
+            seed,
+            increment,
+            options: Default::default(),
+        })
+    };
     let mut declared = base.clone();
     for (table, source, nullable, gated) in [
         ("a", serial(1, 1, None), false, false),
@@ -3886,6 +3932,292 @@ async fn numbering_sources_change_in_place_and_continue_past_the_rows() {
     db.drop().await;
 }
 
+/// A sequence's bounds, cycle and cache, on an identity and on a `serial`,
+/// created, put on and retuned in place, read back the same and planned
+/// again to nothing (#1921, DEC-1921.1). Only a retune that ends the numbers
+/// sooner faces the `numbering` gate, and the pre-flight counts a counter
+/// already past the bounds a retune gives it — which the engine refuses
+/// mid-apply — or one this session cannot read.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted() {
+    use pbps_model::{Identity, OwnedSequence, RiskClass, SequenceOptions, ValueSource};
+    let s = emit_schema("opt1921");
+    let mut db = TestDb::create("opt1921").await;
+    fresh(&mut db, &s).await;
+    db.execute(&format!(
+        "CREATE TABLE {s}.a (id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v int);
+         INSERT INTO {s}.a (v) VALUES (1), (2), (3);
+         CREATE TABLE {s}.b (id serial PRIMARY KEY, v int);
+         SELECT setval(pg_get_serial_sequence('{s}.b', 'id'), 50);
+         CREATE TABLE {s}.c (id integer GENERATED ALWAYS AS IDENTITY (MAXVALUE 99 CYCLE));
+         CREATE TABLE {s}.c2 (id integer GENERATED ALWAYS AS IDENTITY (MAXVALUE 99));
+         CREATE TABLE {s}.d (id serial);
+         CREATE TABLE {s}.e (id integer NOT NULL); INSERT INTO {s}.e VALUES (7);
+         CREATE TABLE {s}.g (id serial);
+         SELECT setval(pg_get_serial_sequence('{s}.g', 'id'), 8, false);
+         CREATE TABLE {s}.h (id integer GENERATED ALWAYS AS IDENTITY (MAXVALUE 100000));
+         CREATE TABLE {s}.i (id smallint GENERATED ALWAYS AS IDENTITY (MAXVALUE 100));
+         CREATE TABLE {s}.j (id serial);
+         ALTER SEQUENCE {s}.j_id_seq MAXVALUE 3 CYCLE;
+         SELECT setval(pg_get_serial_sequence('{s}.j', 'id'), 3);
+         CREATE TABLE {s}.k (id integer NOT NULL); INSERT INTO {s}.k VALUES (1), (2), (3);
+         CREATE TABLE {s}.l (id bigint NOT NULL);
+         INSERT INTO {s}.l VALUES (9223372036854775807);
+         CREATE TABLE {s}.m (id bigserial); ALTER SEQUENCE {s}.m_id_seq CYCLE;
+         SELECT setval(pg_get_serial_sequence('{s}.m', 'id'), 9223372036854775807);"
+    ))
+    .await
+    .expect("the tables");
+    let mut base = ours_only(&pull(&mut db).await, &s);
+    pbps_dialect::name_read_sequences(&mut base, &Postgres::new());
+    let ids = mint_ids(&base, &IdsFile::default(), &[]);
+    let o = |min, max, cycle, cache| SequenceOptions {
+        min,
+        max,
+        cycle,
+        cache,
+    };
+    // Read back: the bounds that are not the type's own, and the cycle.
+    let source = |schema: &Schema, table: &str| {
+        schema.tables[&TableName::new(&s, table)].columns["id"]
+            .value_source
+            .clone()
+    };
+    assert_eq!(
+        source(&base, "c"),
+        ValueSource::Identity(Identity {
+            seed: 1,
+            increment: 1,
+            options: o(None, Some(99), true, None),
+        })
+    );
+    let identity = |seed, options| {
+        ValueSource::Identity(Identity {
+            seed,
+            increment: 1,
+            options,
+        })
+    };
+    let serial = |options| {
+        ValueSource::Sequence(OwnedSequence {
+            options,
+            ..OwnedSequence::serial()
+        })
+    };
+    let declare = |changes: &[(&str, ValueSource)]| {
+        let mut declared = base.clone();
+        for (table, to) in changes {
+            declared
+                .tables
+                .get_mut(&TableName::new(&s, *table))
+                .unwrap()
+                .columns
+                .get_mut("id")
+                .unwrap()
+                .value_source = to.clone();
+        }
+        declared
+    };
+
+    // A bound below the counter: counted before apply, and refused by the
+    // engine where nothing counted it.
+    let past = declare(&[("b", serial(o(None, Some(10), false, None)))]);
+    let cs = plan(&base, &ids, &past, &ids);
+    assert_eq!(cs.changes.len(), 1, "{cs:#?}");
+    assert!(cs.changes[0].risks.contains(&RiskClass::Numbering));
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
+    let probes = Postgres::new().preflight(&names).probes;
+    assert_eq!(probes.len(), 1, "{probes:#?}");
+    assert_eq!(
+        counted(&mut db, &probes[0].sql).await,
+        1,
+        "{}",
+        probes[0].description
+    );
+    in_a_transaction(&mut db).await;
+    let mut refused = None;
+    for stmt in Postgres::new()
+        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .unwrap()
+    {
+        if let Err(e) = db.execute(&stmt.sql).await {
+            refused = Some(format!("{e:?}"));
+            break;
+        }
+    }
+    rollback(&mut db).await;
+    let refused = refused.expect("the engine refuses a bound below the counter");
+    assert!(
+        refused.contains("cannot be greater than MAXVALUE"),
+        "{refused}"
+    );
+
+    let mut declared = declare(&[
+        ("a", identity(1, o(None, Some(1000), false, Some(20)))),
+        ("c", identity(1, o(None, Some(99), false, None))),
+        ("c2", identity(1, o(None, Some(500), true, None))),
+        ("d", serial(o(None, Some(10), false, None))),
+        ("e", serial(o(None, Some(100), false, Some(5)))),
+        // A cycling source continued past its bound wraps, as `nextval`
+        // would: `j`'s old counter stands at its maximum, `k`'s values
+        // reach it (#2013 review).
+        ("j", identity(1, o(None, Some(3), true, None))),
+        ("k", serial(o(None, Some(3), true, None))),
+        // And at the end of `bigint`, where one step past is no `int8`.
+        ("l", serial(o(None, None, true, None))),
+        ("m", identity(1, o(None, None, true, None))),
+        // Set by `setval(…, false)` and never called since, as a source this
+        // tool puts on is left: the counter is 8, not the start of 1, and a
+        // minimum of 5 is inside it (#2013 review).
+        (
+            "g",
+            ValueSource::Sequence(OwnedSequence {
+                start: 5,
+                options: o(Some(5), None, false, None),
+                ..OwnedSequence::serial()
+            }),
+        ),
+    ]);
+    let mut f = pbps_model::Column::new("integer".parse().unwrap()).not_null();
+    f.value_source = identity(5, o(Some(5), Some(1000), true, Some(20)));
+    let mut created = pbps_model::Table::default();
+    created.columns.insert("id".into(), f);
+    declared.tables.insert(TableName::new(&s, "f"), created);
+    // Retyped with their bounds: narrowed, the bound goes first, since the
+    // engine moves the sequence with the column and refuses a bound left
+    // outside its new type; widened, the retype goes first (#2013 review).
+    for (table, ty, options) in [
+        ("h", "smallint", o(None, Some(100), false, None)),
+        ("i", "integer", o(None, Some(100000), false, None)),
+    ] {
+        let column = declared
+            .tables
+            .get_mut(&TableName::new(&s, table))
+            .unwrap()
+            .columns
+            .get_mut("id")
+            .unwrap();
+        column.ty = ty.parse().unwrap();
+        column.value_source = identity(1, options);
+    }
+    let declared_ids = mint_ids(&declared, &ids, &[]);
+    let cs = plan(&base, &ids, &declared, &declared_ids);
+    let gated: std::collections::BTreeSet<String> = cs
+        .changes
+        .iter()
+        .filter(|p| p.risks.contains(&RiskClass::Numbering))
+        .filter_map(|p| p.change.table().map(|t| t.name.clone()))
+        .collect();
+    // Negative: `c2` raises its bound and turns its cycle on; `f` is new;
+    // `e` is put on a column under no key, as #1889 leaves ungated; `i`
+    // raises its bound.
+    assert_eq!(
+        gated,
+        ["a", "c", "d", "h", "j", "m"].map(str::to_owned).into(),
+        "{cs:#?}"
+    );
+    let at = |table: &str, numbering: bool| {
+        cs.changes
+            .iter()
+            .position(|p| {
+                p.change.table().is_some_and(|t| t.name == table)
+                    && matches!(p.change, pbps_model::Change::AlterColumnNumbering { .. })
+                        == numbering
+            })
+            .unwrap()
+    };
+    assert!(at("h", true) < at("h", false), "{cs:#?}");
+    assert!(at("i", false) < at("i", true), "{cs:#?}");
+    // Nothing in the way: `a`'s counter is 3, `d`'s never called and at its
+    // start, `e`'s value far from its new bound, `g`'s set to 8 uncalled.
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &declared_ids).unwrap();
+    let probes = Postgres::new().preflight(&names).probes;
+    assert!(
+        probes.iter().any(|p| p.description.contains("counter of")),
+        "{probes:#?}"
+    );
+    for probe in &probes {
+        assert_eq!(
+            counted(&mut db, &probe.sql).await,
+            0,
+            "{}",
+            probe.description
+        );
+    }
+    // A counter this session cannot read is counted as in the way, never
+    // read as within the bounds.
+    let role = format!("pbps_seq_1921_{}", std::process::id());
+    in_a_transaction(&mut db).await;
+    db.execute(&format!(
+        "CREATE ROLE {role}; GRANT USAGE ON SCHEMA {s} TO {role}; SET LOCAL ROLE {role}"
+    ))
+    .await
+    .unwrap();
+    for hidden in probes
+        .iter()
+        .filter(|p| p.description.contains("counter of"))
+    {
+        assert_eq!(
+            counted(&mut db, &hidden.sql).await,
+            1,
+            "{}",
+            hidden.description
+        );
+    }
+    rollback(&mut db).await;
+
+    apply(&mut db, &Postgres::new(), &cs).await;
+    let mut after = ours_only(&pull(&mut db).await, &s);
+    pbps_dialect::name_read_sequences(&mut after, &Postgres::new());
+    // The name a pull reads beside a `serial` is the engine's own, which the
+    // declaration leaves out.
+    let unnamed = |source: ValueSource| match source {
+        ValueSource::Sequence(sequence) => ValueSource::Sequence(OwnedSequence {
+            name: None,
+            ..sequence
+        }),
+        other @ (ValueSource::None
+        | ValueSource::Default(_)
+        | ValueSource::Identity(_)
+        | ValueSource::Generated(_)) => other,
+    };
+    for table in [
+        "a", "c", "c2", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    ] {
+        assert_eq!(
+            unnamed(source(&after, table)),
+            source(&declared, table),
+            "{table}"
+        );
+    }
+    let again = plan(&after, &declared_ids, &declared, &declared_ids);
+    assert!(again.is_empty(), "{again:#?}");
+    // The engine holds what was declared, and numbers on from where it was.
+    let next = |table: &str| format!("INSERT INTO {s}.{table} DEFAULT VALUES RETURNING id");
+    assert_eq!(number(&mut db, &next("d")).await, 1);
+    assert_eq!(number(&mut db, &next("e")).await, 8);
+    assert_eq!(number(&mut db, &next("f")).await, 5);
+    assert_eq!(number(&mut db, &next("g")).await, 8);
+    assert_eq!(number(&mut db, &next("j")).await, 1);
+    assert_eq!(number(&mut db, &next("k")).await, 1);
+    for table in ["l", "m"] {
+        let sql = format!("INSERT INTO {s}.{table} DEFAULT VALUES RETURNING id::int4");
+        assert_eq!(number(&mut db, &sql).await, 1, "{table}");
+    }
+    let held = |table: &str| {
+        format!(
+            "SELECT (seqmin = 1 AND seqmax = 1000 AND seqcache = 20 AND NOT seqcycle)::int \
+             FROM pg_catalog.pg_sequence \
+             WHERE seqrelid = pg_get_serial_sequence('{s}.{table}', 'id')::regclass"
+        )
+    };
+    assert_eq!(number(&mut db, &held("a")).await, 1);
+    db.execute(&format!("DROP SCHEMA {s} CASCADE"))
+        .await
+        .expect("drop");
+}
+
 /// A `serial` added to a table another role owns, applied by a superuser:
 /// `CREATE SEQUENCE` gives the sequence to the superuser, and `OWNED BY`
 /// refuses a sequence whose owner is not the table's. Measured on 16 and 18,
@@ -4083,6 +4415,7 @@ async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
             start: 100,
             increment: 5,
             name: Some("numbers".into()),
+            options: Default::default(),
         })
     );
     assert!(pulled.tables[&u].unlogged);
@@ -4132,6 +4465,7 @@ async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
         start: 7,
         increment: 2,
         name: None,
+        options: Default::default(),
     });
     changed
         .tables
@@ -7645,6 +7979,7 @@ fn rich_schema(s: &str) -> Schema {
     id.value_source = pbps_model::ValueSource::Identity(Identity {
         seed: 1,
         increment: 1,
+        options: Default::default(),
     });
     customer.columns.insert("id".into(), id);
     customer
@@ -18622,6 +18957,7 @@ async fn an_identity_keyed_data_block_is_refused_and_the_hazard_is_measured() {
     id.value_source = pbps_model::ValueSource::Identity(Identity {
         seed: 1,
         increment: 1,
+        options: Default::default(),
     });
     table.columns.insert("id".into(), id);
     table.columns.insert("v".into(), Column::new(ty("text")));
@@ -22591,6 +22927,7 @@ async fn an_identity_column_this_plan_adds_is_a_backfill_no_probe_can_evaluate()
             pid.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             });
         }
         child.columns.insert("pid".into(), pid);
@@ -23435,6 +23772,7 @@ async fn an_insert_leaving_a_key_column_to_an_identity_is_refused() {
     seq.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
         seed: 1,
         increment: 1,
+        options: Default::default(),
     });
     child.columns.insert("seq".into(), seq);
     child.columns.insert("x".into(), Column::new(ty("text")));
@@ -23776,6 +24114,7 @@ async fn a_row_arriving_against_an_unprobeable_parent_backfill_is_refused() {
     alt.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
         seed: 1,
         increment: 1,
+        options: Default::default(),
     });
     parent.columns.insert("alt".into(), alt);
     parent.primary_key = Some(PrimaryKey {
@@ -24025,6 +24364,7 @@ async fn a_row_spelling_a_value_over_a_null_backfill_is_refused_on_its_own_tuple
     alt.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
         seed: 1,
         increment: 1,
+        options: Default::default(),
     });
     parent.columns.insert("alt".into(), alt);
     parent.primary_key = Some(PrimaryKey {
@@ -24174,6 +24514,7 @@ async fn a_stored_row_holding_null_in_the_key_is_not_refused_for_a_backfill_it_n
     pid.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
         seed: 1,
         increment: 1,
+        options: Default::default(),
     });
     parent.columns.insert("pid".into(), pid);
     parent.primary_key = Some(PrimaryKey {
@@ -29378,6 +29719,7 @@ async fn the_generated_relation_names_are_the_ones_the_engine_uses() {
         id.value_source = pbps_model::ValueSource::Identity(Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         declared.columns.insert("id".into(), id);
         declared.primary_key = Some(PrimaryKey {
@@ -29646,11 +29988,13 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
     identity.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
         seed: 1,
         increment: 1,
+        options: Default::default(),
     });
     let mut stepped = plain.clone().not_null();
     stepped.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
         seed: 7,
         increment: 3,
+        options: Default::default(),
     });
     let mut generated = plain.clone();
     generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {

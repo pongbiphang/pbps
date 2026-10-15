@@ -653,13 +653,18 @@ mod tests {
         let over = Identity {
             seed: 1,
             increment: 40000,
+            options: Default::default(),
         };
         s.tables
             .insert(TableName::new("app", "big"), table("smallint", Some(over)));
         // The directional span is accepted exactly: 1..=32767 upward, and
         // -1 down to -32768 for a descending sequence.
         for (name, seed, increment) in [("edge", 1, 32766), ("down", -1, -32767)] {
-            let at = Identity { seed, increment };
+            let at = Identity {
+                seed,
+                increment,
+                options: Default::default(),
+            };
             s.tables
                 .insert(TableName::new("app", name), table("smallint", Some(at)));
         }

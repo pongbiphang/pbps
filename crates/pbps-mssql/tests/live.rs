@@ -1190,6 +1190,7 @@ fn rich_schema() -> Schema {
     id.value_source = pbps_model::ValueSource::Identity(Identity {
         seed: 1,
         increment: 1,
+        options: Default::default(),
     });
     customer.columns.insert("id".into(), id);
     customer
@@ -10336,6 +10337,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
     id.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
         seed: 1,
         increment: 1,
+        options: Default::default(),
     });
     kind.columns.insert("id".to_owned(), id);
     kind.columns.insert(
@@ -10588,6 +10590,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     id.value_source = pbps_model::ValueSource::Identity(Identity {
         seed: 1,
         increment: 1,
+        options: Default::default(),
     });
     kind.columns.insert("id".to_owned(), id);
     kind.columns.insert(

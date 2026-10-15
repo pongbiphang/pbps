@@ -2702,6 +2702,7 @@ mod tests {
         c.value_source = pbps_model::ValueSource::Identity(Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         let mut t = Table::default();
         t.columns.insert("id".into(), c);

@@ -287,6 +287,14 @@ pub(crate) fn convert_for_diagnostics(
                         start: given.and_then(|s| s.start).unwrap_or(1),
                         increment: given.and_then(|s| s.increment).unwrap_or(1),
                         name: given.and_then(|s| s.name.clone()),
+                        options: given.map_or_else(Default::default, |s| {
+                            pbps_model::SequenceOptions {
+                                min: s.min,
+                                max: s.max,
+                                cycle: s.cycle,
+                                cache: s.cache,
+                            }
+                        }),
                     }),
                 )
             }
@@ -325,11 +333,25 @@ pub(crate) fn convert_for_diagnostics(
         if let Some(default) = c.default {
             sources.push(pbps_model::ValueSource::Default(default));
         }
-        if let Some([seed, increment]) = c.identity {
-            sources.push(pbps_model::ValueSource::Identity(Identity {
-                seed,
-                increment,
-            }));
+        match c.identity {
+            None => {}
+            Some(crate::dto::IdentityDto::Pair([seed, increment])) => {
+                sources.push(pbps_model::ValueSource::Identity(Identity::new(
+                    seed, increment,
+                )));
+            }
+            Some(crate::dto::IdentityDto::Options(o)) => {
+                sources.push(pbps_model::ValueSource::Identity(Identity {
+                    seed: o.seed.unwrap_or(1),
+                    increment: o.increment.unwrap_or(1),
+                    options: pbps_model::SequenceOptions {
+                        min: o.min,
+                        max: o.max,
+                        cycle: o.cycle,
+                        cache: o.cache,
+                    },
+                }));
+            }
         }
         if let Some(sequence) = sequence {
             sources.push(pbps_model::ValueSource::Sequence(sequence));

@@ -1091,8 +1091,8 @@ and not the whole answer.
   `'300000-01-01'` with `date out of range for timestamp`.
 
 - **"the seed fits the column" is not "the sequence will start there".** An
-  `identity:` the model can spell carries a seed and an increment and nothing
-  else, so the sequence behind it takes PostgreSQL's default bounds — `1 ..
+  `identity:` that sets no `min` or `max` (DEC-1921.1) leaves the sequence
+  behind it at PostgreSQL's default bounds — `1 ..
   type_max` counting up, `type_min .. -1` counting down. A seed of `0` fits
   every integer type the engine will carry an identity on and is refused,
   `START value (0) cannot be less than MINVALUE (1)`; a seed of `5` counting

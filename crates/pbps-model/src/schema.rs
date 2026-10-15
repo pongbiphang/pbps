@@ -973,6 +973,75 @@ impl std::fmt::Display for Collation {
 pub struct Identity {
     pub seed: i64,
     pub increment: i64,
+    /// Its sequence's bounds, cycle and cache (#1921, DEC-1921.1). Default
+    /// is the engine's, and written as nothing.
+    #[serde(default, skip_serializing_if = "SequenceOptions::is_default")]
+    pub options: SequenceOptions,
+}
+
+impl Identity {
+    /// An identity with the engine's bounds, no cycle and a cache of one.
+    pub fn new(seed: i64, increment: i64) -> Self {
+        Self {
+            seed,
+            increment,
+            options: SequenceOptions::default(),
+        }
+    }
+}
+
+/// What a PostgreSQL sequence holds beyond its start and increment (#1921,
+/// DEC-1921.1): its bounds, whether it cycles, and how many numbers a session
+/// takes at once.
+///
+/// A bound is `None` where it is the engine's default for the column's type
+/// and the direction counted: `1 ..= type max` counting up, `type min ..= -1`
+/// counting down. Measured on 16 and 18, a retype moves a default bound with
+/// the type and keeps an explicit one, so `None` is not the same as the
+/// number it stands for today. A bound declared equal to its default is
+/// refused by validation, so each sequence has one spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SequenceOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<i64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cycle: bool,
+    /// `None` is the engine's cache of one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<i64>,
+}
+
+impl SequenceOptions {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Whether `self`, replacing `was`, can make a writer fail sooner
+    /// (DEC-1921.1): the bound it counts toward set or tightened, or a
+    /// cycle turned off. Needs no type: an explicit bound is always inside
+    /// the default one it replaces, so `None` is the loosest.
+    pub fn ends_sooner_than(&self, was: &SequenceOptions, increment: i64) -> bool {
+        let tighter = |now: Option<i64>, then: Option<i64>, below: bool| match (now, then) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(now), Some(then)) => {
+                if below {
+                    now < then
+                } else {
+                    now > then
+                }
+            }
+        };
+        let bound = if increment < 0 {
+            tighter(self.min, was.min, false)
+        } else {
+            tighter(self.max, was.max, true)
+        };
+        bound || (was.cycle && !self.cycle)
+    }
 }
 
 /// A sequence a column owns and defaults from (#1631, DEC-1631.1): created
@@ -991,6 +1060,10 @@ pub struct OwnedSequence {
     pub increment: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Its bounds, cycle and cache (#1921, DEC-1921.1). Default is the
+    /// engine's, and written as nothing.
+    #[serde(default, skip_serializing_if = "SequenceOptions::is_default")]
+    pub options: SequenceOptions,
 }
 
 impl OwnedSequence {
@@ -1000,14 +1073,17 @@ impl OwnedSequence {
             start: 1,
             increment: 1,
             name: None,
+            options: SequenceOptions::default(),
         }
     }
 
     /// Whether a sequence read back as `read` is what this declares: the same
-    /// start and increment, and the same name where this one names it.
+    /// start, increment and options, and the same name where this one names
+    /// it.
     pub fn declares(&self, read: &OwnedSequence) -> bool {
         self.start == read.start
             && self.increment == read.increment
+            && self.options == read.options
             && self
                 .name
                 .as_ref()

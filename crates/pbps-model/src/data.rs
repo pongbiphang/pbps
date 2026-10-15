@@ -1206,6 +1206,7 @@ mod tests {
             ValueSource::Identity(Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             }),
         ] {
             t.columns.get_mut("code").unwrap().value_source = source;
@@ -1350,6 +1351,7 @@ mod tests {
         seq.value_source = crate::ValueSource::Identity(crate::schema::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         t.columns.insert("seq".to_owned(), seq);
         let p = check(&name(), &t);

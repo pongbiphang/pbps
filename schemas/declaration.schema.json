@@ -205,18 +205,15 @@
           "default": null
         },
         "identity": {
-          "description": "`[seed, increment]`",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "minItems": 2,
-          "maxItems": 2,
-          "default": null
+          "description": "`[seed, increment]`, or a mapping where the identity's sequence has\nmore to say: `{seed, increment, min, max, cycle, cache}` (PostgreSQL,\n#1921).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IdentityDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "sequence": {
           "description": "What a `serial` column's sequence says other than `serial`'s own: its\n`start`, its `increment`, and a `name` other than the engine's\n`<table>_<column>_seq` (PostgreSQL). Only beside a `type: serial`,\n`bigserial` or `smallserial`.",
@@ -277,6 +274,80 @@
         "type"
       ]
     },
+    "IdentityDto": {
+      "description": "A column's `identity:`: `[seed, increment]`, or a mapping (#1921).",
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        {
+          "$ref": "#/$defs/IdentityOptionsDto"
+        }
+      ]
+    },
+    "IdentityOptionsDto": {
+      "description": "An `identity:` written as a mapping, with its sequence's options\n(PostgreSQL, #1921).",
+      "type": "object",
+      "properties": {
+        "seed": {
+          "description": "The first value. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "increment": {
+          "description": "The step. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "min": {
+          "description": "The lowest value. Absent is the engine's for the type and direction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "max": {
+          "description": "The highest value. Absent is the engine's for the type and direction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "cycle": {
+          "description": "Whether the sequence starts again at the other bound once it reaches\none. Absent is `false`.",
+          "type": "boolean",
+          "default": false
+        },
+        "cache": {
+          "description": "How many numbers a session takes at once. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
     "SequenceDto": {
       "type": "object",
       "properties": {
@@ -304,6 +375,38 @@
             "string",
             "null"
           ],
+          "default": null
+        },
+        "min": {
+          "description": "The lowest value. Absent is the engine's for the type and direction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "max": {
+          "description": "The highest value. Absent is the engine's for the type and direction.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "cycle": {
+          "description": "Whether the sequence starts again at the other bound once it reaches\none. Absent is `false`.",
+          "type": "boolean",
+          "default": false
+        },
+        "cache": {
+          "description": "How many numbers a session takes at once. Absent is 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
           "default": null
         }
       },
@@ -1185,6 +1288,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 45,
+  "x-pbps-schema-version": 46,
   "x-pbps-tool-version": "0.0.0"
 }

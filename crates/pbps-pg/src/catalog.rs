@@ -661,6 +661,7 @@ fn columns_query() -> String {
             seq.relname AS sequence_name,
             s.seqmin::int8 AS seq_min, s.seqmax::int8 AS seq_max, s.seqcycle AS seq_cycle,
             s.seqcache::int8 AS seq_cache,
+            (s.seqtypid = a.atttypid) AS seq_same_type,
             (SELECT pg_catalog.string_agg(
                       DISTINCT pg_catalog.format('`%I.%I`', sn.nspname, sq.relname), ', ')
                FROM pg_catalog.pg_depend dd
@@ -1292,6 +1293,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
                 max: number(row, "seq_max")?,
                 cycles: flag(row, "seq_cycle")?,
                 cache: number(row, "seq_cache")?,
+                same_type: flag(row, "seq_same_type")?,
             }),
             _ => None,
         };

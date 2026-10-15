@@ -604,6 +604,15 @@ pub(crate) fn table_sources(
                     "column `{col_name}` has an IDENTITY increment of 0, which never advances"
                 )));
             }
+            // An IDENTITY here has a seed and an increment and nothing else:
+            // no bounds, cycle or cache to set (#1921, DEC-1921.1).
+            if !identity.options.is_default() {
+                errs.push(invalid(format!(
+                    "column `{col_name}` has an `identity:` with min, max, cycle or cache, \
+                     which a SQL Server IDENTITY does not have; it takes only a seed and an \
+                     increment"
+                )));
+            }
             if supplied.iter().any(|source| match source {
                 pbps_model::ValueSource::Default(_) => true,
                 pbps_model::ValueSource::None
@@ -1574,6 +1583,7 @@ mod tests {
                         pbps_model::ValueSource::Identity(pbps_model::Identity {
                             seed: 1,
                             increment: 1,
+                            options: Default::default(),
                         })
                 },
                 "cannot also be an identity",
@@ -1792,12 +1802,52 @@ mod tests {
         c.value_source = pbps_model::ValueSource::Identity(Identity {
             seed: 1,
             increment: 0,
+            options: Default::default(),
         });
         t.columns.insert("seq".into(), c);
         let msg = messages(&table(&name, &t));
         assert!(msg.contains("needs an integer type"), "{msg}");
         assert!(msg.contains("cannot be nullable"), "{msg}");
         assert!(msg.contains("never advances"), "{msg}");
+    }
+
+    /// A SQL Server IDENTITY has a seed and an increment and nothing else, so
+    /// a declared sequence option is refused by name, never dropped (#1921,
+    /// DEC-1921.1). The same identity with none is accepted.
+    #[test]
+    fn an_identity_with_sequence_options_is_refused_on_sql_server() {
+        let (name, mut t) = base_table();
+        let mut c = Column::new(ty("int")).not_null();
+        c.value_source = pbps_model::ValueSource::Identity(Identity::new(1, 1));
+        t.columns.insert("seq".into(), c.clone());
+        let msg = messages(&table(&name, &t));
+        assert!(!msg.contains("min, max, cycle or cache"), "{msg}");
+        for options in [
+            pbps_model::SequenceOptions {
+                max: Some(100),
+                ..Default::default()
+            },
+            pbps_model::SequenceOptions {
+                cycle: true,
+                ..Default::default()
+            },
+            pbps_model::SequenceOptions {
+                cache: Some(20),
+                ..Default::default()
+            },
+        ] {
+            c.value_source = pbps_model::ValueSource::Identity(Identity {
+                seed: 1,
+                increment: 1,
+                options,
+            });
+            t.columns.insert("seq".into(), c.clone());
+            let msg = messages(&table(&name, &t));
+            assert!(
+                msg.contains("min, max, cycle or cache"),
+                "{options:?}: {msg}"
+            );
+        }
     }
 
     /// Refused, not converted: the emitter has no types to convert with.
@@ -2299,6 +2349,7 @@ mod tests {
             c.value_source = pbps_model::ValueSource::Identity(Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             });
             t.columns.insert(col.into(), c);
         }

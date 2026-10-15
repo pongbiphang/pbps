@@ -763,6 +763,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 45,
+  "x-pbps-schema-version": 46,
   "x-pbps-tool-version": "0.0.0"
 }

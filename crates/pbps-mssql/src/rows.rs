@@ -1642,6 +1642,7 @@ mod tests {
         seq.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         t.columns.insert("seq".to_owned(), seq);
         let q = query(

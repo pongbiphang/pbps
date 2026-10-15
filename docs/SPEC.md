@@ -388,11 +388,12 @@ indexes:
   the column owns, created with it and dropped with it. It is always
   `NOT NULL`: `nullable: false` may be written and need not be, and
   `nullable: true` is refused. A start, an increment, or a
-  sequence name other than the engine's `<table>_<column>_seq` goes in
-  `sequence: {start, increment, name}`. `pull` writes a column back as
-  `serial` only where it is exactly the shape `serial` makes; a sequence
-  that is shared, not owned, cached, bounded or cycling stays a named
-  limitation, as does one on a partitioned table (#1893). A role inserting
+  sequence name other than the engine's `<table>_<column>_seq`, and its
+  `min`, `max`, `cycle` and `cache`, go in `sequence: {start, increment,
+  name, min, max, cycle, cache}` (DEC-1921.1). `pull` writes a column back as
+  `serial` only where it is the shape `serial` makes; a sequence that is
+  shared or not owned stays a named limitation, as does one on a partitioned
+  table (#1893). A role inserting
   into it needs a grant on the sequence, which is not declared yet (#1892).
   A `data:` block keyed by one is refused. SQL Server refuses it: its form is
   `identity:` (DEC-1631.1).
@@ -405,6 +406,18 @@ indexes:
   beside it is its own default change. A partitioned table's source, and a
   kept source whose increment changes sign, are refused (#1681, #1893). SQL Server refuses every identity change
   (DECISIONS 5).
+- **A PostgreSQL sequence's bounds, cycle and cache are declared** on an
+  identity, as `identity: {seed, increment, min, max, cycle, cache}` beside
+  the `[seed, increment]` pair, and on a `serial`'s `sequence:`. Each left out
+  is the engine's own for the type and direction, and spelling that default
+  is refused, so a declaration has one spelling. They are read back, created,
+  and retuned in place; a retune that makes a writer fail sooner — the bound
+  it counts toward set or lowered, or the cycle turned off — is gated as
+  `numbering`, and the pre-flight counts a counter already past the new
+  bounds. A cycle on a column under a primary key, unique constraint or
+  unique index is refused: once it wraps, an insert fails as a duplicate.
+  SQL Server's identity has only a seed and an increment, and refuses them
+  (DEC-1921.1).
 - **A SQL Server computed column is declared under `computed:`**, beside
   `columns:` and not among them: `{expression: "a * 2"}`, with `persisted:
   true` for a stored value and `not_null: true` for `PERSISTED NOT NULL`. It
@@ -985,7 +998,7 @@ exists is never consulted, since no plan creates it again.
 | `data-delete` | A reference row leaves the table | Rows elsewhere that point at it fail, or lose what they pointed at |
 | `revoke` | A permission is revoked, or a role dropped (4.7) | A running application loses access mid-flight |
 | `grant-widen` | A permission is granted (4.7) | Access widens. Labelled, **not gated**: the merge request reviews the grant |
-| `numbering` | A PostgreSQL identity put on a column, a `serial` turned into one, or a numbering source taken off (DEC-1889.1) | An insert supplying its own value, calling the old sequence by name, or leaving the column to the source now gone fails |
+| `numbering` | A PostgreSQL identity put on a column, a `serial` turned into one, or a numbering source taken off (DEC-1889.1); a sequence's bound lowered, or its cycle turned off (DEC-1921.1) | An insert supplying its own value, calling the old sequence by name, or leaving the column to the source now gone fails; or the numbers run out sooner |
 
 The criterion is **whether this kind of change can fail or change stored values**; data is not read
 to decide whether this particular run happens to be safe. Data-level validation is

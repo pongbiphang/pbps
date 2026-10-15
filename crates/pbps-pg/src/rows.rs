@@ -1983,6 +1983,7 @@ mod tests {
         seq.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         t.columns.insert("seq".to_owned(), seq);
         let q = query(&name(), &t, &every())
@@ -2528,6 +2529,7 @@ mod tests {
             pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             });
         with_rows(&mut t, &[("1", &[])]);
         let problems = data_problems(&name(), &t, Default::default());
@@ -2550,6 +2552,7 @@ mod tests {
             .value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         with_rows(&mut beside, &[("a", &[])]);
         assert!(data_problems(&name(), &beside, Default::default()).is_empty());

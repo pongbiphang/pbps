@@ -1593,6 +1593,7 @@ async fn an_object_a_declaration_creates_is_reproduced_with_it() {
             id.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
                 seed: 1,
                 increment: 1,
+                options: Default::default(),
             });
             table.columns.insert("id".into(), id);
             Declared::default()
@@ -1644,6 +1645,7 @@ async fn a_shared_identity_the_target_did_not_get_from_a_managed_object_is_unres
         id.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
             seed: 1,
             increment: 1,
+            options: Default::default(),
         });
         table.columns.insert("id".into(), id);
         table
