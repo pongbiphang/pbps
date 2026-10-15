@@ -38,10 +38,7 @@ fn violations(from: &str, to: &str, order: &[usize]) -> Vec<Violation> {
         },
         ..Identity::new(1, 1)
     };
-    let (before, after) = (
-        schema(from, Identity::new(1, 1)),
-        schema(to, retuned.clone()),
-    );
+    let (before, after) = (schema(from, Identity::new(1, 1)), schema(to, retuned));
     let mut ids = IdsFile::default();
     let uid = Uid::derived(UidKind::Column, "t.id", 0);
     ids.tables.insert(Uid::derived(UidKind::Table, "t", 0), t());
