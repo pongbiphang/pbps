@@ -26275,11 +26275,22 @@ fn resolver_externals_drafts_what_a_managed_view_reads_and_never_replaces_the_ex
     ]);
     assert_ne!(code(&refused), 0);
     assert!(
-        stderr(&refused).contains("is under the declarations' directory"),
+        stderr(&refused).contains("is a declaration file under"),
         "{}",
         stderr(&refused)
     );
     assert!(!declaration.exists());
+    // Negative: a file there the loader does not read is written.
+    let beside = d.dir.join("schema/externals.sql");
+    succeeds(d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--out",
+        beside.to_str().unwrap(),
+    ]));
+    assert_eq!(std::fs::read_to_string(&beside).unwrap(), sql);
     // Nor through a link, dangling or not, `--force` or not.
     #[cfg(unix)]
     {

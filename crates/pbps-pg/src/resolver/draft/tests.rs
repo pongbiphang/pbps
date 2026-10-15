@@ -478,15 +478,19 @@ fn a_shape_that_names_a_foreign_table_is_listed_and_not_written() {
 fn a_table_with_an_invalid_unique_index_is_listed_for_writing_by_hand() {
     let (mut target, table, _, managed) = reading_a_view();
     target.depend(&managed, &table, 'n', false);
-    let index = |valid| Index {
+    let index = |valid, tablespace| Index {
         name: "t_name".into(),
         definition: "CREATE UNIQUE INDEX t_name ON ext.t USING btree (name)".into(),
         keyed: false,
         clustered: false,
         replica_identity: false,
         valid,
+        tablespace,
     };
-    target.facts.indexes.insert(20000, vec![index(false)]);
+    target
+        .facts
+        .indexes
+        .insert(20000, vec![index(false, false)]);
     let draft = target.draft(&[]);
     assert!(
         draft.listed.contains(
@@ -497,8 +501,19 @@ fn a_table_with_an_invalid_unique_index_is_listed_for_writing_by_hand() {
         draft.listed
     );
     assert!(!draft.sql.contains("CREATE TABLE ext.t"), "{}", draft.sql);
-    // Negative: a valid one is written.
-    target.facts.indexes.insert(20000, vec![index(true)]);
+    // One in a tablespace of its own, which scratch need not have.
+    target.facts.indexes.insert(20000, vec![index(true, true)]);
+    let draft = target.draft(&[]);
+    assert!(
+        draft.listed.contains(
+            &"table ext.t: write it here by hand if a binding needs it; the draft writes no tablespace"
+                .to_owned()
+        ),
+        "{:?}",
+        draft.listed
+    );
+    // Negative: a valid one in the default tablespace is written.
+    target.facts.indexes.insert(20000, vec![index(true, false)]);
     let draft = target.draft(&[]);
     assert!(
         draft

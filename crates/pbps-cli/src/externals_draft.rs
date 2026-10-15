@@ -80,13 +80,19 @@ fn refuse_destination(project: &Project, out: &Path, force: bool) -> anyhow::Res
             );
         }
     }
-    // Every file under the declarations' directory is one the loader may
-    // read, including one that does not exist yet.
+    // A declaration file under the declarations' directory is one the
+    // loader reads, including one that does not exist yet.
     let schema_dir = paths::absolute(&project.schema_dir())?;
-    if paths::absolute(out)?.starts_with(&schema_dir) {
+    if paths::absolute(out)?.starts_with(&schema_dir)
+        // The files the loader reads there (`pbps_load::schema_files`).
+        && matches!(
+            out.extension().and_then(|extension| extension.to_str()),
+            Some("yml" | "yaml")
+        )
+    {
         bail!(
-            "`{}` is under the declarations' directory `{}`, which the project reads; write \
-             the draft elsewhere",
+            "`{}` is a declaration file under `{}`, which the project reads; write the draft \
+             elsewhere",
             out.display(),
             schema_dir.display()
         );

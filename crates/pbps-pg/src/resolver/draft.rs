@@ -201,6 +201,8 @@ struct Index {
     /// False for an index a failed concurrent build left: a statement
     /// builds a valid one, and the comparison reads which it is.
     valid: bool,
+    /// In a tablespace of its own, which scratch need not have.
+    tablespace: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -381,6 +383,7 @@ async fn read_in(conn: &mut impl QueryConnection) -> Result<Facts, DbError> {
                 clustered: flag(&row, "clustered")?,
                 replica_identity: flag(&row, "replica_identity")?,
                 valid: flag(&row, "valid")?,
+                tablespace: flag(&row, "tablespace")?,
             });
     }
     for row in conn.query(SEQUENCES).await? {
@@ -539,7 +542,7 @@ SELECT i.indrelid::text AS relation, pg_catalog.quote_ident(c.relname) AS name, 
                 WHERE k.conindid = i.indexrelid AND k.conrelid = i.indrelid \
                   AND k.contype IN ('p', 'u', 'x'))::text AS keyed, \
        i.indisclustered::text AS clustered, i.indisreplident::text AS replica_identity, \
-       i.indisvalid::text AS valid \
+       i.indisvalid::text AS valid, (c.reltablespace <> 0)::text AS tablespace \
   FROM pg_catalog.pg_index i JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid \
  WHERE i.indrelid >= 16384 \
    AND (i.indisunique OR EXISTS (SELECT FROM pg_catalog.pg_constraint k \
@@ -1062,8 +1065,8 @@ fn table(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'stati
     if relation.tablespace {
         return Err("tablespace");
     }
-    if invalid_index(facts, oid) {
-        return Err("invalid unique index");
+    if let Some(what) = unreproducible_index(facts, oid) {
+        return Err(what);
     }
     let columns = facts.columns.get(&oid).map_or(&[][..], Vec::as_slice);
     let owned: Vec<&Sequence> = facts
@@ -1205,8 +1208,8 @@ fn shape_view(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'
     if relation.tablespace {
         return Err("tablespace");
     }
-    if invalid_index(facts, oid) {
-        return Err("invalid unique index");
+    if let Some(what) = unreproducible_index(facts, oid) {
+        return Err(what);
     }
     let columns = facts.columns.get(&oid).map_or(&[][..], Vec::as_slice);
     let select = columns
@@ -1248,15 +1251,18 @@ fn shape_view(facts: &Facts, oid: u32, relation: &Relation) -> Result<String, &'
     })
 }
 
-/// Whether a compared index of the relation is invalid, which no statement
-/// that builds one reproduces.
-fn invalid_index(facts: &Facts, oid: u32) -> bool {
-    facts
-        .indexes
-        .get(&oid)
-        .into_iter()
-        .flatten()
-        .any(|index| !index.valid)
+/// What of a compared index of the relation no statement the draft writes
+/// reproduces: an invalid one, which a statement builds valid, or one in a
+/// tablespace of its own, which scratch need not have.
+fn unreproducible_index(facts: &Facts, oid: u32) -> Option<&'static str> {
+    let indexes = facts.indexes.get(&oid).map_or(&[][..], Vec::as_slice);
+    if indexes.iter().any(|index| !index.valid) {
+        Some("invalid unique index")
+    } else if indexes.iter().any(|index| index.tablespace) {
+        Some("tablespace")
+    } else {
+        None
+    }
 }
 
 /// The unique indexes no key owns, and what the relation says of any
