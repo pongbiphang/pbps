@@ -8807,6 +8807,20 @@ fn doctor_does_not_call_a_series_short_of_a_value_past_the_integer_maximum() {
     }
 }
 
+/// A default horizon past the end of the key's axis is a question about the
+/// declarations when they add a partition with no upper end: the finding says
+/// a plan is missing, and not that `partition_runway` must change (#2036). A
+/// series declared finite stays undetermined. On 16 and 18. The whole scenario
+/// is `support/partition_runway.rs`'s.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn doctor_names_the_plan_when_declarations_with_no_upper_end_reach_a_horizon_past_the_axis() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        partition_runway::open_ended_declarations(server, &format!("runway-open-2036-{k}"));
+    }
+}
+
 /// `doctor` does not read a partitioned table's occupancy through a parent
 /// that row-level security filters for the account it runs as: the runway and
 /// the DEFAULT's rows are each `…-unknown`, never "no row", while the owner, a
