@@ -26280,6 +26280,28 @@ fn resolver_externals_drafts_what_a_managed_view_reads_and_never_replaces_the_ex
         stderr(&refused)
     );
     assert!(!declaration.exists());
+    // Nor through a link, dangling or not, `--force` or not.
+    #[cfg(unix)]
+    {
+        let link = d.dir.join("draft-link.sql");
+        std::os::unix::fs::symlink(&declaration, &link).unwrap();
+        let refused = d.run(&[
+            "resolver",
+            "externals",
+            "--db",
+            db.connection(),
+            "--out",
+            link.to_str().unwrap(),
+            "--force",
+        ]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("is a symbolic link"),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(!declaration.exists());
+    }
     // The file a resolver entry names is never replaced, `--force` or not.
     std::fs::create_dir_all(d.dir.join("db")).unwrap();
     let named = d.dir.join("db/externals.sql");

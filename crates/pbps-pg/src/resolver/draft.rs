@@ -134,8 +134,9 @@ struct Object {
 
 /// One `pg_depend` row. `shape` says whether the dependent is a part the
 /// comparison reads: not a view's query, a default, a trigger, a policy, a
-/// foreign key, a CHECK or a plain index (SPEC §9.3.2, #1783), and of a
-/// routine only the types its signature names, never what its body reads.
+/// foreign key, a CHECK or a plain index (SPEC §9.3.2, #1783); of a
+/// routine only the types its signature names, never what its body reads;
+/// of a domain only its base type and collation, never its default.
 #[derive(Debug, Clone)]
 struct Depend {
     dependent: Key,
@@ -450,6 +451,13 @@ SELECT (SELECT c.relname::text FROM pg_catalog.pg_class c WHERE c.oid = d.classi
                           AND (d.refobjid = p.prorettype \
                                OR d.refobjid = ANY (p.proargtypes::pg_catalog.oid[]) \
                                OR d.refobjid = ANY (coalesce(p.proallargtypes, '{}')))) \
+          WHEN 'pg_catalog.pg_type'::pg_catalog.regclass THEN \
+            coalesce((SELECT t.typtype <> 'd' \
+                             OR (d.refclassid = 'pg_catalog.pg_type'::pg_catalog.regclass \
+                                 AND d.refobjid = t.typbasetype) \
+                             OR (d.refclassid = 'pg_catalog.pg_collation'::pg_catalog.regclass \
+                                 AND d.refobjid = t.typcollation) \
+                        FROM pg_catalog.pg_type t WHERE t.oid = d.objid), true) \
           WHEN 'pg_catalog.pg_class'::pg_catalog.regclass THEN \
             NOT EXISTS (SELECT FROM pg_catalog.pg_index i \
                          WHERE i.indexrelid = d.objid AND NOT i.indisunique \

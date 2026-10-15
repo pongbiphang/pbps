@@ -58,6 +58,14 @@ pub fn cmd_externals(
 /// Refuses a destination the project already uses, whatever `force` says,
 /// and an existing file unless `force`.
 fn refuse_destination(project: &Project, out: &Path, force: bool) -> anyhow::Result<()> {
+    // A link's destination is what gets written, and a dangling one cannot
+    // be resolved to compare with what the project reads.
+    if std::fs::symlink_metadata(out).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        bail!(
+            "`{}` is a symbolic link; write the draft to a regular file or a new path",
+            out.display()
+        );
+    }
     for (name, profile) in &project.config.resolvers {
         let (pbps_config::resolver::ResolverProfile::Docker { externals, .. }
         | pbps_config::resolver::ResolverProfile::Server { externals, .. }) = profile;

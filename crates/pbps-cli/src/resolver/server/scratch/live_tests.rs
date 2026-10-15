@@ -4501,8 +4501,10 @@ async fn resolver_stages_an_externals_file_drafted_from_the_target_unchanged() {
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn resolver_draft_lists_a_routine_and_a_chain_and_writes_neither() {
-    let a =
-        format!("SELECT {EXTERNAL}.f(1) AS one, {EXTERNAL}.g() AS two, c.m FROM {EXTERNAL}.c c");
+    let a = format!(
+        "SELECT {EXTERNAL}.f(1) AS one, {EXTERNAL}.g() AS two, c.m, u.x \
+         FROM {EXTERNAL}.c c, {EXTERNAL}.u u"
+    );
     let declarations = declared(&[("a", &a)], &["m"]);
     for server in SERVERS {
         let mut fixture = Fixture::new(server);
@@ -4523,6 +4525,13 @@ async fn resolver_draft_lists_a_routine_and_a_chain_and_writes_neither() {
                      RETURN (SELECT count(*)::integer FROM {MANAGED}.m)"
                 ),
                 format!("CREATE TABLE {EXTERNAL}.c (m {MANAGED}.m)"),
+                // Its default names the managed table; a default is not
+                // compared, so that is no chain either.
+                format!(
+                    "CREATE DOMAIN {EXTERNAL}.d AS oid \
+                     DEFAULT ('{MANAGED}.m'::pg_catalog.regclass)::oid"
+                ),
+                format!("CREATE TABLE {EXTERNAL}.u (x {EXTERNAL}.d)"),
                 format!("CREATE VIEW {MANAGED}.a AS {a}"),
             ],
         )
@@ -4565,6 +4574,13 @@ async fn resolver_draft_lists_a_routine_and_a_chain_and_writes_neither() {
                 .any(|line| line.starts_with(&format!("function {EXTERNAL}.g() cannot"))),
             "{server}: a routine's body is no chain: {:?}",
             draft.listed
+        );
+        assert!(
+            draft
+                .sql
+                .contains(&format!("CREATE DOMAIN {EXTERNAL}.d AS oid;\n")),
+            "{server}: a domain's default is no chain\n{}",
+            draft.sql
         );
         // Negative: neither is written, and no routine source in any form.
         assert!(
