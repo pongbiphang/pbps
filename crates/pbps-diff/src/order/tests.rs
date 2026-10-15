@@ -1659,6 +1659,19 @@ fn a_numbering_source_given_up_goes_before_the_retype_and_one_put_on_goes_after(
         [],
         "the numbering first is accepted"
     );
+    // An identity turned into an owned sequence goes first too (rank -3).
+    let serial = ValueSource::Sequence(pbps_model::OwnedSequence {
+        start: 1,
+        increment: 1,
+        name: None,
+    });
+    let plan = numbered_and_retyped(identity.clone(), serial);
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL),
+        [],
+        "an identity turned into a sequence goes before the retype"
+    );
     // Negative: put on a column the plan retypes, the sequence is created
     // `AS` the final type, so the numbering first is refused and the retype
     // first accepted.

@@ -6159,7 +6159,10 @@ pub fn cmd_plan_db(
             // Every pass that orders the plan has run: the verifier checks the
             // order that is saved and applied, in tests and debug builds
             // (#1954, DEC-1954.6).
-            #[cfg(any(test, debug_assertions))]
+            // Debug assertions alone, not `cfg(test)`: `pbps-diff` is compiled
+            // without its own `cfg(test)` here, so a release test build has no
+            // observer to call.
+            #[cfg(debug_assertions)]
             pbps_diff::order::shadow::observe_scheduled(
                 pbps_diff::Side {
                     schema: &recorded_snapshot.schema,

@@ -2,11 +2,15 @@
 
 use pbps_dialect::Dialect;
 use pbps_model::ModuleDeps;
+#[cfg(any(test, debug_assertions))]
+use pbps_model::operation::Requirement;
 use pbps_model::operation::{
-    Effects, Operation, OperationId, Operations, OwnerError, Owners, Requirement, Snapshot, effects,
+    Effects, Operation, OperationId, Operations, OwnerError, Owners, Snapshot, effects,
 };
 
-use super::edges::{Baseline, Because, Checks, Graph, graph};
+#[cfg(any(test, debug_assertions))]
+use super::edges::Because;
+use super::edges::{Baseline, Checks, Graph, graph};
 use super::verify::{Violation, verify_with};
 
 /// Everything the effects say about one ordered plan.

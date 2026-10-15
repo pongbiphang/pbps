@@ -488,10 +488,17 @@ impl Cx<'_> {
                 let key = ColumnKey::Recorded(Recorded(uid.clone()));
                 // A source put on, or kept through a retype, follows the
                 // column's last rewrite: a sequence is created `AS` the
-                // final type. One given up goes before the retype
-                // (DEC-1889.1, rank -3 before -1), so it does not wait for
-                // the column's rewrites.
-                if matches!(to, ValueSource::Identity(_) | ValueSource::Sequence(_)) {
+                // final type. One given up, or an identity turned into a
+                // sequence, goes before the retype (DEC-1889.1, rank -3
+                // before -1), so it does not wait for the column's rewrites.
+                let early = matches!(
+                    (from, to),
+                    (
+                        ValueSource::Identity(_) | ValueSource::Sequence(_),
+                        ValueSource::None | ValueSource::Default(_)
+                    ) | (ValueSource::Identity(_), ValueSource::Sequence(_))
+                );
+                if !early {
                     self.exists(ObjectKey::Column(key.clone()));
                 }
                 // The engine refuses an identity on a nullable column, so a
