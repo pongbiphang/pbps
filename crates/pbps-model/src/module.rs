@@ -60,10 +60,11 @@ pub type ObjectName = TableName;
 /// An array, a quoted name whose case the engine keeps, and a schema-qualified
 /// user type. [`ColumnType`]'s base name admits ASCII alphanumerics, underscore
 /// and space and lowercases what it holds, so of those four one is refused for
-/// its brackets, one for its quotes, one for its dot, and the quoted one would
-/// have its case taken away as well. And a dialect's column normalizer is a
-/// closed catalogue of the engine's own type names, which refuses a domain the
-/// user declared — while a routine may take one.
+/// its brackets and one for its quotes, and the quoted one would have its case
+/// taken away as well. The qualified name is read as a `TypeRef` since #1523
+/// (`dl.pos` and `"dl"."Pos"` parse), and a dialect's column normalizer is a
+/// closed catalogue of the engine's own type names, which refuses it — a domain
+/// the user declared — while a routine may take one.
 ///
 /// So this holds text and compares as text, for the reason
 /// [`Module::definition`] does: **the engine is the normalizer.**

@@ -4470,6 +4470,86 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
     }
 
+    /// A user-defined type named as `schema.name` loads (#1523) and this
+    /// dialect refuses it by name until it can read what the type is. The
+    /// refusal is the dialect's, so it says so, and it never calls the type
+    /// unknown to the catalogue or lets it through as a scalar.
+    #[test]
+    fn a_user_type_reference_is_refused_by_name_and_never_normalized() {
+        for (declared, named) in [
+            ("app.mood", "app.mood"),
+            ("APP.Mood", "app.mood"),
+            ("app.mood[]", "app.mood[]"),
+            ("\"App\".\"Mood\"", "\"App\".\"Mood\""),
+            ("\"App\".\"Mood\"[]", "\"App\".\"Mood\"[]"),
+            ("public.citext", "public.citext"),
+            ("pg_catalog.text", "pg_catalog.text"),
+        ] {
+            let error = Postgres::new()
+                .normalize_type(&ty(declared))
+                .expect_err(declared);
+            let message = error.to_string();
+            assert!(message.contains(&format!("`{named}`")), "{message}");
+            assert!(
+                message.contains("references to user-defined types are not supported yet"),
+                "{message}"
+            );
+            assert!(!message.contains("has no type"), "{message}");
+            // The array is refused whole, not as its element.
+            assert_eq!(
+                message.contains("[]"),
+                declared.ends_with("[]"),
+                "{message}"
+            );
+        }
+        // Negative: the same spellings without a reference are the catalogue's
+        // and still normalize; a bare name that is not one is unknown.
+        for spelling in ["text[]", "integer", "character varying(10)[]"] {
+            assert!(
+                Postgres::new().normalize_type(&ty(spelling)).is_ok(),
+                "{spelling}"
+            );
+        }
+        let message = Postgres::new()
+            .normalize_type(&ty("_mood"))
+            .expect_err("a bare name is not a catalogue type")
+            .to_string();
+        assert!(message.contains("has no type"), "{message}");
+    }
+
+    /// Where a user looks at the declaration, `validate` names the column's
+    /// type once, beside the other columns, which it leaves alone (#1523).
+    #[test]
+    fn validating_a_table_refuses_a_user_type_reference_by_name() {
+        let mut table = Table::default();
+        for (column, spelling) in [
+            ("mood", "app.mood"),
+            ("moods", "app.mood[]"),
+            ("note", "text"),
+        ] {
+            table
+                .columns
+                .insert(column.to_owned(), pbps_model::Column::new(ty(spelling)));
+        }
+        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
+        let messages: Vec<String> = found.iter().map(ToString::to_string).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.contains("references to user-defined types are not supported yet")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("`app.mood`")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("`app.mood[]`")),
+            "{messages:?}"
+        );
+    }
+
     /// A name the emitter cannot spell is a table `validate` must not call
     /// clean. The limit is `quote_ident`'s, and it is enforced nowhere else:
     /// the server truncates instead of refusing, so a declaration that got

@@ -175,6 +175,19 @@ fn arity(ty: &ColumnType, detail: impl Into<String>) -> DialectError {
 /// Expands aliases, fills in the arguments SQL Server fills in itself, and
 /// collapses the spellings the engine collapses.
 pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
+    // A user-defined type named as `schema.name` parses (#1523), and SQL Server
+    // does not take one by name: its alias types are left out of a pull and
+    // are not declarable. Checked before the array rule so the message names
+    // `app.mood[]` whole.
+    if ty.type_ref().is_some() {
+        return Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: format!(
+                "`{ty}` names a user-defined type, and references to user-defined types are \
+                 not supported; declare a built-in type"
+            ),
+        });
+    }
     // PostgreSQL's (#1167): read as its element, it would be a scalar column
     // the declaration never asked for.
     if ty.is_array() {
@@ -726,6 +739,35 @@ mod tests {
             .to_string();
         assert!(e.contains("array type"), "{e}");
         assert!(normalize(&"int".parse().unwrap()).is_ok());
+    }
+
+    /// A user-defined type named as `schema.name` loads (#1523) and SQL Server
+    /// refuses it by name, whole: an alias type is neither declarable nor read,
+    /// and an array of one is the reference that is wrong, not only the array.
+    #[test]
+    fn a_user_type_reference_is_refused_by_name() {
+        for (declared, named) in [
+            ("dbo.Phone", "dbo.phone"),
+            ("\"Dbo\".\"Phone\"", "\"Dbo\".\"Phone\""),
+            ("app.mood[]", "app.mood[]"),
+            ("sys.sysname", "sys.sysname"),
+        ] {
+            let e = normalize(&ty(declared)).expect_err(declared).to_string();
+            assert!(e.contains(&format!("`{named}`")), "{e}");
+            assert!(
+                e.contains("references to user-defined types are not supported"),
+                "{e}"
+            );
+            assert!(
+                !e.contains("has no type") && !e.contains("array type"),
+                "{e}"
+            );
+        }
+        // Negative: a built-in still normalizes, and a bare unknown name is the
+        // catalogue's refusal and not the reference one.
+        assert!(normalize(&ty("nvarchar(10)")).is_ok());
+        let e = normalize(&ty("phone")).expect_err("not a type").to_string();
+        assert!(e.contains("has no type"), "{e}");
     }
 
     include!("../tests/support/estimate_types.rs");

@@ -240,6 +240,14 @@ indexes:
   between a scalar and an array, is refused. So is `data:` on a table with an
   array column, and so is an array type on SQL Server. User-defined element
   types are #1523 (DEC-1167.1).
+- **A user-defined type is named `schema.name`**, each part optionally in double
+  quotes (`"App"."Mood"`, which `fmt` writes in single quotes), optionally
+  followed by `[]`. It is always qualified and takes no arguments. An unquoted
+  part is folded to lowercase and a quoted one is kept, so `APP.Mood` is
+  `app.mood` and `"App"."Mood"` is another type. A part over 63 bytes, a type
+  name starting with `_`, a temporary schema, `U&"…"` and a name of three
+  parts are refused by the loader. Both dialects still refuse the reference by
+  name until the references are admitted (#1523).
 - **`deprecated` needs only a reason**; the date comes from git and is not written
   by hand.
 - **`collation` on a SQL Server column names an explicit collation**; absent

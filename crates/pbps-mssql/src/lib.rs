@@ -625,6 +625,31 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// A routine may take an alias type by its schema-qualified name, and its
+    /// argument comes back as written. Since #1523 that name parses as a type
+    /// reference, which the column normalizer refuses; the routine argument is
+    /// not a column, so the default hook must not hand it to one.
+    #[test]
+    fn a_routine_argument_naming_an_alias_type_is_left_as_it_is() {
+        for spelling in ["dbo.phone", "app.mood", "dbo.phone[]"] {
+            let arg: pbps_model::RoutineArg = spelling.parse().unwrap();
+            assert_eq!(
+                Mssql.normalize_routine_arg(&arg).unwrap(),
+                arg,
+                "{spelling}"
+            );
+        }
+        // Negative: a column type is still spelled the way the catalog does,
+        // and one the catalogue lacks is still refused.
+        let arg: pbps_model::RoutineArg = "INTEGER".parse().unwrap();
+        assert_eq!(Mssql.normalize_routine_arg(&arg).unwrap().as_str(), "int");
+        assert!(
+            Mssql
+                .normalize_routine_arg(&"jsonb".parse().unwrap())
+                .is_err()
+        );
+    }
+
     fn ty(s: &str) -> ColumnType {
         s.parse().unwrap()
     }

@@ -101,7 +101,7 @@ pub fn render_partitioned(
                 }
             }
             None => {
-                let _ = writeln!(s, "    type: {}", scalar(&c.ty.to_string()));
+                let _ = writeln!(s, "    type: {}", type_scalar(&c.ty));
                 if !c.nullable {
                     s.push_str("    nullable: false\n");
                 }
@@ -557,6 +557,28 @@ fn scalar(s: &str) -> String {
         quoted(s)
     } else {
         s.to_owned()
+    }
+}
+
+/// A column's type as a YAML scalar. A type reference may hold double quotes
+/// (`"App"."Mood"`, #1523), which `scalar` would escape one by one; single
+/// quotes keep the name as it is written, and YAML has nothing to escape inside
+/// them but the single quote itself. A name with a character that cannot sit
+/// raw on one line takes `scalar`'s escapes instead. A type with no `"` is
+/// `scalar`'s, exactly as before.
+fn type_scalar(ty: &pbps_model::ColumnType) -> String {
+    let text = ty.to_string();
+    let raw_ok = !text.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{2028}' | '\u{2029}' | '\u{feff}' | '\u{fffe}' | '\u{ffff}'
+            )
+    });
+    if text.contains('"') && raw_ok {
+        format!("'{}'", text.replace('\'', "''"))
+    } else {
+        scalar(&text)
     }
 }
 
@@ -2027,6 +2049,42 @@ indexes:
             assert!(
                 crate::load_table_str(Path::new("t.yml"), &bad).is_err(),
                 "{spelling} should not load"
+            );
+        }
+    }
+
+    /// A type reference with quoted parts needs a YAML scalar that reads back
+    /// as the same reference, and `fmt` writes one that is single-quoted so the
+    /// name stays readable (#1523). The same reference written another way is
+    /// rewritten to the canonical spelling, and the output does not move again.
+    #[test]
+    fn a_quoted_type_reference_is_written_as_a_scalar_that_reads_back() {
+        let yaml = "table: app.t\ncolumns:\n  a:\n    type: '\"App\".\"Mood\"'\n  b:\n    type: '\"App\".\"Mood\"[]'\n  c:\n    type: APP.Mood\n  d:\n    type: '\"it''s\".\"a\"\"b\"'\n  e:\n    type: \"app.\\\"x\\ty\\\"\"\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert_eq!(t.table.columns["a"].ty.to_string(), "\"App\".\"Mood\"");
+        assert!(t.table.columns["b"].ty.is_array());
+        assert_eq!(t.table.columns["c"].ty.to_string(), "app.mood");
+        assert_eq!(
+            t.table.columns["d"]
+                .ty
+                .type_ref()
+                .map(|r| (r.schema(), r.name())),
+            Some(("it's", "a\"b"))
+        );
+        let out = render(&t.name, &t.table, &t.intents, t.strategy.as_ref());
+        assert!(out.contains("type: '\"App\".\"Mood\"'"), "{out}");
+        assert!(out.contains("type: '\"App\".\"Mood\"[]'"), "{out}");
+        assert!(out.contains("type: app.mood\n"), "{out}");
+        assert!(out.contains("type: '\"it''s\".\"a\"\"b\"'"), "{out}");
+        // A character that cannot sit raw on one line keeps the escapes.
+        assert!(out.contains("type: \"app.\\\"x\\ty\\\"\""), "{out}");
+        // Negative: a reference no dialect could hold does not load.
+        for bad in ["a.b.c", "app.", "app.mood(3)", "app.\"\""] {
+            let yaml = format!("table: app.t\ncolumns:\n  a:\n    type: '{bad}'\n");
+            assert!(
+                crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),
+                "{bad} should not load"
             );
         }
     }

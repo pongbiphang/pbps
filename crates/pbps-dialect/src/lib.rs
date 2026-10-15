@@ -2547,6 +2547,13 @@ pub trait Dialect {
         let Ok(ty) = arg.as_str().parse::<ColumnType>() else {
             return Ok(arg.clone());
         };
+        // A schema-qualified name reads as a type reference since #1523, which
+        // a column normalizer refuses. A routine argument naming a user-defined
+        // type was never a column type, and comes back unchanged, as it did
+        // when it did not parse at all.
+        if ty.type_ref().is_some() {
+            return Ok(arg.clone());
+        }
         let spelled = self.normalize_type(&ty)?;
         spelled
             .to_string()

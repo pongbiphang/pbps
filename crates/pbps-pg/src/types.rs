@@ -317,6 +317,19 @@ pub fn refuse_serial(ty: &ColumnType, column: Option<&str>) -> Option<DialectErr
 /// Expands aliases, fills in the arguments PostgreSQL fills in itself, and
 /// resolves the spellings the engine resolves.
 pub fn normalize(ty: &ColumnType) -> Result<ColumnType, DialectError> {
+    // A user-defined type named as `schema.name` parses (#1523) and is refused
+    // here, before the array rule so that the message names `app.mood[]` and
+    // not its element. The catalogue is closed, and a reference needs what a
+    // catalogue cannot give it: the kind of the type, read from the database.
+    if ty.type_ref().is_some() {
+        return Err(DialectError::Invalid {
+            dialect: DIALECT,
+            message: format!(
+                "`{ty}` names a user-defined type, and references to user-defined types are \
+                 not supported yet; declare a type from the catalogue"
+            ),
+        });
+    }
     // An array is its element, normalized, with the marker kept (#1167): the
     // engine reads every array back as its element's spelling and `[]`.
     if ty.is_array() {
