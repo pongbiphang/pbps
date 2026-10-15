@@ -401,9 +401,8 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
     let mut current = observed.desired.clone().unwrap();
     current.managed_inputs = BTreeSet::from([Surface::Table(old)]);
     observed.current = Some(current);
-    let edges = graph::constraints(
+    let edges = graph::constraints_of_logical(
         &changes,
-        changes.changes.len(),
         &[observed],
         &Default::default(),
         crate::Side {
@@ -1903,6 +1902,285 @@ mod generated_surface_coverage {
         assert!(away < into, "{steps:?}");
         assert!(away < restore, "{steps:?}");
         ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// An ordinary step spelled ahead of a rename chain belongs to the table
+    /// holding its name there, not to the one holding it once the plan has
+    /// run. The differ spells its removals after the renames today, so the
+    /// plan is built by hand: drop app.b's check, then app.b to app.c and
+    /// app.a to app.b. Read by the final name, the drop would belong to the
+    /// old app.a, follow its rename into app.b and hit it (#1871).
+    #[test]
+    fn an_ordinary_removal_ahead_of_a_rename_chain_belongs_to_the_table_there() {
+        let [a, b, c] =
+            ["app.a", "app.b", "app.c"].map(|n| n.parse::<pbps_model::TableName>().unwrap());
+        let mut checked = table(None);
+        checked.checks.insert(
+            "k".into(),
+            pbps_model::CheckConstraint {
+                expression: "a > 0".into(),
+            },
+        );
+        let mut base = Schema::default();
+        base.tables.insert(a.clone(), table(None));
+        base.tables.insert(b.clone(), checked);
+        let mut desired = Schema::default();
+        desired.tables.insert(b.clone(), table(None));
+        desired.tables.insert(c.clone(), table(None));
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        after_ids.rename_table(&b, &c);
+        after_ids.rename_table(&a, &b);
+        let rename = |from: &pbps_model::TableName, to: &pbps_model::TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: before_ids.table_uid(from).unwrap().clone(),
+                from: from.clone(),
+                to: to.clone(),
+                defaults: Vec::new(),
+            })
+        };
+        let changes = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::DropCheck {
+                    table: b.clone(),
+                    name: "k".into(),
+                }),
+                rename(&b, &c),
+                rename(&a, &b),
+            ],
+        };
+        let edges = graph::constraints_of_logical(
+            &changes,
+            &[],
+            &Default::default(),
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+        );
+        let between = |before, after| edges.iter().any(|e| e.before == before && e.after == after);
+        assert!(
+            between(0, 1),
+            "the drop goes before its table's rename: {edges:?}"
+        );
+        // Negative: it does not wait for the other table's rename into app.b.
+        assert!(!between(2, 0), "{edges:?}");
+        let ordered = order(changes, edges).unwrap();
+        assert!(matches!(
+            ordered.changes.changes[0].change,
+            Change::DropCheck { .. }
+        ));
+    }
+
+    /// A rebuild of the table that moves into a reused name: app.a's check
+    /// rebinds while app.b goes to app.c and app.a to app.b. Its restoration
+    /// is spelled app.b and belongs to the table holding that name once the
+    /// plan has run, so it follows app.a's rename into it. Read by the base
+    /// name, app.b would be the other table, and the restoration could run
+    /// before the name is the right table's (#1871).
+    #[test]
+    fn a_restoration_into_a_reused_name_follows_the_rename_into_it() {
+        let (id, module) = routine();
+        let [a, b, c] =
+            ["app.a", "app.b", "app.c"].map(|n| n.parse::<pbps_model::TableName>().unwrap());
+        let mut checked = table(None);
+        checked.checks.insert(
+            "k".into(),
+            pbps_model::CheckConstraint {
+                expression: "app.f(a) > 0".into(),
+            },
+        );
+        let mut base = Schema::default();
+        base.modules.insert(id.clone(), module);
+        base.tables.insert(a.clone(), checked.clone());
+        base.tables.insert(b.clone(), table(None));
+        let mut desired = Schema {
+            modules: base.modules.clone(),
+            ..Default::default()
+        };
+        desired.tables.insert(b.clone(), checked);
+        desired.tables.insert(c.clone(), table(None));
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        after_ids.rename_table(&b, &c);
+        after_ids.rename_table(&a, &b);
+        let function = Surface::Module(id);
+        let check = |table: &pbps_model::TableName| Surface::Check {
+            table: table.clone(),
+            name: "k".into(),
+        };
+        let constraint = |binds: &str| {
+            Some(bound(
+                "pg_constraint",
+                "app.x.k",
+                std::slice::from_ref(&function),
+                binds,
+            ))
+        };
+        let observations = [
+            SurfaceResolution {
+                surface: check(&a),
+                current: constraint("f"),
+                desired: None,
+            },
+            SurfaceResolution {
+                surface: check(&b),
+                current: None,
+                desired: constraint("f_exact"),
+            },
+            SurfaceResolution {
+                surface: function.clone(),
+                current: Some(bound("pg_proc", "app.f", &[], "int4in")),
+                desired: Some(bound("pg_proc", "app.f", &[], "int4in")),
+            },
+        ];
+        let ordered = super::plan(
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Hints::default(),
+            &observations,
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let steps = &ordered.changes.changes;
+        let position = |f: &dyn Fn(&Change) -> bool| {
+            steps
+                .iter()
+                .position(|p| f(&p.change))
+                .unwrap_or_else(|| panic!("missing from {steps:?}"))
+        };
+        let teardown = position(&|ch| matches!(ch, Change::DropCheck { table, .. } if table == &a));
+        let away = position(&|ch| matches!(ch, Change::RenameTable { from, .. } if from == &b));
+        let into = position(&|ch| matches!(ch, Change::RenameTable { to, .. } if to == &b));
+        let restore = position(&|ch| matches!(ch, Change::AddCheck { table, .. } if table == &b));
+        assert!(teardown < into, "{steps:?}");
+        assert!(away < into, "{steps:?}");
+        assert!(into < restore, "{steps:?}");
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    /// Owners are read from the ordinary plan's own names, so a plan whose
+    /// names cannot be followed is refused, not ordered by guessed owners.
+    /// Final identities the index cannot read stand in for such a plan
+    /// (#1871).
+    #[test]
+    fn a_plan_whose_names_cannot_be_followed_is_refused() {
+        let (base, desired, before_ids, after_ids, observations) = chained_check();
+        let plan = |after_ids: &IdsFile| {
+            super::plan(
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: after_ids,
+                },
+                &Hints::default(),
+                &observations,
+                &pbps_dialect::MinimalDialect,
+            )
+        };
+        let mut unreadable = after_ids.clone();
+        unreadable.version += 1;
+        match plan(&unreadable) {
+            Err(super::Error::Names(reason)) => {
+                assert!(reason.contains("final identities"), "{reason}")
+            }
+            other => panic!("planned: {:?}", other.map(|o| o.changes)),
+        }
+        // Negative: the same plan with readable identities is ordered.
+        assert!(plan(&after_ids).is_ok());
+    }
+
+    /// The edge behind that order, which the order alone does not show: the
+    /// restoration waits for the rename into its name, and not for the old
+    /// holder of the name, which it does not belong to (#1871).
+    #[test]
+    fn a_restoration_belongs_to_the_final_holder_of_its_name() {
+        use pbps_model::operation::{Origin, PlanOwners, Source};
+        let [a, b, c] =
+            ["app.a", "app.b", "app.c"].map(|n| n.parse::<pbps_model::TableName>().unwrap());
+        let mut checked = table(None);
+        checked.checks.insert(
+            "k".into(),
+            pbps_model::CheckConstraint {
+                expression: "a > 0".into(),
+            },
+        );
+        let mut base = Schema::default();
+        base.tables.insert(a.clone(), checked.clone());
+        base.tables.insert(b.clone(), table(None));
+        let mut desired = Schema::default();
+        desired.tables.insert(b.clone(), checked);
+        desired.tables.insert(c.clone(), table(None));
+        let before_ids = ids(&base, &IdsFile::default());
+        let mut after_ids = before_ids.clone();
+        after_ids.rename_table(&b, &c);
+        after_ids.rename_table(&a, &b);
+        let rename = |from: &pbps_model::TableName, to: &pbps_model::TableName| {
+            PlannedChange::new(Change::RenameTable {
+                uid: before_ids.table_uid(from).unwrap().clone(),
+                from: from.clone(),
+                to: to.clone(),
+                defaults: Vec::new(),
+            })
+        };
+        let logical = ChangeSet {
+            changes: vec![rename(&b, &c), rename(&a, &b)],
+        };
+        let mut steps = logical.clone();
+        steps.changes.push(PlannedChange::new(Change::AddCheck {
+            table: b.clone(),
+            name: "k".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: "a > 0".into(),
+            },
+        }));
+        let rebinding = Source::Rebinding(Surface::Check {
+            table: b.clone(),
+            name: "k".into(),
+        });
+        let origins = [
+            Origin::Whole(0),
+            Origin::Whole(1),
+            Origin::Restoration(rebinding),
+        ];
+        let owners = PlanOwners::new(
+            pbps_model::plan_names::PlanNames::of(&logical.changes, &after_ids).unwrap(),
+            &before_ids,
+            &after_ids,
+        );
+        let edges = graph::constraints(
+            &steps,
+            logical.changes.len(),
+            &origins,
+            &owners,
+            &[],
+            &Default::default(),
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+        );
+        let between = |before, after| edges.iter().any(|e| e.before == before && e.after == after);
+        assert!(between(1, 2), "after the rename into app.b: {edges:?}");
+        // Negative: the old app.b's rename away is not its table's.
+        assert!(!between(0, 2), "{edges:?}");
     }
 
     /// The rebuild appended in that chain spells its teardown by the base
@@ -3780,14 +4058,7 @@ fn a_parents_new_index_precedes_its_partitions_own_under_the_resolver() {
         schema: &desired,
         ids: &ids,
     };
-    let edges = graph::constraints(
-        &changes,
-        changes.changes.len(),
-        &[],
-        &Default::default(),
-        side,
-        side,
-    );
+    let edges = graph::constraints_of_logical(&changes, &[], &Default::default(), side, side);
     assert!(
         edges
             .iter()

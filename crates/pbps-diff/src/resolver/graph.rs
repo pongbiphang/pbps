@@ -1,6 +1,7 @@
+use pbps_model::operation::{Origin, OwnerError, Owners};
 use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart, PartEffect};
 use pbps_model::resolver::{OrderEdge, OrderReason, Surface, SurfaceResolution};
-use pbps_model::{Change, ChangeSet, GrantTarget, TableName, ValueSource};
+use pbps_model::{Change, ChangeSet, GrantTarget, TableName, Uid, ValueSource};
 use std::collections::BTreeSet;
 
 // Model facts classify every Change kind. This consumer selects the binding
@@ -165,10 +166,38 @@ fn expression(c: &Change) -> Option<bool> {
     }
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
+/// [`constraints`] over a plan that is its own logical plan, each step
+/// whole: the shape a test builds by hand.
+#[cfg(test)]
+pub(super) fn constraints_of_logical(
+    changes: &ChangeSet,
+    observations: &[SurfaceResolution],
+    annotations: &pbps_model::ModuleDeps,
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+) -> BTreeSet<OrderEdge> {
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, desired.ids)
+        .expect("a hand-built test plan is an executable order");
+    let owners = pbps_model::operation::PlanOwners::new(names, base.ids, desired.ids);
+    let origins: Vec<_> = (0..changes.changes.len()).map(Origin::Whole).collect();
+    constraints(
+        changes,
+        changes.changes.len(),
+        &origins,
+        &owners,
+        observations,
+        annotations,
+        base,
+        desired,
+    )
+}
+
+#[allow(clippy::wildcard_enum_match_arm, clippy::too_many_arguments)]
 pub(super) fn constraints(
     changes: &ChangeSet,
     ordinary: usize,
+    origins: &[Origin],
+    table_owners: &dyn Owners,
     observations: &[SurfaceResolution],
     annotations: &pbps_model::ModuleDeps,
     base: crate::Side<'_>,
@@ -205,46 +234,36 @@ pub(super) fn constraints(
             surfaces
         })
         .collect();
-    // The table each step changes, by recorded UID. A step of the ordinary
-    // plan spells a table as it is named where the differ placed the step:
-    // by the latest earlier rename to that name or creation under it,
-    // otherwise by the base table. A rebuild appended after it spells a
-    // teardown by the base name and a restoration by the final one.
-    // A dropped table's name taken by a renamed one is two tables
-    // (DEC-1498.1).
-    let owners: Vec<Option<&pbps_model::Uid>> = steps
+    // The table each step changes, by recorded UID, read from where the step
+    // came from: the ordinary plan's names in force at its position, a
+    // teardown's base names, a restoration's final ones (DEC-1498.1). The
+    // graph keeps no history of its own: the logical plan is ordered and
+    // indexed once, and these steps may be split, appended or reordered
+    // (#1871). A dropped table's name taken by a renamed one is two tables.
+    // A name no managed table holds there leaves the owner unknown, which
+    // keeps every edge a shared name would draw.
+    debug_assert_eq!(origins.len(), steps.len());
+    let owners: Vec<Option<Uid>> = steps
         .iter()
-        .enumerate()
-        .map(|(k, c)| match c {
+        .zip(origins)
+        .map(|(c, origin)| match c {
             Change::CreateTable { uid, .. }
             | Change::DropTable { uid, .. }
-            | Change::RenameTable { uid, .. } => Some(uid),
-            other if k >= ordinary => other.table().and_then(|t| {
-                if expression(other) == Some(false)
-                    || matches!(other, Change::AlterColumnDefault { to: None, .. })
-                {
-                    base_names.table_uid(t)
-                } else {
-                    desired_names.table_uid(t)
-                }
-            }),
-            other => other.table().and_then(|t| {
-                steps[..k]
-                    .iter()
-                    .rev()
-                    .find_map(|earlier| match earlier {
-                        Change::RenameTable { uid, to, .. } if to == t => Some(uid),
-                        Change::CreateTable { uid, name, .. } if name == t => Some(uid),
-                        _ => None,
-                    })
-                    .or_else(|| base_names.table_uid(t))
-                    .or_else(|| desired_names.table_uid(t))
-            }),
+            | Change::RenameTable { uid, .. } => Some(uid.clone()),
+            other => other
+                .table()
+                .and_then(|t| match table_owners.table(t, origin.spelling()) {
+                    Ok(uid) => Some(uid),
+                    Err(OwnerError::Unmanaged { .. } | OwnerError::Vacant { .. }) => None,
+                    Err(e @ OwnerError::Outside { .. }) => {
+                        unreachable!("a prepared step outside its logical plan: {e}")
+                    }
+                }),
         })
         .collect();
     // Same name is not enough when both UIDs are known: only a false edge
     // between two tables that share a name in turn is ever dropped.
-    let same_table = |i: usize, j: usize| match (owners[i], owners[j]) {
+    let same_table = |i: usize, j: usize| match (&owners[i], &owners[j]) {
         (Some(a), Some(b)) => a == b,
         _ => true,
     };
@@ -412,7 +431,7 @@ pub(super) fn constraints(
         }
         for (j, other) in steps.iter().enumerate() {
             if let Change::RenameColumn { from, to, .. } = other
-                && owners[j] == parent_uid
+                && owners[j].as_ref() == parent_uid
             {
                 if base_spelled && from == column {
                     edge(i, j, OrderReason::Identity);
@@ -596,7 +615,7 @@ pub(super) fn constraints(
     // and the renamed table's removal is spelled by its final name
     // (DEC-1498.1).
     let opening = super::prepare::surfaces(base.schema);
-    let owned = |i: usize, owner: Option<&pbps_model::Uid>| match (owners[i], owner) {
+    let owned = |i: usize, owner: Option<&Uid>| match (&owners[i], owner) {
         (Some(a), Some(b)) => a == b,
         _ => true,
     };
