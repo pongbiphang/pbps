@@ -3154,6 +3154,33 @@ async fn ask_about_every_spelling(
             });
         }
     }
+    for (parent, q) in crate::rows::list_collision_queries(schema)? {
+        let read = |source| crate::rows::RowsError::Read {
+            table: parent.clone(),
+            source: Box::new(source),
+        };
+        for row in &conn.query(&q.sql).await.map_err(read)? {
+            let members = crate::rows::decode_members(&parent, row)?;
+            let entries: Vec<&(TableName, String)> =
+                members.iter().filter_map(|i| q.entries.get(*i)).collect();
+            // One partition may list two spellings of one value; the engine
+            // takes that (measured on 18). Two partitions may not.
+            let Some((first, second)) = entries.first().and_then(|first| {
+                entries
+                    .iter()
+                    .find(|other| other.0 != first.0)
+                    .map(|second| (*first, *second))
+            }) else {
+                continue;
+            };
+            out.list_collisions.push(pbps_db::catalog::ListCollision {
+                parent: parent.clone(),
+                first: first.clone(),
+                second: second.clone(),
+                ty: q.ty.clone(),
+            });
+        }
+    }
     let as_declared = crate::rows::Catalogued::default();
     for (name, table) in &schema.tables {
         let at = at.get(name).unwrap_or(&as_declared);

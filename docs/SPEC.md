@@ -304,7 +304,8 @@ indexes:
   SQL NULL, and `partition_by: {hash: [a, b]}` HASH-partitioned, each
   partition `{modulus: m, remainder: r}`. Validation refuses what the engine
   does: a key of more than 32 columns, a LIST key of more than one column, a
-  value two partitions take, a bound of another strategy than its parent's,
+  value two partitions take (a connected plan asks the engine, by the key
+  type's equality), a bound of another strategy than its parent's,
   a DEFAULT under HASH, a remainder not below its modulus, a modulus above
   2147483647, a modulus that is not a factor of the next larger, and hash
   partitions that overlap. A tree's strategy never changes in a plan

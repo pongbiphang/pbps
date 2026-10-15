@@ -25308,7 +25308,7 @@ fn forced_pull_preserves_applied_column_rename_and_drop_history() {
 /// Two keys that read as one stay refused (DECISIONS 106), as do a `numeric`
 /// spelling (DECISIONS 101 outside the date and time types), a text with two
 /// readings (DEC-1756.1) and one the engine cannot read at all, and so are two
-/// partitions' list values that read as one (#1632).
+/// partitions' list values the key's type takes as one (#1632).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_date_or_time_is_taken_as_the_value_the_engine_reads() {
@@ -25440,17 +25440,19 @@ fn a_date_or_time_is_taken_as_the_value_the_engine_reads() {
     }
     assert_eq!(stored(connection), 1);
 
-    // Two list values spelt apart in two partitions, read as one value: the
-    // declared check sees two values, the engine would refuse the second
-    // partition, so the plan names the collision (#1632).
+    // Two list values in two partitions that the key's type takes as one
+    // value: validation compares text and sees two, the engine would refuse
+    // the second partition, so the connected plan names the pair by the
+    // type's own equality (#1632). A timestamp spelt two ways, and a numeric
+    // whose two spellings are each the engine's own.
     declare("2026-02-01", "2026-02-01", "1.50", "2026-02-01", "");
-    let list = |table: &str, second: &str| {
+    let list = |table: &str, ty: &str, first: &str, second: &str| {
         std::fs::write(
             d.dir.join(format!("schema/app.{table}.yml")),
             format!(
-                "table: app.{table}\ncolumns:\n  ts: {{type: timestamp without time zone, \
-                 nullable: false}}\npartition_by: {{list: [ts]}}\npartitions:\n  \
-                 {table}_a:\n    in: [\"2026-02-01\"]\n  {table}_b:\n    in: [\"{second}\"]\n"
+                "table: app.{table}\ncolumns:\n  k: {{type: {ty}, nullable: false}}\n\
+                 partition_by: {{list: [k]}}\npartitions:\n  \
+                 {table}_a:\n    in: [\"{first}\"]\n  {table}_b:\n    in: [\"{second}\"]\n"
             ),
         )
         .unwrap();
@@ -25458,15 +25460,33 @@ fn a_date_or_time_is_taken_as_the_value_the_engine_reads() {
         succeeds(d.run(&["plan"]));
         d.commit();
     };
-    // Negative: two values the engine reads apart plan as written.
-    list("m", "2026-03-01");
+    // Negative: values the engine reads apart plan as written, and one
+    // partition may list two spellings of one value.
+    list(
+        "m",
+        "timestamp without time zone",
+        "2026-02-01",
+        "2026-03-01",
+    );
+    list("o", "numeric", "1.0\", \"1.00", "2");
     succeeds(d.run(&["plan", "--db", connection]));
-    list("l", "2026-02-01 00:00:00");
+    list(
+        "l",
+        "timestamp without time zone",
+        "2026-02-01",
+        "2026-02-01 00:00:00",
+    );
+    list("n", "numeric", "1.0", "1.00");
     let o = d.run(&["plan", "--db", connection]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
-    for needle in ["collide", "both take '2026-02-01 00:00:00' of `app.l`"] {
+    for needle in [
+        "2 pair(s) of list values are one value of the partition key's type",
+        "`app.l_a` takes \"2026-02-01\" and `app.l_b` takes \"2026-02-01 00:00:00\" of `app.l`",
+        "`app.n_a` takes \"1.0\" and `app.n_b` takes \"1.00\" of `app.n`",
+    ] {
         assert!(stderr(&o).contains(needle), "{needle}: {}", stderr(&o));
     }
+    assert!(!stderr(&o).contains("app.o"), "{}", stderr(&o));
 }
 
 /// A date/time literal the engine reads two ways is refused by a connected

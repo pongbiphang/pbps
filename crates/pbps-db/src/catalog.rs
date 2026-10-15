@@ -336,6 +336,22 @@ pub struct MisspeltBound {
     pub temporal: bool,
 }
 
+/// Two LIST values declared in two partitions of one parent that the engine
+/// takes as one value of the key's type, by the type's own equality: `1.0`
+/// and `1.00` for a `numeric`, `2026-01-01` and `2026-01-01 00:00:00` for a
+/// `timestamp` (#1632). The engine refuses the second partition as
+/// overlapping the first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListCollision {
+    pub parent: TableName,
+    /// One partition and the value it declares.
+    pub first: (TableName, String),
+    /// Another partition, and its value equal to the first's.
+    pub second: (TableName, String),
+    /// The key column's type, whose equality decided it.
+    pub ty: String,
+}
+
 /// A partition's declared own default that the engine stores in the same text
 /// as its parent's, so reads back as no default of its own (#1609).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,6 +415,8 @@ pub struct Spellings {
     /// Declared bound values the engine reads back differently (#1170), with
     /// the same exception as `misspelt` (DEC-1883.1).
     pub bounds: Vec<MisspeltBound>,
+    /// LIST values of two partitions the engine takes as one (#1632).
+    pub list_collisions: Vec<ListCollision>,
     /// Partitions' own defaults the engine stores as their parents' (#1609).
     pub defaults_as_parents: Vec<DefaultAsParents>,
     /// Partitions' own defaults the engine could not be asked about, each

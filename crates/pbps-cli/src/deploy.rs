@@ -2663,29 +2663,11 @@ pub(crate) async fn refuse_misspelt(
     if found.misspelt.is_empty()
         && found.conflicts.is_empty()
         && found.bounds.is_empty()
+        && found.list_collisions.is_empty()
         && found.defaults_as_parents.is_empty()
         && found.ambiguous.is_empty()
     {
-        let read = as_read(schema, &cells, &bounds);
-        // Two list values spelt apart and read as one, such as `2026-01-01`
-        // and `2026-01-01 00:00:00` in two partitions of a timestamp key,
-        // pass the declared check and route one value twice, which the
-        // engine refuses at the second partition. The declared schema's own
-        // problems are validation's; only the reading's new ones are here
-        // (#1632).
-        let declared = pbps_dialect::check_partitions(schema);
-        let new: Vec<String> = pbps_dialect::check_partitions(&read)
-            .into_iter()
-            .filter(|p| !declared.contains(p))
-            .collect();
-        if !new.is_empty() {
-            bail!(
-                "the partition bounds, as the engine reads their date/time values, \
-                 collide:\n  {}",
-                new.join("\n  ")
-            );
-        }
-        return Ok(read);
+        return Ok(as_read(schema, &cells, &bounds));
     }
     // Two keys the engine reads as one row would insert twice and fail on
     // the second; the alias check (74) cannot see them on a table that holds
@@ -2743,6 +2725,29 @@ pub(crate) async fn refuse_misspelt(
             "{} declared value(s) would not come back as written:\n  {}\n\
              A declaration that disagrees with its own database on every plan is worse \
              than none; the engine's spelling is the one to write (DECISIONS 101, 106).",
+            lines.len(),
+            lines.join("\n  ")
+        ));
+    }
+    // Two partitions taking one value by the key type's own equality, which
+    // validation's text comparison cannot see: the engine refuses the second
+    // as overlapping the first. Its own section, because the remedy is not a
+    // spelling: both texts may be the engine's own (#1632).
+    if !found.list_collisions.is_empty() {
+        let lines: Vec<String> = found
+            .list_collisions
+            .iter()
+            .map(|c| {
+                format!(
+                    "`{}` takes {:?} and `{}` takes {:?} of `{}`",
+                    c.first.0, c.first.1, c.second.0, c.second.1, c.parent
+                )
+            })
+            .collect();
+        sections.push(format!(
+            "{} pair(s) of list values are one value of the partition key's type:\n  {}\n\
+             A value routes to one partition, so the engine refuses the second; list it in \
+             one partition only.",
             lines.len(),
             lines.join("\n  ")
         ));
