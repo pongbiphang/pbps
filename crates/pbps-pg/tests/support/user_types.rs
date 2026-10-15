@@ -570,6 +570,17 @@ async fn other_kinds_of_type_are_refused_by_name() {
             ),
             ("pg_catalog", "int4", NotAdmitted::Base { extension: None }),
             ("pg_catalog", "text", NotAdmitted::Base { extension: None }),
+            // Array category and an element type, and not an array.
+            (
+                "pg_catalog",
+                "int2vector",
+                NotAdmitted::Base { extension: None },
+            ),
+            (
+                "pg_catalog",
+                "oidvector",
+                NotAdmitted::Base { extension: None },
+            ),
             ("app", "span", NotAdmitted::Range),
             ("pg_catalog", "int4range", NotAdmitted::Range),
             ("app", "span_multirange", NotAdmitted::Multirange),
@@ -624,7 +635,7 @@ async fn other_kinds_of_type_are_refused_by_name() {
         }
         assert_eq!(
             texts.len(),
-            13,
+            15,
             "every refusal names its own kind: {texts:#?}"
         );
         // A sequence has no row type: nothing by its name is found, which is
@@ -1204,6 +1215,45 @@ async fn a_range_inside_a_type_is_pinned_with_the_type_it_ranges_over() {
                 "{name} on {label} kept its pin when the range's subtype changed"
             );
         }
+        db.drop().await;
+    }
+}
+
+/// `int2vector` is not `smallint[]`, though the catalog gives both the array
+/// category and an element type: a composite that swaps one for the other has
+/// another pin (review of #2039).
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_vector_type_is_not_an_array_of_its_element() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "vectors").await;
+        db.sql(
+            "CREATE SCHEMA app;
+             CREATE TYPE app.with_vector AS (v int2vector, o oidvector);
+             CREATE TYPE app.with_array AS (v smallint[], o oid[]);",
+        )
+        .await;
+        let vector = present(&mut db.conn, "app", "with_vector").await;
+        let array = present(&mut db.conn, "app", "with_array").await;
+        let attribute = |t: &UserType, i: usize| match &t.definition().body {
+            Body::Composite(c) => c.attributes[i].ty.clone(),
+            Body::Enum { .. } | Body::Domain(_) => panic!("{:?}", t.definition()),
+        };
+        assert!(
+            matches!(attribute(&vector, 0), Component::Other { ref name, .. } if name == "int2vector")
+                && matches!(attribute(&vector, 1), Component::Other { ref name, .. } if name == "oidvector"),
+            "{:?} on {}",
+            vector.definition(),
+            server.label
+        );
+        assert!(matches!(attribute(&array, 0), Component::Array(_)));
+        assert!(matches!(attribute(&array, 1), Component::Array(_)));
+        // Same names and positions, and the one pin is not the other's.
+        let (a, b) = (
+            without_oids(vector.definition()),
+            without_oids(array.definition()),
+        );
+        assert_ne!(a, b);
         db.drop().await;
     }
 }

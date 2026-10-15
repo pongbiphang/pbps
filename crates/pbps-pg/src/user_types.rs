@@ -675,8 +675,7 @@ const LOOKUP: &str = "
     SELECT t.oid::pg_catalog.int8 AS oid,
            t.typtype::pg_catalog.text AS typtype,
            t.typisdefined AS defined,
-           t.typcategory::pg_catalog.text AS category,
-           t.typelem::pg_catalog.int8 AS elem,
+           COALESCE((SELECT e.typarray = t.oid FROM pg_catalog.pg_type e WHERE e.oid = t.typelem), false) AS array_of,
            c.relkind::pg_catalog.text AS relkind,
            n.nspname::pg_catalog.text AS schema,
            pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS schema_usage,
@@ -726,11 +725,10 @@ async fn read_one(conn: &mut Conn, reference: &TypeRef) -> Result<TypeRead, DbEr
     let oid = need::<i64>(row, "oid")?;
     let typtype = need::<&str>(row, "typtype")?;
     let relkind = row.try_get::<&str>("relkind")?;
-    let category = need::<&str>(row, "category")?;
+    let array_of = need::<bool>(row, "array_of")?;
     if let Some(not_admitted) = classify(
         typtype,
-        category,
-        need::<i64>(row, "elem")?,
+        array_of,
         relkind,
         row.try_get::<&str>("extension")?,
     ) {
@@ -757,8 +755,7 @@ async fn read_one(conn: &mut Conn, reference: &TypeRef) -> Result<TypeRead, DbEr
 /// and not admitted.
 fn classify(
     typtype: &str,
-    category: &str,
-    elem: i64,
+    array_of: bool,
     relkind: Option<&str>,
     extension: Option<&str>,
 ) -> Option<NotAdmitted> {
@@ -775,7 +772,7 @@ fn classify(
                 typtype: "c".to_owned(),
             }),
         },
-        "b" if category == "A" && elem != 0 => Some(NotAdmitted::Array),
+        "b" if array_of => Some(NotAdmitted::Array),
         "b" => Some(NotAdmitted::Base {
             extension: extension.map(str::to_owned),
         }),
@@ -797,7 +794,10 @@ struct TypeRow {
     name: String,
     owner: Oid,
     typtype: String,
-    category: String,
+    /// Whether this is the array type of `elem` by the engine's own record
+    /// (`elem.typarray`). `typcategory` and `typelem` do not say so:
+    /// `int2vector` and `oidvector` have both and are types of their own.
+    array_of: bool,
     elem: Oid,
     base: Oid,
     typmod: i32,
@@ -809,7 +809,7 @@ struct TypeRow {
 
 impl TypeRow {
     fn is_array(&self) -> bool {
-        self.typtype == "b" && self.category == "A" && self.elem != 0
+        self.typtype == "b" && self.array_of
     }
 
     /// Whether the definition holds this type in full.
@@ -1013,7 +1013,7 @@ async fn fetch_types(conn: &mut Conn, oids: &[Oid]) -> Result<Vec<TypeRow>, DbEr
                     t.typname::pg_catalog.text AS name,
                     t.typowner::pg_catalog.int8 AS owner,
                     t.typtype::pg_catalog.text AS typtype,
-                    t.typcategory::pg_catalog.text AS category,
+                    COALESCE((SELECT e.typarray = t.oid FROM pg_catalog.pg_type e WHERE e.oid = t.typelem), false) AS array_of,
                     t.typelem::pg_catalog.int8 AS elem,
                     t.typbasetype::pg_catalog.int8 AS base,
                     t.typtypmod AS typmod,
@@ -1038,7 +1038,7 @@ async fn fetch_types(conn: &mut Conn, oids: &[Oid]) -> Result<Vec<TypeRow>, DbEr
                 name: need::<&str>(row, "name")?.to_owned(),
                 owner: need(row, "owner")?,
                 typtype: need::<&str>(row, "typtype")?.to_owned(),
-                category: need::<&str>(row, "category")?.to_owned(),
+                array_of: need(row, "array_of")?,
                 elem: need(row, "elem")?,
                 base: need(row, "base")?,
                 typmod: need(row, "typmod")?,
@@ -1705,31 +1705,37 @@ mod tests {
     }
 
     fn row_of(typtype: &str) -> Option<NotAdmitted> {
-        classify(typtype, "X", 0, None, None)
+        classify(typtype, false, None, None)
     }
 
     #[test]
     fn the_three_kinds_are_admitted_and_every_other_is_refused_by_name() {
         assert_eq!(row_of("e"), None);
         assert_eq!(row_of("d"), None);
-        assert_eq!(classify("c", "C", 0, Some("c"), None), None);
+        assert_eq!(classify("c", false, Some("c"), None), None);
         assert_eq!(row_of("r"), Some(NotAdmitted::Range));
         assert_eq!(row_of("m"), Some(NotAdmitted::Multirange));
         assert_eq!(row_of("p"), Some(NotAdmitted::Pseudo));
         assert_eq!(
-            classify("b", "S", 0, None, Some("citext")),
+            classify("b", false, None, Some("citext")),
             Some(NotAdmitted::Base {
                 extension: Some("citext".to_owned())
             })
         );
         assert_eq!(
-            classify("b", "N", 0, None, None),
+            classify("b", false, None, None),
             Some(NotAdmitted::Base { extension: None })
         );
-        assert_eq!(classify("b", "A", 23, None, None), Some(NotAdmitted::Array));
+        assert_eq!(classify("b", true, None, None), Some(NotAdmitted::Array));
+        // `int2vector` has the array category and an element type, and is not
+        // the array of it: the engine says so by `typarray` (review of #2039).
+        assert_eq!(
+            classify("b", false, None, None),
+            Some(NotAdmitted::Base { extension: None })
+        );
         for relkind in ["r", "p", "v", "m", "f"] {
             assert_eq!(
-                classify("c", "C", 0, Some(relkind), None),
+                classify("c", false, Some(relkind), None),
                 Some(NotAdmitted::RowType {
                     relkind: relkind.to_owned()
                 }),
@@ -1738,7 +1744,7 @@ mod tests {
         }
         // A composite with no relation, and a kind nobody lists, are refused.
         assert!(matches!(
-            classify("c", "C", 0, None, None),
+            classify("c", false, None, None),
             Some(NotAdmitted::Unknown { .. })
         ));
         assert!(matches!(
