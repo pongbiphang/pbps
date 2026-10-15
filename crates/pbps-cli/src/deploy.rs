@@ -6141,7 +6141,7 @@ pub fn cmd_plan_db(
             crate::engine::refuse_added_computed_calls(&mut conn, &cs, &declared).await?;
             // Last of the passes that order the plan, so the order it settles
             // from the catalog is the one checked below and saved (#1366).
-            crate::engine::order_created_object_names(
+            let object_facts = crate::engine::order_created_object_names(
                 &mut conn,
                 &mut cs,
                 &resolved.ids,
@@ -6176,7 +6176,15 @@ pub fn cmd_plan_db(
                 &hints.module_deps,
                 &cs,
                 pbps_diff::order::shadow::Stage::Final,
+                Some(
+                    &object_facts
+                        .clone()
+                        .or_else(|| name_facts.as_ref().map(crate::engine::NameFacts::slots))
+                        .unwrap_or_default(),
+                ),
             );
+            #[cfg(not(any(test, debug_assertions)))]
+            let _ = object_facts;
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
             let drops = crate::engine::check_drop_blockers(
                 &mut conn,

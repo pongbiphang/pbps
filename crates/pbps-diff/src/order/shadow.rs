@@ -168,6 +168,7 @@ pub(crate) fn observe_plan(
         changes,
         &operations,
         Stage::Differ,
+        None,
     );
 }
 
@@ -197,6 +198,7 @@ pub fn observe_scheduled(
     declared: &ModuleDeps,
     changes: &pbps_model::ChangeSet,
     stage: Stage,
+    facts: Option<&pbps_dialect::slots::CatalogFacts>,
 ) {
     use pbps_model::operation::ModuleEdits;
     let modes = if dialect.rebuilds_modules() {
@@ -213,12 +215,14 @@ pub fn observe_scheduled(
         changes,
         &operations,
         stage,
+        facts,
     );
 }
 
 /// [`observe_plan`] for operations an expansion made, in the order they run:
 /// `logical` is the plan their names are in force in.
 #[cfg(any(test, debug_assertions))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn observe(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
@@ -227,6 +231,7 @@ pub(crate) fn observe(
     logical: &pbps_model::ChangeSet,
     operations: &Operations,
     stage: Stage,
+    facts: Option<&pbps_dialect::slots::CatalogFacts>,
 ) {
     use pbps_model::operation::PlanOwners;
     use pbps_model::plan_names::PlanNames;
@@ -260,6 +265,9 @@ pub(crate) fn observe(
     let ops = operations.as_slice();
     let (violations, any) = judge(ops, &report, stage);
     lines.extend(violations);
+    let (slot_lines, slot_fail) = judge_slots(ops, &owners, before, dialect, facts);
+    lines.extend(slot_lines);
+    let any = any || slot_fail;
     if std::env::var_os("PBPS_ORDER_SHADOW").is_some() {
         let kind = |i: usize| {
             format!("{:?}", ops[i].change())
@@ -407,6 +415,93 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
         .iter()
         .any(|v| !v.starts_with("unprovided ") && !v.starts_with("connected "));
     (violations, any)
+}
+
+/// The name slots' findings as lines, and whether any fails the run
+/// (#1964, DEC-1964.2). A claim on a held name and a broken handover fail it;
+/// a comparison no fact answers is recorded as skipped, with the engine and
+/// whether the plan had the catalog's facts, and fails nothing.
+#[cfg(any(test, debug_assertions))]
+pub(crate) fn judge_slots(
+    ops: &[Operation],
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    dialect: &dyn Dialect,
+    facts: Option<&pbps_dialect::slots::CatalogFacts>,
+) -> (Vec<String>, bool) {
+    use super::slots::{SlotViolation, analyse, verify};
+    let slots = analyse(ops, owners, before, dialect);
+    let (violations, skipped) = verify(ops, &slots, dialect, facts, owners, before);
+    let name = |id: OperationId| {
+        ops.iter().find(|o| o.id() == id).map_or_else(
+            || id.to_string(),
+            |o| {
+                let mut text = format!("{id} {:?}", o.change());
+                clip(&mut text, 160);
+                text
+            },
+        )
+    };
+    let mode = if facts.is_some() {
+        "connected"
+    } else {
+        "offline"
+    };
+    let mut lines: Vec<String> = violations
+        .iter()
+        .map(|v| match v {
+            SlotViolation::Held {
+                operation,
+                slot,
+                holder,
+            } => format!(
+                "slot held {} claims {slot} held by {holder}",
+                name(*operation)
+            ),
+            SlotViolation::Contested {
+                operation,
+                slot,
+                holder,
+            } => format!(
+                "slot contested {} claims {slot} held by {holder}",
+                name(*operation)
+            ),
+            SlotViolation::IntermediateHeld {
+                operation,
+                slot,
+                holder,
+            } => format!(
+                "slot intermediate {} passes through {slot} held by {holder}",
+                name(*operation)
+            ),
+            SlotViolation::Edge {
+                before,
+                after,
+                slot,
+            } => format!(
+                "slot edge {} must precede {} because it frees {slot}",
+                name(*before),
+                name(*after)
+            ),
+        })
+        .collect();
+    let fail = lines.iter().any(|l| !l.starts_with("slot contested "));
+    for s in &skipped {
+        lines.push(format!(
+            "slot skipped {} {mode} {} claims {} beside {}",
+            dialect.name(),
+            s.operation,
+            s.claimed,
+            s.held
+        ));
+    }
+    for (id, error) in &slots.unowned {
+        lines.push(format!("slot unowned {id}: {error}"));
+    }
+    for id in &slots.unlowered {
+        lines.push(format!("slot unlowered {} {id}", dialect.name()));
+    }
+    (lines, fail)
 }
 
 /// Appends `text` to the report file, creating it.

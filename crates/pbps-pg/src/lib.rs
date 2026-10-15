@@ -1460,6 +1460,12 @@ impl Dialect for Postgres {
         false
     }
 
+    /// Identifiers are compared byte for byte, and pbps quotes every one it
+    /// writes, so two spellings are two names (#1964).
+    fn compares_names_exactly(&self) -> bool {
+        true
+    }
+
     /// The index behind an unnamed primary key, `<table>_pkey`, and the
     /// sequence behind each identity column, `<table>_<column>_seq`: the
     /// names the engine generates for what a `CREATE TABLE` implies (#465,
@@ -1762,7 +1768,8 @@ impl Dialect for Postgres {
     ///   of dropping it;
     /// - `ALTER TABLE ... SET SCHEMA` carries the table's indexes and keys
     ///   with it, so they are rewritten by it (DEC-1767.1). Owned sequences
-    ///   move too, but they have no key until name slots (#1964).
+    ///   move too; they have no key, and reach the name slots as catalog
+    ///   occupants that go with their table (DEC-1964.2).
     fn engine_effects(
         &self,
         op: &pbps_model::operation::Operation,

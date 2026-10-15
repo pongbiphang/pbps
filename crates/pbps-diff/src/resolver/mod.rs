@@ -187,6 +187,7 @@ pub fn plan_operations(
         &logical,
         &operations,
         crate::order::shadow::Stage::Differ,
+        None,
     );
     Ok(Planned {
         ordered,

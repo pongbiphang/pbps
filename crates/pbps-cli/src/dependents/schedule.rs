@@ -255,6 +255,7 @@ pub(crate) fn schedule(
         declared.module_deps,
         &cs,
         pbps_diff::order::shadow::Stage::Differ,
+        None,
     );
     Ok(Scheduled {
         changes: cs,

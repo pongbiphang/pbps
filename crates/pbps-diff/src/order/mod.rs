@@ -17,11 +17,14 @@
 pub(crate) mod compare;
 pub mod edges;
 pub mod shadow;
+pub mod slots;
 pub mod verify;
 
 pub use edges::{Baseline, Because, Checks, Edge, Graph, Source, Unmet, graph};
 pub use shadow::{Report, Shadowed, analyse};
 pub use verify::{Violation, verify};
 
+#[cfg(test)]
+mod slot_tests;
 #[cfg(test)]
 mod tests;
