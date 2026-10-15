@@ -303,8 +303,18 @@ indexes:
 - **`partition_by: [ts]` makes a PostgreSQL table RANGE-partitioned** over
   those columns, and `partitions:` declares each partition in the parent's
   file: `name: {from: [...], to: [...]}` with one value per key column, each a
-  quoted value, `MINVALUE` or `MAXVALUE`, or `name: default`. A partition in
-  another schema is named qualified. A partition is a table of its own, with
+  quoted value, `MINVALUE` or `MAXVALUE`, or `name: default`.
+  `partition_by: {list: [k]}` makes it LIST-partitioned over one column, each
+  partition `{in: [...]}`, its values the engine's text and YAML `null` for
+  SQL NULL, and `partition_by: {hash: [a, b]}` HASH-partitioned, each
+  partition `{modulus: m, remainder: r}`. Validation refuses what the engine
+  does: a key of more than 32 columns, a LIST key of more than one column, a
+  value two partitions take (a connected plan asks the engine, by the key
+  type's equality), a bound of another strategy than its parent's,
+  a DEFAULT under HASH, a remainder not below its modulus, a modulus above
+  2147483647, a modulus that is not a factor of the next larger, and hash
+  partitions that overlap. A tree's strategy never changes in a plan
+  (DEC-1632.1). A partition in another schema is named qualified. A partition is a table of its own, with
   an identity. Its columns and keys are its parent's, and so are the clones of
   its parent's checks and indexes. It may declare checks and indexes of its
   own: its entry is then a block of `from:` and `to:`, or `default: true`, with
@@ -330,8 +340,8 @@ indexes:
   partition pbps holds is dropped or detached (DEC-1533.1). `data:` beside a tree, and partitioning on SQL Server,
   are refused (DEC-1170.1). Under a standing parent a partition is added, or
   dropped with drop intent, which detaches it first and is `destructive`. A
-  range added beside a standing DEFAULT partition takes the DEFAULT's rows of
-  its range: it is made as a plain table, filled from the DEFAULT and attached,
+  range or a list added beside a standing DEFAULT partition takes the
+  DEFAULT's rows of its range or values (DEC-1632.1): it is made as a plain table, filled from the DEFAULT and attached,
   in one statement; the apply's pre-flight refuses the move while a row
   references a moved row, a delete trigger or rule on the DEFAULT would fire
   for it, or a publication would send its delete or the insert into the new table (DEC-1547.1). It also refuses any row to move unless a human allowed the
@@ -346,12 +356,13 @@ indexes:
   plan sets is followed by each partition's own (DEC-1581.1). An ordinary
   table moved into its parent's `partitions:` under its own name is attached
   and keeps its rows, `constraint` since the engine checks every row against
-  the range. The table must already hold its parent's columns, in order, and
+  its bound. The table must already hold its parent's columns, in order, and
   none of the keys or constraints a partition does not hold, or it is refused
   by name. What it keeps of its own is then brought to the declaration in the
   same plan, and its column uids leave the ids file. The apply's pre-flight
   refuses rows of the table outside the range, and DEFAULT-partition rows
-  inside it (DEC-1545.1). A standing parent's columns change as a table's
+  inside it (DEC-1545.1); outside a list's values, or a hash's remainder,
+  likewise (DEC-1632.1). A standing parent's columns change as a table's
   do: added, dropped, retyped, renamed, a default or NOT NULL changed, the
   engine recursing each into every partition, whose own defaults and NOT
   NULLs follow (DEC-1687.1). A partition's column is its parent's in the

@@ -363,7 +363,7 @@ enum Command {
         #[arg(long = "data", value_name = "TABLE")]
         data: Vec<String>,
 
-        /// Declare this range-partitioned parent's partitions external: another
+        /// Declare this partitioned parent's partitions external: another
         /// tool creates and drops them, and pbps manages the parent alone;
         /// repeatable. pg_partman's parents are found without it
         #[arg(long = "partitions-external", value_name = "TABLE")]

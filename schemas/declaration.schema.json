@@ -131,15 +131,15 @@
           "default": false
         },
         "partition_by": {
-          "description": "A PostgreSQL RANGE-partitioned parent's key columns, `[ts]`.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "string"
-          },
-          "default": null
+          "description": "A PostgreSQL partitioned parent's key columns: `[ts]` for RANGE, or\n`{list: [k]}` or `{hash: [a, b]}` (#1632).",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PartitionByDto"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "partitions": {
           "description": "The parent's partitions, by name (qualified when in another schema):\n`{from: ['2025-01-01'], to: ['2026-01-01']}`, `MINVALUE`/`MAXVALUE`\nfor an unbounded end, or `default`. Or `external`: another tool, such\nas pg_partman, creates and drops them, and pbps manages the parent\nalone.",
@@ -778,6 +778,75 @@
         }
       ]
     },
+    "PartitionByDto": {
+      "description": "A parent's `partition_by:` (#1632): a column list, which is RANGE, or a\nmapping naming LIST or HASH.",
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "$ref": "#/$defs/PartitionStrategyDto"
+        }
+      ]
+    },
+    "PartitionStrategyDto": {
+      "description": "`{list: [k]}` or `{hash: [a, b]}`: one of the two.",
+      "type": "object",
+      "properties": {
+        "list": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        },
+        "hash": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "list": {
+              "type": "array"
+            },
+            "hash": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "list"
+          ]
+        },
+        {
+          "properties": {
+            "hash": {
+              "type": "array"
+            },
+            "list": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "hash"
+          ]
+        }
+      ]
+    },
     "PartitionsDto": {
       "description": "A parent's `partitions:`: its partitions by name, or `external` (#1533).",
       "anyOf": [
@@ -794,7 +863,7 @@
       ]
     },
     "PartitionDto": {
-      "description": "A RANGE partition: `default`, or a mapping of its bound, `{from: [...], to:\n[...]}` with one value per key column or `default: true`, and what it has of\nits own beside its parent's: `checks:` and `indexes:`, written as a table's\n(#1577).",
+      "description": "A partition: `default`, or a mapping of its bound, `{from: [...], to:\n[...]}` with one value per key column, `{in: [...]}` (#1632), `{modulus: m,\nremainder: r}` (#1632), or `default: true`, and what it has of its own\nbeside its parent's: `checks:` and `indexes:`, written as a table's\n(#1577).",
       "anyOf": [
         {
           "description": "`default`.",
@@ -825,6 +894,36 @@
           "items": {
             "$ref": "#/$defs/BoundValueDto"
           }
+        },
+        "in": {
+          "description": "A LIST partition's values (#1632); `NULL` takes the rows whose key\nis NULL.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/ListValueDto"
+          }
+        },
+        "modulus": {
+          "description": "A HASH partition's modulus (#1632), with `remainder:`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "default": null
+        },
+        "remainder": {
+          "description": "A HASH partition's remainder (#1632), with `modulus:`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0,
+          "default": null
         },
         "default": {
           "description": "The DEFAULT partition, written as a mapping so that it can carry what\nit has of its own.",
@@ -876,6 +975,15 @@
             "to": {
               "type": "array"
             },
+            "in": {
+              "type": "null"
+            },
+            "modulus": {
+              "type": "null"
+            },
+            "remainder": {
+              "type": "null"
+            },
             "default": {
               "const": false
             }
@@ -895,10 +1003,70 @@
             },
             "to": {
               "type": "null"
+            },
+            "in": {
+              "type": "null"
+            },
+            "modulus": {
+              "type": "null"
+            },
+            "remainder": {
+              "type": "null"
             }
           },
           "required": [
             "default"
+          ]
+        },
+        {
+          "properties": {
+            "in": {
+              "type": "array"
+            },
+            "from": {
+              "type": "null"
+            },
+            "to": {
+              "type": "null"
+            },
+            "modulus": {
+              "type": "null"
+            },
+            "remainder": {
+              "type": "null"
+            },
+            "default": {
+              "const": false
+            }
+          },
+          "required": [
+            "in"
+          ]
+        },
+        {
+          "properties": {
+            "modulus": {
+              "type": "integer"
+            },
+            "remainder": {
+              "type": "integer"
+            },
+            "from": {
+              "type": "null"
+            },
+            "to": {
+              "type": "null"
+            },
+            "in": {
+              "type": "null"
+            },
+            "default": {
+              "const": false
+            }
+          },
+          "required": [
+            "modulus",
+            "remainder"
           ]
         }
       ]
@@ -912,6 +1080,24 @@
         {
           "type": "integer",
           "format": "int64"
+        }
+      ]
+    },
+    "ListValueDto": {
+      "description": "One value of a LIST partition (#1632): text, a whole number, a boolean,\nor YAML's `null`, which is SQL's `NULL`.",
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "integer",
+          "format": "int64"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
         }
       ]
     },
@@ -1288,6 +1474,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 46,
+  "x-pbps-schema-version": 47,
   "x-pbps-tool-version": "0.0.0"
 }

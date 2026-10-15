@@ -4264,6 +4264,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["id".into()],
+            strategy: Default::default(),
         });
         let p1 = TableName::new("app", "n_1");
         let partition = |column: &str| Table {
@@ -4627,6 +4628,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["v".into()],
+            strategy: Default::default(),
         });
         let mut cs = plan(vec![
             Change::CreateTable {
@@ -4934,6 +4936,7 @@ mod tests {
             t.partition_by = Some(pbps_model::PartitionBy {
                 external: false,
                 columns: vec!["k".into()],
+                strategy: Default::default(),
             });
             Change::CreateTable {
                 uid: Uid::derived(UidKind::Table, name, 0),
@@ -5812,6 +5815,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["id".into()],
+            strategy: Default::default(),
         });
         s.tables.insert(TableName::new("app", "p"), parent);
         let bound = pbps_model::PartitionBound::Range {
@@ -5935,6 +5939,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["k".into()],
+            strategy: Default::default(),
         });
         parent.checks.insert(
             "ev_ck".into(),
@@ -6007,6 +6012,7 @@ mod tests {
                 partition_by: Some(pbps_model::PartitionBy {
                     external: false,
                     columns: vec!["k".into()],
+                    strategy: Default::default(),
                 }),
                 ..Table::default()
             },
@@ -6154,6 +6160,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["k".into()],
+            strategy: Default::default(),
         });
         s.tables.insert(ev.clone(), parent);
         let partition = |own: &[(&str, &str)]| Table {
@@ -6350,6 +6357,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["n".into()],
+            strategy: Default::default(),
         });
         s.tables.insert(ev.clone(), parent.clone());
         // The baseline: `p_1` an ordinary table with the same default.
@@ -6635,6 +6643,7 @@ mod tests {
         s.tables.get_mut(&t).unwrap().partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["id".into()],
+            strategy: Default::default(),
         });
         let partition = |own: Option<&str>| Table {
             partition_of: Some(pbps_model::PartitionOf {

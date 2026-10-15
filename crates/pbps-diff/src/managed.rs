@@ -530,6 +530,7 @@ mod tests {
         live.tables.get_mut(&t("app.ev")).unwrap().partition_by = Some(pbps_model::PartitionBy {
             columns: vec!["id".into()],
             external: false,
+            strategy: Default::default(),
         });
         live.tables.insert(t("app.ev_p1"), partition_of("app.ev"));
         live.tables.insert(t("app.ev_p2"), partition_of("app.ev"));

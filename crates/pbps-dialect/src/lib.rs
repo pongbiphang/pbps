@@ -2958,14 +2958,46 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
     problems
 }
 
-/// What only the whole schema can say about RANGE partitions (#1170): a
+/// The most columns a partition key may have on a standard build.
+const PARTITION_MAX_KEYS: usize = 32;
+
+/// What only the whole schema can say about partitions (#1170, #1632): a
 /// partition's parent is a declared partitioned table, and not itself a
-/// partition (nested partitioning is not held); its bound has one datum per
-/// key column at each end; and a parent has one default partition at most,
-/// which the engine also enforces.
+/// partition (nested partitioning is not held); its bound is of its parent's
+/// strategy, a range with one datum per key column at each end; and a parent
+/// has one default partition at most. Measured on 16 and 18, the engine
+/// refuses, mid-apply, a key of more than 32 columns, a LIST key of more
+/// than one column, a DEFAULT under HASH, a LIST value two partitions both
+/// take, and hash partitions that overlap or whose moduli do not each divide
+/// the next larger one; each is named here instead (DEC-1632.1).
 pub fn check_partitions(schema: &Schema) -> Vec<String> {
     let mut problems = Vec::new();
     let mut defaults: BTreeMap<&TableName, &TableName> = BTreeMap::new();
+    let mut listed: BTreeMap<(&TableName, &pbps_model::ListDatum), &TableName> = BTreeMap::new();
+    let mut hashed: BTreeMap<&TableName, Vec<(u32, u32, &TableName)>> = BTreeMap::new();
+    for (name, table) in &schema.tables {
+        if let Some(by) = &table.partition_by
+            && by.strategy == pbps_model::PartitionStrategy::List
+            && by.columns.len() != 1
+        {
+            problems.push(format!(
+                "`{name}` is partitioned by LIST over {} columns, and a LIST key is one column",
+                by.columns.len()
+            ));
+        }
+        // The engine's PARTITION_MAX_KEYS, fixed when it is built: measured
+        // on 16 and 18, a RANGE or HASH key of 32 columns is taken and one of
+        // 33 refused ("cannot partition using more than 32 columns").
+        if let Some(by) = &table.partition_by
+            && by.columns.len() > PARTITION_MAX_KEYS
+        {
+            problems.push(format!(
+                "`{name}` is partitioned over {} columns, and PostgreSQL partitions over at \
+                 most {PARTITION_MAX_KEYS}",
+                by.columns.len()
+            ));
+        }
+    }
     for (child, table) in &schema.tables {
         let Some(of) = &table.partition_of else {
             continue;
@@ -2991,7 +3023,27 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
                 of.parent
             ));
         }
+        if let Some(strategy) = of.bound.strategy()
+            && strategy != by.strategy
+        {
+            problems.push(format!(
+                "`{child}` is bounded as a {} partition, and `{}` is partitioned by {}",
+                strategy.keyword(),
+                of.parent,
+                by.strategy.keyword()
+            ));
+            continue;
+        }
         match &of.bound {
+            pbps_model::PartitionBound::Default
+                if by.strategy == pbps_model::PartitionStrategy::Hash =>
+            {
+                problems.push(format!(
+                    "`{child}` is the default partition of `{}`, which is partitioned by HASH \
+                     and takes none",
+                    of.parent
+                ));
+            }
             pbps_model::PartitionBound::Default => {
                 if let Some(first) = defaults.insert(&of.parent, child) {
                     problems.push(format!(
@@ -3011,6 +3063,84 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
                         from.len(),
                         to.len(),
                         of.parent
+                    ));
+                }
+            }
+            pbps_model::PartitionBound::List { values } => {
+                if values.is_empty() {
+                    problems.push(format!("`{child}` is a LIST partition of no values"));
+                }
+                for value in values {
+                    if let Some(first) = listed.insert((&of.parent, value), child)
+                        && first != child
+                    {
+                        let value = match value {
+                            pbps_model::ListDatum::Null => "NULL".to_owned(),
+                            pbps_model::ListDatum::Value(v) => format!("'{v}'"),
+                        };
+                        problems.push(format!(
+                            "`{first}` and `{child}` both take {value} of `{}`, which routes a \
+                             value to one partition",
+                            of.parent
+                        ));
+                    }
+                }
+            }
+            pbps_model::PartitionBound::Hash { modulus, remainder } => {
+                if *modulus == 0 || remainder >= modulus {
+                    problems.push(format!(
+                        "`{child}` takes remainder {remainder} of modulus {modulus}: a modulus \
+                         is at least 1, and a remainder below it"
+                    ));
+                    continue;
+                }
+                // The grammar reads both as a signed int: measured on 16 and
+                // 18, a modulus of 2147483647 is taken and 2147483648 is a
+                // syntax error. A remainder is below its modulus, so the
+                // modulus is the one to bound.
+                if i32::try_from(*modulus).is_err() {
+                    problems.push(format!(
+                        "`{child}` takes modulus {modulus}, and PostgreSQL takes a modulus up \
+                         to {}",
+                        i32::MAX
+                    ));
+                    continue;
+                }
+                hashed
+                    .entry(&of.parent)
+                    .or_default()
+                    .push((*modulus, *remainder, child));
+            }
+        }
+    }
+    // Hash partitions: each modulus a factor of the next larger, and no two
+    // taking a row both would. With the smaller modulus a factor of the
+    // larger, a row with remainder r of the larger has r mod the smaller of
+    // the smaller.
+    for (parent, partitions) in &hashed {
+        let mut moduli: Vec<u32> = partitions.iter().map(|p| p.0).collect();
+        moduli.sort_unstable();
+        moduli.dedup();
+        if let Some(pair) = moduli.windows(2).find(|w| w[1] % w[0] != 0) {
+            problems.push(format!(
+                "`{parent}`'s hash partitions have moduli {} and {}: each modulus must be a \
+                 factor of the next larger one",
+                pair[0], pair[1]
+            ));
+            continue;
+        }
+        for (i, (m1, r1, a)) in partitions.iter().enumerate() {
+            for (m2, r2, b) in &partitions[i + 1..] {
+                let (small, large) = if m1 <= m2 {
+                    ((m1, r1), (m2, r2))
+                } else {
+                    ((m2, r2), (m1, r1))
+                };
+                if large.1 % small.0 == *small.1 {
+                    problems.push(format!(
+                        "`{a}` and `{b}` both take rows of `{parent}`: remainder {} of modulus \
+                         {} lies within remainder {} of modulus {}",
+                        large.1, large.0, small.1, small.0
                     ));
                 }
             }
@@ -4390,6 +4520,7 @@ mod tests {
             partition_by: Some(pbps_model::PartitionBy {
                 external: false,
                 columns: key.iter().map(|k| (*k).to_owned()).collect(),
+                strategy: Default::default(),
             }),
             ..Default::default()
         };
@@ -4437,6 +4568,7 @@ mod tests {
         middle.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["a".into()],
+            strategy: Default::default(),
         });
         nested.tables.insert("app.p3".parse().unwrap(), middle);
         nested
@@ -4472,6 +4604,137 @@ mod tests {
         }
         granted.roles.insert("reader".into(), role);
         assert!(check_partitions(&granted).is_empty());
+    }
+
+    /// LIST and HASH trees are held to what the engine takes, measured on 16
+    /// and 18 (#1632, DEC-1632.1): a LIST key of one column, values no two
+    /// partitions share, a bound of its parent's kind, no DEFAULT under HASH,
+    /// a key of at most 32 columns, a remainder below its modulus, a modulus
+    /// the engine's int takes, moduli each a factor of the next, and hash
+    /// partitions that do not overlap. A DEFAULT under LIST, NULL in one list,
+    /// and hash partitions of mixed moduli that do not overlap are accepted.
+    #[test]
+    fn list_and_hash_partitions_are_held_to_what_the_engine_takes() {
+        use pbps_model::{ListDatum as L, PartitionBound as B, PartitionStrategy as S};
+        let partitioned = |strategy: S, key: &[&str]| Table {
+            partition_by: Some(pbps_model::PartitionBy {
+                external: false,
+                columns: key.iter().map(|k| (*k).to_owned()).collect(),
+                strategy,
+            }),
+            ..Default::default()
+        };
+        let of = |parent: &str, bound: B| Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: parent.parse().unwrap(),
+                bound,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let list = |values: &[Option<&str>]| B::List {
+            values: values
+                .iter()
+                .map(|v| v.map_or(L::Null, |v| L::Value(v.into())))
+                .collect(),
+        };
+        let hash = |modulus, remainder| B::Hash { modulus, remainder };
+        // Only the key's width is asked, so one column name repeated serves.
+        const WIDE: &str = "k";
+        let schema = |tables: Vec<(&str, Table)>| {
+            let mut s = Schema::default();
+            for (name, t) in tables {
+                s.tables.insert(name.parse().unwrap(), t);
+            }
+            s
+        };
+        let ok = schema(vec![
+            ("app.l", partitioned(S::List, &["k"])),
+            ("app.l1", of("app.l", list(&[Some("a"), Some("b")]))),
+            ("app.l2", of("app.l", list(&[None, Some("c")]))),
+            ("app.ld", of("app.l", B::Default)),
+            ("app.h", partitioned(S::Hash, &["a", "b"])),
+            ("app.h0", of("app.h", hash(4, 0))),
+            ("app.h1", of("app.h", hash(2, 1))),
+            ("app.h2", of("app.h", hash(4, 2))),
+            // The widest key the engine takes.
+            ("app.w", partitioned(S::Hash, &[WIDE; 32])),
+            // The largest modulus the engine takes.
+            ("app.g", partitioned(S::Hash, &["a"])),
+            ("app.g0", of("app.g", hash(2_147_483_647, 2_147_483_646))),
+        ]);
+        assert!(
+            check_partitions(&ok).is_empty(),
+            "{:?}",
+            check_partitions(&ok)
+        );
+        let with = |extra: Vec<(&str, Table)>| {
+            let mut s = ok.clone();
+            for (name, t) in extra {
+                s.tables.insert(name.parse().unwrap(), t);
+            }
+            s
+        };
+        for (expected, schema) in [
+            (
+                "a LIST key is one column",
+                with(vec![("app.l", partitioned(S::List, &["k", "j"]))]),
+            ),
+            (
+                "both take 'b'",
+                with(vec![("app.l3", of("app.l", list(&[Some("b")])))]),
+            ),
+            (
+                "both take NULL",
+                with(vec![("app.l3", of("app.l", list(&[None])))]),
+            ),
+            (
+                "a LIST partition of no values",
+                with(vec![("app.l3", of("app.l", list(&[])))]),
+            ),
+            (
+                "bounded as a HASH partition",
+                with(vec![("app.l3", of("app.l", hash(2, 0)))]),
+            ),
+            (
+                "bounded as a LIST partition",
+                with(vec![("app.h3", of("app.h", list(&[Some("x")])))]),
+            ),
+            (
+                "partitioned by HASH and takes none",
+                with(vec![("app.hd", of("app.h", B::Default))]),
+            ),
+            (
+                "a remainder below it",
+                with(vec![("app.h3", of("app.h", hash(4, 4)))]),
+            ),
+            (
+                "each modulus must be a factor",
+                with(vec![("app.h3", of("app.h", hash(3, 2)))]),
+            ),
+            (
+                "both take rows of `app.h`",
+                with(vec![("app.h3", of("app.h", hash(8, 5)))]),
+            ),
+            (
+                "partitioned over 33 columns, and PostgreSQL partitions over at most 32",
+                with(vec![("app.w", partitioned(S::Hash, &[WIDE; 33]))]),
+            ),
+            (
+                "partitioned over 33 columns, and PostgreSQL partitions over at most 32",
+                with(vec![("app.w", partitioned(S::Range, &[WIDE; 33]))]),
+            ),
+            (
+                "PostgreSQL takes a modulus up to 2147483647",
+                with(vec![("app.g1", of("app.g", hash(2_147_483_648, 0)))]),
+            ),
+        ] {
+            let found = check_partitions(&schema);
+            assert!(
+                found.iter().any(|p| p.contains(expected)),
+                "{expected}: {found:?}"
+            );
+        }
     }
 
     /// A history table takes a name in the schema's namespace although no

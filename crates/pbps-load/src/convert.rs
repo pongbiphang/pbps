@@ -547,9 +547,36 @@ pub(crate) fn convert_for_diagnostics(
             (false, indexmap::IndexMap::new())
         }
     };
-    let partition_by = dto
-        .partition_by
-        .map(|columns| pbps_model::PartitionBy { columns, external });
+    let partition_by = dto.partition_by.and_then(|by| {
+        let (strategy, columns) = match by {
+            crate::dto::PartitionByDto::Range(columns) => {
+                (pbps_model::PartitionStrategy::Range, columns)
+            }
+            crate::dto::PartitionByDto::Strategy(crate::dto::PartitionStrategyDto {
+                list: Some(columns),
+                hash: None,
+            }) => (pbps_model::PartitionStrategy::List, columns),
+            crate::dto::PartitionByDto::Strategy(crate::dto::PartitionStrategyDto {
+                list: None,
+                hash: Some(columns),
+            }) => (pbps_model::PartitionStrategy::Hash, columns),
+            crate::dto::PartitionByDto::Strategy(_) => {
+                errs.push(LoadError::semantic(
+                    src,
+                    to_span(&dto.table.defined),
+                    "`partition_by:` is a mapping of neither or both of `list:` and `hash:`: \
+                     write one, or a column list for RANGE",
+                    "not a partitioning",
+                ));
+                return None;
+            }
+        };
+        Some(pbps_model::PartitionBy {
+            columns,
+            external,
+            strategy,
+        })
+    });
     let mut partitions = Vec::new();
     if partition_by.is_none() && external {
         errs.push(LoadError::semantic(
@@ -610,12 +637,66 @@ pub(crate) fn convert_for_diagnostics(
                     continue;
                 }
                 crate::dto::PartitionDto::Entry(e) => {
+                    let listed = |v: crate::dto::ListValueDto| match v {
+                        crate::dto::ListValueDto::Text(t) => pbps_model::ListDatum::Value(t),
+                        crate::dto::ListValueDto::Int(i) => {
+                            pbps_model::ListDatum::Value(i.to_string())
+                        }
+                        // As the engine spells a boolean key's value.
+                        crate::dto::ListValueDto::Bool(b) => {
+                            pbps_model::ListDatum::Value(b.to_string())
+                        }
+                        crate::dto::ListValueDto::Null => pbps_model::ListDatum::Null,
+                    };
+                    let other = e.values.is_some() || e.modulus.is_some() || e.remainder.is_some();
                     let bound = match (e.default, e.from, e.to) {
-                        (false, Some(from), Some(to)) => pbps_model::PartitionBound::Range {
-                            from: from.into_iter().map(datum).collect(),
-                            to: to.into_iter().map(datum).collect(),
+                        (false, Some(from), Some(to)) if !other => {
+                            pbps_model::PartitionBound::Range {
+                                from: from.into_iter().map(datum).collect(),
+                                to: to.into_iter().map(datum).collect(),
+                            }
+                        }
+                        (true, None, None) if !other => pbps_model::PartitionBound::Default,
+                        // A LIST or a HASH bound, alone (#1632).
+                        (false, None, None) if other => match (e.values, e.modulus, e.remainder) {
+                            (Some(values), None, None) => pbps_model::PartitionBound::List {
+                                values: values.into_iter().map(listed).collect(),
+                            },
+                            (None, Some(modulus), Some(remainder)) => {
+                                pbps_model::PartitionBound::Hash { modulus, remainder }
+                            }
+                            _ => {
+                                errs.push(LoadError::semantic(
+                                    src,
+                                    to_span(&dto.table.defined),
+                                    format!(
+                                        "partition `{child}` needs `in:` alone, or `modulus:` \
+                                         and `remainder:` both"
+                                    ),
+                                    "not a partition bound",
+                                ));
+                                continue;
+                            }
                         },
-                        (true, None, None) => pbps_model::PartitionBound::Default,
+                        (default, from, to) if other => {
+                            errs.push(LoadError::semantic(
+                                src,
+                                to_span(&dto.table.defined),
+                                format!(
+                                    "partition `{child}` has {} beside `in:`, `modulus:` or \
+                                     `remainder:`: give one bound",
+                                    if default {
+                                        "`default: true`"
+                                    } else if from.is_some() || to.is_some() {
+                                        "`from:` or `to:`"
+                                    } else {
+                                        "another bound"
+                                    }
+                                ),
+                                "not a partition bound",
+                            ));
+                            continue;
+                        }
                         (default, ..) => {
                             errs.push(LoadError::semantic(
                                 src,

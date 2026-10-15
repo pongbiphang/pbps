@@ -82,10 +82,10 @@ pub use rename::Renames;
 pub use role::{GrantTarget, Permission, Role};
 pub use schema::{
     BoundDatum, CheckConstraint, Clustered, Collation, Column, ComputedColumn, ForeignKey,
-    Generated, Identity, Index, IndexColumn, IndexKey, IndexMethod, OwnedSequence, PartitionBound,
-    PartitionBy, PartitionColumn, PartitionOf, PrimaryKey, ReferentialAction, ReplicaIdentity,
-    Retention, RetentionUnit, Schema, SequenceOptions, SystemTime, SystemVersioning, Table,
-    UniqueConstraint, ValueSource,
+    Generated, Identity, Index, IndexColumn, IndexKey, IndexMethod, ListDatum, OwnedSequence,
+    PartitionBound, PartitionBy, PartitionColumn, PartitionOf, PartitionStrategy, PrimaryKey,
+    ReferentialAction, ReplicaIdentity, Retention, RetentionUnit, Schema, SequenceOptions,
+    SystemTime, SystemVersioning, Table, UniqueConstraint, ValueSource,
 };
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};

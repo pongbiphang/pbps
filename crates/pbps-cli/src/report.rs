@@ -526,9 +526,9 @@ fn one_blocker(b: &Blocker) -> String {
             )
         }
         Blocker::MoveNotBesideDefault { table } => format!(
-            "  {table} is not a range partition whose parent declares a DEFAULT partition, so \
-             no rows can move into it\n\n    declare {table} as a range partition beside the \
-             DEFAULT, or drop the `move-rows` request\n"
+            "  {table} is not a range or list partition whose parent declares a DEFAULT \
+             partition, so no rows can move into it\n\n    declare {table} as a range or list \
+             partition beside the DEFAULT, or drop the `move-rows` request\n"
         ),
     }
 }
@@ -913,7 +913,9 @@ pub fn describe(c: &Change) -> String {
                         of.parent
                     )
                 }
-                pbps_model::PartitionBound::Range { from, to } => {
+                bound @ (pbps_model::PartitionBound::Range { .. }
+                | pbps_model::PartitionBound::List { .. }
+                | pbps_model::PartitionBound::Hash { .. }) => {
                     let list = |data: &[pbps_model::BoundDatum]| {
                         data.iter()
                             .map(|d| match d {
@@ -924,11 +926,30 @@ pub fn describe(c: &Change) -> String {
                             .collect::<Vec<_>>()
                             .join(", ")
                     };
+                    let rows = match bound {
+                        pbps_model::PartitionBound::Range { from, to } => {
+                            format!("from ({}) to ({})", list(from), list(to))
+                        }
+                        // LIST and HASH (#1632).
+                        pbps_model::PartitionBound::List { values } => format!(
+                            "in ({})",
+                            values
+                                .iter()
+                                .map(|v| match v {
+                                    pbps_model::ListDatum::Value(v) => format!("{v:?}"),
+                                    pbps_model::ListDatum::Null => "NULL".to_owned(),
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        pbps_model::PartitionBound::Hash { modulus, remainder } => {
+                            format!("with remainder {remainder} of modulus {modulus}")
+                        }
+                        pbps_model::PartitionBound::Default => String::new(),
+                    };
                     let made = format!(
-                        "+ create table {name}, a partition of {} for rows from ({}) to ({})",
-                        of.parent,
-                        list(from),
-                        list(to)
+                        "+ create table {name}, a partition of {} for rows {rows}",
+                        of.parent
                     );
                     // The rows it takes from the DEFAULT are the change's to
                     // say, since they leave that partition (#1547), and so

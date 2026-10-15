@@ -3483,7 +3483,7 @@ fn a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan() 
         "CREATE TABLE app.x (id integer PRIMARY KEY); \
          CREATE VIEW app.v AS SELECT 1 AS n; \
          CREATE FUNCTION app.g(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$; \
-         CREATE TABLE app.p (id integer NOT NULL) PARTITION BY LIST (id)",
+         CREATE TABLE app.p (id integer NOT NULL) PARTITION BY LIST ((id + 1))",
     );
     let table = |name: &str| {
         std::fs::write(
@@ -8145,7 +8145,7 @@ fn pull_declares_a_named_parents_partitions_external_on(server: &str, k: usize) 
         assert_ne!(code(&o), 0, "{name}: {}", stdout(&o));
         assert!(
             stderr(&o).contains(&format!(
-                "--partitions-external {name}: this database has no range-partitioned parent"
+                "--partitions-external {name}: this database has no partitioned parent"
             )),
             "{name}: {}",
             stderr(&o)
@@ -23307,7 +23307,7 @@ fn default_move_flow(server: &str, slug: &str, container: &str) {
     assert_ne!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     assert!(
         format!("{}{}", stdout(&o), stderr(&o))
-            .contains("app.ev is not a range partition whose parent declares a DEFAULT partition"),
+            .contains("app.ev is not a range or list partition whose parent declares a DEFAULT"),
         "{}{}",
         stdout(&o),
         stderr(&o)
@@ -25839,7 +25839,8 @@ fn forced_pull_preserves_applied_column_rename_and_drop_history() {
 /// again written the engine's way; `pull --data` writes the engine's spelling.
 /// Two keys that read as one stay refused (DECISIONS 106), as do a `numeric`
 /// spelling (DECISIONS 101 outside the date and time types), a text with two
-/// readings (DEC-1756.1) and one the engine cannot read at all.
+/// readings (DEC-1756.1) and one the engine cannot read at all, and so are two
+/// partitions' list values the key's type takes as one (#1632).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_date_or_time_is_taken_as_the_value_the_engine_reads() {
@@ -25970,6 +25971,54 @@ fn a_date_or_time_is_taken_as_the_value_the_engine_reads() {
         assert!(stderr(&o).contains(needle), "{needle}: {}", stderr(&o));
     }
     assert_eq!(stored(connection), 1);
+
+    // Two list values in two partitions that the key's type takes as one
+    // value: validation compares text and sees two, the engine would refuse
+    // the second partition, so the connected plan names the pair by the
+    // type's own equality (#1632). A timestamp spelt two ways, and a numeric
+    // whose two spellings are each the engine's own.
+    declare("2026-02-01", "2026-02-01", "1.50", "2026-02-01", "");
+    let list = |table: &str, ty: &str, first: &str, second: &str| {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{table}.yml")),
+            format!(
+                "table: app.{table}\ncolumns:\n  k: {{type: {ty}, nullable: false}}\n\
+                 partition_by: {{list: [k]}}\npartitions:\n  \
+                 {table}_a:\n    in: [\"{first}\"]\n  {table}_b:\n    in: [\"{second}\"]\n"
+            ),
+        )
+        .unwrap();
+        // Offline the two are two values, so the author's plan mints them.
+        succeeds(d.run(&["plan"]));
+        d.commit();
+    };
+    // Negative: values the engine reads apart plan as written, and one
+    // partition may list two spellings of one value.
+    list(
+        "m",
+        "timestamp without time zone",
+        "2026-02-01",
+        "2026-03-01",
+    );
+    list("o", "numeric", "1.0\", \"1.00", "2");
+    succeeds(d.run(&["plan", "--db", connection]));
+    list(
+        "l",
+        "timestamp without time zone",
+        "2026-02-01",
+        "2026-02-01 00:00:00",
+    );
+    list("n", "numeric", "1.0", "1.00");
+    let o = d.run(&["plan", "--db", connection]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    for needle in [
+        "2 pair(s) of list values are one value of the partition key's type",
+        "`app.l_a` takes \"2026-02-01\" and `app.l_b` takes \"2026-02-01 00:00:00\" of `app.l`",
+        "`app.n_a` takes \"1.0\" and `app.n_b` takes \"1.00\" of `app.n`",
+    ] {
+        assert!(stderr(&o).contains(needle), "{needle}: {}", stderr(&o));
+    }
+    assert!(!stderr(&o).contains("app.o"), "{}", stderr(&o));
 }
 
 /// A date/time literal the engine reads two ways is refused by a connected

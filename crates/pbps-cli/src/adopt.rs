@@ -59,8 +59,8 @@ pub(crate) async fn hand_over_external_partitions(
     for name in named {
         if !parent(&pulled.schema, name) {
             anyhow::bail!(
-                "--partitions-external {name}: this database has no range-partitioned parent by \
-                 that name that pull keeps"
+                "--partitions-external {name}: this database has no partitioned parent by that \
+                 name that pull keeps"
             );
         }
         external.insert(name.clone(), "named with --partitions-external".to_owned());
@@ -92,7 +92,7 @@ pub(crate) async fn hand_over_external_partitions(
             } else {
                 pulled.warnings.push(format!(
                     "pg_partman maintains `{}`, which this pull does not keep as a \
-                     range-partitioned parent; its partitions are not declared external",
+                     partitioned parent; its partitions are not declared external",
                     m.parent
                 ));
             }
@@ -703,6 +703,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["id".into()],
+            strategy: Default::default(),
         });
         s.tables
             .insert(TableName::new("$user", "p"), parent.clone());
@@ -743,6 +744,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["id".into()],
+            strategy: Default::default(),
         });
         s.tables
             .insert(TableName::new("app", "bad"), parent.clone());

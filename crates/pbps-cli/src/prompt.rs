@@ -364,7 +364,7 @@ fn question(b: &Blocker) -> String {
             format!("{prefix}{what} `{part}` contains a `.`")
         }
         Blocker::MoveNotBesideDefault { table } => {
-            format!("{table} is not a range partition beside a DEFAULT")
+            format!("{table} is not a range or list partition beside a DEFAULT")
         }
     }
 }

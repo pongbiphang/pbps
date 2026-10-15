@@ -2333,7 +2333,7 @@ Measured on 18.6 and 16.15:
 
 - `Table::partition_by` holds the key's columns. Only RANGE over plain columns
   is held; an expression key, a key operator class or collation, LIST and HASH
-  stay limitations.
+  stay limitations (LIST and HASH are held since DEC-1632.1).
 - A partition is an ordinary entry in the schema's tables with
   `partition_of: {parent, bound}` and nothing else. It therefore has a uid of
   its own, which #1171 needs to follow a detach or a drop, and occupancy,
@@ -5121,3 +5121,114 @@ turns `object_order`, which `order_created_object_names` runs, and
 `order_carried_moves` into proposed edges. S7 (#1959) converts
 `order_role_drops` and makes "nothing outside `pbps-diff::order` moves
 operations" the rule that closes the list.
+
+<a id="dec-1632-1"></a>
+
+**DEC-1632.1. A PostgreSQL table may be LIST- or HASH-partitioned, under the
+same rules as a RANGE tree: declared in its parent's file, read whole or not
+at all, its partitions holding only their bound and what #1577–#1580 allow
+them (#1632).**
+
+Measured on 16.15 and 18.6:
+
+- `pg_get_partkeydef` prints `LIST (k)` and `HASH (a, b)`; `partstrat` is
+  `l` and `h`.
+- `pg_get_expr(relpartbound)` prints `FOR VALUES IN (…)` with the values in
+  the order written and a repeated one dropped, `NULL` bare, a boolean bare (`true`) and every other
+  value quoted, a number included (`'-5'`, `'1.5'`); and `FOR VALUES WITH
+  (modulus 4, remainder 0)` in lower case.
+- The engine refuses a LIST key of more than one column ("cannot use "list"
+  partition strategy with more than one column"), a value two partitions
+  take ("would overlap partition"), a DEFAULT under HASH ("a
+  hash-partitioned table may not have a default partition"), and moduli of
+  which one is not a factor of the next larger ("every hash partition
+  modulus must be a factor of the next larger modulus").
+- A NULL key goes to the LIST partition listing NULL, else to the DEFAULT. A
+  HASH tree routes NULL like any value. `satisfies_hash_partition(parent,
+  m, r, cols…)` is the engine's own routing.
+- A LIST partition created beside a DEFAULT holding its values is refused
+  ("updated partition constraint for default partition … would be violated
+  by some row"), as a range is.
+
+**The model.** `PartitionBy` gains a `strategy`, RANGE by default and not
+written when RANGE, so every existing file, plan and state reads as before.
+`PartitionBound` gains `List { values }`, a set of values, each the
+engine's text or NULL, and `Hash { modulus, remainder }`. A set because
+neither order nor a repeat changes which rows a partition takes: a list
+written in another order is the same bound, and plans nothing, where a
+sequence would compare unequal and refuse the plan as a changed
+partitioning (#1632 review). The values are written and emitted in the
+set's order. In YAML, `partition_by: [ts]` stays
+RANGE, and `{list: [k]}` and `{hash: [a, b]}` name the others; a partition is
+`{in: [...]}` or `{modulus: m, remainder: r}`. A whole number or a boolean
+may be written bare, and YAML `null` is SQL NULL: `'NULL'` quoted is the
+text. Nothing else changes shape: there is no new change kind, and
+`CreateTable`, `AttachPartition` and `DetachPartition` carry the bound as
+they carry a range (#1776).
+
+**Validation** refuses what the engine refuses, above, and a bound of
+another strategy than its parent's. LIST values are compared as declared
+text: two spellings of one value are both accepted here, and the connected
+spelling check names the one the engine spells otherwise, as for a range
+(DEC-1170.1). Text equality is not the key type's, though: `1.0` and `1.00`
+for a `numeric` are each the engine's own spelling and one value, as are two
+spellings of one timestamp. So the connected spelling check also asks the
+engine to group every LIST value of a parent by `CAST(... AS type)`, the
+type's own equality, and refuses two partitions that take one value; one
+partition listing two spellings of a value is taken (measured on 18). This
+replaced a first fix that re-ran validation on the engine's spelling of
+dates and times only: that caught the timestamp and not the numeric, the
+same mechanism on another type. Hash overlap is decided exactly: two partitions overlap
+when the remainder of the larger modulus, taken by the smaller, is the
+smaller's remainder. A modulus is at most 2147483647: the grammar reads it as
+a signed int, and a larger one is a syntax error (measured on 16 and 18).
+A partition key of any strategy is at most 32 columns, the engine's
+`PARTITION_MAX_KEYS`; a range key had the same limit unchecked since
+DEC-1170.1, and one check now covers all three.
+
+**A strategy change is refused**, as a changed key or bound is: "change its
+partitioning". The engine has no statement for it.
+
+**Pull** reads the three strategies and parses the two new bound shapes; an
+unquoted word other than a number, a boolean or `NULL` leaves the tree out
+named, never guessed at.
+
+**The range-only paths.** Each either gains its LIST and HASH reading or
+refuses by name:
+- The rows a bound takes, which the pre-flight counts and the DEFAULT move
+  moves, are one predicate (`bound_predicate`): a range's as before; a
+  list's `k IS NOT NULL AND k IN (…)`, `OR k IS NULL` when it lists NULL —
+  never NULL itself, since the attach probe counts the rows `NOT` inside it;
+  a hash's through `satisfies_hash_partition`.
+- A LIST partition added beside a standing DEFAULT takes the DEFAULT's rows
+  of its values exactly as DEC-1547.1 moves a range's, under the same
+  questions and the same allowed move (DEC-1788.1). A HASH parent has no
+  DEFAULT, so the question of rows already in it is not asked of a HASH
+  partition, created or attached.
+- An attached table's rows outside a list or a hash bound are counted, a
+  NULL key among them where the list does not take NULL.
+- The engine's spelling of each LIST value, and whether a session reads it
+  two ways, are asked as a range's are, on its one key column.
+- `partitions extend`, the series reader and the runway check stay RANGE-only
+  and say so by name; the runway check answers "not applicable" for a LIST
+  or HASH parent, as it did.
+
+Plan format 41, state 25 and schema set 47 carry the strategy and the new
+bounds.
+
+**Not here.** A partition's own foreign keys and triggers stay limitations;
+#1632's second part proposes their design.
+
+Pinned by `list_and_hash_partition_trees_round_trip_and_take_rows` (live, 16
+and 18: read back, the misspelt and ambiguous value, rebuilt, routing, a LIST
+partition beside a populated DEFAULT refused without and moved with an
+allowed move, a HASH partition planned under a populated tree, list and hash
+attach counts against the engine's refusal),
+`range_partition_trees_round_trip_whole_or_not_at_all` (a LIST parent is no
+longer left out), `list_and_hash_partitions_are_held_to_what_the_engine_takes`,
+`list_and_hash_partitions_load_as_written_and_render_back`,
+`list_and_hash_trees_are_created_with_their_strategy_and_bounds`,
+`a_deparsed_bound_comes_apart_and_nothing_else_does`,
+`the_engines_reading_replaces_only_the_texts_it_was_read_for`,
+`a_parent_that_is_not_partitioned_or_is_external_or_is_a_partition_is_refused`
+and `a_partition_tree_is_created_then_gains_and_loses_partitions_only`.

@@ -1384,8 +1384,29 @@ pub fn bound_spelling_queries(
         let Some(of) = &table.partition_of else {
             continue;
         };
-        let pbps_model::PartitionBound::Range { from, to } = &of.bound else {
-            continue;
+        // A list's values are its one key column's (#1632); a hash bound
+        // and a DEFAULT declare none.
+        let declared = |i: usize| -> Vec<String> {
+            match &of.bound {
+                pbps_model::PartitionBound::Range { from, to } => [from.get(i), to.get(i)]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|d| match d {
+                        pbps_model::BoundDatum::Value(v) => Some(v.clone()),
+                        pbps_model::BoundDatum::MinValue | pbps_model::BoundDatum::MaxValue => None,
+                    })
+                    .collect(),
+                pbps_model::PartitionBound::List { values } if i == 0 => values
+                    .iter()
+                    .filter_map(|d| match d {
+                        pbps_model::ListDatum::Value(v) => Some(v.clone()),
+                        pbps_model::ListDatum::Null => None,
+                    })
+                    .collect(),
+                pbps_model::PartitionBound::List { .. }
+                | pbps_model::PartitionBound::Hash { .. }
+                | pbps_model::PartitionBound::Default => Vec::new(),
+            }
         };
         let Some(parent) = schema.tables.get(&of.parent) else {
             continue;
@@ -1397,14 +1418,7 @@ pub fn bound_spelling_queries(
             let Some(spec) = parent.columns.get(column) else {
                 continue;
             };
-            let values: Vec<String> = [from.get(i), to.get(i)]
-                .into_iter()
-                .flatten()
-                .filter_map(|d| match d {
-                    pbps_model::BoundDatum::Value(v) => Some(v.clone()),
-                    pbps_model::BoundDatum::MinValue | pbps_model::BoundDatum::MaxValue => None,
-                })
-                .collect();
+            let values = declared(i);
             if values.is_empty() {
                 continue;
             }
@@ -1442,6 +1456,113 @@ pub fn bound_spelling_queries(
         }
     }
     Ok(out)
+}
+
+/// The declared LIST values of every partition of one parent, sent to the
+/// engine to be grouped by the key's own equality (#1632).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListCollisionQuery {
+    pub ty: String,
+    /// Each partition beside one value it declares, by the index the query
+    /// returns.
+    pub entries: Vec<(TableName, String)>,
+    pub sql: String,
+}
+
+/// One query per LIST parent whose partitions declare two values or more:
+/// the groups of values the engine takes as one value of the key's type.
+///
+/// Text equality is not the engine's: `1.0` and `1.00` are two spellings
+/// the engine keeps apart and compares equal, as are two spellings of one
+/// timestamp, and validation, which compares the declared text, takes both.
+/// The engine then refuses the second partition as overlapping the first,
+/// mid-apply. Grouping by `CAST(... AS type)` asks the type's own equality,
+/// under the key's collation: a PostgreSQL column here never declares one
+/// (`no_column_collation`), so it is the database's default, which is what
+/// the cast carries too. A value the type cannot read is left out; the
+/// spelling query names it.
+pub fn list_collision_queries(
+    schema: &pbps_model::Schema,
+) -> Result<Vec<(TableName, ListCollisionQuery)>, RowsError> {
+    let mut out = Vec::new();
+    for (parent, table) in &schema.tables {
+        let Some(by) = &table.partition_by else {
+            continue;
+        };
+        let ([column], pbps_model::PartitionStrategy::List) = (by.columns.as_slice(), by.strategy)
+        else {
+            continue;
+        };
+        let Some(spec) = table.columns.get(column) else {
+            continue;
+        };
+        let entries: Vec<(TableName, String)> = schema
+            .tables
+            .iter()
+            .filter_map(|(name, t)| {
+                let of = t.partition_of.as_ref().filter(|of| of.parent == *parent)?;
+                let pbps_model::PartitionBound::List { values } = &of.bound else {
+                    return None;
+                };
+                Some(values.iter().filter_map(move |v| match v {
+                    pbps_model::ListDatum::Value(v) => Some((name.clone(), v.clone())),
+                    pbps_model::ListDatum::Null => None,
+                }))
+            })
+            .flatten()
+            .collect();
+        if entries.len() < 2 {
+            continue;
+        }
+        let ty = crate::types::normalize(&spec.ty)
+            .map_err(|e| RowsError::Unreadable {
+                table: parent.clone(),
+                why: e.to_string(),
+            })?
+            .to_string();
+        let readable = format!("pg_catalog.pg_input_is_valid(v.s, {})", value_literal(&ty));
+        let list = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (_, text))| format!("({i}, {})", value_literal(text)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // The fence for the reason `spelling_queries` has one (DECISIONS 324).
+        let sql = format!(
+            "SELECT pg_catalog.string_agg(v.i::text, ',' ORDER BY v.i) AS members\n  \
+             FROM (SELECT pbps_v.i, pbps_v.s FROM (VALUES {list}) AS pbps_v(i, s) OFFSET 0) \
+             AS v(i, s)\n \
+             WHERE {readable}\n \
+             GROUP BY CAST(v.s AS {ty})\n\
+             HAVING count(*) > 1;"
+        );
+        out.push((parent.clone(), ListCollisionQuery { ty, entries, sql }));
+    }
+    Ok(out)
+}
+
+/// Reads one row of a list collision query: the indexes of one group.
+pub fn decode_members(name: &TableName, row: &pbps_db::Row) -> Result<Vec<usize>, RowsError> {
+    let read = |source: DbError| RowsError::Read {
+        table: name.clone(),
+        source: Box::new(source),
+    };
+    let members: Option<&str> = row.try_get_at(0).map_err(read)?;
+    let Some(members) = members else {
+        return Err(read(DbError::BadRow(
+            "the list collision query returned a NULL group".to_owned(),
+        )));
+    };
+    members
+        .split(',')
+        .map(|i| {
+            i.parse().map_err(|_| {
+                read(DbError::BadRow(format!(
+                    "the list collision query returned an unreadable index {i:?}"
+                )))
+            })
+        })
+        .collect()
 }
 
 pub fn decode_spelling(
@@ -2825,5 +2946,89 @@ mod tests {
             schema.tables.insert(name(), t);
             assert!(not_checked_offline(&schema).is_empty(), "{schema:?}");
         }
+    }
+
+    /// A LIST parent whose partitions declare two values or more is asked
+    /// about every one of them at once, grouped by the key type's equality
+    /// rather than by text (#1632). A RANGE parent, a HASH parent, a LIST
+    /// parent with one value, and NULL, which validation owns, ask nothing.
+    #[test]
+    fn list_values_are_grouped_by_the_key_types_equality_across_partitions() {
+        use pbps_model::{ListDatum as L, PartitionBound as B, PartitionStrategy as S};
+        let parent = |strategy: S| {
+            let mut t = Table::default();
+            t.columns.insert(
+                "k".to_owned(),
+                Column::new(ColumnType::from_str("numeric").unwrap()),
+            );
+            t.partition_by = Some(pbps_model::PartitionBy {
+                external: false,
+                columns: vec!["k".to_owned()],
+                strategy,
+            });
+            t
+        };
+        let of = |parent: &str, bound: B| Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: parent.parse().unwrap(),
+                bound,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let list = |values: &[Option<&str>]| B::List {
+            values: values
+                .iter()
+                .map(|v| v.map_or(L::Null, |v| L::Value(v.into())))
+                .collect(),
+        };
+        let mut schema = pbps_model::Schema::default();
+        for (name, t) in [
+            ("app.l", parent(S::List)),
+            ("app.l1", of("app.l", list(&[Some("1.0"), None]))),
+            ("app.l2", of("app.l", list(&[Some("1.00")]))),
+            ("app.one", parent(S::List)),
+            ("app.one1", of("app.one", list(&[Some("1"), None]))),
+            ("app.r", parent(S::Range)),
+            (
+                "app.r1",
+                of(
+                    "app.r",
+                    B::Range {
+                        from: vec![pbps_model::BoundDatum::Value("1".into())],
+                        to: vec![pbps_model::BoundDatum::Value("2".into())],
+                    },
+                ),
+            ),
+            ("app.h", parent(S::Hash)),
+            (
+                "app.h1",
+                of(
+                    "app.h",
+                    B::Hash {
+                        modulus: 1,
+                        remainder: 0,
+                    },
+                ),
+            ),
+        ] {
+            schema.tables.insert(name.parse().unwrap(), t);
+        }
+        let queries = list_collision_queries(&schema).unwrap();
+        assert_eq!(queries.len(), 1, "{queries:#?}");
+        let (parent, q) = &queries[0];
+        assert_eq!(parent.to_string(), "app.l");
+        assert_eq!(q.ty, "numeric");
+        let entries: Vec<(String, &str)> = q
+            .entries
+            .iter()
+            .map(|(t, v)| (t.to_string(), v.as_str()))
+            .collect();
+        assert_eq!(
+            entries,
+            [("app.l1".to_owned(), "1.0"), ("app.l2".to_owned(), "1.00")]
+        );
+        assert!(q.sql.contains("GROUP BY CAST(v.s AS numeric)"), "{}", q.sql);
+        assert!(q.sql.contains("HAVING count(*) > 1"), "{}", q.sql);
     }
 }

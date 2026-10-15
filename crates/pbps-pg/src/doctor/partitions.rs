@@ -303,6 +303,14 @@ async fn lookup(conn: &mut Conn, physical: &ObjectName) -> Result<Lookup, Failur
                     )));
                 }
             },
+            // A runway is a range's end (#1632): a LIST or HASH tree has
+            // none to run out of.
+            Some(PartitionBound::List { .. } | PartitionBound::Hash { .. }) => {
+                return Err(Failure::said(format!(
+                    "partition {name} of {physical} has the bound `{text}`: the runway is read \
+                     from RANGE partitions only"
+                )));
+            }
             None => {
                 return Err(Failure::said(format!(
                     "partition {name} of {physical} has the bound `{text}`, which this reader \

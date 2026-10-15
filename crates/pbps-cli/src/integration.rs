@@ -41,7 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 46;
+pub const SCHEMA_VERSION: u32 = 47;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -60,6 +60,7 @@ pub const SCHEMA_VERSION: u32 = 46;
 // 44: `explain`'s `resolver`: a resolved plan's sealed evidence (issue #1517).
 // 45: a resolver entry's `externals:`, formerly `baseline:` (issue #2007).
 // 46: an `identity:` mapping and a `sequence:`'s `min`, `max`, `cycle`, `cache` (issue #1921).
+// 47: `partition_by:`'s `list:` and `hash:`, and a partition's `in:`, `modulus:`, `remainder:` (issue #1632).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).
@@ -947,6 +948,80 @@ mod tests {
                 valid,
                 "loader: {entry}"
             );
+        }
+    }
+
+    /// The declaration schema and the loader agree on a LIST or HASH parent
+    /// and its entries (#1632): exactly one strategy and exactly one bound,
+    /// another strategy's or bound's key absent or `null`, as serde reads it.
+    #[test]
+    fn declaration_schema_and_loader_agree_on_list_and_hash_partitions() {
+        let document = schema(SchemaKind::Declaration);
+        let validator = jsonschema::validator_for(&document).unwrap();
+        let agree = |table: serde_json::Value, valid: bool, what: &str| {
+            assert_eq!(validator.is_valid(&table), valid, "schema: {what}");
+            assert_eq!(
+                pbps_load::load_table_str(std::path::Path::new("t.yml"), &table.to_string())
+                    .is_ok(),
+                valid,
+                "loader: {what}"
+            );
+        };
+        for (by, valid) in [
+            (serde_json::json!({"list": ["ts"]}), true),
+            (serde_json::json!({"hash": ["ts"]}), true),
+            (serde_json::json!({"list": ["ts"], "hash": null}), true),
+            (serde_json::json!({"hash": ["ts"], "list": null}), true),
+            (serde_json::json!({"list": null}), false),
+            (serde_json::json!({"list": ["ts"], "hash": ["ts"]}), false),
+            (serde_json::json!({}), false),
+            (serde_json::json!({"range": ["ts"]}), false),
+        ] {
+            let table = serde_json::json!({
+                "table": "app.ev",
+                "columns": {"ts": {"type": "int", "nullable": false}},
+                "partition_by": by,
+            });
+            agree(table, valid, &by.to_string());
+        }
+        for (entry, valid) in [
+            (serde_json::json!({"in": ["a", 1, true, null]}), true),
+            (
+                serde_json::json!({"in": ["a"], "modulus": null, "remainder": null,
+                    "from": null, "to": null, "default": false}),
+                true,
+            ),
+            (serde_json::json!({"modulus": 4, "remainder": 0}), true),
+            (
+                serde_json::json!({"modulus": 4, "remainder": 0, "in": null, "default": false}),
+                true,
+            ),
+            (
+                serde_json::json!({"from": [1], "to": [2], "in": null, "modulus": null}),
+                true,
+            ),
+            (serde_json::json!({"default": true, "in": null}), true),
+            (serde_json::json!({"in": null}), false),
+            (serde_json::json!({"modulus": 4}), false),
+            (serde_json::json!({"modulus": 4, "remainder": null}), false),
+            (
+                serde_json::json!({"in": ["a"], "modulus": 4, "remainder": 0}),
+                false,
+            ),
+            (
+                serde_json::json!({"in": ["a"], "from": [1], "to": [2]}),
+                false,
+            ),
+            (serde_json::json!({"in": ["a"], "default": true}), false),
+            (serde_json::json!({"in": [1.5]}), false),
+        ] {
+            let table = serde_json::json!({
+                "table": "app.ev",
+                "columns": {"ts": {"type": "int", "nullable": false}},
+                "partition_by": {"list": ["ts"]},
+                "partitions": {"p": entry},
+            });
+            agree(table, valid, &entry.to_string());
         }
     }
 

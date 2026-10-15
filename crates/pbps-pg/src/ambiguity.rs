@@ -301,7 +301,6 @@ fn declared_literals(schema: &Schema) -> Result<Vec<Literal>, DbError> {
             });
         }
         if let Some(of) = &table.partition_of
-            && let PartitionBound::Range { from, to } = &of.bound
             && let Some(parent) = schema.tables.get(&of.parent)
             && let Some(by) = &parent.partition_by
         {
@@ -312,10 +311,28 @@ fn declared_literals(schema: &Schema) -> Result<Vec<Literal>, DbError> {
                 let Some((base, ty, array)) = sensitive(&spec.ty)? else {
                     continue;
                 };
-                for datum in [from.get(i), to.get(i)].into_iter().flatten() {
-                    let BoundDatum::Value(text) = datum else {
-                        continue;
-                    };
+                // A list's values are its one key column's (#1632).
+                let texts: Vec<&String> = match &of.bound {
+                    PartitionBound::Range { from, to } => [from.get(i), to.get(i)]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|d| match d {
+                            BoundDatum::Value(text) => Some(text),
+                            BoundDatum::MinValue | BoundDatum::MaxValue => None,
+                        })
+                        .collect(),
+                    PartitionBound::List { values } if i == 0 => values
+                        .iter()
+                        .filter_map(|d| match d {
+                            pbps_model::ListDatum::Value(text) => Some(text),
+                            pbps_model::ListDatum::Null => None,
+                        })
+                        .collect(),
+                    PartitionBound::List { .. }
+                    | PartitionBound::Hash { .. }
+                    | PartitionBound::Default => Vec::new(),
+                };
+                for text in texts {
                     out.push(Literal {
                         at: LiteralAt::Bound {
                             partition: name.clone(),

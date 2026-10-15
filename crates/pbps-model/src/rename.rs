@@ -219,6 +219,7 @@ mod tests {
             partition_by: Some(crate::PartitionBy {
                 external: false,
                 columns: vec!["ts".into()],
+                strategy: Default::default(),
             }),
             ..Default::default()
         };

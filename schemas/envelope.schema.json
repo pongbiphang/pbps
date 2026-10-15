@@ -2278,6 +2278,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 46,
+  "x-pbps-schema-version": 47,
   "x-pbps-tool-version": "0.0.0"
 }

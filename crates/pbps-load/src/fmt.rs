@@ -279,7 +279,18 @@ pub fn render_partitioned(
         s.push_str("\nunlogged: true\n");
     }
     if let Some(by) = &table.partition_by {
-        let _ = writeln!(s, "\npartition_by: {}", seq(&by.columns));
+        // RANGE as the list it always was; LIST and HASH named (#1632).
+        let _ = match by.strategy {
+            pbps_model::PartitionStrategy::Range => {
+                writeln!(s, "\npartition_by: {}", seq(&by.columns))
+            }
+            pbps_model::PartitionStrategy::List => {
+                writeln!(s, "\npartition_by: {{list: {}}}", seq(&by.columns))
+            }
+            pbps_model::PartitionStrategy::Hash => {
+                writeln!(s, "\npartition_by: {{hash: {}}}", seq(&by.columns))
+            }
+        };
         // Another tool's partitions are not listed (#1533): a caller handing
         // some over with the setting has two sources of truth, and the
         // setting wins, as the loader reads it.
@@ -305,6 +316,15 @@ pub fn render_partitioned(
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
+                let values = |d: &std::collections::BTreeSet<pbps_model::ListDatum>| {
+                    d.iter()
+                        .map(|v| match v {
+                            pbps_model::ListDatum::Value(text) => bound_value(text),
+                            pbps_model::ListDatum::Null => "NULL".to_owned(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
                 let bound = t.partition_of.as_ref().map(|p| &p.bound);
                 let own_columns = t.partition_of.as_ref().map(|p| &p.columns);
                 // On one line while the partition is its bound alone; a block
@@ -320,6 +340,12 @@ pub fn render_partitioned(
                         Some(pbps_model::PartitionBound::Range { from, to }) => {
                             format!("{{from: [{}], to: [{}]}}", list(from), list(to))
                         }
+                        Some(pbps_model::PartitionBound::List { values: v }) => {
+                            format!("{{in: [{}]}}", values(v))
+                        }
+                        Some(pbps_model::PartitionBound::Hash { modulus, remainder }) => {
+                            format!("{{modulus: {modulus}, remainder: {remainder}}}")
+                        }
                         Some(pbps_model::PartitionBound::Default) | None => "default".to_owned(),
                     };
                     let _ = writeln!(s, "  {}: {bound}", scalar(&label));
@@ -329,6 +355,13 @@ pub fn render_partitioned(
                         Some(pbps_model::PartitionBound::Range { from, to }) => {
                             let _ =
                                 writeln!(s, "    from: [{}]\n    to: [{}]", list(from), list(to));
+                        }
+                        Some(pbps_model::PartitionBound::List { values: v }) => {
+                            let _ = writeln!(s, "    in: [{}]", values(v));
+                        }
+                        Some(pbps_model::PartitionBound::Hash { modulus, remainder }) => {
+                            let _ =
+                                writeln!(s, "    modulus: {modulus}\n    remainder: {remainder}");
                         }
                         Some(pbps_model::PartitionBound::Default) | None => {
                             s.push_str("    default: true\n");
@@ -2007,6 +2040,7 @@ indexes:
                 partition_by: Some(pbps_model::PartitionBy {
                     external: false,
                     columns: vec!["a".to_owned()],
+                    strategy: Default::default(),
                 }),
                 ..crate::load_table_str(
                     Path::new("t.yml"),
@@ -2054,6 +2088,119 @@ indexes:
         assert!(!render(&t.name, &t.table, &[], None).contains("partition"));
     }
 
+    /// A LIST or HASH parent (#1632) is `partition_by: {list: [..]}` or
+    /// `{hash: [..]}`, its partitions `{in: [..]}` and `{modulus, remainder}`;
+    /// each loads as written and renders back as itself. YAML `null` is SQL
+    /// NULL, a quoted `'NULL'` the text; a whole number or a boolean may be
+    /// written bare and is the engine's text either way.
+    #[test]
+    fn list_and_hash_partitions_load_as_written_and_render_back() {
+        use pbps_model::{ListDatum as L, PartitionBound as B, PartitionStrategy as S};
+        let yaml = "table: app.l\ncolumns:\n  k: {type: text}\n\npartition_by: {list: [k]}\n\npartitions:\n  l_ab: {in: [a, \"it's\"]}\n  l_null: {in: [NULL, \"NULL\"]}\n  l_rest: default\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert_eq!(
+            t.table.partition_by.as_ref().map(|p| p.strategy),
+            Some(S::List)
+        );
+        let bound = |i: usize| {
+            t.partitions[i]
+                .1
+                .partition_of
+                .as_ref()
+                .map(|p| p.bound.clone())
+        };
+        let v = |s: &str| L::Value(s.to_owned());
+        assert_eq!(
+            bound(0),
+            Some(B::List {
+                values: vec![v("a"), v("it's")].into_iter().collect()
+            })
+        );
+        assert_eq!(
+            bound(1),
+            Some(B::List {
+                values: vec![L::Null, v("NULL")].into_iter().collect()
+            })
+        );
+        assert_eq!(bound(2), Some(B::Default));
+
+        let yaml = "table: app.h\ncolumns:\n  a: {type: int}\n  b: {type: text}\n\npartition_by: {hash: [a, b]}\n\npartitions:\n  h0: {modulus: 2, remainder: 0}\n  h1: {modulus: 2, remainder: 1}\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        assert_eq!(
+            t.table.partition_by.as_ref().map(|p| p.strategy),
+            Some(S::Hash)
+        );
+        assert_eq!(
+            t.partitions[1]
+                .1
+                .partition_of
+                .as_ref()
+                .map(|p| p.bound.clone()),
+            Some(B::Hash {
+                modulus: 2,
+                remainder: 1
+            })
+        );
+
+        // The values are a set: written in another order, or with one
+        // repeated, the bound is the same one and renders the same, so a
+        // reordered list plans nothing (#1632 review).
+        let load = |values: &str| {
+            crate::load_table_str(
+                Path::new("t.yml"),
+                &format!(
+                    "table: app.l\ncolumns:\n  k: {{type: text}}\npartition_by: {{list: [k]}}\npartitions:\n  l1: {{in: [{values}]}}\n"
+                ),
+            )
+            .unwrap()
+        };
+        let (written, reordered) = (load("a, b"), load("b, a, b"));
+        assert_eq!(written.partitions, reordered.partitions);
+        let render_of = |t: &crate::LoadedTable| {
+            let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
+            render_partitioned(&t.name, &t.table, &partitions, &[], None)
+        };
+        assert_eq!(render_of(&written), render_of(&reordered));
+        // Negative: another value is another bound.
+        assert_ne!(written.partitions, load("a, c").partitions);
+
+        // Bare numbers and booleans are their text.
+        let t = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: app.n\ncolumns:\n  a: {type: int}\npartition_by: {list: [a]}\npartitions:\n  n1: {in: [-5, 7, true]}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            t.partitions[0]
+                .1
+                .partition_of
+                .as_ref()
+                .map(|p| p.bound.clone()),
+            Some(B::List {
+                values: vec![v("-5"), v("7"), v("true")].into_iter().collect()
+            })
+        );
+
+        // Negative: a decimal whose YAML reading is not the text, a hash entry
+        // missing half or mixed with a list's, and an unknown strategy. A
+        // bound of the other kind loads and is `check_partitions`'s to refuse.
+        for block in [
+            "partition_by: {list: [a]}\npartitions:\n  p1: {in: [1.5]}\n",
+            "partition_by: {hash: [a]}\npartitions:\n  p1: {modulus: 2}\n",
+            "partition_by: {hash: [a]}\npartitions:\n  p1: {modulus: 2, remainder: 0, in: ['1']}\n",
+            "partition_by: {range: [a]}\n",
+            "partition_by: {list: [a], hash: [a]}\n",
+        ] {
+            let yaml = format!("table: app.t\ncolumns:\n  a: {{type: int}}\n{block}");
+            assert!(
+                crate::load_table_str(Path::new("t.yml"), &yaml).is_err(),
+                "{block} should not load"
+            );
+        }
+    }
+
     /// `partitions: external` (#1533) declares the parent alone: no
     /// partition is loaded, the key says so, and it renders back as written.
     /// Any other word, and the setting without a key, are refused by name.
@@ -2068,6 +2215,7 @@ indexes:
             Some(pbps_model::PartitionBy {
                 columns: vec!["ts".into()],
                 external: true,
+                strategy: Default::default(),
             })
         );
         let out = render(&t.name, &t.table, &[], None);

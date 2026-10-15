@@ -1880,6 +1880,7 @@ mod tests {
         table.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: key.iter().map(|c| (*c).to_owned()).collect(),
+            strategy: Default::default(),
         });
         table
     }
@@ -1944,6 +1945,7 @@ mod tests {
         nested.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["x".into()],
+            strategy: Default::default(),
         });
         cases.push(("declares only its own checks, indexes", nested));
         // Negative: its own checks and indexes are a partition's to declare.
@@ -3647,6 +3649,7 @@ mod tests {
             t.partition_by = Some(pbps_model::PartitionBy {
                 columns: vec!["id".into()],
                 external: false,
+                strategy: Default::default(),
             });
         };
         let unlogged = |t: &mut Table| t.unlogged = true;
@@ -5636,6 +5639,7 @@ mod tests {
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
             columns: vec!["id".to_owned()],
+            strategy: Default::default(),
         });
         assert!(
             found(&parent)
