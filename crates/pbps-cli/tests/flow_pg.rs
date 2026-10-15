@@ -26201,6 +26201,30 @@ fn resolver_externals_drafts_what_a_managed_view_reads_and_never_replaces_the_ex
         "{}",
         stdout(&widened)
     );
+    // An absent schema is refused by name; an empty one is not.
+    let absent = d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--schema",
+        "nosuch",
+    ]);
+    assert_ne!(code(&absent), 0);
+    assert!(
+        stderr(&absent).contains("--schema nosuch: the target has no schema of that name"),
+        "{}",
+        stderr(&absent)
+    );
+    on_server(db.connection(), "CREATE SCHEMA empty");
+    succeeds(d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--schema",
+        "empty",
+    ]));
     // `--out` writes a new file and refuses an existing one without `--force`.
     let out = d.dir.join("draft.sql");
     let out_arg = out.to_str().unwrap();
@@ -26239,6 +26263,23 @@ fn resolver_externals_drafts_what_a_managed_view_reads_and_never_replaces_the_ex
         "--force",
     ]));
     assert_eq!(std::fs::read_to_string(&out).unwrap(), sql);
+    // Nor a declaration file, even one that does not exist yet.
+    let declaration = d.dir.join("schema/app.new.yml");
+    let refused = d.run(&[
+        "resolver",
+        "externals",
+        "--db",
+        db.connection(),
+        "--out",
+        declaration.to_str().unwrap(),
+    ]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("is under the declarations' directory"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!declaration.exists());
     // The file a resolver entry names is never replaced, `--force` or not.
     std::fs::create_dir_all(d.dir.join("db")).unwrap();
     let named = d.dir.join("db/externals.sql");

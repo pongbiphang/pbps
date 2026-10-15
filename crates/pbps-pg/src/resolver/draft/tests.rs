@@ -441,3 +441,35 @@ fn nothing_outside_the_managed_set_drafts_a_file_that_says_so() {
     );
     assert!(!draft.sql.contains("CREATE "), "{}", draft.sql);
 }
+
+#[test]
+fn a_shape_that_names_a_foreign_table_is_listed_and_not_written() {
+    let mut target = Target::default();
+    let foreign = target.relation(20800, 'f', "ext", "remote", &[("id", "integer")]);
+    // ext.v has a column of the foreign table's row type.
+    let view = target.relation(20810, 'v', "ext", "v", &[("r", "ext.remote")]);
+    target.depend(&view, &key("pg_type", 20801), 'n', true);
+    let managed = target.relation(20820, 'v', "app", "a", &[("r", "ext.remote")]);
+    target.managed(&managed);
+    target.depend(&managed, &view, 'n', false);
+    target.depend(&managed, &foreign, 'n', false);
+    let draft = target.draft(&[]);
+    assert!(
+        draft.listed.contains(
+            &"table ext.remote cannot be staged: the comparison does not qualify a foreign table's properties"
+                .to_owned()
+        ),
+        "{:?}",
+        draft.listed
+    );
+    assert!(
+        draft.listed.contains(
+            &"view ext.v cannot be staged: its shape names table ext.remote, which cannot be staged either"
+                .to_owned()
+        ),
+        "{:?}",
+        draft.listed
+    );
+    // Negative: the view is not written over a type no file can stage.
+    assert!(!draft.sql.contains("CREATE VIEW ext.v"), "{}", draft.sql);
+}

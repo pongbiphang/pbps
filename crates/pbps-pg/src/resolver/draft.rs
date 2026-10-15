@@ -41,6 +41,11 @@ pub struct Draft {
 pub enum Error {
     #[error("a declared routine's signature: {0}")]
     Declaration(String),
+    #[error(
+        "--schema {0}: the target has no schema of that name; an empty schema and an absent \
+         one draft differently, so a misspelt name is refused rather than read as empty"
+    )]
+    AbsentSchema(String),
     #[error("{what}: {source}")]
     Read {
         what: &'static str,
@@ -78,6 +83,12 @@ pub async fn draft(
         what: "the target's catalog",
         source,
     })?;
+    if let Some(absent) = schemas
+        .iter()
+        .find(|schema| !facts.schemas.contains(*schema))
+    {
+        return Err(Error::AbsentSchema(absent.clone()));
+    }
     let is_managed = |key: &Key| match key.0.as_str() {
         "pg_class" => facts
             .relations
@@ -96,6 +107,8 @@ pub async fn draft(
 /// draft writes.
 #[derive(Debug, Default)]
 struct Facts {
+    /// Every schema's name, initdb's too.
+    schemas: BTreeSet<String>,
     objects: BTreeMap<Key, Object>,
     depends: Vec<Depend>,
     relations: BTreeMap<u32, Relation>,
@@ -243,6 +256,12 @@ async fn read(conn: &mut impl QueryConnection) -> Result<Facts, DbError> {
 
 async fn read_in(conn: &mut impl QueryConnection) -> Result<Facts, DbError> {
     let mut facts = Facts::default();
+    for row in conn
+        .query("SELECT n.nspname::text AS name FROM pg_catalog.pg_namespace n")
+        .await?
+    {
+        facts.schemas.insert(text(&row, "name")?);
+    }
     for row in conn
         .query(&format!(
             "SELECT (SELECT c.relname::text FROM pg_catalog.pg_class c WHERE c.oid = f.classid) \
@@ -604,8 +623,18 @@ fn compose(facts: &Facts, managed: &dyn Fn(&Key) -> bool, schemas: &[String]) ->
             }
         }
     }
-    // An object whose shape names one that cannot be staged cannot be
-    // either.
+    // A foreign table cannot be staged at all; an object whose shape names
+    // one that cannot be staged cannot be either.
+    for key in &drafted {
+        if key.0 == "pg_class"
+            && facts
+                .relations
+                .get(&key.1)
+                .is_some_and(|relation| relation.kind == 'f')
+        {
+            chained.insert(key.clone(), Chain::Foreign);
+        }
+    }
     loop {
         let through: Vec<(Key, Key)> = drafted
             .iter()
@@ -643,6 +672,14 @@ fn compose(facts: &Facts, managed: &dyn Fn(&Key) -> bool, schemas: &[String]) ->
                          conservative rebuild",
                         described(key),
                         described(named),
+                        described(key)
+                    ),
+                ),
+                Some(Chain::Foreign) => Item::listed(
+                    key,
+                    format!(
+                        "{} cannot be staged: the comparison does not qualify a foreign \
+                         table's properties",
                         described(key)
                     ),
                 ),
@@ -715,6 +752,8 @@ enum Chain {
     Names(Key),
     /// Its shape names this object, which cannot be staged.
     Through(Key),
+    /// A foreign table, whose properties the comparison does not qualify.
+    Foreign,
 }
 
 struct Item {
@@ -962,15 +1001,6 @@ fn item(facts: &Facts, key: &Key, described: &str) -> Item {
                     .sequences
                     .get(&key.1)
                     .map(|sequence| sequence_sql(sequence, None)),
-                'f' => {
-                    return Item::listed(
-                        key,
-                        format!(
-                            "{described} cannot be staged: the comparison does not qualify a \
-                             foreign table's properties"
-                        ),
-                    );
-                }
                 'p' => return by_hand("partitioned table"),
                 _ => None,
             },

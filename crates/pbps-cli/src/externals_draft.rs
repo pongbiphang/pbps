@@ -72,6 +72,17 @@ fn refuse_destination(project: &Project, out: &Path, force: bool) -> anyhow::Res
             );
         }
     }
+    // Every file under the declarations' directory is one the loader may
+    // read, including one that does not exist yet.
+    let schema_dir = paths::absolute(&project.schema_dir())?;
+    if paths::absolute(out)?.starts_with(&schema_dir) {
+        bail!(
+            "`{}` is under the declarations' directory `{}`, which the project reads; write \
+             the draft elsewhere",
+            out.display(),
+            schema_dir.display()
+        );
+    }
     let mut inputs = vec![project.config_file(), project.ids_file()];
     // A listing that failed is not an empty directory (the loader reports
     // it); what could be listed is still protected.
