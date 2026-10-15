@@ -90,6 +90,16 @@
 //! is read from `typnotnull` and read the same on 16. What it leaves out is
 //! the ACL, which [`Unreadable`] answers, and a comment.
 //!
+//! A base type outside `pg_catalog` that another type holds (an extension's,
+//! such as `citext`, or a superuser's own) keeps its OID when `ALTER TYPE …
+//! SET (…)` changes it in place, so its OID, name, kind and owner are not
+//! enough. The columns that statement can change (`typstorage` and the OIDs of
+//! `typreceive`, `typsend`, `typanalyze`, `typsubscript`, `typmodin` and
+//! `typmodout`) are part of the pin, and so is the `extversion` of the
+//! extension that owns it (#2043). A function is pinned by OID, as the type,
+//! the owner and the collation are: a name would need the argument types to
+//! tell overloads apart, and the OID of the function is what `SET` changes.
+//!
 //! # One read
 //!
 //! A read of a set of references is two passes over the whole set that must
@@ -123,8 +133,9 @@ const MAX_DEPTH: usize = 64;
 const MAX_TYPES: usize = 10_000;
 
 /// Which rule produced a digest, hashed ahead of the definition. A change to the
-/// encoding below is a new rule, never an edit.
-const RULE: &str = "pbps/type-pin/v1";
+/// encoding below is a new rule, never an edit. `v2` adds a base type's mutable
+/// properties to [`Component::Other`] (#2043).
+const RULE: &str = "pbps/type-pin/v2";
 
 // -- the result ------------------------------------------------------------
 
@@ -504,15 +515,52 @@ pub enum Component {
         owner: Oid,
         subtype: Box<Component>,
     },
-    /// Anything else (a built-in, an extension's type), by OID and name: it
-    /// cannot be changed in place.
+    /// Anything else (a built-in, an extension's type), by OID and name. A
+    /// built-in cannot be changed in place; a base type outside `pg_catalog`
+    /// can, and carries what `ALTER TYPE … SET (…)` changes.
     Other {
         oid: Oid,
         schema: String,
         name: String,
         typtype: String,
         owner: Oid,
+        /// `Some` for a base type (`typtype = 'b'`) outside `pg_catalog`.
+        base: Option<BaseProperties>,
     },
+}
+
+/// What `ALTER TYPE … SET (…)` can change on a base type without changing its
+/// OID, and the version of the extension the type belongs to (#2043). Chosen
+/// columns of its `pg_type` row, never the whole row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseProperties {
+    /// `typstorage`: `p`, `e`, `m` or `x`.
+    pub storage: String,
+    /// The OID of the function, or 0 when the type has none.
+    pub receive: Oid,
+    pub send: Oid,
+    pub analyze: Oid,
+    pub subscript: Oid,
+    pub modin: Oid,
+    pub modout: Oid,
+    /// `pg_extension.extversion` of the extension that owns the type, `None`
+    /// for a type no extension owns.
+    pub extension_version: Option<String>,
+}
+
+impl BaseProperties {
+    fn canonical(&self) -> serde_json::Value {
+        serde_json::json!([
+            self.storage,
+            self.receive,
+            self.send,
+            self.analyze,
+            self.subscript,
+            self.modin,
+            self.modout,
+            self.extension_version,
+        ])
+    }
 }
 
 impl Definition {
@@ -606,13 +654,24 @@ impl Component {
                 owner,
                 subtype.canonical()
             ]),
+            // A built-in keeps the six fields it always had, so no column of
+            // `pg_type` reaches the pin of a type that cannot change.
             Self::Other {
                 oid,
                 schema,
                 name,
                 typtype,
                 owner,
+                base: None,
             } => json!(["other", oid, schema, name, typtype, owner]),
+            Self::Other {
+                oid,
+                schema,
+                name,
+                typtype,
+                owner,
+                base: Some(base),
+            } => json!(["other", oid, schema, name, typtype, owner, base.canonical()]),
         }
     }
 
@@ -874,9 +933,19 @@ struct TypeRow {
     collation: Oid,
     default: Option<String>,
     relkind: Option<String>,
+    /// What `ALTER TYPE … SET (…)` can change, read for every row and kept
+    /// only for a base type outside `pg_catalog` (see [`TypeRow::base`]).
+    properties: BaseProperties,
 }
 
 impl TypeRow {
+    /// The properties a component of this type is pinned by: those of a base
+    /// type outside `pg_catalog`, which `ALTER TYPE … SET (…)` changes in
+    /// place, and none for the built-ins and every other kind.
+    fn base(&self) -> Option<BaseProperties> {
+        (self.typtype == "b" && self.schema != "pg_catalog").then(|| self.properties.clone())
+    }
+
     fn is_array(&self) -> bool {
         self.typtype == "b" && self.array_of
     }
@@ -1072,6 +1141,7 @@ impl Built {
             name: t.name.clone(),
             typtype: t.typtype.clone(),
             owner: t.owner,
+            base: t.base(),
         })
     }
 }
@@ -1091,7 +1161,22 @@ async fn fetch_types(conn: &mut Conn, oids: &[Oid]) -> Result<Vec<TypeRow>, DbEr
                     t.typnotnull AS not_null,
                     t.typcollation::pg_catalog.int8 AS collation,
                     pg_catalog.pg_get_expr(t.typdefaultbin, 0::pg_catalog.oid) AS default_expr,
-                    c.relkind::pg_catalog.text AS relkind
+                    c.relkind::pg_catalog.text AS relkind,
+                    t.typstorage::pg_catalog.text AS storage,
+                    t.typreceive::pg_catalog.oid::pg_catalog.int8 AS receive,
+                    t.typsend::pg_catalog.oid::pg_catalog.int8 AS send,
+                    t.typanalyze::pg_catalog.oid::pg_catalog.int8 AS analyze,
+                    t.typsubscript::pg_catalog.oid::pg_catalog.int8 AS subscript,
+                    t.typmodin::pg_catalog.oid::pg_catalog.int8 AS modin,
+                    t.typmodout::pg_catalog.oid::pg_catalog.int8 AS modout,
+                    (SELECT x.extversion::pg_catalog.text
+                       FROM pg_catalog.pg_depend d
+                       JOIN pg_catalog.pg_extension x ON x.oid = d.refobjid
+                      WHERE d.classid = 'pg_catalog.pg_type'::pg_catalog.regclass
+                        AND d.objid = t.oid
+                        AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                        AND d.deptype = 'e'
+                      LIMIT 1) AS extension_version
                FROM pg_catalog.pg_type t
                JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
                LEFT JOIN pg_catalog.pg_class c ON c.oid = t.typrelid
@@ -1117,6 +1202,16 @@ async fn fetch_types(conn: &mut Conn, oids: &[Oid]) -> Result<Vec<TypeRow>, DbEr
                 collation: need(row, "collation")?,
                 default: row.try_get::<&str>("default_expr")?.map(str::to_owned),
                 relkind: row.try_get::<&str>("relkind")?.map(str::to_owned),
+                properties: BaseProperties {
+                    storage: need::<&str>(row, "storage")?.to_owned(),
+                    receive: need(row, "receive")?,
+                    send: need(row, "send")?,
+                    analyze: need(row, "analyze")?,
+                    subscript: need(row, "subscript")?,
+                    modin: need(row, "modin")?,
+                    modout: need(row, "modout")?,
+                    extension_version: row.try_get::<&str>("extension_version")?.map(str::to_owned),
+                },
             })
         })
         .collect::<Result<_, DbError>>()?;
@@ -1460,6 +1555,32 @@ mod tests {
             name: name.to_owned(),
             typtype: "b".to_owned(),
             owner: 10,
+            base: None,
+        }
+    }
+
+    /// A base type outside `pg_catalog`, the shape of `public.citext`.
+    fn extension_base() -> BaseProperties {
+        BaseProperties {
+            storage: "x".to_owned(),
+            receive: 5001,
+            send: 5002,
+            analyze: 0,
+            subscript: 0,
+            modin: 0,
+            modout: 0,
+            extension_version: Some("1.6".to_owned()),
+        }
+    }
+
+    fn citext(base: BaseProperties) -> Component {
+        Component::Other {
+            oid: 5000,
+            schema: "public".to_owned(),
+            name: "citext".to_owned(),
+            typtype: "b".to_owned(),
+            owner: 10,
+            base: Some(base),
         }
     }
 
@@ -1552,7 +1673,7 @@ mod tests {
     /// fails here and must become a new rule (`RULE`).
     #[test]
     fn the_pin_encoding_is_the_one_the_rule_names() {
-        assert_eq!(RULE, "pbps/type-pin/v1");
+        assert_eq!(RULE, "pbps/type-pin/v2");
         let mood = enumeration(&["happy", "sad"]);
         assert_eq!(
             mood.canonical().to_string(),
@@ -1560,7 +1681,7 @@ mod tests {
         );
         assert_eq!(
             mood.pin().as_str(),
-            "cc7101ae9beff864c124e4bdcb99acaee6d1a1ec2639d8f697d6f72efb8a30f9"
+            "4fa5c905be466b87a689d4803fcf77db1f00c9187370bfde84f102a3bfd87f3c"
         );
         assert_eq!(
             domain().canonical().to_string(),
@@ -1568,12 +1689,129 @@ mod tests {
         );
         assert_eq!(
             domain().pin().as_str(),
-            "cff3b44ec4f81f3b2a9e672a8a2e91f3ac42287d74b8f78dffb3b54c1e3329ac"
+            "8bc6bbdc6a75b39f0e970cbc206aa6e9b1b3586bd99afdc83b7d20e50759d5f4"
         );
         assert_eq!(
             composite().pin().as_str(),
-            "fc580acbe7772fc9c4a2d50eeb79d05b32e3476e3bb5d6f7e920a1182b7ff4a5"
+            "3da5cf826e0979d92888e81790d0bd340b650dc3e94423441da6c2efb718c72f"
         );
+    }
+
+    /// A base type outside `pg_catalog` is pinned by what `ALTER TYPE … SET`
+    /// can change on it (#2043), and a built-in is not: its text is the
+    /// six fields it always had.
+    #[test]
+    fn a_nested_base_types_mutable_properties_are_part_of_the_pin() {
+        let holds = |ty: Component| Definition {
+            oid: 40004,
+            schema: "app".to_owned(),
+            name: "holds".to_owned(),
+            owner: 10,
+            body: Body::Composite(Composite {
+                relkind: "c".to_owned(),
+                attributes: vec![Attribute {
+                    name: "v".to_owned(),
+                    ty,
+                    typmod: -1,
+                    collation: 0,
+                }],
+            }),
+        };
+        let with = |edit: fn(&mut BaseProperties)| {
+            let mut base = extension_base();
+            edit(&mut base);
+            holds(citext(base))
+        };
+        let pinned = with(|_| {});
+        assert_eq!(
+            pinned.canonical().to_string(),
+            r#"[40004,"app","holds",10,["composite","c",[["v",["other",5000,"public","citext","b",10,["x",5001,5002,0,0,0,0,"1.6"]],-1,0]]]]"#
+        );
+        assert_eq!(
+            pinned.pin().as_str(),
+            "210ceebb6ee78b89acbdecba49497f4eccc817875e7452d7489b89abfa0febc9"
+        );
+        assert_eq!(pinned.pin(), with(|_| {}).pin());
+        let edits: Vec<(&str, Definition)> = vec![
+            ("storage", with(|b| b.storage = "m".to_owned())),
+            ("receive", with(|b| b.receive = 5101)),
+            ("send", with(|b| b.send = 5102)),
+            ("analyze", with(|b| b.analyze = 5103)),
+            ("subscript", with(|b| b.subscript = 5104)),
+            ("typmod in", with(|b| b.modin = 5105)),
+            ("typmod out", with(|b| b.modout = 5106)),
+            (
+                "extension version",
+                with(|b| b.extension_version = Some("1.7".to_owned())),
+            ),
+            ("no extension", with(|b| b.extension_version = None)),
+        ];
+        let mut seen = BTreeSet::from([pinned.pin()]);
+        for (what, edited) in edits {
+            assert!(seen.insert(edited.pin()), "{what} does not change the pin");
+        }
+        // The property is read for a base type nested anywhere: under an
+        // array, and under a domain.
+        let nested = |edit: fn(&mut BaseProperties)| {
+            let mut base = extension_base();
+            edit(&mut base);
+            Definition {
+                body: Body::Domain(Domain {
+                    base: Component::Array(Box::new(citext(base))),
+                    ..match domain().body {
+                        Body::Domain(d) => d,
+                        Body::Enum { .. } | Body::Composite(_) => unreachable!(),
+                    }
+                }),
+                ..domain()
+            }
+        };
+        assert_eq!(nested(|_| {}).pin(), nested(|_| {}).pin());
+        assert_ne!(nested(|_| {}).pin(), nested(|b| b.send = 1).pin());
+    }
+
+    /// Negative: a built-in carries no properties, so no column of its row
+    /// reaches the pin, and an owner is still collected from a base type.
+    #[test]
+    fn a_builtin_nested_type_keeps_the_six_field_encoding() {
+        assert_eq!(
+            leaf(25, "text").canonical().to_string(),
+            r#"["other",25,"pg_catalog","text","b",10]"#
+        );
+        let mut ids = BTreeSet::new();
+        citext(extension_base()).collect_owners(&mut ids);
+        assert_eq!(ids, BTreeSet::from([10]));
+    }
+
+    fn row(typtype: &str, schema: &str) -> TypeRow {
+        TypeRow {
+            oid: 5000,
+            schema: schema.to_owned(),
+            name: "t".to_owned(),
+            owner: 10,
+            typtype: typtype.to_owned(),
+            array_of: false,
+            elem: 0,
+            base: 0,
+            typmod: -1,
+            not_null: false,
+            collation: 0,
+            default: None,
+            relkind: None,
+            properties: extension_base(),
+        }
+    }
+
+    /// Only a base type outside `pg_catalog` is pinned by its properties; the
+    /// built-ins, and every kind that is not a base type, are not.
+    #[test]
+    fn only_a_base_type_outside_pg_catalog_carries_properties() {
+        assert_eq!(row("b", "public").base(), Some(extension_base()));
+        assert_eq!(row("b", "app").base(), Some(extension_base()));
+        assert_eq!(row("b", "pg_catalog").base(), None);
+        for typtype in ["p", "r", "m", "e", "d", "c"] {
+            assert_eq!(row(typtype, "public").base(), None, "{typtype}");
+        }
     }
 
     #[test]
@@ -1833,6 +2071,7 @@ mod tests {
             name: "text".to_owned(),
             typtype: "b".to_owned(),
             owner,
+            base: None,
         };
         let range_owned_by = |owner| Component::Range {
             oid: 3904,

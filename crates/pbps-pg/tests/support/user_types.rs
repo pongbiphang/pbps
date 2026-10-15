@@ -12,7 +12,8 @@ use super::*;
 use pbps_model::TypeRef;
 use pbps_pg::pins::Within;
 use pbps_pg::user_types::{
-    self, Body, Component, Definition, Kind, NotAdmitted, TypeRead, Unreadable, UserType,
+    self, BaseProperties, Body, Component, Definition, Kind, NotAdmitted, TypeRead, Unreadable,
+    UserType,
 };
 
 /// One server of the pair, as the libpq keyword string that reaches it.
@@ -220,6 +221,7 @@ fn without_oids(def: &Definition) -> Definition {
                 schema,
                 name,
                 typtype,
+                base,
                 ..
             } => Component::Other {
                 oid: 0,
@@ -227,6 +229,16 @@ fn without_oids(def: &Definition) -> Definition {
                 schema: schema.clone(),
                 name: name.clone(),
                 typtype: typtype.clone(),
+                // The function OIDs differ between servers like any other.
+                base: base.as_ref().map(|b| BaseProperties {
+                    receive: b.receive.min(1),
+                    send: b.send.min(1),
+                    analyze: b.analyze.min(1),
+                    subscript: b.subscript.min(1),
+                    modin: b.modin.min(1),
+                    modout: b.modout.min(1),
+                    ..b.clone()
+                }),
             },
         }
     }
@@ -919,6 +931,169 @@ async fn each_change_to_a_type_changes_its_pin_and_a_no_op_does_not() {
             &format!("ALTER TYPE app.pair OWNER TO {other}"),
         )
         .await;
+        db.drop().await;
+    }
+}
+
+/// `ALTER TYPE … SET (…)` changes a base type in place and keeps its OID, so a
+/// composite, a domain or an array holding one is pinned by the columns it can
+/// change and by the version of the extension that owns it, and a no-op leaves
+/// the pin alone (#2043). A built-in nested type adds nothing.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_nested_base_types_properties_move_the_pin_of_the_type_that_holds_it() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "baseprops").await;
+        db.sql(
+            "CREATE EXTENSION citext VERSION '1.4' SCHEMA public;
+             CREATE SCHEMA app;
+             CREATE TYPE app.ci AS (v public.citext);
+             CREATE DOMAIN app.ci_domain AS public.citext;
+             CREATE TYPE app.ci_array AS (v public.citext[]);
+             CREATE TYPE app.plain AS (a integer, b text);
+             CREATE FUNCTION public.t2043_send(public.citext) RETURNS bytea
+                 LANGUAGE internal IMMUTABLE STRICT AS 'textsend';
+             CREATE FUNCTION public.t2043_recv(internal) RETURNS public.citext
+                 LANGUAGE internal IMMUTABLE STRICT AS 'textrecv';
+             CREATE FUNCTION public.t2043_analyze(internal) RETURNS boolean
+                 LANGUAGE internal IMMUTABLE STRICT AS 'ts_typanalyze';
+             CREATE FUNCTION public.t2043_modin(cstring[]) RETURNS integer
+                 LANGUAGE internal IMMUTABLE STRICT AS 'varchartypmodin';
+             CREATE FUNCTION public.t2043_modout(integer) RETURNS cstring
+                 LANGUAGE internal IMMUTABLE STRICT AS 'varchartypmodout';",
+        )
+        .await;
+        let label = server.label;
+
+        // What is read: the extension's type carries its properties and its
+        // extension's version, and the built-in next to it carries none.
+        let ci = present(&mut db.conn, "app", "ci").await;
+        let Body::Composite(c) = &ci.definition().body else {
+            panic!("{:?}", ci.definition())
+        };
+        let Component::Other {
+            base: Some(base), ..
+        } = &c.attributes[0].ty
+        else {
+            panic!("{:?}", c.attributes[0].ty)
+        };
+        assert_eq!(base.storage, "x", "on {label}");
+        assert_eq!(base.extension_version.as_deref(), Some("1.4"));
+        assert_ne!((base.receive, base.send), (0, 0));
+        assert_eq!(
+            (base.analyze, base.subscript, base.modin, base.modout),
+            (0, 0, 0, 0)
+        );
+        let plain = present(&mut db.conn, "app", "plain").await;
+        let Body::Composite(p) = &plain.definition().body else {
+            panic!("{:?}", plain.definition())
+        };
+        assert!(
+            p.attributes
+                .iter()
+                .all(|a| matches!(&a.ty, Component::Other { base: None, .. })),
+            "{:?}",
+            p.attributes
+        );
+
+        // No-ops: a comment, a grant, and setting a property to what it is.
+        let holders = ["ci", "ci_domain", "ci_array"];
+        let mut before = Vec::new();
+        for name in holders {
+            before.push(pin_of(&mut db.conn, "app", name).await);
+        }
+        let plain_before = pin_of(&mut db.conn, "app", "plain").await;
+        for sql in [
+            "COMMENT ON TYPE public.citext IS 'case-insensitive text'",
+            "GRANT USAGE ON TYPE public.citext TO PUBLIC",
+            "ALTER TYPE public.citext SET (storage = extended)",
+        ] {
+            db.sql(sql).await;
+            for (name, pin) in holders.iter().zip(&before) {
+                assert_eq!(
+                    &pin_of(&mut db.conn, "app", name).await,
+                    pin,
+                    "`{sql}` moved the pin of app.{name} on {label}"
+                );
+            }
+        }
+
+        // Each change moves every type that holds it, directly, through a
+        // domain, and through an array, and never the built-in-only one.
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        seen.insert(before[0].clone());
+        for sql in [
+            "ALTER EXTENSION citext UPDATE TO '1.5'",
+            "ALTER TYPE public.citext SET (storage = main)",
+            "ALTER TYPE public.citext SET (send = public.t2043_send)",
+            "ALTER TYPE public.citext SET (receive = public.t2043_recv)",
+            "ALTER TYPE public.citext SET (analyze = public.t2043_analyze)",
+            "ALTER TYPE public.citext SET (typmod_in = public.t2043_modin)",
+            "ALTER TYPE public.citext SET (typmod_out = public.t2043_modout)",
+            "ALTER TYPE public.citext SET (subscript = raw_array_subscript_handler)",
+        ] {
+            db.sql(sql).await;
+            let mut pins = Vec::new();
+            for name in holders {
+                pins.push(pin_of(&mut db.conn, "app", name).await);
+            }
+            assert!(
+                seen.insert(pins[0].clone()),
+                "`{sql}` left the pin of app.ci as it was on {label}"
+            );
+            for ((name, pin), old) in holders.iter().zip(&pins).zip(&before) {
+                assert_ne!(pin, old, "`{sql}`: app.{name} on {label}");
+            }
+            assert_eq!(
+                pin_of(&mut db.conn, "app", "plain").await,
+                plain_before,
+                "`{sql}` moved a type that holds only built-ins on {label}"
+            );
+            // Another no-op after each change leaves it where the change put it.
+            db.sql("COMMENT ON TYPE public.citext IS 'again'").await;
+            assert_eq!(
+                pin_of(&mut db.conn, "app", "ci").await,
+                pins[0],
+                "on {label}"
+            );
+        }
+
+        // A base type a superuser made, which no extension owns.
+        db.sql(
+            "CREATE TYPE public.t2043_base;
+             CREATE FUNCTION public.t2043_in(cstring) RETURNS public.t2043_base
+                 LANGUAGE internal IMMUTABLE STRICT AS 'textin';
+             CREATE FUNCTION public.t2043_out(public.t2043_base) RETURNS cstring
+                 LANGUAGE internal IMMUTABLE STRICT AS 'textout';
+             CREATE TYPE public.t2043_base (INPUT = public.t2043_in,
+                 OUTPUT = public.t2043_out, LIKE = pg_catalog.text);
+             CREATE TYPE app.own AS (v public.t2043_base);",
+        )
+        .await;
+        let own = present(&mut db.conn, "app", "own").await;
+        let Body::Composite(c) = &own.definition().body else {
+            panic!("{:?}", own.definition())
+        };
+        assert!(
+            matches!(
+                &c.attributes[0].ty,
+                Component::Other {
+                    base: Some(BaseProperties {
+                        extension_version: None,
+                        ..
+                    }),
+                    ..
+                }
+            ),
+            "{:?}",
+            c.attributes[0].ty
+        );
+        let own_before = own.pin().to_string();
+        db.sql("COMMENT ON TYPE public.t2043_base IS 'no-op'").await;
+        assert_eq!(pin_of(&mut db.conn, "app", "own").await, own_before);
+        db.sql("ALTER TYPE public.t2043_base SET (storage = main)")
+            .await;
+        assert_ne!(pin_of(&mut db.conn, "app", "own").await, own_before);
         db.drop().await;
     }
 }
