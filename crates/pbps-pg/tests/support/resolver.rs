@@ -1597,6 +1597,7 @@ mod recon2049 {
     #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_SCRATCH_DB (see scripts/live-tests-pg.sh)"]
     async fn a_reproduction_that_fails_partway_names_the_failing_role_and_leaves_none_after_cleanup()
      {
+        let _alone = alone().await;
         let pid = std::process::id();
         let run_login = format!("pbps_r2049a_login_{pid}");
         let mut admin = Conn::connect(Driver::Postgres, &server()).await.unwrap();
