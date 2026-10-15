@@ -12864,8 +12864,8 @@ async fn the_database_owner_is_no_exception_to_the_ledger_editor_rule() {
     }
 }
 
-/// The first part of every crowd role's name; the rest is the process id, an
-/// underscore and a number.
+/// The first part of every crowd role's name; the rest is a tag (empty for the
+/// real crowd), the process id, an underscore and a number.
 const CROWD_STEM: &str = "pbps_crowd_";
 
 /// How many roles one transaction creates or drops.
@@ -12878,6 +12878,47 @@ const CROWD_STEM: &str = "pbps_crowd_";
 /// fit only by slack and fail with `out of shared memory` (#2050).
 const CROWD_BATCH: u32 = 250;
 
+/// The session-level advisory lock that owns the `pbps_crowd_` namespace: the
+/// bytes of `pbpscrow`.
+const CROWD_LOCK_KEY: i64 = 0x7062_7073_6372_6f77;
+
+/// How long a crowd waits for another run's crowd before it gives up. The
+/// longest holder is the ten-thousand-role test, which needs minutes under load.
+const CROWD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Takes the crowd namespace's lock on a connection of its own and returns that
+/// connection: the lock lasts as long as it does, and the server releases it
+/// when the session ends, a killed run's included (#2057).
+///
+/// A retry loop on `pg_try_advisory_lock` and not one `pg_advisory_lock` under
+/// `lock_timeout`: the wait is then bounded by this loop and not by a setting
+/// the session carries into whatever else it is later asked.
+async fn lock_crowd_namespace() -> Result<Conn, String> {
+    let mut lock = Conn::connect(Driver::Postgres, &conn_str())
+        .await
+        .map_err(|e| format!("connect to lock the `{CROWD_STEM}*` roles: {e}"))?;
+    let deadline = std::time::Instant::now() + CROWD_LOCK_WAIT;
+    loop {
+        let rows = lock
+            .query(&format!("SELECT pg_try_advisory_lock({CROWD_LOCK_KEY})"))
+            .await
+            .map_err(|e| format!("lock the `{CROWD_STEM}*` roles: {e}"))?;
+        let held = rows
+            .first()
+            .and_then(|row| row.try_get_at::<bool>(0).ok().flatten())
+            .ok_or_else(|| format!("lock the `{CROWD_STEM}*` roles: no answer came back"))?;
+        if held {
+            return Ok(lock);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "another run still holds the `{CROWD_STEM}*` roles after {CROWD_LOCK_WAIT:?}"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 /// A crowd of login roles that cannot outlive the test that made it.
 ///
 /// Roles belong to the cluster, not to the test's database, so a crowd left
@@ -12888,11 +12929,19 @@ const CROWD_BATCH: u32 = 250;
 /// connection, and so runs on a panic and on an early return alike. This crate
 /// has no `futures` to catch an unwind with, and a guard also covers a step
 /// that returns early.
+///
+/// Two runs can share one cluster, so the namespace has one owner at a time
+/// (#2057): [`RoleCrowd::create`] holds [`CROWD_LOCK_KEY`] before it sweeps or
+/// creates anything, and only the holder sweeps.
 struct RoleCrowd {
     /// `pbps_crowd_<pid>_`: the pid keeps one run's roles from being counted as
     /// another's by the test's own assertions.
     prefix: String,
     armed: bool,
+    /// The connection whose session holds the namespace's lock. It is a field
+    /// so that it is dropped after [`Drop::drop`] has removed the roles: the
+    /// lock is never released while the crowd still exists.
+    lock: Option<Conn>,
 }
 
 impl RoleCrowd {
@@ -12901,16 +12950,31 @@ impl RoleCrowd {
         RoleCrowd {
             prefix: format!("{CROWD_STEM}{}_", std::process::id()),
             armed: true,
+            lock: None,
+        }
+    }
+
+    /// [`RoleCrowd::arm`] for a crowd that is not the real one, told apart from
+    /// it and from its siblings in one process by `tag`. The tag comes before
+    /// the pid so that the real crowd's assertions never count these roles.
+    fn arm_tagged(tag: &str) -> RoleCrowd {
+        RoleCrowd {
+            prefix: format!("{CROWD_STEM}{tag}_{}_", std::process::id()),
+            armed: true,
+            lock: None,
         }
     }
 
     /// Creates `count` roles, [`CROWD_BATCH`] to a transaction.
     ///
-    /// Roles an earlier run left behind (any pid) are dropped first, so one bad
-    /// run cannot poison the next. Every live suite owns its cluster for the
-    /// run (`scripts/live-tests-pg.sh`), and within one process this is the only
-    /// test that makes crowd roles.
+    /// Waits for the namespace's lock first (see [`lock_crowd_namespace`]), then
+    /// drops roles an earlier run left behind (any pid), so one bad run cannot
+    /// poison the next. Holding the lock is what makes that sweep safe: a live
+    /// crowd always holds it, so none can be swept (#2057).
     async fn create(&mut self, conn: &mut Conn, count: u32) -> Result<(), String> {
+        if self.lock.is_none() {
+            self.lock = Some(lock_crowd_namespace().await?);
+        }
         drop_crowd_roles(conn, CROWD_STEM).await?;
         let mut first = 1;
         while first <= count {
@@ -12928,10 +12992,19 @@ impl RoleCrowd {
         Ok(())
     }
 
-    /// Drops the crowd, and disarms the guard only once none is left.
+    /// Drops the crowd, and disarms the guard and releases the namespace only
+    /// once none is left.
     async fn remove(&mut self, conn: &mut Conn) -> Result<(), String> {
         drop_crowd_roles(conn, &self.prefix).await?;
         self.armed = false;
+        if let Some(mut lock) = self.lock.take() {
+            // Unlocked at once, not left to the session's end, so that a run
+            // waiting for the namespace does not wait for this connection to
+            // close as well. Were this to fail, closing the session releases it.
+            let _ = lock
+                .query(&format!("SELECT pg_advisory_unlock({CROWD_LOCK_KEY})"))
+                .await;
+        }
         Ok(())
     }
 }
@@ -12942,6 +13015,8 @@ impl Drop for RoleCrowd {
             return;
         }
         let prefix = self.prefix.clone();
+        // `self.lock` is still open: fields drop after this body returns, so
+        // the namespace is released only once the roles are gone (#2057).
         // Never a panic from here: this may already be one unwinding, and a
         // second aborts the process, taking the other tests' verdicts with it.
         let outcome = std::thread::spawn(move || -> Result<(), String> {
@@ -13063,6 +13138,106 @@ async fn the_ledger_trust_check_stays_linear_in_the_clusters_roles() {
         );
     }
     db.drop().await;
+}
+
+/// How many roles in the cluster have a name starting with `prefix`.
+async fn crowd_roles(conn: &mut Conn, prefix: &str) -> i32 {
+    number(
+        conn,
+        &format!(
+            "SELECT count(*)::int4 FROM pg_roles WHERE left(rolname, {}) = '{prefix}'",
+            prefix.len()
+        ),
+    )
+    .await
+}
+
+/// Two runs on one cluster do not take each other's crowd (#2057). A crowd's
+/// sweep removes every `pbps_crowd_` role of any pid, so without an owner of
+/// the namespace the second run would delete the first's live roles under it.
+/// The second waits instead, leaves the first's roles alone while it does, and
+/// goes ahead once the first has removed its own.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_second_role_crowd_waits_for_the_first_and_never_sweeps_it() {
+    let mut admin = Conn::connect(Driver::Postgres, &conn_str()).await.unwrap();
+    let mut other = Conn::connect(Driver::Postgres, &conn_str()).await.unwrap();
+    let mut first = RoleCrowd::arm_tagged("first");
+    let mut second = RoleCrowd::arm_tagged("second");
+    let (first_prefix, second_prefix) = (first.prefix.clone(), second.prefix.clone());
+    first.create(&mut admin, 20).await.unwrap();
+
+    {
+        let mut waiting = std::pin::pin!(second.create(&mut other, 20));
+        let early = tokio::time::timeout(std::time::Duration::from_secs(3), &mut waiting).await;
+        // Read on a third connection: the second one is inside `waiting`.
+        let kept = crowd_roles(&mut admin, &first_prefix).await;
+        assert_eq!(kept, 20, "the second crowd swept the first's live roles");
+        assert!(early.is_err(), "the second crowd did not wait: {early:?}");
+        assert_eq!(crowd_roles(&mut admin, &second_prefix).await, 0);
+
+        first.remove(&mut admin).await.unwrap();
+        // Bounded by the lock's own wait, which is far longer than the first's removal.
+        waiting.await.unwrap();
+        assert_eq!(crowd_roles(&mut admin, &second_prefix).await, 20);
+        assert_eq!(crowd_roles(&mut admin, &first_prefix).await, 0);
+    }
+    second.remove(&mut admin).await.unwrap();
+    assert_eq!(crowd_roles(&mut admin, &second_prefix).await, 0);
+}
+
+/// A crowd left by a run that was killed is still swept by the next one
+/// (#2057): the lock is the session's, so the server releases it with the
+/// connection and the namespace has no owner whose death leaves it locked.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_crowd_left_by_a_killed_run_is_swept_by_the_next() {
+    let mut admin = Conn::connect(Driver::Postgres, &conn_str()).await.unwrap();
+    let mut killed = RoleCrowd::arm_tagged("killed");
+    let killed_prefix = killed.prefix.clone();
+    killed.create(&mut admin, 5).await.unwrap();
+    assert_eq!(crowd_roles(&mut admin, &killed_prefix).await, 5);
+    // The lock is really held while the run lives.
+    let free = truth(
+        &mut admin,
+        &format!("SELECT pg_try_advisory_lock({CROWD_LOCK_KEY})"),
+    )
+    .await;
+    assert!(!free, "the killed run's crowd held no lock");
+    // The run dies: its session ends, which releases the lock, and its roles
+    // stay. The guard stays armed, so a failure below still removes them.
+    drop(killed.lock.take());
+
+    let mut next = RoleCrowd::arm_tagged("next");
+    let next_prefix = next.prefix.clone();
+    next.create(&mut admin, 5).await.unwrap();
+    assert_eq!(
+        crowd_roles(&mut admin, &killed_prefix).await,
+        0,
+        "the killed run's roles were not swept"
+    );
+    assert_eq!(crowd_roles(&mut admin, &next_prefix).await, 5);
+    next.remove(&mut admin).await.unwrap();
+    assert_eq!(crowd_roles(&mut admin, &next_prefix).await, 0);
+}
+
+/// A crowd that is dropped, not removed (a panicking test), takes its roles
+/// with it and gives the namespace up (#2057). The order, roles first and lock
+/// after, is by field drop order and is not observable from here.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_dropped_role_crowd_removes_its_roles_and_releases_the_namespace() {
+    let mut admin = Conn::connect(Driver::Postgres, &conn_str()).await.unwrap();
+    let mut crowd = RoleCrowd::arm_tagged("dropped");
+    let prefix = crowd.prefix.clone();
+    crowd.create(&mut admin, 5).await.unwrap();
+    assert_eq!(crowd_roles(&mut admin, &prefix).await, 5);
+    drop(crowd);
+    assert_eq!(crowd_roles(&mut admin, &prefix).await, 0);
+    // The namespace is free again: a new crowd gets it.
+    let mut next = RoleCrowd::arm_tagged("dropped_next");
+    next.create(&mut admin, 1).await.unwrap();
+    next.remove(&mut admin).await.unwrap();
 }
 
 /// Issue #313: a role with `CREATE` on `public` makes the ledger tables before
