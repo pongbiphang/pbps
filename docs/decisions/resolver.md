@@ -3132,8 +3132,9 @@ The rest is fixed as follows:
 
 **DEC-619.3. SQL Server scratch is told from the target by a live global
 temporary marker, not by a reported identifier; a same-instance scratch
-needs a confined account in the supplied layout, and is proven empty
-against the measured fresh-install inventory as `db_owner` (#619).**
+needs an account confined by one reach read against an allowlist, in the
+supplied layout, and is proven empty against the measured fresh-install
+inventory as `db_owner` (#619).**
 
 - **No reported identifier proves separation.** `master`'s `family_guid`
   differs between two installations of one image, but a `podman commit`
@@ -3152,26 +3153,36 @@ against the measured fresh-install inventory as `db_owner` (#619).**
   - It ends with its session, so a stale marker cannot match.
   - Seen means one instance. Then scratch is not the target database, and
     the account must be confined.
-- **A login reads its own server reach without privilege.** It reads
-  `fn_my_permissions(NULL, 'SERVER')`, `sys.login_token` and its token's own
-  rows in `sys.server_permissions`:
-  - Confined means `CONNECT SQL` and `VIEW ANY DATABASE` only, no server
-    role but `public`, and no grant on a server-scoped securable beyond
-    `public`'s defaults (those two and `CONNECT` on the endpoints).
-  - The first two reads are not enough. They are securable-wide, and a
-    login granted `IMPERSONATE` on an administrator's login reads exactly
-    as a confined one there, then becomes `sysadmin` by `EXECUTE AS LOGIN`.
-    Its own grant row is visible to it, and is what refuses it.
-  - Confined also means entering no database but its own scratch and
-    `master`, `tempdb` and `msdb`: `HAS_DBACCESS` over every database
-    `VIEW ANY DATABASE` lists. A login mapped into the target, or a target
-    with `guest` enabled, reads 1 there, and no server-level read shows it.
-    This is the SQL Server half of #1667's rule, and the counterpart of
-    DEC-1672.1's ownership of another database.
-  - In `master`, `tempdb` and `msdb` access is always 1, so it says nothing
-    there: a login mapped as `db_owner` in `msdb` reads exactly as `guest`.
-    Confined also means no principal of its own in the three, read from
-    their `sys.database_principals` by its own SID.
+- **Confinement is one read of the login's reach against an allowlist**,
+  PostgreSQL's form (`pbps-pg` `scratch.rs`, `REACH` and
+  `CONTAINED_PREDEFINED`; #2085). Every part of the read needs no
+  privilege:
+  - The reach is:
+    - its token (`sys.login_token`);
+    - its server permissions (`fn_my_permissions(NULL, 'SERVER')`);
+    - every grant to a principal in its token (`sys.server_permissions`);
+    - every database it can enter (`HAS_DBACCESS` over the databases
+      `VIEW ANY DATABASE` lists);
+    - its own principal in `master`, `tempdb` and `msdb`.
+  - The allowlist is:
+    - the server role `public`;
+    - `CONNECT SQL` and `VIEW ANY DATABASE`;
+    - endpoint `CONNECT`;
+    - its own scratch database;
+    - those three system databases as `guest`.
+  - Anything else is unconfined and named, including a kind no rule names.
+  - **Why an allowlist.** The design first listed what makes a login
+    unconfined, and review found three cases it missed, one round at a time:
+    - `IMPERSONATE` on an administrator's login, which reads as confined in
+      the server permissions and the token and becomes `sysadmin` by
+      `EXECUTE AS LOGIN`;
+    - a user in another database, or a target with `guest` enabled, which is
+      #1667's "no access to another database";
+    - a `db_owner` user in `msdb`, where access reads 1 for everyone.
+
+    PostgreSQL went the same way on #1678 before its single read (DEC-1672.1).
+    The maintainer decided on 2026-10-16 that SQL Server follows the
+    PostgreSQL side's form first.
   - The run-owned layout needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`
     (`securityadmin`, `dbcreator`), so it never runs on the target's
     instance.
@@ -3192,35 +3203,52 @@ against the measured fresh-install inventory as `db_owner` (#619).**
 
 <a id="dec-619-4"></a>
 
-**DEC-619.4. The SQL Server externals file is compared on what a
-creation-time binding reads, a cross-database reference refuses by name,
+**DEC-619.4. The SQL Server externals file is compared on every property
+the engine reports, minus what no creation reads, a cross-database
+reference refuses by name,
 and the reported-facts rule stops comparing CLR assemblies: a CLR object a
 managed object reaches is an unstaged external object (#619).**
 
-The comparison is #1673's (DEC-1673.1) with SQL Server's shapes:
+The comparison is #1673's (DEC-1673.1) in PostgreSQL's form, as `pbps-pg`'s
+`capture/staged.rs` does it (#2085). It covers every property the engine
+reports for an object and its children:
 
-- every object's schema, name and object type, since every kind occupies a
-  name;
-- columns: type (a user type by `schema.name`), length, precision, scale,
-  nullability, collation, and whether the column is computed;
-- function and procedure parameters and return types, a function's kind,
-  and every module's `is_schema_bound`: a schema-bound caller refuses a view
-  or a function that is not (4513), so a schema-bound stub for a plain
-  target view would admit a managed object the target refuses;
-- a table-valued function's result columns, as a table's: a view over the
-  function binds them, and breaks (207) when they change;
-- a function's `IsDeterministic` and `IsPrecise`, as the engine reports them:
-  a `PERSISTED` computed column refuses a function that is not
-  deterministic (4936), which no signature shows;
-- a table's primary key, unique constraints and unique indexes, as #1673
-  compares them on PostgreSQL: a foreign key binds one by `key_index_id` and
-  is refused without one (1776);
-- a user type's base and facets;
-- a synonym's `base_object_name`;
-- schemas.
+- the columns of a table, a view and a table-valued function's result;
+- parameters;
+- primary keys, unique constraints and unique indexes with their key
+  columns;
+- a type's facets;
+- a synonym's base object;
+- `sys.sql_modules`' flags and the `OBJECTPROPERTYEX` properties of its type.
 
-Bodies, non-unique indexes, CHECKs, defaults, foreign keys and triggers are
-not compared: no creation-time binding reads them on SQL Server.
+It skips only what no creation in another object reads, as `projected`
+skips a body and defaults there:
+
+- module definitions (a view may be staged as a shape view);
+- column defaults and CHECK bodies;
+- foreign keys, non-unique indexes and triggers;
+- ids, dates and owners, which differ on scratch by construction.
+
+A property or class no rule names is compared, not passed.
+
+**Why compare by default.** The design first listed what to compare, and
+review found four properties it missed, one round at a time. Each is read
+when another object is created, measured on 17.0:
+
+- a view's schema binding: a schema-bound caller refuses a plain view or
+  function (4513), and a synonym (2788);
+- a table-valued function's result columns: a view over it breaks (207)
+  when they change;
+- a referenced table's candidate keys: a foreign key binds one by
+  `key_index_id` and is refused without one (1776). #1673 already compares
+  them on PostgreSQL;
+- a function's determinism: a `PERSISTED` computed column refuses a
+  non-deterministic function (4936), which no signature shows.
+
+An omission from a list of what to compare admits a stub the target would
+refuse. An omission from a list of what to skip refuses a valid plan, which
+is the safe direction. The maintainer decided on 2026-10-16 that SQL Server
+follows PostgreSQL's form here.
 
 A three-part or four-part name is recorded with no id. An externals file
 stages one database and cannot stand in for another, so such a reference

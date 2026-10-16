@@ -181,33 +181,39 @@ for a moment keeps that type.
     [`a_global_temporary_table_marks_one_instance_to_every_login_on_it`].
   - Seen means the same instance. Then the same-instance rules below apply,
     and scratch may never be the target database itself.
-- **A confined account.** A login reads its own server reach without
-  privilege, from `fn_my_permissions(NULL, 'SERVER')`, `sys.login_token`
-  and its own rows in `sys.server_permissions`
-  [`a_login_reads_its_own_server_reach_without_privilege`]:
-  - Confined means server permissions of `CONNECT SQL` and
-    `VIEW ANY DATABASE` only, no server role but `public`, and no grant to
-    any principal in its token on a server-scoped securable beyond
-    `public`'s defaults (those two and `CONNECT` on the endpoints).
-  - The third read is needed: a login granted `IMPERSONATE` on an
-    administrator's login reads exactly as a confined one in the first two,
-    and becomes `sysadmin` by `EXECUTE AS LOGIN`. Its grant row shows it.
-  - `securityadmin` adds `ALTER ANY LOGIN` and `CREATE LOGIN`; `dbcreator`
-    adds `CREATE ANY DATABASE`; `sysadmin` holds `CONTROL SERVER`.
-  - **And it enters no other database.** Confined means that `HAS_DBACCESS`
-    reads 1 only for its own scratch database and `master`, `tempdb` and
-    `msdb`, over every database `VIEW ANY DATABASE` lists. A login mapped
-    into the target, as its owner or any user, reads 1 there, and so does
-    every login on a target with `guest` enabled. Neither shows in a
-    server-level read, and either would let a scratch statement reach the
-    target by `USE` or a three-part name. This is #1667's SQL Server half:
-    no server-level permission and no access to another database
-    [`a_login_reads_every_database_it_can_enter`].
-  - **In those three it is `guest`.** Access to `master`, `tempdb` and
-    `msdb` is the same 1 whether the login enters as `guest` or as a user
-    mapped there as `db_owner`. So the login also has no principal of its
-    own in any of the three, which it reads from their
-    `sys.database_principals` by its own SID.
+- **A confined account**, in PostgreSQL's form (#2085): one read of
+  everything the login reaches, checked against an allowlist, as
+  `pbps-pg`'s `scratch.rs` does with `REACH` and `CONTAINED_PREDEFINED`.
+  Anything outside the allowlist, including a kind no rule names, is
+  unconfined and named. Every read needs no privilege.
+  - **The reach:**
+    - its token (`sys.login_token`: itself, `public` and its server roles);
+    - its server permissions (`fn_my_permissions(NULL, 'SERVER')`);
+    - every grant to a principal in its token (`sys.server_permissions`);
+    - every database it can enter (`HAS_DBACCESS` over the databases
+      `VIEW ANY DATABASE` lists);
+    - its own principal, if any, in `master`, `tempdb` and `msdb`, read
+      from their `sys.database_principals` by its own SID.
+  - **The allowlist:**
+    - the server role `public`;
+    - the server permissions `CONNECT SQL` and `VIEW ANY DATABASE`;
+    - `public`'s default grants: those two and `CONNECT` on the endpoints;
+    - its own scratch database;
+    - `master`, `tempdb` and `msdb` as `guest`, with no principal of its own.
+  - **What the read refuses, measured**
+    [`a_login_reads_its_own_server_reach_without_privilege`,
+    `a_login_reads_every_database_it_can_enter`]:
+    - `securityadmin` (`ALTER ANY LOGIN`, `CREATE LOGIN`), `dbcreator`
+      (`CREATE ANY DATABASE`) and `sysadmin` (`CONTROL SERVER`);
+    - `IMPERSONATE` on an administrator's login. It reads as confined in the
+      first two reads, and the login becomes `sysadmin` by
+      `EXECUTE AS LOGIN`;
+    - a user in another database, as its owner or any user, and a target
+      with `guest` enabled. These are #1667's "no access to another
+      database", and either would let a scratch statement reach the target
+      by `USE` or a three-part name;
+    - a user mapped as `db_owner` in `msdb`, where access alone reads 1 for
+      everyone.
 - **The layout.** The run-owned layout creates the run's login and database,
   so it needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`, which no confined
   account holds. On the target's instance only the supplied layout runs: a
@@ -250,24 +256,44 @@ afterwards refuses the next run.
 
 ## 8. The externals file on SQL Server
 
-#1673's rule (DEC-1673.1), with SQL Server's shapes
-([DEC-619.4](decisions/resolver.md#dec-619-4)). Every object the externals
-file creates is compared with the target on what a creation-time binding can
-read:
+#1673's rule (DEC-1673.1), in PostgreSQL's form (#2085,
+[DEC-619.4](decisions/resolver.md#dec-619-4)), as `pbps-pg`'s
+`capture/staged.rs` does it. Every object the externals file creates is
+compared with the target on **every property the engine reports for it and
+its children**, minus a short skip list. A property or class no rule names is
+compared, not passed.
 
-| Class | Compared |
+- **What is read:**
+  - the object: `sys.objects`, `sys.sql_modules`' flags and the
+    `OBJECTPROPERTYEX` properties the engine reports for its type;
+  - its columns: a table's, a view's and a table-valued function's result
+    columns, from `sys.columns`;
+  - its parameters (`sys.parameters`);
+  - its primary key, unique constraints and unique indexes, with their key
+    columns (`sys.indexes`, `sys.index_columns`);
+  - a type's facets (`sys.types`);
+  - a synonym's `base_object_name`.
+- **What is skipped, and why**, as PostgreSQL's `projected` skips a body and
+  defaults:
+  - a module's definition, since a view may be staged as a shape view of
+    typed NULLs;
+  - column defaults and CHECK bodies;
+  - foreign keys, non-unique indexes and triggers: no creation in another
+    object reads them;
+  - ids, dates and owners, which differ on scratch by construction, as
+    PostgreSQL drops role names.
+
+Why the default must be "compared": each measured property below is one a
+creation in another object reads, and a hand-written list of what to compare
+missed each in turn.
+
+| Property | What reads it |
 |---|---|
-| Any object | Its schema, name and object type: every kind occupies the name (§2) |
-| Table, view | Columns: name, order, type (a user type by `schema.name`), length, precision, scale, nullability, collation, computed or not; a view's `is_schema_bound`, which a schema-bound caller requires (4513); a table's primary key, unique constraints and unique indexes (key columns and order), which a foreign key binds by `key_index_id` and is refused without (1776), as #1673 compares them on PostgreSQL |
-| Function | Parameters and return type as above, kind (scalar, inline, multi-statement), `is_schema_bound`, which a schema-bound caller requires (4513), the engine's `IsDeterministic` and `IsPrecise`, which a `PERSISTED` computed column calling it requires (4936) [`a_foreign_key_binds_a_candidate_key_and_a_persisted_column_a_deterministic_function`], and a table-valued function's result columns as a table's, which a view over it binds [`a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`] |
-| Procedure | Parameters as above |
-| User type | Base type, length, precision, scale, nullability |
-| Synonym | `base_object_name`; a schema-bound caller may not name one (2788) |
-| Schema | Name |
-
-Not compared: module bodies and view queries (a view may be staged as a shape
-view of typed NULLs), non-unique indexes, CHECKs, defaults, foreign keys and
-triggers.
+| A view's or function's `is_schema_bound` | A schema-bound caller refuses one that is not (4513) and may not name a synonym (2788) [`schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not`] |
+| A table-valued function's result columns | A view over the function binds them, and breaks (207) when they change [`a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`] |
+| A table's primary key, unique constraints and unique indexes | A foreign key binds one by `key_index_id`, and is refused without one (1776), as #1673 compares them on PostgreSQL [`a_foreign_key_binds_a_candidate_key_and_a_persisted_column_a_deterministic_function`] |
+| A function's `IsDeterministic`, `IsPrecise` | A `PERSISTED` computed column refuses a function that is not deterministic (4936); no signature shows it |
+| A column's type, a user type by `schema.name` | A schema-bound view and a computed column read it at creation |
 
 A three-part or four-part reference refuses by name: the externals file stages
 objects in one database and cannot stand in for another.
