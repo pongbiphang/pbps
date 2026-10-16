@@ -6194,7 +6194,8 @@ So the change carries its parent's key (`AttachPartition::key`), and
 4. drop it.
 
 Its name is `pbps_attach_<uid>`, the table's own identity. Nothing finds it by
-prefix.
+prefix, and no declared check may start with `pbps_attach_`: the name is
+pbps's, so one that stands is the run's to remove, not a user's.
 
 **What runs beside the plan.**
 - *No checkpoint after the `ADD`.* Measured, a `NOT VALID` check makes every
@@ -6210,10 +6211,11 @@ prefix.
   records it as the database holds it.
 - *Later failures keep it.* A run stopped after the `VALIDATE` keeps the
   validated CHECK for `--resume`, whose last statement drops it.
-- *Abandoning goes through `baseline`.* Leon chose this route. When the newest
-  ledger entry is a staged checkpoint or a failed attempt, `baseline` first
-  drops a CHECK named after a table's identity in that entry, on that table,
-  and its recorded reason says what it removed.
+- *Abandoning goes through `baseline`.* Leon chose this route. `baseline`
+  first drops a CHECK named after a table's identity in the newest ledger
+  entry, on that table, and its recorded reason says what it removed. It
+  does so whatever that entry's kind: a run that dies between the `ADD` and
+  the `VALIDATE`'s checkpoint records neither a checkpoint nor a failure.
 
 Against #1776 it adds no change kind and no order. The attach stays one
 operation, and the temporary name is claimed and released inside it.
@@ -6224,11 +6226,14 @@ Pinned by the live
 - a `VALIDATE` stopped by an event trigger leaves no CHECK and no checkpoint;
 - an attach stopped after its checkpoint leaves the validated CHECK, which
   `baseline` removes by name;
+- a `NOT VALID` CHECK left with no checkpoint after it is removed by
+  `baseline` too;
 - the same stop resumed drops it, and the next plan is empty;
 - a staged attach scans its table as often as a transactional one, which a
   CHECK that does not imply the bound fails (3 against 2).
 
-Each mechanism fails the test when reverted. Also pinned by the unit
-`a_staged_attach_validates_a_check_its_bound_implies_first`, and by the staged
+Each mechanism fails the test when reverted. Also pinned by the units
+`a_staged_attach_validates_a_check_its_bound_implies_first` and
+`a_declared_check_cannot_take_the_staged_attachs_name`, and by the staged
 step of `a_table_is_attached_as_a_partition_through_the_cli`, which fails
 without the comparison filter.

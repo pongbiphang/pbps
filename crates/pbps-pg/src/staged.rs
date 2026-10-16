@@ -164,12 +164,34 @@ async fn remove_unvalidated(conn: &mut Conn, check: &ScanCheck) -> Result<String
 /// `tables` are the tables the newest ledger entry names, with their
 /// identities; a staged attach's CHECK is named after its table's identity
 /// ([`crate::emit::scan_check_name`]), so each is looked for by that exact
-/// name on that table, and nothing else is touched. Returns what was
-/// removed, for the record.
+/// name on that table, and nothing else is touched. No declared check can
+/// hold such a name ([`crate::emit::SCAN_CHECK_PREFIX`]), so one that stands
+/// is pbps's, whatever the run that left it recorded before it stopped.
+/// Returns what was removed, for the record.
 pub async fn remove_scan_checks<'a>(
     conn: &mut Conn,
     tables: impl IntoIterator<Item = (&'a pbps_model::Uid, &'a pbps_model::TableName)>,
 ) -> Result<Vec<ScanCheck>, DbError> {
+    // One read for every table. The pattern only narrows it: what is removed
+    // is matched below by the exact name its table's identity gives.
+    let rows = conn
+        .query_with(
+            "SELECT n.nspname, c.relname, k.conname FROM pg_catalog.pg_constraint k \
+             JOIN pg_catalog.pg_class c ON c.oid = k.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE k.contype = 'c' AND starts_with(k.conname::text, $1)",
+            &[crate::emit::SCAN_CHECK_PREFIX.into()],
+        )
+        .await?;
+    let mut standing = std::collections::BTreeSet::new();
+    for row in &rows {
+        let field = |column: &str| -> Result<String, DbError> {
+            row.try_get::<&str>(column)?
+                .map(str::to_owned)
+                .ok_or_else(|| missing(column))
+        };
+        standing.insert((field("nspname")?, field("relname")?, field("conname")?));
+    }
     let mut removed = Vec::new();
     for (uid, table) in tables {
         let check = ScanCheck {
@@ -177,20 +199,11 @@ pub async fn remove_scan_checks<'a>(
             name: crate::emit::scan_check_name(uid),
             step: ScanCheckStep::Add,
         };
-        let rows = conn
-            .query_with(
-                "SELECT 1 FROM pg_catalog.pg_constraint k \
-                 JOIN pg_catalog.pg_class c ON c.oid = k.conrelid \
-                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = $1 AND c.relname = $2 AND k.conname = $3 AND k.contype = 'c'",
-                &[
-                    check.table.schema.as_str().into(),
-                    check.table.name.as_str().into(),
-                    check.name.as_str().into(),
-                ],
-            )
-            .await?;
-        if rows.is_empty() {
+        if !standing.contains(&(
+            check.table.schema.as_str().to_owned(),
+            check.table.name.as_str().to_owned(),
+            check.name.clone(),
+        )) {
             continue;
         }
         let sql = crate::emit::drop_scan_check(&check)

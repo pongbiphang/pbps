@@ -129,6 +129,16 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
                 "check constraint `{name}` has an empty expression"
             )));
         }
+        // The prefix a staged attach's temporary CHECK takes (DEC-1638.1).
+        // `baseline` removes one by its exact name, so a declared check
+        // that could hold that name would be removed with it: none can.
+        if name.starts_with(crate::emit::SCAN_CHECK_PREFIX) {
+            found.push(invalid(format!(
+                "check constraint `{name}` starts with `{}`, which pbps keeps for the \
+                 temporary CHECK of a staged attach; rename it",
+                crate::emit::SCAN_CHECK_PREFIX
+            )));
+        }
     }
     for (name, index) in &table.indexes {
         let what = format!("index `{name}`");
@@ -759,6 +769,41 @@ mod tests {
 
     fn role_errors(name: &str, role: &Role) -> Vec<DialectError> {
         super::role(name, role, &declarations())
+    }
+
+    /// `baseline` removes a staged attach's temporary CHECK by its exact
+    /// name, so no declared check may take the prefix that name has
+    /// (DEC-1638.1): it would be removed with it.
+    #[test]
+    fn a_declared_check_cannot_take_the_staged_attachs_name() {
+        let refused = |name: &str| {
+            let mut table = Table::default();
+            table.columns.insert(
+                "n".into(),
+                pbps_model::Column::new("integer".parse().unwrap()),
+            );
+            table.checks.insert(
+                name.into(),
+                pbps_model::CheckConstraint {
+                    expression: "n > 0".into(),
+                },
+            );
+            table_structure(&table)
+                .iter()
+                .any(|e| e.to_string().contains("keeps for the temporary CHECK"))
+        };
+        assert!(refused("pbps_attach_t_01"));
+        assert!(refused("pbps_attach_"));
+        // Negative: the prefix elsewhere in the name, or spelled otherwise,
+        // is another name to the engine, and never one pbps writes.
+        for name in [
+            "ck_pbps_attach_t",
+            "PBPS_ATTACH_t",
+            "pbps_attach",
+            "pbps_ck",
+        ] {
+            assert!(!refused(name), "{name}");
+        }
     }
 
     /// A table with a `jsonb` and an `integer` column, and one index over the

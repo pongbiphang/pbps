@@ -189,22 +189,17 @@ pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
 /// Takes out the temporary CHECK a staged attach left on its table, before
 /// `baseline` takes the database as it stands (#1638, DEC-1638.1).
 ///
-/// Only when the newest entry is a staged checkpoint or a failed attempt,
-/// the two a run that stopped leaves, and only under the exact name the
-/// table's identity in that entry gives: never by a prefix. The database
-/// cannot be read while a `NOT VALID` one stands, and a validated one is
-/// pbps's own and no declaration's. SQL Server's staged plans write none.
-/// Returns each removed, named, for the record.
+/// Only under the exact name the table's identity in the newest entry
+/// gives: never by a prefix. Whatever that entry's kind: a run that dies
+/// between the `ADD` and the `VALIDATE`'s checkpoint records neither a
+/// checkpoint nor a failure. No declared check can hold the name, the
+/// database cannot be read while a `NOT VALID` one stands, and a validated
+/// one is pbps's own. SQL Server's staged plans write none. Returns each
+/// removed, named, for the record.
 pub async fn remove_scan_checks(conn: &mut Conn) -> anyhow::Result<Vec<String>> {
     let Some(entry) = latest(conn).await? else {
         return Ok(Vec::new());
     };
-    if !matches!(
-        entry.snapshot.kind,
-        pbps_model::StateKind::Staged | pbps_model::StateKind::Failed
-    ) {
-        return Ok(Vec::new());
-    }
     let removed = match conn.driver() {
         Driver::Mssql => Vec::new(),
         Driver::Postgres => {

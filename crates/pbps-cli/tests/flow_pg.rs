@@ -9762,7 +9762,8 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
 /// DEC-1638.1). A `VALIDATE` that fails takes it out itself, with no
 /// checkpoint to resume from. An attach that fails after its checkpoint
 /// leaves it validated: `baseline` takes it out by its exact name before it
-/// records, and `--resume` drops it as the run's last statement. Measured
+/// records, as it does one a run that died before any checkpoint left, and
+/// `--resume` drops it as the run's last statement. Measured
 /// by `seq_scan`, the staged attach scans its table no more often than a
 /// transactional one does, which reads the table once more for the attach.
 #[test]
@@ -9909,6 +9910,32 @@ fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
         reason.starts_with("the attach is given up (first removed the staged attach's"),
         "{reason}"
     );
+
+    // B': a run that dies after the `ADD` commits and before the `VALIDATE`'s
+    // checkpoint records nothing: the newest entry is the baseline above.
+    // `baseline` still takes the CHECK out, which no declaration can name.
+    let removed = stdout(&o);
+    let name = removed
+        .split("CHECK `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .expect("the removed CHECK is named");
+    on_server(
+        &connection,
+        &format!(
+            "ALTER TABLE app.t ADD CONSTRAINT \"{name}\" \
+             CHECK (ts >= DATE '2024-01-01') NOT VALID"
+        ),
+    );
+    let o = succeeds(d.run(&["baseline", "--db", &connection, "--reason", "the run died"]));
+    assert!(
+        stdout(&o).contains(&format!(
+            "Removed the staged attach's temporary CHECK `{name}`"
+        )),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(temporaries(), 0);
 
     // C: stopped there again, and resumed: the run drops the CHECK itself.
     let plan = connected_artifact(&d, &connection, true);

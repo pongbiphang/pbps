@@ -3909,8 +3909,12 @@ pub(crate) fn staged_attach(change: &Change) -> Option<Sql> {
 
 /// The temporary CHECK's name for the table whose identity is `uid`.
 pub fn scan_check_name(uid: &pbps_model::Uid) -> String {
-    format!("pbps_attach_{uid}")
+    format!("{SCAN_CHECK_PREFIX}{uid}")
 }
+
+/// What every [`scan_check_name`] starts with, and no declared check may
+/// (DEC-1638.1).
+pub const SCAN_CHECK_PREFIX: &str = "pbps_attach_";
 
 /// A CHECK expression on the parent's `key` that implies `bound`, or `None`
 /// where the staged form does not apply: a HASH or DEFAULT bound, an empty
