@@ -373,7 +373,7 @@ indexes:
   likewise (DEC-1632.1). In a staged plan a range or list attach first adds
   and validates a CHECK that implies its bound, so the attach skips the scan
   that holds the table locked; the CHECK is dropped after, and one a stopped
-  run leaves is taken out by `baseline`; no declared check may start with its
+  run leaves is taken out by `baseline`; no declared constraint may start with its
   `pbps_attach_` prefix (DEC-1638.1). A standing parent's columns change as a table's
   do: added, dropped, retyped, renamed, a default or NOT NULL changed, the
   engine recursing each into every partition, whose own defaults and NOT

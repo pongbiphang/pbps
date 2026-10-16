@@ -129,13 +129,39 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
                 "check constraint `{name}` has an empty expression"
             )));
         }
-        // The prefix a staged attach's temporary CHECK takes (DEC-1638.1).
-        // `baseline` removes one by its exact name, so a declared check
-        // that could hold that name would be removed with it: none can.
+    }
+    // The prefix a staged attach's temporary CHECK takes (DEC-1638.1).
+    // `baseline` removes one by its exact name, so a declared check that
+    // could hold that name would be removed with it; and a table's
+    // constraints of every kind share one namespace, so a key or a foreign
+    // key holding it would fail the attach's `ADD`. None can.
+    let constraints = table
+        .primary_key
+        .iter()
+        .filter_map(|key| key.name.as_deref().map(|name| ("primary key", name)))
+        .chain(
+            table
+                .unique
+                .keys()
+                .map(|name| ("unique constraint", name.as_str())),
+        )
+        .chain(
+            table
+                .foreign_keys
+                .keys()
+                .map(|name| ("foreign key", name.as_str())),
+        )
+        .chain(
+            table
+                .checks
+                .keys()
+                .map(|name| ("check constraint", name.as_str())),
+        );
+    for (kind, name) in constraints {
         if name.starts_with(crate::emit::SCAN_CHECK_PREFIX) {
             found.push(invalid(format!(
-                "check constraint `{name}` starts with `{}`, which pbps keeps for the \
-                 temporary CHECK of a staged attach; rename it",
+                "{kind} `{name}` starts with `{}`, which pbps keeps for the temporary \
+                 CHECK of a staged attach; rename it",
                 crate::emit::SCAN_CHECK_PREFIX
             )));
         }
@@ -772,37 +798,77 @@ mod tests {
     }
 
     /// `baseline` removes a staged attach's temporary CHECK by its exact
-    /// name, so no declared check may take the prefix that name has
-    /// (DEC-1638.1): it would be removed with it.
+    /// name, so no declared constraint may take the prefix that name has
+    /// (DEC-1638.1): a check would be removed with it, and any kind would
+    /// fail the attach's `ADD`, in the namespace they share.
     #[test]
-    fn a_declared_check_cannot_take_the_staged_attachs_name() {
-        let refused = |name: &str| {
+    fn a_declared_constraint_cannot_take_the_staged_attachs_name() {
+        let refused = |kind: &str, name: &str| {
             let mut table = Table::default();
-            table.columns.insert(
-                "n".into(),
-                pbps_model::Column::new("integer".parse().unwrap()),
-            );
-            table.checks.insert(
-                name.into(),
-                pbps_model::CheckConstraint {
-                    expression: "n > 0".into(),
-                },
-            );
-            table_structure(&table)
-                .iter()
-                .any(|e| e.to_string().contains("keeps for the temporary CHECK"))
+            for column in ["n", "m"] {
+                table.columns.insert(
+                    column.into(),
+                    pbps_model::Column::new("integer".parse().unwrap()),
+                );
+            }
+            if kind == "primary key" {
+                table.primary_key = Some(pbps_model::PrimaryKey {
+                    name: Some(name.into()),
+                    columns: vec!["n".into()],
+                    storage_parameters: Default::default(),
+                });
+            } else if kind == "unique constraint" {
+                table.unique.insert(
+                    name.into(),
+                    pbps_model::UniqueConstraint {
+                        columns: vec!["m".into()],
+                        storage_parameters: Default::default(),
+                    },
+                );
+            } else if kind == "foreign key" {
+                table.foreign_keys.insert(
+                    name.into(),
+                    pbps_model::ForeignKey {
+                        columns: vec!["m".into()],
+                        references_table: "app.other".parse().unwrap(),
+                        references_columns: vec!["id".into()],
+                        on_delete: Default::default(),
+                        on_update: Default::default(),
+                    },
+                );
+            } else {
+                table.checks.insert(
+                    name.into(),
+                    pbps_model::CheckConstraint {
+                        expression: "n > 0".into(),
+                    },
+                );
+            }
+            table_structure(&table).iter().any(|e| {
+                let said = e.to_string();
+                said.contains(&format!("{kind} `{name}`"))
+                    && said.contains("keeps for the temporary CHECK")
+            })
         };
-        assert!(refused("pbps_attach_t_01"));
-        assert!(refused("pbps_attach_"));
-        // Negative: the prefix elsewhere in the name, or spelled otherwise,
-        // is another name to the engine, and never one pbps writes.
-        for name in [
-            "ck_pbps_attach_t",
-            "PBPS_ATTACH_t",
-            "pbps_attach",
-            "pbps_ck",
+        for kind in [
+            "primary key",
+            "unique constraint",
+            "foreign key",
+            "check constraint",
         ] {
-            assert!(!refused(name), "{name}");
+            assert!(refused(kind, "pbps_attach_t_01"), "{kind}");
+            assert!(refused(kind, "pbps_attach_"), "{kind}");
+            // Negative: the prefix elsewhere in the name, or spelled
+            // otherwise, is another name to the engine, and never one pbps
+            // writes.
+            for name in [
+                "ck_pbps_attach_t",
+                "PBPS_ATTACH_t",
+                "pbps_attach",
+                "pbps_ck",
+            ] {
+                assert!(!refused(kind, name), "{kind} {name}");
+            }
         }
     }
 

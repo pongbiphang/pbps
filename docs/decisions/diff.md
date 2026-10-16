@@ -6194,8 +6194,10 @@ So the change carries its parent's key (`AttachPartition::key`), and
 4. drop it.
 
 Its name is `pbps_attach_<uid>`, the table's own identity. Nothing finds it by
-prefix, and no declared check may start with `pbps_attach_`: the name is
-pbps's, so one that stands is the run's to remove, not a user's.
+prefix, and no declared constraint of any kind may start with
+`pbps_attach_`: the name is pbps's, so a CHECK that stands under it is the
+run's to remove, not a user's, and no key or foreign key fails its `ADD` in
+the namespace a table's constraints share.
 
 **What runs beside the plan.**
 - *No checkpoint after the `ADD`.* Measured, a `NOT VALID` check makes every
@@ -6234,6 +6236,6 @@ Pinned by the live
 
 Each mechanism fails the test when reverted. Also pinned by the units
 `a_staged_attach_validates_a_check_its_bound_implies_first` and
-`a_declared_check_cannot_take_the_staged_attachs_name`, and by the staged
+`a_declared_constraint_cannot_take_the_staged_attachs_name`, and by the staged
 step of `a_table_is_attached_as_a_partition_through_the_cli`, which fails
 without the comparison filter.
