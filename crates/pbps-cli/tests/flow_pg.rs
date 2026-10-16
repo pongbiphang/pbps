@@ -26797,6 +26797,21 @@ fn a_partition_trees_triggers_go_through_the_cli() {
     .unwrap();
     succeeds(d.run(&["plan"]));
     d.commit();
+    // A comment on one clone is the clone's own, which the parent's rebuild
+    // would lose: the connected plan refuses it by name (#1632 review).
+    on_server(
+        &tgt,
+        "COMMENT ON TRIGGER ev_row ON app.ev_a IS 'kept by hand'",
+    );
+    let o = d.run(&["plan", "--db", &tgt]);
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        code(&o) != 0
+            && said.contains("on its clone on `app.ev_a`")
+            && said.contains("kept by hand"),
+        "{said}"
+    );
+    on_server(&tgt, "COMMENT ON TRIGGER ev_row ON app.ev_a IS NULL");
     applied("routine.json", &["--allow", "destructive"]);
     assert_eq!(
         (triggers_on("app.ev_a", true), triggers_on("app.ev_b", true)),

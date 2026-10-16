@@ -271,6 +271,7 @@ pub async fn before_a_rebuild(
             read_trigger_enabled(conn, oid, &mut carries).await?;
             read_attached(conn, oid, "pg_trigger", &mut carries).await?;
             read_extension_ties(conn, oid, "pg_trigger", &mut carries).await?;
+            read_clones(conn, oid, &mut carries).await?;
         }
     }
     Ok(Rebuild {
@@ -1252,6 +1253,42 @@ pub fn catalogs_read_by_address() -> Vec<&'static str> {
         .iter()
         .map(|(catalog, ..)| *catalog)
         .collect()
+}
+
+/// What the clones of a partitioned parent's row trigger carry of their own
+/// (#1632 review). Measured on 16 and 18, the parent's `DROP` takes every
+/// clone with it and its `CREATE` makes them again bare, so a clone's enabled
+/// mode, its comment or label and its extension tie are lost by a rebuild of
+/// the parent, or of the routine it runs, as the parent's own would be. A
+/// clone is no module, so it is asked here, under its parent, by its table.
+async fn read_clones(conn: &mut Conn, oid: i64, carries: &mut Vec<Carried>) -> Result<(), DbError> {
+    let rows = conn
+        .query_with(
+            "SELECT tg.oid::int8 AS oid,
+                    pg_catalog.format('%I.%I', n.nspname, c.relname) AS on_table
+               FROM pg_catalog.pg_trigger tg
+               JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE tg.tgparentid = ($1::int8)::oid
+              ORDER BY 2",
+            &[Param::I64(oid)],
+        )
+        .await?;
+    for row in rows {
+        let clone: i64 = row
+            .try_get("oid")?
+            .ok_or_else(|| DbError::BadRow("a trigger clone without an oid".into()))?;
+        let on = text(&row, "on_table")?;
+        let mut own = Vec::new();
+        read_trigger_enabled(conn, clone, &mut own).await?;
+        read_attached(conn, clone, "pg_trigger", &mut own).await?;
+        read_extension_ties(conn, clone, "pg_trigger", &mut own).await?;
+        carries.extend(own.into_iter().map(|c| Carried {
+            what: c.what,
+            detail: format!("on its clone on `{on}`: {}", c.detail),
+        }));
+    }
+    Ok(())
 }
 
 /// Everything the catalog attaches to this object's address, which a `DROP`

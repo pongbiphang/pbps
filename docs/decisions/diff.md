@@ -5872,7 +5872,10 @@ refused any trigger, since the reader could not hold a partition with one.
 
 **What runs beside the plan.** The dependents walk of a rebuilt routine
 leaves a clone out: its parent is the dependent, and the parent's drop and
-create take it. The reference-data trigger guard authenticates a clone a
+create take it. What a clone holds of its own, its enabled mode, a comment,
+a security label or an extension tie, a rebuild of the parent would lose, so
+the parent's check before a rebuild reads each clone's too and refuses it by
+name. The reference-data trigger guard authenticates a clone a
 write reaches as its parent's trigger, by the parent's table, name and
 definition, and approves that parent trigger with it. Before each row
 statement it then accepts a clone whose parent trigger it approved, with the
