@@ -1098,6 +1098,123 @@ async fn a_nested_base_types_properties_move_the_pin_of_the_type_that_holds_it()
     }
 }
 
+/// Whether a base type is the engine's own is its OID, not its schema (#2061).
+/// A superuser can install an extension in `pg_catalog`, or create a base type
+/// there by name, with `allow_system_table_mods` off; its OID is above
+/// `FirstNormalObjectId` and `ALTER TYPE … SET (…)` moves nothing a schema test
+/// would pin. A type initdb made in the same schema keeps its six fields.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_base_type_filed_in_pg_catalog_after_initdb_is_pinned_by_its_properties() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "syspins").await;
+        db.sql(
+            "CREATE EXTENSION citext VERSION '1.4' SCHEMA pg_catalog;
+             CREATE SCHEMA app;
+             CREATE TYPE app.ci AS (v pg_catalog.citext);
+             CREATE DOMAIN app.ci_domain AS pg_catalog.citext;
+             CREATE TYPE app.ci_array AS (v pg_catalog.citext[]);
+             CREATE TYPE app.plain AS (a pg_catalog.int4, b pg_catalog.text);
+             CREATE TYPE pg_catalog.t2061_base;
+             CREATE FUNCTION public.t2061_in(cstring) RETURNS pg_catalog.t2061_base
+                 LANGUAGE internal IMMUTABLE STRICT AS 'textin';
+             CREATE FUNCTION public.t2061_out(pg_catalog.t2061_base) RETURNS cstring
+                 LANGUAGE internal IMMUTABLE STRICT AS 'textout';
+             CREATE TYPE pg_catalog.t2061_base (INPUT = public.t2061_in,
+                 OUTPUT = public.t2061_out, LIKE = pg_catalog.text);
+             CREATE TYPE app.own AS (v pg_catalog.t2061_base);",
+        )
+        .await;
+        let label = server.label;
+
+        // What is read: a type in `pg_catalog` that the engine did not make
+        // carries its properties, and the one it made carries none.
+        let attribute = |t: &UserType, index: usize| match &t.definition().body {
+            Body::Composite(c) => c.attributes[index].ty.clone(),
+            Body::Enum { .. } | Body::Domain(_) => panic!("{:?}", t.definition()),
+        };
+        for (name, version) in [("ci", Some("1.4")), ("own", None)] {
+            let held = present(&mut db.conn, "app", name).await;
+            let Component::Other {
+                oid,
+                schema,
+                base: Some(base),
+                ..
+            } = attribute(&held, 0)
+            else {
+                panic!("app.{name} on {label}: {:?}", attribute(&held, 0))
+            };
+            assert_eq!(schema, "pg_catalog", "on {label}");
+            assert!(oid >= 16384, "{name} has OID {oid} on {label}");
+            assert_eq!(base.extension_version.as_deref(), version, "on {label}");
+        }
+        let plain = present(&mut db.conn, "app", "plain").await;
+        for index in 0..2 {
+            let Component::Other {
+                oid,
+                schema,
+                base: None,
+                ..
+            } = attribute(&plain, index)
+            else {
+                panic!("{:?} on {label}", attribute(&plain, index))
+            };
+            assert_eq!(schema, "pg_catalog", "on {label}");
+            assert!(oid < 16384, "built-in OID {oid} on {label}");
+        }
+
+        // No-ops leave every pin where it was.
+        let holders = ["ci", "ci_domain", "ci_array", "own"];
+        let mut before = Vec::new();
+        for name in holders {
+            before.push(pin_of(&mut db.conn, "app", name).await);
+        }
+        let plain_before = pin_of(&mut db.conn, "app", "plain").await;
+        for sql in [
+            "COMMENT ON TYPE pg_catalog.citext IS 'case-insensitive text'",
+            "COMMENT ON TYPE pg_catalog.t2061_base IS 'no-op'",
+            "ALTER TYPE pg_catalog.citext SET (storage = extended)",
+        ] {
+            db.sql(sql).await;
+            for (name, pin) in holders.iter().zip(&before) {
+                assert_eq!(
+                    &pin_of(&mut db.conn, "app", name).await,
+                    pin,
+                    "`{sql}` moved the pin of app.{name} on {label}"
+                );
+            }
+        }
+
+        // Each change moves what holds the type, directly, through a domain
+        // and through an array, and never the composite of built-ins.
+        for (sql, moved) in [
+            ("ALTER TYPE pg_catalog.citext SET (storage = main)", 3),
+            ("ALTER EXTENSION citext UPDATE TO '1.5'", 3),
+            ("ALTER TYPE pg_catalog.t2061_base SET (storage = main)", 1),
+        ] {
+            let mut was = Vec::new();
+            for name in holders {
+                was.push(pin_of(&mut db.conn, "app", name).await);
+            }
+            db.sql(sql).await;
+            let mut changed = 0;
+            for (name, old) in holders.iter().zip(&was) {
+                if &pin_of(&mut db.conn, "app", name).await != old {
+                    changed += 1;
+                }
+            }
+            assert_eq!(changed, moved, "`{sql}` moved {changed} pins on {label}");
+            assert_eq!(
+                pin_of(&mut db.conn, "app", "plain").await,
+                plain_before,
+                "`{sql}` moved a type that holds only built-ins on {label}"
+            );
+        }
+        db.sql("DROP EXTENSION citext CASCADE").await;
+        db.drop().await;
+    }
+}
+
 /// Reading a type runs none of its code: a domain whose CHECK and DEFAULT call
 /// a function that raises is read as the text of the catalog, and the read
 /// does not cast to it (DEC-1663.1).
