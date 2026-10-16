@@ -15,12 +15,25 @@ use super::{TestDb, connected_base, fresh, pull};
 /// least one. PostgreSQL plans no role of its own (ADR-0010 §3), so the role
 /// kinds are SQL Server's to cover.
 const SCENARIOS: &[Scenario] = &[
+    // `AddIndex` and `AddCheck` each have pairs of their own below; the
+    // first pair is a foreign key added, which no other pair plans (#1965).
     Scenario {
-        name: "an_index_and_a_check_on_one_table",
-        pair: ["AddIndex", "AddCheck"],
+        name: "a_foreign_key_added_beside_an_index",
+        pair: ["AddForeignKey", "AddIndex"],
         gap: None,
         uid_order: None,
         base: r#"
+table: app.p
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+data:
+  mode: exact
+  rows:
+    1: {}
+    3: {}
+
+---
 table: app.t
 columns:
   id: {type: integer, nullable: false}
@@ -34,17 +47,30 @@ data:
     2: {a: 3, b: 4}
 "#,
         desired: r#"
+table: app.p
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+data:
+  mode: exact
+  rows:
+    1: {}
+    3: {}
+
+---
 table: app.t
 columns:
   id: {type: integer, nullable: false}
   a: {type: integer}
   b: {type: integer}
 primary_key: [id]
-checks:
-  ck_b: (b > 0)
-indexes:
-  ix_a:
+foreign_keys:
+  fk_a:
     columns: [a]
+    references: app.p(id)
+indexes:
+  ix_b:
+    columns: [b]
 data:
   mode: exact
   rows:

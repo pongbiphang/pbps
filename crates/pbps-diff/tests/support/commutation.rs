@@ -108,9 +108,18 @@ pub enum Finding {
     /// The plan made twice from the same uids is not byte-identical. Nothing
     /// excuses it.
     Nondeterministic(String),
-    /// The plan made with new uids does not end as the plan does. Not the
-    /// pair's fault, so a listed `gap` does not excuse it; only `uid_order`.
-    Reminted(String),
+}
+
+/// What a scenario's run found: the pair's result, and apart from it whether
+/// the plan made with new uids ends as the plan does. Kept apart so that
+/// neither can stand in for the other: the swapped run is checked whatever
+/// the plan with new uids did.
+#[derive(Debug)]
+pub struct Checked {
+    pub pair: Result<(), Finding>,
+    /// How the plan with new uids ended otherwise, if it did. Not the pair's
+    /// fault, so a listed `gap` does not excuse it; only `uid_order`.
+    pub reminted: Option<String>,
 }
 
 impl From<String> for Finding {
@@ -450,12 +459,27 @@ pub async fn outcome_of<E: Engine>(
     out.map_err(|f| match f {
         Finding::Harness(e) => Finding::Harness(format!("{tag}: {e}")),
         Finding::Differs(e) => Finding::Differs(format!("{tag}: {e}")),
-        kept @ (Finding::Stale(_) | Finding::Nondeterministic(_) | Finding::Reminted(_)) => kept,
+        kept @ (Finding::Stale(_) | Finding::Nondeterministic(_)) => kept,
     })
 }
 
 /// Runs one scenario and says what, if anything, is wrong with it.
-pub async fn check<E: Engine>(engine: &E, scenario: &Scenario, role: &str) -> Result<(), Finding> {
+pub async fn check<E: Engine>(engine: &E, scenario: &Scenario, role: &str) -> Checked {
+    match checked(engine, scenario, role).await {
+        Ok(found) => found,
+        // Nothing past the failure ran, so there is no new-uid result.
+        Err(f) => Checked {
+            pair: Err(f),
+            reminted: None,
+        },
+    }
+}
+
+async fn checked<E: Engine>(
+    engine: &E,
+    scenario: &Scenario,
+    role: &str,
+) -> Result<Checked, Finding> {
     let dialect = engine.dialect();
     let p = prepare(engine.name(), dialect, scenario, role);
     // Determinism: the same plan from the same uids, byte for byte.
@@ -585,14 +609,13 @@ pub async fn check<E: Engine>(engine: &E, scenario: &Scenario, role: &str) -> Re
         true,
     )
     .await?;
-    same("the plan with new uids", &a, &c).map_err(|f| match f {
-        Finding::Differs(e) => Finding::Reminted(e),
-        kept @ (Finding::Harness(_)
-        | Finding::Stale(_)
-        | Finding::Nondeterministic(_)
-        | Finding::Reminted(_)) => kept,
-    })?;
-    let b = outcome_of(
+    let reminted = match same("the plan with new uids", &a, &c) {
+        Ok(()) => None,
+        Err(Finding::Differs(e)) => Some(e),
+        Err(other) => return Err(other),
+    };
+    // The swapped run, whatever the plan with new uids did.
+    let pair = match outcome_of(
         engine,
         &tag("b"),
         &p,
@@ -602,12 +625,16 @@ pub async fn check<E: Engine>(engine: &E, scenario: &Scenario, role: &str) -> Re
         &p.ids,
         false,
     )
-    .await?;
-    same(
-        &format!("{} and {} swapped", kinds[earlier], kinds[later]),
-        &a,
-        &b,
-    )
+    .await
+    {
+        Ok(b) => same(
+            &format!("{} and {} swapped", kinds[earlier], kinds[later]),
+            &a,
+            &b,
+        ),
+        Err(f) => Err(f),
+    };
+    Ok(Checked { pair, reminted })
 }
 
 /// Runs a scenario's pair in both orders whatever the effects say of it, and
@@ -658,32 +685,33 @@ pub async fn forced<E: Engine>(engine: &E, scenario: &Scenario, role: &str) -> R
     same("the forced order", &a, &b)
 }
 
-/// What a scenario's result says, `None` when it is as listed. A listed gap
+/// What a scenario's run says, `None` when it is as listed. A listed gap
 /// excuses only the pair's own difference (`Differs`), and `uid_order` only
-/// the plan with new uids ending otherwise (`Reminted`). A plan that is not
-/// byte-identical from the same uids, a broken harness or a stale pair fails
-/// whatever is listed.
-pub fn verdict(scenario: &Scenario, result: Result<(), Finding>) -> Option<String> {
+/// the plan with new uids ending otherwise; each is judged whatever the
+/// other found. A plan that is not byte-identical from the same uids, a
+/// broken harness or a stale pair fails whatever is listed.
+pub fn verdict(scenario: &Scenario, found: Checked) -> Option<String> {
     let name = scenario.name;
-    match (result, scenario.gap) {
-        (Err(Finding::Reminted(e)), _) => match scenario.uid_order {
-            Some(_) => None,
-            None => Some(format!(
-                "{name}: the plan with new uids ends otherwise: {e}"
-            )),
-        },
-        (Err(Finding::Nondeterministic(e)), _) => Some(format!(
-            "{name}: the same plan from the same uids differs: {e}"
-        )),
-        (Ok(()), None) | (Err(Finding::Differs(_)), Some(_)) => None,
-        (Ok(()), Some(gap)) => Some(format!(
+    let mut wrong = Vec::new();
+    if let (Some(e), None) = (&found.reminted, scenario.uid_order) {
+        wrong.push(format!(
+            "{name}: the plan with new uids ends otherwise: {e}"
+        ));
+    }
+    match (found.pair, scenario.gap) {
+        (Ok(()), None) | (Err(Finding::Differs(_)), Some(_)) => {}
+        (Ok(()), Some(gap)) => wrong.push(format!(
             "{name}: the gap #{gap} no longer shows; list the pair as an ordinary one"
         )),
-        (Err(Finding::Stale(e)), Some(gap)) => Some(format!(
+        (Err(Finding::Stale(e)), Some(gap)) => wrong.push(format!(
             "{name}: the effects now order the pair of gap #{gap}; replace it\n{e}"
         )),
-        (Err(f), _) => Some(format!("{name}: {f:?}")),
+        (Err(Finding::Nondeterministic(e)), _) => wrong.push(format!(
+            "{name}: the same plan from the same uids differs: {e}"
+        )),
+        (Err(f), _) => wrong.push(format!("{name}: {f:?}")),
     }
+    (!wrong.is_empty()).then(|| wrong.join("\n"))
 }
 
 /// Runs the whole sample and fails with every scenario that is wrong: a pair
@@ -714,24 +742,35 @@ pub async fn suite<E: Engine>(engine: &E, scenarios: &[Scenario], role: &str) {
 mod verdict_tests {
     use super::*;
 
-    fn scenario(gap: Option<u32>) -> Scenario {
+    fn scenario(gap: Option<u32>, uid_order: Option<u32>) -> Scenario {
         Scenario {
             name: "s",
             pair: ["AddColumn", "AddColumn"],
             gap,
-            uid_order: None,
+            uid_order,
             base: "",
             desired: "",
         }
     }
 
+    fn found(pair: Result<(), Finding>, reminted: Option<&str>) -> Checked {
+        Checked {
+            pair,
+            reminted: reminted.map(str::to_owned),
+        }
+    }
+
+    fn differs() -> Result<(), Finding> {
+        Err(Finding::Differs("x".into()))
+    }
+
     #[test]
     fn a_listed_gap_excuses_the_pairs_own_difference() {
         assert_eq!(
-            verdict(&scenario(Some(1)), Err(Finding::Differs("x".into()))),
+            verdict(&scenario(Some(1), None), found(differs(), None)),
             None
         );
-        assert_eq!(verdict(&scenario(None), Ok(())), None);
+        assert_eq!(verdict(&scenario(None, None), found(Ok(()), None)), None);
     }
 
     /// The plan's own instability is never the pair's: a gap does not hide
@@ -740,35 +779,32 @@ mod verdict_tests {
     #[test]
     fn a_listed_gap_does_not_excuse_an_unstable_plan() {
         let same_uids = || Err(Finding::Nondeterministic("not byte-identical".into()));
-        let new_uids = || Err(Finding::Reminted("column order".into()));
-        assert!(verdict(&scenario(Some(1)), same_uids()).is_some());
-        assert!(verdict(&scenario(Some(1)), new_uids()).is_some());
+        let gap = scenario(Some(1), None);
+        assert!(verdict(&gap, found(same_uids(), None)).is_some());
+        assert!(verdict(&gap, found(differs(), Some("column order"))).is_some());
         let harness = Err(Finding::Harness("refused".into()));
-        assert!(verdict(&scenario(Some(1)), harness).is_some());
+        assert!(verdict(&gap, found(harness, None)).is_some());
         // Not even a listed uid order excuses a plan unstable from the same
         // uids.
-        let ordered = Scenario {
-            uid_order: Some(1),
-            ..scenario(Some(1))
-        };
-        assert!(verdict(&ordered, same_uids()).is_some());
+        assert!(verdict(&scenario(Some(1), Some(1)), found(same_uids(), None)).is_some());
     }
 
-    /// Only `uid_order` excuses the plan with new uids ending otherwise.
+    /// A listed uid order excuses the plan with new uids, and the swapped
+    /// run is still judged: a failure there is not hidden by it.
     #[test]
-    fn a_listed_uid_order_excuses_only_the_plan_with_new_uids() {
-        let ordered = Scenario {
-            uid_order: Some(1),
-            ..scenario(None)
-        };
-        assert_eq!(verdict(&ordered, Err(Finding::Reminted("x".into()))), None);
-        assert!(verdict(&ordered, Err(Finding::Differs("x".into()))).is_some());
+    fn a_listed_uid_order_still_judges_the_swapped_run() {
+        let ordered = scenario(None, Some(1));
+        assert_eq!(verdict(&ordered, found(Ok(()), Some("x"))), None);
+        assert!(verdict(&ordered, found(differs(), Some("x"))).is_some());
+        let harness = Err(Finding::Harness("the swapped run failed".into()));
+        assert!(verdict(&ordered, found(harness, Some("x"))).is_some());
     }
 
     #[test]
     fn a_gap_that_no_longer_shows_or_is_ordered_fails() {
-        assert!(verdict(&scenario(Some(1)), Ok(())).is_some());
-        assert!(verdict(&scenario(Some(1)), Err(Finding::Stale("edge".into()))).is_some());
-        assert!(verdict(&scenario(None), Err(Finding::Differs("x".into()))).is_some());
+        assert!(verdict(&scenario(Some(1), None), found(Ok(()), None)).is_some());
+        let stale = Err(Finding::Stale("edge".into()));
+        assert!(verdict(&scenario(Some(1), None), found(stale, None)).is_some());
+        assert!(verdict(&scenario(None, None), found(differs(), None)).is_some());
     }
 }

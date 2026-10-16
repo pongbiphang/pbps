@@ -1339,7 +1339,7 @@ data:
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
 async fn a_row_written_before_and_after_the_column_it_fills_fails_the_row_check() {
     // Dependent by the effects: the insert fills the column's default.
-    match core::check(&Ms, &NEGATIVE, "pbps_commute").await {
+    match core::check(&Ms, &NEGATIVE, "pbps_commute").await.pair {
         Err(core::Finding::Stale(_)) => {}
         other => panic!("the effects do not order the pair: {other:?}"),
     }
