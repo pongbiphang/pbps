@@ -3143,8 +3143,9 @@ The rest is fixed as follows:
 **DEC-619.3. SQL Server scratch is told from the target by a live global
 temporary marker, not by a reported identifier; a same-instance scratch
 runs every scratch statement in a loginless database sandbox, in the
-supplied layout, and is proven empty against the measured fresh-install
-inventory as `db_owner` (#619).**
+supplied layout, sends only DDL pbps renders unless the entry allows an
+externals file there, and is proven empty against the measured
+fresh-install inventory as `db_owner` (#619).**
 
 - **No reported identifier proves separation.** `master`'s `family_guid`
   differs between two installations of one image, but a `podman commit`
@@ -3227,6 +3228,28 @@ inventory as `db_owner` (#619).**
   - its cluster-wide authority is the closed set `REACH` reads;
   - `SET ROLE` is undone by `RESET ROLE`, so it offers no sandbox a
     declared statement cannot leave.
+- **The target's instance shares `tempdb`, and the sandbox reaches it.**
+  - **Measured:** a global temporary table has no permission check. The
+    sandbox reads, writes and drops one that another session is still
+    using, and can take a `##` name first.
+  - **Why it cannot be blocked:** nothing denies creating a temporary
+    table, and dynamic SQL defeats a parse of an externals file.
+  - **So the run is limited there instead.** Without an externals file,
+    pbps renders the externals from the target's catalog, with quoted
+    identifiers, and sends only DDL it renders: no DML, no `EXEC` of a
+    module, no user SQL.
+    - Such DDL runs no body that reaches a `##` table. A function or view
+      cannot name one (2772, 4508), and a function cannot run dynamic SQL
+      (443).
+    - A trigger or procedure body runs on DML or `EXEC`, not on DDL.
+  - **An externals file there refuses** unless the entry sets
+    `same_instance: allow`. The default is `refuse`. The evidence seals the
+    choice and `explain` shows it, as with `outside_writes`
+    (DEC-1674.1).
+  - **The maintainer chose this on 2026-10-17.** A company is unlikely to
+    set aside an instance for pbps. A Docker container or, on Windows, a
+    per-user LocalDB instance is another instance without one; #620 (b)
+    qualifies LocalDB.
 - **The run-owned layout** needs `ALTER ANY LOGIN` and `CREATE ANY
   DATABASE` (`securityadmin`, `dbcreator`), so it never runs on the target's
   instance.
@@ -3254,6 +3277,8 @@ inventory as `db_owner` (#619).**
 `a_login_reads_its_own_server_reach_without_privilege`,
 `a_login_reads_every_database_it_can_enter`,
 `a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_admits_it`,
+`a_sandbox_on_the_targets_instance_reaches_another_sessions_global_temporary_table`,
+`rendered_ddl_on_an_empty_scratch_runs_no_body_that_reaches_a_global_temporary_table`,
 `the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_rights`,
 `a_database_list_without_view_any_database_hides_the_target_and_says_so`,
 `a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`,

@@ -1771,6 +1771,172 @@ async fn a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_adm
     scratch.drop().await;
 }
 
+/// On the target's instance the sandbox shares `tempdb` with every other
+/// session. A global temporary table carries no permission check, so the
+/// sandbox reads, writes and drops one another session is still using.
+/// `##` names are global; local `#` tables are not, and stay private. So a
+/// sandbox that runs arbitrary SQL, an externals file's, does not belong on
+/// the target's instance by default.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_sandbox_on_the_targets_instance_reaches_another_sessions_global_temporary_table() {
+    let mut scratch = TestDb::create("gtt619").await;
+    run(
+        &mut scratch.conn,
+        &[
+            "CREATE USER pbps_sandbox WITHOUT LOGIN;",
+            "ALTER ROLE db_owner ADD MEMBER pbps_sandbox;",
+        ],
+    )
+    .await;
+    let global = format!("##{}_prod", scratch.name);
+    let local = format!("#{}_own", scratch.name);
+    let mut holder = session(&scratch).await;
+    run(
+        &mut holder,
+        &[&*format!(
+            "CREATE TABLE [{global}] (c int); INSERT [{global}] VALUES (1); \
+             CREATE TABLE [{local}] (c int);"
+        )],
+    )
+    .await;
+    let mut sandbox = session(&scratch).await;
+    run(
+        &mut sandbox,
+        &["EXECUTE AS USER = N'pbps_sandbox' WITH NO REVERT;"],
+    )
+    .await;
+    assert_eq!(
+        refusal(&mut sandbox, &format!("SELECT c FROM [{local}];"))
+            .await
+            .as_deref(),
+        Some("208"),
+        "another session's local temporary table is private"
+    );
+    assert_eq!(
+        number(
+            &mut sandbox,
+            &format!("SELECT CONVERT(bigint, COUNT(*)) FROM [{global}];")
+        )
+        .await,
+        1,
+        "the sandbox read it"
+    );
+    run(
+        &mut sandbox,
+        &[
+            &*format!("INSERT [{global}] VALUES (2);"),
+            &*format!("CREATE TABLE [##{}_squat] (c int);", scratch.name),
+        ],
+    )
+    .await;
+    assert_eq!(
+        number(
+            &mut holder,
+            &format!("SELECT CONVERT(bigint, SUM(c)) FROM [{global}];")
+        )
+        .await,
+        3,
+        "the sandbox wrote it"
+    );
+    run(&mut sandbox, &[&*format!("DROP TABLE [{global}];")]).await;
+    assert_eq!(
+        refusal(&mut holder, &format!("SELECT c FROM [{global}];"))
+            .await
+            .as_deref(),
+        Some("208"),
+        "the sandbox dropped it under the session using it"
+    );
+    drop(sandbox);
+    drop(holder);
+    scratch.drop().await;
+}
+
+/// What runs on an empty scratch when nothing but rendered DDL is sent. A
+/// function or view cannot name a temporary table (2772, 4508), and a
+/// function cannot run dynamic SQL (443). A trigger or procedure body runs
+/// only on DML or `EXEC`, never on DDL against its table. So a run that
+/// sends only DDL pbps renders, with no DML and no `EXEC`, reaches no `##`
+/// table on a shared instance. The DML the negative case sends does.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn rendered_ddl_on_an_empty_scratch_runs_no_body_that_reaches_a_global_temporary_table() {
+    let mut scratch = TestDb::create("ddlbody619").await;
+    let global = format!("##{}_prod", scratch.name);
+    let mut holder = session(&scratch).await;
+    run(
+        &mut holder,
+        &[&*format!(
+            "CREATE TABLE [{global}] (c int); INSERT [{global}] VALUES (1);"
+        )],
+    )
+    .await;
+    for (sql, code) in [
+        (
+            format!(
+                "CREATE FUNCTION dbo.f() RETURNS int AS BEGIN \
+                 RETURN (SELECT COUNT(*) FROM [{global}]) END;"
+            ),
+            "2772",
+        ),
+        (
+            format!("CREATE FUNCTION dbo.tvf() RETURNS TABLE AS RETURN SELECT c FROM [{global}];"),
+            "2772",
+        ),
+        (
+            format!("CREATE VIEW dbo.v AS SELECT c FROM [{global}];"),
+            "4508",
+        ),
+        (
+            format!(
+                "CREATE FUNCTION dbo.g() RETURNS int AS BEGIN \
+                 EXEC(N'DROP TABLE [{global}]'); RETURN 1 END;"
+            ),
+            "443",
+        ),
+    ] {
+        assert_eq!(
+            refusal(&mut scratch.conn, &sql).await.as_deref(),
+            Some(code),
+            "{sql}"
+        );
+    }
+    run(
+        &mut scratch.conn,
+        &[
+            "CREATE TABLE dbo.t (c int NOT NULL, d AS (c + 1) PERSISTED NOT NULL);",
+            &*format!(
+                "CREATE TRIGGER dbo.t_dml ON dbo.t AFTER INSERT, UPDATE, DELETE AS \
+                 INSERT [{global}] VALUES (10);"
+            ),
+            &*format!("CREATE PROCEDURE dbo.p AS INSERT [{global}] VALUES (100);"),
+            "ALTER TABLE dbo.t ADD e int NULL;",
+            "CREATE INDEX t_d ON dbo.t (d);",
+            "ALTER TABLE dbo.t ADD CONSTRAINT t_ck CHECK (c > 0);",
+            "ALTER TABLE dbo.t ADD CONSTRAINT t_df DEFAULT (1) FOR e;",
+            "ALTER TABLE dbo.t ADD CONSTRAINT t_pk PRIMARY KEY NONCLUSTERED (d);",
+            "EXEC sp_rename N'dbo.t.e', N'e2', N'COLUMN';",
+            "ALTER TABLE dbo.t DISABLE TRIGGER t_dml; ALTER TABLE dbo.t ENABLE TRIGGER t_dml;",
+        ],
+    )
+    .await;
+    let sum = format!("SELECT CONVERT(bigint, SUM(c)) FROM [{global}];");
+    assert_eq!(
+        number(&mut holder, &sum).await,
+        1,
+        "no DDL ran a trigger or procedure body"
+    );
+    // The negative: DML fires the trigger, and EXEC runs the procedure.
+    run(
+        &mut scratch.conn,
+        &["INSERT dbo.t (c) VALUES (1);", "EXEC dbo.p;"],
+    )
+    .await;
+    assert_eq!(number(&mut holder, &sum).await, 111);
+    drop(holder);
+    scratch.drop().await;
+}
+
 /// The supplied session lists the databases the sandbox's guest admission is
 /// read over, and a list it cannot see whole still reads as a success. Under
 /// `DENY VIEW ANY DATABASE` the query returns only `master`, `tempdb` and the

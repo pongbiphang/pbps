@@ -305,11 +305,49 @@ for a moment keeps that type.
       name;
     - its cluster-wide authority is the closed set `REACH` reads;
     - `SET ROLE` is undone by `RESET ROLE`.
+- **The target's instance shares `tempdb`.** A global temporary table
+  carries no permission check, and every session on the instance shares the
+  `##` names. On the target's instance the sandbox can do the following to
+  a `##` table another session is still using
+  [`a_sandbox_on_the_targets_instance_reaches_another_sessions_global_temporary_table`]:
+  - read it;
+  - write to it;
+  - drop it;
+  - take a `##` name before the session that expects it.
+
+  Only `#` tables are private. Creating a temporary table needs no
+  permission, so nothing can deny it, and an externals file's dynamic SQL
+  defeats any parse. On the target's instance, then, what runs is limited
+  instead:
+  - **Without an externals file, pbps renders the externals.** It renders
+    them from the target's catalog, as shapes carrying §8's compared
+    properties, with every identifier quoted. The run then sends only DDL
+    that pbps renders: no DML, no `EXEC` of a module and no user SQL.
+  - **Such DDL runs no body that reaches a `##` table**
+    [`rendered_ddl_on_an_empty_scratch_runs_no_body_that_reaches_a_global_temporary_table`].
+    - A function or view cannot name a temporary table (2772, 4508), and a
+      function cannot run dynamic SQL (443).
+    - A trigger or procedure body runs on DML or `EXEC`, never on DDL
+      against its table.
+    - A run on the target's instance that would need any other statement
+      refuses by name.
+  - **An externals file on the target's instance refuses** unless the
+    entry sets `same_instance: allow`. The default is `refuse`. As with
+    `outside_writes`, the choice is the user's: the evidence seals it and
+    `explain` shows it, because under `allow` the file's SQL shares
+    `tempdb` with production.
+  - **Another instance needs no server set aside.**
+    - The run-owned layout on a Docker container is the default
+      (DEC-1674.1).
+    - On Windows, a per-user LocalDB instance is another instance with its
+      own `tempdb`. It is Express, so an edition difference is a recorded
+      limitation (§9). #620 (b) qualifies it on Windows; it is not measured
+      here.
 - **The layout.** The run-owned layout creates the run's login and
   database, so it needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`. It runs
   on another instance. On the target's instance only the supplied layout
   runs: an account that is `db_owner` of its own pre-created database, its
-  statements in the sandbox.
+  statements in the sandbox, under the `tempdb` rule above.
 
 ## 7. An empty scratch database
 
@@ -502,6 +540,9 @@ Fixture names are the tests #620 adds.
 - **(b) Separation, reconstruction and assessment.**
   - The marker, the sandbox and the three reads before the first write,
     and the layout rule of §6.
+  - On the target's instance:
+    - the rendered externals, with only rendered DDL sent;
+    - the `same_instance` switch, sealed and shown by `explain`.
   - #723's inventory check, run as `db_owner` (§7), and emptying the
     supplied layout.
   - The externals shapes of §8.

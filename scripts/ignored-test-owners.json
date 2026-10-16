@@ -880,6 +880,8 @@
         "binding619::a_guest_login_reads_what_guest_and_public_hold_in_a_system_database",
         "binding619::a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database",
         "binding619::a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_admits_it",
+        "binding619::a_sandbox_on_the_targets_instance_reaches_another_sessions_global_temporary_table",
+        "binding619::rendered_ddl_on_an_empty_scratch_runs_no_body_that_reaches_a_global_temporary_table",
         "binding619::a_role_drops_only_after_its_members_and_the_schemas_it_owns",
         "binding619::a_database_list_without_view_any_database_hides_the_target_and_says_so",
         "binding619::a_persisted_column_needs_its_functions_owner_to_be_the_tables",
