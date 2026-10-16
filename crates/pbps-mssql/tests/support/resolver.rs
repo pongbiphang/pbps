@@ -435,10 +435,7 @@ mod scope611 {
         drop(elsewhere);
         other.drop().await;
         let mut db = db;
-        db.conn
-            .execute(&format!("USE master; DROP LOGIN [{login}];"))
-            .await
-            .ok();
+        drop_login_when_idle(&mut db.conn, &login).await.ok();
         db.drop().await;
     }
 }

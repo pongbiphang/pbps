@@ -192,9 +192,10 @@ async fn future_grants_match_real_creation_authority_for_admin_and_narrow_logins
         drop(connection);
         if authority != "sa" {
             db.conn
-                .execute(&format!("DROP USER [{login}]; DROP LOGIN [{login}];"))
+                .execute(&format!("DROP USER [{login}];"))
                 .await
                 .unwrap();
+            drop_login_when_idle(&mut db.conn, &login).await.unwrap();
         }
         db.drop().await;
 
