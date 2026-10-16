@@ -2034,13 +2034,13 @@ async fn a_scratch_databases_options_are_compared_whole_with_a_fresh_databases()
     assert_eq!(differ, identity, "a used database reads as a fresh one");
 
     let ledger = format!("pbps_test_ledger619_{}", std::process::id());
-    run(
+    // Through the `model` lock retry, as `TestDb::create` does (#1055).
+    super::create_database(
         &mut fresh.conn,
-        &[&*format!(
-            "USE master; CREATE DATABASE [{ledger}] WITH LEDGER = ON;"
-        )],
+        &format!("USE master; CREATE DATABASE [{ledger}] WITH LEDGER = ON;"),
     )
-    .await;
+    .await
+    .expect("create the ledger database");
     let mut differ = differing_options(&mut fresh.conn, &fresh.name, &ledger).await;
     differ.retain(|column| column != "create_date" && !identity.contains(&column.as_str()));
     assert_eq!(differ, ["is_ledger_on"]);
