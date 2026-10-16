@@ -5373,6 +5373,10 @@ logical order assigned (DEC-1961.1): swapped from it they are refused. Three
 guard flags turn the baseline, the incarnations or write-write off for the
 tests that show each negative then passes wrongly.
 
+*Amended by [DEC-1956.3](#dec-1956-3): the edge check is `settle`'s now.
+The effect graph, settled over the order observed, must give it back; the
+replay is unchanged.*
+
 <a id="dec-1954-7"></a>
 
 **DEC-1954.7. Every edge `graph::constraints` emits is classified against the
@@ -5627,3 +5631,170 @@ rule reverted. Also pinned by the units
 `a_partitions_own_foreign_key_follows_a_renamed_target_through_a_detach`,
 `an_attached_tables_own_foreign_key_follows_a_renamed_target` and
 `a_partition_with_its_own_foreign_key_is_dropped_under_its_parent`.
+
+<a id="dec-1956-1"></a>
+
+**DEC-1956.1. Each edge a schedule settles carries one sealed `OrderReason`,
+chosen by the effect behind it; its source stays internal.** (#1956, S3 of
+#1776)
+
+`OrderingProof` version 1 seals six reasons, and they do not change. The
+sources (`Effect`, `Declared`, `Lexical`, `Catalog`, `Binding`, `Search`) say
+where an edge was found and are never sealed. `order::schedule::reason` maps
+an effect edge with an exhaustive match, so an edge kind without a reason
+does not compile:
+
+- **What depends on an object** (`Creates`, `Removes`, `Frees`, `Precedes`):
+  by the object's kind. A row is `Data`; a role or a grant is
+  `Authorization`; a table, column, default, NOT NULL, part or module is
+  `Structural`.
+- **A rewrite** is `Identity` when either end is a rename, since the rename
+  moves the address its reader spells (DEC-1954.4), and otherwise the
+  object's kind.
+- **Values written before they are read** (`Writes`) is `Data`.
+- **Two writes of one resource** (DEC-1954.6) are `Identity` when the
+  resource is an object, which decides which instance stands, and `Data`
+  when it is values or rows.
+- **An address passing from the baseline's instance to the plan's**
+  (`Replaces`) is `Identity`.
+- **An annotation** (`depends_on:`) is `Structural`.
+
+The source decides only where it is the whole story: evidence is `Binding`,
+and an edge a bounded search proposes (#1957) is `Identity`, the reason of the
+handover it orders. The source is kept beside the reason, so a refusal and
+`explain` can tell a proposed edge from a derived one.
+
+The resolver keeps its own edges and their reasons until #1968 (S7a). Its
+proof is unchanged: every resolver test that pins `OrderingProof` edges and
+reasons passes as it did. An ordinary plan's proof is still not sealed.
+
+Pinned by `each_edge_maps_to_one_sealed_reason_by_the_effect_behind_it`.
+
+<a id="dec-1956-2"></a>
+
+**DEC-1956.2. `settle` breaks ties by the lowest position first: a change an
+edge holds back sinks to right after what it waits for, and nothing else
+moves.** (#1956)
+
+Kahn's algorithm leaves the choice among ready changes open. Lowest position
+first sinks a successor. Run from the end, highest last, it hoists a
+predecessor instead. Over A, B, C with an edge C → A, the first gives B, C, A
+and the second C, A, B. Where A and B interact (A → B), both give C, A, B.
+
+The choice is the first, for two reasons:
+
+- It is the order every pass `settle` replaces already made. The resolver
+  took the lowest position first. `order_after_releases` ran a change
+  "right after the last change it waits for, so nothing moves earlier than
+  the differ put it" (DEC-1391.1). `computed_order` moved a drop "to right
+  after the last change it waits for". Hoisting would move the release, the
+  function create or the resolver's appended steps ahead of changes the
+  differ placed before them.
+- Measured over the full local gate (unit, doc and live suites on both
+  engines), `settle` produced 116 orders that moved something: 92 in the
+  resolver, 16 in `order_after_releases` and 8 in `computed_order`. Lowest
+  first kept every one of them as the pass it replaced had made it, except
+  the two `computed_order` plans DEC-1956.3 lists. Hoisting would have
+  changed 19 of them (12, 5 and 2).
+
+Two writes of one resource keep their base order under either choice: their
+edge runs by the operations' ids, so neither tie-break reverses it
+(`two_writes_to_one_resource_settle_in_their_base_order_under_either_tie_break`).
+This is a fixed choice, not a preference rule that can fail (#1776's planning
+contract). Pinned by
+`a_held_step_sinks_after_what_it_waits_for_and_nothing_else_moves`.
+
+<a id="dec-1956-3"></a>
+
+**DEC-1956.3. `settle` orders only where an order is moved today, keeps what
+a moved change must not pass, refuses only the obligations its caller hands
+it, and is the verifier's edge check everywhere else.** (#1956)
+
+The conversions are behavior-preserving. Each old pass ran beside its
+replacement over the full local gate, and their outputs were compared:
+
+- `order_after_releases`: 776 calls, 16 of them moving changes and 11
+  refused. Every order and every refusal text was identical.
+- The resolver: 208 calls, 92 moving and 4 refused by both. Every order was
+  identical.
+- `computed_order`: 23 calls, 8 moving. 21 were identical, and 2 differ in
+  one way. The fixpoint moved one drop at a time, so a drop it moved could
+  land behind an unrelated drop it had already moved. `settle` keeps two
+  drops that no edge relates in the order the differ gave them.
+  - In `computed_function_drops_follow_the_catalogs_edges` (live), the
+    fixpoint ran `x.f` before `g`. `settle` runs `dbo.g` before `x.f`, the
+    module sort's order.
+  - In `what_a_released_function_is_bound_to_follows_it`, the fixpoint ran
+    `lookup` before `g`, and `settle` runs `g` before `lookup`.
+
+  Neither pair has a catalog edge. Each drop still follows everything it
+  waits for, and both orders apply. The rendered script, and so the saved
+  plan's checksum, changes only for such a plan.
+
+**Where it runs.** In every build, it runs where a pass moved changes by
+edges:
+
+- the resolver, over `graph::constraints`;
+- `order_after_releases`, over DEC-1391.1's waits: the catalog's live
+  readers are `Catalog` edges, a new text that may read the retyped column
+  is `Lexical`, and the default written for the new type is `Effect`;
+- `computed_order::release`, over `waits_for`, as `Catalog` edges.
+
+Its hold-and-insert loop, `passes` and the n²+1 fixpoint are gone. The
+catalog edges are read once over the plan as it stands. They do not depend on
+the order, which is DEC-1391.1's own premise.
+
+The effects are not computed in a release build. Whether the verifier
+becomes a release-build gate, and with it whether `settle` orders every plan
+over the effect graph, is #1776's to decide after #1965's benchmark.
+
+**What a moved change must not pass is kept, not sunk.** `passes` refused a
+held drop or retype that would move past a change that needs it first:
+
+- an insert into its table, where the column is NOT NULL with no default;
+- a change taking its name;
+- after a retype, a row, key, module or grant that may need the new type.
+
+Kahn's algorithm would instead sink that change after the held one. That is
+safe only when every constraint on the sunk change is an edge, and two kinds
+are not edges yet:
+
+- name slots arrive with #1957 (S4): a view naming a column added under the
+  dropped column's name would bind the old column;
+- lexical edges arrive with #1967 (S6a): a function a release calls, sunk
+  after the release, would not exist when it runs.
+
+So each such fact is a `Keep`: an order `settle` must not reverse, refused by
+name with the text `passes` gave. Sinking waits for S4 and S6a. The insert
+case also lacks an effect (an `InsertRow` declares nothing about the NOT
+NULL, no-default columns it leaves unwritten), deferred to #2086.
+
+**Unmet obligations.** `settle` refuses the obligations its caller hands it,
+by name and with the caller's remedy. The effect graph's own unmet
+requirements are not handed to it. DEC-1954.6 records them as `unprovided`
+and those plans stand: a SQL Server check the lowering rebuilds around a
+retype, #1460's computed column, a grant on an unmanaged view. The refusals
+the passes make today (`generation_support`, `computed_order`'s refused list,
+the reader of a dropped input) stay where they are.
+
+**The verifier.** Its replay stays independent of the scheduler: requirements
+against the state, `Absent`, the baseline and a broken `depends_on:` edge.
+"Every edge is respected" is no longer checked edge by edge. In tests and
+debug builds the effect graph is settled over each observed order, which
+must come back as given. Where it does not, each edge the order runs the
+other way is named, with both operations, as the verifier named it before
+(`Violation::Edge`). `verify_with` keeps its signature.
+
+**A cycle of annotations alone.** A strongly connected component made only of
+`depends_on:` edges is planned today, in the order the module sort gives it.
+`settle` keeps that order and does not refuse it. The replay still reports
+the broken annotation, and the policy is #2083's. Any other cycle is refused
+by name, with its members and each edge's reason and source.
+
+Pinned by `a_kept_order_the_edges_would_reverse_is_refused_not_repaired`,
+`a_cycle_of_annotations_alone_keeps_the_order_given_and_any_other_is_refused`,
+`a_cycle_is_refused_by_name_not_ordered_arbitrarily`,
+`an_unmet_obligation_is_refused_by_name_with_its_remedy`,
+`settling_is_idempotent_and_deterministic`,
+`every_settled_order_passes_the_replay_and_settles_to_itself` and
+`a_released_input_is_retyped_or_dropped_after_its_release`.
