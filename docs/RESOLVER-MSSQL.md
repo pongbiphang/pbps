@@ -192,14 +192,26 @@ for a moment keeps that type.
     - every grant to a principal in its token (`sys.server_permissions`);
     - every database it can enter (`HAS_DBACCESS` over the databases
       `VIEW ANY DATABASE` lists);
-    - its own principal, if any, in `master`, `tempdb` and `msdb`, read
-      from their `sys.database_principals` by its own SID.
+    - in each of `master`, `tempdb` and `msdb`, its database token
+      (`sys.user_token`), every grant to a principal in that token
+      (`sys.database_permissions`), and every securable such a principal
+      owns. An unmapped login enters as `guest`, so what `guest` and
+      `public` hold there is the login's: `CONTROL` granted to `guest`, a
+      role `guest` joins, a schema `guest` owns. None of it moves
+      `HAS_DBACCESS` or the login's own principal
+      [`a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`].
   - **The allowlist:**
     - the server role `public`;
     - the server permissions `CONNECT SQL` and `VIEW ANY DATABASE`;
     - `public`'s default grants: those two and `CONNECT` on the endpoints;
     - its own scratch database;
-    - `master`, `tempdb` and `msdb` as `guest`, with no principal of its own.
+    - in `master`, `tempdb` and `msdb`, a token of `guest` and `public`
+      only, and the grants and ownership the fresh-install inventory holds
+      for them, measured as §7's inventory is. On the pinned build that inventory is identical on
+      Developer and Express: at database scope `CONNECT` to `guest` and the
+      two `VIEW ANY COLUMN … KEY DEFINITION` permissions to `public`; the
+      rest are object grants on system objects; `guest` owns the `guest`
+      schema.
   - **What the read refuses, measured**
     [`a_login_reads_its_own_server_reach_without_privilege`,
     `a_login_reads_every_database_it_can_enter`]:
@@ -213,7 +225,10 @@ for a moment keeps that type.
       database", and either would let a scratch statement reach the target
       by `USE` or a three-part name;
     - a user mapped as `db_owner` in `msdb`, where access alone reads 1 for
-      everyone.
+      everyone: its token holds its own user, not `guest`;
+    - `CONTROL` or a schema permission granted to `guest` or `public` in a
+      system database, `guest` added to a role there, or a schema `guest`
+      owns: each differs from the fresh-install inventory.
 - **The layout.** The run-owned layout creates the run's login and database,
   so it needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`, which no confined
   account holds. On the target's instance only the supplied layout runs: a

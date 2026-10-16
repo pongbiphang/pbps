@@ -3163,13 +3163,16 @@ inventory as `db_owner` (#619).**
     - every grant to a principal in its token (`sys.server_permissions`);
     - every database it can enter (`HAS_DBACCESS` over the databases
       `VIEW ANY DATABASE` lists);
-    - its own principal in `master`, `tempdb` and `msdb`.
+    - in `master`, `tempdb` and `msdb`, its database token, every grant to
+      a principal in it, and every securable one owns.
   - The allowlist is:
     - the server role `public`;
     - `CONNECT SQL` and `VIEW ANY DATABASE`;
     - endpoint `CONNECT`;
     - its own scratch database;
-    - those three system databases as `guest`.
+    - in those three system databases, a token of `guest` and `public`
+      only, holding exactly the grants and ownership of the fresh-install
+      inventory (identical on Developer and Express).
   - Anything else is unconfined and named, including a kind no rule names.
   - **Why an allowlist.** The design first listed what makes a login
     unconfined, and review found three cases it missed, one round at a time:
@@ -3178,7 +3181,13 @@ inventory as `db_owner` (#619).**
       `EXECUTE AS LOGIN`;
     - a user in another database, or a target with `guest` enabled, which is
       #1667's "no access to another database";
-    - a `db_owner` user in `msdb`, where access reads 1 for everyone.
+    - a `db_owner` user in `msdb`, where access reads 1 for everyone;
+    - a grant to `guest` or `public` in a system database: an unmapped
+      login enters there as `guest`, so `CONTROL` granted to `guest` in
+      `msdb` is the login's, and moves neither its access nor its own
+      principal. Reading the token's grants and ownership against the
+      fresh-install inventory closes it the way PostgreSQL's `REACH`
+      includes `PUBLIC`.
 
     PostgreSQL went the same way on #1678 before its single read (DEC-1672.1).
     The maintainer decided on 2026-10-16 that SQL Server follows the
@@ -3198,6 +3207,7 @@ inventory as `db_owner` (#619).**
 **Pinned by** `a_global_temporary_table_marks_one_instance_to_every_login_on_it`,
 `a_login_reads_its_own_server_reach_without_privilege`,
 `a_login_reads_every_database_it_can_enter`,
+`a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`,
 `a_database_born_from_model_holds_only_the_fresh_install_inventory` and
 `an_account_that_is_not_db_owner_cannot_see_what_its_database_holds`.
 

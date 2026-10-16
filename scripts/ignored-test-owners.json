@@ -876,6 +876,7 @@
         "binding619::a_login_reads_every_database_it_can_enter",
         "binding619::a_table_valued_functions_result_columns_are_what_a_view_over_it_binds",
         "binding619::a_foreign_key_binds_a_candidate_key_and_a_persisted_column_a_deterministic_function",
+        "binding619::a_guest_login_reads_what_guest_and_public_hold_in_a_system_database",
         "binding619::a_database_born_from_model_holds_only_the_fresh_install_inventory",
         "binding619::an_account_that_is_not_db_owner_cannot_see_what_its_database_holds",
         "a_bare_name_in_another_schema_is_not_an_edge",

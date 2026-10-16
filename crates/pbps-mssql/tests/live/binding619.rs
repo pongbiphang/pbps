@@ -1274,6 +1274,121 @@ async fn a_table_valued_functions_result_columns_are_what_a_view_over_it_binds()
     db.drop().await;
 }
 
+/// In `master`, `tempdb` and `msdb` a login enters as `guest`, and holds
+/// what `guest` and `public` hold there: a grant to either, a role `guest`
+/// joins, or a schema `guest` owns is the login's too, and none of it moves
+/// `HAS_DBACCESS` or the login's own principal. The login reads all three
+/// without privilege, from its database token: `sys.user_token`, the grants
+/// to its token, and what its token owns.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_guest_login_reads_what_guest_and_public_hold_in_a_system_database() {
+    let pid = std::process::id();
+    let password = "Pbps!Guest619x";
+    let login = format!("pbps619_guest_{pid}");
+    let schema = format!("pbps619_guest_{pid}");
+    let mut admin = connect_live(&conn_str()).await.unwrap();
+    run(
+        &mut admin,
+        &[&*format!(
+            "CREATE LOGIN [{login}] WITH PASSWORD = N'{password}', CHECK_POLICY = OFF;"
+        )],
+    )
+    .await;
+    let mut conn = connect_live(&super::resolver_tests::login_url(&login, password, "msdb"))
+        .await
+        .unwrap();
+    let token = "SELECT CONVERT(nvarchar(128), name) FROM sys.user_token ORDER BY name;";
+    let database_grants = "SELECT CONVERT(nvarchar(200), p.permission_name + N':' + USER_NAME(p.grantee_principal_id)) \
+         FROM sys.database_permissions p \
+         WHERE p.class = 0 AND p.grantee_principal_id IN (SELECT principal_id FROM sys.user_token) \
+         ORDER BY 1;";
+    let grants = "SELECT CONVERT(bigint, COUNT(*)) FROM sys.database_permissions \
+         WHERE grantee_principal_id IN (SELECT principal_id FROM sys.user_token);";
+    let owned = "SELECT CONVERT(nvarchar(128), name) FROM sys.schemas \
+         WHERE principal_id IN (SELECT principal_id FROM sys.user_token) ORDER BY name;";
+    let control = "SELECT CONVERT(bigint, COUNT(*)) FROM fn_my_permissions(NULL, 'DATABASE') \
+         WHERE permission_name = 'CONTROL';";
+
+    assert_eq!(texts(&mut conn, token).await, ["guest", "public"]);
+    assert_eq!(
+        texts(&mut conn, database_grants).await,
+        [
+            "CONNECT:guest",
+            "VIEW ANY COLUMN ENCRYPTION KEY DEFINITION:public",
+            "VIEW ANY COLUMN MASTER KEY DEFINITION:public"
+        ]
+    );
+    assert_eq!(texts(&mut conn, owned).await, ["guest"]);
+    let defaults = number(&mut conn, grants).await;
+
+    run(&mut admin, &["USE msdb; GRANT CONTROL TO guest;"]).await;
+    assert_eq!(
+        number(&mut conn, control).await,
+        1,
+        "guest's CONTROL is the login's"
+    );
+    assert!(
+        texts(&mut conn, database_grants)
+            .await
+            .contains(&"CONTROL:guest".to_owned())
+    );
+    run(&mut admin, &["USE msdb; REVOKE CONTROL FROM guest;"]).await;
+    assert_eq!(number(&mut conn, control).await, 0);
+
+    run(
+        &mut admin,
+        &["USE msdb; GRANT ALTER ON SCHEMA::dbo TO public;"],
+    )
+    .await;
+    assert_eq!(number(&mut conn, grants).await, defaults + 1);
+    run(
+        &mut admin,
+        &["USE msdb; REVOKE ALTER ON SCHEMA::dbo FROM public;"],
+    )
+    .await;
+    assert_eq!(number(&mut conn, grants).await, defaults);
+
+    run(
+        &mut admin,
+        &["USE msdb; ALTER ROLE SQLAgentOperatorRole ADD MEMBER guest;"],
+    )
+    .await;
+    assert!(
+        texts(&mut conn, token)
+            .await
+            .contains(&"SQLAgentOperatorRole".to_owned())
+    );
+    run(
+        &mut admin,
+        &["USE msdb; ALTER ROLE SQLAgentOperatorRole DROP MEMBER guest;"],
+    )
+    .await;
+
+    run(
+        &mut admin,
+        &[&*format!(
+            "USE msdb; EXEC(N'CREATE SCHEMA [{schema}] AUTHORIZATION guest');"
+        )],
+    )
+    .await;
+    assert_eq!(texts(&mut conn, owned).await, ["guest", &*schema]);
+    run(
+        &mut admin,
+        &[&*format!("USE msdb; DROP SCHEMA [{schema}];")],
+    )
+    .await;
+
+    assert_eq!(
+        number(&mut conn, "SELECT CONVERT(bigint, HAS_DBACCESS(N'msdb'));").await,
+        1,
+        "none of it moves access"
+    );
+    assert_eq!(texts(&mut conn, token).await, ["guest", "public"]);
+    drop(conn);
+    drop_login(&mut admin, &login).await;
+}
+
 /// Two more things a creation reads from an object it does not own: a
 /// foreign key binds the referenced table's primary key or unique index
 /// (`key_index_id`) and is refused without one (1776), and a `PERSISTED`
