@@ -77,6 +77,7 @@ pub mod roles;
 pub mod rows;
 pub mod staged;
 pub mod state;
+pub mod type_refs;
 mod types;
 pub mod user_types;
 pub mod validate;
@@ -195,6 +196,13 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
             ));
         }
         for column in &by.columns {
+            if table
+                .columns
+                .get(column)
+                .is_some_and(|c| c.ty.type_ref().is_some())
+            {
+                found.push(invalid(format!("partition key `{column}` has a user-defined type reference, which is not supported as a partition key")));
+            }
             if !table.columns.contains_key(column) {
                 found.push(invalid(format!(
                     "`partition_by` names `{column}`, which is not a declared column",
@@ -754,7 +762,7 @@ fn default_problems(
                         .is_some_and(|t| t == *normalized)
             }
         };
-    if erased {
+    if erased && column.ty.type_ref().is_none() {
         found.push(DialectError::Invalid {
             dialect: types::DIALECT,
             message: format!(
@@ -1329,6 +1337,14 @@ impl Dialect for Postgres {
         // bounds (`'[0:1]={1,2}'` is not `'{1,2}'`): rows are not held in a
         // table with an array column until a codec for them is (#1167).
         if table.data.is_some() {
+            for (column, spec) in &table.columns {
+                if spec.ty.type_ref().is_some() {
+                    found.push(DialectError::Invalid {
+                        dialect: types::DIALECT,
+                        message: format!("`data:` cannot be declared on a table with the user-defined type reference `{}` on column `{column}`", spec.ty),
+                    });
+                }
+            }
             for (column, spec) in &table.columns {
                 if spec.ty.is_array() {
                     found.push(DialectError::Invalid {
@@ -5116,51 +5132,20 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
     }
 
-    /// A user-defined type named as `schema.name` loads (#1523) and this
-    /// dialect refuses it by name until it can read what the type is. The
-    /// refusal is the dialect's, so it says so, and it never calls the type
-    /// unknown to the catalogue or lets it through as a scalar.
+    /// Normalization preserves reference identity rather than guessing a
+    /// catalogue base type (#1523).
     #[test]
-    fn a_user_type_reference_is_refused_by_name_and_never_normalized() {
-        for (declared, named) in [
-            ("app.mood", "app.mood"),
-            ("APP.Mood", "app.mood"),
-            ("app.mood[]", "app.mood[]"),
-            ("\"App\".\"Mood\"", "\"App\".\"Mood\""),
-            ("\"App\".\"Mood\"[]", "\"App\".\"Mood\"[]"),
-            ("public.citext", "public.citext"),
-            ("pg_catalog.text", "pg_catalog.text"),
-        ] {
-            let error = Postgres::new()
-                .normalize_type(&ty(declared))
-                .expect_err(declared);
-            let message = error.to_string();
-            assert!(message.contains(&format!("`{named}`")), "{message}");
-            assert!(
-                message.contains("references to user-defined types are not supported yet"),
-                "{message}"
-            );
-            assert!(!message.contains("has no type"), "{message}");
-            // The array is refused whole, not as its element.
+    fn a_user_type_reference_normalizes_idempotently_with_its_identity_and_array_marker() {
+        for spelling in ["app.mood", "APP.Mood", "app.mood[]", "\"App\".\"Mood\"[]"] {
+            let declared = ty(spelling);
+            let normalized = Postgres::new().normalize_type(&declared).unwrap();
+            assert_eq!(declared, normalized);
             assert_eq!(
-                message.contains("[]"),
-                declared.ends_with("[]"),
-                "{message}"
+                normalized,
+                Postgres::new().normalize_type(&normalized).unwrap()
             );
         }
-        // Negative: the same spellings without a reference are the catalogue's
-        // and still normalize; a bare name that is not one is unknown.
-        for spelling in ["text[]", "integer", "character varying(10)[]"] {
-            assert!(
-                Postgres::new().normalize_type(&ty(spelling)).is_ok(),
-                "{spelling}"
-            );
-        }
-        let message = Postgres::new()
-            .normalize_type(&ty("_mood"))
-            .expect_err("a bare name is not a catalogue type")
-            .to_string();
-        assert!(message.contains("has no type"), "{message}");
+        assert!(Postgres::new().normalize_type(&ty("unknown")).is_err());
     }
 
     /// The engine truncates an identifier over [`MAX_IDENT_BYTES`] without an
@@ -5215,8 +5200,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("whose name is 64 bytes"), "{message}");
-        // Negative: a part of exactly the limit passes the length check and gets
-        // the refusal every reference still gets, in bytes and not characters.
         for part in [&limit, &multibyte_fits] {
             for declared in [
                 format!("app.{part}"),
@@ -5224,15 +5207,10 @@ mod tests {
                 format!("\"{part}\".\"{part}\""),
                 format!("app.{part}[]"),
             ] {
-                let message = Postgres::new()
-                    .normalize_type(&ty(&declared))
-                    .expect_err(&declared)
-                    .to_string();
                 assert!(
-                    message.contains("references to user-defined types are not supported yet"),
-                    "{declared}: {message}"
+                    Postgres::new().normalize_type(&ty(&declared)).is_ok(),
+                    "{declared}"
                 );
-                assert!(!message.contains("truncating"), "{declared}: {message}");
             }
         }
         // And a built-in is untouched by the check.
@@ -5254,17 +5232,9 @@ mod tests {
         }
         let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         let messages: Vec<String> = found.iter().map(ToString::to_string).collect();
-        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert_eq!(messages.len(), 1, "{messages:?}");
         assert_eq!(
             messages.iter().filter(|m| m.contains("truncating")).count(),
-            1,
-            "{messages:?}"
-        );
-        assert_eq!(
-            messages
-                .iter()
-                .filter(|m| m.contains("not supported yet"))
-                .count(),
             1,
             "{messages:?}"
         );
@@ -5273,7 +5243,8 @@ mod tests {
     /// Where a user looks at the declaration, `validate` names the column's
     /// type once, beside the other columns, which it leaves alone (#1523).
     #[test]
-    fn validating_a_table_refuses_a_user_type_reference_by_name() {
+    fn references_are_admitted_as_columns_but_refused_as_partition_keys() {
+        let name = "app.t".parse().unwrap();
         let mut table = Table::default();
         for (column, spelling) in [
             ("mood", "app.mood"),
@@ -5284,22 +5255,39 @@ mod tests {
                 .columns
                 .insert(column.into(), pbps_model::Column::new(ty(spelling)));
         }
-        let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
-        let messages: Vec<String> = found.iter().map(ToString::to_string).collect();
-        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(Postgres::new().validate_table(&name, &table).is_empty());
+        table.partition_by = Some(pbps_model::PartitionBy {
+            strategy: pbps_model::PartitionStrategy::Range,
+            columns: vec!["mood".into()],
+            external: false,
+        });
+        let found = Postgres::new().validate_table(&name, &table);
         assert!(
-            messages
+            found
                 .iter()
-                .all(|m| m.contains("references to user-defined types are not supported yet")),
-            "{messages:?}"
+                .any(|e| e.to_string().contains("user-defined type reference")
+                    && e.to_string().contains("partition key")),
+            "{found:?}"
         );
+    }
+
+    #[test]
+    fn a_scalar_reference_refuses_declared_data_by_type_before_any_row_read() {
+        let name = "app.t".parse().unwrap();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("mood".into(), pbps_model::Column::new(ty("app.mood")));
+        table.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Ensure,
+            rows: Default::default(),
+        });
         assert!(
-            messages.iter().any(|m| m.contains("`app.mood`")),
-            "{messages:?}"
-        );
-        assert!(
-            messages.iter().any(|m| m.contains("`app.mood[]`")),
-            "{messages:?}"
+            Postgres::new()
+                .validate_table(&name, &table)
+                .iter()
+                .any(|e| e.to_string().contains("`data:`")
+                    && e.to_string().contains("user-defined type reference"))
         );
     }
 

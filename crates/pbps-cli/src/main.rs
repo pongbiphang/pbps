@@ -3496,6 +3496,7 @@ fn cmd_plan(
             res.ids.clone(),
         );
         plan.module_deps = loaded.hints.module_deps.clone();
+        plan.trusted_roles = project.config.trusted_roles.clone();
         plan.git_sha = db::git_sha(project.root());
         // The artifact is the deliverable, so failing to write it is a failure
         // of the whole command — but it is still the *command* that could not

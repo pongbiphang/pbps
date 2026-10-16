@@ -134,7 +134,8 @@ use crate::schema::Schema;
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
 /// 28 records authored policy predicates independently (DEC-1172.2).
-pub const CURRENT_VERSION: u32 = 28;
+/// Version 29 admits existing user-type references (DEC-1523.2).
+pub const CURRENT_VERSION: u32 = 29;
 
 /// The oldest snapshot version this build reads as its own.
 ///

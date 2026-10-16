@@ -602,6 +602,17 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             ..
         } => {
             let about = format!("adding the column {}", table.column(name).raw());
+            if column.ty.type_ref().is_some() {
+                let mut estimate = Estimate::new(
+                    about,
+                    table.clone(),
+                    Rewrite::No,
+                    Reads::Nothing,
+                    Lock::AccessExclusive,
+                );
+                estimate.unknown("a referenced domain's CHECK or DEFAULT can read every row and force a rewrite, even without a column DEFAULT");
+                return Some(estimate);
+            }
             // Measured, `ADD COLUMN d integer DEFAULT 7` rewrites nothing and
             // reads nothing, and `ADD COLUMN d uuid DEFAULT gen_random_uuid()`
             // rebuilds the table. Both are one `AddColumn` carrying a default,

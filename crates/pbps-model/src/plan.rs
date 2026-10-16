@@ -257,7 +257,8 @@ use crate::zone::SessionZone;
 /// which a `Grant` or `Revoke` can carry and an older build cannot read: it
 /// should refuse the plan as a newer one, not as malformed.
 /// 45 adds created-table policy and row-security operations (DEC-1172.2).
-pub const CURRENT_VERSION: u32 = 45;
+/// Version 46 admits user-type references and pins their prerequisites (DEC-1523.2).
+pub const CURRENT_VERSION: u32 = 46;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -432,6 +433,25 @@ pub struct SavedPlan {
     /// since is a change like any other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routine_pins: Option<RoutinePins>,
+
+    /// Existing user-defined types required by this plan (DEC-1523.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_pins: Vec<TypePin>,
+
+    /// The project roles trusted when the input-path gate admitted this plan.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub trusted_roles: std::collections::BTreeSet<String>,
+}
+
+/// A referenced type's identity and unkeyed canonical-definition digest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypePin {
+    pub schema: String,
+    pub name: String,
+    pub oid: i64,
+    pub kind: String,
+    pub digest: String,
 }
 
 /// The routines a plan pins, keyed per schema (DEC-319.1).
@@ -490,6 +510,8 @@ impl SavedPlan {
             ids,
             data: BTreeMap::new(),
             routine_pins: None,
+            type_pins: Vec::new(),
+            trusted_roles: Default::default(),
         }
     }
 
@@ -1029,5 +1051,33 @@ mod tests {
         json.as_object_mut().unwrap().remove("mode");
         let back: SavedPlan = serde_json::from_value(json).unwrap();
         assert_eq!(back.mode, PlanMode::Transactional);
+    }
+    #[test]
+    fn type_pins_and_declared_trust_survive_serialization_and_change_the_approved_checksum() {
+        let mut plan = plan_over(ChangeSet::default());
+        let unpinned = plan.checksum();
+        plan.type_pins.push(TypePin {
+            schema: "app".into(),
+            name: "mood".into(),
+            oid: 40000,
+            kind: "enum".into(),
+            digest: "ab".repeat(32),
+        });
+        plan.trusted_roles.insert("platform_owner".into());
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(serde_json::from_str::<SavedPlan>(&json).unwrap(), plan);
+        assert_ne!(plan.checksum(), unpinned);
+        let before = plan.checksum();
+        plan.type_pins[0].oid += 1;
+        assert_ne!(plan.checksum(), before);
+        let before = plan.checksum();
+        plan.trusted_roles.clear();
+        assert_ne!(plan.checksum(), before);
+        assert!(
+            serde_json::from_str::<SavedPlan>(
+                &json.replace("\"oid\":40000", "\"oid\":40000,\"invented\":true")
+            )
+            .is_err()
+        );
     }
 }

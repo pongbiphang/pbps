@@ -6,6 +6,14 @@
     "dialect": {
       "$ref": "#/$defs/DialectName"
     },
+    "trusted_roles": {
+      "description": "Roles the organization trusts to change evaluated user-type code (#2046).",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
     "schema_dir": {
       "type": "string",
       "pattern": "^(?!(?:\\.\\.?(?:[/\\\\]+|$))*$)",

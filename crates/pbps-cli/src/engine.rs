@@ -5449,3 +5449,106 @@ async fn refuse_policy_dependents(
     }
     Ok(())
 }
+
+/// Read prerequisites before probes can rely on a referenced type.
+pub async fn seal_type_pins(
+    conn: &mut Conn,
+    schemas: &[&Schema],
+    changes: &ChangeSet,
+    trusted: &BTreeSet<String>,
+) -> anyhow::Result<Vec<pbps_model::TypePin>> {
+    match conn.driver() {
+        Driver::Postgres => Ok(pbps_pg::type_refs::seal(conn, schemas, changes, trusted).await?),
+        Driver::Mssql if trusted.is_empty() => Ok(Vec::new()),
+        Driver::Mssql => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
+    }
+}
+
+/// Refuse changed type prerequisites and owner trust before replay proceeds.
+pub async fn check_type_pins(
+    conn: &mut Conn,
+    plan: &pbps_model::SavedPlan,
+    trusted: &BTreeSet<String>,
+    within_transaction: bool,
+) -> anyhow::Result<()> {
+    if &plan.trusted_roles != trusted {
+        anyhow::bail!("trusted_roles changed since planning; plan again against the database");
+    }
+    match conn.driver() {
+        Driver::Postgres => {
+            let within = if within_transaction {
+                pbps_pg::pins::Within::CallersTransaction
+            } else {
+                pbps_pg::pins::Within::OwnTransaction
+            };
+            pbps_pg::type_refs::trusted_roles(conn, trusted).await?;
+            pbps_pg::type_refs::check(conn, within, &plan.type_pins, &plan.changes).await?;
+        }
+        Driver::Mssql if plan.type_pins.is_empty() && trusted.is_empty() => {}
+        Driver::Mssql => {
+            anyhow::bail!("this SQL Server plan carries PostgreSQL type prerequisites")
+        }
+    }
+    Ok(())
+}
+
+/// Refuse implicit fill code before adding reference columns over existing rows.
+pub async fn check_added_type_paths(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    ids: &IdsFile,
+    stored: &IdsFile,
+    trusted: &BTreeSet<String>,
+    within_transaction: bool,
+) -> anyhow::Result<()> {
+    match conn.driver() {
+        Driver::Postgres => {
+            let within = if within_transaction {
+                pbps_pg::pins::Within::CallersTransaction
+            } else {
+                pbps_pg::pins::Within::OwnTransaction
+            };
+            pbps_pg::type_refs::check_added(conn, changes, ids, stored, trusted, within).await?;
+        }
+        Driver::Mssql => {}
+    }
+    Ok(())
+}
+
+/// Assert offline type prerequisites before bootstrap creates any object.
+pub fn bootstrap_type_guard(
+    dialect: &str,
+    schema: &Schema,
+    trusted: &BTreeSet<String>,
+) -> anyhow::Result<Option<pbps_dialect::Statement>> {
+    match dialect {
+        "postgres" => {
+            Ok(pbps_pg::type_refs::bootstrap_guard(schema, trusted)?
+                .map(pbps_dialect::Statement::new))
+        }
+        _ if trusted.is_empty() => Ok(None),
+        _ => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
+    }
+}
+
+/// Keep bootstrap's prerequisite reads valid through execution and recording.
+pub async fn recheck_type_prerequisites(
+    conn: &mut Conn,
+    expected: &[pbps_model::TypePin],
+    changes: &ChangeSet,
+    inside: bool,
+) -> anyhow::Result<()> {
+    match conn.driver() {
+        Driver::Postgres => {
+            let within = if inside {
+                pbps_pg::pins::Within::CallersTransaction
+            } else {
+                pbps_pg::pins::Within::OwnTransaction
+            };
+            pbps_pg::type_refs::check(conn, within, expected, changes).await?;
+        }
+        Driver::Mssql if expected.is_empty() => {}
+        Driver::Mssql => anyhow::bail!("SQL Server does not support type references"),
+    }
+    Ok(())
+}

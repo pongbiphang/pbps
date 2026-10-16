@@ -2476,3 +2476,7 @@ key duplicate still refused INSERT. Owner bypass, FORCE and NOINHERIT owner
 membership make the session's effective answer necessary, rather than the
 catalog's enabled flag. The engine enforces constraints transactionally when
 pre-flight cannot prove them (SPEC §7.5).
+
+<a id="dec-1523-1"></a>
+
+**DEC-1523.1. PostgreSQL columns reference existing enums, domains and standalone composites, scalar or array.** pbps manages no type lifecycle and refuses retypes, row data and partition keys over references. Measured on 16 and 18, ADD COLUMN evaluates domain CHECKs on NULL but no attributes, elements or bounds of a NULL container. Its gate judges evaluated code and its owners, excluding code-free enums; `trusted_roles` extends owner trust only (#2046).

@@ -1194,3 +1194,7 @@ fixtures keep their original envelope versions. A new envelope advances its
 version deliberately; prior published schema archives are never rewritten.
 
 PR C advances state/plan/schema-set to 28/45/52 for authored policy predicates and created-table operations (oldest state stays 6); the generated schemas change only their publication stamp.
+
+<a id="dec-1523-2"></a>
+
+**DEC-1523.2. State 29 admits type references; plan 46 requires their pins; published schema set 53 adds trusted_roles.** States 6–28 remain readable. Measured on 16 and 18, a referenced domain remains a domain in the column catalog: an older reader's omission cannot represent the new state. Plans require the current version so an older apply cannot skip prerequisites.

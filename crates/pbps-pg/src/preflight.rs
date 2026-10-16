@@ -2917,7 +2917,7 @@ fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Probe {
             column = column.raw()
         ),
         format!(
-            "SELECT {} AS n FROM {from} WHERE {reads} IS NULL;",
+            "SELECT {} AS n FROM {from} WHERE {reads} IS NOT DISTINCT FROM NULL;",
             saturated_count("count(*)")
         ),
     )
@@ -3085,6 +3085,9 @@ fn build<'v, 'p: 'v>(
             let Some(stored) = names.view().table(table) else {
                 return Ok(Vec::new());
             };
+            if column.ty.type_ref().is_some() {
+                return Ok(skip(change, "a user type's fill may use its own DEFAULT; no value is evaluated before apply", unchecked));
+            }
             // The model's marker is lexical and deliberately conservative: it
             // answers "could this expression mean NULL?" by looking for the
             // word, and `NULLIF` is one of the words. **Measured on 18.6**, a

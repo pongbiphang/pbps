@@ -5,8 +5,7 @@
 //! and DEFAULT once per existing row, as the deploying role (measured on 16 and
 //! 18, #1523). Whoever wrote those expressions, or the functions they call,
 //! therefore runs code with the deployer's privileges. This module reads what is
-//! needed to refuse that, and nothing else: it is not yet called by `plan`,
-//! `apply`, introspection or emit, and it changes no file format.
+//! needed to judge that before plan probes and apply statements (DEC-1523.1).
 //!
 //! # The two questions
 //!
@@ -30,16 +29,20 @@
 //!   [`crate::catalog`]), or when the caller has declared it trusted. A role that
 //!   can act as an owner without being trusted is named in the refusal.
 //!
-//! A type whose input path runs no code at all is admitted without either
+//! A type contributing no evaluated code needs no trusted owner. A type whose
+//! whole input path runs no code at all is admitted without either
 //! question: an enum, a composite or an array whose leaves have no CHECK and no
 //! DEFAULT, a domain with neither. Nothing is evaluated, so nobody's code runs.
 //!
 //! # The input path
 //!
-//! It is the type itself and every type it is made of or its expressions name:
-//! a domain's base, a composite's attributes, an array's element, a range's
-//! subtype, and any type a CHECK or a DEFAULT names (the domain it casts `VALUE`
-//! to, whose own CHECKs the cast runs). A type the engine made (OID below 16384)
+//! It is the type itself, a domain's base and any evaluated domain coercion
+//! in a stored expression.
+//! A NULL composite, array or range does not evaluate its parts; a statement
+//! DEFAULT can construct them. Stored typed constants have already passed
+//! input conversion, unlike ROW, array coercion and range constructors
+//! (measured on 16 and 18). A cast to a domain follows that domain's CHECKs.
+//! A type the engine made (OID below 16384)
 //! is a leaf: nothing a role can write is behind it. The set is closed by
 //! reading, not by listing the kinds of object that might lead somewhere else.
 //!
@@ -485,6 +488,15 @@ fn settled(first: InputPath, second: InputPath) -> InputPath {
 pub struct Added<'a> {
     ty: &'a UserType,
     own_default: bool,
+    fill: Fill,
+    array: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    Null,
+    StatementDefault,
+    TypeDefault,
 }
 
 impl<'a> Added<'a> {
@@ -495,7 +507,38 @@ impl<'a> Added<'a> {
     /// of the type's input path.
     #[must_use]
     pub fn new(ty: &'a UserType, own_default: bool) -> Self {
-        Self { ty, own_default }
+        let fill = if own_default {
+            Fill::StatementDefault
+        } else if matches!(&ty.definition().body, crate::user_types::Body::Domain(d) if d.default.is_some())
+        {
+            Fill::TypeDefault
+        } else {
+            Fill::Null
+        };
+        Self {
+            ty,
+            own_default,
+            fill,
+            array: false,
+        }
+    }
+
+    /// An explicit NULL default still shadows the type default, but constructs
+    /// no attributes or elements (measured on 16 and 18).
+    #[must_use]
+    pub fn null_fill(mut self) -> Self {
+        self.fill = Fill::Null;
+        self
+    }
+
+    /// An array's NULL fill does not coerce an element or use its DEFAULT.
+    #[must_use]
+    pub fn array(mut self, array: bool) -> Self {
+        self.array = array;
+        if array && self.fill == Fill::TypeDefault {
+            self.fill = Fill::Null;
+        }
+        self
     }
 }
 
@@ -659,13 +702,11 @@ async fn pass(
     };
     let mut gathered: Vec<Result<Facts, String>> = Vec::with_capacity(added.len());
     for column in added {
-        gathered.push(
-            match gather(conn, major, &denied, column.ty.oid(), column.own_default).await {
-                Ok(facts) => Ok(facts),
-                Err(Failure::Read(e)) => return Err(e),
-                Err(Failure::Uncertified(why)) => Err(why),
-            },
-        );
+        gathered.push(match gather(conn, major, &denied, *column).await {
+            Ok(facts) => Ok(facts),
+            Err(Failure::Read(e)) => return Err(e),
+            Err(Failure::Uncertified(why)) => Err(why),
+        });
     }
     // Who can act as the owner of each type that matters: one walk of the
     // cluster's roles for all of them.
@@ -770,9 +811,18 @@ async fn gather(
     conn: &mut Conn,
     major: u32,
     runs_sql: &BTreeSet<Oid>,
-    root: Oid,
-    own_default: bool,
+    added: Added<'_>,
 ) -> Result<Facts, Failure> {
+    let root = added.ty.oid();
+    let own_default = added.own_default;
+    if added.array && added.fill == Fill::Null {
+        return Ok(Facts {
+            runs_code: false,
+            routines: Vec::new(),
+            types: Vec::new(),
+        });
+    }
+    let mut evaluated = BTreeSet::new();
     let mut types: BTreeMap<Oid, TypeRow> = BTreeMap::new();
     // Where each routine is used, by OID.
     let mut functions: BTreeMap<Oid, Vec<Use>> = BTreeMap::new();
@@ -790,7 +840,12 @@ async fn gather(
                 "types are nested more than {MAX_DEPTH} deep"
             )));
         }
-        let reached = reach(conn, &roots).await?;
+        let reached = reach(
+            conn,
+            &roots,
+            added.fill == Fill::StatementDefault && rounds == 1,
+        )
+        .await?;
         // A type the walk was asked to start from and did not find has been
         // dropped under the read: a failed read, not an absence.
         if let Some(gone) = roots.iter().find(|r| !reached.iter().any(|t| t.oid == **r)) {
@@ -822,6 +877,7 @@ async fn gather(
             }
             if let Some(text) = &domain.default {
                 runs_code = true;
+                evaluated.insert(domain.oid);
                 let used_by = Use {
                     ty: domain.name.clone(),
                     part: Part::Default,
@@ -833,6 +889,7 @@ async fn gather(
             let wanted: Vec<Oid> = domains.iter().map(|t| t.oid).collect();
             for (domain, constraint, text) in checks(conn, &wanted).await? {
                 runs_code = true;
+                evaluated.insert(domain);
                 let used_by = Use {
                     ty: domains
                         .iter()
@@ -864,9 +921,9 @@ async fn gather(
                     .or_default()
                     .push(used_by.clone());
             }
-            // A type an expression names is on the path: a cast to a domain
-            // runs that domain's CHECKs. One the engine made is a leaf.
-            for ty in &bound.types {
+            // Only a coercion evaluates domain CHECKs. A stored typed constant
+            // has already passed input conversion (measured on 16 and 18).
+            for ty in &bound.domain_coercions {
                 let ty = Oid::from(*ty);
                 if !is_builtin(ty) && !types.contains_key(&ty) && !fresh.iter().any(|t| t.oid == ty)
                 {
@@ -887,7 +944,7 @@ async fn gather(
         unadmitted_routines(conn, runs_sql, &functions, &operators, &row_compares).await?;
     let owned = types
         .values()
-        .filter(|t| !is_builtin(t.oid))
+        .filter(|t| !is_builtin(t.oid) && evaluated.contains(&t.oid))
         .map(|t| OwnedType {
             oid: t.oid,
             ty: t.name.clone(),
@@ -907,10 +964,10 @@ fn certify(text: &str, major: u32, used_by: &Use) -> Result<Bound, Failure> {
 }
 
 /// Every type reached from `roots` by what a type is made of, the roots
-/// included: a domain's base, a composite's attributes, an array's element, a
-/// range's and a multirange's subtype. Types the engine made are returned and
-/// not entered. One statement, so one snapshot.
-async fn reach(conn: &mut Conn, roots: &[Oid]) -> Result<Vec<TypeRow>, DbError> {
+/// included where evaluated: a domain's base always, and a composite's
+/// attributes, array's element or range's subtype for a constructing fill.
+/// Types the engine made are returned and not entered. One statement, so one snapshot.
+async fn reach(conn: &mut Conn, roots: &[Oid], constructs: bool) -> Result<Vec<TypeRow>, DbError> {
     let first = Oid::from(FIRST_NORMAL_OBJECT_ID);
     let rows = conn
         .query(&format!(
@@ -922,17 +979,17 @@ async fn reach(conn: &mut Conn, roots: &[Oid]) -> Result<Vec<TypeRow>, DbError> 
                    JOIN pg_catalog.pg_type t ON t.oid = r.oid
                   CROSS JOIN LATERAL (
                       SELECT t.typelem AS oid
-                       WHERE EXISTS (SELECT FROM pg_catalog.pg_type el
+                       WHERE {constructs} AND EXISTS (SELECT FROM pg_catalog.pg_type el
                                       WHERE el.oid = t.typelem AND el.typarray = t.oid)
                       UNION ALL
                       SELECT t.typbasetype WHERE t.typtype = 'd'
                       UNION ALL
                       SELECT a.atttypid FROM pg_catalog.pg_attribute a
-                       WHERE t.typtype = 'c' AND a.attrelid = t.typrelid
+                       WHERE {constructs} AND t.typtype = 'c' AND a.attrelid = t.typrelid
                          AND a.attnum > 0 AND NOT a.attisdropped
                       UNION ALL
                       SELECT g.rngsubtype FROM pg_catalog.pg_range g
-                       WHERE g.rngtypid = t.oid OR g.rngmultitypid = t.oid
+                       WHERE {constructs} AND (g.rngtypid = t.oid OR g.rngmultitypid = t.oid)
                   ) e
                   WHERE r.oid >= {first}::pg_catalog.oid)
              SELECT t.oid::pg_catalog.int8 AS oid,

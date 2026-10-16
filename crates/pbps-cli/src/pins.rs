@@ -122,10 +122,18 @@ pub async fn check(
     conn: &mut Conn,
     project: &Project,
     target: &Target,
-    pins: Option<&RoutinePins>,
+    plan: &pbps_model::SavedPlan,
     managed: &BTreeSet<ModuleId>,
     at: Check,
 ) -> anyhow::Result<()> {
+    crate::engine::check_type_pins(
+        conn,
+        plan,
+        &project.config.trusted_roles,
+        matches!(at.within(), pbps_pg::pins::Within::CallersTransaction),
+    )
+    .await?;
+    let pins = plan.routine_pins.as_ref();
     if conn.driver() != Driver::Postgres {
         return Ok(());
     }

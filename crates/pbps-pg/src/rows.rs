@@ -161,6 +161,19 @@ pub fn query(
     scope: &RowScope,
 ) -> Result<Option<RowQuery>, RowsError> {
     let key = key_column(name, table)?;
+    if let Some((column, spec)) = table
+        .columns
+        .iter()
+        .find(|(_, c)| c.ty.type_ref().is_some())
+    {
+        return Err(RowsError::Unreadable {
+            table: name.clone(),
+            why: format!(
+                "its column `{column}` is `{}`, a user-defined type reference, and pbps reads no rows of this type",
+                spec.ty
+            ),
+        });
+    }
     // A row's values are scalars, and an array's base is its element's: read
     // as one, `{1,2}` would fail as a malformed integer, or worse. Refused
     // by name before any query, as `validate` refuses `data:` beside one
@@ -3144,5 +3157,22 @@ mod tests {
         );
         assert!(q.sql.contains("GROUP BY CAST(v.s AS numeric)"), "{}", q.sql);
         assert!(q.sql.contains("HAVING count(*) > 1"), "{}", q.sql);
+    }
+    #[test]
+    fn a_reference_column_refuses_the_row_query_before_any_value_is_read() {
+        let with = table(
+            Some(vec!["id"]),
+            &[("id", "integer", None), ("mood", "app.mood", None)],
+        );
+        let error = query(&name(), &with, &every()).unwrap_err().to_string();
+        assert!(
+            error.contains("user-defined type reference") && error.contains("mood"),
+            "{error}"
+        );
+        let without = table(
+            Some(vec!["id"]),
+            &[("id", "integer", None), ("mood", "text", None)],
+        );
+        assert!(query(&name(), &without, &every()).is_ok());
     }
 }

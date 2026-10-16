@@ -41,9 +41,7 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 52;
-// 52: created-table row-security operations (issue #1172 PR C).
-// 51: a table's `row_security:` and `row_policies:` (issue #1172 PR A).
+pub const SCHEMA_VERSION: u32 = 53;
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -64,6 +62,9 @@ pub const SCHEMA_VERSION: u32 = 52;
 // 46: an `identity:` mapping and a `sequence:`'s `min`, `max`, `cycle`, `cache` (issue #1921).
 // 47: `partition_by:`'s `list:` and `hash:`, and a partition's `in:`, `modulus:`, `remainder:` (issue #1632).
 // 50: a plan's `origins`, the steps a planning rule added (issue #1958).
+// 51: a table's `row_security:` and `row_policies:` (issue #1172 PR A).
+// 52: created-table row-security operations (issue #1172 PR C).
+// 53: PostgreSQL user-type references and trusted_roles (issue #1523).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).

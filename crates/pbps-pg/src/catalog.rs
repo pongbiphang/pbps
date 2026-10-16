@@ -704,6 +704,10 @@ fn columns_query() -> String {
     format!(
         "SELECT a.attrelid::int8 AS table_oid, a.attnum::int4 AS attnum, a.attname AS name,
             pg_catalog.format_type(a.atttypid, a.atttypmod) AS ty,
+            ut.oid::int8 AS user_type_oid, un.nspname AS user_type_schema,
+            ut.typname AS user_type_name, ut.typtype::text AS user_type_kind,
+            ut.typisdefined AS user_type_defined, ur.relkind::text AS user_type_relkind,
+            (el.oid IS NOT NULL) AS type_array,
             NOT a.attnotnull AS nullable,
             pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_expr,
             a.attidentity::text AS identity_kind,
@@ -738,6 +742,10 @@ fn columns_query() -> String {
        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid
+       LEFT JOIN pg_catalog.pg_type el ON el.oid = ty.typelem AND el.typarray = ty.oid
+       LEFT JOIN pg_catalog.pg_type ut ON ut.oid = COALESCE(el.oid, ty.oid) AND ut.oid >= 16384
+       LEFT JOIN pg_catalog.pg_namespace un ON un.oid = ut.typnamespace
+       LEFT JOIN pg_catalog.pg_class ur ON ur.oid = ut.typrelid
        LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
        LEFT JOIN (pg_catalog.pg_depend own
                   JOIN pg_catalog.pg_class seq
@@ -1491,6 +1499,18 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             attnum: small(row, "attnum")?,
             name: text(row, "name")?,
             ty: text(row, "ty")?,
+            user_type: if row.integer("user_type_oid")?.is_some() {
+                Some(crate::introspect::RawUserType {
+                    schema: text(row, "user_type_schema")?,
+                    name: text(row, "user_type_name")?,
+                    kind: text(row, "user_type_kind")?,
+                    defined: flag(row, "user_type_defined")?,
+                    relkind: optional_text(row, "user_type_relkind")?,
+                    array: flag(row, "type_array")?,
+                })
+            } else {
+                None
+            },
             nullable: flag(row, "nullable")?,
             default: optional_text(row, "default_expr")?,
             identity,

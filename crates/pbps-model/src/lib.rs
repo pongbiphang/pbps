@@ -76,7 +76,7 @@ pub use module::{
 pub use name::{ColumnName, ColumnRef, NameError, RoleName, TableName, check_segment};
 pub use partitions::Partitions;
 pub use plan::{
-    PlanBaseline, PlanMode, PlanOrigin, RoutinePins, SavedPlan, SchemaPin, plan_checksum,
+    PlanBaseline, PlanMode, PlanOrigin, RoutinePins, SavedPlan, SchemaPin, TypePin, plan_checksum,
     state_checksum,
 };
 pub use reason::{Reason, ReasonError};
