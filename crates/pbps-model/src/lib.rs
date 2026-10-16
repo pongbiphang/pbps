@@ -49,6 +49,7 @@ pub mod schema;
 pub mod state;
 pub mod storage;
 pub mod strategy;
+pub mod text;
 pub mod types;
 pub mod uid;
 pub mod zone;
@@ -89,6 +90,7 @@ pub use schema::{
 };
 pub use state::{StagedProgress, StateKind, StateSnapshot, Unreadable, check_readable_version};
 pub use strategy::{Strategies, Strategy};
+pub use text::Text;
 pub use types::{ColumnType, TypeArg, TypeParseError, TypeRef};
 pub use uid::{Uid, UidError, UidKind};
 pub use zone::{SessionZone, ZoneError};

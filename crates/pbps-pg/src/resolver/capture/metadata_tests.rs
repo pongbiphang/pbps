@@ -166,7 +166,7 @@ async fn exercise(connection: String) {
             .columns
             .get_mut(&column.name)
             .unwrap()
-            .deprecated = reason.map(str::to_owned);
+            .deprecated = reason.map(pbps_model::Text::from);
         let ordered = pbps_diff::resolver::plan(
             pbps_diff::Side {
                 schema: &schema,

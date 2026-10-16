@@ -61,7 +61,7 @@ pub fn render_partitioned(
     let _ = writeln!(s, "table: {}", scalar(&name.to_string()));
 
     if let Some(d) = &table.description {
-        let _ = writeln!(s, "description: {}", scalar(d));
+        let _ = writeln!(s, "description: {}", scalar(d.raw()));
     }
 
     if let Some(Intent::RenameTable { from, .. }) = intents
@@ -154,10 +154,10 @@ pub fn render_partitioned(
             let _ = writeln!(s, "    collation: {}", scalar(collation.as_str()));
         }
         if let Some(d) = &c.description {
-            let _ = writeln!(s, "    description: {}", scalar(d));
+            let _ = writeln!(s, "    description: {}", scalar(d.raw()));
         }
         if let Some(d) = &c.deprecated {
-            let _ = writeln!(s, "    deprecated: {}", scalar(d));
+            let _ = writeln!(s, "    deprecated: {}", scalar(d.raw()));
         }
         if let Some(Intent::RenameColumn { from, .. }) = intents.iter().find(|i| {
             matches!(i, Intent::RenameColumn { table: t, to, .. } if t == name && to == col_name)
@@ -484,7 +484,7 @@ pub fn render_module(
     let _ = writeln!(s, "{}: {}", module.kind.as_str(), scalar(&declared));
 
     if let Some(d) = &module.description {
-        let _ = writeln!(s, "description: {}", scalar(d));
+        let _ = writeln!(s, "description: {}", scalar(d.raw()));
     }
     if let Some(on) = on.as_deref() {
         let _ = writeln!(s, "on: {}", scalar(on));
@@ -527,7 +527,7 @@ pub fn render_role(name: &str, role: &pbps_model::Role, pending: &[Intent]) -> S
     let mut s = String::new();
     let _ = writeln!(s, "role: {}", scalar(name));
     if let Some(d) = &role.description {
-        let _ = writeln!(s, "description: {}", scalar(d));
+        let _ = writeln!(s, "description: {}", scalar(d.raw()));
     }
     for i in pending {
         if let Intent::RenameRole { from, to } = i
@@ -1025,7 +1025,7 @@ mod tests {
             }
             let module = Module {
                 kind: pbps_model::ModuleKind::View,
-                description: Some(s.clone()),
+                description: Some(s.as_str().into()),
                 definition: "SELECT 'first  \nsecond' AS note".into(),
             };
             let id = ModuleId::Named("app.v".parse().unwrap());
@@ -1043,7 +1043,7 @@ mod tests {
             );
 
             let role = pbps_model::Role {
-                description: Some(s.clone()),
+                description: Some(s.as_str().into()),
                 ..Default::default()
             };
             let out = render_role("reader", &role, &[]);

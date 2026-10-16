@@ -3409,7 +3409,7 @@ fn cmd_plan(
             now(),
             pbps_model::PlanBaseline {
                 time_zone: None,
-                description: base.description.clone(),
+                description: base.description.as_str().into(),
                 checksum: pbps_model::state_checksum(&base.schema, &base.ids),
                 database_collation: None,
             },

@@ -1050,7 +1050,12 @@ pub fn describe(c: &Change) -> String {
         ),
         Change::DropComputedColumn { name, .. } => format!("- drop computed column {name}"),
         Change::SetColumnDeprecated { column, reason, .. } => match reason {
-            Some(r) => format!("~ {} marked deprecated: {r}", column.name),
+            // `.raw()`: this line is the JSON `risks[].changes` text as well as
+            // the report's, and the report escapes each line whole when it
+            // prints it (`Escaped(&describe(..))`, #2035). Showing the reason
+            // here too would escape it twice and change the JSON. The interim
+            // cover goes with #2084 step 5.
+            Some(r) => format!("~ {} marked deprecated: {}", column.name, r.raw()),
             None => format!("~ {} no longer deprecated", column.name),
         },
         Change::SetPrimaryKey { to, .. } => match to {

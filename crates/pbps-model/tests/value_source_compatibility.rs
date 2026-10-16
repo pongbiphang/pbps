@@ -145,6 +145,65 @@ fn every_value_source_keeps_approved_bytes_and_fingerprints() {
     );
 }
 
+/// The free text a plan and a state carry is `Text` (#2084), which serializes
+/// as the bare string a `String` did: the fixture's own bytes, and its
+/// fingerprints, are the other half of this pin. The fields the fixture leaves
+/// out are inserted where the field order puts them, holding the characters a
+/// hand-made file can hold, and must be exactly the JSON string of each.
+#[test]
+fn free_text_keeps_the_bytes_a_string_had() {
+    let text = "a\nb\r\u{1b}[31mred\u{9b}2J \\ \"q\" \u{202e} 名前";
+    let json = serde_json::to_string(text).unwrap();
+    let (_, _, mut plan, mut state) = artifacts();
+    let plan_before = serde_json::to_string(&plan).unwrap();
+    let state_before = serde_json::to_string(&state).unwrap();
+
+    plan.git_sha = Some(text.into());
+    plan.created_at = text.into();
+    plan.baseline.description = text.into();
+    let expected = plan_before
+        .replacen(
+            r#""created_at":"2026-10-12T00:00:00Z""#,
+            &format!(r#""created_at":{json},"git_sha":{json}"#),
+            1,
+        )
+        .replacen(
+            r#""description":"value-source byte fixture""#,
+            &format!(r#""description":{json}"#),
+            1,
+        );
+    assert_eq!(serde_json::to_string(&plan).unwrap(), expected);
+    assert_eq!(
+        serde_json::from_str::<SavedPlan>(&expected).unwrap(),
+        plan,
+        "the same bytes read back as the same plan"
+    );
+
+    state.git_sha = Some(text.into());
+    state.reason = Some(text.into());
+    let expected = state_before
+        .replacen(
+            r#""plan_checksum":"#,
+            &format!(r#""git_sha":{json},"plan_checksum":"#),
+            1,
+        )
+        .replacen(
+            r#""operator":"fixture""#,
+            &format!(r#""operator":"fixture","reason":{json}"#),
+            1,
+        );
+    assert_eq!(serde_json::to_string(&state).unwrap(), expected);
+    assert_eq!(StateSnapshot::from_json(&expected).unwrap(), state);
+
+    // Negative: a value that is not a string is still refused, as it was.
+    let number = plan_before.replacen(
+        r#""created_at":"2026-10-12T00:00:00Z""#,
+        r#""created_at":7"#,
+        1,
+    );
+    assert!(serde_json::from_str::<SavedPlan>(&number).is_err());
+}
+
 #[test]
 fn absent_and_explicit_null_sources_keep_the_historical_empty_spelling() {
     for input in [

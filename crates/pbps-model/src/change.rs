@@ -422,7 +422,7 @@ pub enum Change {
     SetColumnDeprecated {
         uid: Uid,
         column: ColumnRef,
-        reason: Option<String>,
+        reason: Option<crate::Text>,
     },
 
     /// A PostgreSQL table's replica identity (#1444): `ALTER TABLE …

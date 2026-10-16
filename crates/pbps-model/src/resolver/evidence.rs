@@ -38,7 +38,7 @@ pub enum ResolverRuntime {
     Scratch {
         /// The `pbps.yml` resolver entry that ran, so a reviewer of the plan
         /// alone can tell which configuration produced it (#1517).
-        entry: String,
+        entry: crate::Text,
         scratch: ScratchSource,
         /// Whether the run made its scratch database or used one supplied.
         layout: ScratchLayout,
@@ -69,7 +69,7 @@ pub enum ScratchSource {
     /// A container pbps started for the run and removed after it, from this
     /// image reference as configured. Unverified: no digest is claimed, and
     /// the content behind a tag can change (#1674).
-    Docker { image: String },
+    Docker { image: crate::Text },
 }
 
 /// What a baseline was allowed to change outside the scratch database.
@@ -104,7 +104,7 @@ pub struct Qualification {
     /// The differences the rule accepted as named limitations rather than
     /// refusing them, such as a differing build string (DEC-1672.1): each
     /// name, with what it means (#1700).
-    pub limitations: BTreeMap<String, String>,
+    pub limitations: BTreeMap<crate::Text, crate::Text>,
     /// What the target facts above answer, for apply to ask again (#616).
     pub target_scope: TargetScope,
 }

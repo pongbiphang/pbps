@@ -312,7 +312,7 @@ impl std::fmt::Display for PlanMode {
 pub struct PlanBaseline {
     /// Human-readable, for the approver reading the plan at the gate: "prod as
     /// queried", "git HEAD~3".
-    pub description: String,
+    pub description: crate::Text,
 
     /// [`state_checksum`] of the baseline. `apply` recomputes it from the live
     /// database; a mismatch is drift and stops the apply.
@@ -370,12 +370,12 @@ pub struct SavedPlan {
     /// `YYYY-MM-DDTHH:MM:SSZ`. For the human reading the plan, not for any
     /// decision the tool makes — staleness is caught by the checksum, which is
     /// the only honest test.
-    pub created_at: String,
+    pub created_at: crate::Text,
 
     /// The commit the declarations came from, when the tool is run inside a
     /// checkout. Carried into the ledger, which is where an audit looks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_sha: Option<String>,
+    pub git_sha: Option<crate::Text>,
 
     pub baseline: PlanBaseline,
 
@@ -459,7 +459,7 @@ impl SavedPlan {
     pub fn new(
         origin: PlanOrigin,
         dialect: impl Into<String>,
-        created_at: impl Into<String>,
+        created_at: impl Into<crate::Text>,
         baseline: PlanBaseline,
         changes: ChangeSet,
         ids: IdsFile,

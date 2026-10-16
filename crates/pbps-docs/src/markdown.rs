@@ -68,7 +68,7 @@ fn modules_section(s: &mut String, modules: &BTreeMap<ModuleId, Module>) {
             .unwrap_or_default();
         let _ = writeln!(s, "*{}{on}*\n", m.kind);
         if let Some(d) = &m.description {
-            let _ = writeln!(s, "{d}\n");
+            let _ = writeln!(s, "{}\n", d.raw());
         }
         let _ = writeln!(s, "```sql\n{}\n```", m.definition.trim_end());
     }
@@ -84,7 +84,7 @@ fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
     for (name, role) in roles {
         let _ = writeln!(s, "\n### `{name}`\n");
         if let Some(d) = &role.description {
-            let _ = writeln!(s, "{d}\n");
+            let _ = writeln!(s, "{}\n", d.raw());
         }
         if role.grants.is_empty() {
             s.push_str("No grants.\n");
@@ -101,7 +101,7 @@ fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
 fn one_table(s: &mut String, name: &TableName, table: &Table) {
     let _ = writeln!(s, "\n### `{name}`\n");
     if let Some(d) = &table.description {
-        let _ = writeln!(s, "{d}\n");
+        let _ = writeln!(s, "{}\n", d.raw());
     }
 
     s.push_str("| Column | Type | Null | Default | Description |\n");
@@ -130,7 +130,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
                 | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => "—".into(),
             },
-            cell(c.description.as_deref())
+            cell(c.description.as_ref().map(pbps_model::Text::raw))
         );
     }
 
@@ -230,7 +230,7 @@ fn deprecated_section(s: &mut String, schema: &Schema) {
     s.push_str("\n## Do not use\n\nThese columns still exist but are on their way out.\n\n");
     s.push_str("| Column | Reason |\n|---|---|\n");
     for (name, reason) in rows {
-        let _ = writeln!(s, "| `{name}` | {reason} |");
+        let _ = writeln!(s, "| `{name}` | {} |", reason.raw());
     }
 }
 

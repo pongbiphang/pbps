@@ -79,7 +79,8 @@ pub fn render(schema: &Schema) -> String {
             let key = key_marker(table, col_name);
             let comment = col
                 .description
-                .as_deref()
+                .as_ref()
+                .map(pbps_model::Text::raw)
                 .map(|d| format!(" \"{}\"", d.replace('"', "'")))
                 .unwrap_or_default();
             let _ = writeln!(

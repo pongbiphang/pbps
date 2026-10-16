@@ -17,7 +17,9 @@ fn resolved_plan() -> SavedPlan {
     resolved_plan_with(Default::default())
 }
 
-fn resolved_plan_with(limitations: std::collections::BTreeMap<String, String>) -> SavedPlan {
+fn resolved_plan_with(
+    limitations: std::collections::BTreeMap<pbps_model::Text, pbps_model::Text>,
+) -> SavedPlan {
     let plan = sealed_under(pbps_pg::resolver::compatibility::REPORTED_RULE, limitations);
     let PlanAnalysis::Resolved(evidence) = &plan.analysis else {
         unreachable!("sealed_under resolves the plan");
@@ -28,7 +30,10 @@ fn resolved_plan_with(limitations: std::collections::BTreeMap<String, String>) -
 
 /// A plan whose evidence names `rule`, valid or not: what an earlier build
 /// sealed, with the checksum that build computed.
-fn sealed_under(rule: &str, limitations: std::collections::BTreeMap<String, String>) -> SavedPlan {
+fn sealed_under(
+    rule: &str,
+    limitations: std::collections::BTreeMap<pbps_model::Text, pbps_model::Text>,
+) -> SavedPlan {
     sealed(
         rule,
         limitations,
@@ -46,7 +51,7 @@ fn sealed_under(rule: &str, limitations: std::collections::BTreeMap<String, Stri
 /// [`sealed_under`] over a chosen change set, identity mapping and runtime.
 fn sealed(
     rule: &str,
-    limitations: std::collections::BTreeMap<String, String>,
+    limitations: std::collections::BTreeMap<pbps_model::Text, pbps_model::Text>,
     changes: ChangeSet,
     runtime: ResolverRuntime,
     ids: IdsFile,
@@ -243,8 +248,8 @@ fn ordinary_database_approval_and_preview_remedy_keep_their_meaning() {
 fn a_resolved_plan_explains_its_provenance_and_sealed_qualification() {
     let limited = resolved_plan_with(
         [(
-            "build:server_version".to_owned(),
-            "the scratch reports another build string of the same version".to_owned(),
+            "build:server_version".into(),
+            "the scratch reports another build string of the same version".into(),
         )]
         .into(),
     );
@@ -942,7 +947,7 @@ fn plan_holding(text: &str) -> SavedPlan {
 fn resolved_plan_holding(text: &str) -> SavedPlan {
     sealed(
         pbps_pg::resolver::compatibility::REPORTED_RULE,
-        [(text.to_owned(), text.to_owned())].into(),
+        [(text.into(), text.into())].into(),
         ChangeSet::default(),
         ResolverRuntime::Scratch {
             entry: text.into(),
@@ -1091,6 +1096,112 @@ fn a_unicode_name_is_shown_as_the_file_spells_it() {
             assert!(text.contains(&fragment), "{fragment:?} not in\n{text}");
         }
     }
+}
+
+/// What the free text of a plan can hold that a reviewer reads (#2084): a line
+/// break, a carriage return, a terminal sequence and the single-character
+/// introducer some terminals read as one.
+const FREE_TEXT: &str = "why\nerror: forged\r\u{1b}[31mred\u{9b}2J";
+/// What the report shows of [`FREE_TEXT`].
+const FREE_TEXT_SHOWN: &str = "why\\nerror: forged\\r\\u{1b}[31mred\\u{9b}2J";
+
+/// A plan whose column is made deprecated for `reason`, whose added column
+/// carries `reason` as its description and deprecation, and whose baseline
+/// description is `reason` too.
+fn plan_with_free_text(reason: &str) -> SavedPlan {
+    let table = TableName::new("app", "t");
+    let uid = |s: &str| -> Uid { s.parse().unwrap() };
+    let mut column = Column::new("int".parse().unwrap());
+    column.description = Some(reason.into());
+    column.deprecated = Some(reason.into());
+    let changes = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::AddColumn {
+                uid: uid("c_aaaaaa"),
+                table: table.clone(),
+                name: "kept".into(),
+                column: Box::new(column),
+            }),
+            PlannedChange::new(Change::SetColumnDeprecated {
+                uid: uid("c_bbbbbb"),
+                column: table.column("old"),
+                reason: Some(reason.into()),
+            }),
+        ],
+    };
+    let ids = IdsFile {
+        tables: [(uid("t_aaaaaa"), table.clone())].into(),
+        columns: [
+            (uid("c_aaaaaa"), table.column("kept")),
+            (uid("c_bbbbbb"), table.column("old")),
+        ]
+        .into(),
+        ..IdsFile::default()
+    };
+    SavedPlan::new(
+        PlanOrigin::Database,
+        "postgres",
+        "2026-10-16T00:00:00Z",
+        PlanBaseline {
+            time_zone: None,
+            description: reason.into(),
+            checksum: "00".repeat(32),
+            database_collation: None,
+        },
+        changes,
+        ids,
+    )
+}
+
+/// A description, a deprecation reason and a baseline in a hand-made plan may
+/// hold a line break or a terminal sequence. The text report shows them escaped
+/// in the lines it already had, and `--format json` carries them as it did.
+#[test]
+fn a_deprecation_reason_and_a_description_in_a_plan_are_shown_escaped_and_json_is_unchanged() {
+    let explained = |plan: &SavedPlan| {
+        let artifact = Artifact::new(&serde_json::to_value(plan).unwrap());
+        let text = artifact.explain("text");
+        assert!(text.status.success() && text.stderr.is_empty(), "{text:?}");
+        let json = artifact.explain("json");
+        assert!(json.status.success(), "{json:?}");
+        (String::from_utf8(text.stdout).unwrap(), json)
+    };
+    let (text, json) = explained(&plan_with_free_text(FREE_TEXT));
+    let (plain, _) = explained(&plan_with_free_text("x"));
+    assert_only_the_reports_own_lines(&text, &plain, "explain text");
+    for (what, fragment) in [
+        (
+            "a deprecation reason",
+            format!("~ old marked deprecated: {FREE_TEXT_SHOWN}\n"),
+        ),
+        ("the baseline", format!("  baseline    {FREE_TEXT_SHOWN}\n")),
+    ] {
+        assert!(
+            text.contains(&fragment),
+            "{what}: {fragment:?} not in\n{text}"
+        );
+    }
+
+    // JSON is what it was: the value as JSON spells it, not escaped twice.
+    let raw = String::from_utf8(json.stdout.clone()).unwrap();
+    assert_eq!(report(&json)["data"]["baseline"], FREE_TEXT);
+    assert!(
+        raw.contains(&serde_json::to_string(FREE_TEXT).unwrap()),
+        "{raw}"
+    );
+    assert!(!raw.contains(FREE_TEXT_SHOWN), "{raw}");
+
+    // Negative: a plain Unicode reason and description are shown unchanged.
+    let plain_text = "不再使用 ünï 'q' {} 9";
+    let (text, _) = explained(&plan_with_free_text(plain_text));
+    assert!(
+        text.contains(&format!("~ old marked deprecated: {plain_text}\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("  baseline    {plain_text}\n")),
+        "{text}"
+    );
 }
 
 /// A plan with the changes of [`changes_naming`] under `text`, as a database

@@ -15875,7 +15875,11 @@ async fn a_malformed_timeline_row_is_refused_alone_and_the_rest_are_read() {
         .expect("the whole call must still succeed — only the bad rows are refused");
     assert_eq!(rows.len(), 5);
     for row in &rows {
-        let reason = row.reason.as_deref().unwrap_or_default();
+        let reason = row
+            .reason
+            .as_ref()
+            .map(pbps_model::Text::raw)
+            .unwrap_or_default();
         match (reason, &row.state) {
             ("well-formed", Ok(state)) => {
                 assert_eq!((state.tables, state.modules), (2, 1), "{reason}");

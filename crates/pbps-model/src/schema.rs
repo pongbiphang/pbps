@@ -401,7 +401,7 @@ impl Table {
 #[serde(deny_unknown_fields)]
 pub struct Table {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: Option<crate::Text>,
 
     /// An `IndexMap` preserves declaration order, which decides the column
     /// layout of `CREATE TABLE`. Equality ignores order, so reordering is never
@@ -897,14 +897,14 @@ pub struct Column {
     /// out (DECISIONS 443).
     pub collation: Option<Collation>,
 
-    pub description: Option<String>,
+    pub description: Option<crate::Text>,
 
     /// Present means deprecated; the value is the reason.
     ///
     /// No date is stored — git already records it, so asking the user to write
     /// one by hand is redundant and guaranteed to drift from the real time
     /// (SPEC §4.2).
-    pub deprecated: Option<String>,
+    pub deprecated: Option<crate::Text>,
 }
 
 impl Column {

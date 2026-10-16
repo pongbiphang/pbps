@@ -268,7 +268,7 @@ fn assert_answers_the_overload_from(
         ..
     } = &plan.evidence.qualification().runtime;
     assert_eq!(
-        (entry.as_str(), sealed, *outside_writes),
+        (entry.raw(), sealed, *outside_writes),
         (
             "scratch",
             &scratch,
@@ -3725,7 +3725,7 @@ async fn produce_in_docker(
     let provenance = super::Provenance {
         entry: "scratch".into(),
         scratch: pbps_model::resolver::ScratchSource::Docker {
-            image: image.to_owned(),
+            image: image.into(),
         },
         outside_writes,
     };
@@ -3969,7 +3969,9 @@ async fn resolver_docker_answers_a_managed_question() {
         let plan = result.unwrap_or_else(|error| panic!("{target_var}: {error}"));
         assert_answers_the_overload_from(
             &plan,
-            pbps_model::resolver::ScratchSource::Docker { image },
+            pbps_model::resolver::ScratchSource::Docker {
+                image: image.into(),
+            },
         );
     }
 }
@@ -4011,7 +4013,9 @@ async fn resolver_docker_records_the_image_as_configured_and_unverified() {
         plan.evidence.qualification().runtime,
         pbps_model::resolver::ResolverRuntime::Scratch {
             entry: "scratch".into(),
-            scratch: pbps_model::resolver::ScratchSource::Docker { image: tag.clone() },
+            scratch: pbps_model::resolver::ScratchSource::Docker {
+                image: tag.as_str().into(),
+            },
             // A container's superuser provisions its own database.
             layout: pbps_model::resolver::ScratchLayout::RunOwned,
             outside_writes: pbps_model::resolver::OutsideWrites::Refused,
@@ -4579,7 +4583,7 @@ async fn resolver_seals_an_accepted_build_limitation_and_rechecks_it() {
                     let named = limitations
                         .get("build:server_version")
                         .unwrap_or_else(|| panic!("{server}: {limitations:?}"));
-                    assert!(named.contains(build), "{server}: {named}");
+                    assert!(named.raw().contains(build), "{server}: {:?}", named.raw());
                 }
                 None => assert!(
                     limitations.is_empty(),

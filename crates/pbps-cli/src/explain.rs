@@ -42,10 +42,10 @@ pub struct Explanation {
     /// does not assert that the target or risk approval is ready.
     pub applyable: bool,
     pub dialect: String,
-    pub created_at: String,
+    pub created_at: pbps_model::Text,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_sha: Option<String>,
-    pub baseline: String,
+    pub git_sha: Option<pbps_model::Text>,
+    pub baseline: pbps_model::Text,
     /// `transactional` or `staged`.
     pub mode: &'static str,
     /// The checksum `apply` will re-compute and refuse a mismatch on.
@@ -617,11 +617,11 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         out.push_str(&format!("  resolver    {}\n", resolver::line(detail)));
     }
     out.push_str(&format!("  dialect     {}\n", Escaped(&e.dialect)));
-    out.push_str(&format!("  created     {}\n", Escaped(&e.created_at)));
+    out.push_str(&format!("  created     {}\n", e.created_at.shown()));
     if let Some(sha) = &e.git_sha {
-        out.push_str(&format!("  git sha     {}\n", Escaped(sha)));
+        out.push_str(&format!("  git sha     {}\n", sha.shown()));
     }
-    out.push_str(&format!("  baseline    {}\n", Escaped(&e.baseline)));
+    out.push_str(&format!("  baseline    {}\n", e.baseline.shown()));
     out.push_str(&format!(
         "  execution   {}\n",
         match plan.mode {

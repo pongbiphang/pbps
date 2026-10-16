@@ -161,7 +161,11 @@ pub(super) fn seal(
             "system-identifier",
             identity.target_cluster.as_bytes(),
         ),
-        limitations: identity.limitations,
+        limitations: identity
+            .limitations
+            .into_iter()
+            .map(|(name, description)| (name.into(), description.into()))
+            .collect(),
         target_scope: pbps_model::resolver::TargetScope {
             schemas: schemas.clone(),
             write_path_extras: write_path_extras.clone(),
