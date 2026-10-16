@@ -1911,7 +1911,10 @@ async fn the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_r
 /// written by hand. It reads one catalog per database-scoped securable class
 /// the engine reports in `sys.fn_builtin_permissions`, and a class with no
 /// known catalog refuses; this pins the classes the pinned build reports, so
-/// a build that adds one fails here first.
+/// a build that adds one fails here first. A class is database-scoped when it
+/// is `DATABASE` or its parent is `DATABASE` or `SCHEMA`, not by a list of
+/// server classes written by hand: that list let the server's `CREDENTIAL`
+/// through, whose catalog a database's owner reads as empty.
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn a_database_holds_securables_no_object_catalog_lists() {
@@ -1920,7 +1923,7 @@ async fn a_database_holds_securables_no_object_catalog_lists() {
         texts(
             &mut db.conn,
             "SELECT DISTINCT CONVERT(nvarchar(60), class_desc) FROM sys.fn_builtin_permissions(DEFAULT) \
-             WHERE class_desc NOT IN (N'SERVER', N'ENDPOINT', N'LOGIN', N'SERVER ROLE', N'AVAILABILITY GROUP') \
+             WHERE class_desc = N'DATABASE' OR parent_class_desc IN (N'DATABASE', N'SCHEMA') \
              ORDER BY 1;"
         )
         .await,
@@ -1930,7 +1933,6 @@ async fn a_database_holds_securables_no_object_catalog_lists() {
             "ASYMMETRIC KEY",
             "CERTIFICATE",
             "CONTRACT",
-            "CREDENTIAL",
             "DATABASE",
             "DATABASE SCOPED CREDENTIAL",
             "EXTERNAL LANGUAGE",
@@ -1950,6 +1952,23 @@ async fn a_database_holds_securables_no_object_catalog_lists() {
             "USER",
             "XML SCHEMA COLLECTION"
         ]
+    );
+    assert_eq!(
+        texts(
+            &mut db.conn,
+            "SELECT DISTINCT CONVERT(nvarchar(60), class_desc) FROM sys.fn_builtin_permissions(DEFAULT) \
+             WHERE parent_class_desc = N'SERVER' ORDER BY 1;"
+        )
+        .await,
+        [
+            "AVAILABILITY GROUP",
+            "CREDENTIAL",
+            "DATABASE",
+            "ENDPOINT",
+            "LOGIN",
+            "SERVER ROLE"
+        ],
+        "a credential is the server's; only the database-scoped credential is the database's"
     );
     let held = "SELECT CONVERT(bigint, (SELECT COUNT(*) FROM sys.symmetric_keys) * 10000 \
          + (SELECT COUNT(*) FROM sys.certificates) * 1000 \

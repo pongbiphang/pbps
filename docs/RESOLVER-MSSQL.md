@@ -310,9 +310,11 @@ certificate, an asymmetric key, and a partition function and scheme each
 live only in their own catalog [`a_database_holds_securables_no_object_catalog_lists`].
 
 - **Securable classes.** The read takes one catalog per database-scoped
-  securable class the engine reports in `sys.fn_builtin_permissions`. On the
-  pinned build there are 24, from `APPLICATION ROLE` to
-  `XML SCHEMA COLLECTION`. Each catalog is compared with its fresh-install
+  securable class the engine reports in `sys.fn_builtin_permissions`: the
+  `DATABASE` class and every class whose parent is `DATABASE` or `SCHEMA`.
+  On the pinned build there are 23, from `APPLICATION ROLE` to
+  `XML SCHEMA COLLECTION`. `CREDENTIAL` is not among them: its parent is
+  `SERVER`, and only `DATABASE SCOPED CREDENTIAL` belongs to the database. Each catalog is compared with its fresh-install
   rows, and the system broker objects a new database carries are among
   them. A class with no known catalog refuses by name, so a class a later
   build adds is refused until it is read.

@@ -3225,8 +3225,10 @@ inventory as `db_owner` (#619).**
   the pinned build, identical on Developer and Express. A table or user
   added to `model` appears in the next database.
   - It is read per securable class the engine reports in
-    `sys.fn_builtin_permissions`, 24 on the pinned build, each from its own
-    catalog. A class with no known catalog refuses.
+    `sys.fn_builtin_permissions` whose scope is the database (the
+    `DATABASE` class and those whose parent is `DATABASE` or `SCHEMA`), 23
+    on the pinned build, each from its own catalog. A class with no known
+    catalog refuses.
   - The objects that are no securable are read too: partition functions
     and schemes, plan guides, event notifications, audit specifications,
     files.
