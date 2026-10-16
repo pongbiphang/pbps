@@ -1050,6 +1050,15 @@ protection under test is removed.
 3. **SQL Server resolver:** shared infrastructure, but a separately designed
    binding adapter and real SQL Server tests before connected planning can use
    its evidence. PostgreSQL tests do not qualify it.
+   - **Designed by #619** in [RESOLVER-MSSQL.md](RESOLVER-MSSQL.md)
+     (DEC-619.1–DEC-619.4), which maps each case above to its SQL Server
+     fixture. PostgreSQL's facts did not carry over:
+     - a one-part name in a SQL Server module body is resolved when it runs,
+       so the rebuild decision of case 1 does not exist there;
+     - its catalog is not versioned, so case 9's collections are component
+       reads compared at the opening and closing reads, not one instant;
+     - no reported identifier separates two installations, so case 11's
+       replacement is a live marker.
 
 Confidential resolver artifacts in either binding stage additionally depend on
 the completed legacy-reader boundary in decision 5/#594. Its tests must run
