@@ -237,6 +237,25 @@ pub(crate) fn schedule(
             None => skipped.push(Skipped::RoleDrops),
         }
     }
+    // The verifier runs on the order this entry point settles, in tests and
+    // debug builds (#1954, DEC-1954.6). On a connected SQL Server plan the
+    // computed-column pass still follows, so that pair is recorded and not
+    // failed here; `deploy` checks the order that runs.
+    // Debug assertions alone, not `cfg(test)`: `pbps-diff` is compiled
+    // without its own `cfg(test)` here, so a release test build has no
+    // observer to call.
+    #[cfg(debug_assertions)]
+    pbps_diff::order::shadow::observe_scheduled(
+        declared.sources.before,
+        pbps_diff::Side {
+            schema: declared.schema,
+            ids: declared.sources.after,
+        },
+        dialect,
+        declared.module_deps,
+        &cs,
+        pbps_diff::order::shadow::Stage::Differ,
+    );
     Ok(Scheduled {
         changes: cs,
         added,

@@ -5232,3 +5232,210 @@ longer left out), `list_and_hash_partitions_are_held_to_what_the_engine_takes`,
 `the_engines_reading_replaces_only_the_texts_it_was_read_for`,
 `a_parent_that_is_not_partitioned_or_is_external_or_is_a_partition_is_refused`
 and `a_partition_tree_is_created_then_gains_and_loses_partitions_only`.
+
+<a id="dec-1954-1"></a>
+
+**DEC-1954.1. Every operation declares what it creates, removes, rewrites
+and requires, in an exhaustive match over its own payload; the verifier and
+the edges read those declarations and never decide an order.**
+`pbps_model::operation::effects` is the requires table of
+`docs/ORDERING.md` in code. A `Change` kind without effects does not compile,
+and `ordering_audit` compares the last column of that table with what the
+code reports, kind by kind. The baseline and the desired state are asked only
+for the other end of a change: what a drop takes with it, what stands over a
+column, what a created partition must rely on. The obvious alternative reads
+the desired model for the step, which hands a bare table the indexes a later
+step adds (DEC-1961.1). Requirements are `Exists`, `Is(key, Base|Final)`,
+`Absent` and `Bound`, which only the resolver's evidence builds, plus
+`Reads` (DEC-1954.2). `Owners` gained `role`, so a grant requires the role
+the plan creates or renames: the role holder S1a left open is here, not in
+#1871, because grants are the first step to need it. A requirement on a key
+nothing creates and the baseline does not hold is reported as unmet, not
+dropped; a key the baseline model cannot say anything about (rows,
+permissions, a role the cluster owns) is unknown, and unknown is never read
+as absent.
+A step that only annotates an object (a column's deprecation) is not a
+rewrite of it, and a replica identity moving to an index that already stands reads
+its old index as it stands (`Is` of the base incarnation) instead of rewriting
+it: a rewrite orders every
+reader of the object after the step, which refused valid plans.
+A revoke reads the module that stands (`Is` of the base incarnation), so it
+may precede an in-place alteration of it. A replica identity reads its old
+index only when the target is usable in the baseline as it is and the plan
+leaves it as it is, which is the differ's own test for switching early. A row
+waits only for a foreign key that stands throughout, since one the plan adds
+is installed after the rows it checks, and names a parent row only through the
+referenced primary key. A dropped column ends what it
+owns, its default and its NOT NULL.
+
+<a id="dec-1954-2"></a>
+
+**DEC-1954.2. NOT NULL is a key of its own, and a step that reads the values
+under a key says so with `Reads`, a fifth requirement.** A relaxation has to
+precede what writes a NULL and a tightening has to follow it, so no single
+"the column changed" resource orders both: a recomputed generated column must
+come after the relaxation and before the tightening (DEC-1168.1), and a rewrite
+of the column read by an expression would put the tightening first. The
+obvious alternative gives the column one definition resource; it either invents
+the cycle (DEC-1364.1) or leaves one of the two unordered. `ObjectKey::NotNull`
+is produced by a tightening and ended by a relaxation, and what needs a NULL
+or none requires `Absent` or `Is` of it. A check, a key, a foreign key and a
+data-mode change validate or depend on the rows as the plan leaves them, which
+`Exists` of the table cannot say (every step on a table requires it): they
+`Reads` the table, and a step that writes a column's values or a row is what it
+reads. Two writes of different columns of one table are not one write. A tightening reads no values: a non-NULL write is valid on either side of
+it, and what may produce a NULL, a recomputed expression, is ordered before it
+by `Absent` of the NOT NULL it produces.
+
+<a id="dec-1954-3"></a>
+
+**DEC-1954.3. What only the engine's lexer or catalog knows is
+`Dialect::engine_effects`, pure, merged beside the portable effects.** A
+check, a filtered index or a computed column that may name a column stands in
+the way of dropping, renaming or retyping it; a function a computed column
+may call cannot be altered or dropped while it stands (3729, measured on
+17.0); on PostgreSQL `SET SCHEMA` rewrites the indexes and keys it carries.
+They are `Absent` requirements and rewrites, found by the dialect's
+over-approximating lexer (DEC-174, DEC-1174.1) and built through the owners
+(`base_table`), so a dialect cannot make a key up. A dependency only a
+connected plan's catalog reads is the `Catalog` edge source's (S6a), and a
+body or an expression read by the lexer is `Lexical`: neither is produced
+here. Owned sequences moved by `SET SCHEMA` have no key until name slots.
+
+<a id="dec-1954-4"></a>
+
+**DEC-1954.4. A step is ordered against the renames of what it reads by the
+name it spells, never by position; two removers of one object are ordered by
+the first.** A rename rewrites an address, and "rewrites before reads" would
+put every reader after it, including the steps the differ places before it
+and spells with the old name (a replica identity at (0, 1), a teardown spelled
+by its base name). The direction is the reader's spelling (DEC-1961.1): a
+base spelling reads before, a final one after, a name in force at a boundary
+by the boundary. Several steps that remove one object (a foreign key dropped
+explicitly and with its table) are one `Absent`: once the first has run the
+object is gone, and the others follow it as a second write of the same
+resource. `Exists` of an object the plan both ends and produces draws no edge
+(a step that means one instance says `Is`) and is counted as ambiguous; the
+base instance ends before the plan's produces under one address.
+
+<a id="dec-1954-5"></a>
+
+**DEC-1954.5. A parent's default or NOT NULL reaching a partition is an
+ordering requirement of the partition's own entry, and attach and detach move
+the entries.** The parent's `SET DEFAULT` recurses into every partition and
+overwrites its own default (DEC-1687.1), so what sets the partition's default
+follows whatever the plan does to the parent's. The first reading was a write
+of the partition's key by the parent, ordered by the base order of the two;
+that is wrong where the plan appended the parent's change after the
+partition's, and the direction is a fact of the engine, not of position. The
+partition's step therefore requires the parent's default as the plan leaves it
+(`Is`) or gone (`Absent`), and likewise its NOT NULL. This is in the portable
+effects because partitions are in the model, not an engine's. Attach ends the
+table's own columns and produces the partition's entries; detach ends the
+entries and produces the table's own columns, so what releases one runs before
+the move and what restores one after. The partition's own alterations keep
+their order after an attach as writes of the same entry (DEC-1545.1). The partition's default and its NOT NULL are separate attributes of
+the entry: setting one does not order the other.
+
+<a id="dec-1954-6"></a>
+
+**DEC-1954.6. The effects and the verifier run beside every order in tests
+and debug builds; a violation fails the test that made the order.**
+`pbps_diff::order` replays the operations from the baseline and refuses a
+requirement not satisfied at its step, an `Absent` dependency still present, a
+broken `depends_on:` annotation, and an edge the effects imply that the order
+runs the other way. A requirement nothing in the plan provides and the baseline lacks (an identity
+file naming a column the base declarations lack), or a dependent that stands
+throughout and that no operation removes (a check the lowering rebuilds around
+a retype, a computed column the catalog judges by its own collation, #1460), is
+recorded as `unprovided` and does not fail: no order could meet it, so it says
+nothing about the order. A function a computed column calls that the differ's order alters or drops
+ahead of the column's own removal is recorded as `connected`: the connected
+pass moves it afterwards from the catalog's edges (DEC-1431.1), so the order
+the differ made is not the one that runs. It is not failed at the differ's or
+`schedule`'s output, where the connected pass has yet to run; it is failed
+where the order that runs is complete (`deploy`, after the last pass that
+orders the plan, `Stage::Final`). A column change in the same position fails
+at every stage.
+A foreign key the plan drops and adds again is read as absent by the rows
+written in between; a report file that cannot be written fails the run that was
+measuring, with the I/O error on stderr, rather than reading as an empty report. They run where an order is made: the differ's, the
+resolver's, `schedule`'s (#1955) and a connected plan's final order. The resolver's intermediate ordinary plan is not observed, because
+it is not an order anything runs. With `PBPS_ORDER_SHADOW` set to a file they
+write their findings and never fail, which is how the go/no-go report is
+measured. The edge check holds by construction once `settle` produces the
+order and is then dropped; the replay stays independent of the scheduler.
+Write-write pairs take the direction of the operations' ids, which a plan's
+logical order assigned (DEC-1961.1): swapped from it they are refused. Three
+guard flags turn the baseline, the incarnations or write-write off for the
+tests that show each negative then passes wrongly.
+
+<a id="dec-1954-7"></a>
+
+**DEC-1954.7. Every edge `graph::constraints` emits is classified against the
+effects' edges, and none is required to be contained.** Some edges only keep
+the original order, and reproducing them would carry the over-constraint
+into the new graph. The classes are *covered* (implied by effects, directly or
+through others), *binding* (evidence the resolver supplies, which stays in
+`graph.rs` for S7a), *position only* (order kept between steps whose effects
+do not interact), *slot* (an address released and claimed again: S1b-ii),
+*execution* (the executing principal must hold a permission when the step
+runs: an execution requirement, not an effect) and *missing* (a real
+dependency effects do not imply: an `effects` correction made in this slice).
+The classifier runs in tests and debug builds on every resolver plan; the go
+criterion is no *missing*. Edges the effects add that the graph lacks are
+listed with their reason.
+
+<a id="dec-1954-8"></a>
+
+**DEC-1954.8. A numbering change declares the nullability and default orders
+DEC-1889.1 measured, and nothing about the column's values.**
+`AlterColumnNumbering` requires the column and its table. An identity put on a
+column a tightening makes `NOT NULL`, or taken off one a relaxation frees,
+reads that nullability state; a plain default turned into a source requires the
+default gone. The retype, the owned sequence's names and the rows the new
+source numbers stay with the class ranks DEC-1889.1 gave them: reading the
+column's values would order every row write before the numbering, which the
+engine does not require.
+
+A kept identity retuned (`Identity` to `Identity`) does not wait for its
+column's rewrites in the portable effects: whether it follows a retype or goes
+before it is the engine's to say. PostgreSQL's `engine_effects` makes it wait
+unless the retype narrows, which DEC-1921.1 measured (the engine refuses a
+narrowing while a bound for the wider type stands, and a bound for the wider
+type on the narrower column). SQL Server has no such retune, so there the
+retune is free of the retype, which is too narrow and refuses no valid plan.
+
+<a id="dec-1954-9"></a>
+
+**DEC-1954.9. The verifier on the order that runs refused six kinds of valid
+order; each effect is narrowed to what the engine requires.** The first live
+run of the final-order check (`Stage::Final`) failed nine tests that pass on
+`master`, none a misorder:
+
+- A computed column, check or filtered index the plan replaces under its own
+  name with text that no longer reads what the step changes does not hold the
+  step back: a requirement that its baseline incarnation be gone could not
+  tell it from the new one. A replacement that still reads it keeps the
+  requirement.
+- A numbering source given up goes before the column's retype (DEC-1889.1,
+  rank -3 before -1), so only one put on waits for the column's rewrites.
+- `Replaces` orders an ending before a making only for a key the baseline
+  holds. For any other key the ending ends what a plan step made, so an edge
+  runs from each making that precedes the ending in the plan's own order to the
+  ending (a detach makes a table's own default, which a later change ends); a
+  making after it is a later incarnation, as a default dropped and set again
+  around a module change.
+- A `SetPartitionDefault` follows the parent's change only when it writes a
+  default of its own. A step with no own default writes only its fallback, the
+  parent's final text, which the parent's recursive `SET DEFAULT` writes again
+  in either order. Measured as emitted: the parent's change is plain `ALTER
+  TABLE`, not `ONLY`, so an own default is still overwritten by a later one.
+- A partition's `CREATE` requires its parent table and nothing of its columns
+  or defaults. Created before the parent's `ADD COLUMN` or `SET DEFAULT`, the
+  partition is reached by the recursion; created after, it copies them. Both
+  orders run on the engine (`partitions_are_added_and_dropped_through_the_cli`,
+  `a_partitions_default_taken_back_resolves_under_its_parents_schema`).
+
+What the narrowing gives up is recorded in #1998: a rewritten computed column
+whose function is altered before its drop is not refused.

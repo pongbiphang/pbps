@@ -180,6 +180,23 @@ steps:
      `sys.sql_expression_dependencies`) at plan time, so it is exact, not
      positional.
 
+## How the code states what a change requires
+
+The table below is executable. `pbps_model::operation::effects` reports, for
+each operation, what it creates, removes and rewrites (objects, by key and
+instance, and the values under a key) and what it requires: that an object
+exists, that one instance of it stands, that it is gone, or, for a check or a
+key, that the values under it are final. `Dialect::engine_effects` adds what
+only the engine's lexer or catalog knows (DEC-1954.3). From those,
+`pbps_diff::order` draws the edges (a creation before what requires it, a
+requirement before the removal, a removal before what needs it gone, a
+rewrite before its readers, and two writes of one resource in their base
+order), replays the operations from the baseline and refuses an order they
+contradict (DEC-1954.6). It runs beside every order in tests and debug
+builds; the passes below still decide the order. The last column of the table
+is what the code reports for the kind, and `ordering_audit` refuses a
+difference, so a new kind or a new effect updates both (DEC-1954.1).
+
 ## What each change requires
 
 `P` is PostgreSQL and `S` is SQL Server; no marker means both. Every change
@@ -187,46 +204,46 @@ also requires the names it uses to be the ones in force at its position. That
 requirement is common to all of them, so it is listed once,
 [below](#names-in-force), rather than in every row.
 
-| Change | Class | Requires before it | Creates, removes or rewrites |
-|---|---|---|---|
-| `DropModule` | 0 | Its dependents gone. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views | Removes the module, frees its name |
-| `DropRole` | 0 | P: performed by hand (ADR-0010 §3). S: no members, no owned objects | Removes the role |
-| `RenameTable` | 1 | The target name free | The table's new name |
-| `RenameRole` | 1 | P: performed by hand. S: the target name free | The role's new name |
-| `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }` | 2 | A foreign key on a key is dropped before the key | Frees names; releases columns for a rename, drop or retype |
-| `DropComputedColumn` | 2 (2, 4) | S: the indexes, uniques and checks over it gone (4922) | Removes a computed column, frees its name and releases the columns and functions it reads (DEC-1174.1) |
-| `RenameColumn` | 3 | The target name free. S: no check and no filtered index naming the column (DECISIONS 474) | The column's new name. P: dependents' text follows the rename |
-| `Revoke` | 4 | The target exists (a revoke on an object the plan drops is not emitted) | Removes a permission |
-| `DropColumn` | 5 | Its indexes, constraints, inbound foreign keys and modules gone. P: generated columns reading it gone | Removes the column, frees its name |
-| `DropTable` | 6 | Inbound foreign keys and dependent modules gone | Removes the table, frees its name |
-| `DetachPartition` | 6 | P: no row referencing the partition through a foreign key to its parent (pre-flight) | The partition leaves its parent with its rows, as an ordinary table under the declared names; frees its range (DEC-1544.1) |
-| `CreateTable` | 7; a partition (7, 2), or (9, 5) under a parent whose columns the plan changes | The name free, its types. Functions its defaults, checks and generated columns call: *content*. Beside a standing DEFAULT partition, P: no row referencing a row it moves, and no delete trigger or rule on the DEFAULT that the move fires (pre-flight) | The table, columns, key, uniques, checks, indexes; beside a standing DEFAULT partition, the DEFAULT's rows of its range move into it (DEC-1547.1) |
-| `AttachPartition` | 7; (11, 1) when its parent's foreign key references a table the plan writes rows into or attaches a table to | The parent standing; the table already its parent's columns, order and parent's checks (refused otherwise). P: no row of the table outside its range, no trigger or column grant on it, none in the parent's DEFAULT partition inside it (pre-flight) | The table becomes a partition with its rows; its columns become its parent's, its matching keys and indexes clones, and the rest its own; takes its range (DEC-1545.1) |
-| `AddColumn` | 8 | The table, the name free. A generated column's inputs; functions its default or expression calls: *content* | The column, backfilled |
-| `AlterColumnType` | 9 | What blocks a retype gone. S: keys, indexes, checks, foreign keys. P: views and rules (`weave`), generated readers (refused). An old default dropped first | Converted values |
-| `AlterColumnNullability` | 9 | Tightening: the values non-null | Accepts or refuses NULL |
-| `AlterColumnDefault` | 9 | Functions the default calls: *content* | The default |
-| `SetPartitionDefault` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Functions the default calls: *content*. P: after its parent's default set by the plan (`after_their_parents_defaults`); one split from a create beside a DEFAULT, right after the last function its text may call (`split_moving_defaults`, DEC-1547.1) | One partition's default: its own, or its parent's again (DEC-1581.1) |
-| `SetPartitionNotNull` | 9; (9, 4) after its parent's default or NOT NULL change on the column; a DEFAULT's tightening (9, 6) in a plan that moves rows out of it | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) |
-| `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values |
-| `AlterColumnNumbering` | 9; −3 giving up a source or an identity, +2 otherwise; (9, 0) retuning a kept identity on a column this plan narrows; (6, 1 + chain depth) giving up, renaming, or turning into an identity an owned sequence on a column it neither tightens nor retypes; (12, 3) putting a source on a table whose rows it updates or deletes and does not only insert | Putting an identity on: the column `NOT NULL`. Putting a source on: the column in its final type. Giving up an identity: the column still `NOT NULL`. P: no value too near the bound it counts toward to continue past; a kept source's bounds moved: its counter inside them (pre-flight) | The column's identity or owned sequence put on, taken off, retuned or converted; one put on continues past the column's values (DEC-1889.1); its bounds, cycle and cache set (DEC-1921.1) |
-| `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) |
-| `SetColumnDeprecated` | 10 | Nothing | Metadata only |
-| `SetTablePersistence` | 9 (9, 10 + depth) | P: the foreign keys that stand: to logged, the tables it references logged first; to unlogged, the tables referencing it unlogged first (refused the other way round, measured) | Rewrites the table and its indexes under `AccessExclusiveLock` (DEC-1443.1) |
-| `SetStorageParameters` | 10 | P: the table, under its final name. Nothing reads a storage parameter | The table's heap storage parameters; no rewrite (DEC-1441.1) |
-| `SetIndexStorageParameters` | 10 | P: the index, which stands: one the plan adds or rebuilds takes its parameters in its `CREATE` instead | An index's storage parameters, in place; no rebuild (DEC-1442.1) |
-| `InsertRow`, `UpdateRow` | 11 | The columns written, defaults the row takes, parent rows | Rows |
-| `DeleteRow` | 12 | Child rows moved away or cascaded | Removes a row |
-| `SetPrimaryKey { to: Some }`, `AddUnique`, `AddIndex` | 13 | Columns, NOT NULL, unique data; a clustered index first | A key or index |
-| `AddForeignKey` | 13 | Its columns, the referenced key, valid data | A foreign key |
-| `SetReplicaIdentity` | 0 (0, 1) or 13, last | P: the key, unique constraint or unique index it names, over NOT NULL columns. At (0, 1) when that stands before the plan, before any drop of the old identity's index; after the additions otherwise | The table's replica identity (DEC-1444.1) |
-| `AddCheck` | 13 | Its columns, valid data. Functions it calls: *content* | A check |
-| `CreateModule`, `AlterModule` | 14 | What its definition names: other modules, by lexed name (DECISIONS 315); tables, columns and types | A module. P `AlterModule`: a drop and a create |
-| `CreateRole` | 15 | The name free | A role |
-| `PublicExecution` | 14, at its routine's create rank | The routine exists | `PUBLIC`'s execute on a routine, settled in the statement after its `CREATE` (#687) |
-| `Grant` | 16 | The role and the target exist | A permission |
-| `SetDataMode` | 17 | The table's rows written | The table's data mode |
-| `SetEnsureKeys` | 17 | The table's rows written | The table's managed ensure keys |
+| Change | Class | Requires before it | Creates, removes or rewrites | Effects (checked) |
+|---|---|---|---|---|
+| `DropModule` | 0 | Its dependents gone. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views | Removes the module, frees its name | removes |
+| `DropRole` | 0 | P: performed by hand (ADR-0010 §3). S: no members, no owned objects | Removes the role | removes |
+| `RenameTable` | 1 | The target name free | The table's new name | Exists, rewrites |
+| `RenameRole` | 1 | P: performed by hand. S: the target name free | The role's new name | Exists, rewrites |
+| `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }` | 2 | A foreign key on a key is dropped before the key | Frees names; releases columns for a rename, drop or retype | Exists, Is, removes |
+| `DropComputedColumn` | 2 (2, 4) | S: the indexes, uniques and checks over it gone (4922) | Removes a computed column, frees its name and releases the columns and functions it reads (DEC-1174.1) | Exists, removes |
+| `RenameColumn` | 3 | The target name free. S: no check and no filtered index naming the column (DECISIONS 474) | The column's new name. P: dependents' text follows the rename | Exists, rewrites |
+| `Revoke` | 4 | The target exists (a revoke on an object the plan drops is not emitted) | Removes a permission | Exists, rewrites |
+| `DropColumn` | 5 | Its indexes, constraints, inbound foreign keys and modules gone. P: generated columns reading it gone | Removes the column, frees its name | Absent, Exists, removes |
+| `DropTable` | 6 | Inbound foreign keys and dependent modules gone | Removes the table, frees its name | Absent, Exists, removes |
+| `DetachPartition` | 6 | P: no row referencing the partition through a foreign key to its parent (pre-flight) | The partition leaves its parent with its rows, as an ordinary table under the declared names; frees its range (DEC-1544.1) | Exists, removes |
+| `CreateTable` | 7; a partition (7, 2), or (9, 5) under a parent whose columns the plan changes | The name free, its types. Functions its defaults, checks and generated columns call: *content*. Beside a standing DEFAULT partition, P: no row referencing a row it moves, and no delete trigger or rule on the DEFAULT that the move fires (pre-flight) | The table, columns, key, uniques, checks, indexes; beside a standing DEFAULT partition, the DEFAULT's rows of its range move into it (DEC-1547.1) | Exists, creates, rewrites |
+| `AttachPartition` | 7; (11, 1) when its parent's foreign key references a table the plan writes rows into or attaches a table to | The parent standing; the table already its parent's columns, order and parent's checks (refused otherwise). P: no row of the table outside its range, no trigger or column grant on it, none in the parent's DEFAULT partition inside it (pre-flight) | The table becomes a partition with its rows; its columns become its parent's, its matching keys and indexes clones, and the rest its own; takes its range (DEC-1545.1) | Exists, creates, removes, rewrites |
+| `AddColumn` | 8 | The table, the name free. A generated column's inputs; functions its default or expression calls: *content* | The column, backfilled | Exists, creates |
+| `AlterColumnType` | 9 | What blocks a retype gone. S: keys, indexes, checks, foreign keys. P: views and rules (`weave`), generated readers (refused). An old default dropped first | Converted values | Absent, Exists, creates, rewrites |
+| `AlterColumnNullability` | 9 | Tightening: the values non-null | Accepts or refuses NULL | Exists, creates, removes |
+| `AlterColumnDefault` | 9 | Functions the default calls: *content* | The default | Exists, Is, creates, removes |
+| `SetPartitionDefault` | 9; (9, 4) after its parent's default or NOT NULL change on the column | Functions the default calls: *content*. P: after its parent's default set by the plan (`after_their_parents_defaults`); one split from a create beside a DEFAULT, right after the last function its text may call (`split_moving_defaults`, DEC-1547.1) | One partition's default: its own, or its parent's again (DEC-1581.1) | Exists, Is, creates |
+| `SetPartitionNotNull` | 9; (9, 4) after its parent's default or NOT NULL change on the column; a DEFAULT's tightening (9, 6) in a plan that moves rows out of it | Tightening: the partition's values non-null | One partition's column accepts or refuses NULL (DEC-1581.1) | Exists, Reads |
+| `AlterColumnExpression` | 9 | P: its inputs, a relaxation of its own column. Functions it calls: *content* | Recomputed stored values | Absent, Exists, creates, removes, rewrites |
+| `AlterColumnNumbering` | 9; −3 giving up a source or an identity, +2 otherwise; (9, 0) retuning a kept identity on a column this plan narrows; (6, 1 + chain depth) giving up, renaming, or turning into an identity an owned sequence on a column it neither tightens nor retypes; (12, 3) putting a source on a table whose rows it updates or deletes and does not only insert | Putting an identity on: the column `NOT NULL`. Putting a source on: the column in its final type. Giving up an identity: the column still `NOT NULL`. P: no value too near the bound it counts toward to continue past; a kept source's bounds moved: its counter inside them (pre-flight) | The column's identity or owned sequence put on, taken off, retuned or converted; one put on continues past the column's values (DEC-1889.1); its bounds, cycle and cache set (DEC-1921.1) | Exists, Absent |
+| `AddComputedColumn` | 9 (9, 3) | S: the columns it reads, in their final type. Functions it calls exist (one this plan creates is refused by name) | A computed column at the end of its table (DEC-1174.1) | Exists, creates |
+| `SetColumnDeprecated` | 10 | Nothing | Metadata only | Exists |
+| `SetTablePersistence` | 9 (9, 10 + depth) | P: the foreign keys that stand: to logged, the tables it references logged first; to unlogged, the tables referencing it unlogged first (refused the other way round, measured) | Rewrites the table and its indexes under `AccessExclusiveLock` (DEC-1443.1) | Exists |
+| `SetStorageParameters` | 10 | P: the table, under its final name. Nothing reads a storage parameter | The table's heap storage parameters; no rewrite (DEC-1441.1) | Exists |
+| `SetIndexStorageParameters` | 10 | P: the index, which stands: one the plan adds or rebuilds takes its parameters in its `CREATE` instead | An index's storage parameters, in place; no rebuild (DEC-1442.1) | Exists |
+| `InsertRow`, `UpdateRow` | 11 | The columns written, defaults the row takes, parent rows | Rows | Absent, Exists, Is, creates, rewrites |
+| `DeleteRow` | 12 | Child rows moved away or cascaded | Removes a row | Exists, removes, rewrites |
+| `SetPrimaryKey { to: Some }`, `AddUnique`, `AddIndex` | 13 | Columns, NOT NULL, unique data; a clustered index first | A key or index | Exists, Reads, creates, removes |
+| `AddForeignKey` | 13 | Its columns, the referenced key, valid data | A foreign key | Exists, Is, Reads, creates |
+| `SetReplicaIdentity` | 0 (0, 1) or 13, last | P: the key, unique constraint or unique index it names, over NOT NULL columns. At (0, 1) when that stands before the plan, before any drop of the old identity's index; after the additions otherwise | The table's replica identity (DEC-1444.1) | Exists, Is |
+| `AddCheck` | 13 | Its columns, valid data. Functions it calls: *content* | A check | Exists, Reads, creates |
+| `CreateModule`, `AlterModule` | 14 | What its definition names: other modules, by lexed name (DECISIONS 315); tables, columns and types | A module. P `AlterModule`: a drop and a create | Exists, creates, rewrites |
+| `CreateRole` | 15 | The name free | A role | creates |
+| `PublicExecution` | 14, at its routine's create rank | The routine exists | `PUBLIC`'s execute on a routine, settled in the statement after its `CREATE` (#687) | Is, rewrites |
+| `Grant` | 16 | The role and the target exist | A permission | Exists, Is, rewrites |
+| `SetDataMode` | 17 | The table's rows written | The table's data mode | Exists, Reads |
+| `SetEnsureKeys` | 17 | The table's rows written | The table's managed ensure keys | Exists, Reads |
 
 ## Pairs that interact
 
@@ -499,9 +516,13 @@ decision or the issue named in its row.
 
 ## Keeping this current
 
-- A new `Change` variant adds a row to [the table](#what-each-change-requires).
+- A new `Change` variant adds a row to [the table](#what-each-change-requires),
+  with its effects in `pbps_model::operation::effects` (an exhaustive match,
+  so it does not compile without them) and in the table's last column.
   `every_change_kind_has_a_row_in_the_ordering_audit` lists the variants from
-  the enum and refuses one this file does not name.
+  the enum and refuses one this file does not name, and
+  `the_requires_table_states_the_effects_of_each_kind_it_names` refuses a last
+  column the code disagrees with.
 - A new sort class, rank or reordering pass updates [the mechanism](#the-mechanism)
   and re-reads the pairs its changes appear in. A pass that reorders a plan
   after the differ is added to `schedule` and nowhere else; one that must be
