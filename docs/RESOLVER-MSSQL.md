@@ -335,8 +335,21 @@ compared, not passed.
   - column defaults and CHECK bodies;
   - foreign keys, non-unique indexes and triggers: no creation in another
     object reads them;
-  - ids, dates and owners, which differ on scratch by construction, as
-    PostgreSQL drops role names.
+  - ids, dates and owner names, which differ on scratch by construction,
+    as PostgreSQL drops role names.
+- **Owner equality is compared.** Unlike PostgreSQL, SQL Server reads
+  ownership at creation, though only as an equality: a `PERSISTED` computed
+  column refuses a function whose effective owner is not the table's
+  (4988), whoever owns either [`a_persisted_column_needs_its_functions_owner_to_be_the_tables`].
+  - The comparison covers every schema scratch holds, managed and external.
+    Two of them must share an effective owner on scratch exactly when they
+    do on the target, and an object with its own owner counts as its own
+    entry.
+  - Scratch reproduces the target's grouping: each schema is created
+    `AUTHORIZATION` a loginless user standing for its target owner, one
+    user per distinct owner.
+  - A grouping scratch does not reproduce refuses by name. A scratch where
+    everything has one owner would accept what the target refuses.
 
 Why the default must be "compared": each measured property below is one a
 creation in another object reads, and a hand-written list of what to compare
@@ -349,6 +362,7 @@ missed each in turn.
 | A table's primary key, unique constraints and unique indexes | A foreign key binds one by `key_index_id`, and is refused without one (1776), as #1673 compares them on PostgreSQL [`a_foreign_key_binds_a_candidate_key_and_a_persisted_column_a_deterministic_function`] |
 | A function's `IsDeterministic`, `IsPrecise` | A `PERSISTED` computed column refuses a function that is not deterministic (4936); no signature shows it |
 | A column's type, a user type by `schema.name` | A schema-bound view and a computed column read it at creation |
+| Whether two objects share an effective owner | A `PERSISTED` computed column refuses a function owned by another principal than the table (4988) [`a_persisted_column_needs_its_functions_owner_to_be_the_tables`] |
 
 A three-part or four-part reference refuses by name: the externals file stages
 objects in one database and cannot stand in for another.

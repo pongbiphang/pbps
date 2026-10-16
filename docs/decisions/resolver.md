@@ -3251,9 +3251,23 @@ skips a body and defaults there:
 - module definitions (a view may be staged as a shape view);
 - column defaults and CHECK bodies;
 - foreign keys, non-unique indexes and triggers;
-- ids, dates and owners, which differ on scratch by construction.
+- ids, dates and owner names, which differ on scratch by construction.
 
 A property or class no rule names is compared, not passed.
+
+**Owner equality is compared, owner names are not.** SQL Server reads
+ownership at creation as an equality: a `PERSISTED` computed column refuses
+a function whose effective owner is not the table's (4988), whoever owns
+either. PostgreSQL reads no such equality, which is why its projection can
+drop roles outright.
+
+- Scratch reproduces the target's grouping of schemas by effective owner,
+  managed and external alike, with one loginless user per distinct target
+  owner.
+- The comparison checks that two schemas, or two objects with their own
+  owner, share an owner on scratch exactly when they do on the target.
+- Without it, a scratch where the sandbox owns everything admits a column
+  the target refuses.
 
 **Why compare by default.** The design first listed what to compare, and
 review found four properties it missed, one round at a time. Each is read
@@ -3297,6 +3311,7 @@ makes the change, which moves the rule identifier (DEC-2012.1).
 
 **Pinned by** `schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not`
 (4513), `a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`,
-`a_foreign_key_binds_a_candidate_key_and_a_persisted_column_a_deterministic_function`
+`a_foreign_key_binds_a_candidate_key_and_a_persisted_column_a_deterministic_function`,
+`a_persisted_column_needs_its_functions_owner_to_be_the_tables`
 and `synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed`
 (the three-part name).

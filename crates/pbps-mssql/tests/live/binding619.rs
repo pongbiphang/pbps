@@ -1772,6 +1772,73 @@ async fn a_database_list_without_view_any_database_hides_the_target_and_says_so(
     scratch.drop().await;
 }
 
+/// Ownership is read at creation on SQL Server, though only as an equality: a
+/// `PERSISTED` computed column refuses a function whose effective owner is not
+/// the table's (4988). Which principal owns them does not matter, only whether
+/// it is the same one: two schemas owned by one loginless user behave as `dbo`
+/// does, and a scratch where everything has one owner would accept what the
+/// target refuses.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_persisted_column_needs_its_functions_owner_to_be_the_tables() {
+    let mut db = TestDb::create("owner619").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE USER owner_a WITHOUT LOGIN;",
+            "CREATE USER owner_b WITHOUT LOGIN;",
+            "CREATE SCHEMA ext AUTHORIZATION owner_a;",
+            "CREATE SCHEMA app AUTHORIZATION owner_a;",
+            "CREATE SCHEMA other AUTHORIZATION owner_b;",
+            "CREATE FUNCTION ext.f (@v int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @v * 2 END;",
+        ],
+    )
+    .await;
+    assert_eq!(
+        refusal(
+            &mut db.conn,
+            "CREATE TABLE dbo.mixed (v int, c AS ext.f(v) PERSISTED);"
+        )
+        .await
+        .as_deref(),
+        Some("4988"),
+        "dbo's table, owner_a's function"
+    );
+    assert_eq!(
+        refusal(
+            &mut db.conn,
+            "CREATE TABLE other.mixed (v int, c AS ext.f(v) PERSISTED);"
+        )
+        .await
+        .as_deref(),
+        Some("4988"),
+        "owner_b's table, owner_a's function"
+    );
+    assert_eq!(
+        refusal(
+            &mut db.conn,
+            "CREATE TABLE app.same (v int, c AS ext.f(v) PERSISTED);"
+        )
+        .await,
+        None,
+        "one owner, whoever it is"
+    );
+    run(
+        &mut db.conn,
+        &["ALTER AUTHORIZATION ON SCHEMA::other TO owner_a;"],
+    )
+    .await;
+    assert_eq!(
+        refusal(
+            &mut db.conn,
+            "CREATE TABLE other.joined (v int, c AS ext.f(v) PERSISTED);"
+        )
+        .await,
+        None
+    );
+    db.drop().await;
+}
+
 /// SQL Server has no `DROP OWNED`, so cleanup drops what the inventory read
 /// finds beyond the fresh-install inventory, in dependency order. A database
 /// role is one of those objects: `DROP ROLE` refuses while the role has a
