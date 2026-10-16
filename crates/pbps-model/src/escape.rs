@@ -73,11 +73,12 @@ fn write_inert(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
 /// terminal draws: the line and paragraph separators, the zero-width and
 /// directional marks, the embeddings, overrides and isolates, the byte order
 /// mark, and the rest of the default-ignorable set that draws nothing by
-/// itself (the grapheme joiner, the Hangul and Khmer fillers, the Mongolian
-/// vowel separator, the reserved U+FFF0..=U+FFF8, the shorthand and musical
-/// format controls, the tag characters). The interlinear annotation marks
-/// (U+FFF9..=U+FFFB) are not default-ignorable and are left alone. A hand-made
-/// name carrying one would otherwise read the same as one without it (#2040).
+/// itself (the soft hyphen, the grapheme joiner, the Hangul and Khmer fillers,
+/// the Mongolian vowel separator, the reserved U+FFF0..=U+FFF8, the shorthand
+/// and musical format controls, the tag characters). The interlinear annotation
+/// marks (U+FFF9..=U+FFFB) are not default-ignorable and are left alone. A
+/// hand-made name carrying one would otherwise read the same as one without it
+/// (#2040, #2063).
 ///
 /// The variation selectors (U+FE00..=U+FE0F, the Mongolian U+180B..=U+180D and
 /// U+180F, and U+E0100..=U+E01EF) are left alone on purpose. Each follows a
@@ -88,7 +89,8 @@ fn hides_or_moves(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{034f}'
+            '\u{00ad}'
+                | '\u{034f}'
                 | '\u{061c}'
                 | '\u{115f}'..='\u{1160}'
                 | '\u{17b4}'..='\u{17b5}'
@@ -138,9 +140,10 @@ mod tests {
 
     #[test]
     fn zero_width_default_ignorable_characters_are_shown() {
-        // The first and the last character of each range added for #2040 are
-        // shown, so a range cut short at either end fails here.
+        // The first and the last character of each range added for #2040 and
+        // #2063 are shown, so a range cut short at either end fails here.
         for (first, last) in [
+            ('\u{00ad}', '\u{00ad}'),
             ('\u{034f}', '\u{034f}'),
             ('\u{115f}', '\u{1160}'),
             ('\u{17b4}', '\u{17b5}'),
@@ -196,6 +199,9 @@ mod tests {
             "`quoted` 'single' \"double\" {} %s",
             "emoji 🙂",
             "\u{a0}non-breaking",
+            // The neighbours of the soft hyphen, the not sign and the
+            // registered sign, are drawn and stay as written (#2063).
+            "\u{ac}\u{ae}",
             "",
         ] {
             assert_eq!(shown(name), name);
