@@ -46,15 +46,18 @@ checksum-pinned, and state lives in the database itself.
 - One branch per issue, cut from `origin/master`, named `fix/issue-<n>-<slug>`.
 - The **full gate** is what CI runs: `python3
   scripts/check_decisions_test.py`, `python3 scripts/check-decisions.py`,
-  `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`
-  warning-free, `cargo test --workspace --all-targets`, `scripts/live-tests.sh`
-  and `scripts/live-tests-pg.sh`. Run it on every head that can be queued:
-  before the first push of the branch, before marking the PR ready, before
-  every push in the ready phase, and before pushing a rebase — except a
-  docs-only rebase (below, DEC-2000.1). All green, then push (DEC-1838.1).
+  `python3 scripts/check_raw_in_messages_test.py`, `python3
+  scripts/check-raw-in-messages.py`, `cargo fmt --all --check`, `cargo clippy
+  --workspace --all-targets` warning-free, `cargo test --workspace
+  --all-targets`, `scripts/live-tests.sh` and `scripts/live-tests-pg.sh`. Run
+  it on every head that can be queued: before the first push of the branch,
+  before marking the PR ready, before every push in the ready phase, and before
+  pushing a rebase — except a docs-only rebase (below, DEC-2000.1). All green,
+  then push (DEC-1838.1).
 - Every other push (a draft-phase review round's fixes) runs the **round
-  gate**: the two decision checks, `fmt`, warning-free `clippy`, and the tests
-  that pin the round's fixes, live ones included when a fix is engine-facing.
+  gate**: the two decision checks, the two raw-in-messages checks, `fmt`,
+  warning-free `clippy`, and the tests that pin the round's fixes, live ones
+  included when a fix is engine-facing.
   A round fix that breaks something it did not touch is found by the full gate
   before ready, not on its own push; that is the price.
 - A docs-only push runs only the two decision checks.
