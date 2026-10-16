@@ -330,11 +330,14 @@ impl Schedule {
             // A component made only of annotations is planned today, in the
             // order the module sort gave it; the policy is #2083's. Its
             // annotations are set aside, its members are chained in the order
-            // given, and it is scheduled as one step: an edge into any member
-            // waits for nothing more than its first member does, and an edge
-            // out of any member leaves from its last, so nothing outside lands
-            // between them (#1956 review). The chain and the redirected edges
-            // order, but the proof holds the edges as stated, which they imply.
+            // given, and every edge that reaches it is redirected: an edge into
+            // any member holds its first member, and an edge out of any member
+            // leaves from its last. A step ordered against any member is so
+            // held outside the span; a step unrelated to every member keeps
+            // its place in the order given, which may fall between them, as
+            // on master today (#1956 review). The chain and the redirected
+            // edges order, but the proof holds the edges as stated, which they
+            // imply.
             let mut chain: Vec<Constraint> = Vec::new();
             let mut declared_only: BTreeSet<(usize, usize)> = BTreeSet::new();
             // For each member of such a component: its first and last member.

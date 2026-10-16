@@ -212,6 +212,16 @@ fn a_cycle_of_annotations_alone_keeps_the_order_given_and_any_other_is_refused()
         .unwrap();
     assert_eq!(names(&settled.changes), ["a", "c", "b"]);
     settled.proof.validate(&settled.changes).unwrap();
+    // #2098 review: a step unrelated to every member keeps its place in the
+    // order given, between them as on master; only what is ordered against
+    // a member is held outside the span.
+    let unrelated = [(0, 2, Source::Declared), (2, 0, Source::Declared)];
+    let settled = schedule(3, &unrelated)
+        .settle(plan(&["a", "b", "c"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["a", "b", "c"]);
+    assert!(settled.proof.edges().is_empty());
+    settled.proof.validate(&settled.changes).unwrap();
 
     let mixed = [
         (2, 1, Source::Declared),

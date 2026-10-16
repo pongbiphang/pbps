@@ -5788,11 +5788,13 @@ other way is named, with both operations, as the verifier named it before
 **A cycle of annotations alone.** A strongly connected component made only of
 `depends_on:` edges is planned today, in the order the module sort gives it.
 `settle` keeps that order and does not refuse it: it sets the annotations
-aside, chains the members in the order given and schedules them as one step:
-an edge into any member holds the first, and an edge out of any member leaves
-from the last, so nothing outside lands between them. The replay still reports
-the broken annotation, and the policy is #2083's. Any other cycle is refused
-by name, with its members and each edge's reason and source.
+aside and keeps the members in the order given. A step ordered against any
+member is held outside their span: an edge into any member holds the first,
+and an edge out of any member leaves from the last. A step unrelated to every
+member keeps its place in the order given, which may fall between them, as it
+does today. The replay still reports the broken annotation, and the policy
+is #2083's. Any other cycle is refused by name, with its members and each
+edge's reason and source.
 
 Pinned by `a_kept_order_the_edges_would_reverse_is_refused_not_repaired`,
 `a_cycle_of_annotations_alone_keeps_the_order_given_and_any_other_is_refused`,
