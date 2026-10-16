@@ -25,7 +25,7 @@ use pbps_db::resolver::Observation;
 use pbps_db::resolver::environment::{
     CatalogFacts, DatabaseRecipe, RecipeUnavailable, ScopeReport,
 };
-use pbps_db::transport::QueryConnection;
+use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Driver};
 use pbps_mssql::resolver::authorization as mssql_auth;
 use pbps_pg::resolver::authorization as pg_auth;
@@ -524,7 +524,7 @@ const MIXED: &str = "the authorization context and the principal map belong to d
 /// deployer; SQL Server runs them in [`settle`], after the reproduction has
 /// been verified.
 pub(crate) async fn prepare(
-    admin: &mut impl QueryConnection,
+    admin: &mut impl ExecuteConnection,
     principals: &Principals,
     authorization: &Authorization,
     planned: &[PlannedGrant],

@@ -16,8 +16,9 @@
 //! Unreadable is not empty: a catalog a least-privilege deployer cannot read
 //! is an error, never an authorization context with nothing in it.
 
+use super::ROLE_BATCH;
 use pbps_db::resolver::environment::DeploymentPrincipal;
-use pbps_db::transport::QueryConnection;
+use pbps_db::transport::{ExecuteConnection, QueryConnection};
 use pbps_db::{DbError, Row};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -345,6 +346,11 @@ async fn settings(conn: &mut impl QueryConnection) -> Result<BTreeMap<String, St
 #[derive(Debug, Clone)]
 pub struct RoleMap {
     to_run_local: BTreeMap<String, String>,
+    /// `to_run_local` the other way round, so the comparison after a
+    /// reproduction finds the logical role of each run-local one in a lookup
+    /// and not a scan of the map: a superuser's closure is every role in the
+    /// cluster, and a scan per role is quadratic in it (#2049).
+    to_logical: BTreeMap<String, String>,
     run_login: String,
 }
 
@@ -428,8 +434,20 @@ impl RoleMap {
                 (name, run_local)
             })
             .collect();
+        Self::new(to_run_local, run_login)
+    }
+
+    fn new(to_run_local: BTreeMap<String, String>, run_login: &str) -> Self {
+        let mut to_logical = BTreeMap::new();
+        for (logical, run_local) in &to_run_local {
+            // The first logical role by name, as a scan of the map would find.
+            to_logical
+                .entry(run_local.clone())
+                .or_insert_with(|| logical.clone());
+        }
         Self {
             to_run_local,
+            to_logical,
             run_login: run_login.to_owned(),
         }
     }
@@ -439,10 +457,10 @@ impl RoleMap {
     /// for the deployer and for nothing else (#1672). Any other role a
     /// compiled object names is the scratch server's own.
     pub fn supplied(context: &AuthorizationContext, login: &str) -> Self {
-        Self {
-            to_run_local: BTreeMap::from([(context.principal.effective.clone(), login.to_owned())]),
-            run_login: login.to_owned(),
-        }
+        Self::new(
+            BTreeMap::from([(context.principal.effective.clone(), login.to_owned())]),
+            login,
+        )
     }
 
     /// The run-local name for a logical role, or `PUBLIC` unchanged. `None`
@@ -461,10 +479,7 @@ impl RoleMap {
         if run_local == "PUBLIC" {
             return Some("PUBLIC".to_owned());
         }
-        self.to_run_local
-            .iter()
-            .find(|(_, run)| *run == run_local)
-            .map(|(logical, _)| logical.clone())
+        self.to_logical.get(run_local).cloned()
     }
 
     /// Every run-local role name, so the run records them as recovery names
@@ -569,13 +584,40 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Sends `statements` in order, [`ROLE_BATCH`] to a round trip. A batch runs
+/// as one implicit transaction, so a statement that fails leaves nothing of
+/// its own batch behind and the engine's error for it is the one returned,
+/// exactly as when each went alone; the batches before it stay, which is why
+/// the run records every role name before the first is created.
+///
+/// A batch that finds the shared lock table too full for a lock per role
+/// (`53200`, a small `max_locks_per_transaction` or a busy cluster; DEC-2049.1)
+/// is sent again in halves, and the rest of the statements keep the size that
+/// fitted: a plan the one-statement transactions could run is not refused for
+/// the batch size.
+async fn batched(admin: &mut impl ExecuteConnection, statements: &[String]) -> Result<(), DbError> {
+    let mut size = ROLE_BATCH;
+    let mut rest = statements;
+    while !rest.is_empty() {
+        let (batch, later) = rest.split_at(size.min(rest.len()));
+        match admin.execute(&batch.join(";\n")).await {
+            Ok(()) => rest = later,
+            Err(error) if size > 1 && error.server_error_code().as_deref() == Some("53200") => {
+                size = size.div_ceil(2);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// Creates the run-local roles, memberships, schemas and settings that
 /// reproduce the target deployer's authorization on the scratch database,
 /// through the admin connection. `database` is the scratch database, for the
 /// database-scoped settings. Every statement names only run-local roles and
 /// this run's own schemas; nothing pre-existing is altered.
 pub async fn reconstruct(
-    admin: &mut impl QueryConnection,
+    admin: &mut impl ExecuteConnection,
     map: &RoleMap,
     context: &AuthorizationContext,
     database: &str,
@@ -587,7 +629,10 @@ pub async fn reconstruct(
     };
     // Roles. A role in the closure carries its measured attributes; an owner
     // that is not in the closure is created unprivileged (it only needs to
-    // own a schema).
+    // own a schema). A superuser deployer's closure is every role in the
+    // cluster, so these go out `ROLE_BATCH` to a round trip, not one each
+    // (#2049).
+    let mut creations = Vec::new();
     for (logical, run) in &map.to_run_local {
         if is_predefined(logical) {
             continue;
@@ -596,41 +641,40 @@ pub async fn reconstruct(
         let superuser = attrs.is_some_and(|a| a.superuser);
         let inherit = attrs.is_none_or(|a| a.inherit);
         let bypass = attrs.is_some_and(|a| a.bypass_rls);
-        admin
-            .query(&format!(
-                "CREATE ROLE {} NOLOGIN {} {} {}",
-                quote_ident(run),
-                if superuser {
-                    "SUPERUSER"
-                } else {
-                    "NOSUPERUSER"
-                },
-                if inherit { "INHERIT" } else { "NOINHERIT" },
-                if bypass { "BYPASSRLS" } else { "NOBYPASSRLS" },
-            ))
-            .await?;
+        creations.push(format!(
+            "CREATE ROLE {} NOLOGIN {} {} {}",
+            quote_ident(run),
+            if superuser {
+                "SUPERUSER"
+            } else {
+                "NOSUPERUSER"
+            },
+            if inherit { "INHERIT" } else { "NOINHERIT" },
+            if bypass { "BYPASSRLS" } else { "NOBYPASSRLS" },
+        ));
     }
+    batched(admin, &creations).await?;
     // The deployer's flattened closure: a direct grant per role it inherits
     // from or can switch to, with the measured options, reproduces the same
     // `has_*_privilege` and `pg_has_role` answers.
     let deployer = map
         .run_local(&context.principal.effective)
         .ok_or_else(|| missing(&context.principal.effective))?;
+    let mut memberships = Vec::new();
     for (logical, attrs) in &context.roles {
         if *logical == context.principal.effective {
             continue;
         }
         let role = map.run_local(logical).ok_or_else(|| missing(logical))?;
-        admin
-            .query(&format!(
-                "GRANT {} TO {} WITH INHERIT {}, SET {}",
-                quote_ident(&role),
-                quote_ident(&deployer),
-                attrs.inherits,
-                attrs.can_set,
-            ))
-            .await?;
+        memberships.push(format!(
+            "GRANT {} TO {} WITH INHERIT {}, SET {}",
+            quote_ident(&role),
+            quote_ident(&deployer),
+            attrs.inherits,
+            attrs.can_set,
+        ));
     }
+    batched(admin, &memberships).await?;
     // The run login can become the deployer but never inherits it, so the
     // compilation runs as the mapped deployer only under an explicit SET ROLE.
     admin
@@ -1429,6 +1473,45 @@ mod tests {
             "{:?}",
             map.run_local_names()
         );
+    }
+
+    /// The comparison after a reproduction asks for the logical role of every
+    /// run-local one, and a superuser's closure is every role in the cluster.
+    /// A scan of the map for each is quadratic: twenty thousand roles took
+    /// seconds in this profile, where a lookup takes a few milliseconds (#2049).
+    #[test]
+    fn the_logical_role_of_a_run_local_one_is_a_lookup_not_a_scan() {
+        let mut ctx = context();
+        let attributes = ctx.roles["app_reader"].clone();
+        for i in 0..20_000 {
+            ctx.roles
+                .insert(format!("crowd_{i:05}"), attributes.clone());
+        }
+        ctx.roles.insert("pg_monitor".into(), attributes);
+        let map = RoleMap::generate(&ctx, &[], "pbps_run_x", "tok");
+        let started = std::time::Instant::now();
+        for (logical, run_local) in &map.to_run_local {
+            assert_eq!(map.logical_of(run_local).as_deref(), Some(logical.as_str()));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "twenty thousand lookups took {:?}",
+            started.elapsed()
+        );
+        // Negative: a name the map does not hold is not a role it stands for,
+        // and `PUBLIC` and a predefined role stand for themselves.
+        assert_eq!(map.logical_of("pbps_role_nope_tok"), None);
+        assert_eq!(
+            map.logical_of("crowd_00001"),
+            None,
+            "the logical name is not a run-local one"
+        );
+        assert_eq!(map.logical_of("PUBLIC").as_deref(), Some("PUBLIC"));
+        assert_eq!(map.logical_of("pg_monitor").as_deref(), Some("pg_monitor"));
+        // A supplied login stands for the deployer and nothing else.
+        let supplied = RoleMap::supplied(&ctx, "login_x");
+        assert_eq!(supplied.logical_of("login_x").as_deref(), Some("dep"));
+        assert_eq!(supplied.logical_of("dep"), None);
     }
 
     /// Measured on 18: with two inherited roles both holding the option, the

@@ -2929,3 +2929,55 @@ and `a_record_another_tables_change_carries_as_a_reference_is_the_plans`
 `a_resolved_plan_renaming_a_referenced_table_closes` and
 `a_resolved_plan_closes_over_what_it_newly_reaches`
 (`flow_pg`).
+
+<a id="dec-2049-1"></a>
+
+**DEC-2049.1. The run-local roles are created, granted and dropped 250 to a
+round trip, and a batch that cannot be dropped is retried a role at a time
+(#2049).**
+
+A superuser deployer's closure is every role in its cluster, and the run
+reproduced each one with its own `CREATE ROLE`, `GRANT` and `DROP ROLE`: about
+9 ms a role, almost all of it waiting (110 s at 11,000 roles against about 10 s
+of server time). The reproduction, the comparison and the rule identifier are
+unchanged; only the statements travel together.
+
+**What was decided.**
+- **A batch is 250 statements** (`pbps_pg::resolver::ROLE_BATCH`), one
+  multi-statement `batch_execute`, so one implicit transaction. `CREATE ROLE`
+  and `DROP ROLE` each hold one lock until the transaction ends (one `pg_locks`
+  row per role, measured on 18.6), and the shared lock table holds
+  `max_locks_per_transaction` x (`max_connections` + `max_prepared_transactions`)
+  entries, 6400 by default and shared with every other session (#2050). 250 is
+  4% of that; ten thousand roles take 40 round trips. A batch the table cannot
+  hold (`53200`, a small `max_locks_per_transaction` or a busy cluster) is sent
+  again in halves down to one statement, and the batches after it keep the size
+  that fitted, so a plan the one-statement transactions could run is not
+  refused for the batch size.
+- **A failed batch leaves nothing of its own,** and the engine's error for the
+  failing statement is the one returned. The batches before it stay, which is
+  why the run records every role name before creating the first (it always
+  did): cleanup drops by recorded name, so it reaches every batched role.
+- **Cleanup retries a failed batch one role at a time.** `DROP ROLE` for a
+  role that owns something fails the whole statement and so its batch; the
+  batch is then dropped role by role, which names exactly the roles that
+  cannot go and drops the rest, as `drop_roles` always reported.
+- **`RoleMap::logical_of` reads a reverse map built with the map,** where it
+  scanned the map for each reproduced role, quadratic in the cluster's roles.
+- **Not done:** reproducing fewer roles (for a superuser, whose answers do not
+  depend on its memberships). That changes what the sealed authorization
+  context compares and would move the rule identifier; it needs its own design
+  and is revisited only if batching proves insufficient.
+
+**Measured** on PostgreSQL 18.6 (lane-1 servers, the test profile, a loaded
+machine): a run at 10,000 cluster roles took 186.7 s against 29.2 s at 1,000
+before, and 30.0 s against 14.5 s after. The reproduction itself is 0.9 s at
+10,000 roles; what remains is the captures, the recheck and the seal reading
+the role catalog, about 1.5 ms a role.
+
+**Pinned by** `resolver_run_owned_reproduction_stays_linear_in_the_clusters_roles`
+(live), `recon2049::a_reproduction_that_fails_partway_names_the_failing_role_and_leaves_none_after_cleanup`,
+`recon2049::cleanup_names_exactly_the_role_that_cannot_be_dropped_and_drops_the_rest`
+and `recon2049::a_batch_the_shared_lock_table_cannot_hold_is_sent_in_halves`
+(live, `pbps-pg`), and the unit test
+`the_logical_role_of_a_run_local_one_is_a_lookup_not_a_scan`.

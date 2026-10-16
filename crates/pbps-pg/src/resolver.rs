@@ -230,23 +230,51 @@ pub fn scratch_database_ddl(names: &ScratchNames, recipe: &DatabaseRecipe) -> St
     ddl
 }
 
-/// Removes exactly the two run-owned objects. FORCE closes this run's own
-/// scratch sessions; it cannot reach anything the run did not create.
+/// How many run-local roles one round trip creates, grants or drops (#2049,
+/// DEC-2049.1).
+/// A superuser deployer's closure is every role in its cluster, and one round
+/// trip each cost about 9 ms a role, almost all of it waiting. A batch is one
+/// implicit transaction, and `CREATE ROLE` and `DROP ROLE` each hold a lock on
+/// the role until it ends (one `pg_locks` row per role, measured on 18.6),
+/// against a lock table of `max_locks_per_transaction` x (`max_connections` +
+/// `max_prepared_transactions`) entries, 6400 by default and shared with every
+/// other session on the cluster (#2050). 250 is 4% of that and still leaves
+/// 40 round trips for ten thousand roles.
+pub const ROLE_BATCH: usize = 250;
+
 /// Drops the run-local authorization roles, after the scratch database they
 /// owned is gone. Each drop is independent: a role that cannot be dropped is
 /// returned so the caller can report it, and does not stop the others. Uses
 /// `IF EXISTS` so a role a retry already removed is not an error.
+///
+/// Roles go [`ROLE_BATCH`] to a statement. A batch is one transaction, so the
+/// one role that cannot be dropped (it owns something) fails every drop in its
+/// batch; that batch is then retried a role at a time, which names exactly the
+/// roles that cannot go and drops all the others.
 pub async fn drop_roles(conn: &mut impl ExecuteConnection, roles: &[String]) -> Vec<String> {
+    let quoted = |role: &String| format!("\"{}\"", role.replace('"', "\"\""));
     let mut failed = Vec::new();
-    for role in roles {
-        let statement = format!("DROP ROLE IF EXISTS \"{}\"", role.replace('"', "\"\""));
-        if conn.execute(&statement).await.is_err() {
-            failed.push(role.clone());
+    for batch in roles.chunks(ROLE_BATCH) {
+        let all = batch.iter().map(quoted).collect::<Vec<_>>().join(", ");
+        if conn
+            .execute(&format!("DROP ROLE IF EXISTS {all}"))
+            .await
+            .is_ok()
+        {
+            continue;
+        }
+        for role in batch {
+            let statement = format!("DROP ROLE IF EXISTS {}", quoted(role));
+            if conn.execute(&statement).await.is_err() {
+                failed.push(role.clone());
+            }
         }
     }
     failed
 }
 
+/// Removes exactly the two run-owned objects. FORCE closes this run's own
+/// scratch sessions; it cannot reach anything the run did not create.
 pub async fn drop_scratch(
     conn: &mut impl ExecuteConnection,
     names: &ScratchNames,
