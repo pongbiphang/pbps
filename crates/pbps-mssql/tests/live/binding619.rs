@@ -1700,6 +1700,54 @@ async fn a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_adm
     scratch.drop().await;
 }
 
+/// SQL Server has no `DROP OWNED`, so cleanup drops what the inventory read
+/// finds beyond the fresh-install inventory, in dependency order. A database
+/// role is one of those objects: `DROP ROLE` refuses while the role has a
+/// member (15144) or owns a schema (15138), and succeeds once both are gone.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_role_drops_only_after_its_members_and_the_schemas_it_owns() {
+    let mut db = TestDb::create("role619").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE ROLE reader;",
+            "CREATE USER member WITHOUT LOGIN;",
+            "ALTER ROLE reader ADD MEMBER member;",
+            "CREATE ROLE holder;",
+            "CREATE SCHEMA held AUTHORIZATION holder;",
+        ],
+    )
+    .await;
+    assert_eq!(
+        refusal(&mut db.conn, "DROP ROLE reader;").await.as_deref(),
+        Some("15144")
+    );
+    assert_eq!(
+        refusal(&mut db.conn, "DROP ROLE holder;").await.as_deref(),
+        Some("15138")
+    );
+    run(
+        &mut db.conn,
+        &["ALTER ROLE reader DROP MEMBER member;", "DROP SCHEMA held;"],
+    )
+    .await;
+    assert_eq!(refusal(&mut db.conn, "DROP ROLE reader;").await, None);
+    assert_eq!(refusal(&mut db.conn, "DROP ROLE holder;").await, None);
+    assert_eq!(refusal(&mut db.conn, "DROP USER member;").await, None);
+    assert_eq!(
+        number(
+            &mut db.conn,
+            "SELECT CONVERT(bigint, COUNT(*)) FROM sys.database_principals WHERE is_fixed_role = 0 \
+             AND name NOT IN (N'public', N'dbo', N'guest', N'INFORMATION_SCHEMA', N'sys');"
+        )
+        .await,
+        0,
+        "back to the inventory's principals"
+    );
+    db.drop().await;
+}
+
 /// Two more things a creation reads from an object it does not own: a
 /// foreign key binds the referenced table's primary key or unique index
 /// (`key_index_id`) and is refused without one (1776), and a `PERSISTED`

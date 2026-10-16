@@ -288,10 +288,22 @@ So the supplied layout's account must be `db_owner` of its database, and a
 check that cannot read as one refuses.
 
 The supplied layout is emptied after a run, and before one, as `db_owner`.
-SQL Server has no `DROP OWNED`, so pbps drops what the run created in reverse
-dependency order: schema-bound dependents first, then modules, tables, types,
-synonyms, schemas and users. A database that does not read as the inventory
-afterwards refuses the next run.
+SQL Server has no `DROP OWNED`. So cleanup drops exactly what the
+inventory read finds beyond the fresh-install inventory, the same read #723's
+check makes, rather than a list of kinds. A kind no rule here knows to drop
+refuses by name, rather than being left behind:
+
+- **Order.** Cleanup works in reverse dependency order: schema-bound
+  dependents, then modules, tables, types, synonyms and other
+  schema-contained objects, then schemas, then database roles and users.
+- **Roles.** A role sheds its members first. Its schemas go before it,
+  since `DROP ROLE` refuses a role that has a member (15144) or owns a
+  schema (15138)
+  [`a_role_drops_only_after_its_members_and_the_schemas_it_owns`].
+- **The sandbox user** is dropped last, by a fresh session of the supplied
+  account.
+- **Afterwards.** A database that does not read as the inventory refuses
+  the next run.
 
 ## 8. The externals file on SQL Server
 
