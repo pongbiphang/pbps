@@ -225,10 +225,6 @@ fn the_prepared_graph_projects_the_split_steps_not_the_ordinary_positions() {
             }),
         },
     ];
-    let (unsplit, _) = measured(|| {
-        graph::constraints_of_logical(&ordinary, &observations, &hints.module_deps, old, wanted)
-    });
-    assert!(unsplit.iter().all(|e| e.reason != OrderReason::Restoration));
     let owners = pbps_model::operation::PlanOwners::new(
         pbps_model::plan_names::PlanNames::of(&ordinary.changes, &after_ids).unwrap(),
         &ids,
@@ -237,22 +233,14 @@ fn the_prepared_graph_projects_the_split_steps_not_the_ordinary_positions() {
     let (edges, projections) = measured(|| {
         graph::constraints(
             &prepared.changes,
-            prepared.ordinary,
             &prepared.origins,
             &owners,
             &observations,
-            &hints.module_deps,
             old,
             wanted,
         )
     });
     assert_eq!(projections, prepared.changes.changes.len());
-    let removal = prepared
-        .changes
-        .changes
-        .iter()
-        .position(|p| matches!(p.change, Change::AlterColumnDefault { to: None, .. }))
-        .unwrap();
     let creation = prepared
         .changes
         .changes
@@ -268,24 +256,18 @@ fn the_prepared_graph_projects_the_split_steps_not_the_ordinary_positions() {
             )
         })
         .unwrap();
-    assert!(edges.contains(&OrderEdge {
-        before: removal,
-        after: creation,
-        reason: OrderReason::Restoration
-    }));
     let provider = prepared
         .changes
         .changes
         .iter()
         .position(|p| matches!(&p.change, Change::CreateModule { id, .. } if id == &function))
         .unwrap();
-    // The generic expression-order rule can supply the restoration edge even
-    // with stale facts. Only this binding edge proves the new default is provided.
-    assert!(edges.contains(&OrderEdge {
-        before: provider,
-        after: creation,
-        reason: OrderReason::Binding
-    }));
+    // Only this binding edge proves the new default is provided; the order
+    // of the split pair is the effects' (DEC-1968.2).
+    assert!(edges.iter().any(|e| e.before == provider
+        && e.after == creation
+        && e.reason == OrderReason::Binding
+        && e.source == crate::order::Source::Binding));
     assert!(edges.iter().all(|e| e.before != e.after));
     let (planned, projections) =
         measured(|| plan(old, wanted, &hints, &observations, &dialect).unwrap());
@@ -294,5 +276,37 @@ fn the_prepared_graph_projects_the_split_steps_not_the_ordinary_positions() {
         ordinary.changes.len() + prepared.changes.changes.len()
     );
     assert_eq!(planned.changes.changes.len(), 4);
+    let steps = &planned.changes.changes;
+    let at = |f: &dyn Fn(&Change) -> bool| steps.iter().position(|p| f(&p.change)).unwrap();
+    // The old default is released before the new one is set, and the
+    // function exists first: edges the effects and the evidence state.
+    let removal = at(&|c| matches!(c, Change::AlterColumnDefault { to: None, .. }));
+    let creation = at(&|c| {
+        matches!(
+            c,
+            Change::AlterColumnDefault {
+                from: None,
+                to: Some(_),
+                ..
+            }
+        )
+    });
+    let provider = at(&|c| matches!(c, Change::CreateModule { id, .. } if id == &function));
+    assert!(removal < creation && provider < creation, "{steps:?}");
+    // Negative: a deprecation emits no SQL, so nothing orders it against the
+    // split pair; the old same-table rule put it between them (#1954).
+    let deprecation = at(&|c| matches!(c, Change::SetColumnDeprecated { .. }));
+    assert!(
+        !planned.proof.edges().iter().any(|e| {
+            (e.before == deprecation || e.after == deprecation)
+                && [removal, creation].contains(&if e.before == deprecation {
+                    e.after
+                } else {
+                    e.before
+                })
+        }),
+        "{:?}",
+        planned.proof.edges()
+    );
     planned.proof.validate(&planned.changes).unwrap();
 }

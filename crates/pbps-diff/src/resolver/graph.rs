@@ -1,6 +1,7 @@
+use crate::order::{Constraint, Source};
 use pbps_model::operation::{Origin, OwnerError, Owners};
 use pbps_model::part_effects::{DefaultChange, Effect, Part as DependencyPart, PartEffect};
-use pbps_model::resolver::{OrderEdge, OrderReason, Surface, SurfaceResolution};
+use pbps_model::resolver::{OrderReason, Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, GrantTarget, TableName, Uid, ValueSource};
 use std::collections::BTreeSet;
 
@@ -151,58 +152,30 @@ fn table_of(s: &Surface) -> Option<&TableName> {
     }
 }
 
+/// Whether a step installs an expression a routine may be called from.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn expression(c: &Change) -> Option<bool> {
+fn installs_expression(c: &Change) -> bool {
     match c {
-        Change::AlterColumnDefault { to, .. } => Some(to.is_some()),
-        // A partition's default is installed or released as a column's is,
-        // so the rebuild's pair takes the same order (#1610).
-        Change::SetPartitionDefault { to, fallback, .. } => {
-            Some(to.is_some() || fallback.is_some())
-        }
-        Change::AddCheck { .. } | Change::AddIndex { .. } => Some(true),
-        Change::DropCheck { .. } | Change::DropIndex { .. } => Some(false),
-        _ => None,
+        Change::AlterColumnDefault { to, .. } => to.is_some(),
+        Change::SetPartitionDefault { to, fallback, .. } => to.is_some() || fallback.is_some(),
+        Change::AddCheck { .. } | Change::AddIndex { .. } => true,
+        _ => false,
     }
 }
 
-/// [`constraints`] over a plan that is its own logical plan, each step
-/// whole: the shape a test builds by hand.
-#[cfg(test)]
-pub(crate) fn constraints_of_logical(
-    changes: &ChangeSet,
-    observations: &[SurfaceResolution],
-    annotations: &pbps_model::ModuleDeps,
-    base: crate::Side<'_>,
-    desired: crate::Side<'_>,
-) -> BTreeSet<OrderEdge> {
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, desired.ids)
-        .expect("a hand-built test plan is an executable order");
-    let owners = pbps_model::operation::PlanOwners::new(names, base.ids, desired.ids);
-    let origins: Vec<_> = (0..changes.changes.len()).map(Origin::Whole).collect();
-    constraints(
-        changes,
-        changes.changes.len(),
-        &origins,
-        &owners,
-        observations,
-        annotations,
-        base,
-        desired,
-    )
-}
-
-#[allow(clippy::wildcard_enum_match_arm, clippy::too_many_arguments)]
+/// The constraints only the resolver's evidence states, over the prepared
+/// steps: a surface's bindings, and what the principal must hold when the
+/// steps that make them run. Everything else the effects and the name slots
+/// order (DEC-1968.2).
+#[allow(clippy::wildcard_enum_match_arm)]
 pub(super) fn constraints(
     changes: &ChangeSet,
-    ordinary: usize,
     origins: &[Origin],
     table_owners: &dyn Owners,
     observations: &[SurfaceResolution],
-    annotations: &pbps_model::ModuleDeps,
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
-) -> BTreeSet<OrderEdge> {
+) -> BTreeSet<Constraint> {
     // Asked once per step and observation: indexed once (#1870).
     let base_names = base.ids.index();
     let desired_names = desired.ids.index();
@@ -261,350 +234,62 @@ pub(super) fn constraints(
                 }),
         })
         .collect();
-    // Same name is not enough when both UIDs are known: only a false edge
-    // between two tables that share a name in turn is ever dropped.
-    let same_table = |i: usize, j: usize| match (&owners[i], &owners[j]) {
-        (Some(a), Some(b)) => a == b,
-        _ => true,
-    };
     let mut edges = BTreeSet::new();
-    let mut edge = |before, after, reason| {
-        edges.insert(OrderEdge {
+    let mut state = |before, after, source, reason| {
+        edges.insert(Constraint {
             before,
             after,
+            source,
             reason,
         });
     };
 
-    // Retain ordinary ordering only where there is an actual structural,
-    // identity or data relation. A global chain would invent a cycle when an
-    // ADD COLUMN DEFAULT needs a routine over a later, independent table.
+    // What the executing principal must hold when a step runs is not an
+    // effect: a grant restored before the binding DDL and the rows that call
+    // what it grants (`Execution` in DEC-1954.7). The evidence names the
+    // surfaces those steps make, so it is stated here with the bindings.
     for (i, change) in steps.iter().enumerate() {
-        for (j, other) in steps.iter().enumerate().skip(i + 1) {
-            if expression(change).is_none()
-                && expression(other).is_none()
-                && change.objects().any(|a| other.objects().any(|b| a == b))
-            {
-                edge(i, j, OrderReason::Identity);
-            }
-            if row(change) && row(other) {
-                edge(i, j, OrderReason::Data);
-            }
-            if role_identity(change).is_some() && role_identity(change) == role_identity(other) {
-                edge(i, j, OrderReason::Identity);
-            }
-            // A view and a table can occupy the same engine namespace. The
-            // ordinary differ has already decided whether a drop precedes a
-            // creation; binding edges do not erase that identity constraint.
-            if matches!(change, Change::DropModule { .. } | Change::DropTable { .. })
-                && matches!(
-                    other,
-                    Change::CreateModule { .. } | Change::CreateTable { .. }
-                )
-                && change.object() == other.object()
-            {
-                edge(i, j, OrderReason::Identity);
-            }
-        }
-    }
-    for (i, change) in steps.iter().enumerate() {
-        let reference = match change {
-            Change::AddForeignKey { constraint, .. } => {
-                Some((constraint.references_table.clone(), true))
-            }
-            Change::DropForeignKey { table, name } => base
-                .schema
-                .tables
-                .get(&desired_names.resolved_in(table, base.ids))
-                .and_then(|t| t.foreign_keys.get(name))
-                .map(|f| (f.references_table.clone(), false)),
-            _ => None,
-        };
-        if let Some((table, adding)) = reference {
-            let final_name = base_names.resolved_in(&table, desired.ids);
-            for (j, other) in steps.iter().enumerate() {
-                if i != j
-                    && other
-                        .objects()
-                        .any(|t| t == &table || (!adding && t == &final_name))
-                    && (adding || !matches!(other, Change::RenameTable { .. }))
-                    && expression(other).is_none()
-                    && !matches!(
-                        other,
-                        Change::AddForeignKey { .. } | Change::DropForeignKey { .. }
-                    )
-                {
-                    if adding {
-                        edge(j, i, OrderReason::Structural);
-                    } else {
-                        edge(i, j, OrderReason::Structural);
-                    }
-                }
-            }
-        }
-    }
-
-    // A partitioned parent's new index before each partition's own: built
-    // after one of its shape, it would take it as its clone (DEC-1688.1). The
-    // ordinary plan's (13, 0) rank is no edge, and an index the parent waits
-    // for a column to build could otherwise follow the partition's (#1737
-    // review).
-    for (i, change) in steps.iter().enumerate() {
-        let Change::AddIndex { table: parent, .. } = change else {
-            continue;
-        };
-        for (j, other) in steps.iter().enumerate() {
-            if let Change::AddIndex { table, .. } = other
-                && desired
-                    .schema
-                    .tables
-                    .get(table)
-                    .and_then(|t| t.partition_of.as_ref())
-                    .is_some_and(|of| of.parent == *parent)
-            {
-                edge(i, j, OrderReason::Structural);
-            }
-        }
-    }
-
-    // A parent's default change before its partitions' own on that column:
-    // the engine recurses the parent's `SET DEFAULT` or `DROP DEFAULT` into
-    // every partition, over the partition's own default, so the partition's
-    // must come after it to stay (DEC-1687.1, docs/ORDERING.md). The ordinary
-    // plan's (9, 4) rank is no edge here (#1610). Only what sets the
-    // partition's default waits: its release has nothing to keep, and when
-    // one routine both defaults call is rebuilt, the release must precede
-    // the routine's drop, which precedes the parent's restoration (#1610
-    // review).
-    for (i, change) in steps.iter().enumerate() {
-        let Change::AlterColumnDefault { column, .. } = change else {
-            continue;
-        };
-        for (j, other) in steps.iter().enumerate() {
-            if let Change::SetPartitionDefault {
-                parent,
-                column: c,
-                to,
-                fallback,
+        let schema_grant = matches!(
+            change,
+            Change::Grant {
+                target: GrantTarget::Schema(_),
                 ..
-            } = other
-                && (to.is_some() || fallback.is_some())
-                && *parent == column.table
-                && *c == column.name
-            {
-                edge(i, j, OrderReason::Structural);
+            } | Change::Revoke {
+                target: GrantTarget::Schema(_),
+                ..
             }
-        }
-    }
-
-    // A partition's own default spelled by a column name its parent's
-    // rename moves. A partition declares no column, so the parent's rename is
-    // the one that moves the name, and the rules below that read a column's
-    // own rename by its UID do not see it (#1610 review). Only a release the
-    // resolver appended is spelled by the base name, so it goes before the
-    // parent's rename away from that name; every other change, the ordinary
-    // plan's included, is spelled by the name the column has once the
-    // renames have run, so it goes after the rename into that name. The
-    // parent is matched by its table UID, which a rename of the parent
-    // itself does not change.
-    for (i, change) in steps.iter().enumerate() {
-        let Change::SetPartitionDefault {
-            parent,
-            column,
-            to,
-            fallback,
-            ..
-        } = change
-        else {
-            continue;
-        };
-        let base_spelled = i >= ordinary && to.is_none() && fallback.is_none();
-        let parent_uid = if base_spelled {
-            base_names.table_uid(parent)
-        } else {
-            desired_names
-                .table_uid(parent)
-                .or_else(|| base_names.table_uid(parent))
-        };
-        if parent_uid.is_none() {
-            continue;
-        }
-        for (j, other) in steps.iter().enumerate() {
-            if let Change::RenameColumn { from, to, .. } = other
-                && owners[j].as_ref() == parent_uid
-            {
-                if base_spelled && from == column {
-                    edge(i, j, OrderReason::Identity);
-                } else if !base_spelled && to == column {
-                    edge(j, i, OrderReason::Identity);
-                }
-            }
-        }
-    }
-
-    // A default change spelled by its own column's final name: where the
-    // plan renames that column, by its UID, into the name the change uses.
-    let own_rename: Vec<Option<usize>> = steps
-        .iter()
-        .map(|c| match c {
-            Change::AlterColumnDefault { uid, column, .. } => steps.iter().position(|r| {
-                matches!(r, Change::RenameColumn { uid: renamed, table, to, .. }
-                    if renamed == uid && *table == column.table && *to == column.name)
-            }),
+        );
+        let target = match change {
+            Change::Grant { target, .. } => Some(target.clone()),
+            Change::PublicExecution { routine, .. } => Some(GrantTarget::Routine(routine.clone())),
             _ => None,
-        })
-        .collect();
-    for (i, change) in steps.iter().enumerate() {
+        };
+        if !schema_grant && target.is_none() {
+            continue;
+        }
         for (j, other) in steps.iter().enumerate() {
             if i == j {
                 continue;
             }
-            if expression(change).is_some()
-                && let Change::RenameTable { to, .. } = other
-                && change.table() == Some(to)
-                && same_table(i, j)
-            {
-                edge(j, i, OrderReason::Identity);
+            if schema_grant && (!made[j].is_empty() || row(other)) {
+                state(i, j, Source::Execution, OrderReason::Authorization);
             }
-            // A default spelled by its column's final name follows every
-            // column rename of its table: the name is the one the column has
-            // once they have all run, as an expression change follows its
-            // table's rename and as the ordinary plan orders `RenameColumn`
-            // before later changes naming the column (docs/ORDERING.md;
-            // #1292). Whose rename frees that name is not read from names: a
-            // chain may fold case, as the differ's rename order does. The
-            // removal-first rule below would address the name before the
-            // column holds it. A teardown spelled by the base name keeps it.
-            let renamed_into = own_rename[i].is_some()
-                && matches!(other, Change::RenameColumn { table, .. }
-                    if change.table() == Some(table))
-                && same_table(i, j);
-            // What the differ placed ahead of that rename, such as a drop
-            // that frees the name, runs before the name exists, so it does
-            // not wait for a removal that needs the name.
-            let ahead_of_the_name = own_rename[i].is_some_and(|rename| j < rename);
-            if renamed_into {
-                edge(j, i, OrderReason::Identity);
+            if target.is_some() && row(other) {
+                state(i, j, Source::Execution, OrderReason::Authorization);
             }
-            if let (Some(t), Some(u), Some(install)) =
-                (change.table(), other.table(), expression(change))
-                && t == u
-                && same_table(i, j)
-                && !renamed_into
-                && !ahead_of_the_name
-                && expression(other).is_none()
-                // A replica identity follows the index it names and goes
-                // ahead of the old identity's index's drop, as the differ
-                // ordered it (DEC-1444.1); this rule would put it before
-                // every add and after every drop of its table's indexes.
-                && !matches!(other, Change::SetReplicaIdentity { .. })
-            {
-                if row(other) {
-                    // A DEFAULT is consumed by INSERT/UPDATE. CHECKs and
-                    // indexes keep the differ's data-before-validation order.
-                    if install
-                        && matches!(
-                            change,
-                            Change::AlterColumnDefault { .. } | Change::SetPartitionDefault { .. }
-                        )
-                    {
-                        edge(i, j, OrderReason::Data);
-                    } else if install {
-                        edge(j, i, OrderReason::Data);
-                    } else {
-                        edge(i, j, OrderReason::Data);
-                    }
-                } else if install {
-                    edge(j, i, OrderReason::Structural);
-                } else if !matches!(other, Change::CreateTable { .. }) {
-                    edge(i, j, OrderReason::Structural);
-                }
-            }
-            if let (Some(false), Some(true)) = (expression(change), expression(other))
-                && change.table() == other.table()
-                && same_table(i, j)
-            {
-                edge(i, j, OrderReason::Restoration);
-            }
-            // Grant targets and principals must exist. Restore grants before
-            // row operations can evaluate a routine in its new incarnation.
-            if let Change::Grant { role, target, .. } | Change::Revoke { role, target, .. } = other
-                && (creates_role(change, role) || creates_target(change, target))
-            {
-                edge(i, j, OrderReason::Authorization);
-            }
-            if matches!(
-                change,
-                Change::Grant {
-                    target: GrantTarget::Schema(_),
-                    ..
-                } | Change::Revoke {
-                    target: GrantTarget::Schema(_),
-                    ..
-                }
-            ) && (!made[j].is_empty() || row(other))
-            {
-                edge(i, j, OrderReason::Authorization);
-            }
-            if matches!(
-                change,
-                Change::Grant { .. } | Change::PublicExecution { .. }
-            ) && row(other)
-            {
-                edge(i, j, OrderReason::Authorization);
-            }
-            let target = match change {
-                Change::Grant { target, .. } => Some(target.clone()),
-                Change::PublicExecution { routine, .. } => {
-                    Some(GrantTarget::Routine(routine.clone()))
-                }
-                _ => None,
-            };
-            if let Some(target) = target
-                && (expression(other) == Some(true) || writes_attrdef(other))
+            if let Some(target) = &target
+                && (installs_expression(other) || writes_attrdef(other))
                 && (observations.iter().any(|o| {
                     made[j].contains(&o.surface)
                         && o.desired.as_ref().is_some_and(|d| {
                             d.managed_inputs
                                 .iter()
-                                .any(|input| grant_matches(&target, input))
+                                .any(|input| grant_matches(target, input))
                         })
                 }) || (matches!(change, Change::Grant { .. })
-                    && !steps.iter().any(|c| creates_target(c, &target))))
+                    && !steps.iter().any(|c| creates_target(c, target))))
             {
-                edge(i, j, OrderReason::Authorization);
-            }
-            if let Change::PublicExecution { routine, .. } = other
-                && change
-                    .module_id()
-                    .is_some_and(|id| id == &pbps_model::ModuleId::Routine(routine.clone()))
-                && matches!(change, Change::CreateModule { .. })
-            {
-                edge(i, j, OrderReason::Restoration);
-            }
-        }
-    }
-    for (dependent, inputs) in annotations {
-        for input in inputs {
-            for (i, change) in steps.iter().enumerate() {
-                for (j, other) in steps.iter().enumerate() {
-                    if change.module_id() == Some(input) && other.module_id() == Some(dependent) {
-                        if matches!(
-                            change,
-                            Change::CreateModule { .. } | Change::AlterModule { .. }
-                        ) && matches!(
-                            other,
-                            Change::CreateModule { .. } | Change::AlterModule { .. }
-                        ) {
-                            edge(i, j, OrderReason::Structural);
-                        }
-                        if matches!(change, Change::DropModule { .. })
-                            && matches!(other, Change::DropModule { .. })
-                        {
-                            edge(j, i, OrderReason::Structural);
-                        }
-                    }
-                }
+                state(i, j, Source::Execution, OrderReason::Authorization);
             }
         }
     }
@@ -650,20 +335,13 @@ pub(super) fn constraints(
             .filter(|&(i, s)| s.contains(surface) && owned(i, desired_owner))
             .map(|(i, _)| i)
             .collect();
-        for &drop in &removes {
-            // A rewritten expression both lets go of its old binding and
-            // installs its new one: no step precedes itself.
-            for &create in creates.iter().filter(|&&create| create != drop) {
-                edge(drop, create, OrderReason::Restoration);
-            }
-        }
         if let Some(current) = &observation.current {
             for input in &current.managed_inputs {
                 for (i, facts) in parts.iter().enumerate() {
                     if super::prepare::invalidates(facts, input) {
                         for &drop in &removes {
                             if drop != i {
-                                edge(drop, i, OrderReason::Binding);
+                                state(drop, i, Source::Binding, OrderReason::Binding);
                             }
                         }
                     }
@@ -677,7 +355,7 @@ pub(super) fn constraints(
                         // A table's generation expression reads columns the
                         // same CREATE TABLE makes: no step precedes itself.
                         for &create in creates.iter().filter(|&&create| create != i) {
-                            edge(i, create, OrderReason::Binding);
+                            state(i, create, Source::Binding, OrderReason::Binding);
                         }
                     }
                 }
@@ -687,25 +365,11 @@ pub(super) fn constraints(
     edges
 }
 
-fn role_identity(c: &Change) -> Option<&pbps_model::Uid> {
-    if let Change::CreateRole { uid, .. }
-    | Change::DropRole { uid, .. }
-    | Change::RenameRole { uid, .. } = c
-    {
-        Some(uid)
-    } else {
-        None
-    }
-}
 fn row(c: &Change) -> bool {
     matches!(
         c,
         Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. }
     )
-}
-fn creates_role(c: &Change, role: &str) -> bool {
-    matches!(c, Change::CreateRole { name, .. } if name == role)
-        || matches!(c, Change::RenameRole { to, .. } if to == role)
 }
 #[allow(clippy::wildcard_enum_match_arm)]
 fn creates_target(c: &Change, target: &GrantTarget) -> bool {

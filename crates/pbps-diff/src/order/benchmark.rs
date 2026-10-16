@@ -179,8 +179,8 @@ struct Measured {
     shape: &'static str,
     operations: usize,
     pipeline: Duration,
-    resolver_edges: usize,
-    resolver: Duration,
+    settle_edges: usize,
+    settle: Duration,
     effects: Duration,
     effect_edges: usize,
     graph: Duration,
@@ -252,12 +252,6 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
         }
         None => planned.changes,
     };
-    // The resolver's graph, whose constraints compare steps in pairs.
-    let started = Instant::now();
-    let resolver_edges =
-        crate::resolver::constraints_of_logical(&changes, &[], &shape.declared, base, desired)
-            .len();
-    let resolver = started.elapsed();
     // The effects, the graph they imply, and the replay.
     let mut operations = Operations::of_plan(&changes.changes, ModuleEdits::InPlace);
     if reversed {
@@ -288,6 +282,13 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
         Checks::ALL,
     );
     let graph_time = started.elapsed();
+    // What the resolver does with the graph: settle it into an order.
+    let started = Instant::now();
+    let schedule = super::Schedule::of_graph(&g, ops);
+    let settled = schedule.sequence();
+    let settle = started.elapsed();
+    let settle_edges = schedule.constraints().len();
+    assert!(settled.is_ok(), "{}: {settled:?}", shape.name);
     let started = Instant::now();
     let violations = verify_with(
         ops,
@@ -301,8 +302,8 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
         shape: shape.name,
         operations: ops.len(),
         pipeline,
-        resolver_edges,
-        resolver,
+        settle_edges,
+        settle,
         effects,
         effect_edges: g.edges.len(),
         graph: graph_time,
@@ -320,7 +321,7 @@ fn the_benchmark_shapes_plan_and_the_effects_find_only_the_cycle() {
     };
     let ms = |d: Duration| format!("{:.1}", d.as_secs_f64() * 1000.0);
     println!(
-        "| shape | operations | pipeline ms | resolver edges | resolver ms \
+        "| shape | operations | pipeline ms | settle edges | settle ms \
          | effects ms | effect edges | graph ms | verify ms | violations |"
     );
     println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
@@ -334,8 +335,8 @@ fn the_benchmark_shapes_plan_and_the_effects_find_only_the_cycle() {
             m.shape,
             m.operations,
             ms(m.pipeline),
-            m.resolver_edges,
-            ms(m.resolver),
+            m.settle_edges,
+            ms(m.settle),
             ms(m.effects),
             m.effect_edges,
             ms(m.graph),
