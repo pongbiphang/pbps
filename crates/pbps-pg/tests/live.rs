@@ -52,6 +52,9 @@ mod rename_order_tests;
 #[path = "support/user_types.rs"]
 mod user_types_tests;
 
+#[path = "support/input_path.rs"]
+mod input_path_tests;
+
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn the_pull_keeps_project_ledger_names_beside_the_real_ledger() {

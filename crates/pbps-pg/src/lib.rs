@@ -62,6 +62,7 @@ pub(crate) const LEXICON: Lexicon = Lexicon {
 pub mod estimate;
 pub mod generated;
 pub mod impact;
+pub mod input_path;
 pub mod introspect;
 pub mod modules;
 mod partition_runway;

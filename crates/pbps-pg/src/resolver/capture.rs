@@ -18,6 +18,52 @@ mod scope;
 use pbps_db::resolver::capture::ObjectIdentity;
 use std::collections::BTreeSet;
 
+/// What a stored expression's node tree binds, by class (#1523, #2046).
+///
+/// `pg_depend` is no substitute: it omits the pinned built-ins, so it cannot
+/// say which built-in function a CHECK or a DEFAULT calls, and a gate that
+/// admits only built-in code has to know exactly that. The tree carries every
+/// occurrence, and the decoder refuses a node or a field it does not know
+/// instead of certifying a partial set (see `nodes`).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Bound {
+    /// Every function the tree names: calls, cast functions, an operator's
+    /// own function (`opfuncid`).
+    pub routines: BTreeSet<u32>,
+    /// Every operator, which runs its `pg_operator.oprcode`.
+    pub operators: BTreeSet<u32>,
+    /// Every type: the type a coercion or a literal names.
+    pub types: BTreeSet<u32>,
+}
+
+/// The objects a stored expression binds, or why the tree cannot be certified
+/// complete. The reason is the decoder's category only: a tree can hold a
+/// private literal.
+pub(crate) fn bound_objects(text: &str, major: u32) -> Result<Bound, String> {
+    let tree = nodes::decode(text, major)
+        .map_err(|e| format!("the stored expression is not one this release can read ({e:?})"))?;
+    let mut bound = Bound::default();
+    for reference in nodes::references(&tree, major).map_err(|e| {
+        format!("the stored expression has a reference this release cannot read ({e:?})")
+    })? {
+        // A relation, collation, role, constraint or operator class an
+        // expression names is not code of its own: what runs is the function
+        // or the operator that takes it, and that is listed above.
+        match reference.class {
+            nodes::ReferenceClass::Routine => bound.routines.insert(reference.oid),
+            nodes::ReferenceClass::Operator => bound.operators.insert(reference.oid),
+            nodes::ReferenceClass::Type => bound.types.insert(reference.oid),
+            nodes::ReferenceClass::Relation
+            | nodes::ReferenceClass::Collation
+            | nodes::ReferenceClass::Role
+            | nodes::ReferenceClass::Constraint
+            | nodes::ReferenceClass::OperatorClass
+            | nodes::ReferenceClass::OperatorFamily => false,
+        };
+    }
+    Ok(bound)
+}
+
 /// A complete set of candidates sharing a name, or all names in a namespace.
 /// The set includes every overload; signatures cannot filter its membership.
 /// Capturing a set is not proof that a planner selected every required set.

@@ -17,12 +17,12 @@ use pbps_pg::user_types::{
 };
 
 /// One server of the pair, as the libpq keyword string that reaches it.
-struct Server {
-    label: &'static str,
-    connection: String,
+pub(super) struct Server {
+    pub(super) label: &'static str,
+    pub(super) connection: String,
 }
 
-fn servers() -> [Server; 2] {
+pub(super) fn servers() -> [Server; 2] {
     let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
     [
         Server {
@@ -56,17 +56,17 @@ fn with(connection: &str, overrides: &[(&str, &str)]) -> String {
 
 /// A database of its own on one server, and the roles made in the cluster for
 /// it. Dropped explicitly: a role outlives its database.
-struct Scratch {
-    label: &'static str,
+pub(super) struct Scratch {
+    pub(super) label: &'static str,
     tag: String,
     server: String,
     name: String,
-    conn: Conn,
+    pub(super) conn: Conn,
     roles: Vec<String>,
 }
 
 impl Scratch {
-    async fn create(server: &Server, tag: &str) -> Scratch {
+    pub(super) async fn create(server: &Server, tag: &str) -> Scratch {
         let name = format!("pbps_t1523b_{tag}_{}_{}", server.label, std::process::id());
         let mut admin = Conn::connect(Driver::Postgres, &server.connection)
             .await
@@ -96,7 +96,7 @@ impl Scratch {
     }
 
     /// Runs statements as the superuser that made the database.
-    async fn sql(&mut self, sql: &str) {
+    pub(super) async fn sql(&mut self, sql: &str) {
         self.conn
             .execute(sql)
             .await
@@ -104,7 +104,7 @@ impl Scratch {
     }
 
     /// A role of this test's own, with `options` (`LOGIN`, `NOLOGIN`).
-    async fn role(&mut self, tag: &str, options: &str) -> String {
+    pub(super) async fn role(&mut self, tag: &str, options: &str) -> String {
         // The test's own tag too: two tests run at once, and a role is shared
         // by the whole cluster.
         let role = format!(
@@ -128,7 +128,7 @@ impl Scratch {
         role
     }
 
-    async fn as_role(&self, role: &str) -> Conn {
+    pub(super) async fn as_role(&self, role: &str) -> Conn {
         let connection = with(
             &self.server,
             &[
@@ -142,7 +142,7 @@ impl Scratch {
             .unwrap_or_else(|e| panic!("connect as `{role}` on {}: {e}", self.label))
     }
 
-    async fn drop(self) {
+    pub(super) async fn drop(self) {
         let Scratch {
             server,
             name,
@@ -175,7 +175,7 @@ async fn read_as(conn: &mut Conn, schema: &str, name: &str) -> TypeRead {
     reads.remove(0)
 }
 
-async fn present(conn: &mut Conn, schema: &str, name: &str) -> UserType {
+pub(super) async fn present(conn: &mut Conn, schema: &str, name: &str) -> UserType {
     let read = read_as(conn, schema, name).await;
     let TypeRead::Present(t) = read else {
         panic!("{schema}.{name} should be present: {read:?}")
