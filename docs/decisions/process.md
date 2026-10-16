@@ -1299,3 +1299,20 @@ rows had to guess every spelling GitHub renders as a table row (spacing, no
 leading pipe, bold, code, a link), and each guess drew a review finding for
 the next one. With the closed table in its own file, a stray row is a reviewer's
 catch and a one-line conflict, not a recurring one.
+
+<a id="dec-2113-1"></a>
+
+**DEC-2113.1. Test builds optimize the two crates that run the SCRAM loop, and
+no others.** `profile.dev.package.postgres-protocol` and
+`profile.dev.package."sha2@0.11"` set `opt-level = 3`. `test` and `live-test`
+inherit `dev`; `release` is untouched, and workspace crates keep their profile,
+debug assertions and overflow checks. The set is what the measurement showed
+mattered, not every crate on the dependency path: `hmac`, `digest` and the rest
+add nothing once these two are optimized, because the generic HMAC code is
+compiled into `postgres-protocol`. `sha2 0.10` is the plan checksum and is not
+on the path.
+
+`profile.dev.package."*"` is not adopted. It was measured and is not wrong, but
+it recompiles the whole tree for a benefit past this one, and that choice
+belongs to its own decision. The numbers are in
+[CI performance](../CI-PERFORMANCE.md#scram-in-test-builds).

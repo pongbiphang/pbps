@@ -166,3 +166,17 @@ inherits = "test"
 opt-level = 1
 debug-assertions = true
 overflow-checks = true
+
+# SCRAM-SHA-256 is 4096 rounds of HMAC-SHA-256 on every PostgreSQL connection,
+# and an unoptimized build spent about 100 ms of CPU on each one (#2113,
+# DEC-2113.1). Only the two crates that run that loop are optimized:
+# `postgres-protocol` holds it, and the generic HMAC code is compiled into it,
+# while `sha2` holds the block compression. Measured: optimizing `hmac`,
+# `digest` or the rest of the chain as well changes nothing, and leaving out
+# either of these two keeps most of the cost. `sha2 0.10` (plan checksums) is
+# not on this path. Workspace crates keep their profile. `test` and `live-test`
+# inherit `dev`, so they get these too; `release` does not.
+[profile.dev.package.postgres-protocol]
+opt-level = 3
+[profile.dev.package."sha2@0.11"]
+opt-level = 3
