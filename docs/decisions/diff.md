@@ -2705,6 +2705,9 @@ without the validation wiring). Also by the units
 *Amended by [DEC-1581.1](#dec-1581-1): changing them on a standing partition
 plans and applies.*
 
+*Amended by [DEC-1632.2](#dec-1632-2): an own foreign key no longer leaves
+the tree out; it is declared and read as the partition's own.*
+
 <a id="dec-1578-1"></a>
 
 **DEC-1578.1. A partition declares its own column defaults and NOT NULLs under
@@ -5546,3 +5549,81 @@ A claim on a held name and a broken handover fail the run as an effect
 violation does (DEC-1954.6). Skipped comparisons, contested claims and steps
 whose names or statements cannot be read are recorded in the
 `PBPS_ORDER_SHADOW` file.
+
+<a id="dec-1632-2"></a>
+
+**DEC-1632.2. A partition declares its own foreign keys under its entry, as
+its own checks; one equal to a parent's foreign key is refused by name (#1632
+Part 2a).**
+
+Leon chose the shape on #1632 (issuecomment-6202190069): `foreign_keys:`
+under the partition's entry, an absorbed one refused by name, and the
+partition's triggers left to a second PR.
+
+Measured on 16 and 18, with the same results on each:
+
+- An own foreign key added to a standing partition has `conparentid = 0`. The
+  parent's clone beside it keeps the parent's name and has a `conparentid`.
+- One **equal** to a parent's (same columns, referenced table and columns,
+  and actions) stays apart when added to a standing partition. It is taken
+  for the parent's clone, gaining a `conparentid` and keeping its own name,
+  when the table is attached or when the parent's key is added after it. With
+  another `ON DELETE` it is never taken.
+- One named as the parent's foreign key is `constraint ... already exists`.
+- A detach makes the parent's clone local and keeps the partition's own
+  under its names.
+
+**What is declared and validated.** `foreign_keys:` under the entry, written
+as a table's. `Dialect::validate_partition` holds the foreign keys to the
+parent's columns as a table's are held to its own. It refuses one named as a
+parent's check or foreign key, as it refuses an own check so named. It also
+refuses one equal to a parent's: whether that one survives would depend on
+how the partition came to be, and once taken it reads back as nothing of the
+partition's own. `validate`, `plan --db` and `bootstrap` refuse them; the
+offline preview leaves validity to `validate`, as for every declaration.
+
+**What is read.** The tree predicate admits a foreign key with no
+`conparentid`; the constraint query already reads no clone. Each one is read
+in the second pass, as a table's are, so a referenced uniqueness that pull
+leaves out is reported as for any table.
+
+**What is planned.** A created partition's own foreign keys are
+`AddForeignKey` changes after the tree, as a table's are. On a standing
+partition, adding and dropping one is the partition's own change (DEC-1581.1):
+a clone is never in the model to be confused with it. A partition dropped
+under its standing parent drops its own foreign keys first, as a table does. A detach matches them
+by name before the parent's by definition, as an own check, so one declared
+otherwise is refused by name. An attach takes the table's foreign keys that
+match none of the parent's as the partition's own, which the plan then
+compares with what the entry declares. One matching a parent's becomes the
+clone, as the engine does, keeping its own name (measured on 16 and 18); one
+whose name the entry declares again, for an own check or foreign key, is
+dropped before the attach, so the engine clones the parent's under the
+parent's name, and the own one is added after. So is each of two or more
+equal to one parent's: the engine takes one of them by an order the model
+does not hold (measured: the later-created `a_fk` over `z_fk`), and which one
+stays local cannot be planned. Both compare the foreign keys
+as this plan leaves them, so one whose referenced table is renamed in the same plan is declared
+under the new name.
+
+**Schema set 49; the plan and state versions stay.** The declaration schema
+gains the entry's `foreign_keys:`, so the published schema set is 49. `Table`
+always had `foreign_keys`, and a partition's reach a plan only as
+`AddForeignKey` and `DropForeignKey` changes. An older
+build emits those as it emits a table's, unlike DEC-1577.1's checks, which
+`create_table` emitted and an older build dropped. An older build reading a
+newer project or tree refuses it: the loader rejects the unknown key, and
+validation or the reader refuses the foreign key.
+
+Pinned on 16 and 18 by the CLI's live
+`a_partitions_own_foreign_keys_change_through_the_cli`. It covers bootstrap,
+pull, adding and dropping on a standing partition, both refusals, detach and
+re-attach, and it fails with any one of the predicate, the read, the
+validation, the detach match, the attach carry-over or the standing-change
+rule reverted. Also pinned by the units
+`a_partitions_own_foreign_keys_round_trip_under_its_entry`,
+`a_partitions_own_checks_and_indexes_answer_to_its_parents_columns`,
+`an_ordinary_table_declared_as_a_partition_is_attached`,
+`a_partitions_own_foreign_key_follows_a_renamed_target_through_a_detach`,
+`an_attached_tables_own_foreign_key_follows_a_renamed_target` and
+`a_partition_with_its_own_foreign_key_is_dropped_under_its_parent`.

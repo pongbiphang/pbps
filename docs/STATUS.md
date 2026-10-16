@@ -70,8 +70,9 @@ partitions under `partitions:`, in its own file (LIST and HASH since #1632,
 DEC-1632.1). `pull` reads a tree whose partitions are their
 parent's and their own checks, indexes (#1577, DEC-1577.1), column defaults
 and NOT NULLs (#1578, DEC-1578.1), grants on the parent and on each
-partition, each its own (#1579, DEC-1579.1), and persistence and storage
-parameters (#1580, DEC-1580.1), and leaves any other tree out
+partition, each its own (#1579, DEC-1579.1), persistence and storage
+parameters (#1580, DEC-1580.1), and foreign keys (#1632, DEC-1632.2), and
+leaves any other tree out
 whole, by name. A
 tree is created whole, and a partition nobody declared is refused with the
 commands that adopt it (#1170, DEC-1170.1). A partition is then added under its
@@ -81,7 +82,8 @@ beside a standing DEFAULT partition takes the DEFAULT's rows of it, made as a
 plain table, filled and attached (#1547, DEC-1547.1). A partition declared in a file of its own with its
 parent's shape is detached and kept, under its declared names (#1544,
 DEC-1544.1). A standing partition's own indexes, checks, defaults, NOT NULLs,
-storage parameters and persistence change on it alone (#1581, DEC-1581.1). An
+storage parameters and persistence change on it alone (#1581, DEC-1581.1), and
+its own foreign keys (#1632, DEC-1632.2). An
 unlogged partition under a key from a table outside the declarations is
 refused from the catalog (#1595, DEC-1595.1). An ordinary table declared
 in its parent's `partitions:` with its parent's columns is attached with its

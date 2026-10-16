@@ -863,7 +863,7 @@
       ]
     },
     "PartitionDto": {
-      "description": "A partition: `default`, or a mapping of its bound, `{from: [...], to:\n[...]}` with one value per key column, `{in: [...]}` (#1632), `{modulus: m,\nremainder: r}` (#1632), or `default: true`, and what it has of its own\nbeside its parent's: `checks:` and `indexes:`, written as a table's\n(#1577).",
+      "description": "A partition: `default`, or a mapping of its bound, `{from: [...], to:\n[...]}` with one value per key column, `{in: [...]}` (#1632), `{modulus: m,\nremainder: r}` (#1632), or `default: true`, and what it has of its own\nbeside its parent's: `checks:` and `indexes:` (#1577) and `foreign_keys:`\n(#1632), written as a table's.",
       "anyOf": [
         {
           "description": "`default`.",
@@ -943,6 +943,13 @@
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/IndexDto"
+          }
+        },
+        "foreign_keys": {
+          "description": "The partition's own foreign keys (#1632); the parent's reach it as\nclones without being written here, and one equal to a parent's is\nrefused, since the engine may take it for the parent's clone.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ForeignKeyDto"
           }
         },
         "columns": {
@@ -1474,6 +1481,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 48,
+  "x-pbps-schema-version": 49,
   "x-pbps-tool-version": "0.0.0"
 }

@@ -196,8 +196,8 @@ fn tables_query() -> String {
 /// 16 and 18, and is no column (#1545). Every constraint a clone
 /// (`conparentid`, the keys and foreign keys), inherited and not local (a
 /// CHECK, and on 18 a NOT NULL row), a CHECK of its own, local and
-/// inherited from nowhere (#1577), or on 18 a validated NOT NULL row of its
-/// own (#1578). An index is a clone of the parent's or the
+/// inherited from nowhere (#1577), a foreign key of its own (#1632), or on
+/// 18 a validated NOT NULL row of its own (#1578). An index is a clone of the parent's or the
 /// partition's own (#1577); one backing a constraint of its own is left out
 /// with that constraint. Anything else in any partition leaves the whole tree
 /// out, named.
@@ -293,6 +293,7 @@ fn partition_tree(root: &str) -> String {
                                        AND NOT (k.contype IN ('c', 'n') AND NOT k.conislocal)
                                        AND NOT (k.contype = 'c' AND k.conislocal
                                                 AND k.coninhcount = 0)
+                                       AND k.contype <> 'f'
                                        AND NOT (k.contype = 'n' AND k.convalidated)))))"
     )
 }

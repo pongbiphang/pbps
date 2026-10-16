@@ -165,9 +165,9 @@ fn generation_problems(column: &str, generated: &pbps_model::Generated) -> Vec<D
 /// What a RANGE-partitioned parent and its partitions must be (#1170,
 /// DEC-1170.1): a key over declared columns, which every key and UNIQUE
 /// constraint includes (the engine refuses one that does not); a partition
-/// that declares nothing of its own but checks and indexes (#1577), since it
-/// inherits the rest and the other partition-level extras are not held yet
-/// (#1532); and no `data:` on either, whose rows the engine routes by bound.
+/// that declares nothing of its own but checks, indexes (#1577), foreign keys
+/// (#1632), persistence and storage parameters (#1580), since it inherits the
+/// rest and the other partition-level extras are not held yet (#1532); and no `data:` on either, whose rows the engine routes by bound.
 fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
     let invalid = |message: String| DialectError::Invalid {
         dialect: crate::types::DIALECT,
@@ -219,23 +219,23 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
         }
     }
     // A partition's own checks and indexes are its to declare (#1577), and
-    // its persistence and storage parameters (#1580); its columns and keys
-    // are its parent's, and the rest is not held yet (#1532).
+    // its persistence and storage parameters (#1580), and its foreign keys
+    // (#1632); its columns and keys are its parent's, and the rest is not
+    // held yet (#1532).
     if table.partition_of.is_some() {
         let own = !table.columns.is_empty()
             || !table.computed.is_empty()
             || table.primary_key.is_some()
             || !table.unique.is_empty()
-            || !table.foreign_keys.is_empty()
             || table.clustered.is_some()
             || table.replica_identity.is_some()
             || table.system_time.is_some()
             || table.partition_by.is_some();
         if own {
             found.push(invalid(
-                "a partition declares only its own checks, indexes, `unlogged` and \
-                 `storage_parameters`: its columns and keys are its parent's, and the rest is \
-                 not held yet"
+                "a partition declares only its own checks, indexes, foreign keys, `unlogged` \
+                 and `storage_parameters`: its columns and keys are its parent's, and the rest \
+                 is not held yet"
                     .to_owned(),
             ));
         }
@@ -967,12 +967,13 @@ impl Dialect for Postgres {
         quote(ident)
     }
 
-    /// A partition's own checks and indexes, held to its parent's columns as
-    /// a table's are to its own (#1577): the same structure, method and class
-    /// rules, over the columns the partition has without declaring them.
+    /// A partition's own checks, indexes and foreign keys (#1632), held to
+    /// its parent's columns as a table's are to its own (#1577): the same
+    /// structure, method and class rules, over the columns the partition has
+    /// without declaring them.
     ///
-    /// And an own check is not named as one of the parent's checks or foreign
-    /// keys, whose clones on the partition keep the parent's names: measured on
+    /// And an own check or foreign key is not named as one of the parent's
+    /// checks or foreign keys, whose clones on the partition keep the parent's names: measured on
     /// 16 and 18, `ADD CONSTRAINT` under one of them is `constraint … already
     /// exists`. The names the engine chooses for the other clones (an index's,
     /// a key's, and on 18 a NOT NULL's) are the engine's to choose and are not
@@ -1011,10 +1012,17 @@ impl Dialect for Postgres {
             columns,
             checks: partition.checks.clone(),
             indexes: partition.indexes.clone(),
+            foreign_keys: partition.foreign_keys.clone(),
             storage_parameters: partition.storage_parameters.clone(),
             ..Table::default()
         });
-        for name in partition.checks.keys() {
+        let own = partition.checks.keys().map(|name| ("check", name)).chain(
+            partition
+                .foreign_keys
+                .keys()
+                .map(|name| ("foreign key", name)),
+        );
+        for (own, name) in own {
             let kind = if parent.checks.contains_key(name) {
                 "check"
             } else if parent.foreign_keys.contains_key(name) {
@@ -1025,10 +1033,28 @@ impl Dialect for Postgres {
             found.push(DialectError::Invalid {
                 dialect: crate::types::DIALECT,
                 message: format!(
-                    "check `{name}` is named as its parent's {kind}, which the partition already \
+                    "{own} `{name}` is named as its parent's {kind}, which the partition already \
                      has under that name; name it otherwise"
                 ),
             });
+        }
+        // An own foreign key equal to one of the parent's: measured on 16 and
+        // 18, the engine keeps it apart when it is added to a standing
+        // partition, but takes it for the parent's clone when the partition is
+        // attached or the parent's key is added after it, and it then reads
+        // back as nothing of the partition's own. Whether it survives would
+        // depend on the path, so it is refused (#1632).
+        for (name, fk) in &partition.foreign_keys {
+            if let Some((parents, _)) = parent.foreign_keys.iter().find(|(_, p)| *p == fk) {
+                found.push(DialectError::Invalid {
+                    dialect: crate::types::DIALECT,
+                    message: format!(
+                        "foreign key `{name}` is its parent's `{parents}` again, which the \
+                         partition already has as a clone, and which the engine may take it \
+                         for; declare it on the parent only"
+                    ),
+                });
+            }
         }
         // Its own default and NOT NULL, each an override of one of the
         // parent's columns (#1578). One equal to the parent's is not an
@@ -2154,10 +2180,12 @@ mod tests {
         }
     }
 
-    /// A partition's own checks and indexes are held to the columns it has
-    /// from its parent, by the rules a table's are (#1577); and an own check
-    /// takes no name the parent's checks and foreign keys give their clones,
-    /// which the engine refuses as already existing, measured on 16 and 18.
+    /// A partition's own checks, indexes and foreign keys are held to the
+    /// columns it has from its parent, by the rules a table's are (#1577,
+    /// #1632); an own check or foreign key takes no name the parent's checks
+    /// and foreign keys give their clones, which the engine refuses as already
+    /// existing, measured on 16 and 18; and an own foreign key is never one
+    /// equal to the parent's.
     #[test]
     fn a_partitions_own_checks_and_indexes_answer_to_its_parents_columns() {
         use pbps_dialect::Dialect;
@@ -2257,6 +2285,57 @@ mod tests {
                 got.iter()
                     .any(|p| p.contains(&format!("check `{name}` is named as its parent's {kind}"))),
                 "{got:?}"
+            );
+        }
+        // Its own foreign keys (#1632): over the parent's columns, as a
+        // table's are over its own, under no name the parent's clones keep,
+        // and never one equal to a parent's, which the engine may take for
+        // its clone.
+        let fk = |column: &str, on_delete| pbps_model::ForeignKey {
+            columns: vec![column.into()],
+            references_table: "app.r".parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete,
+            on_update: Default::default(),
+        };
+        let mut own_fk = ok.clone();
+        own_fk
+            .foreign_keys
+            .insert("p1_fk".into(), fk("ts", Default::default()));
+        // The parent's columns again, with another action: not the parent's.
+        own_fk.foreign_keys.insert(
+            "p1_cascade".into(),
+            fk("id", pbps_model::ReferentialAction::Cascade),
+        );
+        assert!(found(&own_fk).is_empty(), "{:?}", found(&own_fk));
+        for (name, definition, expected) in [
+            (
+                "p1_x",
+                fk("x", Default::default()),
+                "references `x`, which is not a column",
+            ),
+            (
+                "ev_fk",
+                fk("ts", Default::default()),
+                "foreign key `ev_fk` is named as its parent's foreign key",
+            ),
+            (
+                "ev_ck",
+                fk("ts", Default::default()),
+                "foreign key `ev_ck` is named as its parent's check",
+            ),
+            (
+                "p1_again",
+                fk("id", Default::default()),
+                "foreign key `p1_again` is its parent's `ev_fk` again",
+            ),
+        ] {
+            let mut wrong = ok.clone();
+            wrong.foreign_keys.insert(name.into(), definition);
+            let got = found(&wrong);
+            assert!(
+                got.iter().any(|p| p.contains(expected)),
+                "{expected}: {got:?}"
             );
         }
     }

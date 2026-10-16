@@ -224,29 +224,7 @@ pub fn render_partitioned(
         }
     }
 
-    if !table.foreign_keys.is_empty() {
-        s.push_str("\nforeign_keys:\n");
-        for (n, fk) in &table.foreign_keys {
-            let _ = writeln!(s, "  {}:", scalar(n));
-            let _ = writeln!(s, "    columns: {}", seq(&fk.columns));
-            let _ = writeln!(
-                s,
-                "    references: {}",
-                scalar(&format!(
-                    "{}({})",
-                    fk.references_table,
-                    fk.references_columns.join(", ")
-                ))
-            );
-            if fk.on_delete != Default::default() {
-                let _ = writeln!(s, "    on_delete: {}", action(fk.on_delete));
-            }
-            if fk.on_update != Default::default() {
-                let _ = writeln!(s, "    on_update: {}", action(fk.on_update));
-            }
-        }
-    }
-
+    render_foreign_keys(&mut s, table, "", "\n");
     render_checks_and_indexes(&mut s, table, "", "\n");
 
     // After the indexes it may name, and on one line: a layout is a single
@@ -329,9 +307,11 @@ pub fn render_partitioned(
                 let own_columns = t.partition_of.as_ref().map(|p| &p.columns);
                 // On one line while the partition is its bound alone; a block
                 // once it has checks, indexes (#1577), columns (#1578), a
-                // persistence or storage parameters (#1580) of its own.
+                // persistence or storage parameters (#1580), or foreign keys
+                // (#1632) of its own.
                 if t.checks.is_empty()
                     && t.indexes.is_empty()
+                    && t.foreign_keys.is_empty()
                     && own_columns.is_none_or(std::collections::BTreeMap::is_empty)
                     && !t.unlogged
                     && t.storage_parameters.is_empty()
@@ -383,6 +363,7 @@ pub fn render_partitioned(
                                 writeln!(s, "      {}: {{{}}}", scalar(column), fields.join(", "));
                         }
                     }
+                    render_foreign_keys(&mut s, t, "    ", "");
                     render_checks_and_indexes(&mut s, t, "    ", "");
                     // As a table's, last (#1580).
                     if t.unlogged {
@@ -713,6 +694,33 @@ fn reads_back_bare(s: &str) -> bool {
 /// of a table's file, or a partition's entry under its parent's `partitions:`
 /// (#1577). `lead` goes before each section's first line, the blank line
 /// between top-level sections.
+/// A table's foreign keys, or a partition's own under its entry (#1632).
+fn render_foreign_keys(s: &mut String, table: &Table, pad: &str, lead: &str) {
+    if table.foreign_keys.is_empty() {
+        return;
+    }
+    let _ = writeln!(s, "{lead}{pad}foreign_keys:");
+    for (n, fk) in &table.foreign_keys {
+        let _ = writeln!(s, "{pad}  {}:", scalar(n));
+        let _ = writeln!(s, "{pad}    columns: {}", seq(&fk.columns));
+        let _ = writeln!(
+            s,
+            "{pad}    references: {}",
+            scalar(&format!(
+                "{}({})",
+                fk.references_table,
+                fk.references_columns.join(", ")
+            ))
+        );
+        if fk.on_delete != Default::default() {
+            let _ = writeln!(s, "{pad}    on_delete: {}", action(fk.on_delete));
+        }
+        if fk.on_update != Default::default() {
+            let _ = writeln!(s, "{pad}    on_update: {}", action(fk.on_update));
+        }
+    }
+}
+
 fn render_checks_and_indexes(s: &mut String, table: &Table, pad: &str, lead: &str) {
     if !table.checks.is_empty() {
         let _ = writeln!(s, "{lead}{pad}checks:");
@@ -1801,6 +1809,40 @@ indexes:
             out.contains("\n  ev_rest:\n    default: true\n    indexes:\n      rest_id:\n"),
             "{out}"
         );
+    }
+
+    /// A partition's own foreign keys are written under its entry, before its
+    /// checks and indexes as a table's are, and read back as its own, with
+    /// their actions (#1632). The parent's stay the parent's, and a partition
+    /// with none of its own stays on one line.
+    #[test]
+    fn a_partitions_own_foreign_keys_round_trip_under_its_entry() {
+        let yaml = "table: app.ev\ncolumns:\n  ts: {type: date, nullable: false}\n  u: {type: int}\n  w: {type: int}\n\nforeign_keys:\n  ev_u_fk:\n    columns: [u]\n    references: app.users(id)\n\npartition_by: [ts]\n\npartitions:\n  ev_old:\n    from: [MINVALUE]\n    to: [\"2025-01-01\"]\n    foreign_keys:\n      old_w_fk:\n        columns: [w]\n        references: app.archive(id)\n        on_delete: cascade\n    checks:\n      old_ck: w > 0\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n";
+        round_trip(yaml);
+        let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
+        let own = |n: &str| {
+            &t.partitions
+                .iter()
+                .find(|(name, _)| name.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+                .1
+        };
+        let fk = &own("ev_old").foreign_keys["old_w_fk"];
+        assert_eq!(fk.columns, ["w"]);
+        assert_eq!(fk.references_table.to_string(), "app.archive");
+        assert_eq!(fk.on_delete, pbps_model::ReferentialAction::Cascade);
+        assert!(own("ev_plain").foreign_keys.is_empty());
+        assert_eq!(t.table.foreign_keys.keys().collect::<Vec<_>>(), ["ev_u_fk"]);
+        let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
+        let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
+        assert!(
+            out.contains("\n  ev_plain: {from: [\"2025-01-01\"], to: [MAXVALUE]}\n"),
+            "{out}"
+        );
+        // Negative: a foreign key whose reference does not parse is refused
+        // under a partition as under a table.
+        let bad = yaml.replace("app.archive(id)", "app.archive");
+        assert!(crate::load_table_str(Path::new("t.yml"), &bad).is_err());
     }
 
     /// A partition's persistence and storage parameters are written under

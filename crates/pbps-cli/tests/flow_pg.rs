@@ -26643,3 +26643,219 @@ fn resolver_externals_drafts_what_a_managed_view_reads_and_never_replaces_the_ex
     );
     assert_eq!(std::fs::read_to_string(&named).unwrap(), "-- reviewed\n");
 }
+
+/// A partition's own foreign keys round-trip through the CLI (#1632): created
+/// with the tree beside the parent's clone, pulled back under the partition's
+/// entry and never the clone, added and dropped on a standing partition,
+/// kept under their names when the partition is detached, and kept when the
+/// table is attached again, where the one equal to the parent's becomes its
+/// clone, and dropped with the partition. Each saved plan
+/// applies, verifies and replans empty. One equal to the parent's, which the
+/// engine may take for its clone, and one under the name the parent's clone
+/// keeps are refused by name by `validate` and by a connected plan.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partitions_own_foreign_keys_change_through_the_cli() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "part-fk-1632");
+    let conn = own.connection().to_owned();
+    on_server(&conn, "CREATE SCHEMA app");
+    let d = Demo::new("part-fk-1632");
+    let referenced = |name: &str| {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!(
+                "table: app.{name}\ncolumns:\n  id: {{type: integer, nullable: false}}\n\
+                 primary_key: [id]\n"
+            ),
+        )
+        .unwrap();
+    };
+    referenced("r");
+    referenced("s");
+    let columns = "columns:\n  id: {type: integer, nullable: false}\n  \
+                   ts: {type: date, nullable: false}\n  r: {type: integer}\n  \
+                   s: {type: integer}\n";
+    let tree = |partitions: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!(
+                "table: app.ev\n{columns}foreign_keys:\n  ev_r_fk:\n    columns: [r]\n    \
+                 references: app.r(id)\npartition_by: [ts]\npartitions:\n{partitions}"
+            ),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+    };
+    let own_fk = |name: &str, extra: &str| {
+        format!(
+            "    foreign_keys:\n      {name}:\n        columns: [s]\n        \
+             references: app.s(id)\n{extra}"
+        )
+    };
+    let p2025 = format!(
+        "  ev_2025:\n    from: [\"2025-01-01\"]\n    to: [\"2026-01-01\"]\n{}",
+        own_fk("ev_2025_s_fk", "")
+    );
+    let p2026 = "  ev_2026: {from: [\"2026-01-01\"], to: [\"2027-01-01\"]}\n";
+    tree(&format!("{p2025}{p2026}"));
+    succeeds(d.run(&["bootstrap", "--db", &conn]));
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    let holds = |sql: &str| scalar(&conn, &format!("SELECT ({sql})::int::int8"));
+    let fk_on = |table: &str, name: &str, clone: bool| {
+        holds(&format!(
+            "SELECT EXISTS (SELECT FROM pg_constraint WHERE contype = 'f' \
+               AND conrelid = '{table}'::regclass AND conname = '{name}' \
+               AND (conparentid <> 0) = {clone})"
+        ))
+    };
+    assert_eq!(fk_on("app.ev_2025", "ev_2025_s_fk", false), 1);
+    assert_eq!(fk_on("app.ev_2025", "ev_r_fk", true), 1);
+
+    // Pulled back under the partition's entry, the clone left to the parent.
+    let pulled = Demo::new("part-fk-1632-pull");
+    succeeds(pulled.run(&["pull", "--db", &conn]));
+    let text = std::fs::read_to_string(pulled.dir.join("schema/app.ev.yml")).unwrap();
+    assert!(
+        text.contains(&format!(
+            "  ev_2025:\n    from: [\"2025-01-01\"]\n    to: [\"2026-01-01\"]\n{}",
+            own_fk("ev_2025_s_fk", "")
+        )) && text.contains(p2026)
+            && text.matches("ev_r_fk").count() == 1,
+        "{text}"
+    );
+
+    let applied = |name: &str, allow: &[&str]| {
+        let plan = d.dir.join(name);
+        let o = succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, &conn, &plan, allow));
+        succeeds(d.run(&["verify", "--db", &conn]));
+        let next = succeeds(d.run(&["plan", "--db", &conn]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        stdout(&o)
+    };
+    on_server(
+        &conn,
+        "INSERT INTO app.r VALUES (1); INSERT INTO app.s VALUES (1); \
+         INSERT INTO app.ev VALUES (1, '2025-06-01', 1, 1), (2, '2026-06-01', 1, 1)",
+    );
+    // Added to a standing partition holding rows, and dropped from another.
+    let p2026_own = format!(
+        "  ev_2026:\n    from: [\"2026-01-01\"]\n    to: [\"2027-01-01\"]\n{}",
+        own_fk("ev_2026_s_fk", "        on_delete: cascade\n")
+    );
+    tree(&format!(
+        "  ev_2025: {{from: [\"2025-01-01\"], to: [\"2026-01-01\"]}}\n{p2026_own}"
+    ));
+    applied(
+        "own.json",
+        &["--allow", "constraint", "--allow", "destructive"],
+    );
+    assert_eq!(fk_on("app.ev_2026", "ev_2026_s_fk", false), 1);
+    assert_eq!(fk_on("app.ev_2025", "ev_2025_s_fk", false), 0);
+    assert_eq!(fk_on("app.ev_2025", "ev_r_fk", true), 1);
+
+    // Refused by name before a plan exists: one equal to the parent's, and
+    // one under the name the parent's clone keeps.
+    for (entry, needle) in [
+        (
+            "  ev_2025:\n    from: [\"2025-01-01\"]\n    to: [\"2026-01-01\"]\n    \
+             foreign_keys:\n      ev_2025_r:\n        columns: [r]\n        \
+             references: app.r(id)\n"
+                .to_owned(),
+            "foreign key `ev_2025_r` is its parent's `ev_r_fk` again",
+        ),
+        (
+            format!(
+                "  ev_2025:\n    from: [\"2025-01-01\"]\n    to: [\"2026-01-01\"]\n{}",
+                own_fk("ev_r_fk", "")
+            ),
+            "foreign key `ev_r_fk` is named as its parent's foreign key",
+        ),
+    ] {
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!(
+                "table: app.ev\n{columns}foreign_keys:\n  ev_r_fk:\n    columns: [r]\n    \
+                 references: app.r(id)\npartition_by: [ts]\npartitions:\n{entry}{p2026_own}"
+            ),
+        )
+        .unwrap();
+        // By `validate`, the CI check, and by the connected plan, which
+        // refuses invalid declarations before it reads the target; the
+        // offline preview leaves validity to `validate`.
+        for args in [&["validate"][..], &["plan", "--db", &conn][..]] {
+            let o = d.run(args);
+            assert_ne!(code(&o), 0, "{needle}: {}", stdout(&o));
+            let said = format!("{}{}", stdout(&o), stderr(&o));
+            assert!(said.contains(needle), "{args:?} {needle}: {said}");
+        }
+    }
+
+    // Detached and kept: its own foreign key keeps its name beside the
+    // parent's, which the detach makes the table's own.
+    std::fs::write(
+        d.dir.join("schema/app.ev_2026.yml"),
+        format!(
+            "table: app.ev_2026\n{columns}foreign_keys:\n  arch_r:\n    columns: [r]\n    \
+             references: app.r(id)\n  ev_2026_s_fk:\n    columns: [s]\n    \
+             references: app.s(id)\n    on_delete: cascade\n"
+        ),
+    )
+    .unwrap();
+    tree("  ev_2025: {from: [\"2025-01-01\"], to: [\"2026-01-01\"]}\n");
+    let planned = applied("detach.json", &["--allow", "destructive"]);
+    assert!(
+        planned.contains("~ detach table app.ev_2026 from app.ev, keeping its rows"),
+        "{planned}"
+    );
+    assert_eq!(
+        holds("SELECT NOT relispartition FROM pg_class WHERE oid = 'app.ev_2026'::regclass"),
+        1
+    );
+    assert_eq!(fk_on("app.ev_2026", "ev_2026_s_fk", false), 1);
+    assert_eq!(fk_on("app.ev_2026", "arch_r", false), 1);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM app.ev_2026"), 1);
+
+    // Attached again: the foreign key equal to the parent's would become its
+    // clone under its own name `arch_r`, measured on 16 and 18, which the
+    // partition declares again for one of its own: dropped before the
+    // attach, the engine clones the parent's as `ev_r_fk`, and the own one is
+    // added after (#1632 review). The other stays the partition's own.
+    std::fs::remove_file(d.dir.join("schema/app.ev_2026.yml")).unwrap();
+    tree(&format!(
+        "  ev_2025: {{from: [\"2025-01-01\"], to: [\"2026-01-01\"]}}\n{p2026_own}      \
+         arch_r:\n        columns: [r]\n        references: app.r(id)\n        \
+         on_delete: cascade\n"
+    ));
+    let planned = applied(
+        "attach.json",
+        &["--allow", "constraint", "--allow", "destructive"],
+    );
+    assert!(planned.contains("attach"), "{planned}");
+    assert_eq!(fk_on("app.ev_2026", "ev_2026_s_fk", false), 1);
+    assert_eq!(fk_on("app.ev_2026", "arch_r", false), 1);
+    assert_eq!(fk_on("app.ev_2026", "ev_r_fk", true), 1);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM app.ev"), 2);
+
+    // Dropped under its standing parent with drop intent, its own foreign
+    // keys first (#1632 review).
+    std::fs::write(
+        d.dir.join("schema/app.ev.yml"),
+        format!(
+            "table: app.ev\n{columns}foreign_keys:\n  ev_r_fk:\n    columns: [r]\n    \
+             references: app.r(id)\npartition_by: [ts]\npartitions:\n  \
+             ev_2025: {{from: [\"2025-01-01\"], to: [\"2026-01-01\"]}}\n"
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["drop-table", "app.ev_2026", "--reason", "retired"]));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    applied("drop.json", &["--allow", "destructive"]);
+    assert_eq!(holds("SELECT to_regclass('app.ev_2026') IS NULL"), 1);
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM app.ev"), 1);
+}

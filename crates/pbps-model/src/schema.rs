@@ -493,9 +493,12 @@ pub struct Table {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_by: Option<PartitionBy>,
 
-    /// This table is a partition of another, with its bound (#1170). A
-    /// partition holds nothing of its own: its columns, keys and indexes are
-    /// its parent's, which the engine gives it.
+    /// This table is a partition of another, with its bound (#1170). Its
+    /// columns and keys are its parent's, which the engine gives it, with
+    /// clones of the parent's indexes, checks and foreign keys; what it holds
+    /// of its own beside them is its checks, indexes (#1577), foreign keys
+    /// (#1632), column defaults and NOT NULLs (#1578), persistence and storage
+    /// parameters (#1580).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partition_of: Option<PartitionOf>,
 
