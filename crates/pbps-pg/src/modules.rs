@@ -271,7 +271,7 @@ pub async fn before_a_rebuild(
             read_trigger_enabled(conn, oid, &mut carries).await?;
             read_attached(conn, oid, "pg_trigger", &mut carries).await?;
             read_extension_ties(conn, oid, "pg_trigger", &mut carries).await?;
-            read_clones(conn, oid, &mut carries).await?;
+            read_clones(conn, oid, changes, &mut carries).await?;
         }
     }
     Ok(Rebuild {
@@ -1258,19 +1258,40 @@ pub fn catalogs_read_by_address() -> Vec<&'static str> {
 /// What the clones of a partitioned parent's row trigger carry of their own
 /// (#1632 review). Measured on 16 and 18, the parent's `DROP` takes every
 /// clone with it and its `CREATE` makes them again bare, so a clone's enabled
-/// mode, its comment or label and its extension tie are lost by a rebuild of
-/// the parent, or of the routine it runs, as the parent's own would be. A
-/// clone is no module, so it is asked here, under its parent, by its table.
-async fn read_clones(conn: &mut Conn, oid: i64, carries: &mut Vec<Carried>) -> Result<(), DbError> {
+/// mode, its comment or label, its extension tie, and for a constraint
+/// trigger what is attached to its constraint, are lost by a rebuild of the
+/// parent, or of the routine it runs, as the parent's own would be. A clone
+/// is no module, so it is asked here, under its parent, by its table. One on
+/// a partition the plan drops or detaches is gone before the rebuild: both
+/// run in class 6, the rebuild in 14.
+async fn read_clones(
+    conn: &mut Conn,
+    oid: i64,
+    changes: &ChangeSet,
+    carries: &mut Vec<Carried>,
+) -> Result<(), DbError> {
+    let gone: BTreeSet<&TableName> = changes
+        .changes
+        .iter()
+        .filter_map(|p| {
+            if let Change::DropTable { name, .. } = &p.change {
+                Some(name)
+            } else if let Change::DetachPartition { table, .. } = &p.change {
+                Some(table)
+            } else {
+                None
+            }
+        })
+        .collect();
     let rows = conn
         .query_with(
-            "SELECT tg.oid::int8 AS oid,
-                    pg_catalog.format('%I.%I', n.nspname, c.relname) AS on_table
+            "SELECT tg.oid::int8 AS oid, tg.tgconstraint::int8 AS constraint_oid,
+                    n.nspname AS schema_name, c.relname AS table_name
                FROM pg_catalog.pg_trigger tg
                JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
               WHERE tg.tgparentid = ($1::int8)::oid
-              ORDER BY 2",
+              ORDER BY 3, 4",
             &[Param::I64(oid)],
         )
         .await?;
@@ -1278,11 +1299,18 @@ async fn read_clones(conn: &mut Conn, oid: i64, carries: &mut Vec<Carried>) -> R
         let clone: i64 = row
             .try_get("oid")?
             .ok_or_else(|| DbError::BadRow("a trigger clone without an oid".into()))?;
-        let on = text(&row, "on_table")?;
+        let constraint: i64 = row.try_get("constraint_oid")?.unwrap_or(0);
+        let on = TableName::new(text(&row, "schema_name")?, text(&row, "table_name")?);
+        if gone.contains(&on) {
+            continue;
+        }
         let mut own = Vec::new();
         read_trigger_enabled(conn, clone, &mut own).await?;
         read_attached(conn, clone, "pg_trigger", &mut own).await?;
         read_extension_ties(conn, clone, "pg_trigger", &mut own).await?;
+        if constraint != 0 {
+            read_attached(conn, constraint, "pg_constraint", &mut own).await?;
+        }
         carries.extend(own.into_iter().map(|c| Carried {
             what: c.what,
             detail: format!("on its clone on `{on}`: {}", c.detail),

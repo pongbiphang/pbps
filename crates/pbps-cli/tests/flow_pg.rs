@@ -26776,9 +26776,42 @@ fn a_partition_trees_triggers_go_through_the_cli() {
         let next = succeeds(d.run(&["plan", "--db", &tgt]));
         assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
     };
+    // A partition to drop with the rebuild below.
+    let ev_path = d.dir.join("schema/app.ev.yml");
+    let entry_of = |text: &str, name: &str| {
+        let mut entry = Vec::new();
+        for line in text
+            .lines()
+            .skip_while(|l| !l.starts_with(&format!("  {name}")))
+        {
+            if !entry.is_empty() && !line.starts_with("    ") {
+                break;
+            }
+            entry.push(line.to_owned());
+        }
+        format!("{}\n", entry.join("\n"))
+    };
+    let before_z = std::fs::read_to_string(&ev_path).unwrap();
+    let a_entry = entry_of(&before_z, "ev_a");
+    let z_entry = a_entry
+        .replace("ev_a", "ev_z")
+        .replace("[a]", "[z]")
+        .replace("\"a\"", "\"z\"");
+    assert_ne!(z_entry, a_entry, "{a_entry}");
+    std::fs::write(
+        &ev_path,
+        before_z.replace(&a_entry, &format!("{a_entry}{z_entry}")),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    applied("z.json", &[]);
+
     // The routine the triggers run is rebuilt: the parent's triggers are its
     // dependents, dropped and created again around it, and their clones go
-    // and come with them.
+    // and come with them. The same plan drops `ev_z`.
+    std::fs::write(&ev_path, &before_z).unwrap();
+    succeeds(d.run(&["drop-table", "app.ev_z", "--reason", "retired"]));
     let routine = std::fs::read_dir(d.dir.join("schema"))
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -26812,7 +26845,34 @@ fn a_partition_trees_triggers_go_through_the_cli() {
         "{said}"
     );
     on_server(&tgt, "COMMENT ON TRIGGER ev_row ON app.ev_a IS NULL");
+    // So is one on the constraint a constraint trigger's clone has.
+    on_server(
+        &tgt,
+        "COMMENT ON CONSTRAINT ev_ct ON app.ev_a IS 'kept by hand too'",
+    );
+    let o = d.run(&["plan", "--db", &tgt]);
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        code(&o) != 0
+            && said.contains("on its clone on `app.ev_a`")
+            && said.contains("kept by hand too"),
+        "{said}"
+    );
+    on_server(&tgt, "COMMENT ON CONSTRAINT ev_ct ON app.ev_a IS NULL");
+    // One on a clone of the partition the plan drops goes with the partition,
+    // before the rebuild, and refuses nothing.
+    on_server(
+        &tgt,
+        "COMMENT ON TRIGGER ev_row ON app.ev_z IS 'goes with it'",
+    );
     applied("routine.json", &["--allow", "destructive"]);
+    assert_eq!(
+        scalar(
+            &tgt,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.ev_z')"
+        ),
+        0
+    );
     assert_eq!(
         (triggers_on("app.ev_a", true), triggers_on("app.ev_b", true)),
         (2, 2)
