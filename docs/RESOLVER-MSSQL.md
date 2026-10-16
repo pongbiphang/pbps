@@ -258,15 +258,15 @@ read:
 | Class | Compared |
 |---|---|
 | Any object | Its schema, name and object type: every kind occupies the name (§2) |
-| Table, view | Columns: name, order, type (a user type by `schema.name`), length, precision, scale, nullability, collation, computed or not; a view's `is_schema_bound`, which a schema-bound caller requires (4513) |
-| Function | Parameters and return type as above, kind (scalar, inline, multi-statement), `is_schema_bound`, which a schema-bound caller requires (4513), and a table-valued function's result columns as a table's, which a view over it binds [`a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`] |
+| Table, view | Columns: name, order, type (a user type by `schema.name`), length, precision, scale, nullability, collation, computed or not; a view's `is_schema_bound`, which a schema-bound caller requires (4513); a table's primary key, unique constraints and unique indexes (key columns and order), which a foreign key binds by `key_index_id` and is refused without (1776), as #1673 compares them on PostgreSQL |
+| Function | Parameters and return type as above, kind (scalar, inline, multi-statement), `is_schema_bound`, which a schema-bound caller requires (4513), the engine's `IsDeterministic` and `IsPrecise`, which a `PERSISTED` computed column calling it requires (4936) [`a_foreign_key_binds_a_candidate_key_and_a_persisted_column_a_deterministic_function`], and a table-valued function's result columns as a table's, which a view over it binds [`a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`] |
 | Procedure | Parameters as above |
 | User type | Base type, length, precision, scale, nullability |
 | Synonym | `base_object_name`; a schema-bound caller may not name one (2788) |
 | Schema | Name |
 
 Not compared: module bodies and view queries (a view may be staged as a shape
-view of typed NULLs), indexes, keys, CHECKs, defaults, foreign keys and
+view of typed NULLs), non-unique indexes, CHECKs, defaults, foreign keys and
 triggers.
 
 A three-part or four-part reference refuses by name: the externals file stages

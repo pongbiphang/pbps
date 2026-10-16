@@ -1274,6 +1274,82 @@ async fn a_table_valued_functions_result_columns_are_what_a_view_over_it_binds()
     db.drop().await;
 }
 
+/// Two more things a creation reads from an object it does not own: a
+/// foreign key binds the referenced table's primary key or unique index
+/// (`key_index_id`) and is refused without one (1776), and a `PERSISTED`
+/// computed column needs the function it calls to be deterministic (4936),
+/// which the engine reports and the signature does not show.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_foreign_key_binds_a_candidate_key_and_a_persisted_column_a_deterministic_function() {
+    let mut db = TestDb::create("keys619").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE TABLE dbo.parent (id int NOT NULL CONSTRAINT pk_parent PRIMARY KEY, code int NOT NULL);",
+            "CREATE UNIQUE INDEX ux_parent_code ON dbo.parent (code);",
+            "CREATE TABLE dbo.keyless (id int NOT NULL);",
+            "CREATE FUNCTION dbo.same (@v int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @v END;",
+            "CREATE FUNCTION dbo.today (@v int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN DATEPART(day, GETDATE()) END;",
+        ],
+    )
+    .await;
+    assert_eq!(
+        refusal(
+            &mut db.conn,
+            "CREATE TABLE dbo.child (code int REFERENCES dbo.parent (code));"
+        )
+        .await,
+        None
+    );
+    assert_eq!(
+        text(
+            &mut db.conn,
+            "SELECT CONVERT(nvarchar(128), i.name) FROM sys.foreign_keys f \
+             JOIN sys.indexes i ON i.object_id = f.referenced_object_id AND i.index_id = f.key_index_id;"
+        )
+        .await,
+        "ux_parent_code"
+    );
+    assert_eq!(
+        refusal(
+            &mut db.conn,
+            "CREATE TABLE dbo.orphan (id int REFERENCES dbo.keyless (id));"
+        )
+        .await
+        .as_deref(),
+        Some("1776")
+    );
+
+    assert_eq!(
+        texts(
+            &mut db.conn,
+            "SELECT CONVERT(nvarchar(200), name + N':' + CONVERT(nvarchar(1), OBJECTPROPERTY(object_id, 'IsDeterministic'))) \
+             FROM sys.objects WHERE name IN (N'same', N'today') ORDER BY name;"
+        )
+        .await,
+        ["same:1", "today:0"]
+    );
+    assert_eq!(
+        refusal(
+            &mut db.conn,
+            "CREATE TABLE dbo.kept (v int, d AS dbo.same(v) PERSISTED);"
+        )
+        .await,
+        None
+    );
+    assert_eq!(
+        refusal(
+            &mut db.conn,
+            "CREATE TABLE dbo.dated (v int, d AS dbo.today(v) PERSISTED);"
+        )
+        .await
+        .as_deref(),
+        Some("4936")
+    );
+    db.drop().await;
+}
+
 /// A database born from an unmodified `model` on the pinned build holds the
 /// fresh-install inventory #723's empty-at-birth check compares with. The
 /// same reads find a user object once there is one.

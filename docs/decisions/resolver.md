@@ -3209,12 +3209,18 @@ The comparison is #1673's (DEC-1673.1) with SQL Server's shapes:
   target view would admit a managed object the target refuses;
 - a table-valued function's result columns, as a table's: a view over the
   function binds them, and breaks (207) when they change;
+- a function's `IsDeterministic` and `IsPrecise`, as the engine reports them:
+  a `PERSISTED` computed column refuses a function that is not
+  deterministic (4936), which no signature shows;
+- a table's primary key, unique constraints and unique indexes, as #1673
+  compares them on PostgreSQL: a foreign key binds one by `key_index_id` and
+  is refused without one (1776);
 - a user type's base and facets;
 - a synonym's `base_object_name`;
 - schemas.
 
-Bodies, indexes, keys, CHECKs, defaults, foreign keys and triggers are not
-compared: no creation-time binding reads them on SQL Server.
+Bodies, non-unique indexes, CHECKs, defaults, foreign keys and triggers are
+not compared: no creation-time binding reads them on SQL Server.
 
 A three-part or four-part name is recorded with no id. An externals file
 stages one database and cannot stand in for another, so such a reference
@@ -3238,6 +3244,7 @@ inventory read: #721, where an identity covered only the manifest file, and
 makes the change, which moves the rule identifier (DEC-2012.1).
 
 **Pinned by** `schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not`
-(4513), `a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`
+(4513), `a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`,
+`a_foreign_key_binds_a_candidate_key_and_a_persisted_column_a_deterministic_function`
 and `synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed`
 (the three-part name).
