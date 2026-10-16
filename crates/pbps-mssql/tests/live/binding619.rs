@@ -1700,6 +1700,78 @@ async fn a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_adm
     scratch.drop().await;
 }
 
+/// The supplied session lists the databases the sandbox's guest admission is
+/// read over, and a list it cannot see whole still reads as a success. Under
+/// `DENY VIEW ANY DATABASE` the query returns only `master`, `tempdb` and the
+/// login's own database, a guest-enabled target among the missing, and
+/// `DB_NAME` hides the same ones. The login's own `HAS_PERMS_BY_NAME` says so:
+/// the list is complete only while it reads 1.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_database_list_without_view_any_database_hides_the_target_and_says_so() {
+    let mut scratch = TestDb::create("listscratch619").await;
+    let mut target = TestDb::create("listtarget619").await;
+    run(&mut target.conn, &["GRANT CONNECT TO guest;"]).await;
+    let pid = std::process::id();
+    let password = "Pbps!Lister619x";
+    let login = format!("pbps619_lister_{pid}");
+    let mut admin = connect_live(&conn_str()).await.unwrap();
+    run(
+        &mut admin,
+        &[&*format!(
+            "CREATE LOGIN [{login}] WITH PASSWORD = N'{password}', CHECK_POLICY = OFF;"
+        )],
+    )
+    .await;
+    run(
+        &mut scratch.conn,
+        &[
+            &*format!("CREATE USER [{login}] FOR LOGIN [{login}];"),
+            &*format!("ALTER ROLE db_owner ADD MEMBER [{login}];"),
+        ],
+    )
+    .await;
+    let read = format!(
+        "SELECT CONVERT(bigint, HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DATABASE') * 100 \
+           + (SELECT COUNT(*) FROM sys.databases WHERE name = N'{0}') * 10 \
+           + CASE WHEN DB_ID(N'{0}') IS NULL THEN 0 ELSE 1 END);",
+        target.name
+    );
+    let url = super::resolver_tests::login_url(&login, password, &scratch.name);
+    let mut conn = connect_live(&url).await.unwrap();
+    assert_eq!(
+        number(&mut conn, &read).await,
+        111,
+        "the whole list, and it knows"
+    );
+    drop(conn);
+
+    run(
+        &mut admin,
+        &[&*format!("DENY VIEW ANY DATABASE TO [{login}];")],
+    )
+    .await;
+    let mut conn = connect_live(&url).await.unwrap();
+    assert_eq!(
+        number(&mut conn, &read).await,
+        0,
+        "the target is missing, the read succeeds, and only the permission tells"
+    );
+    assert_eq!(
+        number(
+            &mut conn,
+            "SELECT CONVERT(bigint, COUNT(*)) FROM sys.databases \
+             WHERE name NOT IN (N'master', N'tempdb') AND database_id <> DB_ID();"
+        )
+        .await,
+        0
+    );
+    drop(conn);
+    drop_login(&mut admin, &login).await;
+    target.drop().await;
+    scratch.drop().await;
+}
+
 /// SQL Server has no `DROP OWNED`, so cleanup drops what the inventory read
 /// finds beyond the fresh-install inventory, in dependency order. A database
 /// role is one of those objects: `DROP ROLE` refuses while the role has a

@@ -3173,7 +3173,10 @@ inventory as `db_owner` (#619).**
     - The sandbox reads `HAS_DBACCESS` for each. Only scratch, `master`,
       `tempdb` and `msdb` may admit it; this is #1667's "no access to
       another database".
-    - A list that cannot be read refuses.
+    - The list counts only while the supplied session holds
+      `VIEW ANY DATABASE`, read with `HAS_PERMS_BY_NAME`. Under a `DENY` the
+      query still succeeds and silently omits the target, so a list that
+      cannot be shown whole refuses.
   - **The scratch flags.** `TRUSTWORTHY` and ownership chaining must be off,
     as a fresh database has them: a `TRUSTWORTHY` scratch owned by an
     administrator lends an `EXECUTE AS OWNER` module `CONTROL SERVER`.
@@ -3216,6 +3219,7 @@ inventory as `db_owner` (#619).**
 `a_login_reads_its_own_server_reach_without_privilege`,
 `a_login_reads_every_database_it_can_enter`,
 `a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_admits_it`,
+`a_database_list_without_view_any_database_hides_the_target_and_says_so`,
 `a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`,
 `a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`,
 `a_database_born_from_model_holds_only_the_fresh_install_inventory` and

@@ -214,8 +214,12 @@ for a moment keeps that type.
       - The sandbox then reads `HAS_DBACCESS` for each. Only the scratch
         database, `master`, `tempdb` and `msdb` may admit it. This is
         #1667's "no access to another database".
-      - A list the supplied session cannot read refuses: unreadable is not
-        empty.
+      - The list counts only while the supplied session's
+        `HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW ANY DATABASE')` reads 1. Under a
+        `DENY VIEW ANY DATABASE` the query still succeeds but omits every
+        other database, a guest-enabled target included, and `DB_NAME`
+        hides the same ones. A list that cannot be shown whole refuses:
+        hidden is not empty [`a_database_list_without_view_any_database_hides_the_target_and_says_so`].
     - **The scratch database's `TRUSTWORTHY` and ownership chaining.** Both
       must be off, as a fresh database has them. The sandbox cannot turn
       them on. But a `TRUSTWORTHY` scratch owned by an administrator lends
