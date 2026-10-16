@@ -5787,7 +5787,9 @@ other way is named, with both operations, as the verifier named it before
 
 **A cycle of annotations alone.** A strongly connected component made only of
 `depends_on:` edges is planned today, in the order the module sort gives it.
-`settle` keeps that order and does not refuse it. The replay still reports
+`settle` keeps that order and does not refuse it: it sets the annotations
+aside and chains the members in the order given, so an edge that reaches one
+member does not split them. The replay still reports
 the broken annotation, and the policy is #2083's. Any other cycle is refused
 by name, with its members and each edge's reason and source.
 

@@ -244,6 +244,11 @@ impl Schedule {
         self
     }
 
+    /// The orders kept so far, in the order stated.
+    pub fn kept_orders(&self) -> &[Keep] {
+        &self.keeps
+    }
+
     pub fn constraints(&self) -> &BTreeSet<Constraint> {
         &self.constraints
     }
@@ -323,28 +328,36 @@ impl Schedule {
         let mut emitted = kahn(n, &kept, self.tie);
         if emitted.len() < n {
             // A component made only of annotations is planned today, in the
-            // order the module sort gave it; the policy is #2083's.
-            let declared_only: BTreeSet<(usize, usize)> = components(n, &kept)
-                .into_iter()
-                .filter(|members| members.len() > 1)
-                .filter_map(|members| {
-                    let inside: BTreeSet<usize> = members.iter().copied().collect();
-                    let edges: Vec<&&Constraint> = kept
-                        .iter()
-                        .filter(|c| inside.contains(&c.before) && inside.contains(&c.after))
-                        .collect();
-                    edges.iter().all(|c| c.source == Source::Declared).then(|| {
-                        edges
-                            .iter()
-                            .map(|c| (c.before, c.after))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .flatten()
-                .collect();
+            // order the module sort gave it; the policy is #2083's. Its
+            // annotations are set aside and its members chained in the order
+            // given, so what reaches one member does not split them (#1956
+            // review). The chain orders, but is no edge of the proof.
+            let mut chain: Vec<Constraint> = Vec::new();
+            let mut declared_only: BTreeSet<(usize, usize)> = BTreeSet::new();
+            for members in components(n, &kept) {
+                if members.len() < 2 {
+                    continue;
+                }
+                let inside: BTreeSet<usize> = members.iter().copied().collect();
+                let edges: Vec<&Constraint> = kept
+                    .iter()
+                    .copied()
+                    .filter(|c| inside.contains(&c.before) && inside.contains(&c.after))
+                    .collect();
+                if edges.iter().all(|c| c.source == Source::Declared) {
+                    declared_only.extend(edges.iter().map(|c| (c.before, c.after)));
+                    chain.extend(members.windows(2).map(|pair| Constraint {
+                        before: pair[0],
+                        after: pair[1],
+                        source: Source::Declared,
+                        reason: OrderReason::Structural,
+                    }));
+                }
+            }
             if !declared_only.is_empty() {
                 kept.retain(|c| !declared_only.contains(&(c.before, c.after)));
-                emitted = kahn(n, &kept, self.tie);
+                let ordering: Vec<&Constraint> = kept.iter().copied().chain(&chain).collect();
+                emitted = kahn(n, &ordering, self.tie);
             }
         }
         // A kept order the edges reversed, among the steps that were placed:

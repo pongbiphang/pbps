@@ -174,6 +174,21 @@ fn a_cycle_of_annotations_alone_keeps_the_order_given_and_any_other_is_refused()
     assert_eq!(settled.proof.edges().len(), 1);
     settled.proof.validate(&settled.changes).unwrap();
 
+    // #1956 review: what reaches one member does not split them. `c`
+    // waits for nothing and `a` for `c`; `a` and `b` keep their order.
+    let reached = [
+        (0, 1, Source::Declared),
+        (1, 0, Source::Declared),
+        (2, 0, Source::Effect),
+    ];
+    let settled = schedule(3, &reached)
+        .settle(plan(&["a", "b", "c"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["c", "a", "b"]);
+    let mut kept = schedule(3, &reached);
+    kept.keep(0, 1, "`a` stays ahead of `b`".into());
+    assert!(kept.settle(plan(&["a", "b", "c"])).is_ok());
+
     let mixed = [
         (2, 1, Source::Declared),
         (1, 2, Source::Effect),

@@ -1916,9 +1916,23 @@ pub(crate) fn order_after_releases(
         }
     }
     for (h, ws) in waits.iter().enumerate() {
-        if !ws.is_empty() {
-            keep_ahead(&mut schedule, changes, &names, &required, h);
+        if ws.is_empty() {
+            continue;
         }
+        // The furthest change it waits for, through what that waits for:
+        // settled, it lands right after it, and passes exactly the changes
+        // the differ put between (#1956 review). Bounding the kept orders by
+        // it states only the crossings that happen, not one per later change.
+        let mut reach = h;
+        let mut seen = std::collections::BTreeSet::from([h]);
+        let mut stack: Vec<usize> = ws.keys().copied().collect();
+        while let Some(w) = stack.pop() {
+            if seen.insert(w) {
+                reach = reach.max(w);
+                stack.extend(waits[w].keys().copied());
+            }
+        }
+        keep_ahead(&mut schedule, changes, &names, &required, h, reach);
     }
     let settled = match schedule.settle(changes.clone()) {
         Ok(settled) => settled,
@@ -1969,18 +1983,27 @@ fn reused(changes: &ChangeSet, column: &pbps_model::ColumnRef) -> bool {
 }
 
 /// What the change at `held`, which waits for its release, must stay ahead
-/// of: each later change that needs what it holds back. A held change that
+/// of: a later change that needs what it holds back. A held change that
 /// would pass one is refused by name with the two-plan remedy (DEC-1316.1,
 /// DEC-1391.1). These are kept, not edges: moving the later change along
 /// would need the edges its own readers hang on, its name slots (#1957) and
-/// what texts name (#1967), which are not stated yet (DEC-1956.3). Stated
-/// in the order the refusals are checked, so the first one is named.
+/// what texts name (#1967), which are not stated yet (DEC-1956.3).
+///
+/// `reach` is the furthest position among what `held` waits for, directly or
+/// not. Settled, `held` lands after it and passes every change the differ put
+/// before it, none of which is ever held itself: an insert, a name's taker, a
+/// row, key, module or grant waits for nothing here. So only the changes
+/// before `reach` are kept, and of each kind only the first, which is the one
+/// the refusal names: a plan of many retypes and rows states a few kept
+/// orders per held change, not one per pair (#1956 review). Stated in the
+/// order the refusals are checked.
 fn keep_ahead(
     schedule: &mut pbps_diff::order::Schedule,
     changes: &ChangeSet,
     names: &pbps_model::plan_names::PlanNames<'_>,
     required: &std::collections::BTreeSet<(TableName, String)>,
     held: usize,
+    reach: usize,
 ) {
     let change = &changes.changes[held].change;
     let Some((table, live, column, _)) = changed_column(names, change) else {
@@ -1991,6 +2014,7 @@ fn keep_ahead(
             .changes
             .iter()
             .enumerate()
+            .take(reach)
             .skip(held + 1)
             .map(|(i, p)| (i, &p.change))
     };
@@ -1999,27 +2023,27 @@ fn keep_ahead(
     // table the plan inserts is once the declaration drops it. The drop
     // cannot both follow the release and precede the insert (#1397). A
     // nullable or defaulted input lets the row in, and that plan applies.
-    if matches!(change, pbps_model::Change::DropColumn { .. }) && required.contains(&(table, live))
-    {
-        for (i, insert) in later().filter(
+    if matches!(change, pbps_model::Change::DropColumn { .. })
+        && required.contains(&(table, live))
+        && let Some((i, insert)) = later().find(
             |(_, c)| matches!(c, pbps_model::Change::InsertRow { table, .. } if *table == column.table),
-        ) {
-            schedule.keep(
-                held,
-                i,
-                format!(
-                    "{column} is dropped after the expression change that releases it, which \
-                     follows `{}`: the column is NOT NULL with no default, so that row, which \
-                     does not write it, is refused while the column stands. Apply the \
-                     expression change in a plan of its own first, then this one.",
-                    insert.subject()
-                ),
-            );
-        }
+        )
+    {
+        schedule.keep(
+            held,
+            i,
+            format!(
+                "{column} is dropped after the expression change that releases it, which \
+                 follows `{}`: the column is NOT NULL with no default, so that row, which \
+                 does not write it, is refused while the column stands. Apply the \
+                 expression change in a plan of its own first, then this one.",
+                insert.subject()
+            ),
+        );
     }
     // A drop holds its name until it runs: a change taking the name needs it
     // free, and the release needs the column still there.
-    for (i, taker) in later().filter(|(_, c)| {
+    if let Some((i, taker)) = later().find(|(_, c)| {
         matches!(c, pbps_model::Change::AddColumn { table, name, .. }
             if *table == column.table && *name == column.name)
             || matches!(c, pbps_model::Change::RenameColumn { table, to, .. }
@@ -2043,19 +2067,19 @@ fn keep_ahead(
     // type: a row writing a value only it accepts, a function whose body
     // is checked against it. The retype cannot both follow the release and
     // precede them, so the plan is refused by name (DEC-1316.1).
-    if matches!(change, pbps_model::Change::AlterColumnType { .. }) {
-        for (i, past) in later().filter(|(_, c)| after_the_alterations(c)) {
-            schedule.keep(
-                held,
-                i,
-                format!(
-                    "{column} is retyped after the expression change that releases it, which \
-                     follows `{}`: that change may need the new type. Apply the expression \
-                     change in a plan of its own first, then this one.",
-                    past.subject()
-                ),
-            );
-        }
+    if matches!(change, pbps_model::Change::AlterColumnType { .. })
+        && let Some((i, past)) = later().find(|(_, c)| after_the_alterations(c))
+    {
+        schedule.keep(
+            held,
+            i,
+            format!(
+                "{column} is retyped after the expression change that releases it, which \
+                 follows `{}`: that change may need the new type. Apply the expression \
+                 change in a plan of its own first, then this one.",
+                past.subject()
+            ),
+        );
     }
 }
 
@@ -3915,6 +3939,83 @@ mod tests {
         assert_eq!(unreleased(&cs, &reads_a).len(), 1);
         assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(1));
         assert!(unreleased(&cs, &reads_a).is_empty(), "{:?}", cs.changes);
+    }
+
+    /// #1956 review: the kept orders a released retype states are the
+    /// crossings that happen, not one per later change. Released before the
+    /// rows, it passes none and keeps none; released after them, it keeps
+    /// only the first, the one its refusal names.
+    #[test]
+    fn a_released_retype_keeps_only_the_changes_it_would_pass() {
+        use pbps_model::{Change, ColumnRef, PlannedChange};
+        let t: TableName = "app.t".parse().unwrap();
+        let uid = |u: &str| -> pbps_model::Uid { u.parse().unwrap() };
+        let retype = PlannedChange::new(Change::AlterColumnType {
+            uid: uid("c_bbbbbb"),
+            column: ColumnRef::new(t.clone(), "a"),
+            from: "integer".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+        });
+        let release = PlannedChange::new(Change::AlterColumnExpression {
+            uid: uid("c_dddddd"),
+            column: ColumnRef::new(t.clone(), "g"),
+            from: "(a * 2)".into(),
+            to: "b * 2".into(),
+        });
+        let update = |key: usize| {
+            PlannedChange::new(Change::UpdateRow {
+                table: t.clone(),
+                key_column: "id".into(),
+                key: pbps_model::RowKey::from(key.to_string().as_str()),
+                columns: BTreeMap::from([(
+                    "b".to_owned(),
+                    (
+                        pbps_model::Cell::Value(pbps_model::Value::Int(1)),
+                        pbps_model::Cell::Value(pbps_model::Value::Int(2)),
+                    ),
+                )]),
+                unchanged: BTreeMap::new(),
+                types: BTreeMap::new(),
+                after_types: BTreeMap::new(),
+                key_type: None,
+            })
+        };
+        let rows = 200;
+        let kept = |changes: Vec<PlannedChange>, held: usize, reach: usize| {
+            let cs = ChangeSet { changes };
+            let ids = crate::plan_fixture::ids(&cs);
+            let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
+            let mut schedule = pbps_diff::order::Schedule::new(cs.changes.len());
+            keep_ahead(
+                &mut schedule,
+                &cs,
+                &names,
+                &std::collections::BTreeSet::new(),
+                held,
+                reach,
+            );
+            schedule.kept_orders().to_vec()
+        };
+        // Released first: the retype waits for nothing after it.
+        let mut early = vec![release.clone(), retype.clone()];
+        early.extend((0..rows).map(update));
+        assert_eq!(kept(early, 1, 1), []);
+        // Released after every row: one kept order, the first row's.
+        let mut late = vec![retype];
+        late.extend((0..rows).map(update));
+        late.push(release);
+        let late = kept(late, 0, rows + 1);
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert_eq!((late[0].before, late[0].after), (0, 1));
+        assert!(
+            late[0].refusal.contains("may need the new type"),
+            "{late:?}"
+        );
     }
 
     /// The one frame the ready-phase review named: a `DbError::Driver`'s
