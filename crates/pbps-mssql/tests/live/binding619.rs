@@ -315,9 +315,9 @@ async fn the_dependency_catalog_resolves_a_one_part_name_when_it_is_read() {
 /// A schema-bound reference is recorded by id and the engine holds it: the
 /// referenced table's column cannot be altered nor the table dropped, and a
 /// function a DEFAULT, CHECK or computed column calls cannot be dropped or
-/// altered. A plain view holds nothing. A schema-bound module may only call
-/// schema-bound functions, which the externals comparison must therefore
-/// read.
+/// altered. A plain view holds nothing. A schema-bound module may only read
+/// schema-bound views and call schema-bound functions, and may not name a
+/// synonym, so the externals comparison reads every module's schema binding.
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not() {
@@ -329,6 +329,8 @@ async fn schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not()
             "CREATE TABLE dbo.loose (c int);",
             "CREATE VIEW dbo.plain AS SELECT c FROM dbo.loose;",
             "CREATE VIEW dbo.bound WITH SCHEMABINDING AS SELECT c, w FROM dbo.t;",
+            "CREATE VIEW dbo.plain_over_t AS SELECT c FROM dbo.t;",
+            "CREATE SYNONYM dbo.syn_t FOR dbo.t;",
             "CREATE FUNCTION dbo.f (@x int) RETURNS int AS BEGIN RETURN @x END;",
             "CREATE TABLE dbo.u (c int, cc AS dbo.f(c), d int CONSTRAINT df_u DEFAULT dbo.f(1), \
              CONSTRAINT ck_u CHECK (dbo.f(c) > 0));",
@@ -357,6 +359,18 @@ async fn schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not()
             "CREATE VIEW dbo.bound_over_f WITH SCHEMABINDING AS SELECT dbo.f(c) AS fc FROM dbo.t;",
             "4513",
         ),
+        (
+            "CREATE VIEW dbo.bound_over_plain WITH SCHEMABINDING AS SELECT c FROM dbo.plain_over_t;",
+            "4513",
+        ),
+        (
+            "CREATE FUNCTION dbo.bound_fn_over_plain () RETURNS TABLE WITH SCHEMABINDING AS RETURN SELECT c FROM dbo.plain_over_t;",
+            "4513",
+        ),
+        (
+            "CREATE VIEW dbo.bound_over_synonym WITH SCHEMABINDING AS SELECT c FROM dbo.syn_t;",
+            "2788",
+        ),
     ] {
         assert_eq!(
             refusal(&mut db.conn, sql).await.as_deref(),
@@ -364,6 +378,15 @@ async fn schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not()
             "{sql}"
         );
     }
+    assert_eq!(
+        refusal(
+            &mut db.conn,
+            "CREATE VIEW dbo.bound_over_bound WITH SCHEMABINDING AS SELECT c FROM dbo.bound;"
+        )
+        .await,
+        None,
+        "a schema-bound view is what a schema-bound caller may read"
+    );
     assert_eq!(refusal(&mut db.conn, "DROP TABLE dbo.loose;").await, None);
     db.drop().await;
 }

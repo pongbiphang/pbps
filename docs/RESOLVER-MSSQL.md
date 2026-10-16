@@ -258,11 +258,11 @@ read:
 | Class | Compared |
 |---|---|
 | Any object | Its schema, name and object type: every kind occupies the name (§2) |
-| Table, view | Columns: name, order, type (a user type by `schema.name`), length, precision, scale, nullability, collation, computed or not |
-| Function | Parameters and return type as above, kind (scalar, inline, multi-statement), `is_schema_bound`, which a schema-bound caller requires, and a table-valued function's result columns as a table's, which a view over it binds [`a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`] |
+| Table, view | Columns: name, order, type (a user type by `schema.name`), length, precision, scale, nullability, collation, computed or not; a view's `is_schema_bound`, which a schema-bound caller requires (4513) |
+| Function | Parameters and return type as above, kind (scalar, inline, multi-statement), `is_schema_bound`, which a schema-bound caller requires (4513), and a table-valued function's result columns as a table's, which a view over it binds [`a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`] |
 | Procedure | Parameters as above |
 | User type | Base type, length, precision, scale, nullability |
-| Synonym | `base_object_name` |
+| Synonym | `base_object_name`; a schema-bound caller may not name one (2788) |
 | Schema | Name |
 
 Not compared: module bodies and view queries (a view may be staged as a shape

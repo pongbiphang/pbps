@@ -3203,9 +3203,10 @@ The comparison is #1673's (DEC-1673.1) with SQL Server's shapes:
   name;
 - columns: type (a user type by `schema.name`), length, precision, scale,
   nullability, collation, and whether the column is computed;
-- function and procedure parameters and return types, and a function's kind
-  and `is_schema_bound`, since a schema-bound caller refuses a function that
-  is not (4513);
+- function and procedure parameters and return types, a function's kind,
+  and every module's `is_schema_bound`: a schema-bound caller refuses a view
+  or a function that is not (4513), so a schema-bound stub for a plain
+  target view would admit a managed object the target refuses;
 - a table-valued function's result columns, as a table's: a view over the
   function binds them, and breaks (207) when they change;
 - a user type's base and facets;
