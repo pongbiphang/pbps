@@ -329,11 +329,16 @@ impl Schedule {
         if emitted.len() < n {
             // A component made only of annotations is planned today, in the
             // order the module sort gave it; the policy is #2083's. Its
-            // annotations are set aside and its members chained in the order
-            // given, so what reaches one member does not split them (#1956
-            // review). The chain orders, but is no edge of the proof.
+            // annotations are set aside, its members are chained in the order
+            // given, and it is scheduled as one step: an edge into any member
+            // waits for nothing more than its first member does, and an edge
+            // out of any member leaves from its last, so nothing outside lands
+            // between them (#1956 review). The chain and the redirected edges
+            // order, but the proof holds the edges as stated, which they imply.
             let mut chain: Vec<Constraint> = Vec::new();
             let mut declared_only: BTreeSet<(usize, usize)> = BTreeSet::new();
+            // For each member of such a component: its first and last member.
+            let mut ends: Vec<Option<(usize, usize)>> = vec![None; n];
             for members in components(n, &kept) {
                 if members.len() < 2 {
                     continue;
@@ -352,11 +357,23 @@ impl Schedule {
                         source: Source::Declared,
                         reason: OrderReason::Structural,
                     }));
+                    let span = (members[0], members[members.len() - 1]);
+                    for &m in &members {
+                        ends[m] = Some(span);
+                    }
                 }
             }
             if !declared_only.is_empty() {
                 kept.retain(|c| !declared_only.contains(&(c.before, c.after)));
-                let ordering: Vec<&Constraint> = kept.iter().copied().chain(&chain).collect();
+                let redirected: Vec<Constraint> = kept
+                    .iter()
+                    .map(|c| Constraint {
+                        before: ends[c.before].map_or(c.before, |(_, last)| last),
+                        after: ends[c.after].map_or(c.after, |(first, _)| first),
+                        ..(*c).clone()
+                    })
+                    .collect();
+                let ordering: Vec<&Constraint> = redirected.iter().chain(&chain).collect();
                 emitted = kahn(n, &ordering, self.tie);
             }
         }

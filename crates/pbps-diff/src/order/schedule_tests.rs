@@ -189,6 +189,30 @@ fn a_cycle_of_annotations_alone_keeps_the_order_given_and_any_other_is_refused()
     kept.keep(0, 1, "`a` stays ahead of `b`".into());
     assert!(kept.settle(plan(&["a", "b", "c"])).is_ok());
 
+    // #2098 review: the component is one step for every edge that reaches
+    // it. An edge into its later member holds its earlier one too.
+    let into_later = [
+        (0, 1, Source::Declared),
+        (1, 0, Source::Declared),
+        (2, 1, Source::Effect),
+    ];
+    let settled = schedule(3, &into_later)
+        .settle(plan(&["a", "b", "c"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["c", "a", "b"]);
+    settled.proof.validate(&settled.changes).unwrap();
+    // The mirror: an edge out of its earlier member leaves from its later.
+    let out_of_earlier = [
+        (0, 2, Source::Declared),
+        (2, 0, Source::Declared),
+        (0, 1, Source::Effect),
+    ];
+    let settled = schedule(3, &out_of_earlier)
+        .settle(plan(&["a", "b", "c"]))
+        .unwrap();
+    assert_eq!(names(&settled.changes), ["a", "c", "b"]);
+    settled.proof.validate(&settled.changes).unwrap();
+
     let mixed = [
         (2, 1, Source::Declared),
         (1, 2, Source::Effect),
