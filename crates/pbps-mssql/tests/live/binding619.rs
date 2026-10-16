@@ -617,8 +617,13 @@ async fn no_isolation_level_or_hint_holds_the_catalog_against_another_session() 
 }
 
 /// One statement is not one catalog instant either: two scans of
-/// `sys.objects` in one `SELECT`, around a scalar function that spins, see a
+/// `sys.objects` in one `SELECT`, either side of a scalar function, see a
 /// table another session commits in between.
+///
+/// Nothing here waits on a clock. The function returns once the table
+/// exists, so the second scan follows the commit; the writer starts once
+/// the reading statement is inside the function, past the first scan. A writer that still lands before the first
+/// scan (`1|1`) is a round to repeat under a new name, never a verdict.
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn one_statement_does_not_read_the_catalog_at_one_instant() {
@@ -627,27 +632,54 @@ async fn one_statement_does_not_read_the_catalog_at_one_instant() {
         &mut db.conn,
         &[
             "CREATE SCHEMA a;",
-            // `@after` ties the spin to the first scan and the second scan to
-            // the spin, so the plan cannot reorder them.
-            "CREATE FUNCTION dbo.spin (@ms int, @after bigint) RETURNS bigint AS BEGIN \
-                 DECLARE @end datetime2 = DATEADD(millisecond, @ms, SYSDATETIME()), @i bigint = 0; \
+            // `@after` ties the wait to the first scan and the second scan to
+            // the wait, so the plan cannot reorder them. The deadline bounds a
+            // writer that never commits.
+            "CREATE FUNCTION dbo.wait_for (@name nvarchar(300), @after bigint) RETURNS bigint AS BEGIN \
+                 DECLARE @end datetime2 = DATEADD(second, 30, SYSDATETIME()), @i bigint = 0; \
                  IF @after < 0 RETURN -1; \
-                 WHILE SYSDATETIME() < @end SET @i += 1; \
-                 RETURN @i; END;",
+                 WHILE OBJECT_ID(@name) IS NULL AND SYSDATETIME() < @end SET @i += 1; \
+                 RETURN CASE WHEN OBJECT_ID(@name) IS NULL THEN -1 ELSE @i END; END;",
         ],
     )
     .await;
+    let reader = number(&mut db.conn, "SELECT CONVERT(bigint, @@SPID);").await;
     let mut other = session(&db).await;
-    let statement = "SELECT CONVERT(nvarchar(40), CONCAT(f.n, N'|', s.n)) \
-         FROM (SELECT COUNT_BIG(*) AS n FROM sys.objects WHERE schema_id = SCHEMA_ID(N'a')) f \
-         CROSS APPLY (SELECT dbo.spin(3000, f.n) AS spun) p \
-         CROSS APPLY (SELECT COUNT_BIG(*) AS n FROM sys.objects \
-                      WHERE schema_id = SCHEMA_ID(N'a') AND p.spun >= 0) s;";
-    let (counts, ()) = tokio::join!(text(&mut db.conn, statement), async {
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        run(&mut other, &["CREATE TABLE a.during (x int);"]).await;
-    });
-    assert_eq!(counts, "0|1", "the second scan saw the commit");
+    let mut verdict = None;
+    for round in 0..5 {
+        let table = format!("during_{round}");
+        let statement = format!(
+            "SELECT CONVERT(nvarchar(40), CONCAT(f.n, N'|', s.n)) \
+             FROM (SELECT COUNT_BIG(*) AS n FROM sys.objects \
+                   WHERE schema_id = SCHEMA_ID(N'a') AND name = N'{table}') f \
+             CROSS APPLY (SELECT dbo.wait_for(N'a.{table}', f.n) AS waited) p \
+             CROSS APPLY (SELECT COUNT_BIG(*) AS n FROM sys.objects \
+                          WHERE schema_id = SCHEMA_ID(N'a') AND name = N'{table}' AND p.waited >= 0) s;"
+        );
+        let running = format!(
+            "SELECT CONVERT(bigint, COUNT(*)) FROM sys.dm_exec_requests r \
+             CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t \
+             WHERE r.session_id = {reader} AND t.objectid = OBJECT_ID(N'dbo.wait_for');"
+        );
+        let (counts, ()) = tokio::join!(text(&mut db.conn, &statement), async {
+            for _ in 0..500 {
+                if number(&mut other, &running).await > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            run(&mut other, &[&*format!("CREATE TABLE a.{table} (x int);")]).await;
+        });
+        if counts != "1|1" {
+            verdict = Some(counts);
+            break;
+        }
+    }
+    assert_eq!(
+        verdict.as_deref(),
+        Some("0|1"),
+        "the second scan of one statement saw the commit the first did not"
+    );
     drop(other);
     db.drop().await;
 }
