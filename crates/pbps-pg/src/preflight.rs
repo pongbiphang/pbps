@@ -4082,14 +4082,15 @@ fn partition_probes(
         {
             // Four questions, a created partition's one among them: the
             // table's own rows outside the bound, which the engine refuses to
-            // attach over; its triggers and its column grants, which it does
-            // not refuse and the reader does; and the DEFAULT partition's
-            // rows inside it (#1545), which a HASH parent has none of
-            // (#1632).
+            // attach over; its triggers under a name its parent's row
+            // triggers clone onto it, which the engine refuses too (#1632);
+            // its column grants, which it does not refuse and the reader
+            // does; and the DEFAULT partition's rows inside it (#1545), which
+            // a HASH parent has none of (#1632).
             let leaving = leaving(parent);
             for probe in [
                 attach_range_probe(table, parent, bound),
-                attach_trigger_probe(table),
+                attach_trigger_probe(table, parent, &changes[..step]),
                 attach_column_grant_probe(table),
             ] {
                 match probe {
@@ -4829,25 +4830,64 @@ fn attach_range_probe(
     ))
 }
 
-/// The triggers on `table`, managed or not. The engine attaches a table with
-/// triggers, but the reader takes a partition that holds one for a tree it
-/// cannot hold and refuses the whole tree (`partition_tree`'s purity). Left
-/// to the closing read, a staged attach commits first and its checkpoint
-/// fails. An unmanaged trigger is not in the declarations the differ refuses
-/// by, so it is counted here, from the catalog, before the first statement
-/// (#1642 review).
-fn attach_trigger_probe(table: &TableName) -> Result<Probe, DialectError> {
+/// The triggers on `table`, managed or not, named as a row trigger on
+/// `parent` that the plan keeps up to the attach. Measured on 16 and 18, the
+/// engine clones each of the parent's row triggers onto the table as it
+/// attaches it, and refuses the attach (`already exists`) where the table
+/// holds a trigger of that name, whatever it does. A declared one is refused
+/// by name before any plan (DEC-1632.3); an unmanaged one is not in the
+/// declarations, so it is counted here, from the catalog, before the first
+/// statement. A `DropModule` sorts first (class 0), so a trigger the plan
+/// drops from either table is gone before the attach (#1632). Until #1632 any
+/// trigger was counted: the reader held no partition with one (#1642 review).
+fn attach_trigger_probe(
+    table: &TableName,
+    parent: &TableName,
+    before: &[pbps_model::PlannedChange],
+) -> Result<Probe, DialectError> {
+    let dropped = |on_table: &TableName, alias: &str| -> String {
+        let clauses: Vec<String> = before
+            .iter()
+            .filter_map(|p| {
+                if let Change::DropModule {
+                    id: pbps_model::ModuleId::Trigger { on, name },
+                    ..
+                } = &p.change
+                    && on.schema == on_table.schema
+                    && on.name == on_table.name
+                {
+                    Some(format!("{alias}.tgname = {}", value_literal(name)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if clauses.is_empty() {
+            "false".to_owned()
+        } else {
+            clauses.join(" OR ")
+        }
+    };
     Ok(Probe::new(
         format!(
-            "triggers on {table}, which a partition does not hold yet: drop them before it is \
+            "triggers on {table} named as a row trigger of {parent}, which the engine clones \
+             onto it under that name as it attaches it: rename or drop them before it is \
              attached, then plan again"
         ),
         format!(
             "SELECT {}",
             saturated_count(&format!(
                 "(SELECT count(*) FROM pg_catalog.pg_trigger tg \
-                 WHERE tg.tgrelid = pg_catalog.to_regclass({}) AND NOT tg.tgisinternal)",
-                value_literal(&qualified(table)?)
+                 WHERE tg.tgrelid = pg_catalog.to_regclass({}) AND NOT tg.tgisinternal \
+                 AND NOT ({}) \
+                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_trigger ptg \
+                              WHERE ptg.tgrelid = pg_catalog.to_regclass({}) \
+                                AND NOT ptg.tgisinternal AND ptg.tgname = tg.tgname \
+                                AND (ptg.tgtype & 1) <> 0 AND NOT ({})))",
+                value_literal(&qualified(table)?),
+                dropped(table, "tg"),
+                value_literal(&qualified(parent)?),
+                dropped(parent, "ptg"),
             ))
         ),
     ))
@@ -4856,7 +4896,7 @@ fn attach_trigger_probe(table: &TableName) -> Result<Probe, DialectError> {
 /// The columns of `table` with an ACL, granted to anyone. The engine keeps
 /// them as it attaches, and the reader refuses a partition column with one
 /// (`partition_tree`'s purity), so a staged attach would commit and its
-/// checkpoint fail, as with a trigger; a revoke leaves `attacl` NULL again,
+/// checkpoint fail; a revoke leaves `attacl` NULL again,
 /// measured on 16 and 18. A column-level
 /// grant is never declared (SPEC §5, left alone), so no change of the plan
 /// removes one and every one is counted, whoever holds it (#1642 review).
@@ -5312,15 +5352,45 @@ mod tests {
         assert!(sql.contains("to_regclass(E'\"app\".\"ev\"')"), "{sql}");
         assert!(sql.starts_with("SELECT LEAST("), "{sql}");
         assert!(
-            attached[1].description.contains("triggers on app.t"),
+            attached[1]
+                .description
+                .contains("triggers on app.t named as a row trigger of app.ev"),
             "{attached:?}"
         );
+        let sql = &attached[1].sql;
         assert!(
-            attached[1].sql.contains(
+            sql.contains(
                 "tgrelid = pg_catalog.to_regclass(E'\"app\".\"t\"') AND NOT tg.tgisinternal"
-            ),
+            ) && sql.contains("ptg.tgname = tg.tgname AND (ptg.tgtype & 1) <> 0"),
+            "{sql}"
+        );
+        // Nothing dropped before it: no trigger is left out of the count.
+        assert!(sql.contains("AND NOT (false)"), "{sql}");
+        // A trigger the plan drops first, from the table or from its
+        // parent, is gone by the attach, and left out (#1632); one on a third
+        // table is not.
+        let drop = |on: &str, name: &str| {
+            pbps_model::PlannedChange::new(Change::DropModule {
+                id: format!("{on}.{name}").parse().unwrap(),
+                kind: pbps_model::ModuleKind::Trigger,
+            })
+        };
+        let probe = attach_trigger_probe(
+            &"app.t".parse().unwrap(),
+            &"app.ev".parse().unwrap(),
+            &[
+                drop("app.t", "own"),
+                drop("app.ev", "row"),
+                drop("app.other", "else"),
+            ],
+        )
+        .unwrap();
+        assert!(
+            probe.sql.contains("AND NOT (tg.tgname = E'own')")
+                && probe.sql.contains("AND NOT (ptg.tgname = E'row')")
+                && !probe.sql.contains("else"),
             "{}",
-            attached[1].sql
+            probe.sql
         );
         assert!(
             attached[2]

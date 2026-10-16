@@ -7855,23 +7855,33 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
                 .await
                 .expect("the column grant revoked");
             assert_eq!(counted(&mut conn, &probes[2].sql).await, 0, "{table}");
-            // An unmanaged trigger, which the engine attaches over and the
-            // reader refuses the tree for, is counted; an internal one, as a
-            // foreign key's, never is (#1642 review).
+            // An unmanaged trigger named as a row trigger of the parent, which
+            // the engine refuses to attach over (#1632), is counted; one
+            // under another name, a partition's own once attached, is not,
+            // and an internal one, as a foreign key's, never is (#1642
+            // review).
             assert!(probes[1].description.contains("triggers on"), "{probes:?}");
             assert_eq!(counted(&mut conn, &probes[1].sql).await, 0, "{table}");
             conn.execute(&format!(
                 "CREATE FUNCTION {s}.noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+                 CREATE TRIGGER other BEFORE INSERT ON {s}.{table} FOR EACH ROW EXECUTE FUNCTION {s}.noop();
                  CREATE TRIGGER noop BEFORE INSERT ON {s}.{table} FOR EACH ROW EXECUTE FUNCTION {s}.noop();"
             ))
             .await
-            .expect("an unmanaged trigger");
-            assert_eq!(counted(&mut conn, &probes[1].sql).await, 1, "{table}");
+            .expect("unmanaged triggers");
+            assert_eq!(counted(&mut conn, &probes[1].sql).await, 0, "{table}");
             conn.execute(&format!(
-                "DROP TRIGGER noop ON {s}.{table}; DROP FUNCTION {s}.noop();"
+                "CREATE TRIGGER noop BEFORE INSERT ON {s}.m FOR EACH ROW EXECUTE FUNCTION {s}.noop();"
             ))
             .await
-            .expect("the trigger dropped");
+            .expect("the parent's row trigger");
+            assert_eq!(counted(&mut conn, &probes[1].sql).await, 1, "{table}");
+            conn.execute(&format!(
+                "DROP TRIGGER noop ON {s}.{table}; DROP TRIGGER other ON {s}.{table};
+                 DROP TRIGGER noop ON {s}.m; DROP FUNCTION {s}.noop();"
+            ))
+            .await
+            .expect("the triggers dropped");
             let sql: String = pg
                 .emit(&step.changes[0].change, Default::default())
                 .expect("emit")
@@ -18310,8 +18320,82 @@ async fn a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_
     drop_schema(&mut conn, &s).await;
 }
 
-/// A trigger on a relation the table reader leaves out — a partitioned table,
-/// a row-level-secured one — came back in the pull without the relation it is on, and
+/// A partitioned parent's row trigger the plan drops takes its clones out of
+/// the reference-data guard's widening scan too (#1632 review). Measured on
+/// 16 and 18, the clone goes with its parent's drop. Here a `SET NULL`
+/// action updates the partition, and the dropped `BEFORE UPDATE` row trigger
+/// would make the engine include every generated column; counted as standing,
+/// its clone did, and an `UPDATE OF` trigger on such a column, which the
+/// write never fires, was refused as unrecorded. Without the drop it is
+/// reached and refused, as it should be.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_dropped_parent_trigger_takes_its_clones_out_of_the_data_guards_widening() {
+    let s = emit_schema("guard_clone_gone");
+    let mut conn = TestDb::create("guard_clone_gone").await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!(
+            "CREATE FUNCTION {s}.tg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; \
+             END $$"
+        ),
+        format!("CREATE TABLE {s}.kinds (code text PRIMARY KEY)"),
+        format!(
+            "CREATE TABLE {s}.ev (region text NOT NULL, \
+             kind text REFERENCES {s}.kinds (code) ON DELETE SET NULL, \
+             g text GENERATED ALWAYS AS (upper(region)) STORED) PARTITION BY LIST (region)"
+        ),
+        format!("CREATE TABLE {s}.ev_a PARTITION OF {s}.ev FOR VALUES IN ('a')"),
+        format!(
+            "CREATE TRIGGER widen BEFORE UPDATE ON {s}.ev FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
+        ),
+        format!(
+            "CREATE TRIGGER watch AFTER UPDATE OF g ON {s}.ev_a FOR EACH ROW \
+             EXECUTE FUNCTION {s}.tg()"
+        ),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // Recorded as pulled, but for `watch`.
+    let mut baseline = pull(&mut conn).await.schema;
+    let watch: pbps_model::ModuleId = format!("{s}.ev_a.watch").parse().unwrap();
+    assert!(
+        baseline.modules.remove(&watch).is_some(),
+        "`watch` is pulled"
+    );
+    let writes = [pbps_dialect::RowWrite {
+        table: TableName::new(&s, "kinds"),
+        operation: pbps_dialect::RowOperation::Delete,
+    }];
+    let widen: pbps_model::ModuleId = format!("{s}.ev.widen").parse().unwrap();
+    let guarded = |dropped: Option<&pbps_model::ModuleId>| {
+        let mut gone = pbps_pg::data_triggers::Dropped::default();
+        gone.modules.extend(dropped.cloned());
+        gone
+    };
+    for (dropped, refused) in [(None, true), (Some(&widen), false)] {
+        conn.execute("BEGIN").await.unwrap();
+        let outcome =
+            pbps_pg::data_triggers::prepare(&mut conn, &writes, &baseline, &guarded(dropped)).await;
+        conn.execute("ROLLBACK").await.unwrap();
+        match outcome {
+            Err(e) => assert!(
+                refused && format!("{e:?}").contains("`watch`"),
+                "{dropped:?}: {e:?}"
+            ),
+            Ok(_) => assert!(
+                !refused,
+                "{dropped:?}: the unrecorded `watch` was let through"
+            ),
+        }
+    }
+    drop_schema(&mut conn, &s).await;
+}
+
+/// A trigger on a relation the table reader leaves out — a partitioned table
+/// it does not hold, a row-level-secured one — came back in the pull without the relation it is on, and
 /// `check_names` refused the whole schema: a pull nothing could load. Measured,
 /// the engine allows a trigger on both. The trigger is left out with its
 /// relation now, and named beside it rather than silently gone.
@@ -18330,7 +18414,9 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         format!(
             "CREATE TRIGGER audit BEFORE INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
         ),
-        format!("CREATE TABLE {s}.part (id int, d date) PARTITION BY RANGE (d)"),
+        // A tree keyed by an expression, which pbps does not hold; a held
+        // tree's triggers are modules (#1632), pulled with it.
+        format!("CREATE TABLE {s}.part (id int, d date) PARTITION BY RANGE ((id + 1))"),
         format!(
             "CREATE TRIGGER audit BEFORE INSERT ON {s}.part FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
         ),

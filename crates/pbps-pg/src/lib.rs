@@ -1601,6 +1601,12 @@ impl Dialect for Postgres {
         emit::is_constraint_trigger(module)
     }
 
+    /// A row trigger on a partitioned table, measured on 16 and 18; a
+    /// statement trigger is not cloned (#1632).
+    fn clones_to_partitions(&self, trigger: &pbps_model::Module) -> bool {
+        emit::is_row_trigger(trigger)
+    }
+
     /// `ChooseRelationName` retries with the number on the *label*, and cuts
     /// the table name again to fit it. Measured on 18.6, three 60-byte tables
     /// that generate one `_pkey` get `…_pkey`, then a 57-byte cut with
@@ -2178,6 +2184,73 @@ mod tests {
                 "{expected}: {got:?}"
             );
         }
+    }
+
+    /// A partition's own trigger takes no name its parent's row trigger
+    /// gives its clones, and an own check or foreign key none a parent's
+    /// constraint trigger's clone holds, each refused by the engine as
+    /// already existing, measured on 16 and 18 (#1632). A statement
+    /// trigger's name is free.
+    #[test]
+    fn a_partitions_own_names_stay_clear_of_its_parents_cloned_triggers() {
+        let trigger = |definition: &str| pbps_model::Module {
+            kind: pbps_model::ModuleKind::Trigger,
+            description: None,
+            definition: definition.to_owned(),
+        };
+        let found = |parent_trigger: &str, own: &[&str], check: Option<&str>| {
+            let mut schema = pbps_model::Schema::default();
+            schema
+                .tables
+                .insert("app.p".parse().unwrap(), pbps_model::Table::default());
+            let mut partition = pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.p".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            };
+            if let Some(name) = check {
+                partition.checks.insert(
+                    name.to_owned(),
+                    pbps_model::CheckConstraint {
+                        expression: "k > 0".into(),
+                    },
+                );
+            }
+            schema.tables.insert("app.p1".parse().unwrap(), partition);
+            schema.modules.insert(
+                "app.p.audit".parse().unwrap(),
+                trigger(&format!("{parent_trigger} EXECUTE FUNCTION app.f()")),
+            );
+            for name in own {
+                schema.modules.insert(
+                    format!("app.p1.{name}").parse().unwrap(),
+                    trigger("BEFORE UPDATE ON app.p1 FOR EACH ROW EXECUTE FUNCTION app.f()"),
+                );
+            }
+            pbps_dialect::check_partition_triggers(&schema, &super::Postgres::default())
+        };
+        let row = "BEFORE INSERT ON app.p FOR EACH ROW";
+        let got = found(row, &["audit"], None);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains("trigger `audit` on `app.p1`"), "{got:?}");
+        let got = found(
+            "CONSTRAINT AFTER INSERT ON app.p FOR EACH ROW",
+            &[],
+            Some("audit"),
+        );
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].contains("check `audit` on `app.p1`"), "{got:?}");
+        // Negative: another name, a statement trigger's name, and a check
+        // under a plain row trigger's name, which holds no constraint.
+        assert_eq!(found(row, &["mine"], None), Vec::<String>::new());
+        assert_eq!(
+            found("AFTER INSERT ON app.p FOR EACH STATEMENT", &["audit"], None),
+            Vec::<String>::new()
+        );
+        assert_eq!(found(row, &[], Some("audit")), Vec::<String>::new());
     }
 
     /// A partition's own checks, indexes and foreign keys are held to the

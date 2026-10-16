@@ -9628,12 +9628,16 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
         stdout(&o)
     );
     // Refused by the pre-flight, by name, and nothing changed. An unmanaged
-    // trigger and a column grant, which the declarations do not see and the
-    // engine attaches over, are counted from the catalog (#1642 review).
+    // trigger named as a row trigger of the parent, which the engine refuses
+    // to attach over (#1632), and a column grant, which it attaches over, are
+    // counted from the catalog (#1642 review); a trigger under another name
+    // is the partition's own once attached, and not counted.
     on_server(
         &connection,
         "CREATE FUNCTION app.noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+         CREATE TRIGGER noop BEFORE INSERT ON app.ev FOR EACH ROW EXECUTE FUNCTION app.noop();
          CREATE TRIGGER noop BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.noop();
+         CREATE TRIGGER other BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.noop();
          GRANT SELECT (n) ON app.t TO PUBLIC",
     );
     let o = approved_apply(
@@ -9647,7 +9651,7 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
     assert!(
         said.contains("1 rows of app.t outside the range it takes under app.ev")
             && said.contains("1 rows of app.ev inside the range of its new partition app.t")
-            && said.contains("1 triggers on app.t, which a partition does not hold yet")
+            && said.contains("1 triggers on app.t named as a row trigger of app.ev")
             && said.contains("1 columns of app.t with grants of their own")
             && said.contains("nothing has been changed"),
         "{said}"
@@ -9666,7 +9670,8 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
     on_server(
         &connection,
         "DELETE FROM app.t WHERE id = 2; DELETE FROM app.ev WHERE id = 9;
-         DROP TRIGGER noop ON app.t; DROP FUNCTION app.noop();
+         DROP TRIGGER noop ON app.t; DROP TRIGGER other ON app.t;
+         DROP TRIGGER noop ON app.ev; DROP FUNCTION app.noop();
          REVOKE SELECT (n) ON app.t FROM PUBLIC",
     );
     succeeds(approved_apply(
@@ -26642,6 +26647,406 @@ fn resolver_externals_drafts_what_a_managed_view_reads_and_never_replaces_the_ex
         stderr(&refused)
     );
     assert_eq!(std::fs::read_to_string(&named).unwrap(), "-- reviewed\n");
+}
+
+/// A partition tree's triggers go the whole way through the CLI (#1632):
+/// pulled as modules on the parent and on a partition, never the clones of
+/// the parent's row and constraint triggers, which a bootstrap makes again
+/// from the parent's, and which go and come with them when the routine they
+/// run is rebuilt.
+/// A clone in another mode than its parent's leaves the tree out, named. A
+/// partition's own trigger is added and dropped as a table's, and kept
+/// through a detach and an attach, where a trigger under a clone's name is
+/// created after the detach and dropped before the attach; one named as
+/// the parent's row trigger, which the engine refuses as already existing,
+/// is refused by name by `validate` and by a connected plan. A
+/// reference-data delete that cascades into the tree fires the clone, which
+/// is authenticated as the parent's trigger.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partition_trees_triggers_go_through_the_cli() {
+    let server = server();
+    let source = OwnDatabase::new(&server, "part-tg-1632");
+    let target = OwnDatabase::new(&server, "part-tg-1632-target");
+    let (src, tgt) = (
+        source.connection().to_owned(),
+        target.connection().to_owned(),
+    );
+    on_server(
+        &src,
+        "CREATE SCHEMA app; \
+         CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql \
+             AS $$BEGIN RETURN COALESCE(NEW, OLD); END$$; \
+         CREATE TABLE app.kinds (code text NOT NULL PRIMARY KEY, label text); \
+         CREATE TABLE app.ev (kind text NOT NULL PRIMARY KEY \
+             REFERENCES app.kinds (code) ON DELETE CASCADE, label text) \
+             PARTITION BY LIST (kind); \
+         CREATE TABLE app.ev_a PARTITION OF app.ev FOR VALUES IN ('a'); \
+         CREATE TABLE app.ev_b PARTITION OF app.ev FOR VALUES IN ('b'); \
+         CREATE TRIGGER ev_row BEFORE INSERT OR UPDATE OR DELETE ON app.ev \
+             FOR EACH ROW EXECUTE FUNCTION app.f(); \
+         CREATE TRIGGER ev_stmt AFTER INSERT ON app.ev \
+             FOR EACH STATEMENT EXECUTE FUNCTION app.f(); \
+         CREATE CONSTRAINT TRIGGER ev_ct AFTER INSERT ON app.ev \
+             FOR EACH ROW EXECUTE FUNCTION app.f(); \
+         CREATE TRIGGER ev_a_own BEFORE UPDATE ON app.ev_a \
+             FOR EACH ROW EXECUTE FUNCTION app.f()",
+    );
+    // A clone disabled on one partition is a fact no declaration holds: the
+    // tree is left out, named.
+    on_server(&src, "ALTER TABLE app.ev_b DISABLE TRIGGER ev_row");
+    let left = Demo::new("part-tg-1632-left");
+    let o = succeeds(left.run(&["pull", "--db", &src]));
+    assert!(!left.dir.join("schema/app.ev.yml").exists());
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        said.contains("`app.ev_b` is a partition")
+            && said.contains("a clone of its parent's trigger in another mode"),
+        "{said}"
+    );
+    on_server(&src, "ALTER TABLE app.ev_b ENABLE TRIGGER ev_row");
+
+    let d = Demo::new("part-tg-1632");
+    succeeds(d.run(&["pull", "--db", &src]));
+    let triggers = || {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(d.dir.join("schema")).unwrap() {
+            let path = entry.unwrap().path();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let line = |key: &str| {
+                text.lines()
+                    .find_map(|l| l.strip_prefix(key))
+                    .map(str::to_owned)
+            };
+            if let (Some(name), Some(on)) = (line("trigger: "), line("on: ")) {
+                found.push((name, on, path));
+            }
+        }
+        found.sort();
+        found
+    };
+    let names: Vec<(String, String)> = triggers().into_iter().map(|(n, on, _)| (n, on)).collect();
+    assert_eq!(
+        names,
+        [
+            ("app.ev_a_own".to_owned(), "app.ev_a".to_owned()),
+            ("app.ev_ct".to_owned(), "app.ev".to_owned()),
+            ("app.ev_row".to_owned(), "app.ev".to_owned()),
+            ("app.ev_stmt".to_owned(), "app.ev".to_owned()),
+        ],
+        "the clones of `ev_row` and `ev_ct` are the engine's, not the partitions'"
+    );
+    succeeds(d.run(&["fmt", "--check"]));
+    d.commit();
+
+    on_server(&tgt, "CREATE SCHEMA app");
+    succeeds(d.run(&["bootstrap", "--db", &tgt]));
+    succeeds(d.run(&["verify", "--db", &tgt]));
+    let next = succeeds(d.run(&["plan", "--db", &tgt]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    let triggers_on = |table: &str, clone: bool| {
+        scalar(
+            &tgt,
+            &format!(
+                "SELECT count(*) FROM pg_trigger WHERE tgrelid = '{table}'::regclass \
+                   AND NOT tgisinternal AND (tgparentid <> 0) = {clone}"
+            ),
+        )
+    };
+    assert_eq!(
+        (
+            triggers_on("app.ev_a", true),
+            triggers_on("app.ev_a", false)
+        ),
+        (2, 1)
+    );
+    assert_eq!(
+        (
+            triggers_on("app.ev_b", true),
+            triggers_on("app.ev_b", false)
+        ),
+        (2, 0)
+    );
+
+    let applied = |name: &str, allow: &[&str]| {
+        let plan = d.dir.join(name);
+        succeeds(d.run(&["plan", "--db", &tgt, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, &tgt, &plan, allow));
+        succeeds(d.run(&["verify", "--db", &tgt]));
+        let next = succeeds(d.run(&["plan", "--db", &tgt]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    };
+    // A partition to drop with the rebuild below.
+    let ev_path = d.dir.join("schema/app.ev.yml");
+    let entry_of = |text: &str, name: &str| {
+        let mut entry = Vec::new();
+        for line in text
+            .lines()
+            .skip_while(|l| !l.starts_with(&format!("  {name}")))
+        {
+            if !entry.is_empty() && !line.starts_with("    ") {
+                break;
+            }
+            entry.push(line.to_owned());
+        }
+        format!("{}\n", entry.join("\n"))
+    };
+    let before_z = std::fs::read_to_string(&ev_path).unwrap();
+    let a_entry = entry_of(&before_z, "ev_a");
+    let z_entry = a_entry
+        .replace("ev_a", "ev_z")
+        .replace("[a]", "[z]")
+        .replace("\"a\"", "\"z\"");
+    assert_ne!(z_entry, a_entry, "{a_entry}");
+    std::fs::write(
+        &ev_path,
+        before_z.replace(&a_entry, &format!("{a_entry}{z_entry}")),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    applied("z.json", &[]);
+
+    // The routine the triggers run is rebuilt: the parent's triggers are its
+    // dependents, dropped and created again around it, and their clones go
+    // and come with them. The same plan drops `ev_z`.
+    std::fs::write(&ev_path, &before_z).unwrap();
+    succeeds(d.run(&["drop-table", "app.ev_z", "--reason", "retired"]));
+    let routine = std::fs::read_dir(d.dir.join("schema"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .contains("function: app.f")
+        })
+        .unwrap();
+    let body = std::fs::read_to_string(&routine).unwrap();
+    assert!(body.contains("COALESCE(NEW, OLD)"), "{body}");
+    std::fs::write(
+        &routine,
+        body.replace("COALESCE(NEW, OLD)", "COALESCE(OLD, NEW)"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    // A comment on one clone is the clone's own, which the parent's rebuild
+    // would lose: the connected plan refuses it by name (#1632 review).
+    on_server(
+        &tgt,
+        "COMMENT ON TRIGGER ev_row ON app.ev_a IS 'kept by hand'",
+    );
+    let o = d.run(&["plan", "--db", &tgt]);
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        code(&o) != 0
+            && said.contains("on its clone on `app.ev_a`")
+            && said.contains("kept by hand"),
+        "{said}"
+    );
+    on_server(&tgt, "COMMENT ON TRIGGER ev_row ON app.ev_a IS NULL");
+    // So is one on the constraint a constraint trigger's clone has.
+    on_server(
+        &tgt,
+        "COMMENT ON CONSTRAINT ev_ct ON app.ev_a IS 'kept by hand too'",
+    );
+    let o = d.run(&["plan", "--db", &tgt]);
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        code(&o) != 0
+            && said.contains("on its clone on `app.ev_a`")
+            && said.contains("kept by hand too"),
+        "{said}"
+    );
+    on_server(&tgt, "COMMENT ON CONSTRAINT ev_ct ON app.ev_a IS NULL");
+    // One on a clone of the partition the plan drops goes with the partition,
+    // before the rebuild, and refuses nothing.
+    on_server(
+        &tgt,
+        "COMMENT ON TRIGGER ev_row ON app.ev_z IS 'goes with it'",
+    );
+    applied("routine.json", &["--allow", "destructive"]);
+    assert_eq!(
+        scalar(
+            &tgt,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.ev_z')"
+        ),
+        0
+    );
+    assert_eq!(
+        (triggers_on("app.ev_a", true), triggers_on("app.ev_b", true)),
+        (2, 2)
+    );
+
+    // A partition's own trigger moves from one partition to the other.
+    let own = triggers()
+        .into_iter()
+        .find(|(n, _, _)| n == "app.ev_a_own")
+        .unwrap()
+        .2;
+    let text = std::fs::read_to_string(&own).unwrap();
+    std::fs::remove_file(&own).unwrap();
+    std::fs::write(
+        d.dir.join("schema/app.ev_b_own.trigger.yml"),
+        text.replace("ev_a_own", "ev_b_own")
+            .replace("app.ev_a", "app.ev_b"),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    applied("own.json", &["--allow", "destructive"]);
+    assert_eq!(
+        (
+            triggers_on("app.ev_a", false),
+            triggers_on("app.ev_b", false)
+        ),
+        (0, 1)
+    );
+
+    // Refused by name before a plan exists: an own trigger under the name
+    // the parent's row trigger gives its clones.
+    let clash = d.dir.join("schema/app.ev_a_clash.trigger.yml");
+    std::fs::write(&clash, text.replace("ev_a_own", "ev_row")).unwrap();
+    let needle = "trigger `ev_row` on `app.ev_a` is named as its parent's row trigger";
+    for args in [&["validate"][..], &["plan", "--db", &tgt][..]] {
+        let o = d.run(args);
+        assert_ne!(code(&o), 0, "{}", stdout(&o));
+        let said = format!("{}{}", stdout(&o), stderr(&o));
+        assert!(said.contains(needle), "{args:?}: {said}");
+    }
+    std::fs::remove_file(&clash).unwrap();
+
+    // Detached with its shape, the table keeps its own trigger and loses the
+    // clones; a trigger declared on it under the name of a clone it had is
+    // created after the detach, which frees the name (DEC-1632.3).
+    let tree_path = d.dir.join("schema/app.ev.yml");
+    let whole = std::fs::read_to_string(&tree_path).unwrap();
+    let mut without_b = String::new();
+    let mut skipping = false;
+    for line in whole.lines() {
+        if line.starts_with("  ev_b") {
+            skipping = true;
+            continue;
+        }
+        if skipping && line.starts_with("    ") {
+            continue;
+        }
+        skipping = false;
+        without_b.push_str(line);
+        without_b.push('\n');
+    }
+    assert_ne!(without_b, whole, "{whole}");
+    let shape = whole
+        .split("\npartition_by:")
+        .next()
+        .unwrap()
+        .replace("table: app.ev\n", "table: app.ev_b\n")
+        // Its key is the parent's clone, under the engine's name for it.
+        .replace("ev_pkey", "ev_b_pkey");
+    let row = triggers()
+        .into_iter()
+        .find(|(n, _, _)| n == "app.ev_row")
+        .unwrap()
+        .2;
+    let row_text = std::fs::read_to_string(&row).unwrap();
+    let row_on_b = d.dir.join("schema/app.ev_b.ev_row.trigger.yml");
+    std::fs::write(&tree_path, &without_b).unwrap();
+    std::fs::write(d.dir.join("schema/app.ev_b.yml"), format!("{shape}\n")).unwrap();
+    std::fs::write(
+        &row_on_b,
+        row_text
+            .replace("on: app.ev\n", "on: app.ev_b\n")
+            .replace("ON app.ev ", "ON app.ev_b "),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    applied("detach.json", &["--allow", "destructive"]);
+    assert_eq!(
+        scalar(
+            &tgt,
+            "SELECT relispartition::int::int8 FROM pg_class WHERE oid = 'app.ev_b'::regclass"
+        ),
+        0
+    );
+    assert_eq!(
+        (
+            triggers_on("app.ev_b", true),
+            triggers_on("app.ev_b", false)
+        ),
+        (0, 2)
+    );
+
+    // Attached again: the trigger under a parent's row trigger's name is
+    // dropped before the attach, which the engine would refuse over it, the
+    // table's own stays its own, and the parent's clones come back.
+    std::fs::remove_file(&row_on_b).unwrap();
+    std::fs::remove_file(d.dir.join("schema/app.ev_b.yml")).unwrap();
+    std::fs::write(&tree_path, &whole).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    applied("attach.json", &["--allow", "destructive,constraint"]);
+    assert_eq!(
+        (
+            triggers_on("app.ev_b", true),
+            triggers_on("app.ev_b", false)
+        ),
+        (2, 1)
+    );
+
+    // A reference-data delete whose foreign-key action cascades into the tree
+    // reaches the clone of `ev_row` on each partition, which the guard
+    // authenticates, rows or none, as the parent's trigger.
+    let kinds = d.dir.join("schema/app.kinds.yml");
+    let declared = std::fs::read_to_string(&kinds).unwrap();
+    let rows = |rows: &str| {
+        std::fs::write(
+            &kinds,
+            format!("{declared}\ndata:\n  mode: exact\n  rows:\n{rows}"),
+        )
+        .unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+    };
+    rows("    a: {label: A}\n    b: {label: B}\n");
+    applied("rows.json", &[]);
+    rows("    a: {label: A}\n");
+    applied("cascade.json", &["--allow", "data-delete"]);
+    assert_eq!(scalar(&tgt, "SELECT count(*) FROM app.kinds"), 1);
+
+    // A partition the same plan adds before the delete gets its clones under
+    // oids that did not exist when the guard authenticated the write; they
+    // are accepted as the parent's trigger, which it did (#1632 review).
+    rows("    a: {label: A}\n    c: {label: C}\n");
+    applied("c.json", &[]);
+    let tree_now = std::fs::read_to_string(&tree_path).unwrap();
+    let mut entry = Vec::new();
+    for line in tree_now.lines().skip_while(|l| !l.starts_with("  ev_a")) {
+        if !entry.is_empty() && !line.starts_with("    ") {
+            break;
+        }
+        entry.push(line);
+    }
+    let entry = format!("{}\n", entry.join("\n"));
+    let added = entry
+        .replace("ev_a", "ev_c")
+        .replace("[a]", "[c]")
+        .replace("\"a\"", "\"c\"");
+    assert_ne!(added, entry, "{entry}");
+    std::fs::write(
+        &tree_path,
+        tree_now.replace(&entry, &format!("{entry}{added}")),
+    )
+    .unwrap();
+    rows("    a: {label: A}\n");
+    applied("partition_and_cascade.json", &["--allow", "data-delete"]);
+    assert_eq!(
+        (
+            triggers_on("app.ev_c", true),
+            scalar(&tgt, "SELECT count(*) FROM app.kinds")
+        ),
+        (2, 1)
+    );
 }
 
 /// A partition's own foreign keys round-trip through the CLI (#1632): created

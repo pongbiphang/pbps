@@ -2392,6 +2392,10 @@ undeclared-partition refusal; and the unit tests
 *Amended by [DEC-1545.1](#dec-1545-1): the reader skips a column the
 partition dropped before it was attached.*
 
+*Amended by [DEC-1632.3](#dec-1632-3): a trigger on the parent or of a
+partition's own no longer leaves the tree out; it is a module, and the
+parent's clones are never declared.*
+
 <a id="dec-1171-1"></a>
 
 **DEC-1171.1. A standing partition tree gains a partition or loses one with
@@ -3709,6 +3713,12 @@ engine's own refusal, and by these unit tests:
 - `a_table_is_attached_in_one_unscoped_statement`;
 - `a_partition_change_under_a_standing_parent_is_probed`;
 - `an_unlogged_partition_under_a_permanent_key_is_refused_by_name`.
+
+*Amended by [DEC-1632.3](#dec-1632-3): a trigger on the table no longer
+refuses the attach. It stays the partition's own, or the plan drops it before
+the attach, and the pre-flight counts only one named as a row trigger of the
+parent that the plan does not drop first, which the engine refuses to attach
+over.*
 
 <a id="dec-1680-1"></a>
 
@@ -5803,3 +5813,95 @@ Pinned by `a_kept_order_the_edges_would_reverse_is_refused_not_repaired`,
 `settling_is_idempotent_and_deterministic`,
 `every_settled_order_passes_the_replay_and_settles_to_itself` and
 `a_released_input_is_retyped_or_dropped_after_its_release`.
+
+<a id="dec-1632-3"></a>
+
+**DEC-1632.3. A partition tree's triggers are modules on the parent and on
+each partition; a clone of a parent's row trigger is never declared (#1632
+Part 2b).**
+
+Leon chose the shape on #1632 (issuecomment-6202190069): triggers as modules
+on the parent and on partitions, the engine's clones never declared.
+
+Measured on 16 and 18, with the same results on each:
+
+- A parent's row trigger, a constraint trigger among them, is cloned onto
+  every partition under its own name, with a `tgparentid`; a statement
+  trigger is not cloned. A constraint trigger's clone also has a
+  `pg_constraint` row under that name, with no `conparentid`.
+- A clone cannot be dropped or renamed (`trigger ... on table p requires
+  it`). Renaming or dropping the parent's renames or drops every clone, a
+  partition created later gets one, and a detach takes it away.
+- A clone's enabled mode is its own: `ALTER TABLE p1 DISABLE TRIGGER` changes
+  it alone.
+- A partition's own trigger, or a table being attached that holds one, named
+  as a parent's row trigger fails as `already exists`, whatever it does; the
+  table's trigger is never taken for the clone, unlike a foreign key
+  (DEC-1632.2). One named as a statement trigger is free. A check or foreign
+  key named as a parent's constraint trigger fails the same way.
+- A clone has its own dependency edges to the routine it runs and to its
+  partition's columns, beside its parent's edges to the parent's; a refusal
+  names the parent.
+
+**What is read.** The tree predicate admits a parent's triggers, a
+partition's own, and a clone in its parent trigger's enabled mode; a clone in
+another mode leaves the tree out, named, since no declaration holds it. It
+admits a constraint trigger's `pg_constraint` row, which its trigger answers
+for. A trigger on a table of a held tree is read as a module, as on any
+table, and every trigger arm of the module readers leaves clones out.
+
+**What is validated.** `check_partition_triggers` refuses a partition's own
+trigger named as a row trigger on its parent, and an own check or foreign key
+named as a parent's constraint trigger. `Dialect::clones_to_partitions` says
+which triggers clone: on PostgreSQL a `FOR [EACH] ROW` at the top level of
+the definition, read with strings and comments blanked.
+
+**What is planned.** No new change kind. A trigger is created, rebuilt and
+dropped by its module changes, and every name a clone takes or frees changes
+hands by a drop before a create: `DropModule` is class 0, before a detach
+(6), an attach (7) and `CreateModule` (14). A table's trigger the declaration
+drops is gone before its attach, and one declared again under a parent's
+trigger's name on a detached table is created after the detach. The name
+slots of DEC-1964.2 do not see clones, so they neither refuse nor order by
+them; validation keeps a declared state from holding a collision, and the
+class order covers the hand-offs. A trigger on a table being attached no
+longer refuses the attach in the differ, and the attach pre-flight counts
+only the table's triggers named as one of the parent's row triggers that the
+plan does not drop first, from the table or from the parent: until now both
+refused any trigger, since the reader could not hold a partition with one.
+
+**What runs beside the plan.** The dependents walk of a rebuilt routine
+leaves a clone out: its parent is the dependent, and the parent's drop and
+create take it. What a clone holds of its own, its enabled mode, a comment,
+a security label or an extension tie, and for a constraint trigger what is
+attached to its constraint, a rebuild of the parent would lose, so the
+parent's check before a rebuild reads each clone's too and refuses it by
+name. A clone on a partition the plan drops or detaches (class 6) is gone
+before the rebuild (class 14), and is not asked. The reference-data trigger guard authenticates a clone a
+write reaches as its parent's trigger, by the parent's table, name and
+definition, and approves that parent trigger with it. Before each row
+statement it then accepts a clone whose parent trigger it approved, with the
+same routine, so a partition the plan adds or attaches before the write
+brings clones it accepts. A parent trigger the plan drops removes its clones
+from the guard's reach and from its widening scan alike.
+
+**The schema set stays.** A trigger module's file is unchanged; only which
+tables it may be on has widened.
+
+Pinned on 16 and 18 by the CLI's live
+`a_partition_trees_triggers_go_through_the_cli`. It covers the pull, the
+disabled clone, the bootstrap, a routine rebuild, moving an own trigger, the
+refusal, a detach and an attach with triggers on the table, and a
+reference-data delete that cascades into the tree. It fails with any one of
+the predicate, the clone mode, the clone filter, the held tree, the
+validation, the constraint-trigger row, the dependents walk, the data guard,
+the differ's attach rule or the attach pre-flight reverted. The live
+`a_table_is_attached_as_a_partition_through_the_cli` pins the pre-flight's
+count of a trigger under a parent's row trigger's name, and not of another,
+and the live `a_dropped_parent_trigger_takes_its_clones_out_of_the_data_guards_widening`
+the widening scan's.
+Also pinned by the units
+`a_trigger_is_row_level_only_by_its_own_for_each_row`,
+`a_partitions_own_names_stay_clear_of_its_parents_cloned_triggers`,
+`a_partition_change_under_a_standing_parent_is_probed` and
+`an_ordinary_table_declared_as_a_partition_is_attached`.

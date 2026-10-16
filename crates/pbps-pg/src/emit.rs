@@ -1885,6 +1885,63 @@ pub(crate) fn is_constraint_trigger(module: &Module) -> bool {
         && constraint_marker(ascii_trim(&module.definition)).is_some()
 }
 
+/// Whether a trigger declaration fires for each row: a `FOR [EACH] ROW` at
+/// the top level of its definition, where statement level is the grammar's
+/// default (#1632). Strings and comments are blanked first, and a quoted
+/// identifier or a parenthesized list (a `WHEN` condition, the routine's
+/// arguments) is stepped over whole, so a word inside none of them is the
+/// clause's. `FOR` is reserved: unquoted, it names nothing.
+pub(crate) fn is_row_trigger(module: &Module) -> bool {
+    if module.kind != ModuleKind::Trigger {
+        return false;
+    }
+    let code = crate::LEXICON.header(&module.definition);
+    let mut words: Vec<&str> = Vec::new();
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while let Some(c) = code[at..].chars().next() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '"' => {
+                // To the closing quote; a doubled one is a quote inside.
+                let mut end = at + 1;
+                while let Some(close) = code[end..].find('"') {
+                    end += close + 1;
+                    if !code[end..].starts_with('"') {
+                        break;
+                    }
+                    end += 1;
+                }
+                at = end.max(at + 1);
+                continue;
+            }
+            _ if pbps_dialect::continues_ident(c) => {
+                let end = at
+                    + code[at..]
+                        .find(|c: char| !pbps_dialect::continues_ident(c) || c == '"')
+                        .unwrap_or(code.len() - at);
+                if depth == 0 {
+                    words.push(&code[at..end]);
+                }
+                at = end;
+                continue;
+            }
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    let Some(at) = words.iter().position(|w| w.eq_ignore_ascii_case("for")) else {
+        return false;
+    };
+    let rest = &words[at + 1..];
+    let level = match rest.first() {
+        Some(w) if w.eq_ignore_ascii_case("each") => rest.get(1),
+        other => other,
+    };
+    level.is_some_and(|w| w.eq_ignore_ascii_case("row"))
+}
+
 fn create_module(pg: &Postgres, id: &ModuleId, module: &Module) -> Result<Statement, DialectError> {
     // ASCII, not Unicode: a non-breaking space is an identifier byte to this
     // engine (DECISIONS 313), and **measured**, `CREATE VIEW v AS SELECT 1 AS
@@ -7371,6 +7428,44 @@ mod tests {
             assert!(sql.contains("CREATE TRIGGER \"audit\""), "{sql}");
             assert!(!sql.contains("CREATE CONSTRAINT TRIGGER"), "{sql}");
         }
+    }
+
+    /// A row trigger is what a partitioned table clones onto its partitions
+    /// (#1632); the clause is read only at the top level of the code.
+    #[test]
+    fn a_trigger_is_row_level_only_by_its_own_for_each_row() {
+        for body in [
+            "BEFORE INSERT ON app.p FOR EACH ROW EXECUTE FUNCTION app.f()",
+            "BEFORE INSERT ON app.p FOR ROW EXECUTE FUNCTION app.f()",
+            "before insert on app.p for each row execute function app.f()",
+            "CONSTRAINT AFTER INSERT ON app.p FOR EACH ROW EXECUTE FUNCTION app.f()",
+            "AFTER UPDATE OF \"for\" ON app.p FOR EACH ROW WHEN (new.\"for\" > 0) \
+             EXECUTE FUNCTION app.f()",
+            "AFTER INSERT ON app.p /* c */ FOR /* c */ EACH -- c\n ROW EXECUTE FUNCTION app.f()",
+        ] {
+            assert!(is_row_trigger(&module(ModuleKind::Trigger, body)), "{body}");
+        }
+        // Negative: statement level, written or by default, and every `FOR
+        // EACH ROW` inside a comment, a literal, a quoted name or a `WHEN`.
+        for body in [
+            "AFTER INSERT ON app.p FOR EACH STATEMENT EXECUTE FUNCTION app.f()",
+            "AFTER INSERT ON app.p EXECUTE FUNCTION app.f()",
+            "AFTER INSERT ON app.p /* FOR EACH ROW */ EXECUTE FUNCTION app.f()",
+            "AFTER INSERT ON app.p EXECUTE FUNCTION app.f('FOR EACH ROW')",
+            "AFTER INSERT ON app.\"FOR EACH ROW\" EXECUTE FUNCTION app.f()",
+            "AFTER INSERT ON app.p FOR EACH STATEMENT WHEN (true AND 'for each row' <> '') \
+             EXECUTE FUNCTION app.f()",
+        ] {
+            assert!(
+                !is_row_trigger(&module(ModuleKind::Trigger, body)),
+                "{body}"
+            );
+        }
+        // Negative: only a trigger is one.
+        assert!(!is_row_trigger(&module(
+            ModuleKind::View,
+            "SELECT 1 FOR EACH ROW"
+        )));
     }
 
     #[test]
