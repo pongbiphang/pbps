@@ -785,7 +785,8 @@ impl NameFacts {
     /// The occupants as name slots, for the slot replay (#1964, DEC-1964.2).
     /// The tables and views at the carried names are not occupants: the plan
     /// manages them or refuses them already (`refuse_uninventoried_occupants`).
-    #[cfg(any(test, debug_assertions))]
+    // Debug assertions alone, like its one caller (#2089).
+    #[cfg(debug_assertions)]
     pub fn slots(&self) -> pbps_dialect::slots::CatalogFacts {
         use pbps_dialect::slots::{CatalogFacts, Namespace, Occupant, SlotKey};
         CatalogFacts {
