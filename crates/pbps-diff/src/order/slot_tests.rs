@@ -822,3 +822,59 @@ fn a_move_waits_for_what_frees_the_name_it_passes_through() {
     let (wrong, _, _) = plan.run(&[1, 0], &exact, None);
     assert_eq!(held(&wrong), ["intermediate s2.x"], "{wrong:?}");
 }
+
+/// Review of #2119: a step that moves an occupant's table takes it away for
+/// certain, and a later rename of the column it belongs to does not make that
+/// uncertain: a PostgreSQL column rename keeps its sequence's name. The move
+/// into the freed name still waits for the move away.
+#[test]
+fn a_certain_step_decides_beside_a_column_change_that_only_may() {
+    let column_uid = Uid::derived(UidKind::Column, "s2.b.id", 0);
+    let mut plan = Plan::new(
+        &[("a", "s1.a"), ("b", "s2.b")],
+        &[("a", "s2.a"), ("b", "s3.b")],
+        vec![
+            rename_table("a", "s1.a", "s2.a"),
+            rename_table("b", "s2.b", "s3.b"),
+            Change::RenameColumn {
+                uid: column_uid.clone(),
+                table: name("s3.b"),
+                from: "id".into(),
+                to: "id2".into(),
+                table_was: Some(name("s2.b")),
+            },
+        ],
+    );
+    let int = || pbps_model::Column::new("int".parse().unwrap());
+    plan.before
+        .tables
+        .get_mut(&name("s2.b"))
+        .unwrap()
+        .columns
+        .insert("id".into(), int());
+    plan.before_ids
+        .columns
+        .insert(column_uid.clone(), name("s2.b").column("id"));
+    plan.after
+        .tables
+        .get_mut(&name("s3.b"))
+        .unwrap()
+        .columns
+        .insert("id2".into(), int());
+    plan.after_ids
+        .columns
+        .insert(column_uid, name("s3.b").column("id2"));
+    let facts = CatalogFacts {
+        occupants: vec![
+            occupant("s1.a_id_seq", "s1.a", None),
+            occupant("s2.a_id_seq", "s2.b", Some("id")),
+        ],
+        ..CatalogFacts::default()
+    };
+    let found: Vec<(usize, usize)> = plan
+        .handovers(&Slotted { exact: true }, &facts)
+        .into_iter()
+        .map(|e| (e.before, e.after))
+        .collect();
+    assert_eq!(found, [(1, 0)]);
+}

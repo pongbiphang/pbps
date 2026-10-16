@@ -174,10 +174,12 @@ pub struct Carried {
 
 /// The catalog's occupants as holders, for [`edges`]: each one the plan
 /// takes away at exactly one step. An occupant no step takes away holds its
-/// name whatever the order, which the replay reports. One that several
-/// steps may take away, a column's default given another default and then
-/// renamed, has no step the evidence fixes, and no edge: which one really
-/// frees it is the engine's walk to say (`leaves`). Occupants at a name a
+/// name whatever the order, which the replay reports. A step that drops or
+/// moves its table, or drops its column, takes it away for certain; one
+/// that only changes its column may (`leaves`). With no certain step, one
+/// that several steps may take away, a column's default given another
+/// default and then renamed, has no step the evidence fixes, and no edge:
+/// which one really frees it is the engine's walk to say. Occupants at a name a
 /// baseline object holds are that object, tracked by its own claims and
 /// releases, as in [`verify`].
 pub fn carried(
@@ -210,7 +212,13 @@ pub fn carried(
             owner: table.map(|t| t.table_key()),
             column,
         };
-        let steps: Vec<usize> = operations
+        // A step that drops or moves the occupant's table, or drops its
+        // column, takes it away on every engine. The other column changes
+        // `leaves` reads as freeing it may not: a column rename keeps a
+        // PostgreSQL sequence's name (review of #2119). So a certain step
+        // decides where there is one, and a possible one only where there is
+        // none.
+        let possible: Vec<usize> = operations
             .iter()
             .zip(&keys)
             .enumerate()
@@ -219,6 +227,22 @@ pub fn carried(
             })
             .map(|(i, _)| i)
             .collect();
+        let certain: Vec<usize> = possible
+            .iter()
+            .copied()
+            .filter(|&i| {
+                moves(&operations[i], keys[i].as_ref(), &who)
+                    || matches!(
+                        operations[i].change(),
+                        Change::DropTable { .. } | Change::DropColumn { .. }
+                    )
+            })
+            .collect();
+        let steps = if certain.is_empty() {
+            possible
+        } else {
+            certain
+        };
         let [step] = steps[..] else { continue };
         // As in the replay, an occupant the step takes out of its schema
         // does not land anywhere: a default renamed with its table's move.
