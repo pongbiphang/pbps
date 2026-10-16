@@ -75,8 +75,8 @@ pub fn load(
             // from a version this build does not read is refused by its
             // version and the remedy that goes with it, rather than by
             // whichever field of its older shape serde reached first.
-            let snap = StateSnapshot::from_json(&text)
-                .map_err(|e| anyhow::anyhow!("baseline file `{}`: {e}", path.display()))?;
+            let snap = crate::artifact::decode(&text, StateSnapshot::from_json)
+                .with_context(|| format!("baseline file `{}`", path.display()))?;
             let ids = snap
                 .ids
                 .validated()
@@ -381,14 +381,10 @@ pub fn ids_at(project: &Project, rev: &str) -> anyhow::Result<ValidIds> {
 fn ids_from(root: &Path, rev: &str, ids_rel: &str) -> anyhow::Result<ValidIds> {
     match git(root, &["show", &format!("{rev}:{ids_rel}")]) {
         Ok(text) => {
-            // serde repeats the text it stopped at, and that is the file's: shown
-            // escaped, like a plan's (DEC-2032.1, #2035).
-            let ids: IdsFile = serde_json::from_str(&text).map_err(|e| {
-                anyhow::anyhow!(
-                    "the identity file at `{rev}` is malformed: {}",
-                    pbps_model::escape::Escaped(&e.to_string())
-                )
-            })?;
+            // The decoder's sentence repeats the file's text; `artifact::decode`
+            // shows it escaped, like a plan's (DEC-2032.1, #2035).
+            let ids: IdsFile = crate::artifact::decode(&text, serde_json::from_str)
+                .with_context(|| format!("the identity file at `{rev}` is malformed"))?;
             // A committed declaration may be deleted before its uid is retired.
             // Internal validity is required here; schema membership is file-only.
             ids.validated()

@@ -1,6 +1,7 @@
 //! `pbps` — declarative database schema version control.
 
 mod adopt;
+mod artifact;
 mod baseline;
 mod computed_order;
 mod cost;
@@ -2091,10 +2092,9 @@ fn read_ids_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read identity file `{}`", path.display()))?;
-    // serde repeats the text it stopped at, and that is the file's: shown
-    // escaped, like a plan's (DEC-2032.1, #2035).
-    let ids: IdsFile = serde_json::from_str(&text)
-        .map_err(|e| saved_plan::echoed(&e))
+    // The decoder's sentence repeats the file's text; `artifact::decode` shows
+    // it escaped, like a plan's (DEC-2032.1, #2035).
+    let ids: IdsFile = artifact::decode(&text, serde_json::from_str)
         .with_context(|| format!("identity file `{}` is malformed", path.display()))?;
     // The path belongs on this one too: with a custom `ids_file` in pbps.yml, an
     // error naming only two uids leaves the user hunting for the file.
