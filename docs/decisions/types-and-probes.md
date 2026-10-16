@@ -2280,3 +2280,7 @@ empty), `what_the_model_cannot_hold_is_named_and_never_silently_dropped`,
 `sequence_options_round_trip_and_an_identity_keeps_its_pair_without_them`,
 `an_identity_holds_its_sequences_bounds_cycle_and_cache` and
 `an_identity_with_sequence_options_is_refused_on_sql_server`.
+
+<a id="dec-1523-1"></a>
+
+**DEC-1523.1. PostgreSQL columns reference existing enums, domains and standalone composites, scalar or array.** pbps manages no type lifecycle and refuses retypes, row data and partition keys over references. Measured on 16 and 18, ADD COLUMN evaluates domain CHECKs on NULL but no attributes, elements or bounds of a NULL container. Its gate judges evaluated code and its owners, excluding code-free enums; `trusted_roles` extends owner trust only (#2046).

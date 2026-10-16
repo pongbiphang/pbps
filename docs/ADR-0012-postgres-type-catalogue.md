@@ -106,12 +106,11 @@ this document is not taking. Until it is taken, **the dialect refuses both
 spellings explicitly**, `text ARRAY` included, rather than letting one of them
 through into a comparison it cannot win.
 
-Domains, enums and composite types are out of scope for a different reason: they
-are user-defined *objects* with their own creation, ownership and drop
+Managing domains, enums and composite types is out of scope for a different
+reason: they are user-defined *objects* with their own creation, ownership and drop
 semantics, not spellings of a built-in, and modelling them is a separate ADR.
-`pull` reports a column of such a type as unmanaged rather than guessing a base
-type — the alternative is a declaration that silently widens a domain's
-constraint away.
+`pull` holds existing enums, domains and standalone composites by qualified
+reference, scalar or array (#1523, DEC-1523.1); pbps manages no type lifecycle.
 
 ## 2. `TypeChangeRisk` answers its question, and it answers it correctly
 
@@ -584,7 +583,8 @@ emitted only where §2 calls the element change `Safe`. Even then the table is
 rewritten: §3's dataset now has a row the scalar never had, since every element
 change of an array rewrites. Narrowing an element is refused, as is a change
 between a scalar and an array, which needs the `USING` of §5. User-defined
-element types remain out (#1523). The decision record is DEC-1167.1.
+elements are admitted by reference (#1523, DEC-1523.1). The decision record is
+DEC-1167.1.
 
 ## Placement
 

@@ -297,6 +297,10 @@ pub struct Dev {
 pub struct Config {
     pub dialect: DialectName,
 
+    /// Roles the organization trusts to change evaluated user-type code (#2046).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub trusted_roles: std::collections::BTreeSet<String>,
+
     // The schema carries the lexical half of the #739 rule, so an editor
     // refuses what `Config::parse` refuses: an empty path, or one made only
     // of `.` and `..`. Both separators count, as they do on Windows; a
@@ -970,6 +974,25 @@ mod tests {
         assert!(
             Config::parse(
                 "dialect: mssql\ndev:\n  url: Server=localhost\n",
+                Path::new("pbps.yml")
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn trusted_role_names_are_recorded_as_a_set_and_do_not_admit_unknown_settings() {
+        let config = Config::parse(
+            "dialect: postgres\ntrusted_roles: [platform, platform, data_team]\n",
+            Path::new("pbps.yml"),
+        )
+        .unwrap();
+        assert_eq!(
+            config.trusted_roles,
+            std::collections::BTreeSet::from(["data_team".to_owned(), "platform".to_owned()])
+        );
+        assert!(
+            Config::parse(
+                "dialect: postgres\ntrusted_role: [platform]\n",
                 Path::new("pbps.yml")
             )
             .is_err()

@@ -159,6 +159,10 @@ unless the declarations already add a partition with no upper end, which reaches
 target: the finding is then `doctor.partition-runway` with the `pbps plan` remedy
 (#2036). A count of partitions has no calendar or type to leave.
 
+`trusted_roles: [platform_owner]` adds PostgreSQL roles trusted to own evaluated
+type CHECKs and defaults; it never admits user functions. The plan records the
+list and apply refuses a changed list or missing role (DEC-1523.1).
+
 The `policies:` block selects built-in rules and their severities and records
 suppressions — a rule id, a reason and an optional expiry — with parameters
 that are data (a pattern, a number, a change window) and never code
@@ -244,8 +248,8 @@ indexes:
   reads them all back as `T[]`. An element change is taken where every element
   keeps its value, and rewrites the table. Narrowing an element, or changing
   between a scalar and an array, is refused. So is `data:` on a table with an
-  array column, and so is an array type on SQL Server. User-defined element
-  types are #1523 (DEC-1167.1).
+  array column, and so is an array type on SQL Server. User-defined elements
+  are admitted by reference (#1523, DEC-1523.1).
 - **A user-defined type is named `schema.name`**, each part optionally in double
   quotes (`"App"."Mood"`, which `fmt` writes in single quotes), optionally
   followed by `[]`. It is always qualified and takes no arguments. An unquoted
@@ -254,8 +258,10 @@ indexes:
   `_`, a temporary schema, `U&"…"` and a name of three parts are refused by the
   loader. The loader holds a part of any length, because the identifier limit
   is the engine's: PostgreSQL refuses a part over 63 bytes, which the server
-  would truncate without an error (#2021). Both dialects still refuse the
-  reference by name until the references are admitted (#1523).
+  would truncate without an error (#2021). PostgreSQL admits references to
+  existing enums, domains and standalone composites; SQL Server refuses them
+  by name. Retypes, `data:` and partition keys over references are refused
+  (DEC-1523.1).
 - **`deprecated` needs only a reason**; the date comes from git and is not written
   by hand.
 - **`collation` on a SQL Server column names an explicit collation**; absent
@@ -1142,8 +1148,9 @@ clean. Two supporting rules:
   a statement that cannot run inside a transaction (certain ONLINE operations,
   full-text, ...) **fails at plan time**, asking for it to be split into its own
   deployment — rather than being discovered halfway through an apply.
-- Before executing the first statement, `apply` runs pre-flight checks (a
-  connection is guaranteed at this point): the rename impact queries and the
+- Before executing the first statement, `apply` checks referenced types
+  (DEC-1523.3) and runs pre-flight checks (a connection is guaranteed at this
+  point): the rename impact queries and the
   SCHEMABINDING check happen here. Whatever is going to blow up should blow up
   **before** anything has run, filling in the information an offline plan cannot
   see.
@@ -1325,6 +1332,10 @@ managed-expression wording, and adds neither staged guarantees nor protection
 against arbitrary external writes after the last observation. A staged
 resolved plan is refused (#620). Plans without resolver evidence retain the
 existing guard.
+
+**Referenced-type pins (DEC-1523.3):** plans pin existing types by identity,
+OID, kind and canonical definition, checked at the same points as routine pins.
+Missing, undefined and unreadable types refuse separately before DDL.
 
 **External-routine pins (DEC-319.1):** every PostgreSQL plan also
 pins, under the environment's fingerprint key, every unmanaged routine not

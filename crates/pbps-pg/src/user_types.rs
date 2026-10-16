@@ -4,8 +4,8 @@
 //! pbps never creates, alters or drops a type. A column may name one only by
 //! reference (`app.mood`), so before a plan relies on that name it has to know
 //! what the name is *now*, and a saved plan has to notice that it is no longer
-//! the same type. This module does both reads and nothing else: it is not yet
-//! called by `plan`, `apply`, introspection or emit.
+//! the same type. This module supplies the canonical reads used by
+//! plan and replay prerequisites (DEC-1523.3).
 //!
 //! # Three outcomes that must not be confused
 //!

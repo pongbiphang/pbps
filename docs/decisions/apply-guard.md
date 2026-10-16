@@ -1513,3 +1513,7 @@ results, including diagnostic ordering, and is removed after qualification.
 Runtime predicate reversions establish the retained negative coverage. Table
 presence/renames and exhaustive field/read-mode integration now complete #1774's
 five slices; module, grant and row policy stays with its existing owner.
+
+<a id="dec-1523-3"></a>
+
+**DEC-1523.3. Saved plans pin referenced types by identity, OID, kind and an unkeyed canonical-definition digest.** Measured on 16 and 18, enum labels and domain constraints can change without a column's type identity changing. Recheck at DEC-319.1's points, including staged checkpoints, and refuse a changed trust list. Offline bootstrap asserts type prerequisites before creation; connected bootstrap reads them first.

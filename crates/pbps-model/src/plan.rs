@@ -249,7 +249,9 @@ use crate::zone::SessionZone;
 /// Bumped to 42 for a staged attach's scan-free form (DEC-1638.1): an
 /// `AttachPartition`'s `key`, which an older build cannot read, and would
 /// otherwise refuse as no pbps plan rather than as a newer one.
-pub const CURRENT_VERSION: u32 = 42;
+///
+/// Version 43 admits user-type references and pins their prerequisites (DEC-1523.2).
+pub const CURRENT_VERSION: u32 = 43;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -424,6 +426,25 @@ pub struct SavedPlan {
     /// since is a change like any other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routine_pins: Option<RoutinePins>,
+
+    /// Existing user-defined types required by this plan (DEC-1523.3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_pins: Vec<TypePin>,
+
+    /// The project roles trusted when the input-path gate admitted this plan.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub trusted_roles: std::collections::BTreeSet<String>,
+}
+
+/// A referenced type's identity and unkeyed canonical-definition digest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypePin {
+    pub schema: String,
+    pub name: String,
+    pub oid: i64,
+    pub kind: String,
+    pub digest: String,
 }
 
 /// The routines a plan pins, keyed per schema (DEC-319.1).
@@ -482,6 +503,8 @@ impl SavedPlan {
             ids,
             data: BTreeMap::new(),
             routine_pins: None,
+            type_pins: Vec::new(),
+            trusted_roles: Default::default(),
         }
     }
 
@@ -723,7 +746,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 42);
+        assert_eq!(CURRENT_VERSION, 43);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads
@@ -1021,5 +1044,33 @@ mod tests {
         json.as_object_mut().unwrap().remove("mode");
         let back: SavedPlan = serde_json::from_value(json).unwrap();
         assert_eq!(back.mode, PlanMode::Transactional);
+    }
+    #[test]
+    fn type_pins_and_declared_trust_survive_serialization_and_change_the_approved_checksum() {
+        let mut plan = plan_over(ChangeSet::default());
+        let unpinned = plan.checksum();
+        plan.type_pins.push(TypePin {
+            schema: "app".into(),
+            name: "mood".into(),
+            oid: 40000,
+            kind: "enum".into(),
+            digest: "ab".repeat(32),
+        });
+        plan.trusted_roles.insert("platform_owner".into());
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(serde_json::from_str::<SavedPlan>(&json).unwrap(), plan);
+        assert_ne!(plan.checksum(), unpinned);
+        let before = plan.checksum();
+        plan.type_pins[0].oid += 1;
+        assert_ne!(plan.checksum(), before);
+        let before = plan.checksum();
+        plan.trusted_roles.clear();
+        assert_ne!(plan.checksum(), before);
+        assert!(
+            serde_json::from_str::<SavedPlan>(
+                &json.replace("\"oid\":40000", "\"oid\":40000,\"invented\":true")
+            )
+            .is_err()
+        );
     }
 }
