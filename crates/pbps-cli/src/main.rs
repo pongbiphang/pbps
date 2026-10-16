@@ -2004,6 +2004,11 @@ fn declaration_problems_with_sources(
     for problem in pbps_dialect::check_system_time_triggers(schema, dialect) {
         out.push(("dialect.rejected", problem));
     }
+    // And a partition's own trigger, check or foreign key named as a
+    // trigger its parent clones onto it (#1632).
+    for problem in pbps_dialect::check_partition_triggers(schema, dialect) {
+        out.push(("schema.name-collision", problem));
+    }
     // And a third whole-schema question, on the same engines-differ shape: an
     // index (or the index behind a named primary key or unique constraint)
     // shares a schema's relation namespace with tables and views on

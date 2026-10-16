@@ -1954,6 +1954,13 @@ fn dependent_routine_args_query(refclass: &str) -> String {
 /// into the first, and the first is what makes a plan applyable and
 /// predictably failing (SPEC §7.5).
 ///
+/// One row is left out of the trigger arm, and not as a filter of the first
+/// kind: a clone of a partitioned parent's row trigger (#1632). Measured on 16
+/// and 18, it has its own edge to the routine it runs, beside its parent's
+/// edge to it, and the engine refuses to drop it alone (`trigger ... on table
+/// p requires it`) and names the parent in its refusal. The parent is the
+/// dependent, and its drop and create take the clones with them.
+///
 /// **And an arm can be total and still name the wrong object.** A user rule on
 /// a view has its edges in `pg_rewrite`, whose `ev_class` is the view the rule
 /// is on — so the view arm reported the view as its own dependent, and the
@@ -2008,6 +2015,7 @@ fn dependents_query(refclass: &str) -> String {
            JOIN pg_catalog.pg_class c2 ON c2.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_trigger'::regclass
+            AND tg.tgparentid = 0
           UNION ALL
          SELECT 'check',
                 COALESCE(pg_catalog.pg_describe_object('pg_catalog.pg_constraint'::regclass, pcon.oid, 0),

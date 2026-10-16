@@ -322,7 +322,11 @@ indexes:
   (DEC-1577.1). It may declare foreign keys of its own under `foreign_keys:`,
   as a table's; one equal to a parent's foreign key, which the engine may take
   for its clone, or named as one of the parent's checks or foreign keys, is
-  refused (DEC-1632.2). It may also hold
+  refused (DEC-1632.2). Its triggers, and its parent's, are modules whose
+  `on:` names it; the engine's clone of a parent's row trigger on each
+  partition is never declared. An own trigger named as a parent's row
+  trigger, or an own check or foreign key named as a parent's constraint
+  trigger, is refused (DEC-1632.3). It may also hold
   a column default of its own, and a NOT NULL its parent's column lacks, under
   `columns:`, never a type (DEC-1578.1). A grant on a partition is written in
   its role's file as on any table, and is the partition's own: one on the

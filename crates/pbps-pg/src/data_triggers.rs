@@ -480,12 +480,20 @@ async fn read_triggers(
 ) -> Result<Vec<Trigger>, DbError> {
     // Statement-level triggers fire on the relation the statement names, not on
     // each descendant it reaches; row-level ones fire wherever the row lands.
+    //
+    // A clone of a partitioned parent's row trigger is no declaration's: the
+    // parent's trigger is the module, and the clone is created, renamed and
+    // dropped with it, measured on 16 and 18 (#1632). It is authenticated as
+    // that trigger, by the parent's table, name and definition; what fires,
+    // and what the guard locks to, is still the clone's own oid and function.
     let rows = conn
         .query(&format!(
             "{ctes}
              SELECT t.oid::int8 AS oid, t.tgfoid::int8 AS function_oid,
-                    n.nspname AS schema_name, c.relname AS table_name,
-                    t.tgname AS name, pg_catalog.pg_get_triggerdef(t.oid) AS definition,
+                    COALESCE(pn.nspname, n.nspname) AS schema_name,
+                    COALESCE(pc.relname, c.relname) AS table_name,
+                    COALESCE(pt.tgname, t.tgname) AS name,
+                    pg_catalog.pg_get_triggerdef(COALESCE(pt.oid, t.oid)) AS definition,
                     NOT EXISTS (
                         SELECT 1 FROM pg_catalog.pg_roles editor
                         WHERE pg_catalog.pg_has_role(editor.oid, p.proowner, 'USAGE')
@@ -496,6 +504,9 @@ async fn read_triggers(
              JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid
              JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             LEFT JOIN pg_catalog.pg_trigger pt ON pt.oid = t.tgparentid
+             LEFT JOIN pg_catalog.pg_class pc ON pc.oid = pt.tgrelid
+             LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace
              WHERE NOT t.tgisinternal AND (t.tgtype & {events}) <> 0
                AND ({events} <> {update} OR t.tgattr = ''::pg_catalog.int2vector OR EXISTS (
                    SELECT 1 FROM touched

@@ -177,8 +177,9 @@ fn tables_query() -> String {
 /// whose deparsed text is its columns' quoted names and nothing else, so that
 /// an expression, an operator class or a collation, each of which
 /// `pg_get_partkeydef` prints, leaves it out. Permanent, no storage parameters, the default replica
-/// identity, no access method of its own, no row security, rules or triggers:
-/// none of them is in the partitioned table's declaration yet.
+/// identity, no access method of its own, no row security or rules: neither
+/// is in the partitioned table's declaration yet. Its triggers are modules
+/// (#1632).
 ///
 /// **Each partition**: attached (no detach pending), an ordinary heap
 /// table, the same in all of that but its persistence and storage
@@ -196,11 +197,13 @@ fn tables_query() -> String {
 /// 16 and 18, and is no column (#1545). Every constraint a clone
 /// (`conparentid`, the keys and foreign keys), inherited and not local (a
 /// CHECK, and on 18 a NOT NULL row), a CHECK of its own, local and
-/// inherited from nowhere (#1577), a foreign key of its own (#1632), or on
+/// inherited from nowhere (#1577), a foreign key of its own (#1632), a
+/// constraint trigger's row, which its trigger answers for (#1632), or on
 /// 18 a validated NOT NULL row of its own (#1578). An index is a clone of the parent's or the
 /// partition's own (#1577); one backing a constraint of its own is left out
-/// with that constraint. Anything else in any partition leaves the whole tree
-/// out, named.
+/// with that constraint. A trigger is the partition's own, a module, or a
+/// clone of a parent's row trigger in its parent's enabled mode (#1632).
+/// Anything else in any partition leaves the whole tree out, named.
 fn partition_tree(root: &str) -> String {
     // NOT NULL and a plain default are compared below, where a partition may
     // hold its own (#1578); a generation expression is in `pg_attrdef` too,
@@ -225,9 +228,7 @@ fn partition_tree(root: &str) -> String {
              AND NOT {rel}.relhasrules AND {rel}.reloftype = 0
              AND {rel}.relreplident = 'd'
              AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol
-                              WHERE pol.polrelid = {rel}.oid)
-             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger tg
-                              WHERE tg.tgrelid = {rel}.oid AND NOT tg.tgisinternal)"
+                              WHERE pol.polrelid = {rel}.oid)"
         )
     };
     // A partition's persistence and storage parameters are its own (#1580),
@@ -239,7 +240,20 @@ fn partition_tree(root: &str) -> String {
         "{} AND pc.relpersistence = 'p' AND pc.reloptions IS NULL",
         plain("pc")
     );
-    let child_plain = format!("{} AND ch.relpersistence IN ('p', 'u')", plain("ch"));
+    // A trigger on the parent or of a partition's own is a module, read as a
+    // table's (#1632). A parent's row trigger is cloned onto every partition
+    // (`tgparentid`), measured on 16 and 18, and goes and comes with it; the
+    // one thing a clone holds of its own is its enabled mode, which `ALTER
+    // TABLE ... DISABLE TRIGGER` on the partition changes alone. Declared on
+    // the parent only, a clone in another mode than its parent's leaves the
+    // tree out.
+    let child_plain = format!(
+        "{} AND ch.relpersistence IN ('p', 'u')
+         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_trigger tg
+                           JOIN pg_catalog.pg_trigger ptg ON ptg.oid = tg.tgparentid
+                          WHERE tg.tgrelid = ch.oid AND tg.tgenabled <> ptg.tgenabled)",
+        plain("ch")
+    );
     let parent_columns = columns("pc.oid");
     let child_columns = columns("ch.oid");
     format!(
@@ -294,6 +308,7 @@ fn partition_tree(root: &str) -> String {
                                        AND NOT (k.contype = 'c' AND k.conislocal
                                                 AND k.coninhcount = 0)
                                        AND k.contype <> 'f'
+                                       AND k.contype <> 't'
                                        AND NOT (k.contype = 'n' AND k.convalidated)))))"
     )
 }
@@ -361,7 +376,8 @@ const DEFAULT_VIEW_OPTIONS: &str = "NOT EXISTS (
 const DEFAULT_TRIGGER_MODE: &str = "tg.tgenabled = 'O'";
 
 /// Whether the relation `c` a trigger is on is one the pull reads back — a
-/// view, or a table [`tables_query`] holds.
+/// view, a table [`tables_query`] holds, or a table of a partition tree it
+/// holds (#1632).
 ///
 /// A trigger is read with its relation or not at all. **Measured**, the engine
 /// allows a trigger on a partitioned table and on an `UNLOGGED` one, and a
@@ -378,12 +394,21 @@ fn on_a_relation_the_pull_holds() -> String {
     // extension owns leaves the pull for the same reason (DECISIONS 305), so a
     // user's trigger on one would name a table the schema does not have.
     let not_an_extensions = not_an_extensions("c.oid", "pg_class");
+    // And a table of a partition tree the pull holds, its parent or one of
+    // its partitions (#1632).
+    let tree = partition_tree_table();
     format!(
         "({not_an_extensions}
           AND ((c.relkind = 'v' AND {DEFAULT_VIEW_OPTIONS})
-               OR ({ORDINARY_TABLE} AND {not_one_of_ours})))"
+               OR (({ORDINARY_TABLE} OR {tree}) AND {not_one_of_ours})))"
     )
 }
+
+/// A trigger that is not a clone of a partitioned parent's row trigger. A
+/// clone is no declaration's: measured on 16 and 18, the engine refuses to
+/// drop or rename one (`trigger ... on table p requires it`), and creates,
+/// renames and drops it with the parent's, which is the module (#1632).
+const NOT_A_CLONE: &str = "tg.tgparentid = 0";
 
 /// Objects owned by an extension, which are nobody's declarations.
 ///
@@ -461,6 +486,7 @@ fn modules_query() -> String {
            JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE NOT tg.tgisinternal
+            AND {NOT_A_CLONE}
             AND {DEFAULT_TRIGGER_MODE}
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {trigger_not_extension}
@@ -547,6 +573,7 @@ fn unheld_modules_query() -> String {
            JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE NOT tg.tgisinternal
+            AND {NOT_A_CLONE}
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {trigger_not_extension}
             AND NOT {held}
@@ -562,6 +589,7 @@ fn unheld_modules_query() -> String {
            JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid
            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
           WHERE NOT tg.tgisinternal
+            AND {NOT_A_CLONE}
             AND NOT ({DEFAULT_TRIGGER_MODE})
             AND {NOT_A_PROJECTS_SCHEMA}
             AND {trigger_not_extension}
@@ -1186,12 +1214,14 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             "p" => {
                 "a partitioned table other than one pbps holds: RANGE, LIST or HASH over plain \
                  columns, with \
-                 no row security, rules, triggers, storage parameters or replica identity, and \
-                 partitions that are its own and nothing else"
+                 no row security, rules, storage parameters or replica identity, and \
+                 partitions that are its own and nothing else, each clone of its triggers in \
+                 that trigger's mode"
             }
             "r" if flag(row, "partition")? => {
                 "a partition of a partitioned table pbps does not hold whole, or one that has \
-                 columns, constraints, indexes, grants or settings of its own"
+                 columns, constraints, indexes, grants or settings of its own, or a clone of its \
+                 parent's trigger in another mode"
             }
             "f" => "a foreign table",
             "r" if flag(row, "row_security")? => {

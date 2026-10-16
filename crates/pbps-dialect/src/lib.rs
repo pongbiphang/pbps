@@ -2518,6 +2518,14 @@ pub trait Dialect {
         false
     }
 
+    /// Whether a trigger declared on a partitioned table is cloned onto each
+    /// of its partitions under its own name (#1632): PostgreSQL's row
+    /// trigger is. The default, none, is right for an engine without
+    /// partitions.
+    fn clones_to_partitions(&self, _trigger: &Module) -> bool {
+        false
+    }
+
     /// The name the engine falls back to for each of
     /// [`Dialect::implicit_relation_names`], in the same order, when its first
     /// choice is taken and this is its `suffix`-th retry (#987). Two tables
@@ -3395,6 +3403,58 @@ pub fn check_system_time_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec
                  system-versioned table; make it AFTER, or leave `versioning` out",
                 dialect.name()
             ));
+        }
+    }
+    problems
+}
+
+/// A partition's own trigger, check or foreign key named as a trigger its
+/// parent clones onto it (#1632). Measured on 16 and 18, a parent's row
+/// trigger is cloned onto every partition under its name, so a trigger of the
+/// partition's own under that name fails as `already exists`, whatever it
+/// does; a statement trigger is not cloned, and its name is free. A
+/// constraint trigger's clone has a `pg_constraint` row under that name too,
+/// where an own check or foreign key under it fails the same way.
+pub fn check_partition_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, table) in &schema.tables {
+        let Some(of) = &table.partition_of else {
+            continue;
+        };
+        for (id, module) in &schema.modules {
+            let ModuleId::Trigger { on, name: trigger } = id else {
+                continue;
+            };
+            if on != &of.parent || !dialect.clones_to_partitions(module) {
+                continue;
+            }
+            let own_trigger = ModuleId::Trigger {
+                on: name.clone(),
+                name: trigger.clone(),
+            };
+            if schema.modules.contains_key(&own_trigger) {
+                problems.push(format!(
+                    "trigger `{trigger}` on `{name}` is named as its parent's row trigger \
+                     `{id}`, which {} clones onto every partition under that name; name it \
+                     otherwise",
+                    dialect.name()
+                ));
+            }
+            if dialect.declares_a_constraint(module) {
+                for (kind, held) in [
+                    ("check", table.checks.contains_key(trigger)),
+                    ("foreign key", table.foreign_keys.contains_key(trigger)),
+                ] {
+                    if held {
+                        problems.push(format!(
+                            "{kind} `{trigger}` on `{name}` is named as its parent's \
+                             constraint trigger `{id}`, whose clone on every partition is a \
+                             constraint under that name on {}; name it otherwise",
+                            dialect.name()
+                        ));
+                    }
+                }
+            }
         }
     }
     problems

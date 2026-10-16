@@ -3892,15 +3892,10 @@ fn attached(
     }
     // Held by the schema rather than the table: what reaches it from
     // elsewhere would then reach a partition, which the model does not hold.
-    for id in base.schema.modules.keys() {
-        if let pbps_model::ModuleId::Trigger { on, name } = id
-            && on == base_name
-        {
-            what.push(format!(
-                "the trigger `{name}` is on it, and a partition holds none yet"
-            ));
-        }
-    }
+    // A trigger on it does not: a module on the partition, it stays its own,
+    // or is dropped before the attach (class 0), and validation refuses one
+    // the declarations keep under a name its parent's row triggers clone
+    // onto it (DEC-1632.3).
     for (other, t) in &base.schema.tables {
         for (name, fk) in &t.foreign_keys {
             if &fk.references_table == base_name {
@@ -10934,12 +10929,6 @@ mod tests {
                 "renamed from app.t",
             ),
             (
-                triggered_base,
-                &triggered,
-                &[][..],
-                "the trigger `audit` is on it",
-            ),
-            (
                 referencing_base,
                 &referencing_declared,
                 &[][..],
@@ -10954,6 +10943,26 @@ mod tests {
                 "{expected}: {found:?}"
             );
         }
+
+        // A trigger on it stays a module of the partition's own through the
+        // attach (DEC-1632.3): planned, with no change to the trigger.
+        let planned = outcome(&triggered_base, &triggered, &[])
+            .2
+            .expect("an attach with a trigger on the table is planned");
+        assert!(
+            planned
+                .changes
+                .iter()
+                .any(|c| matches!(c.change, Change::AttachPartition { .. }))
+                && !planned.changes.iter().any(|c| matches!(
+                    c.change,
+                    Change::CreateModule { .. }
+                        | Change::DropModule { .. }
+                        | Change::AlterModule { .. }
+                )),
+            "{:?}",
+            kinds(&planned)
+        );
 
         // A foreign key the parent's does not match stays the partition's
         // own through the attach (#1632): kept where it declares it as its

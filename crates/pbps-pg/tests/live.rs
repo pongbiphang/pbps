@@ -7855,23 +7855,33 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
                 .await
                 .expect("the column grant revoked");
             assert_eq!(counted(&mut conn, &probes[2].sql).await, 0, "{table}");
-            // An unmanaged trigger, which the engine attaches over and the
-            // reader refuses the tree for, is counted; an internal one, as a
-            // foreign key's, never is (#1642 review).
+            // An unmanaged trigger named as a row trigger of the parent, which
+            // the engine refuses to attach over (#1632), is counted; one
+            // under another name, a partition's own once attached, is not,
+            // and an internal one, as a foreign key's, never is (#1642
+            // review).
             assert!(probes[1].description.contains("triggers on"), "{probes:?}");
             assert_eq!(counted(&mut conn, &probes[1].sql).await, 0, "{table}");
             conn.execute(&format!(
                 "CREATE FUNCTION {s}.noop() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+                 CREATE TRIGGER other BEFORE INSERT ON {s}.{table} FOR EACH ROW EXECUTE FUNCTION {s}.noop();
                  CREATE TRIGGER noop BEFORE INSERT ON {s}.{table} FOR EACH ROW EXECUTE FUNCTION {s}.noop();"
             ))
             .await
-            .expect("an unmanaged trigger");
-            assert_eq!(counted(&mut conn, &probes[1].sql).await, 1, "{table}");
+            .expect("unmanaged triggers");
+            assert_eq!(counted(&mut conn, &probes[1].sql).await, 0, "{table}");
             conn.execute(&format!(
-                "DROP TRIGGER noop ON {s}.{table}; DROP FUNCTION {s}.noop();"
+                "CREATE TRIGGER noop BEFORE INSERT ON {s}.m FOR EACH ROW EXECUTE FUNCTION {s}.noop();"
             ))
             .await
-            .expect("the trigger dropped");
+            .expect("the parent's row trigger");
+            assert_eq!(counted(&mut conn, &probes[1].sql).await, 1, "{table}");
+            conn.execute(&format!(
+                "DROP TRIGGER noop ON {s}.{table}; DROP TRIGGER other ON {s}.{table};
+                 DROP TRIGGER noop ON {s}.m; DROP FUNCTION {s}.noop();"
+            ))
+            .await
+            .expect("the triggers dropped");
             let sql: String = pg
                 .emit(&step.changes[0].change, Default::default())
                 .expect("emit")
@@ -18310,8 +18320,8 @@ async fn a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_
     drop_schema(&mut conn, &s).await;
 }
 
-/// A trigger on a relation the table reader leaves out — a partitioned table,
-/// a row-level-secured one — came back in the pull without the relation it is on, and
+/// A trigger on a relation the table reader leaves out — a partitioned table
+/// it does not hold, a row-level-secured one — came back in the pull without the relation it is on, and
 /// `check_names` refused the whole schema: a pull nothing could load. Measured,
 /// the engine allows a trigger on both. The trigger is left out with its
 /// relation now, and named beside it rather than silently gone.
@@ -18330,7 +18340,9 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         format!(
             "CREATE TRIGGER audit BEFORE INSERT ON {s}.t FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
         ),
-        format!("CREATE TABLE {s}.part (id int, d date) PARTITION BY RANGE (d)"),
+        // A tree keyed by an expression, which pbps does not hold; a held
+        // tree's triggers are modules (#1632), pulled with it.
+        format!("CREATE TABLE {s}.part (id int, d date) PARTITION BY RANGE ((id + 1))"),
         format!(
             "CREATE TRIGGER audit BEFORE INSERT ON {s}.part FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
         ),
