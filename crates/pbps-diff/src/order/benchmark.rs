@@ -154,10 +154,12 @@ fn chain(size: usize) -> Shape {
 
 /// The chain with one more declaration closing it: the first view reads the
 /// last. No order satisfies it. The pipeline plans a cycle's members in name
-/// order (`pbps_model::module::creation_order`); the effects are measured on
-/// the chain's own plan under the cycle's declarations, where the verifier
-/// must find the one declaration that order breaks. (A rename ring is no
-/// such shape: the differ refuses every rename cycle, DEC-1966.1.)
+/// order (`pbps_model::module::creation_order`), and is timed doing so; the
+/// effects are measured on the chain's own plan under the cycle's
+/// declarations, where the verifier must find the one declaration that
+/// order breaks. (The test build's observer refuses the name order itself,
+/// #2083. A rename ring is no such shape: the differ refuses every rename
+/// cycle, DEC-1966.1.)
 fn cycle(size: usize) -> Shape {
     let chain = chain(size);
     let mut declared = chain.declared.clone();
@@ -209,13 +211,47 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
         ids: &ids,
     };
     // Today's pipeline: the differ and every pass after it.
-    // The pipeline's own shadow check, built into every test build, fails a
-    // plan for a declared cycle (#2083), so a cycle is timed on the plan the
-    // effects read.
-    let timed = shape.planned_with.as_ref().unwrap_or(&shape.declared);
+    // Today's pipeline as a release build runs it: `diff` without the
+    // observer a test build adds after it, which reads the effects, builds
+    // the graph and verifies, the costs measured apart below. Without it a
+    // declared cycle plans too, in name order, and is timed as itself.
     let started = Instant::now();
-    let changes = crate::diff(base, desired, &dialect, &hints(timed)).expect("diff");
+    let planned = crate::schema_diff::diff_partial_rebuilding(
+        base,
+        desired,
+        &dialect,
+        &hints(&shape.declared),
+        &std::collections::BTreeSet::new(),
+        crate::schema_diff::Rebinding::Candidates,
+        crate::schema_diff::Screen::Text,
+        None,
+    );
     let pipeline = started.elapsed();
+    assert!(
+        planned.errors.is_empty(),
+        "{}: {:?}",
+        shape.name,
+        planned.errors
+    );
+    // The operations the effects read: a cycle's are the chain's own plan,
+    // which honours every declaration but the one closing it, so the
+    // verifier's finding is that one alone.
+    let changes = match &shape.planned_with {
+        Some(acyclic) => {
+            crate::schema_diff::diff_partial_rebuilding(
+                base,
+                desired,
+                &dialect,
+                &hints(acyclic),
+                &std::collections::BTreeSet::new(),
+                crate::schema_diff::Rebinding::Candidates,
+                crate::schema_diff::Screen::Text,
+                None,
+            )
+            .changes
+        }
+        None => planned.changes,
+    };
     // The resolver's graph, whose constraints compare steps in pairs.
     let started = Instant::now();
     let resolver_edges =

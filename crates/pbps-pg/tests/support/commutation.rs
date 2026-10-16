@@ -19,6 +19,7 @@ const SCENARIOS: &[Scenario] = &[
         name: "an_index_and_a_check_on_one_table",
         pair: ["AddIndex", "AddCheck"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -55,6 +56,7 @@ data:
         name: "two_columns_added_to_one_table",
         pair: ["AddColumn", "AddColumn"],
         gap: Some(2080),
+        uid_order: Some(2080),
         base: r#"
 table: app.t
 columns:
@@ -88,6 +90,7 @@ data:
         name: "an_index_and_a_check_dropped_from_one_table",
         pair: ["DropIndex", "DropCheck"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -124,6 +127,7 @@ data:
         name: "a_column_dropped_beside_storage_parameters",
         pair: ["DropColumn", "SetStorageParameters"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -158,6 +162,7 @@ data:
         name: "a_column_renamed_beside_a_dropped_unique_constraint",
         pair: ["RenameColumn", "DropUnique"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -191,6 +196,7 @@ data:
         name: "a_column_retyped_beside_a_new_column",
         pair: ["AlterColumnType", "AddColumn"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -223,6 +229,7 @@ data:
         name: "a_column_made_not_null_beside_a_dropped_foreign_key",
         pair: ["AlterColumnNullability", "DropForeignKey"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.p
 columns:
@@ -280,6 +287,7 @@ data:
         name: "a_default_changed_beside_a_deprecation",
         pair: ["AlterColumnDefault", "SetColumnDeprecated"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -311,6 +319,7 @@ data:
         name: "identity_options_beside_a_replica_identity",
         pair: ["AlterColumnNumbering", "SetReplicaIdentity"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -345,6 +354,7 @@ data:
         name: "a_generation_expression_beside_storage_parameters",
         pair: ["AlterColumnExpression", "SetStorageParameters"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -380,6 +390,7 @@ data:
         name: "persistence_beside_index_storage_parameters",
         pair: ["SetTablePersistence", "SetIndexStorageParameters"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -420,6 +431,7 @@ data:
         name: "a_primary_key_renamed_beside_a_check",
         pair: ["SetPrimaryKey", "AddCheck"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.k
 columns:
@@ -441,6 +453,7 @@ checks:
         name: "a_row_inserted_beside_an_index",
         pair: ["InsertRow", "AddIndex"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -476,6 +489,7 @@ data:
         name: "a_row_updated_beside_a_new_column",
         pair: ["UpdateRow", "AddColumn"],
         gap: Some(2079),
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -508,6 +522,7 @@ data:
         name: "a_row_deleted_beside_an_index",
         pair: ["DeleteRow", "AddIndex"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -541,6 +556,7 @@ data:
         name: "a_data_mode_changed_beside_an_index",
         pair: ["SetDataMode", "AddIndex"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -575,6 +591,7 @@ data:
         name: "ensure_keys_beside_a_check",
         pair: ["SetEnsureKeys", "AddCheck"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -607,6 +624,7 @@ data:
         name: "a_table_created_beside_a_view",
         pair: ["CreateTable", "CreateModule"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -648,6 +666,7 @@ definition: SELECT t.id, t.a FROM app.t
         name: "a_table_dropped_beside_a_view_redefined",
         pair: ["DropTable", "AlterModule"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -693,6 +712,7 @@ definition: SELECT t.id, t.b FROM app.t
         name: "a_table_renamed_beside_a_view_dropped",
         pair: ["RenameTable", "DropModule"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -741,6 +761,7 @@ primary_key: [id]
         name: "a_grant_beside_a_revoke",
         pair: ["Grant", "Revoke"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -794,6 +815,7 @@ grants:
         name: "public_execution_beside_an_index",
         pair: ["PublicExecution", "AddIndex"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -833,6 +855,7 @@ definition: |-
         name: "a_partition_attached_beside_a_check",
         pair: ["AttachPartition", "AddCheck"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -891,6 +914,7 @@ partitions:
         name: "a_partition_detached_beside_an_index",
         pair: ["DetachPartition", "AddIndex"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -950,6 +974,7 @@ columns:
         name: "a_partition_default_beside_a_partition_not_null",
         pair: ["SetPartitionDefault", "SetPartitionNotNull"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.m
 columns:
@@ -975,6 +1000,7 @@ partitions:
         name: "a_column_added_beside_a_row_insert",
         pair: ["AddColumn", "InsertRow"],
         gap: Some(2079),
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -1008,6 +1034,7 @@ data:
         name: "an_index_dropped_beside_a_row_update",
         pair: ["DropIndex", "UpdateRow"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -1042,6 +1069,7 @@ data:
         name: "a_view_created_beside_a_column_added",
         pair: ["CreateModule", "AddColumn"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -1078,6 +1106,7 @@ definition: SELECT t.id, t.a FROM app.t
         name: "a_unique_constraint_dropped_beside_another_added",
         pair: ["DropUnique", "AddUnique"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -1113,6 +1142,7 @@ data:
         name: "a_grant_beside_a_column_added",
         pair: ["Grant", "AddColumn"],
         gap: None,
+        uid_order: None,
         base: r#"
 table: app.t
 columns:
