@@ -7584,6 +7584,82 @@ fn an_identity_file_that_does_not_decode_is_refused_with_its_text_escaped() {
     assert_eq!(code(&d.run(&["plan"])), 0);
 }
 
+/// The `--base` snapshot is an artifact handed to the tool like the identity
+/// file, and it decodes through the same entry: when it does not decode, serde
+/// repeats the unknown field it stopped at, which is the file's own spelling. A
+/// line break in it must not start a line of the refusal and an escape sequence
+/// must not rewrite the ones before it, in the human refusal and in the finding
+/// `--format json` carries (DEC-2032.1, #2070, #2084).
+#[test]
+fn a_base_snapshot_that_does_not_decode_is_refused_with_its_text_escaped() {
+    let d = Demo::new("basescaped");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    d.commit();
+    let path = d.dir.join("base.json");
+    let base = path.to_str().unwrap();
+    let refusal = |snapshot: &serde_json::Value, args: &[&str]| {
+        std::fs::write(&path, snapshot.to_string()).unwrap();
+        let mut argv = vec!["plan", "--check", "--base", base];
+        argv.extend_from_slice(args);
+        let o = d.run(&argv);
+        assert_eq!(code(&o), 1, "{}", stderr(&o));
+        o
+    };
+
+    // The field is control-laden: the refusal stays one line with the field shown.
+    let field = "x\n\u{1b}[31mred\r\u{202e}";
+    let shown = "x\\n\\u{1b}[31mred\\r\\u{202e}";
+    let expected = format!(
+        "baseline file `{}`: malformed: unknown field `{shown}`",
+        path.display()
+    );
+    let o = refusal(&serde_json::json!({"version": 6, field: 1}), &[]);
+    let e = stderr(&o);
+    let body = e.strip_suffix('\n').unwrap_or(&e);
+    assert!(!body.chars().any(char::is_control), "{e:?}");
+    assert!(body.starts_with("error: "), "{e:?}");
+    assert!(body.contains(&expected), "{e:?}");
+
+    // The JSON envelope escapes control characters itself, so the finding's text
+    // decodes to the escaped sentence, with no control character left in it.
+    let o = refusal(
+        &serde_json::json!({"version": 6, field: 1}),
+        &["--format", "json"],
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(v["findings"][0]["id"], "baseline.unreadable", "{v}");
+    let message = v["findings"][0]["message"].as_str().unwrap();
+    assert!(!message.chars().any(char::is_control), "{message:?}");
+    assert!(message.contains(&expected), "{message:?}");
+
+    // Negative: a field with nothing to escape is shown as the file spells it.
+    let o = refusal(&serde_json::json!({"version": 6, "extra": 1}), &[]);
+    assert!(
+        stderr(&o).contains(&format!(
+            "baseline file `{}`: malformed: unknown field `extra`",
+            path.display()
+        )),
+        "{}",
+        stderr(&o)
+    );
+
+    // Negative: a snapshot that is only unknown to this version is refused by its
+    // version and the remedy, as it was, and not as a malformed one.
+    let o = refusal(&serde_json::json!({"version": 999}), &[]);
+    let e = stderr(&o);
+    assert!(
+        e.contains(&format!(
+            "baseline file `{}`: this is a version 999 state and this build of pbps reads version ",
+            path.display()
+        )) && e.contains(
+            "It was recorded by a newer pbps; upgrade this one rather than reading it partially."
+        ),
+        "{e}"
+    );
+    assert!(!e.contains("malformed"), "{e}");
+}
+
 /// `--check` is the file check CI runs: it changes nothing and connects to
 /// nothing. Refusing an explicit `--dev` is not enough — a `dev:` block in
 /// pbps.yml would otherwise start a container behind the same command.

@@ -485,7 +485,10 @@ fn stage_project(root: &Path, prepared: &Prepared) -> anyhow::Result<PathBuf> {
         if loaded.schema != prepared.schema {
             bail!("the staged declarations do not round-trip to the pulled schema");
         }
-        let ids: IdsFile = serde_json::from_str(&std::fs::read_to_string(project.ids_file())?)?;
+        let ids: IdsFile = crate::artifact::decode(
+            &std::fs::read_to_string(project.ids_file())?,
+            serde_json::from_str,
+        )?;
         ids.validate()?;
         if ids != prepared.ids {
             bail!("the staged identity file does not round-trip");

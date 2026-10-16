@@ -1353,16 +1353,19 @@ serialization, so it cannot escape itself (#2035).
   and is carried by `DialectError::InvalidVerbatim` (#2081), which `Invalid`
   would otherwise show as `\\x`. A sentence built outside an error type escapes
   the name where it prints it (the `PUBLIC` execution decisions, the staged-run
-  refusal, the statements that cannot run in a transaction). The text serde
-  repeats from the identity file, which is committed text of the same kind, goes
-  through the same `Escaped` as the plan's (`saved_plan::echoed`, used where
-  `main.rs` reads the file and where `baseline.rs` reads it at a revision).
+  refusal, the statements that cannot run in a transaction). The text a
+  decoder repeats from the identity file, which is committed text of the same
+  kind, and from a `--base` snapshot goes through the same `Escaped` as the
+  plan's: the three artifacts decode through the one `artifact::decode`, which
+  takes the decoder's error as a sentence, whatever type carried it (#2070,
+  #2084).
 
 What this still does not cover: the refusals `apply` makes after it has
 connected, which set a plan's names beside what the database holds (the lock
-holder and the ledger are the database's text, not the file's; #2069), and the
-`--base` snapshot's decode error, which is an artifact of a different kind
-(#2070). Both are tracked in their own issues rather than widened here. A neutralising pass over
+holder and the ledger are the database's text, not the file's; #2069). That is
+tracked in its own issue rather than widened here. The state `apply` and `status`
+read back from the database is the database's text and not a file a person handed
+the tool, so it does not go through `artifact::decode`. A neutralising pass over
 `main`'s one `eprintln!` was not added: legitimate messages are multi-line, so it
 cannot stop a forged line break, and the sites above do.
 
@@ -1388,7 +1391,11 @@ the JSON holding each value raw), by
 identity mapping's duplicate name and orphan column, `PlanNames::of` and the
 emitter, each through `explain` in both formats and through `apply`), by
 `flow.rs::an_identity_file_that_does_not_decode_is_refused_with_its_text_escaped`
-(the identity file in the working tree and at the baseline revision), by the unit
+(the identity file in the working tree and at the baseline revision), by
+`flow.rs::a_base_snapshot_that_does_not_decode_is_refused_with_its_text_escaped`
+(a `--base` snapshot with a control-laden unknown field, in the human refusal and
+in the JSON finding; a plain field is shown as spelled, and a snapshot only
+unknown to this version is refused by its version as before), by the unit
 tests of each error type and by the unit tests in `escape.rs`. Negative cases: a
 Unicode name with quotes and braces is shown as the file spells it, in the report
 and in a refusal.

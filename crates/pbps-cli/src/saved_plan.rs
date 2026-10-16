@@ -6,7 +6,7 @@ use anyhow::Context as _;
 use pbps_model::SavedPlan;
 
 pub(crate) fn decode(raw: &str, path: &Path) -> anyhow::Result<SavedPlan> {
-    match serde_json::from_str(raw) {
+    match crate::artifact::decode(raw, serde_json::from_str::<SavedPlan>) {
         Ok(plan) => Ok(plan),
         Err(error) => {
             // Versions 1 through 12 share this envelope. Require it before
@@ -55,35 +55,10 @@ pub(crate) fn decode(raw: &str, path: &Path) -> anyhow::Result<SavedPlan> {
                     pbps_model::escape::Escaped(kind)
                 );
             }
-            Err(echoed(&error)).with_context(|| format!("`{}` is not a pbps plan", path.display()))
+            Err(error).with_context(|| format!("`{}` is not a pbps plan", path.display()))
         }
     }
 }
-
-/// A decoder's sentence about a file it could not read, as an error whose
-/// `Display` shows the file's text escaped.
-///
-/// The one way to carry a `serde_json::Error` read out of an artifact: the
-/// plan here, and the identity file (#2035), whose names are as free as a
-/// plan's.
-pub(crate) fn echoed(error: &serde_json::Error) -> anyhow::Error {
-    anyhow::Error::new(Echoed(error.to_string()))
-}
-
-/// The decoder's own sentence about a file it could not read.
-///
-/// serde repeats the text it stopped at — an unknown variant, an unknown field,
-/// a name a type refused — and that text is the file's. The sentence is one line
-/// by construction, so every control character in it came from the artifact and
-/// is shown escaped, like the other values a refusal takes from a plan
-/// (DEC-2032.1), and so is its backslash: serde repeats some of that text raw
-/// and some behind `Debug` escapes, and only a doubled backslash tells a line
-/// break from the two characters `\n` in both (#2038). Held as text rather than
-/// as `serde_json::Error` because nothing downcasts the cause, and the error's
-/// `Display` is the only thing printed.
-#[derive(Debug, thiserror::Error)]
-#[error("{}", pbps_model::escape::Escaped(.0))]
-struct Echoed(String);
 
 pub(crate) fn require_current(version: u32, path: &Path) -> anyhow::Result<()> {
     if version != pbps_model::plan::CURRENT_VERSION {
