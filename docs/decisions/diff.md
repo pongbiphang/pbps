@@ -5946,3 +5946,38 @@ the base seeded. Choices:
   Small, the shapes must plan and the effects must find no violation in the
   pipeline's order; a negative runs the chain backwards. `PBPS_ORDER_BENCHMARK`
   selects the full size for a report.
+
+<a id="dec-1998-1"></a>
+
+**DEC-1998.1. Where an effect asks whether a dependent stands in a step's
+way, it answers with the differ's own rule, so it requires gone exactly what
+the plan drops.** (#1998, a deferral of #1954) Effects that are too narrow
+let the verifier accept a bad order. Effects that are too wide refuse a plan
+the differ made, because the replay reports a dependent that stands
+throughout as `StillPresent`. Two of the narrow effects sit where a guess
+would be wide:
+
+- **A constraint replaced under its own name.** A row has to wait for the old
+  check, unique constraint, foreign key or unique or filtered index to go,
+  as it waits for a dropped one. "Replaced" is what `diff_constraints`
+  compares: the baseline's table brought forward through the plan's renames
+  (`Renames::apply`, read from the two identity files by uid), with storage
+  parameters set aside, since they change in place (DEC-1442.1). A unique
+  constraint over a renamed column, or one with a new `fillfactor` only, is
+  kept and requires nothing.
+- **What a retype, a collation change or a nullability change must have out
+  of its way.** It is the dialect's answer that `recreate_retyped_dependents`
+  rebuilds by. `RetypeDependents::of_retype` gives that one answer to both the
+  differ and `engine_effects::retype_blockers`.
+  - Keys and indexes are those over the column.
+  - Checks and filtered or expression indexes are those whose text may name
+    it, by the lexer.
+  - Foreign keys are those on either side of it.
+  - So `int` to `bigint` on SQL Server requires the index over the column
+    gone. A `varchar` widening, which keeps checks, does not require a check
+    gone. Before, the textual rule required it whatever the policy said.
+
+Pinned by `a_row_update_waits_for_a_check_replaced_under_its_name_and_not_for_one_kept`,
+`a_unique_constraint_kept_through_a_rename_or_a_parameter_change_is_not_replaced`,
+`a_storage_type_change_waits_for_every_key_and_index_over_its_column` and
+`a_varchar_widening_requires_no_check_gone_and_a_base_type_change_does`.

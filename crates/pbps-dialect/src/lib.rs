@@ -2059,6 +2059,40 @@ pub struct RetypeDependents {
     pub foreign_keys: bool,
 }
 
+impl RetypeDependents {
+    /// Either's dependents.
+    #[must_use]
+    pub fn and(self, other: RetypeDependents) -> RetypeDependents {
+        RetypeDependents {
+            keys_and_indexes: self.keys_and_indexes || other.keys_and_indexes,
+            checks: self.checks || other.checks,
+            filtered_indexes: self.filtered_indexes || other.filtered_indexes,
+            foreign_keys: self.foreign_keys || other.foreign_keys,
+        }
+    }
+
+    /// What one `ALTER COLUMN` that retypes a column has to have out of its
+    /// way: the type change's own dependents, with a collation change's and a
+    /// nullability change's in the same statement (#1175, #1363). The differ
+    /// rebuilds these around the step (`recreate_retyped_dependents`), and the
+    /// step's engine effects require them gone (#1998), from this one answer.
+    pub fn of_retype(
+        dialect: &dyn Dialect,
+        (from, to): (&ColumnType, &ColumnType),
+        recollates: bool,
+        nullability: Option<bool>,
+    ) -> RetypeDependents {
+        let mut dependents = dialect.retype_dependents(from, to);
+        if recollates {
+            dependents = dependents.and(dialect.recollate_dependents());
+        }
+        if let Some(to_nullable) = nullability {
+            dependents = dependents.and(dialect.nullability_dependents(to_nullable));
+        }
+        dependents
+    }
+}
+
 /// What [`Dialect::range_series`] is asked (#1789).
 ///
 /// Text, not parsed values: how a bound is spelled and what a step of

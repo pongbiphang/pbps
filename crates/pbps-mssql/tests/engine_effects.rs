@@ -260,3 +260,327 @@ fn a_computed_column_rewritten_off_a_function_does_not_hold_the_function_back() 
     let late = violations_ending_in(&ending("dbo.f(a)"), plan("dbo.f(a)"), &[0, 1, 2]);
     assert!(!late.is_empty(), "{late:?}");
 }
+
+// The engine effects #1998 found too narrow, on the differ's own plans: the
+// pipeline's order verifies clean, and an order that leaves a dependent the
+// engine refuses in place is refused by name.
+
+fn ty(s: &str) -> pbps_model::ColumnType {
+    s.parse().unwrap()
+}
+
+fn ctx() -> pbps_diff::Context {
+    pbps_diff::Context {
+        operator: "test".into(),
+        today: "2026-10-16".into(),
+    }
+}
+
+/// The differ's plan from `base` to `desired` on SQL Server, the effects of
+/// its steps, and the baseline.
+struct Diffed {
+    changes: Vec<PlannedChange>,
+    ops: Operations,
+    effects: Vec<pbps_model::operation::Effects>,
+    baseline: Baseline,
+}
+
+impl Diffed {
+    fn new(base: &Schema, desired: &Schema) -> Diffed {
+        let base_ids = pbps_diff::resolve(base, &IdsFile::default(), &[], &ctx())
+            .expect("resolve the base")
+            .ids;
+        let ids = pbps_diff::resolve(desired, &base_ids, &[], &ctx())
+            .expect("resolve the desired state")
+            .ids;
+        let changes = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: base,
+                ids: &base_ids,
+            },
+            pbps_diff::Side {
+                schema: desired,
+                ids: &ids,
+            },
+            &Mssql,
+            &pbps_model::Hints::default(),
+        )
+        .expect("diff")
+        .changes;
+        let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
+        let names = PlanNames::of(&changes, &ids).unwrap();
+        let owners = PlanOwners::new(names, &base_ids, &ids);
+        let (before, after) = (
+            Snapshot {
+                schema: base,
+                ids: &base_ids,
+            },
+            Snapshot {
+                schema: desired,
+                ids: &ids,
+            },
+        );
+        let baseline = Baseline::of(before, &owners);
+        let effects = analyse(&ops, &owners, before, after, &Mssql).effects;
+        Diffed {
+            changes,
+            ops,
+            effects,
+            baseline,
+        }
+    }
+
+    fn at(&self, what: impl Fn(&Change) -> bool) -> usize {
+        self.changes
+            .iter()
+            .position(|c| what(&c.change))
+            .unwrap_or_else(|| panic!("not in the plan: {:#?}", self.changes))
+    }
+
+    /// The plan's own order with step `moved` put right after step `after`.
+    fn moved_after(&self, moved: usize, after: usize) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.changes.len()).filter(|&i| i != moved).collect();
+        let at = order.iter().position(|&i| i == after).unwrap();
+        order.insert(at + 1, moved);
+        order
+    }
+
+    fn verify(&self, order: &[usize]) -> Vec<Violation> {
+        let ordered = self.ops.reordered(order);
+        let effects: Vec<_> = order.iter().map(|&i| self.effects[i].clone()).collect();
+        pbps_diff::order::verify(
+            ordered.as_slice(),
+            &effects,
+            &self.baseline,
+            &Default::default(),
+        )
+    }
+}
+
+fn still_present(violations: &[Violation], part: &PartKey) -> bool {
+    violations.iter().any(|v| {
+        matches!(v, Violation::StillPresent { key: ObjectKey::Part { part: p, .. }, .. } if p == part)
+    })
+}
+
+/// `dbo.t(id, a, b)` with an index and a unique constraint over `a`, a check
+/// on `b`, and `dbo.c` holding a foreign key into `t(a)`; `a` and `b` typed
+/// as given.
+fn retyped(a: &str, b: &str) -> Schema {
+    use pbps_model::{CheckConstraint, ForeignKey, Index, IndexColumn, UniqueConstraint};
+    let mut table = Table {
+        columns: IndexMap::from([
+            ("id".to_owned(), Column::new(ty("int")).not_null()),
+            ("a".to_owned(), Column::new(ty(a))),
+            ("b".to_owned(), Column::new(ty(b))),
+        ]),
+        ..Table::default()
+    };
+    table.indexes.insert(
+        "ix_a".into(),
+        Index {
+            columns: vec![IndexColumn::column("a")],
+            include: Vec::new(),
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        },
+    );
+    table.unique.insert(
+        "uq_a".into(),
+        UniqueConstraint {
+            columns: vec!["a".into()],
+            storage_parameters: Default::default(),
+        },
+    );
+    table.checks.insert(
+        "ck_b".into(),
+        CheckConstraint {
+            expression: "b <> ''".into(),
+        },
+    );
+    let mut child = Table {
+        columns: IndexMap::from([("x".to_owned(), Column::new(ty(a)))]),
+        ..Table::default()
+    };
+    child.foreign_keys.insert(
+        "fk_x".into(),
+        ForeignKey {
+            columns: vec!["x".into()],
+            references_table: t(),
+            references_columns: vec!["a".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    let mut schema = Schema::default();
+    schema.tables.insert(t(), table);
+    schema.tables.insert(TableName::new("dbo", "c"), child);
+    schema
+}
+
+/// #1998 items 5 and 12: `int` to `bigint` changes the storage type, so
+/// every key, index and foreign key over the column must be out of its way,
+/// as the differ rebuilds them.
+#[test]
+fn a_storage_type_change_waits_for_every_key_and_index_over_its_column() {
+    let plan = Diffed::new(&retyped("int", "varchar(10)"), &{
+        let mut s = retyped("bigint", "varchar(10)");
+        // The child's column follows, so the key still matches.
+        s.tables
+            .get_mut(&TableName::new("dbo", "c"))
+            .unwrap()
+            .columns["x"]
+            .ty = ty("bigint");
+        s
+    });
+    let own: Vec<usize> = (0..plan.changes.len()).collect();
+    assert_eq!(plan.verify(&own), []);
+    let retype = plan.at(|c| matches!(c, Change::AlterColumnType { column, .. } if column.table == t() && column.name == "a"));
+    for (drop, part) in [
+        (
+            plan.at(|c| matches!(c, Change::DropIndex { name, .. } if name == "ix_a")),
+            PartKey::Index("ix_a".into()),
+        ),
+        (
+            plan.at(|c| matches!(c, Change::DropUnique { name, .. } if name == "uq_a")),
+            PartKey::Unique("uq_a".into()),
+        ),
+        (
+            plan.at(|c| matches!(c, Change::DropForeignKey { name, .. } if name == "fk_x")),
+            PartKey::ForeignKey("fk_x".into()),
+        ),
+    ] {
+        let late = plan.verify(&plan.moved_after(drop, retype));
+        assert!(still_present(&late, &part), "{part:?}: {late:?}");
+    }
+}
+
+/// #1998 item 5, the other half: widening a `varchar` keeps its checks and
+/// indexes on SQL Server, so the retype requires none of them gone; a change
+/// of the base type does require the check gone.
+#[test]
+fn a_varchar_widening_requires_no_check_gone_and_a_base_type_change_does() {
+    let check_gone = |to: &str| {
+        let plan = Diffed::new(&retyped("int", "varchar(10)"), &retyped("int", to));
+        let own: Vec<usize> = (0..plan.changes.len()).collect();
+        assert_eq!(plan.verify(&own), [], "{to}");
+        let retype =
+            plan.at(|c| matches!(c, Change::AlterColumnType { column, .. } if column.name == "b"));
+        plan.effects[retype].requires.iter().any(|r| {
+            matches!(
+                r,
+                pbps_model::operation::Requirement::Absent(ObjectKey::Part {
+                    part: PartKey::Check(n),
+                    ..
+                }) if n == "ck_b"
+            )
+        })
+    };
+    assert!(!check_gone("varchar(20)"));
+    assert!(check_gone("nvarchar(10)"));
+}
+
+/// #1998 item 13: a check whose text names a computed column stands in the
+/// way of dropping it.
+#[test]
+fn dropping_a_computed_column_waits_for_a_check_that_names_it() {
+    let (mut schema, _, _, _) = setup();
+    schema.tables.get_mut(&t()).unwrap().checks.insert(
+        "ck_c".into(),
+        pbps_model::CheckConstraint {
+            expression: "c > 0".into(),
+        },
+    );
+    let mut after = schema.clone();
+    let table = after.tables.get_mut(&t()).unwrap();
+    table.checks.clear();
+    let computed = table.computed.remove("c").unwrap();
+    let plan = vec![
+        Change::DropCheck {
+            table: t(),
+            name: "ck_c".into(),
+        },
+        Change::DropComputedColumn {
+            table: t(),
+            name: "c".into(),
+            computed,
+        },
+    ];
+    let ordered = violations_from(&schema, &after, plan.clone(), &[0, 1]);
+    assert_eq!(ordered, []);
+    let early = violations_from(&schema, &after, plan, &[1, 0]);
+    assert!(
+        still_present(&early, &PartKey::Check("ck_c".into())),
+        "{early:?}"
+    );
+}
+
+/// #1998 item 8: an index over a computed column the plan adds follows the
+/// addition: the column has no uid, only its part of the table.
+#[test]
+fn an_index_over_a_computed_column_follows_its_addition() {
+    let (schema, _, _, _) = setup();
+    let computed = ComputedColumn {
+        expression: "a + 1".into(),
+        persisted: true,
+        not_null: false,
+    };
+    let index = pbps_model::Index {
+        columns: vec![pbps_model::IndexColumn::column("d")],
+        include: Vec::new(),
+        unique: false,
+        filter: None,
+        method: Default::default(),
+        storage_parameters: Default::default(),
+    };
+    let mut after = schema.clone();
+    let table = after.tables.get_mut(&t()).unwrap();
+    table.computed.insert("d".into(), computed.clone());
+    table.indexes.insert("ix_d".into(), index.clone());
+    let plan = vec![
+        Change::AddComputedColumn {
+            table: t(),
+            name: "d".into(),
+            computed,
+        },
+        Change::AddIndex {
+            table: t(),
+            name: "ix_d".into(),
+            index: Box::new(index),
+            clustered: false,
+        },
+    ];
+    assert_eq!(violations_from(&schema, &after, plan.clone(), &[0, 1]), []);
+    assert!(!violations_from(&schema, &after, plan, &[1, 0]).is_empty());
+}
+
+/// [`violations`] from `before` to `after`, under the setup's ids.
+fn violations_from(
+    before: &Schema,
+    after: &Schema,
+    logical: Vec<Change>,
+    order: &[usize],
+) -> Vec<Violation> {
+    let (_, ids, _, _) = setup();
+    let logical: Vec<PlannedChange> = logical.into_iter().map(PlannedChange::new).collect();
+    let ops = Operations::of_plan(&logical, ModuleEdits::InPlace);
+    let names = PlanNames::of(&logical, &ids).unwrap();
+    let owners = PlanOwners::new(names, &ids, &ids);
+    let (b, a) = (
+        Snapshot {
+            schema: before,
+            ids: &ids,
+        },
+        Snapshot {
+            schema: after,
+            ids: &ids,
+        },
+    );
+    let baseline = Baseline::of(b, &owners);
+    let shadowed = analyse(&ops, &owners, b, a, &Mssql);
+    let ordered = ops.reordered(order);
+    let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
+    pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
+}

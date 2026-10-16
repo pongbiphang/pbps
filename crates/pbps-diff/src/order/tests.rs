@@ -1205,6 +1205,19 @@ fn a_replica_identity_target_made_usable_by_the_plan_is_switched_to_last() {
         ),
         []
     );
+    // Negative (#1998 item 4): switched before the tightening, the identity
+    // would select an index over a nullable column.
+    assert!(
+        !run(
+            &ops,
+            &fx,
+            &baseline,
+            &[0, 1, 3, 2],
+            &ModuleDeps::new(),
+            Checks::ALL
+        )
+        .is_empty()
+    );
 }
 
 /// `t(id, n)` keyed by `id`, `n` nullable before and NOT NULL after.
@@ -2033,4 +2046,461 @@ fn each_edge_maps_to_one_sealed_reason_by_the_effect_behind_it() {
         of(Source::Catalog, Because::Writes(table)),
         OrderReason::Data
     );
+}
+
+// The effects #1998 found too narrow: each order below was verified clean
+// although the engine refuses it, or it runs to a different result.
+
+/// `t(id, n)` keyed by `id`, under the check `ck` the baseline and the
+/// desired state give as here, with one row `1` updated as `update` says.
+fn checked(was: &str, will: &str, update: pbps_model::Cell) -> Plan {
+    let table = |check: &str| {
+        let mut table = table_with(&["id", "n"]);
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        table.checks.insert(
+            "ck".into(),
+            pbps_model::CheckConstraint {
+                expression: check.into(),
+            },
+        );
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table(was));
+    after.tables.insert(t("t"), table(will));
+    let ids = Plan::ids(&["t"], &[("t", "id"), ("t", "n")]);
+    let mut logical = vec![p(Change::UpdateRow {
+        table: t("t"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        columns: [(
+            "n".to_owned(),
+            (pbps_model::Cell::Value(Value::Int(5)), update),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    })];
+    if was != will {
+        logical.insert(
+            0,
+            p(Change::DropCheck {
+                table: t("t"),
+                name: "ck".into(),
+            }),
+        );
+        logical.push(p(Change::AddCheck {
+            table: t("t"),
+            name: "ck".into(),
+            constraint: pbps_model::CheckConstraint {
+                expression: will.into(),
+            },
+        }));
+    }
+    Plan {
+        logical,
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    }
+}
+
+/// #1998 item 1: a check replaced under its own name stands in the way of a
+/// row the old one would refuse, as a dropped one does.
+#[test]
+fn a_row_update_waits_for_a_check_replaced_under_its_name_and_not_for_one_kept() {
+    let none = ModuleDeps::new();
+    let minus = pbps_model::Cell::Value(Value::Int(-1));
+    let plan = checked("n > 0", "n < 0", minus.clone());
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    // Drop, update, add: the row is written while no check stands.
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
+    // Negative: the update before the old check's drop.
+    let early = run(&ops, &fx, &baseline, &[1, 0, 2], &none, Checks::ALL);
+    assert!(
+        early.iter().any(|v| matches!(
+            v,
+            Violation::StillPresent {
+                key: ObjectKey::Part {
+                    part: pbps_model::operation::PartKey::Check(n),
+                    ..
+                },
+                ..
+            } if n == "ck"
+        )),
+        "{early:?}"
+    );
+    // A check the plan keeps is no obligation of the row's.
+    let kept = checked("n > 0", "n > 0", pbps_model::Cell::Value(Value::Int(7)));
+    let (_, fx, _) = kept.analysed(ModuleEdits::InPlace);
+    assert!(
+        !fx[0]
+            .requires
+            .iter()
+            .any(|r| matches!(r, Requirement::Absent(_))),
+        "{:?}",
+        fx[0].requires
+    );
+}
+
+/// #1998 item 1, the comparison the differ makes: a unique constraint over a
+/// column the plan renames, or one whose storage parameters alone change,
+/// is kept and not replaced, so a row written beside it waits for nothing.
+#[test]
+fn a_unique_constraint_kept_through_a_rename_or_a_parameter_change_is_not_replaced() {
+    let unique = |column: &str, fill: Option<&str>| pbps_model::UniqueConstraint {
+        columns: vec![column.into()],
+        storage_parameters: fill
+            .map(|f| [("fillfactor".to_owned(), f.to_owned())].into())
+            .unwrap_or_default(),
+    };
+    let requires_absent =
+        |was: pbps_model::UniqueConstraint, will: pbps_model::UniqueConstraint, renamed: bool| {
+            let table = |u: pbps_model::UniqueConstraint, n: &str| {
+                let mut table = table_with(&["id", n]);
+                table.unique.insert("u".into(), u);
+                table
+            };
+            let now = if renamed { "m" } else { "n" };
+            let (mut before, mut after) = (Schema::default(), Schema::default());
+            before.tables.insert(t("t"), table(was, "n"));
+            after.tables.insert(t("t"), table(will, now));
+            let column = uid(UidKind::Column, "t.n");
+            let ids = |name: &str| {
+                let mut ids = Plan::ids(&["t"], &[("t", "id")]);
+                ids.columns.insert(column.clone(), t("t").column(name));
+                ids
+            };
+            let plan = Plan {
+                logical: vec![row("t", "1")],
+                before,
+                after,
+                before_ids: ids("n"),
+                after_ids: ids(now),
+            };
+            let (_, fx, _) = plan.analysed(ModuleEdits::InPlace);
+            fx[0].requires.iter().any(|r| {
+                matches!(
+                    r,
+                    Requirement::Absent(ObjectKey::Part {
+                        part: pbps_model::operation::PartKey::Unique(_),
+                        ..
+                    })
+                )
+            })
+        };
+    assert!(!requires_absent(unique("n", None), unique("m", None), true));
+    assert!(!requires_absent(
+        unique("n", Some("70")),
+        unique("n", Some("90")),
+        false
+    ));
+    // Negative: one moved to another column is replaced.
+    assert!(requires_absent(
+        unique("n", None),
+        unique("id", None),
+        false
+    ));
+}
+
+/// #1998 item 2: `SET n = DEFAULT` writes the default the plan leaves, so it
+/// follows the step that installs it.
+#[test]
+fn a_row_updated_to_its_default_follows_the_default_it_takes() {
+    use pbps_model::ValueSource;
+    let mut plan = checked("n > 0", "n > 0", pbps_model::Cell::Default("3".into()));
+    plan.after
+        .tables
+        .get_mut(&t("t"))
+        .unwrap()
+        .columns
+        .get_mut("n")
+        .unwrap()
+        .value_source = ValueSource::Default("3".into());
+    plan.logical.insert(
+        0,
+        p(Change::AlterColumnDefault {
+            uid: uid(UidKind::Column, "t.n"),
+            column: t("t").column("n"),
+            from: None,
+            to: Some("3".into()),
+        }),
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // Negative: the update before the default is set.
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
+
+/// #1998 items 3 and 9: a new foreign key validates the child's values
+/// against the parent's rows, so it follows a parent row the plan inserts.
+#[test]
+fn a_foreign_key_added_follows_the_parent_rows_the_plan_writes() {
+    let parent = {
+        let mut table = table_with(&["id"]);
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        table
+    };
+    let key = ForeignKey {
+        columns: vec!["pid".into()],
+        references_table: t("p"),
+        references_columns: vec!["id".into()],
+        on_delete: ReferentialAction::default(),
+        on_update: ReferentialAction::default(),
+    };
+    let mut child = table_with(&["pid"]);
+    let mut before = Schema::default();
+    before.tables.insert(t("p"), parent.clone());
+    before.tables.insert(t("c"), child.clone());
+    child.foreign_keys.insert("fk".into(), key.clone());
+    let mut after = Schema::default();
+    after.tables.insert(t("p"), parent);
+    after.tables.insert(t("c"), child);
+    let ids = Plan::ids(&["p", "c"], &[("p", "id"), ("c", "pid")]);
+    let plan = Plan {
+        logical: vec![
+            p(Change::InsertRow {
+                table: t("p"),
+                key_column: "id".into(),
+                identity_key: false,
+                key: RowKey::from("1"),
+                row: [("id".to_owned(), Value::Int(1))]
+                    .into_iter()
+                    .collect::<Row>(),
+                defaults: Default::default(),
+                types: Default::default(),
+            }),
+            p(Change::AddForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+                constraint: Box::new(key),
+            }),
+        ],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // Negative: the key before the parent row it would check against.
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
+
+/// #1998 item 6: a key the baseline lacks, made and then ended by the plan,
+/// is gone after the ending: a step that needs the plan's instance cannot
+/// follow it.
+#[test]
+fn a_key_the_plan_makes_and_ends_is_not_found_after_its_ending() {
+    let (ops, fx, baseline) = attached_partition().analysed(ModuleEdits::InPlace);
+    let key = fx
+        .iter()
+        .flat_map(|e| e.creates.iter().chain(&e.removes))
+        .find_map(|r| match r {
+            Resource::Object(key, _) | Resource::Column(key) => {
+                (baseline.holds(key) == Some(false)).then(|| key.clone())
+            }
+        })
+        .expect("a key the plan makes and the baseline lacks");
+    let make = Effects {
+        creates: vec![Resource::Object(key.clone(), Incarnation::Final)],
+        ..Effects::default()
+    };
+    let end = Effects {
+        removes: vec![Resource::Object(key.clone(), Incarnation::Base)],
+        ..Effects::default()
+    };
+    let need = Effects {
+        requires: vec![Requirement::Is(key.clone(), Incarnation::Final)],
+        ..Effects::default()
+    };
+    let none = ModuleDeps::new();
+    let replay = |order: [usize; 3]| {
+        let fx = [make.clone(), end.clone(), need.clone()];
+        let at: Vec<usize> = order.to_vec();
+        let reordered = ops.reordered(&at);
+        let effects: Vec<Effects> = at.iter().map(|&i| fx[i].clone()).collect();
+        super::verify::verify_with(
+            reordered.as_slice(),
+            &effects,
+            &baseline,
+            &none,
+            Checks::ALL,
+        )
+    };
+    // Made, needed, ended.
+    assert!(
+        !replay([0, 2, 1])
+            .iter()
+            .any(|v| matches!(v, Violation::Unmet { .. })),
+        "{:?}",
+        replay([0, 2, 1])
+    );
+    // Negative: needed after its ending.
+    assert!(
+        replay([0, 1, 2]).iter().any(|v| matches!(
+            v,
+            Violation::Unmet {
+                requirement: Requirement::Is(k, Incarnation::Final),
+                ..
+            } if *k == key
+        )),
+        "{:?}",
+        replay([0, 1, 2])
+    );
+}
+
+/// #1998 item 7: a default dropped from a column the plan renames reads the
+/// column under the name it spells, so it stays on its side of the rename.
+#[test]
+fn a_default_dropped_by_the_old_name_runs_before_the_rename() {
+    let mut plan = renamed_default(None);
+    plan.logical = vec![
+        p(Change::AlterColumnDefault {
+            uid: uid(UidKind::Column, "t.a"),
+            column: t("t").column("a"),
+            from: Some("1".into()),
+            to: None,
+        }),
+        p(Change::RenameColumn {
+            uid: uid(UidKind::Column, "t.a"),
+            table: t("t"),
+            from: "a".into(),
+            to: "b".into(),
+            table_was: None,
+        }),
+    ];
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // Negative: renamed first, the drop would spell a name that is gone.
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
+
+/// #1998 item 10: a default turned into an identity is removed by a change
+/// of its own, and the numbering, whose `from` the differ gives as `None`,
+/// still goes after it.
+#[test]
+fn a_numbering_put_on_a_column_with_a_default_follows_the_default_s_removal() {
+    use pbps_model::{Identity, ValueSource};
+    let table = |source: ValueSource| {
+        let mut table = table_with(&[]);
+        let mut n = Column::new(int());
+        n.nullable = false;
+        n.value_source = source;
+        table.columns.insert("n".into(), n);
+        table
+    };
+    let identity = ValueSource::Identity(Identity::new(1, 1));
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before
+        .tables
+        .insert(t("t"), table(ValueSource::Default("0".into())));
+    after.tables.insert(t("t"), table(identity.clone()));
+    let ids = Plan::ids(&["t"], &[("t", "n")]);
+    let plan = Plan {
+        logical: vec![
+            p(Change::AlterColumnDefault {
+                uid: uid(UidKind::Column, "t.n"),
+                column: t("t").column("n"),
+                from: Some("0".into()),
+                to: None,
+            }),
+            p(Change::AlterColumnNumbering {
+                uid: uid(UidKind::Column, "t.n"),
+                column: t("t").column("n"),
+                ty: int(),
+                from: ValueSource::None,
+                to: identity,
+            }),
+        ],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // Negative: the identity put on while the default stands.
+    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+}
+
+/// #1998 item 4's limit: a column the plan creates NOT NULL is NOT NULL
+/// from its creation, which produces no NOT NULL fact, so a replica identity
+/// switched to an index over it requires none (#2111 review).
+#[test]
+fn a_replica_identity_switched_to_an_index_over_a_new_not_null_column_verifies_clean() {
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod, ReplicaIdentity};
+    let index = Index {
+        columns: vec![IndexColumn {
+            key: IndexKey::Column("a".into()),
+            descending: false,
+            opclass: None,
+        }],
+        include: vec![],
+        unique: true,
+        filter: None,
+        method: IndexMethod::Btree,
+        storage_parameters: Default::default(),
+    };
+    let mut a = Column::new(int());
+    a.nullable = false;
+    let mut will = table_with(&["id"]);
+    will.columns.insert("a".into(), a.clone());
+    will.indexes.insert("ix".into(), index.clone());
+    will.replica_identity = Some(ReplicaIdentity::Index("ix".into()));
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table_with(&["id"]));
+    after.tables.insert(t("t"), will);
+    let plan = Plan {
+        logical: vec![
+            p(Change::AddColumn {
+                uid: uid(UidKind::Column, "t.a"),
+                table: t("t"),
+                name: "a".into(),
+                column: Box::new(a),
+            }),
+            p(Change::AddIndex {
+                table: t("t"),
+                name: "ix".into(),
+                index: Box::new(index),
+                clustered: false,
+            }),
+            p(Change::SetReplicaIdentity {
+                uid: uid(UidKind::Table, "t"),
+                table: t("t"),
+                to: Some(ReplicaIdentity::Index("ix".into())),
+            }),
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(&["t"], &[("t", "id")]),
+        after_ids: Plan::ids(&["t"], &[("t", "id"), ("t", "a")]),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
+    // Negative: the switch before the index it selects.
+    assert!(!run(&ops, &fx, &baseline, &[0, 2, 1], &none, Checks::ALL).is_empty());
 }

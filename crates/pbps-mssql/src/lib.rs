@@ -62,7 +62,11 @@ impl Dialect for Mssql {
     /// - a computed column that may read a column stands in the way of
     ///   dropping, renaming or retyping it, or tightening it (15336, 4922);
     /// - a check or filtered index that may name a column stands in the way
-    ///   of dropping, renaming or retyping it (DECISIONS 474).
+    ///   of dropping or renaming it (DECISIONS 474), and a check that may
+    ///   name a computed column stands in the way of dropping that;
+    /// - what a retype, a collation change or a nullability change has to
+    ///   have out of its way, by the policy the differ rebuilds dependents by
+    ///   (`retype_blockers`, #1998).
     ///
     /// "May" by the lexer, which over-approximates: a false yes costs an edge,
     /// a false no costs an apply the engine refuses (DEC-1174.1).
@@ -78,7 +82,10 @@ impl Dialect for Mssql {
             PartKey, Requirement, base_table, base_table_named, final_table,
         };
         let mut fx =
-            pbps_dialect::engine_effects::text_dependents(self, op, owners, before, after, true)?;
+            pbps_dialect::engine_effects::text_dependents(self, op, owners, before, after, true)?
+                .merged(pbps_dialect::engine_effects::retype_blockers(
+                    self, op, owners, before, after,
+                )?);
         // A computed column the plan replaces under its own name with an
         // expression that no longer reads what the step changes does not
         // stand in its way: its baseline incarnation goes, and a requirement
@@ -138,6 +145,24 @@ impl Dialect for Mssql {
                         if reads(&computed.expression) && !replaced_off(&table, name, &reads) {
                             fx.requires.push(Requirement::Absent(
                                 table.part(PartKey::Computed(name.clone())),
+                            ));
+                        }
+                    }
+                }
+            }
+            // A check whose text may name a computed column stands in the
+            // way of dropping it, as it does an ordinary column's drop
+            // (ORDERING.md, #1998).
+            Change::DropComputedColumn { table, name, .. } => {
+                if let Some(base) = base_table(op, owners, before, table)? {
+                    let replaced = final_table(after, &base);
+                    for (check_name, check) in &base.table.checks {
+                        let off = replaced
+                            .and_then(|t| t.checks.get(check_name))
+                            .is_some_and(|c| !self.may_name(&c.expression, name));
+                        if !off && self.may_name(&check.expression, name) {
+                            fx.requires.push(Requirement::Absent(
+                                base.part(PartKey::Check(check_name.clone())),
                             ));
                         }
                     }
