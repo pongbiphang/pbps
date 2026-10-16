@@ -18320,6 +18320,80 @@ async fn a_rule_on_the_view_is_named_and_refused_because_the_rebuild_would_lose_
     drop_schema(&mut conn, &s).await;
 }
 
+/// A partitioned parent's row trigger the plan drops takes its clones out of
+/// the reference-data guard's widening scan too (#1632 review). Measured on
+/// 16 and 18, the clone goes with its parent's drop. Here a `SET NULL`
+/// action updates the partition, and the dropped `BEFORE UPDATE` row trigger
+/// would make the engine include every generated column; counted as standing,
+/// its clone did, and an `UPDATE OF` trigger on such a column, which the
+/// write never fires, was refused as unrecorded. Without the drop it is
+/// reached and refused, as it should be.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn a_dropped_parent_trigger_takes_its_clones_out_of_the_data_guards_widening() {
+    let s = emit_schema("guard_clone_gone");
+    let mut conn = TestDb::create("guard_clone_gone").await;
+    fresh(&mut conn, &s).await;
+    for sql in [
+        format!(
+            "CREATE FUNCTION {s}.tg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; \
+             END $$"
+        ),
+        format!("CREATE TABLE {s}.kinds (code text PRIMARY KEY)"),
+        format!(
+            "CREATE TABLE {s}.ev (region text NOT NULL, \
+             kind text REFERENCES {s}.kinds (code) ON DELETE SET NULL, \
+             g text GENERATED ALWAYS AS (upper(region)) STORED) PARTITION BY LIST (region)"
+        ),
+        format!("CREATE TABLE {s}.ev_a PARTITION OF {s}.ev FOR VALUES IN ('a')"),
+        format!(
+            "CREATE TRIGGER widen BEFORE UPDATE ON {s}.ev FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
+        ),
+        format!(
+            "CREATE TRIGGER watch AFTER UPDATE OF g ON {s}.ev_a FOR EACH ROW \
+             EXECUTE FUNCTION {s}.tg()"
+        ),
+    ] {
+        conn.execute(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    // Recorded as pulled, but for `watch`.
+    let mut baseline = pull(&mut conn).await.schema;
+    let watch: pbps_model::ModuleId = format!("{s}.ev_a.watch").parse().unwrap();
+    assert!(
+        baseline.modules.remove(&watch).is_some(),
+        "`watch` is pulled"
+    );
+    let writes = [pbps_dialect::RowWrite {
+        table: TableName::new(&s, "kinds"),
+        operation: pbps_dialect::RowOperation::Delete,
+    }];
+    let widen: pbps_model::ModuleId = format!("{s}.ev.widen").parse().unwrap();
+    let guarded = |dropped: Option<&pbps_model::ModuleId>| {
+        let mut gone = pbps_pg::data_triggers::Dropped::default();
+        gone.modules.extend(dropped.cloned());
+        gone
+    };
+    for (dropped, refused) in [(None, true), (Some(&widen), false)] {
+        conn.execute("BEGIN").await.unwrap();
+        let outcome =
+            pbps_pg::data_triggers::prepare(&mut conn, &writes, &baseline, &guarded(dropped)).await;
+        conn.execute("ROLLBACK").await.unwrap();
+        match outcome {
+            Err(e) => assert!(
+                refused && format!("{e:?}").contains("`watch`"),
+                "{dropped:?}: {e:?}"
+            ),
+            Ok(_) => assert!(
+                !refused,
+                "{dropped:?}: the unrecorded `watch` was let through"
+            ),
+        }
+    }
+    drop_schema(&mut conn, &s).await;
+}
+
 /// A trigger on a relation the table reader leaves out — a partitioned table
 /// it does not hold, a row-level-secured one — came back in the pull without the relation it is on, and
 /// `check_names` refused the whole schema: a pull nothing could load. Measured,

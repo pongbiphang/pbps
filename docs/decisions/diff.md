@@ -5874,7 +5874,11 @@ refused any trigger, since the reader could not hold a partition with one.
 leaves a clone out: its parent is the dependent, and the parent's drop and
 create take it. The reference-data trigger guard authenticates a clone a
 write reaches as its parent's trigger, by the parent's table, name and
-definition, while it locks to the clone's own oid.
+definition, and approves that parent trigger with it. Before each row
+statement it then accepts a clone whose parent trigger it approved, with the
+same routine, so a partition the plan adds or attaches before the write
+brings clones it accepts. A parent trigger the plan drops removes its clones
+from the guard's reach and from its widening scan alike.
 
 **The schema set stays.** A trigger module's file is unchanged; only which
 tables it may be on has widened.
@@ -5888,7 +5892,9 @@ the predicate, the clone mode, the clone filter, the held tree, the
 validation, the constraint-trigger row, the dependents walk, the data guard,
 the differ's attach rule or the attach pre-flight reverted. The live
 `a_table_is_attached_as_a_partition_through_the_cli` pins the pre-flight's
-count of a trigger under a parent's row trigger's name, and not of another.
+count of a trigger under a parent's row trigger's name, and not of another,
+and the live `a_dropped_parent_trigger_takes_its_clones_out_of_the_data_guards_widening`
+the widening scan's.
 Also pinned by the units
 `a_trigger_is_row_level_only_by_its_own_for_each_row`,
 `a_partitions_own_names_stay_clear_of_its_parents_cloned_triggers`,

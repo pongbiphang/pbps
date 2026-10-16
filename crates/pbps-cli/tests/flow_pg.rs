@@ -26938,6 +26938,40 @@ fn a_partition_trees_triggers_go_through_the_cli() {
     rows("    a: {label: A}\n");
     applied("cascade.json", &["--allow", "data-delete"]);
     assert_eq!(scalar(&tgt, "SELECT count(*) FROM app.kinds"), 1);
+
+    // A partition the same plan adds before the delete gets its clones under
+    // oids that did not exist when the guard authenticated the write; they
+    // are accepted as the parent's trigger, which it did (#1632 review).
+    rows("    a: {label: A}\n    c: {label: C}\n");
+    applied("c.json", &[]);
+    let tree_now = std::fs::read_to_string(&tree_path).unwrap();
+    let mut entry = Vec::new();
+    for line in tree_now.lines().skip_while(|l| !l.starts_with("  ev_a")) {
+        if !entry.is_empty() && !line.starts_with("    ") {
+            break;
+        }
+        entry.push(line);
+    }
+    let entry = format!("{}\n", entry.join("\n"));
+    let added = entry
+        .replace("ev_a", "ev_c")
+        .replace("[a]", "[c]")
+        .replace("\"a\"", "\"c\"");
+    assert_ne!(added, entry, "{entry}");
+    std::fs::write(
+        &tree_path,
+        tree_now.replace(&entry, &format!("{entry}{added}")),
+    )
+    .unwrap();
+    rows("    a: {label: A}\n");
+    applied("partition_and_cascade.json", &["--allow", "data-delete"]);
+    assert_eq!(
+        (
+            triggers_on("app.ev_c", true),
+            scalar(&tgt, "SELECT count(*) FROM app.kinds")
+        ),
+        (2, 1)
+    );
 }
 
 /// A partition's own foreign keys round-trip through the CLI (#1632): created

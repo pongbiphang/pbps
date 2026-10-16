@@ -81,6 +81,14 @@ pub async fn prepare(
                 return Err(refused(&trigger, &write.table));
             }
             guard.approved.insert(trigger.oid, trigger.function_oid);
+            // A clone is authenticated as its parent's trigger, so that
+            // trigger is approved too: a partition this plan creates or
+            // attaches before the row statement gets a clone of it under
+            // an oid that did not exist here, which `check` accepts by it
+            // (#1632 review).
+            if let Some(parent) = trigger.parent_oid {
+                guard.approved.insert(parent, trigger.function_oid);
+            }
         }
     }
     Ok(guard)
@@ -101,7 +109,9 @@ pub async fn settle(conn: &mut Conn) -> Result<(), DbError> {
 /// or renamed table. The lock stays held through that statement's transaction.
 pub async fn check(conn: &mut Conn, write: &RowWrite, guard: &Guard) -> Result<(), DbError> {
     for trigger in reachable(conn, write, &Dropped::default()).await? {
-        if guard.approved.get(&trigger.oid) != Some(&trigger.function_oid) || !trigger.trusted_owner
+        let approved = |oid: i64| guard.approved.get(&oid) == Some(&trigger.function_oid);
+        if !(approved(trigger.oid) || trigger.parent_oid.is_some_and(approved))
+            || !trigger.trusted_owner
         {
             return Err(refused(&trigger, &write.table));
         }
@@ -119,6 +129,8 @@ fn event(operation: &RowOperation) -> i16 {
 
 struct Trigger {
     oid: i64,
+    /// The parent's row trigger this is a clone of, on a partition (#1632).
+    parent_oid: Option<i64>,
     table: TableName,
     function_oid: i64,
     name: String,
@@ -401,12 +413,20 @@ fn gone_triggers(dropped: &Dropped, namespace: &str, relation: &str, trigger: &s
             // silently matched.
             ModuleId::Named(_) | ModuleId::Routine(_) => None,
         })
+        // A clone of a partitioned parent's row trigger goes with the
+        // parent's, under its name, so the parent's drop removes it too,
+        // measured on 16 and 18 (#1632).
         .map(|(on, name)| {
+            let (schema, table, name) = (literal(&on.schema), literal(&on.name), literal(name));
             format!(
-                "({namespace}.nspname = {} AND {relation}.relname = {} AND {trigger}.tgname = {})",
-                literal(&on.schema),
-                literal(&on.name),
-                literal(name)
+                "(({namespace}.nspname = {schema} AND {relation}.relname = {table} \
+                   AND {trigger}.tgname = {name}) \
+                  OR ({trigger}.tgparentid <> 0 AND {trigger}.tgname = {name} AND EXISTS ( \
+                      SELECT 1 FROM pg_catalog.pg_trigger gone_parent \
+                      JOIN pg_catalog.pg_class gone_rel ON gone_rel.oid = gone_parent.tgrelid \
+                      JOIN pg_catalog.pg_namespace gone_ns ON gone_ns.oid = gone_rel.relnamespace \
+                      WHERE gone_parent.oid = {trigger}.tgparentid \
+                        AND gone_ns.nspname = {schema} AND gone_rel.relname = {table})))"
             )
         })
         .collect();
@@ -490,6 +510,7 @@ async fn read_triggers(
         .query(&format!(
             "{ctes}
              SELECT t.oid::int8 AS oid, t.tgfoid::int8 AS function_oid,
+                    pt.oid::int8 AS parent_oid,
                     COALESCE(pn.nspname, n.nspname) AS schema_name,
                     COALESCE(pc.relname, c.relname) AS table_name,
                     COALESCE(pt.tgname, t.tgname) AS name,
@@ -537,6 +558,7 @@ async fn read_triggers(
         .map(|r| {
             Ok(Trigger {
                 oid: r.try_get("oid")?.ok_or_else(missing)?,
+                parent_oid: r.try_get("parent_oid")?,
                 table: TableName::new(
                     r.try_get::<&str>("schema_name")?.ok_or_else(missing)?,
                     r.try_get::<&str>("table_name")?.ok_or_else(missing)?,
