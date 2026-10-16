@@ -41,6 +41,13 @@
 //! is a leaf: nothing a role can write is behind it. The set is closed by
 //! reading, not by listing the kinds of object that might lead somewhere else.
 //!
+//! Every CHECK of every domain on the path counts, but only the declared type's
+//! own DEFAULT does: `ADD COLUMN` evaluates the column type's default and no
+//! other, so the default of a domain that type is made of, or that an expression
+//! names, never runs (a domain over another is created with a copy of that
+//! one's default, which is then its own). Measured on 16 and 18, and pinned by
+//! a live test; counting them all would refuse plans that run nothing.
+//!
 //! # Why the node trees, not `pg_depend`
 //!
 //! The engine's own record of what an expression calls is `pg_depend`, and it
@@ -225,7 +232,7 @@ pub enum Why {
 pub enum Part {
     /// A CHECK constraint of a domain, by name.
     Check { constraint: String },
-    /// A domain's DEFAULT.
+    /// The declared domain's own DEFAULT.
     Default,
 }
 
@@ -767,6 +774,15 @@ async fn gather(
             .filter(|t| t.typtype == "d" && !is_builtin(t.oid))
             .collect();
         for domain in &domains {
+            // Only the declared type's own DEFAULT is evaluated: `ADD COLUMN`
+            // reads the column's type for one, and a domain it is made of, or
+            // that an expression names, contributes its CHECKs and never its
+            // DEFAULT (measured on 16 and 18). A domain created over another
+            // takes a copy of that one's default at creation, so what the
+            // declared domain would have inherited is already its own.
+            if domain.oid != root {
+                continue;
+            }
             if let Some(text) = &domain.default {
                 runs_code = true;
                 let used_by = Use {

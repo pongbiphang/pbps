@@ -405,6 +405,16 @@ async fn user_code_on_the_input_path_is_refused_by_name_wherever_it_sits() {
             for wrapper in &wrappers {
                 let what = format!("app.{wrapper} on {label}");
                 let path = gate(&mut me, &[], wrapper).await;
+                // A DEFAULT runs only for the declared type: a domain over the
+                // default's domain has a copy of it, and a composite, an array
+                // or a range holding that domain does not run it at all.
+                if case.default && wrapper != n && wrapper != &format!("nest_{n}") {
+                    assert!(
+                        !admitted(&path, &what),
+                        "{what}: the nested DEFAULT is not evaluated"
+                    );
+                    continue;
+                }
                 let all = refused(&path, &what);
                 let hits: Vec<&RoutineReason> = routines(all)
                     .into_iter()
@@ -509,6 +519,93 @@ async fn a_type_an_expression_names_is_on_the_input_path() {
         assert_eq!(owners[0].ty, "app.owned_by_stranger");
         assert_eq!(owners[0].owner, stranger);
         assert_eq!(owners[0].actor, stranger);
+        drop(me);
+        db.drop().await;
+    }
+}
+
+/// `ADD COLUMN` evaluates the declared type's own DEFAULT and no other: a
+/// domain it is made of contributes its CHECKs (measured on 16 and 18), so a
+/// nested domain's DEFAULT that calls a user function does not refuse a type
+/// that never runs it, and one the declared domain copied at creation does.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn only_the_declared_types_own_default_is_on_the_input_path() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "gdefault").await;
+        let (_, mut me) = deployer(&mut db).await;
+        let label = server.label;
+        run(
+            &mut me,
+            label,
+            "CREATE FUNCTION app.boom_d() RETURNS integer LANGUAGE plpgsql
+                 AS $$ BEGIN RAISE EXCEPTION 'boom default ran'; END $$;
+             CREATE FUNCTION app.boom_c(integer) RETURNS boolean LANGUAGE plpgsql
+                 AS $$ BEGIN RAISE EXCEPTION 'boom check ran'; END $$;
+             -- the outer default shadows the inner one
+             CREATE DOMAIN app.s_inner AS integer DEFAULT 5;
+             ALTER DOMAIN app.s_inner SET DEFAULT app.boom_d();
+             CREATE DOMAIN app.s_outer AS app.s_inner DEFAULT 1;
+             -- a composite and an array hold a domain whose default is a user function
+             CREATE DOMAIN app.p_inner AS integer DEFAULT app.boom_d();
+             CREATE TYPE app.p_comp AS (v app.p_inner);
+             CREATE DOMAIN app.p_arr AS app.p_inner[];
+             -- the outer was created before the inner had a default
+             CREATE DOMAIN app.l_inner AS integer;
+             CREATE DOMAIN app.l_outer AS app.l_inner;
+             ALTER DOMAIN app.l_inner SET DEFAULT app.boom_d();
+             -- the outer copied the inner default
+             CREATE DOMAIN app.cp_inner AS integer DEFAULT app.boom_d();
+             CREATE DOMAIN app.cp_outer AS app.cp_inner;
+             -- a nested domain's CHECK does run
+             CREATE DOMAIN app.k_inner AS integer CHECK (app.boom_c(VALUE));
+             CREATE DOMAIN app.k_outer AS app.k_inner DEFAULT 1;",
+        )
+        .await;
+        // The engine runs none of the nested defaults (the same statements,
+        // with the same domains, on a table that holds rows).
+        run(
+            &mut me,
+            label,
+            "CREATE TABLE app.rows (i integer);
+             INSERT INTO app.rows VALUES (1), (2);
+             ALTER TABLE app.rows ADD COLUMN a app.s_outer;
+             ALTER TABLE app.rows ADD COLUMN b app.p_comp;
+             ALTER TABLE app.rows ADD COLUMN c app.p_arr;
+             ALTER TABLE app.rows ADD COLUMN d app.l_outer;",
+        )
+        .await;
+        for (name, sql) in [
+            ("cp_outer", "ALTER TABLE app.rows ADD COLUMN e app.cp_outer"),
+            ("k_outer", "ALTER TABLE app.rows ADD COLUMN f app.k_outer"),
+        ] {
+            let err = me.execute(sql).await.expect_err("the user code must run");
+            assert!(err.to_string().contains("boom"), "{name} on {label}: {err}");
+        }
+        // And the gate says the same.
+        for name in ["s_outer", "p_comp", "p_arr", "l_outer"] {
+            let path = gate(&mut me, &[], name).await;
+            let ran = admitted(&path, &format!("{name} on {label}"));
+            // `s_outer` has a default of its own (a literal); the rest have none.
+            assert_eq!(ran, name == "s_outer", "{name} on {label}");
+        }
+        for (name, ty, part) in [
+            ("cp_outer", "app.cp_outer", Part::Default),
+            (
+                "k_outer",
+                "app.k_inner",
+                Part::Check {
+                    constraint: "k_inner_check".to_owned(),
+                },
+            ),
+        ] {
+            let path = gate(&mut me, &[], name).await;
+            let all = refused(&path, name);
+            let hits = routines(all);
+            assert_eq!(hits.len(), 1, "{name} on {label}: {all:?}");
+            assert_eq!(hits[0].used_by.ty, ty, "{name} on {label}");
+            assert_eq!(hits[0].used_by.part, part, "{name} on {label}");
+        }
         drop(me);
         db.drop().await;
     }
@@ -1105,22 +1202,31 @@ async fn reading_the_gate_runs_none_of_the_types_code() {
              CREATE TYPE app.holds AS (t app.trap);",
         )
         .await;
-        for name in ["trap", "holds"] {
+        // The declared domain runs its CHECK and its DEFAULT; a composite
+        // holding it runs the CHECK and never the DEFAULT.
+        for (name, expected) in [
+            ("trap", vec!["app.boom(integer)", "app.boom_default()"]),
+            ("holds", vec!["app.boom(integer)"]),
+        ] {
             let path = gate(&mut me, &[], name).await;
             let all = refused(&path, name);
             let identities: BTreeSet<&str> =
                 routines(all).iter().map(|r| r.identity.as_str()).collect();
             assert_eq!(
                 identities,
-                BTreeSet::from(["app.boom(integer)", "app.boom_default()"]),
+                expected.into_iter().collect::<BTreeSet<_>>(),
                 "{name} on {label}"
             );
-            // Where each sits.
             let parts: BTreeSet<bool> = routines(all)
                 .iter()
                 .map(|r| matches!(r.used_by.part, Part::Default))
                 .collect();
-            assert_eq!(parts, BTreeSet::from([false, true]));
+            let want: BTreeSet<bool> = if name == "trap" {
+                BTreeSet::from([false, true])
+            } else {
+                BTreeSet::from([false])
+            };
+            assert_eq!(parts, want, "{name} on {label}");
         }
         drop(me);
         db.drop().await;
