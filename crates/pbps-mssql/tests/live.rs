@@ -1087,6 +1087,31 @@ impl TestDb {
     }
 }
 
+/// Drops a server login once the server has finished with its last session.
+///
+/// A client that drops its connection returns before the server tears the
+/// session down, so an immediate `DROP LOGIN` can be refused with 15434 ("the
+/// user is currently logged in") although the login is about to be free
+/// (#2006). The refusal is retried, and only that code is: any other error is
+/// the caller's to see at once. The code is matched, never the localized text.
+/// The login's sessions are waited out rather than `KILL`ed, which would
+/// reach a session this test did not close. The wait is bounded, so a session
+/// that is really held still surfaces as the 15434 it is.
+async fn drop_login_when_idle(conn: &mut Conn, login: &str) -> Result<(), pbps_db::DbError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match conn.execute(&format!("DROP LOGIN [{login}];")).await {
+            Err(error)
+                if error.server_error_code().as_deref() == Some("15434")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Emits and executes every change of a plan, in plan order.
 async fn apply(conn: &mut Conn, cs: &pbps_model::ChangeSet) {
     for p in &cs.changes {
