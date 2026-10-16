@@ -2941,6 +2941,54 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
         .collect()
 }
 
+/// The role walk of DEC-1663.1, as the common table expressions `me`, `here`,
+/// `others`, `walk` and `reach`, to follow a `WITH RECURSIVE`.
+///
+/// `others` is every role that is neither trusted nor below OID 16384: not a
+/// superuser, not able to `SET ROLE` to the current role, not able to `SET ROLE`
+/// to a superuser, and not named in `declared`. `reach` holds, for each of
+/// them, every role it can act as or administer, itself included, by
+/// memberships granted with `SET`, `INHERIT` or `ADMIN` (with `ADMIN` it can
+/// grant the role with `SET` to one of its own). A role is not asked about
+/// pair by pair with `pg_has_role`, which took seconds over a few hundred
+/// roles (#1707).
+///
+/// `declared` is a SQL expression of type `text[]`: the roles a human has
+/// declared trusted (the input-path gate's `trusted_roles`, #2046). It is the
+/// caller's to bind, and every name in it must be a role that exists: an
+/// absent one trusts nothing and is the caller's error to raise.
+pub(crate) fn untrusted_role_walk(declared: &str) -> String {
+    format!(
+        "me AS (
+                 SELECT r.oid FROM pg_catalog.pg_roles r
+                  WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER),
+             here AS (
+                 SELECT db.oid, db.datdba FROM pg_catalog.pg_database db
+                  WHERE db.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()),
+             others AS (
+                 SELECT r.oid, r.rolname FROM pg_catalog.pg_roles r
+                  WHERE r.oid OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid
+                    AND NOT r.rolsuper
+                    AND r.rolname::pg_catalog.text OPERATOR(pg_catalog.<>) ALL ({declared})
+                    AND NOT pg_catalog.pg_has_role(r.oid, (SELECT oid FROM me), 'SET')
+                    AND NOT EXISTS (
+                        SELECT FROM pg_catalog.pg_roles su
+                         WHERE su.rolsuper
+                           AND pg_catalog.pg_has_role(r.oid, su.oid, 'SET'))),
+             walk AS (
+                 SELECT o.oid AS origin, o.oid FROM others o
+                 UNION
+                 SELECT w.origin, m.roleid FROM pg_catalog.pg_auth_members m
+                   JOIN walk w ON w.oid OPERATOR(pg_catalog.=) m.member
+                  WHERE m.set_option OR m.inherit_option OR m.admin_option),
+             reach AS (
+                 SELECT origin, oid FROM walk
+                 UNION
+                 SELECT w.origin, 'pg_database_owner'::pg_catalog.regrole::pg_catalog.oid
+                   FROM walk w JOIN here ON here.datdba OPERATOR(pg_catalog.=) w.oid)"
+    )
+}
+
 /// The roles other than this one or a superuser that can change this
 /// database's catalog, and so what a default's parse reaches, between the
 /// probe's read and its store (#1707). Listing the dangerous kinds of object
@@ -2965,33 +3013,8 @@ async fn enabled_ddl_event_triggers(conn: &mut Conn) -> Result<Vec<String>, DbEr
 /// their members, so `pg_database_owner` counts only under another owner.
 async fn untrusted_catalog_writers(conn: &mut Conn) -> Result<Vec<String>, DbError> {
     let rows = conn
-        .query(
-            "WITH RECURSIVE me AS (
-                 SELECT r.oid FROM pg_catalog.pg_roles r
-                  WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER),
-             here AS (
-                 SELECT db.oid, db.datdba FROM pg_catalog.pg_database db
-                  WHERE db.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()),
-             others AS (
-                 SELECT r.oid, r.rolname FROM pg_catalog.pg_roles r
-                  WHERE r.oid OPERATOR(pg_catalog.>=) 16384::pg_catalog.oid
-                    AND NOT r.rolsuper
-                    AND NOT pg_catalog.pg_has_role(r.oid, (SELECT oid FROM me), 'SET')
-                    AND NOT EXISTS (
-                        SELECT FROM pg_catalog.pg_roles su
-                         WHERE su.rolsuper
-                           AND pg_catalog.pg_has_role(r.oid, su.oid, 'SET'))),
-             walk AS (
-                 SELECT o.oid AS origin, o.oid FROM others o
-                 UNION
-                 SELECT w.origin, m.roleid FROM pg_catalog.pg_auth_members m
-                   JOIN walk w ON w.oid OPERATOR(pg_catalog.=) m.member
-                  WHERE m.set_option OR m.inherit_option OR m.admin_option),
-             reach AS (
-                 SELECT origin, oid FROM walk
-                 UNION
-                 SELECT w.origin, 'pg_database_owner'::pg_catalog.regrole::pg_catalog.oid
-                   FROM walk w JOIN here ON here.datdba OPERATOR(pg_catalog.=) w.oid)
+        .query(&format!(
+            "WITH RECURSIVE {walk}
              SELECT DISTINCT pg_catalog.format('`%I`', o.rolname) AS name
                FROM others o
                JOIN reach r ON r.origin OPERATOR(pg_catalog.=) o.oid
@@ -3011,7 +3034,11 @@ async fn untrusted_catalog_writers(conn: &mut Conn) -> Result<Vec<String>, DbErr
                          WHERE NOT pg_catalog.pg_is_other_temp_schema(n.oid)
                            AND pg_catalog.has_schema_privilege(r.oid, n.oid, 'CREATE'))
               ORDER BY 1",
-        )
+            // No role is trusted by declaration here: this is the catalog
+            // probe's own question, and `pbps.yml`'s list is the input-path
+            // gate's alone (#2046).
+            walk = untrusted_role_walk("ARRAY[]::pg_catalog.text[]"),
+        ))
         .await?;
     // `typname` is NOT NULL; a NULL read still counts as a domain, never as
     // none.

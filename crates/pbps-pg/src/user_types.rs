@@ -720,7 +720,7 @@ pub async fn read(conn: &mut Conn, within: Within, references: &[TypeRef]) -> Ve
 
 /// `REPEATABLE READ`, so the lookup, the definition and the closure of one
 /// type come from one snapshot of the catalog tables.
-const OWN_TRANSACTION: TransactionFraming = TransactionFraming {
+pub(crate) const OWN_TRANSACTION: TransactionFraming = TransactionFraming {
     begin: std::borrow::Cow::Borrowed("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;"),
     commit: std::borrow::Cow::Borrowed("COMMIT;"),
     rollback: std::borrow::Cow::Borrowed("ROLLBACK;"),
@@ -990,7 +990,7 @@ struct Catalog {
 }
 
 /// An OID list as SQL. The values are integers this module read, never text.
-fn oid_array(oids: &[Oid]) -> String {
+pub(crate) fn oid_array(oids: &[Oid]) -> String {
     let list: Vec<String> = oids.iter().map(Oid::to_string).collect();
     format!("ARRAY[{}]::pg_catalog.oid[]", list.join(", "))
 }
@@ -1555,7 +1555,10 @@ async fn owners(conn: &mut Conn, ids: &BTreeSet<Oid>) -> Result<BTreeMap<Oid, Ow
 }
 
 /// A column that is never NULL where it is read. A NULL is a failed read.
-fn need<'a, T: pbps_db::FromColumn<'a>>(row: &'a Row, column: &str) -> Result<T, DbError> {
+pub(crate) fn need<'a, T: pbps_db::FromColumn<'a>>(
+    row: &'a Row,
+    column: &str,
+) -> Result<T, DbError> {
     row.try_get::<T>(column)?
         .ok_or_else(|| DbError::BadRow(format!("column `{column}` is unexpectedly NULL")))
 }
