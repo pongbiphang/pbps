@@ -3219,6 +3219,15 @@ inventory as `db_owner` (#619).**
   (`docs/RESOLVER-MSSQL.md` §7), measured from a pristine installation of
   the pinned build, identical on Developer and Express. A table or user
   added to `model` appears in the next database.
+  - It is read per securable class the engine reports in
+    `sys.fn_builtin_permissions`, 24 on the pinned build, each from its own
+    catalog. A class with no known catalog refuses.
+  - The objects that are no securable are read too: partition functions
+    and schemes, plan guides, event notifications, audit specifications,
+    files.
+  - A list of catalogs written by hand misses what `sys.objects` never
+    holds, such as a master key, a certificate, an asymmetric key or a
+    partition scheme.
 - **The check reads as `db_owner`.** Metadata visibility shows a non-owner
   no user object where one exists, so its "empty" is hidden, not absent. The
   supplied account must be `db_owner` of its database, and a check that
@@ -3232,7 +3241,8 @@ inventory as `db_owner` (#619).**
 `a_database_list_without_view_any_database_hides_the_target_and_says_so`,
 `a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`,
 `a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`,
-`a_database_born_from_model_holds_only_the_fresh_install_inventory` and
+`a_database_born_from_model_holds_only_the_fresh_install_inventory`,
+`a_database_holds_securables_no_object_catalog_lists` and
 `an_account_that_is_not_db_owner_cannot_see_what_its_database_holds`.
 
 <a id="dec-619-4"></a>

@@ -294,8 +294,31 @@ fresh-install inventory
   or database DDL trigger, and no database-scoped configuration away from its
   default.
 
-#723's check compares the newborn database with this inventory, before any
-scratch write. A table or user added to `model` appears in the next
+**How the inventory is read.** Not from a hand-written list of catalogs. A
+database holds things `sys.objects` never lists: a master key, a
+certificate, an asymmetric key, and a partition function and scheme each
+live only in their own catalog [`a_database_holds_securables_no_object_catalog_lists`].
+
+- **Securable classes.** The read takes one catalog per database-scoped
+  securable class the engine reports in `sys.fn_builtin_permissions`. On the
+  pinned build there are 24, from `APPLICATION ROLE` to
+  `XML SCHEMA COLLECTION`. Each catalog is compared with its fresh-install
+  rows, and the system broker objects a new database carries are among
+  them. A class with no known catalog refuses by name, so a class a later
+  build adds is refused until it is read.
+- **Objects that are no securable.** These are read from their catalogs
+  too:
+  - partition functions and schemes;
+  - plan guides;
+  - event notifications;
+  - database audit specifications;
+  - the database's filegroups and files.
+
+  The engine names no list of these, so this is the one part written by
+  hand.
+
+#723's check compares the newborn database with this inventory, read so,
+before any scratch write. A table or user added to `model` appears in the next
 `CREATE DATABASE`, measured on #619.
 
 The check reads as the database's `db_owner`. Metadata visibility hides what

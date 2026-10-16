@@ -1905,6 +1905,86 @@ async fn the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_r
     db.drop().await;
 }
 
+/// A database holds things `sys.objects` never lists: a master key, a
+/// certificate, an asymmetric key, a partition function and scheme each live
+/// in their own catalog only. So the inventory cannot be a list of catalogs
+/// written by hand. It reads one catalog per database-scoped securable class
+/// the engine reports in `sys.fn_builtin_permissions`, and a class with no
+/// known catalog refuses; this pins the classes the pinned build reports, so
+/// a build that adds one fails here first.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_database_holds_securables_no_object_catalog_lists() {
+    let mut db = TestDb::create("securables619").await;
+    assert_eq!(
+        texts(
+            &mut db.conn,
+            "SELECT DISTINCT CONVERT(nvarchar(60), class_desc) FROM sys.fn_builtin_permissions(DEFAULT) \
+             WHERE class_desc NOT IN (N'SERVER', N'ENDPOINT', N'LOGIN', N'SERVER ROLE', N'AVAILABILITY GROUP') \
+             ORDER BY 1;"
+        )
+        .await,
+        [
+            "APPLICATION ROLE",
+            "ASSEMBLY",
+            "ASYMMETRIC KEY",
+            "CERTIFICATE",
+            "CONTRACT",
+            "CREDENTIAL",
+            "DATABASE",
+            "DATABASE SCOPED CREDENTIAL",
+            "EXTERNAL LANGUAGE",
+            "EXTERNAL MODEL",
+            "FULLTEXT CATALOG",
+            "FULLTEXT STOPLIST",
+            "MESSAGE TYPE",
+            "OBJECT",
+            "REMOTE SERVICE BINDING",
+            "ROLE",
+            "ROUTE",
+            "SCHEMA",
+            "SEARCH PROPERTY LIST",
+            "SERVICE",
+            "SYMMETRIC KEY",
+            "TYPE",
+            "USER",
+            "XML SCHEMA COLLECTION"
+        ]
+    );
+    let held = "SELECT CONVERT(bigint, (SELECT COUNT(*) FROM sys.symmetric_keys) * 10000 \
+         + (SELECT COUNT(*) FROM sys.certificates) * 1000 \
+         + (SELECT COUNT(*) FROM sys.asymmetric_keys) * 100 \
+         + (SELECT COUNT(*) FROM sys.partition_functions) * 10 \
+         + (SELECT COUNT(*) FROM sys.partition_schemes));";
+    assert_eq!(
+        number(&mut db.conn, held).await,
+        0,
+        "a fresh database holds none"
+    );
+    run(
+        &mut db.conn,
+        &[
+            "CREATE MASTER KEY ENCRYPTION BY PASSWORD = N'Pbps!Master619x';",
+            "CREATE CERTIFICATE pbps619_cert WITH SUBJECT = N'pbps';",
+            "CREATE ASYMMETRIC KEY pbps619_key WITH ALGORITHM = RSA_2048;",
+            "CREATE PARTITION FUNCTION pbps619_pf (int) AS RANGE LEFT FOR VALUES (1);",
+            "CREATE PARTITION SCHEME pbps619_ps AS PARTITION pbps619_pf ALL TO ([PRIMARY]);",
+        ],
+    )
+    .await;
+    assert_eq!(
+        number(
+            &mut db.conn,
+            "SELECT COUNT_BIG(*) FROM sys.objects WHERE is_ms_shipped = 0;"
+        )
+        .await,
+        0,
+        "none of them is an object"
+    );
+    assert_eq!(number(&mut db.conn, held).await, 11111);
+    db.drop().await;
+}
+
 /// SQL Server has no `DROP OWNED`, so cleanup drops what the inventory read
 /// finds beyond the fresh-install inventory, in dependency order. A database
 /// role is one of those objects: `DROP ROLE` refuses while the role has a
