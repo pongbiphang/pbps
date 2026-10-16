@@ -212,12 +212,17 @@ pub fn carried(
             owner: table.map(|t| t.table_key()),
             column,
         };
-        // A step that drops or moves the occupant's table, or drops its
+        // A step that moves or drops the occupant's table, or drops its
         // column, takes it away on every engine. The other column changes
         // `leaves` reads as freeing it may not: a column rename keeps a
-        // PostgreSQL sequence's name (review of #2119). So a certain step
-        // decides where there is one, and a possible one only where there is
-        // none.
+        // PostgreSQL sequence's name (review of #2119). A table has at most
+        // one move or drop, and a column one drop, so the step that frees
+        // the occupant's own name is decided by kind, not by position: its
+        // table's move, which carries it out of the schema whatever its
+        // column does after; else its table's drop; else its column's drop;
+        // else the one step that may. A column dropped before the move frees
+        // the name earlier still, so the edge holds the claim longer than it
+        // must, and never too short.
         let possible: Vec<usize> = operations
             .iter()
             .zip(&keys)
@@ -227,22 +232,16 @@ pub fn carried(
             })
             .map(|(i, _)| i)
             .collect();
-        let certain: Vec<usize> = possible
+        let ranked: [&dyn Fn(usize) -> bool; 3] = [
+            &|i| moves(&operations[i], keys[i].as_ref(), &who),
+            &|i| matches!(operations[i].change(), Change::DropTable { .. }),
+            &|i| matches!(operations[i].change(), Change::DropColumn { .. }),
+        ];
+        let steps: Vec<usize> = ranked
             .iter()
-            .copied()
-            .filter(|&i| {
-                moves(&operations[i], keys[i].as_ref(), &who)
-                    || matches!(
-                        operations[i].change(),
-                        Change::DropTable { .. } | Change::DropColumn { .. }
-                    )
-            })
-            .collect();
-        let steps = if certain.is_empty() {
-            possible
-        } else {
-            certain
-        };
+            .map(|kind| possible.iter().copied().filter(|&i| kind(i)).collect())
+            .find(|steps: &Vec<usize>| !steps.is_empty())
+            .unwrap_or_else(|| possible.clone());
         let [step] = steps[..] else { continue };
         // As in the replay, an occupant the step takes out of its schema
         // does not land anywhere: a default renamed with its table's move.

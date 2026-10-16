@@ -878,3 +878,46 @@ fn a_certain_step_decides_beside_a_column_change_that_only_may() {
         .collect();
     assert_eq!(found, [(1, 0)]);
 }
+
+/// Review of #2119, round 2: a drop of the sequence's column after its
+/// table's move frees the name the sequence landed on, not its own. The
+/// move still decides the handover of its own name: a table's move ranks
+/// before its column's drop, by kind.
+#[test]
+fn a_tables_move_frees_its_occupant_before_a_later_drop_of_its_column() {
+    let column_uid = Uid::derived(UidKind::Column, "s2.b.id", 0);
+    let mut plan = Plan::new(
+        &[("a", "s1.a"), ("b", "s2.b")],
+        &[("a", "s2.a"), ("b", "s3.b")],
+        vec![
+            rename_table("a", "s1.a", "s2.a"),
+            rename_table("b", "s2.b", "s3.b"),
+            Change::DropColumn {
+                uid: column_uid.clone(),
+                column: name("s3.b").column("id"),
+            },
+        ],
+    );
+    plan.before
+        .tables
+        .get_mut(&name("s2.b"))
+        .unwrap()
+        .columns
+        .insert("id".into(), pbps_model::Column::new("int".parse().unwrap()));
+    plan.before_ids
+        .columns
+        .insert(column_uid, name("s2.b").column("id"));
+    let facts = CatalogFacts {
+        occupants: vec![
+            occupant("s1.a_id_seq", "s1.a", None),
+            occupant("s2.a_id_seq", "s2.b", Some("id")),
+        ],
+        ..CatalogFacts::default()
+    };
+    let found: Vec<(usize, usize)> = plan
+        .handovers(&Slotted { exact: true }, &facts)
+        .into_iter()
+        .map(|e| (e.before, e.after))
+        .collect();
+    assert_eq!(found, [(1, 0)]);
+}

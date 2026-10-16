@@ -5998,13 +5998,22 @@ kinds of holder:
   its name from the start, and the plan takes it away at the step that drops
   or moves its table, or drops, renames, retypes or re-defaults its column, as
   DEC-1964.2's replay reads it. Carried to another schema, it takes the name
-  it lands on there. A step that drops or moves its table, or drops its
+  it lands on there. A step that moves or drops its table, or drops its
   column, takes it away on every engine. The other column changes only may:
-  a column rename keeps a PostgreSQL sequence's name. So a certain step
-  decides where there is one (review of #2119). With none, an occupant that
-  two steps may take away, a column given another default and then renamed,
-  has no step the evidence fixes, and so no edge. Which one frees it is the
-  engine's walk to say.
+  a column rename keeps a PostgreSQL sequence's name. A table has at most one
+  move or drop, and a column one drop, so the step that frees the occupant's
+  own name is decided by kind, not position (review of #2119):
+  1. its table's move, which carries it out of the schema whatever its
+     column does after;
+  2. else its table's drop;
+  3. else its column's drop;
+  4. else the one step that may.
+
+  A column dropped before the move frees the name earlier still, so the edge
+  holds the claim longer than it must, never too short. With no certain step,
+  an occupant that two steps may take away, a column given another default
+  and then renamed, has no step the evidence fixes, and so no edge. Which one
+  frees it is the engine's walk to say.
 - **A move passing through a name** between its two statements (`SET SCHEMA`
   before `RENAME TO`, `TRANSFER` before `sp_rename`) holds it for that step
   alone: it waits for the name's first holder, and the last holder waits for
@@ -6023,7 +6032,8 @@ name the same fault twice.
 
 Pinned by `a_catalog_occupant_hands_its_name_to_what_its_owners_move_lands_there`,
 `an_occupant_two_steps_may_free_is_ordered_by_neither`,
-`a_certain_step_decides_beside_a_column_change_that_only_may` and
+`a_certain_step_decides_beside_a_column_change_that_only_may`,
+`a_tables_move_frees_its_occupant_before_a_later_drop_of_its_column` and
 `a_move_waits_for_what_frees_the_name_it_passes_through`. The existing
 `only_the_first_and_last_holders_of_a_name_are_ordered_by_evidence` pins that
 two claims with no evidence between them are not ordered by position.
