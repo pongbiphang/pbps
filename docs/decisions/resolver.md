@@ -3072,9 +3072,11 @@ and `the_apply_transaction_reads_its_own_ddl_and_does_not_lock_out_another_write
 <a id="dec-619-2"></a>
 
 **DEC-619.2. On SQL Server a one-part name in a module body that is not
-schema-bound is runtime-bound: its candidates are the name in the module's
-schema and in `dbo`, of every object type, and the resolver reports what a
-plan-created object captures instead of deciding a rebuild (#619).**
+schema-bound is runtime-bound: an object reference's candidates are the name
+in the module's schema and in `dbo`, of every object type, a procedure
+call's are the executing principal's default schema and `dbo` unless `sys`
+holds the name, and the resolver reports what a plan-created object captures
+instead of deciding a rebuild (#619).**
 
 PostgreSQL binds a view's relation reference at creation, so a rebuild
 decision exists there. SQL Server does not:
@@ -3086,8 +3088,15 @@ decision exists there. SQL Server does not:
   `sys.sql_expression_dependencies.referenced_id` for a one-part name is
   resolved when the catalog is read: it follows an arrival without a compile
   and returns after a drop. `dm_sql_referenced_entities` reports no schema.
-- **The path is the module's schema, then `dbo`.** Neither the caller's
-  default schema nor `EXECUTE AS` changes it.
+- **An object reference's path is the module's schema, then `dbo`.**
+  Neither the caller's default schema nor `EXECUTE AS` changes it.
+- **A procedure call's path is `sys`, then the default schema of the
+  principal the module executes as, then `dbo`.** It is never the module's
+  schema.
+  - A system procedure is never captured.
+  - A module without a fixed `EXECUTE AS` can run as any database
+    principal, so every principal's default schema is a candidate.
+  - Those default schemas enter the manifest.
 - **Every object type occupies the name.** A scalar function arriving under
   a table's name breaks the view (208), rather than being passed over.
 
@@ -3123,6 +3132,7 @@ The rest is fixed as follows:
 
 **Pinned by** `an_arrival_in_a_modules_own_schema_rebinds_its_one_part_names_and_no_other_arrival_does`,
 `a_modules_one_part_names_resolve_in_its_schema_and_a_statements_in_the_users`,
+`a_procedure_call_in_a_module_resolves_in_sys_then_the_executing_users_schema`,
 `the_dependency_catalog_resolves_a_one_part_name_when_it_is_read`,
 `schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not`,
 `a_modules_set_options_are_fixed_when_it_is_created` and

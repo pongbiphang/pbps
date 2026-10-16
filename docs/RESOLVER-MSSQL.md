@@ -25,6 +25,7 @@ what they resolve to now, not what they resolved to when they were created.
 | Surface | Bound | Recorded |
 |---|---|---|
 | A one-part name in a view, function, procedure or trigger body that is not schema-bound | When it runs: the module's schema, then `dbo` | `sys.sql_expression_dependencies`, `referenced_id` resolved when the catalog is read [`the_dependency_catalog_resolves_a_one_part_name_when_it_is_read`] |
+| A one-part procedure name in an `EXEC` in such a body | When it runs: `sys`, then the default schema of the principal the module executes as, then `dbo`; never the module's schema [`a_procedure_call_in_a_module_resolves_in_sys_then_the_executing_users_schema`] | The same |
 | A two-part name in such a body | The named object, by name | The same, by name |
 | A `WITH SCHEMABINDING` view or function's references (two-part names required) | At creation, by id; the engine refuses to alter or drop the target | `is_schema_bound_reference = 1` with `referenced_id` [`schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not`] |
 | A function a computed column, DEFAULT or CHECK calls (two-part names required) | At creation, by id; schema-bound | The same |
@@ -42,9 +43,22 @@ pbps manages no CLR-typed column, so the reference is read as the function.
 
 ## 2. Name resolution
 
-- **Inside a module** a one-part name looks in the module's own schema, then
-  in `dbo`. Neither the caller's default schema nor `EXECUTE AS` changes it
+- **Inside a module** a one-part object name looks in the module's own
+  schema, then in `dbo`. Neither the caller's default schema nor `EXECUTE AS`
+  changes it
   [`a_modules_one_part_names_resolve_in_its_schema_and_a_statements_in_the_users`].
+- **A procedure call is the exception**
+  [`a_procedure_call_in_a_module_resolves_in_sys_then_the_executing_users_schema`].
+  A one-part name in an `EXEC` inside a module looks in this order:
+  - first in `sys`, so a system procedure is never captured, even by a
+    same-name procedure in the module's schema or `dbo`;
+  - then in the default schema of the principal the module executes as:
+    the caller, or the module's `EXECUTE AS` principal;
+  - then in `dbo`.
+
+  It never looks in the module's schema. `app.calls` running `EXEC q` runs
+  `dbo.q` for a caller whose default schema is `dbo`, though `app.q` exists,
+  and `other.q` for a caller whose default schema is `other`.
 - **Outside a module**, in the statement that creates a table or a module, a
   one-part name looks in the executing user's default schema, then in `dbo`.
   A column typed `amount` lands on `a.amount` for a deployer whose default
@@ -65,9 +79,20 @@ pbps manages no CLR-typed column, so the reference is read as the function.
 
 **Consequence for the resolver.** A one-part reference in a body that is not
 schema-bound is **runtime-bound**. Rebuilding the module cannot pin it, so
-there is no rebuild decision to make for it. Its candidates are the same name
-in the module's schema and in `dbo`, of any object type. Both enter the
-manifest, and the resolver reports what each plan-created object captures:
+there is no rebuild decision to make for it. Its candidates enter the
+manifest:
+
+- **An object reference:** the same name in the module's schema and in
+  `dbo`, of any object type.
+- **A procedure call:** none if `sys` holds a procedure of that name.
+  Otherwise the name in `dbo` and in the default schema of each principal
+  the module can execute as.
+  - A module with a fixed `EXECUTE AS` has that one principal.
+  - Any other module has every database principal, since anyone may call it.
+  - The principals' default schemas enter the manifest with them, because
+    `ALTER USER … WITH DEFAULT_SCHEMA` moves the call.
+
+The resolver reports what each plan-created object captures:
 
 - an object the plan creates that captures a **managed** module's reference
   is reported as that module's binding change, with no statement;
@@ -465,8 +490,11 @@ Fixture names are the tests #620 adds.
 ## #620's four sub-issues
 
 - **(a) Capture and ownership.**
-  - The candidate reads of §2: the module's schema and `dbo`, every object
-    type.
+  - The candidate reads of §2:
+    - for an object reference, the module's schema and `dbo`, every object
+      type;
+    - for a procedure call, the executing principals' default schemas and
+      `dbo`, unless `sys` holds the name.
   - The bindings of §1, with `VIEW DEFINITION` required.
   - Ownership from the start, sealed under the environment key.
   - Plain component reads, compared (DEC-619.1).

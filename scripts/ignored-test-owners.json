@@ -861,6 +861,7 @@
       "cases": [
         "binding619::an_arrival_in_a_modules_own_schema_rebinds_its_one_part_names_and_no_other_arrival_does",
         "binding619::a_modules_one_part_names_resolve_in_its_schema_and_a_statements_in_the_users",
+        "binding619::a_procedure_call_in_a_module_resolves_in_sys_then_the_executing_users_schema",
         "binding619::the_dependency_catalog_resolves_a_one_part_name_when_it_is_read",
         "binding619::schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not",
         "binding619::a_modules_set_options_are_fixed_when_it_is_created",

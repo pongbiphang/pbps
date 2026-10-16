@@ -302,6 +302,77 @@ async fn a_modules_one_part_names_resolve_in_its_schema_and_a_statements_in_the_
     db.drop().await;
 }
 
+/// A one-part procedure name in an `EXEC` inside a module does not follow a
+/// one-part object name. It looks in `sys` first, so a system procedure is
+/// never captured. Then it looks in the default schema of the principal the
+/// module executes as: the caller, or its `EXECUTE AS` principal. Then `dbo`.
+/// It never looks in the module's own schema, while a table in the same body
+/// does.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_procedure_call_in_a_module_resolves_in_sys_then_the_executing_users_schema() {
+    let mut db = TestDb::create("proccall619").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE SCHEMA other;",
+            "CREATE SCHEMA own;",
+            "CREATE USER u_other WITHOUT LOGIN WITH DEFAULT_SCHEMA = other;",
+            "CREATE USER u_own WITHOUT LOGIN WITH DEFAULT_SCHEMA = own;",
+            "GRANT EXECUTE TO u_other; GRANT EXECUTE TO u_own; GRANT SELECT TO u_other;",
+            "CREATE PROCEDURE dbo.q AS SELECT CONVERT(nvarchar(20), N'dbo.q') AS ran;",
+            "CREATE PROCEDURE app.q AS SELECT CONVERT(nvarchar(20), N'app.q') AS ran;",
+            "CREATE PROCEDURE other.q AS SELECT CONVERT(nvarchar(20), N'other.q') AS ran;",
+            "CREATE PROCEDURE own.q AS SELECT CONVERT(nvarchar(20), N'own.q') AS ran;",
+            "CREATE TABLE dbo.t (which nvarchar(20)); INSERT dbo.t VALUES (N'dbo.t');",
+            "CREATE TABLE app.t (which nvarchar(20)); INSERT app.t VALUES (N'app.t');",
+            "CREATE PROCEDURE app.calls AS EXEC q;",
+            "CREATE PROCEDURE app.calls_as_own WITH EXECUTE AS N'u_own' AS EXEC q;",
+            "CREATE PROCEDURE app.reads AS SELECT which FROM t;",
+            "CREATE PROCEDURE app.calls_system AS BEGIN \
+             DECLARE @r TABLE (id int, name nvarchar(128), value nvarchar(255)); \
+             INSERT @r EXEC sp_server_info 1; SELECT name FROM @r; END;",
+            "CREATE PROCEDURE app.sp_server_info @a int = 0 AS SELECT 1, N'app', N'app';",
+            "CREATE PROCEDURE dbo.sp_server_info @a int = 0 AS SELECT 1, N'dbo', N'dbo';",
+        ],
+    )
+    .await;
+    assert_eq!(
+        text(&mut db.conn, "EXEC app.calls;").await,
+        "dbo.q",
+        "dbo's default schema, not the module's, though app.q exists"
+    );
+    assert_eq!(text(&mut db.conn, "EXEC app.reads;").await, "app.t");
+    assert_eq!(text(&mut db.conn, "EXEC app.calls_as_own;").await, "own.q");
+    assert_eq!(
+        text(&mut db.conn, "EXEC app.calls_system;").await,
+        "DBMS_NAME",
+        "a same-name procedure in the module's schema or dbo captured a system procedure"
+    );
+    run(&mut db.conn, &["EXECUTE AS USER = N'u_other';"]).await;
+    assert_eq!(text(&mut db.conn, "EXEC app.calls;").await, "other.q");
+    assert_eq!(
+        text(&mut db.conn, "EXEC app.calls_as_own;").await,
+        "own.q",
+        "the module's EXECUTE AS principal decides, not the caller"
+    );
+    assert_eq!(
+        text(&mut db.conn, "EXEC app.reads;").await,
+        "app.t",
+        "a table reference stays in the module's schema"
+    );
+    run(&mut db.conn, &["REVERT;", "DROP PROCEDURE other.q;"]).await;
+    run(&mut db.conn, &["EXECUTE AS USER = N'u_other';"]).await;
+    assert_eq!(
+        text(&mut db.conn, "EXEC app.calls;").await,
+        "dbo.q",
+        "without one in the caller's schema the call falls to dbo, never app"
+    );
+    run(&mut db.conn, &["REVERT;"]).await;
+    db.drop().await;
+}
+
 /// The dependency catalog stores no creation-time binding for a one-part
 /// name: `referenced_id` is resolved when the view is read, so an arrival
 /// moves it without any compile and a drop moves it back. A capture reads
