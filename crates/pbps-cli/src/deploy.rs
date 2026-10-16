@@ -5044,11 +5044,18 @@ pub fn cmd_baseline(
                 StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
             );
             snapshot.module_deps = loaded.hints.module_deps.clone();
+            // The note on what was removed rides on the reason only where
+            // the bounded column has room for both: it never turns a reason
+            // that fits into a record that fails after the removal committed.
+            // The removal was printed either way.
+            let noted = format!("{reason} (first removed {})", removed.join(", "));
             snapshot.reason = Some(
-                if removed.is_empty() {
+                if removed.is_empty()
+                    || crate::engine::truncate_reason(conn.driver(), &noted) != noted
+                {
                     reason.to_string()
                 } else {
-                    format!("{reason} (first removed {})", removed.join(", "))
+                    noted
                 }
                 .into(),
             );

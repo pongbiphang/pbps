@@ -6215,7 +6215,9 @@ the namespace a table's constraints share.
   validated CHECK for `--resume`, whose last statement drops it.
 - *Abandoning goes through `baseline`.* Leon chose this route. `baseline`
   first drops a CHECK named after a table's identity in the project's ids
-  file, on that table, and its recorded reason says what it removed. It asks
+  file, on that table, and its recorded reason says what it removed where
+  the bounded `reason` column holds both; a reason that fits only on its own
+  is kept whole, and the removal is printed either way. It asks
   the ledger nothing: a run that dies between the `ADD` and the `VALIDATE`'s
   checkpoint records neither a checkpoint nor a failure, and `baseline` is
   the remedy for an entry this build cannot read (DECISIONS 203).

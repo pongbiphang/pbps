@@ -9927,7 +9927,10 @@ fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
              CHECK (ts >= DATE '2024-01-01') NOT VALID"
         ),
     );
-    let o = succeeds(d.run(&["baseline", "--db", &connection, "--reason", "the run died"]));
+    // A reason the column holds only on its own keeps its own text: the
+    // note is left out rather than overflowing the record.
+    let full = format!("the run died{}", ".".repeat(988));
+    let o = succeeds(d.run(&["baseline", "--db", &connection, "--reason", &full]));
     assert!(
         stdout(&o).contains(&format!(
             "Removed the staged attach's temporary CHECK `{name}`"
@@ -9936,6 +9939,13 @@ fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
         stdout(&o)
     );
     assert_eq!(temporaries(), 0);
+    assert_eq!(
+        latest_snapshot(&connection)
+            .reason
+            .map(pbps_model::Text::into_raw)
+            .unwrap_or_default(),
+        full
+    );
 
     // B'': the same, under a newest entry this build cannot read. `baseline`
     // is that entry's remedy (DECISIONS 203), so the CHECK is found by the
@@ -9965,7 +9975,10 @@ fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
         stdout(&o)
     );
     assert_eq!(temporaries(), 0);
-    let reason = latest_snapshot(&connection).reason.unwrap_or_default();
+    let reason = latest_snapshot(&connection)
+        .reason
+        .map(pbps_model::Text::into_raw)
+        .unwrap_or_default();
     assert_eq!(
         reason,
         format!(
