@@ -1812,7 +1812,10 @@ impl Dialect for Postgres {
         use pbps_model::Change;
         use pbps_model::operation::{Incarnation, PartKey, Resource, base_table};
         let mut fx =
-            pbps_dialect::engine_effects::text_dependents(self, op, owners, before, after, false)?;
+            pbps_dialect::engine_effects::text_dependents(self, op, owners, before, after, false)?
+                .merged(pbps_dialect::engine_effects::retype_blockers(
+                    self, op, owners, before, after,
+                )?);
         if let Change::RenameTable { from, to, .. } = op.change()
             && from.schema != to.schema
             && let Some(base) = base_table(op, owners, before, from)?

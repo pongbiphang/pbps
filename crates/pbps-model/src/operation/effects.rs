@@ -523,8 +523,12 @@ impl Cx<'_> {
                 // And a plain default is dropped before a source goes on:
                 // measured on 16 and 18, an identity on a column with a
                 // default is refused.
-                if matches!(from, ValueSource::Default(_)) && !matches!(to, ValueSource::Default(_))
-                {
+                // The differ removes that default in a change of its own and
+                // gives this one `from: None`, so the baseline says whether
+                // there was one (#1998).
+                let had_default = matches!(from, ValueSource::Default(_))
+                    || self.base_default(&owner, &key).is_some();
+                if had_default && !matches!(to, ValueSource::Default(_)) {
                     self.requires(Requirement::Absent(ObjectKey::Default(key)));
                 }
             }
@@ -560,6 +564,10 @@ impl Cx<'_> {
                         Self::part(&owner, part.clone()),
                         Incarnation::Final,
                     ));
+                    // An index is usable as the identity only over NOT NULL
+                    // columns, so a tightening that makes it so goes first
+                    // (#1998).
+                    self.identity_columns_not_null(&owner, part);
                 }
                 // And the old identity's index stays until the identity
                 // moves: the drop reads it as it is now.
@@ -709,6 +717,11 @@ impl Cx<'_> {
                 }
                 let referenced = self.table(&constraint.references_table)?;
                 self.exists(ObjectKey::Table(referenced.clone()));
+                // It validates the child's values against the referenced
+                // rows, so it follows every write of them too (#1998).
+                if referenced != owner {
+                    self.requires_valid_data(&referenced);
+                }
                 for c in &constraint.references_columns {
                     self.requires_column(&constraint.references_table, c, false);
                 }
@@ -816,10 +829,23 @@ impl Cx<'_> {
                 self.row_meets_constraints(&owner, table, &written);
                 let mut cells: Vec<(&str, &Value)> = Vec::new();
                 for (c, (from, to)) in columns {
-                    if let crate::Cell::Value(v) = to {
-                        cells.push((c.as_str(), v));
-                        if v.is_null() {
-                            self.row_needs_nullable(&owner, table, c);
+                    match to {
+                        crate::Cell::Value(v) => {
+                            cells.push((c.as_str(), v));
+                            if v.is_null() {
+                                self.row_needs_nullable(&owner, table, c);
+                            }
+                        }
+                        // `SET c = DEFAULT` writes the default the plan
+                        // leaves, as an insert that omits the column does
+                        // (#1998).
+                        crate::Cell::Default(_) => {
+                            if let Ok(column) = self.column(&table.column(c.as_str())) {
+                                self.requires(Requirement::Is(
+                                    ObjectKey::Default(column),
+                                    Incarnation::Final,
+                                ));
+                            }
                         }
                     }
                     let _ = from;
@@ -946,6 +972,16 @@ impl Cx<'_> {
     /// adds nothing.
     fn requires_column(&mut self, table: &TableName, column: &str, strict: bool) {
         let Ok(key) = self.column(&table.column(column)) else {
+            // A SQL Server computed column has no column uid, only its part
+            // of the table: an index or key over one needs that part (#1998).
+            if let Ok(owner) = self.table(table)
+                && [self.final_of(&owner), self.base_of(&owner)]
+                    .into_iter()
+                    .flatten()
+                    .any(|(_, t)| t.computed.contains_key(column))
+            {
+                self.exists(Self::part(&owner, PartKey::Computed(column.to_owned())));
+            }
             return;
         };
         self.exists(ObjectKey::Column(key.clone()));
@@ -956,6 +992,45 @@ impl Cx<'_> {
             && will.columns.get(&now).is_some_and(|c| !c.nullable)
         {
             self.exists(Self::not_null(key));
+        }
+    }
+
+    /// The NOT NULL of each column of the identity's target, where the plan
+    /// leaves the column NOT NULL: produced by a tightening when the plan
+    /// makes it, held by the baseline otherwise.
+    fn identity_columns_not_null(&mut self, owner: &Recorded, part: &PartKey) {
+        let Some((name, will)) = self.final_of(owner) else {
+            return;
+        };
+        let columns: Vec<String> = match part {
+            PartKey::PrimaryKey => will
+                .primary_key
+                .as_ref()
+                .map(|pk| pk.columns.clone())
+                .unwrap_or_default(),
+            PartKey::Unique(n) => will
+                .unique
+                .get(n)
+                .map(|u| u.columns.clone())
+                .unwrap_or_default(),
+            PartKey::Index(n) => will
+                .indexes
+                .get(n)
+                .map(|i| {
+                    i.columns
+                        .iter()
+                        .filter_map(|c| c.key.column().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            PartKey::ForeignKey(_) | PartKey::Check(_) | PartKey::Computed(_) => Vec::new(),
+        };
+        for c in columns {
+            if will.columns.get(&c).is_some_and(|c| !c.nullable)
+                && let Some(key) = self.final_column(&name.column(c.as_str()))
+            {
+                self.exists(Self::not_null(key));
+            }
         }
     }
 
@@ -1273,6 +1348,42 @@ impl Cx<'_> {
         Some((was.name.clone(), will.name.clone()))
     }
 
+    /// The plan's renames that bring the baseline's `table` forward, as the
+    /// differ brings it before comparing its constraints
+    /// (`Renames::apply`): of its own columns, of the columns its foreign keys
+    /// reference, of a partition's parent's columns, and of those tables. Read
+    /// from the two identity files, by uid.
+    fn renames_of(&self, name: &TableName, table: &Table) -> crate::rename::Renames {
+        let mut renames = crate::rename::Renames::default();
+        let mut tables: Vec<&TableName> = vec![name];
+        tables.extend(table.foreign_keys.values().map(|fk| &fk.references_table));
+        if let Some(of) = &table.partition_of {
+            tables.push(&of.parent);
+        }
+        for t in tables {
+            let Some(uid) = self.owners.table(t, Spelling::Base).ok() else {
+                continue;
+            };
+            if let Some(now) = self.after.ids.tables.get(&uid)
+                && now != t
+            {
+                renames.rename_table(t.clone(), now.clone());
+            }
+            let Some(base) = self.before.schema.tables.get(t) else {
+                continue;
+            };
+            for c in base.columns.keys() {
+                if let Some(key) = self.base_column(&t.column(c.as_str()))
+                    && let Some((was, now)) = self.names_of(&key)
+                    && was != now
+                {
+                    renames.rename_column(t.column(was.as_str()), now);
+                }
+            }
+        }
+        renames
+    }
+
     /// Whether the plan takes the column's default away: the baseline has one
     /// and the desired state has a different one or none.
     fn default_goes(&self, owner: &Recorded, column: &ColumnKey) -> bool {
@@ -1287,6 +1398,19 @@ impl Cx<'_> {
             _ => None,
         };
         default(was, &was_name).is_some() && default(was, &was_name) != default(will, &will_name)
+    }
+
+    /// The plain default the baseline gives the column, if any.
+    fn base_default(&self, owner: &Recorded, column: &ColumnKey) -> Option<&str> {
+        let (_, was) = self.base_of(owner)?;
+        let (was_name, _) = self.names_of(column)?;
+        match &was.columns.get(&was_name)?.value_source {
+            ValueSource::Default(d) => Some(d.as_str()),
+            ValueSource::None
+            | ValueSource::Identity(_)
+            | ValueSource::Sequence(_)
+            | ValueSource::Generated(_) => None,
+        }
     }
 
     /// Whether the plan tightens the column to NOT NULL.
@@ -1335,27 +1459,48 @@ impl Cx<'_> {
     }
 
     /// A row meets the constraints the plan leaves it under, so those it takes
-    /// away go first.
+    /// away go first: dropped, or replaced under the same name, which the old
+    /// one's drop ends as surely (#1998). A constraint the plan keeps is
+    /// compared as the differ compares it, through the plan's renames and
+    /// without its storage parameters, which change in place (DEC-1442.1): one
+    /// the differ does not rebuild must not be required gone, or the plan that
+    /// keeps it is refused (DEC-1998.1).
     fn row_meets_constraints(&mut self, owner: &Recorded, _table: &TableName, written: &[&str]) {
-        let (Some((_, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner)) else {
+        let (Some((base_name, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner))
+        else {
             return;
         };
+        let forward = self.renames_of(base_name, was).apply(was, base_name);
         let mut gone = Vec::new();
-        for n in was.checks.keys().filter(|n| !will.checks.contains_key(*n)) {
-            gone.push(Self::part(owner, PartKey::Check(n.clone())));
+        for (n, check) in &was.checks {
+            if will.checks.get(n) != Some(check) {
+                gone.push(Self::part(owner, PartKey::Check(n.clone())));
+            }
         }
-        for n in was.unique.keys().filter(|n| !will.unique.contains_key(*n)) {
-            gone.push(Self::part(owner, PartKey::Unique(n.clone())));
+        let unique_bare = |u: &crate::UniqueConstraint| {
+            let mut u = u.clone();
+            u.storage_parameters.clear();
+            u
+        };
+        for (n, unique) in &forward.unique {
+            if will.unique.get(n).map(unique_bare) != Some(unique_bare(unique)) {
+                gone.push(Self::part(owner, PartKey::Unique(n.clone())));
+            }
         }
-        for n in was
-            .foreign_keys
-            .keys()
-            .filter(|n| !will.foreign_keys.contains_key(*n))
-        {
-            gone.push(Self::part(owner, PartKey::ForeignKey(n.clone())));
+        for (n, fk) in &forward.foreign_keys {
+            if will.foreign_keys.get(n) != Some(fk) {
+                gone.push(Self::part(owner, PartKey::ForeignKey(n.clone())));
+            }
         }
-        for (n, index) in &was.indexes {
-            if (index.unique || index.filter.is_some()) && !will.indexes.contains_key(n) {
+        let index_bare = |i: &crate::Index| {
+            let mut i = i.clone();
+            i.storage_parameters.clear();
+            i
+        };
+        for (n, index) in &forward.indexes {
+            if (index.unique || index.filter.is_some())
+                && will.indexes.get(n).map(index_bare) != Some(index_bare(index))
+            {
                 gone.push(Self::part(owner, PartKey::Index(n.clone())));
             }
         }

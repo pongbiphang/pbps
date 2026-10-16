@@ -2870,18 +2870,14 @@ fn recreate_retyped_dependents(
             to_collation,
             ..
         } => {
-            let mut dependents = dialect.retype_dependents(from, to);
-            if from_collation != to_collation {
-                also(&mut dependents, dialect.recollate_dependents());
-            }
             // A nullability change in the same statement brings its own
             // blockers, which a type change alone may not have (#1363).
-            if from_nullable != to_nullable {
-                also(
-                    &mut dependents,
-                    dialect.nullability_dependents(*to_nullable),
-                );
-            }
+            let dependents = pbps_dialect::RetypeDependents::of_retype(
+                dialect,
+                (from, to),
+                from_collation != to_collation,
+                (from_nullable != to_nullable).then_some(*to_nullable),
+            );
             Some((column.clone(), dependents))
         }
         Change::AlterColumnNullability {

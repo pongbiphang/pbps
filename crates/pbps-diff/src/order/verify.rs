@@ -155,7 +155,15 @@ pub(crate) fn verify_with(
             if let Resource::Object(key, _) = resource {
                 let s = replay.entry(key.clone()).or_insert_with(|| start(key));
                 if checks.incarnations {
-                    s.base = false;
+                    // A removal ends the instance that stands: the
+                    // baseline's while it does, and otherwise the one the
+                    // plan made, which a later `Is(Final)` must not then
+                    // find (#1998).
+                    if s.base {
+                        s.base = false;
+                    } else {
+                        s.plan = false;
+                    }
                 } else {
                     s.base = false;
                     s.plan = false;

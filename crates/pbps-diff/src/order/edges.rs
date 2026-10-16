@@ -411,6 +411,20 @@ pub fn graph(
                     }
                 }
                 Requirement::Is(_, Incarnation::Base) => {
+                    // A rename of what it reads moves the address it spells,
+                    // so it is ordered by that name as any reader is
+                    // (DEC-1954.4, #1998). Another rewrite is not: the
+                    // baseline's instance is read whatever the plan does to
+                    // it in place.
+                    if !own_rewrite {
+                        for &a in rewriters.iter().filter(|&&a| renames(&operations[a])) {
+                            if reads_before(&operations[b], &operations[a]) {
+                                edge(b, a, Source::Effect, Because::Rewrites(key.clone()));
+                            } else {
+                                edge(a, b, Source::Effect, Because::Rewrites(key.clone()));
+                            }
+                        }
+                    }
                     for &a in removers {
                         edge(b, a, Source::Effect, Because::Removes(key.clone()));
                     }
