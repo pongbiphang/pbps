@@ -1574,7 +1574,8 @@
         "input_path_tests::a_read_that_fails_is_unreadable_and_never_admitted",
         "input_path_tests::every_function_on_the_runs_sql_list_exists_is_built_in_and_runs_what_it_is_given",
         "input_path_tests::reading_the_gate_runs_none_of_the_types_code",
-        "input_path_tests::only_the_declared_types_own_default_is_on_the_input_path"
+        "input_path_tests::only_the_declared_types_own_default_is_on_the_input_path",
+        "input_path_tests::a_default_the_statement_carries_replaces_the_domains_and_its_checks_still_run"
       ]
     },
     {

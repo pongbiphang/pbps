@@ -11,7 +11,7 @@ use super::user_types_tests::{Scratch, servers};
 use super::*;
 use pbps_model::TypeRef;
 use pbps_pg::input_path::{
-    self, InputPath, OwnerReason, Part, Reason, RoutineKind, RoutineReason, Unreadable, Why,
+    self, Added, InputPath, OwnerReason, Part, Reason, RoutineKind, RoutineReason, Unreadable, Why,
 };
 use pbps_pg::pins::Within;
 use pbps_pg::user_types::{self, TypeRead, UserType};
@@ -38,9 +38,9 @@ async fn gate_all(conn: &mut Conn, trusted: &[&str], names: &[(&str, &str)]) -> 
             }
         })
         .collect();
-    let refs: Vec<&UserType> = types.iter().collect();
+    let columns: Vec<Added<'_>> = types.iter().map(|t| Added::new(t, false)).collect();
     let trusted: Vec<String> = trusted.iter().map(|t| (*t).to_owned()).collect();
-    input_path::read(conn, Within::OwnTransaction, &trusted, &refs).await
+    input_path::read(conn, Within::OwnTransaction, &trusted, &columns).await
 }
 
 async fn gate(conn: &mut Conn, trusted: &[&str], name: &str) -> InputPath {
@@ -228,7 +228,13 @@ async fn built_in_code_on_a_type_the_deployer_owns_is_admitted() {
         let TypeRead::Present(short) = &t[0] else {
             panic!("{:?}", t[0])
         };
-        let inside = input_path::read(&mut me, Within::CallersTransaction, &[], &[short]).await;
+        let inside = input_path::read(
+            &mut me,
+            Within::CallersTransaction,
+            &[],
+            &[Added::new(short, false)],
+        )
+        .await;
         assert!(admitted(&inside[0], "app.short in a transaction"));
         let during = me.query("SHOW search_path").await.unwrap();
         assert_eq!(
@@ -606,6 +612,94 @@ async fn only_the_declared_types_own_default_is_on_the_input_path() {
             assert_eq!(hits[0].used_by.ty, ty, "{name} on {label}");
             assert_eq!(hits[0].used_by.part, part, "{name} on {label}");
         }
+        drop(me);
+        db.drop().await;
+    }
+}
+
+/// A DEFAULT the `ADD COLUMN` statement carries replaces the domain's, so the
+/// domain's is not code the statement runs; the domain's CHECKs still run on the
+/// value the statement supplies.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_default_the_statement_carries_replaces_the_domains_and_its_checks_still_run() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "gowndefault").await;
+        let (_, mut me) = deployer(&mut db).await;
+        let label = server.label;
+        run(
+            &mut me,
+            label,
+            "CREATE FUNCTION app.boom_d() RETURNS integer LANGUAGE plpgsql
+                 AS $$ BEGIN RAISE EXCEPTION 'boom default ran'; END $$;
+             CREATE FUNCTION app.is_pos(integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                 AS 'SELECT $1 > 0';
+             CREATE DOMAIN app.default_only AS integer DEFAULT app.boom_d();
+             CREATE DOMAIN app.default_and_builtin_check AS integer
+                 DEFAULT app.boom_d() CHECK (VALUE > 0);
+             CREATE DOMAIN app.default_and_user_check AS integer
+                 DEFAULT app.boom_d() CHECK (app.is_pos(VALUE));
+             CREATE TABLE app.rows (i integer);
+             INSERT INTO app.rows VALUES (1), (2);",
+        )
+        .await;
+        // The engine: the domain's default runs without a default of the
+        // statement's own, and does not with one.
+        let err = me
+            .execute("ALTER TABLE app.rows ADD COLUMN a app.default_only")
+            .await
+            .expect_err("the domain default must run");
+        assert!(err.to_string().contains("boom default ran"), "{err}");
+        run(
+            &mut me,
+            label,
+            "ALTER TABLE app.rows ADD COLUMN a app.default_only DEFAULT 7;
+             ALTER TABLE app.rows ADD COLUMN b app.default_and_builtin_check DEFAULT 7;",
+        )
+        .await;
+
+        let read = async |me: &mut Conn, name: &str, own_default: bool| -> InputPath {
+            let TypeRead::Present(t) = user_types::read(
+                me,
+                Within::OwnTransaction,
+                &[TypeRef::new("app", name).unwrap()],
+            )
+            .await
+            .remove(0) else {
+                panic!("{name} should be present")
+            };
+            input_path::read(
+                me,
+                Within::OwnTransaction,
+                &[],
+                &[Added::new(&t, own_default)],
+            )
+            .await
+            .remove(0)
+        };
+        for name in ["default_only", "default_and_builtin_check"] {
+            let without = read(&mut me, name, false).await;
+            let all = refused(&without, name);
+            assert_eq!(routines(all).len(), 1, "{name} on {label}: {all:?}");
+            assert!(matches!(routines(all)[0].used_by.part, Part::Default));
+        }
+        // With a default of the statement's own: the domain's is not read. A
+        // domain left with nothing to run runs no code.
+        assert!(!admitted(
+            &read(&mut me, "default_only", true).await,
+            "default_only, own default"
+        ));
+        assert!(admitted(
+            &read(&mut me, "default_and_builtin_check", true).await,
+            "default_and_builtin_check, own default"
+        ));
+        // Negative: the CHECK is still read.
+        let with = read(&mut me, "default_and_user_check", true).await;
+        let all = refused(&with, "default_and_user_check");
+        let hits = routines(all);
+        assert_eq!(hits.len(), 1, "on {label}: {all:?}");
+        assert_eq!(hits[0].identity, "app.is_pos(integer)");
+        assert!(matches!(hits[0].used_by.part, Part::Check { .. }));
         drop(me);
         db.drop().await;
     }
@@ -1082,8 +1176,8 @@ async fn a_read_that_fails_is_unreadable_and_never_admitted() {
             })
             .collect();
         run(&mut me, label, "DROP DOMAIN app.gone").await;
-        let refs: Vec<&UserType> = types.iter().collect();
-        let paths = input_path::read(&mut me, Within::OwnTransaction, &[], &refs).await;
+        let columns: Vec<Added<'_>> = types.iter().map(|t| Added::new(t, false)).collect();
+        let paths = input_path::read(&mut me, Within::OwnTransaction, &[], &columns).await;
         assert_eq!(paths.len(), 2);
         // A failed read is a failed read for every type: nothing was learned.
         for path in &paths {
@@ -1097,7 +1191,8 @@ async fn a_read_that_fails_is_unreadable_and_never_admitted() {
         // too, not admitted.
         run(&mut me, label, "BEGIN").await;
         assert!(me.execute("SELECT 1/0").await.is_err());
-        let aborted = input_path::read(&mut me, Within::CallersTransaction, &[], &refs[1..]).await;
+        let aborted =
+            input_path::read(&mut me, Within::CallersTransaction, &[], &columns[1..]).await;
         assert!(
             matches!(aborted[0], InputPath::Unreadable(Unreadable::Failed(_))),
             "{:?}",

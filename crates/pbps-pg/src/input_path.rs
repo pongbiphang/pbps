@@ -45,8 +45,10 @@
 //! own DEFAULT does: `ADD COLUMN` evaluates the column type's default and no
 //! other, so the default of a domain that type is made of, or that an expression
 //! names, never runs (a domain over another is created with a copy of that
-//! one's default, which is then its own). Measured on 16 and 18, and pinned by
-//! a live test; counting them all would refuse plans that run nothing.
+//! one's default, which is then its own). And not even that one when the
+//! statement carries a DEFAULT of its own ([`Added::new`]), which replaces it.
+//! Measured on 16 and 18, and pinned by live tests; counting them all would
+//! refuse plans that run nothing.
 //!
 //! # Why the node trees, not `pg_depend`
 //!
@@ -473,10 +475,29 @@ fn settled(first: InputPath, second: InputPath) -> InputPath {
     }
 }
 
+/// A column to add, as far as the gate is concerned.
+#[derive(Debug, Clone, Copy)]
+pub struct Added<'a> {
+    ty: &'a UserType,
+    own_default: bool,
+}
+
+impl<'a> Added<'a> {
+    /// `own_default` is whether the `ADD COLUMN` statement carries a DEFAULT of
+    /// its own. The engine then uses it and never the domain's, so the domain's
+    /// DEFAULT is not code the statement runs; its CHECKs still run on the
+    /// value. The statement's own default is the plan's expression and not part
+    /// of the type's input path.
+    #[must_use]
+    pub fn new(ty: &'a UserType, own_default: bool) -> Self {
+        Self { ty, own_default }
+    }
+}
+
 // -- the read -----------------------------------------------------------------
 
-/// Reads whether `ADD COLUMN` over existing rows may run each type's input path,
-/// one answer per type, in order.
+/// Reads whether `ADD COLUMN` over existing rows may run each column's type's
+/// input path, one answer per column, in order.
 ///
 /// `trusted` are the roles a human has declared trusted, over and above the
 /// engine's rule (a superuser, or a role that can `SET ROLE` to the deploying
@@ -492,11 +513,11 @@ pub async fn read(
     conn: &mut Conn,
     within: Within,
     trusted: &[String],
-    types: &[&UserType],
+    added: &[Added<'_>],
 ) -> Vec<InputPath> {
-    match read_all(conn, within, trusted, types).await {
+    match read_all(conn, within, trusted, added).await {
         Ok(reads) => reads,
-        Err(e) => types
+        Err(e) => added
             .iter()
             .map(|_| InputPath::Unreadable(Unreadable::Failed(e.to_string())))
             .collect(),
@@ -534,12 +555,12 @@ async fn read_all(
     conn: &mut Conn,
     within: Within,
     trusted: &[String],
-    types: &[&UserType],
+    added: &[Added<'_>],
 ) -> Result<Vec<InputPath>, DbError> {
     match within {
         Within::OwnTransaction => {
             conn.begin(&OWN_TRANSACTION).await?;
-            let result = read_each(conn, trusted, types).await;
+            let result = read_each(conn, trusted, added).await;
             let closed = conn.rollback(&OWN_TRANSACTION).await;
             let reads = result?;
             closed?;
@@ -547,7 +568,7 @@ async fn read_all(
         }
         Within::CallersTransaction => {
             conn.execute(&format!("SAVEPOINT {SAVEPOINT}")).await?;
-            match read_each(conn, trusted, types).await {
+            match read_each(conn, trusted, added).await {
                 Ok(reads) => {
                     conn.execute(&format!("ROLLBACK TO SAVEPOINT {SAVEPOINT}"))
                         .await?;
@@ -574,7 +595,7 @@ async fn read_all(
 async fn read_each(
     conn: &mut Conn,
     trusted: &[String],
-    types: &[&UserType],
+    added: &[Added<'_>],
 ) -> Result<Vec<InputPath>, DbError> {
     // Names in the stored expressions' text, in the identities and in the
     // deparsed output are qualified unless the path shows them.
@@ -583,8 +604,8 @@ async fn read_each(
     // Read the whole set twice and compare (see `user_types`): the queries of a
     // pass are separate statements and in a READ COMMITTED transaction share no
     // snapshot.
-    let first = pass(conn, trusted, types).await?;
-    let second = pass(conn, trusted, types).await?;
+    let first = pass(conn, trusted, added).await?;
+    let second = pass(conn, trusted, added).await?;
     Ok(first
         .into_iter()
         .zip(second)
@@ -609,11 +630,11 @@ impl From<DbError> for Failure {
 async fn pass(
     conn: &mut Conn,
     trusted: &[String],
-    types: &[&UserType],
+    added: &[Added<'_>],
 ) -> Result<Vec<InputPath>, DbError> {
     let missing = missing_roles(conn, trusted).await?;
     if !missing.is_empty() {
-        return Ok(types
+        return Ok(added
             .iter()
             .map(|_| InputPath::Unreadable(Unreadable::TrustedRolesMissing(missing.clone())))
             .collect());
@@ -622,19 +643,21 @@ async fn pass(
     let denied = match runs_sql_oids(conn).await? {
         Ok(denied) => denied,
         Err(why) => {
-            return Ok(types
+            return Ok(added
                 .iter()
                 .map(|_| InputPath::Unreadable(Unreadable::Failed(why.clone())))
                 .collect());
         }
     };
-    let mut gathered: Vec<Result<Facts, String>> = Vec::with_capacity(types.len());
-    for t in types {
-        gathered.push(match gather(conn, major, &denied, t.oid()).await {
-            Ok(facts) => Ok(facts),
-            Err(Failure::Read(e)) => return Err(e),
-            Err(Failure::Uncertified(why)) => Err(why),
-        });
+    let mut gathered: Vec<Result<Facts, String>> = Vec::with_capacity(added.len());
+    for column in added {
+        gathered.push(
+            match gather(conn, major, &denied, column.ty.oid(), column.own_default).await {
+                Ok(facts) => Ok(facts),
+                Err(Failure::Read(e)) => return Err(e),
+                Err(Failure::Uncertified(why)) => Err(why),
+            },
+        );
     }
     // Who can act as the owner of each type that matters: one walk of the
     // cluster's roles for all of them.
@@ -740,6 +763,7 @@ async fn gather(
     major: u32,
     runs_sql: &BTreeSet<Oid>,
     root: Oid,
+    own_default: bool,
 ) -> Result<Facts, Failure> {
     let mut types: BTreeMap<Oid, TypeRow> = BTreeMap::new();
     // Where each routine is used, by OID.
@@ -780,7 +804,10 @@ async fn gather(
             // DEFAULT (measured on 16 and 18). A domain created over another
             // takes a copy of that one's default at creation, so what the
             // declared domain would have inherited is already its own.
-            if domain.oid != root {
+            //
+            // Nor does it when the statement carries a DEFAULT of its own,
+            // which the engine uses instead.
+            if domain.oid != root || own_default {
                 continue;
             }
             if let Some(text) = &domain.default {
