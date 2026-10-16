@@ -6183,7 +6183,9 @@ pub fn cmd_plan_db(
                         .unwrap_or_default(),
                 ),
             );
-            #[cfg(not(any(test, debug_assertions)))]
+            // The observer's own gate: a release test build has `cfg(test)`
+            // but no observer, so the facts are spent here too (#2089).
+            #[cfg(not(debug_assertions))]
             let _ = object_facts;
             let rebuilds = crate::engine::check_module_rebuilds(&mut conn, &cs, false).await?;
             let drops = crate::engine::check_drop_blockers(
