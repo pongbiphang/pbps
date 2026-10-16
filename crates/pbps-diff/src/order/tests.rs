@@ -2442,3 +2442,65 @@ fn a_numbering_put_on_a_column_with_a_default_follows_the_default_s_removal() {
     // Negative: the identity put on while the default stands.
     assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
 }
+
+/// #1998 item 4's limit: a column the plan creates NOT NULL is NOT NULL
+/// from its creation, which produces no NOT NULL fact, so a replica identity
+/// switched to an index over it requires none (#2111 review).
+#[test]
+fn a_replica_identity_switched_to_an_index_over_a_new_not_null_column_verifies_clean() {
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod, ReplicaIdentity};
+    let index = Index {
+        columns: vec![IndexColumn {
+            key: IndexKey::Column("a".into()),
+            descending: false,
+            opclass: None,
+        }],
+        include: vec![],
+        unique: true,
+        filter: None,
+        method: IndexMethod::Btree,
+        storage_parameters: Default::default(),
+    };
+    let mut a = Column::new(int());
+    a.nullable = false;
+    let mut will = table_with(&["id"]);
+    will.columns.insert("a".into(), a.clone());
+    will.indexes.insert("ix".into(), index.clone());
+    will.replica_identity = Some(ReplicaIdentity::Index("ix".into()));
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table_with(&["id"]));
+    after.tables.insert(t("t"), will);
+    let plan = Plan {
+        logical: vec![
+            p(Change::AddColumn {
+                uid: uid(UidKind::Column, "t.a"),
+                table: t("t"),
+                name: "a".into(),
+                column: Box::new(a),
+            }),
+            p(Change::AddIndex {
+                table: t("t"),
+                name: "ix".into(),
+                index: Box::new(index),
+                clustered: false,
+            }),
+            p(Change::SetReplicaIdentity {
+                uid: uid(UidKind::Table, "t"),
+                table: t("t"),
+                to: Some(ReplicaIdentity::Index("ix".into())),
+            }),
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(&["t"], &[("t", "id")]),
+        after_ids: Plan::ids(&["t"], &[("t", "id"), ("t", "a")]),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
+    // Negative: the switch before the index it selects.
+    assert!(!run(&ops, &fx, &baseline, &[0, 2, 1], &none, Checks::ALL).is_empty());
+}

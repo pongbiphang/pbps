@@ -1025,9 +1025,12 @@ impl Cx<'_> {
                 .unwrap_or_default(),
             PartKey::ForeignKey(_) | PartKey::Check(_) | PartKey::Computed(_) => Vec::new(),
         };
+        // A column the plan creates has no producer of its NOT NULL, as in
+        // `requires_column`: it is created NOT NULL, before any switch.
         for c in columns {
             if will.columns.get(&c).is_some_and(|c| !c.nullable)
                 && let Some(key) = self.final_column(&name.column(c.as_str()))
+                && self.names_of(&key).is_some()
             {
                 self.exists(Self::not_null(key));
             }
@@ -1470,7 +1473,20 @@ impl Cx<'_> {
         else {
             return;
         };
-        let forward = self.renames_of(base_name, was).apply(was, base_name);
+        // Only the parts compared below, and what `apply` looks a partition's
+        // columns up by: the whole table would bring its reference rows into
+        // every row step's copy.
+        let parts = Table {
+            unique: was.unique.clone(),
+            foreign_keys: was.foreign_keys.clone(),
+            indexes: was.indexes.clone(),
+            partition_of: was.partition_of.clone(),
+            ..Table::default()
+        };
+        let forward = self
+            .renames_of(base_name, was)
+            .apply(&parts, base_name)
+            .into_owned();
         let mut gone = Vec::new();
         for (n, check) in &was.checks {
             if will.checks.get(n) != Some(check) {
