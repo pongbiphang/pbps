@@ -77,7 +77,13 @@ pub(crate) fn order_occupied_objects_under(
         }
         return Err(refusal);
     };
-    cs.changes = search.reordered(&order);
+    // The search proposes its order as edges, and `settle` applies them
+    // (#1957, DEC-1957.3).
+    let settled = search
+        .proposal(&order)
+        .settle(cs.clone())
+        .map_err(|refusal| anyhow::anyhow!("{}", refusal.describe(cs)))?;
+    *cs = search.addressed(settled);
     // The order found is walked once more, as the plan now stands: the same
     // check every other plan gets.
     let mut again = Walk::new(&facts);
@@ -161,22 +167,35 @@ pub(crate) fn order_column_renames(
         if renames.len() < 2 {
             continue;
         }
-        // What each rename waits for: the one vacating the name it takes.
-        let waits: Vec<Vec<usize>> = (0..renames.len())
-            .map(|r| {
-                (0..renames.len())
-                    .filter(|&v| v != r && renames[v].1 == renames[r].2)
-                    .collect()
-            })
-            .collect();
-        let mut left: Vec<usize> = (0..renames.len()).collect();
-        let mut order: Vec<usize> = Vec::new();
-        while !left.is_empty() {
-            let Some(k) = left
-                .iter()
-                .position(|&r| waits[r].iter().all(|v| order.contains(v)))
-            else {
-                let waiting: Vec<String> = left
+        // What each rename waits for: the one vacating the name it takes, a
+        // handover `settle` orders (#1957). The same spelling is the plan's
+        // own evidence; one the collation reads alike is the catalog's.
+        let mut schedule = pbps_diff::order::Schedule::new(renames.len());
+        for (r, (_, _, takes)) in renames.iter().enumerate() {
+            for (v, (_, vacates, _)) in renames.iter().enumerate() {
+                if v != r && vacates == takes {
+                    let spelled = |i: usize| {
+                        if let Change::RenameColumn { from, to, .. } =
+                            &cs.changes[renames[i].0].change
+                        {
+                            Some((from, to))
+                        } else {
+                            None
+                        }
+                    };
+                    let source = if spelled(v).map(|s| s.0) == spelled(r).map(|s| s.1) {
+                        pbps_diff::order::Source::Effect
+                    } else {
+                        pbps_diff::order::Source::Catalog
+                    };
+                    schedule.edge(v, r, source, pbps_model::resolver::OrderReason::Identity);
+                }
+            }
+        }
+        let order = match schedule.sequence() {
+            Ok(order) => order,
+            Err(pbps_diff::order::Refusal::Cycle { waiting, .. }) => {
+                let waiting: Vec<String> = waiting
                     .iter()
                     .map(|&r| crate::report::describe(&cs.changes[renames[r].0].change))
                     .collect();
@@ -187,9 +206,9 @@ pub(crate) fn order_column_renames(
                      first, then this one (DEC-1366.3).",
                     waiting.join(", ")
                 );
-            };
-            order.push(left.remove(k));
-        }
+            }
+            Err(refusal) => anyhow::bail!("{refusal}"),
+        };
         placed.push((
             renames.iter().map(|r| r.0).collect(),
             order.into_iter().map(|r| renames[r].0).collect(),
@@ -554,22 +573,53 @@ impl<'c> Search<'c> {
         (self.start..self.changes.len()).filter(|i| !self.region.contains(i))
     }
 
-    /// The plan with its renames and drops in `order`, each drop addressed
-    /// for where it now runs: everything before the first of them, then
-    /// them, then the rest in the plan's order.
-    fn reordered(&self, order: &[usize]) -> Vec<PlannedChange> {
-        let mut out: Vec<PlannedChange> = self.before().map(|i| self.changes[i].clone()).collect();
-        let mut done = BTreeSet::new();
-        for &i in order {
-            let mut p = self.changes[i].clone();
-            p.change = self.change(i, &done);
-            if self.moves.contains_key(&i) {
-                done.insert(i);
-            }
-            out.push(p);
+    /// The order found, as the edges `settle` applies (#1957, DEC-1957.3):
+    /// each change of the region before the next one the search ran, the
+    /// changes ahead of the region before its first, and its last before the
+    /// rest, which is the order the search walked. Proposed, so `Search`;
+    /// beside them, the computed edges' order of the drops it kept
+    /// (`Catalog`). The search no longer moves the changes itself.
+    fn proposal(&self, order: &[usize]) -> pbps_diff::order::Schedule {
+        use pbps_diff::order::Source;
+        use pbps_model::resolver::OrderReason;
+        let mut schedule = pbps_diff::order::Schedule::new(self.changes.len());
+        for pair in order.windows(2) {
+            schedule.edge(pair[0], pair[1], Source::Search, OrderReason::Identity);
         }
-        out.extend(self.after().map(|i| self.changes[i].clone()));
-        out
+        if let (Some(&first), Some(&last)) = (order.first(), order.last()) {
+            for i in self.before() {
+                schedule.edge(i, first, Source::Search, OrderReason::Identity);
+            }
+            for i in self.after() {
+                schedule.edge(last, i, Source::Search, OrderReason::Identity);
+            }
+        }
+        for (after, before) in &self.waits {
+            for &b in before {
+                schedule.edge(b, *after, Source::Catalog, OrderReason::Structural);
+            }
+        }
+        schedule
+    }
+
+    /// `settled`, each drop on a renamed table addressed for where it now
+    /// runs: by the source name before the rename, and the new one after.
+    fn addressed(&self, settled: pbps_diff::order::Settled) -> ChangeSet {
+        let mut done = BTreeSet::new();
+        let changes = settled
+            .changes
+            .changes
+            .into_iter()
+            .zip(&settled.sequence)
+            .map(|(mut p, &i)| {
+                p.change = self.change(i, &done);
+                if self.moves.contains_key(&i) {
+                    done.insert(i);
+                }
+                p
+            })
+            .collect();
+        ChangeSet { changes }
     }
 }
 
@@ -1644,6 +1694,82 @@ mod tests {
         }
     }
 
+    /// #1957: the search proposes the order it found as edges with the
+    /// `Search` source, and `settle` applies them. Settled again, the plan
+    /// clears the walk as it stands, so no search runs and nothing more is
+    /// proposed; the order is unchanged.
+    #[test]
+    fn the_search_proposes_its_order_as_edges_and_settling_again_proposes_nothing() {
+        let adopted = held("s1.c", "default constraint", Some("s1.old"), Some("x"));
+        let changes = vec![
+            rename("s1.a", "s1.c", &[]),
+            rename("s1.old", "s2.new", &["x"]),
+        ];
+        let facts = NameFacts::new(std::slice::from_ref(&adopted), &[]);
+        let mut search = Search::new(&changes, &[], &facts);
+        let found = search.run(&facts).expect("an order clears the walk");
+        let proposal = search.proposal(&found);
+        assert!(!proposal.constraints().is_empty());
+        assert!(
+            proposal
+                .constraints()
+                .iter()
+                .all(|c| c.source == pbps_diff::order::Source::Search),
+            "{:?}",
+            proposal.constraints()
+        );
+
+        let settled = order(changes, std::slice::from_ref(&adopted), &[]).unwrap();
+        assert_eq!(
+            renames(&settled),
+            [pair("s1.old", "s2.new"), pair("s1.a", "s1.c")]
+        );
+
+        // A change the search does not move runs after the renames and drops
+        // it ordered, where the walk it cleared had it: the proposal holds it
+        // there, not only the renames' own order.
+        let column = PlannedChange::new(Change::RenameColumn {
+            uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.t.p", 0),
+            table: name("dbo.t"),
+            from: "p".into(),
+            to: "q".into(),
+            table_was: None,
+        });
+        let with_column = order(
+            vec![
+                rename("s1.a", "s1.c", &[]),
+                column.clone(),
+                rename("s1.old", "s2.new", &["x"]),
+            ],
+            std::slice::from_ref(&adopted),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            with_column.changes,
+            [
+                rename("s1.old", "s2.new", &["x"]),
+                rename("s1.a", "s1.c", &[]),
+                column
+            ]
+        );
+        let mut walk = Walk::new(&facts);
+        walk.run(&settled.changes);
+        assert!(walk.is_clear(), "nothing left for a search to propose");
+        let again = order(settled.changes.clone(), &[adopted], &[]).unwrap();
+        assert_eq!(again.changes, settled.changes);
+    }
+
+    /// The plan with the region in `order`, as the search's proposal settles
+    /// it.
+    fn reordered(search: &Search<'_>, order: &[usize]) -> Vec<PlannedChange> {
+        let cs = ChangeSet {
+            changes: search.changes.to_vec(),
+        };
+        let settled = search.proposal(order).settle(cs).unwrap();
+        search.addressed(settled).changes
+    }
+
     /// A drop on a renamed table names the table as it is called where the
     /// drop runs, whichever side of the rename the order puts it.
     #[test]
@@ -1673,19 +1799,19 @@ mod tests {
         });
         let after = [rename("s1.old", "s2.new", &[]), computed];
         let search = Search::new(&after, &[], &NameFacts::new(&[], &[]));
-        assert_eq!(table(&search.reordered(&[0, 1])), ["s2.new"]);
-        assert_eq!(table(&search.reordered(&[1, 0])), ["s1.old"]);
+        assert_eq!(table(&reordered(&search, &[0, 1])), ["s2.new"]);
+        assert_eq!(table(&reordered(&search, &[1, 0])), ["s1.old"]);
         let before = [drop_check("s1.old", "c"), rename("s1.old", "s2.new", &[])];
         let search = Search::new(&before, &[], &NameFacts::new(&[], &[]));
-        assert_eq!(table(&search.reordered(&[0, 1])), ["s1.old"]);
-        assert_eq!(table(&search.reordered(&[1, 0])), ["s2.new"]);
+        assert_eq!(table(&reordered(&search, &[0, 1])), ["s1.old"]);
+        assert_eq!(table(&reordered(&search, &[1, 0])), ["s2.new"]);
         let after = [rename("s1.old", "s2.new", &[]), drop_check("s2.new", "c")];
         let search = Search::new(&after, &[], &NameFacts::new(&[], &[]));
-        assert_eq!(table(&search.reordered(&[0, 1])), ["s2.new"]);
-        assert_eq!(table(&search.reordered(&[1, 0])), ["s1.old"]);
+        assert_eq!(table(&reordered(&search, &[0, 1])), ["s2.new"]);
+        assert_eq!(table(&reordered(&search, &[1, 0])), ["s1.old"]);
         // A table no rename moves keeps its name.
         let other = [drop_check("dbo.t", "c"), rename("s1.old", "s2.new", &[])];
         let search = Search::new(&other, &[], &NameFacts::new(&[], &[]));
-        assert_eq!(table(&search.reordered(&[1, 0])), ["dbo.t"]);
+        assert_eq!(table(&reordered(&search, &[1, 0])), ["dbo.t"]);
     }
 }
