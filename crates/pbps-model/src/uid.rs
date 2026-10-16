@@ -21,15 +21,20 @@ const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 /// anyway, so a collision only causes a redraw, never a wrong identity.
 const LEN: usize = 6;
 
+/// A uid that was refused is shown escaped, since the text is whatever the file
+/// held (DEC-2032.1, #2035).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum UidError {
-    #[error("UID `{0}` is missing the `t_`, `c_` or `r_` prefix")]
+    #[error("UID `{}` is missing the `t_`, `c_` or `r_` prefix", crate::escape::Escaped(.0))]
     BadPrefix(String),
 
-    #[error("UID `{0}` should be {LEN} characters long, excluding the prefix")]
+    #[error(
+        "UID `{}` should be {LEN} characters long, excluding the prefix",
+        crate::escape::Escaped(.0)
+    )]
     BadLength(String),
 
-    #[error("UID `{0}` contains a character outside the alphabet")]
+    #[error("UID `{}` contains a character outside the alphabet", crate::escape::Escaped(.0))]
     BadChar(String),
 }
 
@@ -301,5 +306,16 @@ mod tests {
             "c_K7X2MQ".parse::<Uid>().is_err(),
             "uppercase is not in the alphabet"
         );
+    }
+
+    #[test]
+    fn a_refused_uid_is_shown_escaped() {
+        for text in ["c_\u{1b}[31m\nx", "t_a\rb", "x\u{202e}"] {
+            let refusal = text.parse::<Uid>().unwrap_err().to_string();
+            assert!(!refusal.chars().any(char::is_control), "{refusal:?}");
+        }
+        // Negative: a uid that is only malformed is shown as it is.
+        let refusal = "c_k7x2mi".parse::<Uid>().unwrap_err().to_string();
+        assert!(refusal.contains("`c_k7x2mi`"), "{refusal}");
     }
 }

@@ -31,20 +31,32 @@ pub enum Holder<'a> {
     Vacant,
 }
 
+/// Why a plan's names do not add up.
+///
+/// An address in a message is a name out of the plan, and a name may hold any
+/// character (SPEC §4.3), so each is shown escaped by this type's own `Display`
+/// (DEC-2032.1, #2035). A uid, a namespace and a step number are the tool's own
+/// vocabulary and are printed as they are.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PlanNamesError {
     #[error("invalid final identities: {0}")]
     Ids(#[from] crate::ids::IdsError),
     #[error("{uid} has the wrong identity kind for a {namespace} change")]
     Kind { namespace: &'static str, uid: Uid },
-    #[error("{namespace} identity {uid} does not hold {expected} before change {step}")]
+    #[error(
+        "{namespace} identity {uid} does not hold {} before change {step}",
+        crate::escape::Escaped(.expected)
+    )]
     Source {
         namespace: &'static str,
         uid: Uid,
         expected: String,
         step: usize,
     },
-    #[error("{namespace} address {address} is held by both {a} and {b} at boundary {boundary}")]
+    #[error(
+        "{namespace} address {} is held by both {a} and {b} at boundary {boundary}",
+        crate::escape::Escaped(.address)
+    )]
     Collision {
         namespace: &'static str,
         address: String,
@@ -54,7 +66,10 @@ pub enum PlanNamesError {
     },
     #[error("{namespace} histories disagree with the final identity mapping")]
     End { namespace: &'static str },
-    #[error("column {column} has no managed owning table before change {step}")]
+    #[error(
+        "column {} has no managed owning table before change {step}",
+        crate::escape::Escaped(&.column.to_string())
+    )]
     Owner { column: ColumnRef, step: usize },
     #[error("column identity {uid} changes owning table")]
     ColumnOwner { uid: Uid },

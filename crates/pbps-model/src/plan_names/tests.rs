@@ -605,3 +605,74 @@ fn a_first_column_address_does_not_extend_its_managed_lifetime() {
         None
     );
 }
+
+/// A name in a refusal is a name out of the plan, which may hold a line break
+/// or a terminal sequence; each kind of refusal that names an address shows it
+/// escaped (DEC-2032.1, #2035). Negative: a Unicode address is left as it is.
+#[test]
+fn a_refusal_shows_the_address_it_names_escaped() {
+    const HOSTILE: &str = "x\n\u{1b}[31mred\r\u{202e}";
+    let shown = |refusal: PlanNamesError| {
+        let text = refusal.to_string();
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+        text
+    };
+    let hostile = || TableName::new("app", HOSTILE);
+
+    // `Owner` prints a column's address.
+    let owner = PlanNames::of(
+        &[alter(&column("c"), hostile().column("c"))],
+        &IdsFile::default(),
+    )
+    .unwrap_err();
+    assert!(
+        shown(owner).contains("x\\n\\u{1b}[31mred\\r\\u{202e}"),
+        "the escaped address is shown"
+    );
+
+    // `Source` prints the address the history expected.
+    let a = table("a");
+    let source = PlanNames::of(
+        &[rename(&a, hostile(), t("b")), rename(&a, hostile(), t("c"))],
+        &ids(&[(&a, t("c"))], &[]),
+    )
+    .unwrap_err();
+    assert!(matches!(source, PlanNamesError::Source { .. }), "{source}");
+    shown(source);
+
+    // `Collision` prints the address two identities hold.
+    let (c, d) = (column("c"), column("d"));
+    let rename_column = |uid: &Uid, from: &str, to: &str| {
+        p(Change::RenameColumn {
+            uid: uid.clone(),
+            table: hostile(),
+            from: from.into(),
+            to: to.into(),
+            table_was: None,
+        })
+    };
+    let collision = PlanNames::of(
+        &[rename_column(&c, "c", "d"), rename_column(&d, "d", "e")],
+        &ids(
+            &[(&a, hostile())],
+            &[(&c, hostile().column("d")), (&d, hostile().column("e"))],
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(collision, PlanNamesError::Collision { .. }),
+        "{collision}"
+    );
+    shown(collision);
+
+    // Negative: an address that is only not ASCII is shown as it is.
+    let unicode = PlanNames::of(
+        &[alter(
+            &column("c"),
+            TableName::new("app", "名前_ünï").column("c"),
+        )],
+        &IdsFile::default(),
+    )
+    .unwrap_err();
+    assert!(shown(unicode).contains("app.名前_ünï.c"));
+}

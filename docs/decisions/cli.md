@@ -1320,12 +1320,53 @@ way and the checksum does not move. `EvidenceError::Rule` formats its field
 through `Escaped` in its own `Display`, so no caller of that error can print the
 identifier raw.
 
-What this does not cover, on purpose: object names (tables, columns, modules)
-that a later refusal names, and the strings `explain` prints when it succeeds
-(its text report shows a plan's names, limitations and entry as they are).
-Those are valid values that may hold a control character, there are hundreds of
-sites, and `--format json` already escapes them; they are the subject of #2035
-rather than extra diff here. Pinned by
+The rule covers the rest of what `explain` and `apply` print out of a plan, in
+two further places, and not by refusing the plan for the values it holds: the
+names and free text of a plan are valid with control characters in them (SPEC
+§4.3), there are hundreds of sites, and `TableName`'s `Display` is also its
+serialization, so it cannot escape itself (#2035).
+
+- **The text report.** `explain`'s `render`, `report::changes` and
+  `explain/resolver.rs` put every string out of the plan through `Escaped` at
+  the point where the report is put into words: the time, the revision, the
+  baseline, the reference-data tables, each change's table, the description of
+  each change, the findings, the approval and check lines, and the resolver's
+  entry, image, rule, key, limitations and surfaces. The data behind the report
+  (`Explanation`, `ResolverDetail`) stays raw, because it is also the JSON, which
+  escapes control characters itself and which a machine reads: `--format json` is
+  byte for byte what it was, and escaping there would have changed it.
+  `report::describe` stays raw for the same reason (the JSON lists its text under
+  each risk), so `report::changes` and the approval list escape its result; its
+  other callers print after `apply` has connected (#2069). The report's own line
+  breaks are literals; none comes from a value.
+- **Refusals that name an object.** The error types that carry a name format it
+  through `Escaped` in their own `Display`, the way `EvidenceError::Rule` does,
+  so that no caller of one can print the name raw and a `format!` that builds a
+  message out of names needs no edit: `NameError`, `UidError`, `IdsError`,
+  `PlanNamesError` and `DialectError`, whose `Invalid` message covers the
+  emitter's and validator's refusals (about 250 of them) at once. The one
+  message that has line breaks of its own, the statement to run by hand, is a
+  variant of its own (`DialectError::ByHand`) so that escaping the message does
+  not escape the tool's layout. Tool-authored text is not escaped, only the
+  plan-carried values in it: a message that writes a backslash of its own, such
+  as PostgreSQL's `\x` spelling of a `bytea`, escapes its values as it builds
+  and is carried by `DialectError::InvalidVerbatim` (#2081), which `Invalid`
+  would otherwise show as `\\x`. A sentence built outside an error type escapes
+  the name where it prints it (the `PUBLIC` execution decisions, the staged-run
+  refusal, the statements that cannot run in a transaction). The text serde
+  repeats from the identity file, which is committed text of the same kind, goes
+  through the same `Escaped` as the plan's (`saved_plan::echoed`, used where
+  `main.rs` reads the file and where `baseline.rs` reads it at a revision).
+
+What this still does not cover: the refusals `apply` makes after it has
+connected, which set a plan's names beside what the database holds (the lock
+holder and the ledger are the database's text, not the file's; #2069), and the
+`--base` snapshot's decode error, which is an artifact of a different kind
+(#2070). Both are tracked in their own issues rather than widened here. A neutralising pass over
+`main`'s one `eprintln!` was not added: legitimate messages are multi-line, so it
+cannot stop a forged line break, and the sites above do.
+
+Pinned by
 `explain_resolver.rs::a_refusal_shows_the_files_values_escaped_and_never_raw`
 (a rule, the dialect of a resolved and of an ordinary plan, and an unknown
 variant, each carrying a line break, a terminal sequence, a carriage return and
@@ -1336,7 +1377,21 @@ the escaped value is in it), by `a_refusal_names_a_unicode_value_as_the_file_spe
 `a_decode_refusal_tells_a_line_break_from_the_two_characters_backslash_n` (an
 unknown variant and a string where a number belongs, each holding a line break
 in one file and the two characters `\n` in another, refused differently by
-`explain` in both formats and by `apply`) and by the unit tests in `escape.rs`.
+`explain` in both formats and by `apply`), by
+`the_text_report_shows_the_plans_strings_escaped_and_json_is_unchanged` (a plan
+whose table, columns, time, revision, baseline, finding, data table and, for a
+resolved plan, resolver entry, image and limitation each carry the same text is
+explained with no raw control character but the report's own line breaks, in as
+many lines as the same plan with a plain value, every escaped value present, and
+the JSON holding each value raw), by
+`a_refusal_naming_an_object_shows_the_name_escaped_on_explain_and_apply` (the
+identity mapping's duplicate name and orphan column, `PlanNames::of` and the
+emitter, each through `explain` in both formats and through `apply`), by
+`flow.rs::an_identity_file_that_does_not_decode_is_refused_with_its_text_escaped`
+(the identity file in the working tree and at the baseline revision), by the unit
+tests of each error type and by the unit tests in `escape.rs`. Negative cases: a
+Unicode name with quotes and braces is shown as the file spells it, in the report
+and in a refusal.
 
 <a id="dec-2042-1"></a>
 

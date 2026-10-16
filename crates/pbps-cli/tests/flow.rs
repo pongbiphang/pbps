@@ -7539,6 +7539,51 @@ fn a_project_below_the_repo_root_reads_its_own_baseline() {
     );
 }
 
+/// The identity file is committed text, and when it does not decode serde
+/// repeats what it stopped at: here an unknown field, which is the file's own
+/// spelling. A line break in it must not start a line of the refusal, and an
+/// escape sequence must not rewrite the ones before it, in the working tree
+/// and in the revision the baseline is read from (DEC-2032.1, #2035).
+#[test]
+fn an_identity_file_that_does_not_decode_is_refused_with_its_text_escaped() {
+    let d = Demo::new("idsescaped");
+    d.table(ONE_COLUMN);
+    assert_eq!(code(&d.run(&["plan"])), 0);
+    let good = std::fs::read_to_string(d.ids_path()).unwrap();
+    let field = "x\n\u{1b}[31mred\r\u{202e}";
+    let shown = "x\\n\\u{1b}[31mred\\r\\u{202e}";
+    let hostile = serde_json::to_string(&serde_json::json!({"version": 1, field: 1})).unwrap();
+    let assert_one_line = |o: &Output, what: &str, expected: &str| {
+        assert_eq!(code(o), 1, "{what}: {}", stderr(o));
+        let e = stderr(o);
+        let body = e.strip_suffix('\n').unwrap_or(&e);
+        assert!(!body.chars().any(char::is_control), "{what}: {e:?}");
+        assert!(body.starts_with("error: "), "{what}: {e:?}");
+        assert!(body.contains(expected), "{what}: {e:?}");
+        assert!(
+            body.contains(&format!("unknown field `{shown}`")),
+            "{what}: {e:?}"
+        );
+    };
+
+    // The working tree's file.
+    std::fs::write(d.ids_path(), &hostile).unwrap();
+    assert_one_line(&d.run(&["plan"]), "working tree", "is malformed: ");
+
+    // The revision the baseline reads.
+    d.commit();
+    std::fs::write(d.ids_path(), &good).unwrap();
+    assert_one_line(
+        &d.run(&["plan"]),
+        "baseline revision",
+        "the identity file at `HEAD` is malformed: ",
+    );
+
+    // Negative: the same project plans once the file decodes in both places.
+    d.commit();
+    assert_eq!(code(&d.run(&["plan"])), 0);
+}
+
 /// `--check` is the file check CI runs: it changes nothing and connects to
 /// nothing. Refusing an explicit `--dev` is not enough — a `dev:` block in
 /// pbps.yml would otherwise start a container behind the same command.

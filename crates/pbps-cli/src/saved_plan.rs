@@ -55,10 +55,19 @@ pub(crate) fn decode(raw: &str, path: &Path) -> anyhow::Result<SavedPlan> {
                     pbps_model::escape::Escaped(kind)
                 );
             }
-            Err(anyhow::Error::new(Echoed(error.to_string())))
-                .with_context(|| format!("`{}` is not a pbps plan", path.display()))
+            Err(echoed(&error)).with_context(|| format!("`{}` is not a pbps plan", path.display()))
         }
     }
+}
+
+/// A decoder's sentence about a file it could not read, as an error whose
+/// `Display` shows the file's text escaped.
+///
+/// The one way to carry a `serde_json::Error` read out of an artifact: the
+/// plan here, and the identity file (#2035), whose names are as free as a
+/// plan's.
+pub(crate) fn echoed(error: &serde_json::Error) -> anyhow::Error {
+    anyhow::Error::new(Echoed(error.to_string()))
 }
 
 /// The decoder's own sentence about a file it could not read.

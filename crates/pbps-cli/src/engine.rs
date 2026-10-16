@@ -2954,7 +2954,7 @@ pub fn require_transactional_rebuilds(
                 ..
             } = &p.change
             {
-                Some(routine.to_string())
+                Some(pbps_model::escape::Escaped(&routine.to_string()).to_string())
             } else {
                 None
             }
@@ -4283,6 +4283,33 @@ mod tests {
                 origin: pbps_model::RoutineOrigin::Created,
             }));
         assert!(require_transactional_rebuilds(Driver::Postgres, &kept, true).is_ok());
+    }
+
+    /// The routine the refusal names is the plan's, and its name may hold a
+    /// line break or a terminal sequence: it is shown escaped (DEC-2032.1,
+    /// #2035). Negative: a Unicode name is shown as it is.
+    #[test]
+    fn the_staged_refusal_shows_the_routine_name_escaped() {
+        use pbps_model::{Change, PlannedChange};
+        let closing = |name: &str| {
+            let mut cs = ChangeSet::default();
+            cs.changes.push(PlannedChange::new(Change::PublicExecution {
+                routine: format!("app.{name}(integer)").parse().unwrap(),
+                access: pbps_model::PublicAccess::Revoked,
+                origin: pbps_model::RoutineOrigin::Created,
+            }));
+            require_transactional_rebuilds(Driver::Postgres, &cs, true)
+                .expect_err("a staged run leaves the routine open")
+                .to_string()
+        };
+        let e = closing("f\n\u{1b}[31mred\r\u{202e}");
+        assert!(!e.chars().any(|c| c.is_control() && c != '\n'), "{e:?}");
+        assert!(
+            e.contains("app.f\\n\\u{1b}[31mred\\r\\u{202e}(integer)"),
+            "{e}"
+        );
+        assert_eq!(e.lines().count(), 2, "the name started no line: {e}");
+        assert!(closing("名前_ünï").contains("app.名前_ünï(integer)"));
     }
 
     /// A runtime for the live tests below, built by hand because the

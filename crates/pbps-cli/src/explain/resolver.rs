@@ -3,6 +3,7 @@
 //! credentials and no resolver. A fingerprint's presence is shown, never its
 //! value, and a surface's verdict is what its sealed bindings say.
 
+use pbps_model::escape::Escaped;
 use pbps_model::resolver::{
     ObjectIdentity, OrderReason, OutsideWrites, Prerequisite, ResolverEvidence, ResolverRuntime,
     ScratchLayout, ScratchSource, Surface, SurfaceResolution,
@@ -230,13 +231,22 @@ fn reason(reason: OrderReason) -> &'static str {
 /// The one line `explain` prints for the resolver: `<entry> (<kind>
 /// scratch, <layout>)`, with an unverified image and an allowed outside
 /// write said after it.
+///
+/// The entry and the image are the plan's text, shown escaped (DEC-2032.1,
+/// #2035); the rest of this module's text is escaped for the same reason, and
+/// [`ResolverDetail`] itself stays raw because it is also the JSON.
 pub fn line(detail: &ResolverDetail) -> String {
     let mut out = format!(
         "{} ({} scratch, {})",
-        detail.entry, detail.scratch, detail.layout
+        Escaped(&detail.entry),
+        detail.scratch,
+        detail.layout
     );
     if let Some(image) = &detail.image {
-        out.push_str(&format!("; image {image}, as configured, not verified"));
+        out.push_str(&format!(
+            "; image {}, as configured, not verified",
+            Escaped(image)
+        ));
     }
     if detail.outside_writes == "allowed" {
         out.push_str(
@@ -249,8 +259,8 @@ pub fn line(detail: &ResolverDetail) -> String {
 /// The evidence section of the human output, after the plan's summary.
 pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> String {
     let mut out = String::from("\nResolver evidence\n");
-    out.push_str(&format!("  rule        {}\n", detail.rule));
-    out.push_str(&format!("  key id      {}\n", detail.key_id));
+    out.push_str(&format!("  rule        {}\n", Escaped(&detail.rule)));
+    out.push_str(&format!("  key id      {}\n", Escaped(&detail.key_id)));
     out.push_str(&format!(
         "  sealed      {} (keyed fingerprints; values not shown)\n",
         detail.sealed.join(", ")
@@ -262,7 +272,8 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
         for limitation in &detail.limitations {
             out.push_str(&format!(
                 "    {}: {}\n",
-                limitation.name, limitation.description
+                Escaped(&limitation.name),
+                Escaped(&limitation.description)
             ));
         }
     }
@@ -270,7 +281,8 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
     for surface in &detail.surfaces {
         out.push_str(&format!(
             "    {:<11} {}\n",
-            surface.verdict, surface.surface
+            surface.verdict,
+            Escaped(&surface.surface)
         ));
     }
     if !detail.order.is_empty() {
@@ -285,7 +297,7 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
                         .ok()
                         .and_then(|v| v.get("op").and_then(|op| op.as_str()).map(str::to_owned))
                         .unwrap_or_default();
-                    format!("{op} {}", p.change.subject())
+                    format!("{op} {}", Escaped(&p.change.subject()))
                 })
                 .unwrap_or_default()
         };
@@ -316,7 +328,7 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
             .count();
         let counts: Vec<String> = classes
             .iter()
-            .map(|(class, count)| format!("{class} {count}"))
+            .map(|(class, count)| format!("{} {count}", Escaped(class)))
             .collect();
         out.push_str(&format!(
             "  prerequisites {} catalog records, by class: {}\n",
@@ -457,5 +469,82 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    /// Every string of the evidence is the plan's, and a hand-made plan can put
+    /// a line break or a terminal sequence in any of them: what the report
+    /// prints is escaped, and what the JSON carries is not touched
+    /// (DEC-2032.1, #2035).
+    #[test]
+    fn the_evidence_text_shows_what_the_plan_holds_escaped() {
+        const HOSTILE: &str = "x\n\u{1b}[31mred\r\u{202e}";
+        const SHOWN: &str = "x\\n\\u{1b}[31mred\\r\\u{202e}";
+        // Every string field, holding `text`.
+        let holding = |text: &str| {
+            let mut d = detail("docker", Some(text), "refused");
+            d.entry = text.into();
+            d.rule = text.into();
+            d.key_id = text.into();
+            d.limitations = vec![Limitation {
+                name: text.into(),
+                description: text.into(),
+            }];
+            d.surfaces = vec![SurfaceVerdict {
+                surface: format!("table app.{text}"),
+                verdict: "created",
+            }];
+            d.prerequisites = vec![PrerequisiteDetail {
+                object: ObjectDetail {
+                    class: text.into(),
+                    name: vec![],
+                    signature: vec![],
+                },
+                fingerprinted: true,
+            }];
+            d
+        };
+        let report = |d: &ResolverDetail| {
+            format!(
+                "{}\n{}",
+                line(d),
+                render(d, &pbps_model::ChangeSet::default())
+            )
+        };
+        let text = report(&holding(HOSTILE));
+        // The report's own line breaks are all there is: a value starts no
+        // line, so the report has the lines it has for a value that is plain.
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert_eq!(
+            text.lines().count(),
+            report(&holding("x")).lines().count(),
+            "{text}"
+        );
+        for fragment in [
+            format!("{SHOWN} (docker scratch, run-owned); image {SHOWN},"),
+            format!("rule        {SHOWN}\n"),
+            format!("key id      {SHOWN}\n"),
+            format!("    {SHOWN}: {SHOWN}\n"),
+            format!("created     table app.{SHOWN}\n"),
+            format!("{SHOWN} 1"),
+        ] {
+            assert!(text.contains(&fragment), "{fragment:?} not in {text}");
+        }
+        // The JSON is the raw value, escaped the way JSON escapes it and no
+        // further.
+        let json = serde_json::to_string(&holding(HOSTILE)).unwrap();
+        assert!(
+            json.contains(&serde_json::to_string(HOSTILE).unwrap()) && !json.contains(SHOWN),
+            "{json}"
+        );
+        // Negative: a Unicode entry and image are shown as written.
+        let mut unicode = detail("docker", Some("registry/名前:ünï"), "refused");
+        unicode.entry = "règle-名前".into();
+        assert_eq!(
+            line(&unicode),
+            "règle-名前 (docker scratch, run-owned); image registry/名前:ünï, as configured, not verified"
+        );
     }
 }

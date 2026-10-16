@@ -2091,7 +2091,10 @@ fn read_ids_opt(project: &Project) -> anyhow::Result<Option<IdsFile>> {
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read identity file `{}`", path.display()))?;
+    // serde repeats the text it stopped at, and that is the file's: shown
+    // escaped, like a plan's (DEC-2032.1, #2035).
     let ids: IdsFile = serde_json::from_str(&text)
+        .map_err(|e| saved_plan::echoed(&e))
         .with_context(|| format!("identity file `{}` is malformed", path.display()))?;
     // The path belongs on this one too: with a custom `ids_file` in pbps.yml, an
     // error naming only two uids leaves the user hunting for the file.
@@ -3759,22 +3762,24 @@ fn public_execution_decisions_match_their_modules(
         };
         if let Some(first) = decided.insert(routine, index) {
             bail!(
-                "changes {} and {} both decide `PUBLIC` execution on `{routine}`; a plan settles \
+                "changes {} and {} both decide `PUBLIC` execution on `{}`; a plan settles \
                  that once.\n\
                  The artifact was edited or produced by a broken planner; regenerate it with \
                  `pbps plan --db`.",
                 first + 1,
-                index + 1
+                index + 1,
+                pbps_model::escape::Escaped(&routine.to_string())
             );
         }
         let derived = origin_of(routine);
         if derived != Some(*origin) {
             bail!(
-                "change {} decides `PUBLIC` execution on `{routine}` as `{}`, which the rest of \
+                "change {} decides `PUBLIC` execution on `{}` as `{}`, which the rest of \
                  the plan does not bear out ({}).\n\
                  The artifact was edited or produced by a broken planner; regenerate it with \
                  `pbps plan --db`.",
                 index + 1,
+                pbps_model::escape::Escaped(&routine.to_string()),
                 match origin {
                     RoutineOrigin::Created => "created",
                     RoutineOrigin::Rebuilt => "rebuilt",
@@ -3798,7 +3803,7 @@ fn public_execution_decisions_match_their_modules(
     let silent: Vec<String> = owed
         .into_iter()
         .filter(|routine| !decided.contains_key(routine))
-        .map(ToString::to_string)
+        .map(|routine| pbps_model::escape::Escaped(&routine.to_string()).to_string())
         .collect();
     if !silent.is_empty() {
         bail!(
@@ -4303,6 +4308,55 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A refusal that names a routine out of a saved plan shows it escaped: a
+    /// routine's name may hold a line break or a terminal sequence, and each of
+    /// the three refusals prints it in a sentence of the tool's own
+    /// (DEC-2032.1, #2035). Negative: a Unicode name is shown as it is.
+    #[test]
+    fn a_refusal_naming_a_routine_shows_its_name_escaped() {
+        use pbps_model::{Change, PublicAccess, RoutineOrigin};
+        const HOSTILE: &str = "f\n\u{1b}[31mred\r\u{202e}";
+        const SHOWN: &str = "f\\n\\u{1b}[31mred\\r\\u{202e}";
+        let routine = |name: &str| format!("app.{name}(integer)");
+        let create = |name: &str| Change::CreateModule {
+            id: routine(name).parse().unwrap(),
+            module: routine_module(),
+        };
+        let decide = |name: &str, origin| Change::PublicExecution {
+            routine: routine(name).parse().unwrap(),
+            access: PublicAccess::Revoked,
+            origin,
+        };
+        for (what, changes) in [
+            (
+                "two decisions",
+                vec![
+                    create(HOSTILE),
+                    decide(HOSTILE, RoutineOrigin::Created),
+                    decide(HOSTILE, RoutineOrigin::Created),
+                ],
+            ),
+            (
+                "a decision the plan does not bear out",
+                vec![create(HOSTILE), decide(HOSTILE, RoutineOrigin::Rebuilt)],
+            ),
+            ("no decision at all", vec![create(HOSTILE)]),
+        ] {
+            let e = pg_verdict(changes).expect_err(what).to_string();
+            assert!(
+                !e.chars().any(|c| c.is_control() && c != '\n'),
+                "{what}: {e:?}"
+            );
+            assert!(e.contains(&format!("app.{SHOWN}(integer)")), "{what}: {e}");
+            // Only the sentence's own break: the name started no line.
+            assert_eq!(e.lines().count(), 2, "{what}: {e}");
+        }
+        let e = pg_verdict(vec![create("名前_ünï")])
+            .expect_err("no decision")
+            .to_string();
+        assert!(e.contains("app.名前_ünï(integer)"), "{e}");
     }
 
     fn routine_module() -> Box<pbps_model::Module> {

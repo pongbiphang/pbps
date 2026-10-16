@@ -1,8 +1,12 @@
 //! Saved resolver artifacts: reviewable from the file alone, and approved
 //! through the ordinary command (#616).
 
+use pbps_model::data::{DataMode, DataScope};
 use pbps_model::resolver::*;
-use pbps_model::{ChangeSet, IdsFile, PlanBaseline, PlanOrigin, SavedPlan};
+use pbps_model::{
+    Change, ChangeSet, Column, Finding, IdsFile, PlanBaseline, PlanOrigin, PlannedChange,
+    SavedPlan, Severity, TableName, Uid,
+};
 use std::collections::BTreeSet;
 use std::process::{Command, Output};
 
@@ -25,10 +29,31 @@ fn resolved_plan_with(limitations: std::collections::BTreeMap<String, String>) -
 /// A plan whose evidence names `rule`, valid or not: what an earlier build
 /// sealed, with the checksum that build computed.
 fn sealed_under(rule: &str, limitations: std::collections::BTreeMap<String, String>) -> SavedPlan {
+    sealed(
+        rule,
+        limitations,
+        ChangeSet::default(),
+        ResolverRuntime::Scratch {
+            entry: "scratch".into(),
+            scratch: ScratchSource::Server {},
+            layout: ScratchLayout::Supplied,
+            outside_writes: OutsideWrites::Refused,
+        },
+        IdsFile::default(),
+    )
+}
+
+/// [`sealed_under`] over a chosen change set, identity mapping and runtime.
+fn sealed(
+    rule: &str,
+    limitations: std::collections::BTreeMap<String, String>,
+    changes: ChangeSet,
+    runtime: ResolverRuntime,
+    ids: IdsFile,
+) -> SavedPlan {
     // Synthetic, source-free reader evidence, not a claim of live qualification.
     // Use the public sealing constructors so an invalid fixture cannot turn an
     // explanation regression into an unrelated deserialization refusal.
-    let changes = ChangeSet::default();
     let manifest = InputManifest::new(
         "postgres-catalog-inputs-v2".into(),
         18,
@@ -61,12 +86,7 @@ fn sealed_under(rule: &str, limitations: std::collections::BTreeMap<String, Stri
                 schemas: vec!["app".into()],
                 write_path_extras: vec![],
             },
-            runtime: ResolverRuntime::Scratch {
-                entry: "scratch".into(),
-                scratch: ScratchSource::Server {},
-                layout: ScratchLayout::Supplied,
-                outside_writes: OutsideWrites::Refused,
-            },
+            runtime,
         },
         AuthorizationCondition {
             rule: pbps_pg::resolver::authorization::RULE.into(),
@@ -92,7 +112,7 @@ fn sealed_under(rule: &str, limitations: std::collections::BTreeMap<String, Stri
             database_collation: None,
         },
         changes,
-        IdsFile::default(),
+        ids,
     )
     .with_resolution(evidence)
     .unwrap()
@@ -425,6 +445,12 @@ fn assert_inert(out: &Output, shown: &[&str], what: &str) {
 
 /// `apply` on `plan.json` against a target that must never be contacted.
 fn apply_refused(artifact: &Artifact, checksum: &str) -> Output {
+    apply_refused_allowing(artifact, checksum, &[])
+}
+
+/// [`apply_refused`] with the risk classes the plan carries approved, so that
+/// the refusal under test is not the gate's.
+fn apply_refused_allowing(artifact: &Artifact, checksum: &str, allow: &[&str]) -> Output {
     std::fs::write(artifact.0.join("pbps.yml"), "dialect: postgres\n").unwrap();
     let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     target.set_nonblocking(true).unwrap();
@@ -443,6 +469,7 @@ fn apply_refused(artifact: &Artifact, checksum: &str) -> Output {
             "--checksum",
             checksum,
         ])
+        .args(allow.iter().flat_map(|class| ["--allow", class]))
         .output()
         .unwrap();
     assert_eq!(
@@ -829,4 +856,331 @@ fn evidence_naming_an_unknown_runtime_is_refused_with_the_remedy() {
     // Negative: the resolver's own runtime reads.
     let readable = Artifact::new(&serde_json::to_value(resolved_plan()).unwrap());
     assert!(readable.explain("text").status.success());
+}
+
+// ---- the successful text report and the refusals that name an object ----
+// (DEC-2032.1, #2035)
+
+/// One address-bearing change set: a column added to a table, a column dropped
+/// from it (destructive, so the report lists it under the approval) and a
+/// column made NOT NULL (so the report lists a check that runs first), with
+/// the identities that hold them, a finding on the first, all spelled by
+/// `text`.
+fn changes_naming(text: &str) -> (ChangeSet, IdsFile) {
+    use pbps_dialect::Dialect as _;
+    let table = TableName::new("app", text);
+    let uid = |s: &str| -> Uid { s.parse().unwrap() };
+    let (kept, dropped) = (format!("{text}1"), format!("{text}2"));
+    let planned = |change: Change| {
+        let mut planned = PlannedChange::new(change);
+        planned.risks = pbps_pg::Postgres::new().change_risks(&planned.change);
+        planned
+    };
+    let mut added = planned(Change::AddColumn {
+        uid: uid("c_aaaaaa"),
+        table: table.clone(),
+        name: kept.clone(),
+        column: Box::new(Column::new("int".parse().unwrap())),
+    });
+    added.findings = vec![Finding::new(text, Severity::Warning, text, None)];
+    let changes = ChangeSet {
+        changes: vec![
+            added,
+            planned(Change::DropColumn {
+                uid: uid("c_bbbbbb"),
+                column: table.column(dropped),
+            }),
+            planned(Change::AlterColumnNullability {
+                uid: uid("c_aaaaaa"),
+                column: table.column(&kept),
+                ty: "int".parse().unwrap(),
+                to_nullable: false,
+                collation: None,
+                through_external_partitions: false,
+            }),
+        ],
+    };
+    let ids = IdsFile {
+        tables: [(uid("t_aaaaaa"), table.clone())].into(),
+        columns: [(uid("c_aaaaaa"), table.column(kept))].into(),
+        ..IdsFile::default()
+    };
+    (changes, ids)
+}
+
+/// A database plan in which every string a reviewer is shown holds `text`: the
+/// table, the columns, the time, the revision, the baseline, a finding and a
+/// reference-data table.
+fn plan_holding(text: &str) -> SavedPlan {
+    let (changes, ids) = changes_naming(text);
+    let mut plan = SavedPlan::new(
+        PlanOrigin::Database,
+        "postgres",
+        text,
+        PlanBaseline {
+            time_zone: None,
+            description: text.into(),
+            checksum: "00".repeat(32),
+            database_collation: None,
+        },
+        changes,
+        ids,
+    );
+    plan.git_sha = Some(text.into());
+    plan.data.insert(
+        TableName::new("app", text),
+        DataScope {
+            mode: DataMode::Ensure,
+            keys: Default::default(),
+        },
+    );
+    plan
+}
+
+/// A resolved plan whose resolver entry, image and limitation hold `text`.
+/// Evidence is sealed over the changes it is given, so this one has none.
+fn resolved_plan_holding(text: &str) -> SavedPlan {
+    sealed(
+        pbps_pg::resolver::compatibility::REPORTED_RULE,
+        [(text.to_owned(), text.to_owned())].into(),
+        ChangeSet::default(),
+        ResolverRuntime::Scratch {
+            entry: text.into(),
+            scratch: ScratchSource::Docker { image: text.into() },
+            layout: ScratchLayout::RunOwned,
+            outside_writes: OutsideWrites::Refused,
+        },
+        IdsFile::default(),
+    )
+}
+
+/// Every line of `text` is one the report wrote: a value that held a line
+/// break did not start one, and nothing acts on the terminal.
+fn assert_only_the_reports_own_lines(text: &str, plain: &str, what: &str) {
+    assert!(
+        !text.chars().any(|c| c.is_control() && c != '\n'),
+        "{what}: a raw control character in {text:?}"
+    );
+    assert_eq!(
+        text.lines().count(),
+        plain.lines().count(),
+        "{what}: a value started a line of the report:\n{text}"
+    );
+}
+
+/// A reviewer approves from the text report, and a hand-made plan holds valid
+/// names and free text with control characters in them: the report shows each
+/// of them escaped, in the lines it already had, and `--format json`, which
+/// escapes them as JSON, is what it was.
+#[test]
+fn the_text_report_shows_the_plans_strings_escaped_and_json_is_unchanged() {
+    let shown = HOSTILE_SHOWN;
+    let explained = |plan: SavedPlan| {
+        let artifact = Artifact::new(&serde_json::to_value(plan).unwrap());
+        let text = artifact.explain("text");
+        assert!(text.status.success() && text.stderr.is_empty(), "{text:?}");
+        let json = artifact.explain("json");
+        assert!(json.status.success(), "{json:?}");
+        (String::from_utf8(text.stdout).unwrap(), json)
+    };
+
+    // A plan with changes, a finding, a data scope, a time and a revision.
+    let (text, json) = explained(plan_holding(HOSTILE));
+    let (plain, _) = explained(plan_holding("x"));
+    assert_only_the_reports_own_lines(&text, &plain, "explain text");
+    for (what, fragment) in [
+        ("created_at", format!("  created     {shown}\n")),
+        ("git_sha", format!("  git sha     {shown}\n")),
+        ("baseline", format!("  baseline    {shown}\n")),
+        ("a data scope's table", format!("app.{shown} (ensure)")),
+        ("a change's table", format!("\n  app.{shown}\n")),
+        ("a column added", format!("+ add column {shown}1 ")),
+        ("a finding", format!("      warning: {shown} — {shown}\n")),
+        (
+            "a column dropped, under the approval",
+            format!("- drop column {shown}2"),
+        ),
+    ] {
+        assert!(
+            text.contains(&fragment),
+            "{what}: {fragment:?} not in\n{text}"
+        );
+    }
+    // The check that runs first names the column it counts.
+    let checks = &text[text.find("Checks that run before").expect(&text)..];
+    assert!(checks.contains(shown), "a probe: {checks}");
+
+    // JSON is what it was: each value as JSON spells it, and not escaped a
+    // second time.
+    let raw = String::from_utf8(json.stdout.clone()).unwrap();
+    let value = report(&json);
+    for (what, got) in [
+        ("created_at", &value["data"]["created_at"]),
+        ("git_sha", &value["data"]["git_sha"]),
+        ("baseline", &value["data"]["baseline"]),
+    ] {
+        assert_eq!(got, HOSTILE, "{what}");
+    }
+    assert!(
+        raw.contains(&serde_json::to_string(HOSTILE).unwrap()),
+        "{raw}"
+    );
+    assert!(!raw.contains(shown) && !raw.contains("\\u{1b}"), "{raw}");
+    let approval = value["data"]["risks"][0]["changes"][0].as_str().unwrap();
+    assert!(
+        approval.contains(HOSTILE) && !approval.contains(shown),
+        "{approval:?}"
+    );
+
+    // A resolved plan, with the resolver's entry, image and limitation.
+    let (text, json) = explained(resolved_plan_holding(HOSTILE));
+    let (plain, _) = explained(resolved_plan_holding("x"));
+    assert_only_the_reports_own_lines(&text, &plain, "explain text of a resolved plan");
+    for (what, fragment) in [
+        (
+            "the resolver's entry and image",
+            format!("  resolver    {shown} (docker scratch, run-owned); image {shown},"),
+        ),
+        ("a limitation", format!("    {shown}: {shown}\n")),
+    ] {
+        assert!(
+            text.contains(&fragment),
+            "{what}: {fragment:?} not in\n{text}"
+        );
+    }
+    let value = report(&json);
+    assert_eq!(value["data"]["resolver"]["entry"], HOSTILE);
+    assert_eq!(value["data"]["resolver"]["image"], HOSTILE);
+    assert_eq!(value["data"]["resolver"]["limitations"][0]["name"], HOSTILE);
+    assert_eq!(
+        value["data"]["resolver"]["limitations"][0]["description"],
+        HOSTILE
+    );
+    let raw = String::from_utf8(json.stdout).unwrap();
+    assert!(!raw.contains(shown), "{raw}");
+}
+
+/// Negative: a valid Unicode name, with the punctuation a name may hold, is
+/// shown as the file spells it, in the report and in a resolved plan's
+/// evidence.
+#[test]
+fn a_unicode_name_is_shown_as_the_file_spells_it() {
+    let name = "名前_ünï 'q' \"d\" {} %s";
+    for (plan, fragments) in [
+        (
+            plan_holding(name),
+            vec![
+                format!("  created     {name}\n"),
+                format!("\n  app.{name}\n"),
+                format!("+ add column {name}1 "),
+                format!("app.{name} (ensure)"),
+            ],
+        ),
+        (
+            resolved_plan_holding(name),
+            vec![
+                format!("  resolver    {name} (docker scratch, run-owned); image {name},"),
+                format!("    {name}: {name}\n"),
+            ],
+        ),
+    ] {
+        let artifact = Artifact::new(&serde_json::to_value(plan).unwrap());
+        let out = artifact.explain("text");
+        let text = String::from_utf8(out.stdout).unwrap();
+        for fragment in fragments {
+            assert!(text.contains(&fragment), "{fragment:?} not in\n{text}");
+        }
+    }
+}
+
+/// A plan with the changes of [`changes_naming`] under `text`, as a database
+/// plan the gate would read, and the checksum to apply it with.
+fn named_plan(text: &str, edit: impl FnOnce(&mut SavedPlan)) -> (Artifact, String) {
+    let (changes, ids) = changes_naming(text);
+    let mut plan = SavedPlan::new(
+        PlanOrigin::Database,
+        "postgres",
+        "fixture",
+        PlanBaseline {
+            time_zone: None,
+            description: "target database".into(),
+            checksum: "00".repeat(32),
+            database_collation: None,
+        },
+        changes,
+        ids,
+    );
+    edit(&mut plan);
+    let checksum = plan.checksum();
+    (
+        Artifact::new(&serde_json::to_value(&plan).unwrap()),
+        checksum,
+    )
+}
+
+/// A refusal that names an object shows the name escaped, whichever error type
+/// carries it, and stays the one line it was (DEC-2032.1, #2035). Each case
+/// reaches a different error type on the way to `explain` and `apply`.
+#[test]
+fn a_refusal_naming_an_object_shows_the_name_escaped_on_explain_and_apply() {
+    let shown = HOSTILE_SHOWN;
+    /// One way to make a plan refuse, and what the refusal says of the name.
+    struct Case {
+        what: &'static str,
+        edit: fn(&mut SavedPlan),
+        fragment: String,
+    }
+    let cases = [
+        Case {
+            // The identity mapping holds one name twice.
+            what: "IdsFile::validate (DuplicateName)",
+            edit: |plan| {
+                let table = plan.ids.tables.values().next().unwrap().clone();
+                plan.ids.tables.insert("t_bbbbbb".parse().unwrap(), table);
+            },
+            fragment: format!("both point at the name `app.{shown}`"),
+        },
+        Case {
+            // A column whose table entry is gone.
+            what: "IdsFile::validate (OrphanColumn)",
+            edit: |plan| plan.ids.tables.clear(),
+            fragment: format!("points at `app.{shown}.{shown}1`, but no live table entry owns it"),
+        },
+        Case {
+            // A column whose table no identity holds, in an identity mapping
+            // that is consistent: `PlanNames::of`.
+            what: "PlanNames::of (Owner)",
+            edit: |plan| {
+                plan.ids.tables.clear();
+                plan.ids.columns.clear();
+            },
+            fragment: format!("column app.{shown}.{shown}1 has no managed owning table"),
+        },
+        Case {
+            // A name the SQL cannot carry: the dialect's own refusal. The plan
+            // is otherwise consistent, so explain and apply reach the emitter.
+            what: "the emitter (UnquotableIdent)",
+            edit: |plan| {
+                let Change::DropColumn { column, .. } = &mut plan.changes.changes[1].change else {
+                    unreachable!()
+                };
+                column.name = format!("\0{}", column.name);
+            },
+            fragment: "the identifier `\\u{0}".to_owned(),
+        },
+    ];
+    for Case {
+        what,
+        edit,
+        fragment,
+    } in cases
+    {
+        let (artifact, checksum) = named_plan(HOSTILE, edit);
+        for format in ["text", "json"] {
+            let out = artifact.explain(format);
+            assert_inert(&out, &[&fragment], &format!("explain {format}: {what}"));
+        }
+        let out = apply_refused_allowing(&artifact, &checksum, &["destructive", "not-null"]);
+        assert_inert(&out, &[&fragment], &format!("apply: {what}"));
+    }
 }

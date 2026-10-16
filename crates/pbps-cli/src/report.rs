@@ -8,6 +8,7 @@
 
 use pbps_diff::{Blocker, RenameSide};
 use pbps_model::change::DeleteCause;
+use pbps_model::escape::Escaped;
 use pbps_model::plan_names::{At, Holder, PlanNames};
 use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass};
 
@@ -758,13 +759,18 @@ pub fn plan(cs: &ChangeSet, names: &PlanNames<'_>) -> String {
 /// plan and to nothing else: a drift report describes what already happened, and
 /// telling the reader which flag would approve it invites them to approve their
 /// way past a schema someone changed by hand.
+///
+/// Every name, description and finding in it is text out of the plan, shown
+/// escaped (DEC-2032.1, #2035): this is what a reviewer approves from, and a
+/// hand-made plan could otherwise put a line of its own in it. The line breaks
+/// here are the literals; none comes from a value.
 pub fn changes(cs: &ChangeSet) -> String {
     let mut out = String::new();
     let mut current = None;
     for p in &cs.changes {
         let table = p.change.subject();
         if current.as_deref() != Some(table.as_str()) {
-            out.push_str(&format!("\n  {table}\n"));
+            out.push_str(&format!("\n  {}\n", Escaped(&table)));
             current = Some(table);
         }
         let risks = if p.risks.is_empty() {
@@ -779,11 +785,16 @@ pub fn changes(cs: &ChangeSet) -> String {
                     .join(", ")
             )
         };
-        out.push_str(&format!("    {}{}\n", describe(&p.change), risks));
+        out.push_str(&format!("    {}{}\n", Escaped(&describe(&p.change)), risks));
         // The analyzers' findings, under the change they are about, at the
         // severity the project chose (ADR-0008).
         for f in &p.findings {
-            out.push_str(&format!("      {}: {} — {}\n", f.severity, f.id, f.message));
+            out.push_str(&format!(
+                "      {}: {} — {}\n",
+                f.severity,
+                Escaped(&f.id),
+                Escaped(&f.message)
+            ));
         }
     }
     out
