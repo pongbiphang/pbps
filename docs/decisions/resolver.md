@@ -3168,6 +3168,10 @@ against the measured fresh-install inventory as `db_owner` (#619).**
     with `guest` enabled, reads 1 there, and no server-level read shows it.
     This is the SQL Server half of #1667's rule, and the counterpart of
     DEC-1672.1's ownership of another database.
+  - In `master`, `tempdb` and `msdb` access is always 1, so it says nothing
+    there: a login mapped as `db_owner` in `msdb` reads exactly as `guest`.
+    Confined also means no principal of its own in the three, read from
+    their `sys.database_principals` by its own SID.
   - The run-owned layout needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`
     (`securityadmin`, `dbcreator`), so it never runs on the target's
     instance.
@@ -3202,6 +3206,8 @@ The comparison is #1673's (DEC-1673.1) with SQL Server's shapes:
 - function and procedure parameters and return types, and a function's kind
   and `is_schema_bound`, since a schema-bound caller refuses a function that
   is not (4513);
+- a table-valued function's result columns, as a table's: a view over the
+  function binds them, and breaks (207) when they change;
 - a user type's base and facets;
 - a synonym's `base_object_name`;
 - schemas.
@@ -3231,5 +3237,6 @@ inventory read: #721, where an identity covered only the manifest file, and
 makes the change, which moves the rule identifier (DEC-2012.1).
 
 **Pinned by** `schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not`
-(4513) and `synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed`
+(4513), `a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`
+and `synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed`
 (the three-part name).

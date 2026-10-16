@@ -1114,7 +1114,9 @@ async fn a_login_reads_its_own_server_reach_without_privilege() {
 /// mapped into another database — as its owner or any user — or a database
 /// with `guest` enabled reads 1, as `master`, `tempdb` and `msdb` always do.
 /// Server-level reads show none of it, so a confined account is also one
-/// that enters no database but its own scratch and those three.
+/// that enters no database but its own scratch and those three. In those
+/// three, access alone says nothing: a login mapped there as `db_owner`
+/// reads the same 1 as guest, and only its own principal row shows it.
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn a_login_reads_every_database_it_can_enter() {
@@ -1165,8 +1167,87 @@ async fn a_login_reads_every_database_it_can_enter() {
         1111,
         "guest admits every login"
     );
+
+    let mapped = "SELECT CONVERT(bigint, \
+             (SELECT COUNT(*) FROM master.sys.database_principals WHERE sid = SUSER_SID()) * 100 \
+           + (SELECT COUNT(*) FROM msdb.sys.database_principals WHERE sid = SUSER_SID()) * 10 \
+           + (SELECT COUNT(*) FROM tempdb.sys.database_principals WHERE sid = SUSER_SID()));";
+    assert_eq!(number(&mut conn, mapped).await, 0);
+    run(
+        &mut admin,
+        &[
+            &*format!("USE msdb; CREATE USER [{login}] FOR LOGIN [{login}];"),
+            &*format!("USE msdb; ALTER ROLE db_owner ADD MEMBER [{login}];"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        number(&mut conn, &enters).await,
+        1111,
+        "access alone is unchanged"
+    );
+    assert_eq!(number(&mut conn, mapped).await, 10);
+    run(
+        &mut admin,
+        &[
+            &*format!("USE msdb; ALTER ROLE db_owner DROP MEMBER [{login}];"),
+            &*format!("USE msdb; DROP USER [{login}];"),
+            "USE master;",
+        ],
+    )
+    .await;
     drop(conn);
     drop_login(&mut admin, &login).await;
+    db.drop().await;
+}
+
+/// A table-valued function's result columns are part of what a view over it
+/// binds: they are in `sys.columns` under the function, for an inline and a
+/// multi-statement function alike, and a view over the function breaks
+/// (207) when they change, while a body change that keeps them does not.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_table_valued_functions_result_columns_are_what_a_view_over_it_binds() {
+    let mut db = TestDb::create("tvf619").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE FUNCTION dbo.inline_t (@k int) RETURNS TABLE AS RETURN SELECT @k AS a, CONVERT(varchar(5), 'x') AS b;",
+            "CREATE FUNCTION dbo.multi_t (@k int) RETURNS @r TABLE (a int, b varchar(5)) AS BEGIN INSERT @r VALUES (@k, 'x'); RETURN END;",
+            "CREATE VIEW dbo.over_t AS SELECT a, b FROM dbo.inline_t(1);",
+        ],
+    )
+    .await;
+    assert_eq!(
+        texts(
+            &mut db.conn,
+            "SELECT CONVERT(nvarchar(200), OBJECT_NAME(c.object_id) + N'.' + c.name + N':' + TYPE_NAME(c.user_type_id)) \
+             FROM sys.columns c WHERE c.object_id IN (OBJECT_ID(N'dbo.inline_t'), OBJECT_ID(N'dbo.multi_t')) \
+             ORDER BY 1;"
+        )
+        .await,
+        ["inline_t.a:int", "inline_t.b:varchar", "multi_t.a:int", "multi_t.b:varchar"]
+    );
+    run(
+        &mut db.conn,
+        &["ALTER FUNCTION dbo.inline_t (@k int) RETURNS TABLE AS RETURN SELECT @k + 1 AS a, CONVERT(varchar(5), 'y') AS b;"],
+    )
+    .await;
+    assert_eq!(
+        refusal(&mut db.conn, "SELECT a, b FROM dbo.over_t;").await,
+        None
+    );
+    run(
+        &mut db.conn,
+        &["ALTER FUNCTION dbo.inline_t (@k int) RETURNS TABLE AS RETURN SELECT @k AS a, @k AS c;"],
+    )
+    .await;
+    assert_eq!(
+        refusal(&mut db.conn, "SELECT a, b FROM dbo.over_t;")
+            .await
+            .as_deref(),
+        Some("207")
+    );
     db.drop().await;
 }
 

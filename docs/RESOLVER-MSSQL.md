@@ -203,6 +203,11 @@ for a moment keeps that type.
     target by `USE` or a three-part name. This is #1667's SQL Server half:
     no server-level permission and no access to another database
     [`a_login_reads_every_database_it_can_enter`].
+  - **In those three it is `guest`.** Access to `master`, `tempdb` and
+    `msdb` is the same 1 whether the login enters as `guest` or as a user
+    mapped there as `db_owner`. So the login also has no principal of its
+    own in any of the three, which it reads from their
+    `sys.database_principals` by its own SID.
 - **The layout.** The run-owned layout creates the run's login and database,
   so it needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`, which no confined
   account holds. On the target's instance only the supplied layout runs: a
@@ -254,7 +259,7 @@ read:
 |---|---|
 | Any object | Its schema, name and object type: every kind occupies the name (§2) |
 | Table, view | Columns: name, order, type (a user type by `schema.name`), length, precision, scale, nullability, collation, computed or not |
-| Function | Parameters and return type as above, kind (scalar, inline, multi-statement), `is_schema_bound`, which a schema-bound caller requires |
+| Function | Parameters and return type as above, kind (scalar, inline, multi-statement), `is_schema_bound`, which a schema-bound caller requires, and a table-valued function's result columns as a table's, which a view over it binds [`a_table_valued_functions_result_columns_are_what_a_view_over_it_binds`] |
 | Procedure | Parameters as above |
 | User type | Base type, length, precision, scale, nullability |
 | Synonym | `base_object_name` |
