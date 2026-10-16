@@ -717,14 +717,15 @@ fn roles_are_the_clusters(question: &str) -> anyhow::Error {
 /// entry outside the catalog inventory already holds (#951). SQL Server's
 /// `sys.objects` walk also orders the plan, so it runs after every pass that
 /// changes the plan: [`order_created_object_names`]. On PostgreSQL it first
-/// hoists a table rename that moves a carried object's holder away, where
-/// that clears the plan (#1767, DEC-1767.1). What it read is returned, for
+/// orders a cross-schema rename after the rename that moves a carried
+/// object's holder away (#1767, DEC-1957.2). What it read is returned, for
 /// [`NameFacts::order_and_refuse`] again once the module passes, which may
 /// plan the revision afresh in the differ's order, have run.
 pub async fn refuse_created_name_occupants(
     conn: &mut Conn,
     cs: &mut ChangeSet,
     label: &str,
+    plan: Planned<'_>,
 ) -> anyhow::Result<Option<NameFacts>> {
     match conn.driver() {
         Driver::Postgres => {
@@ -758,7 +759,7 @@ pub async fn refuse_created_name_occupants(
                 relations: pbps_pg::catalog::relations_at(conn, &at_names).await?,
                 occupants,
             };
-            facts.order_and_refuse(cs, label)?;
+            facts.order_and_refuse(cs, label, plan)?;
             Ok(Some(facts))
         }
         Driver::Mssql => Ok(None),
@@ -773,38 +774,40 @@ pub struct NameFacts {
     relations: Vec<(TableName, &'static str)>,
 }
 
+/// What the name passes read the plan's names through: its two sides and the
+/// dialect (#1957).
+#[derive(Clone, Copy)]
+pub struct Planned<'a> {
+    pub base: pbps_diff::Side<'a>,
+    pub desired: pbps_diff::Side<'a>,
+    pub dialect: &'a dyn pbps_dialect::Dialect,
+}
+
 impl NameFacts {
-    /// Hoists a table rename that moves a carried object's holder away, where
-    /// one hoist clears the plan (#1767, DEC-1767.1), then refuses what is
-    /// left (#951, #1749, #1765).
-    pub fn order_and_refuse(&self, cs: &mut ChangeSet, label: &str) -> anyhow::Result<()> {
-        crate::deploy::order_carried_moves(cs, &self.occupants, &self.relations);
+    /// Orders a cross-schema rename after what moves its carried objects'
+    /// holders away, by the plan's name handovers (#1767, #1957,
+    /// DEC-1957.2), then refuses what is left (#951, #1749, #1765).
+    pub fn order_and_refuse(
+        &self,
+        cs: &mut ChangeSet,
+        label: &str,
+        plan: Planned<'_>,
+    ) -> anyhow::Result<()> {
+        crate::deploy::order_carried_moves(
+            cs,
+            &self.occupants,
+            &self.relations,
+            (plan.base, plan.desired),
+            plan.dialect,
+        );
         crate::deploy::refuse_uninventoried_occupants(cs, &self.occupants, &self.relations, label)
     }
 
     /// The occupants as name slots, for the slot replay (#1964, DEC-1964.2).
-    /// The tables and views at the carried names are not occupants: the plan
-    /// manages them or refuses them already (`refuse_uninventoried_occupants`).
     // Debug assertions alone, like its one caller (#2089).
     #[cfg(debug_assertions)]
     pub fn slots(&self) -> pbps_dialect::slots::CatalogFacts {
-        use pbps_dialect::slots::{CatalogFacts, Namespace, Occupant, SlotKey};
-        CatalogFacts {
-            occupants: self
-                .occupants
-                .iter()
-                .map(|o| Occupant {
-                    slot: SlotKey {
-                        namespace: Namespace::Relations(o.name.schema.clone()),
-                        name: o.name.name.clone(),
-                    },
-                    kind: o.kind.to_owned(),
-                    owner: o.owner.clone(),
-                    column: o.owner_column.clone(),
-                })
-                .collect(),
-            ..CatalogFacts::default()
-        }
+        crate::deploy::occupant_slots(&self.occupants)
     }
 }
 

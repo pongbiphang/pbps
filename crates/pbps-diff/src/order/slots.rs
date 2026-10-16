@@ -1,15 +1,19 @@
-//! Name slots beside the effects (#1776 slice S1b-ii, DEC-1964.2).
+//! Name slots beside the effects (#1776 slices S1b-ii and S4, DEC-1964.2,
+//! DEC-1957.1).
 //!
 //! `pbps_model::operation::names` says which names each step claims and
 //! releases; `pbps_dialect::slots` says which namespace holds each and whether
-//! two spellings are one name. This module reads the two three ways, none of
-//! which decides an order:
+//! two spellings are one name. This module reads the two three ways:
 //!
 //! - [`edges`]: release before claim, where the evidence names the holder a
 //!   claim replaces. A name's first holder is one that only gives it up; its
 //!   last is one that only takes it. Between them, an object that takes the
 //!   name and gives it up again has no place the evidence fixes, and no edge:
-//!   proposing one is S4's search (#1957), never position.
+//!   proposing one is a search's, never position's. A catalog occupant the
+//!   plan takes away at one step is a first holder too ([`carried`]), and a
+//!   move passing through a name holds it between its statements. The edges
+//!   are `Identity` edges a schedule settles ([`schedule`], [`handovers`]);
+//!   a connected PostgreSQL plan orders its carried moves by them.
 //! - [`verify`]: a replay of the order given, refusing a claim on a name
 //!   another object still holds.
 //! - the statement-level check inside it: a rename that passes through an
@@ -151,17 +155,117 @@ pub struct SlotEdge {
     pub before: usize,
     pub after: usize,
     pub slot: SlotKey,
+    /// Whether a catalog occupant is the holder that gives the name up or
+    /// takes it, so the edge is the catalog's evidence, not the plan's.
+    pub catalog: bool,
+}
+
+/// What one catalog occupant does in the plan: the one step that takes it
+/// away from its name, and the name it lands on where that step moves its
+/// table to another schema (#1957, DEC-1957.1).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Carried {
+    /// Its position in the facts' occupants.
+    pub occupant: usize,
+    pub slot: SlotKey,
+    pub step: usize,
+    pub lands: Option<SlotKey>,
+}
+
+/// The catalog's occupants as holders, for [`edges`]: each one the plan
+/// takes away at exactly one step. An occupant no step takes away holds its
+/// name whatever the order, which the replay reports. One that several
+/// steps may take away, a column's default given another default and then
+/// renamed, has no step the evidence fixes, and no edge: which one really
+/// frees it is the engine's walk to say (`leaves`). Occupants at a name a
+/// baseline object holds are that object, tracked by its own claims and
+/// releases, as in [`verify`].
+pub fn carried(
+    operations: &[Operation],
+    facts: &CatalogFacts,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    dialect: &dyn Dialect,
+) -> Vec<Carried> {
+    let declared: BTreeSet<SlotKey> = baseline_names(owners, before)
+        .into_iter()
+        .flat_map(|named| slots_of(dialect, &named.address))
+        .collect();
+    let keys: Vec<Option<ObjectKey>> = operations.iter().map(|op| op.key(owners).ok()).collect();
+    let mut out = Vec::new();
+    for (k, o) in facts.occupants.iter().enumerate() {
+        if declared.contains(&o.slot) {
+            continue;
+        }
+        let table = o
+            .owner
+            .as_ref()
+            .and_then(|t| base_table_named(owners, before, t));
+        let column = table
+            .as_ref()
+            .zip(o.column.as_ref())
+            .and_then(|(t, c)| t.column(owners, c).map(|key| (key, c.clone())));
+        let who = Occupier::Catalog {
+            kind: o.kind.clone(),
+            owner: table.map(|t| t.table_key()),
+            column,
+        };
+        let steps: Vec<usize> = operations
+            .iter()
+            .zip(&keys)
+            .enumerate()
+            .filter(|(_, (op, key))| {
+                leaves(op, key.as_ref(), &who) || moves(op, key.as_ref(), &who)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let [step] = steps[..] else { continue };
+        // As in the replay, an occupant the step takes out of its schema
+        // does not land anywhere: a default renamed with its table's move.
+        let key = keys[step].as_ref();
+        let lands = if let Change::RenameTable { from, to, .. } = operations[step].change()
+            && from.schema != to.schema
+            && !leaves(&operations[step], key, &who)
+            && moves(&operations[step], key, &who)
+        {
+            let mut landed = o.slot.clone();
+            if let pbps_dialect::slots::Namespace::Relations(schema) = &mut landed.namespace {
+                schema.clone_from(&to.schema);
+            }
+            Some(landed)
+        } else {
+            None
+        };
+        out.push(Carried {
+            occupant: k,
+            slot: o.slot.clone(),
+            step,
+            lands,
+        });
+    }
+    out
 }
 
 /// The slots `a` and `b` are one name in, by the facts at hand: equal slots
 /// always, and alike spellings where the catalog says so.
-fn groups(slots: &Slots, facts: Option<&CatalogFacts>) -> BTreeMap<SlotKey, SlotKey> {
+fn groups(
+    slots: &Slots,
+    facts: Option<&CatalogFacts>,
+    carried: &[Carried],
+) -> BTreeMap<SlotKey, SlotKey> {
     // Each slot's representative: itself, or the least slot the catalog
     // reports alike with it.
     let mut all: BTreeSet<&SlotKey> = BTreeSet::new();
     for fx in &slots.effects {
         all.extend(fx.claims.iter().map(|(s, _)| s));
         all.extend(fx.releases.iter().map(|(s, _)| s));
+    }
+    for c in carried {
+        all.insert(&c.slot);
+        all.extend(&c.lands);
+    }
+    for fx in &slots.effects {
+        all.extend(&fx.intermediate);
     }
     let mut rep: BTreeMap<SlotKey, SlotKey> =
         all.iter().map(|s| ((*s).clone(), (*s).clone())).collect();
@@ -189,18 +293,41 @@ fn groups(slots: &Slots, facts: Option<&CatalogFacts>) -> BTreeMap<SlotKey, Slot
     rep
 }
 
-/// Release before claim, where the evidence names whom a claim replaces.
-pub fn edges(slots: &Slots, facts: Option<&CatalogFacts>) -> Vec<SlotEdge> {
-    let rep = groups(slots, facts);
+/// Who holds a name, for the edges: an object of the plan, a catalog
+/// occupant by its position in the facts, or a step passing through a name
+/// between two of its statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Holder<'a> {
+    Managed(&'a ObjectKey),
+    Catalog(usize),
+    Passing(usize),
+}
+
+/// Release before claim, where the evidence names whom a claim replaces:
+/// the plan's own names, the names a step passes through between its
+/// statements, and the catalog's occupants as the first holders of theirs
+/// (`carried`, DEC-1957.1).
+pub fn edges(slots: &Slots, facts: Option<&CatalogFacts>, carried: &[Carried]) -> Vec<SlotEdge> {
+    handovers_of(slots, facts, carried, true)
+}
+
+/// [`edges`], with the names steps pass through as holders where `passing`.
+fn handovers_of(
+    slots: &Slots,
+    facts: Option<&CatalogFacts>,
+    carried: &[Carried],
+    passing: bool,
+) -> Vec<SlotEdge> {
+    let rep = groups(slots, facts, carried);
     // Per name: each holder's claims and releases, by step.
     type Steps = (Vec<usize>, Vec<usize>);
-    let mut by_slot: BTreeMap<&SlotKey, BTreeMap<&ObjectKey, Steps>> = BTreeMap::new();
+    let mut by_slot: BTreeMap<&SlotKey, BTreeMap<Holder<'_>, Steps>> = BTreeMap::new();
     for (i, fx) in slots.effects.iter().enumerate() {
         for (s, h) in &fx.claims {
             by_slot
                 .entry(&rep[s])
                 .or_default()
-                .entry(h)
+                .entry(Holder::Managed(h))
                 .or_default()
                 .0
                 .push(i);
@@ -209,20 +336,57 @@ pub fn edges(slots: &Slots, facts: Option<&CatalogFacts>) -> Vec<SlotEdge> {
             by_slot
                 .entry(&rep[s])
                 .or_default()
-                .entry(h)
+                .entry(Holder::Managed(h))
                 .or_default()
                 .1
                 .push(i);
+        }
+    }
+    // A step that passes through a name takes it and gives it up again: a
+    // holder between the name's first and last, which waits for the first
+    // and which the last waits for, as a borrower does.
+    for (i, fx) in slots.effects.iter().enumerate().filter(|_| passing) {
+        for s in &fx.intermediate {
+            let steps = by_slot
+                .entry(&rep[s])
+                .or_default()
+                .entry(Holder::Passing(i))
+                .or_default();
+            steps.0.push(i);
+            steps.1.push(i);
+        }
+    }
+    // An occupant holds its name from the start and gives it up at its
+    // step; carried to another schema, it takes the name it lands on there.
+    for c in carried {
+        by_slot
+            .entry(&rep[&c.slot])
+            .or_default()
+            .entry(Holder::Catalog(c.occupant))
+            .or_default()
+            .1
+            .push(c.step);
+        if let Some(lands) = &c.lands {
+            by_slot
+                .entry(&rep[lands])
+                .or_default()
+                .entry(Holder::Catalog(c.occupant))
+                .or_default()
+                .0
+                .push(c.step);
         }
     }
     let mut out = BTreeSet::new();
     for (s, holders) in &by_slot {
         for (holder, (claims, releases)) in holders {
             let others = holders.iter().filter(|(h, _)| *h != holder);
+            let catalog = |other: &Holder<'_>| {
+                matches!(holder, Holder::Catalog(_)) || matches!(other, Holder::Catalog(_))
+            };
             if claims.is_empty() {
                 // The name's first holder: every other claim waits for it to
                 // give the name up.
-                for (_, (their_claims, _)) in others {
+                for (other, (their_claims, _)) in others {
                     for &r in releases {
                         for &c in their_claims {
                             if r != c {
@@ -230,6 +394,7 @@ pub fn edges(slots: &Slots, facts: Option<&CatalogFacts>) -> Vec<SlotEdge> {
                                     before: r,
                                     after: c,
                                     slot: (*s).clone(),
+                                    catalog: catalog(other),
                                 });
                             }
                         }
@@ -238,7 +403,7 @@ pub fn edges(slots: &Slots, facts: Option<&CatalogFacts>) -> Vec<SlotEdge> {
             } else if releases.is_empty() {
                 // The name's last holder: it takes the name once every other
                 // holder has given it up.
-                for (_, (_, their_releases)) in others {
+                for (other, (_, their_releases)) in others {
                     for &r in their_releases {
                         for &c in claims {
                             if r != c {
@@ -246,6 +411,7 @@ pub fn edges(slots: &Slots, facts: Option<&CatalogFacts>) -> Vec<SlotEdge> {
                                     before: r,
                                     after: c,
                                     slot: (*s).clone(),
+                                    catalog: catalog(other),
                                 });
                             }
                         }
@@ -255,6 +421,59 @@ pub fn edges(slots: &Slots, facts: Option<&CatalogFacts>) -> Vec<SlotEdge> {
         }
     }
     out.into_iter().collect()
+}
+
+/// The handover edges as a schedule's: a name changing hands is `Identity`
+/// (DEC-1956.1), from the plan's names (`Effect`) or a catalog occupant's
+/// (`Catalog`).
+pub fn schedule(schedule: &mut super::Schedule, edges: &[SlotEdge]) {
+    for e in edges {
+        let source = if e.catalog {
+            super::Source::Catalog
+        } else {
+            super::Source::Effect
+        };
+        schedule.edge(
+            e.before,
+            e.after,
+            source,
+            pbps_model::resolver::OrderReason::Identity,
+        );
+    }
+}
+
+/// A plan's name handovers as a schedule over its changes, from the plan's
+/// names and the catalog's occupants (#1957, DEC-1957.1), for a pass that
+/// orders by them. Every other edge of the plan is the caller's to keep: a
+/// release build computes no effects, so what the schedule may move is the
+/// caller's rule (DEC-1957.2). `Err` where the plan's names cannot be read.
+pub fn handovers(
+    changes: &[pbps_model::PlannedChange],
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    dialect: &dyn Dialect,
+    facts: &CatalogFacts,
+) -> Result<super::Schedule, String> {
+    use pbps_model::operation::{ModuleEdits, Operations, PlanOwners};
+    let modes = if dialect.rebuilds_modules() {
+        ModuleEdits::Rebuilt
+    } else {
+        ModuleEdits::InPlace
+    };
+    let operations = Operations::of_plan(changes, modes);
+    let names =
+        pbps_model::plan_names::PlanNames::of(changes, desired.ids).map_err(|e| e.to_string())?;
+    let owners = PlanOwners::new(names, base.ids, desired.ids);
+    let before = Snapshot {
+        schema: base.schema,
+        ids: base.ids,
+    };
+    let ops = operations.as_slice();
+    let slots = analyse(ops, &owners, before, dialect);
+    let held = carried(ops, facts, &owners, before, dialect);
+    let mut out = super::Schedule::new(changes.len());
+    schedule(&mut out, &edges(&slots, Some(facts), &held));
+    Ok(out)
 }
 
 /// Why the replay refused a claim.
@@ -507,7 +726,10 @@ pub fn verify(
             held.push((s.clone(), Occupier::Managed(h.clone())));
         }
     }
-    for e in edges(slots, facts) {
+    // The occupants and the names steps pass through are the replay's above,
+    // not edges here: it refuses a claim on one still held, and an edge would
+    // name the same fault twice.
+    for e in handovers_of(slots, facts, &[], false) {
         if e.before >= e.after {
             violations.push(SlotViolation::Edge {
                 before: operations[e.before].id(),

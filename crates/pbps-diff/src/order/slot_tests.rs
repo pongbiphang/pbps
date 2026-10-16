@@ -14,7 +14,7 @@ use pbps_model::{
 };
 
 use super::edges::Baseline;
-use super::slots::{Skipped, SlotViolation, analyse, edges, verify};
+use super::slots::{Skipped, SlotEdge, SlotViolation, analyse, carried, edges, verify};
 
 /// An engine that renames across schemas in two statements, through the
 /// table's old name in the new schema, as PostgreSQL's `SET SCHEMA` and SQL
@@ -145,6 +145,38 @@ impl Plan {
         )
         .len();
         (violations, skipped, effect_violations)
+    }
+}
+
+impl Plan {
+    /// The handover edges over the plan in its own order, the catalog's
+    /// occupants included as holders (#1957).
+    fn handovers(&self, dialect: &dyn Dialect, facts: &CatalogFacts) -> Vec<SlotEdge> {
+        let logical = Operations::of_plan(&self.logical, ModuleEdits::InPlace);
+        let names = PlanNames::of(&self.logical, &self.after_ids).unwrap();
+        let owners = PlanOwners::new(names, &self.before_ids, &self.after_ids);
+        let before = Snapshot {
+            schema: &self.before,
+            ids: &self.before_ids,
+        };
+        let ops = logical.as_slice();
+        let slots = analyse(ops, &owners, before, dialect);
+        let held = carried(ops, facts, &owners, before, dialect);
+        edges(&slots, Some(facts), &held)
+    }
+}
+
+/// A catalog occupant at `at` (`schema.name`) that belongs to `owner`.
+fn occupant(at: &str, owner: &str, column: Option<&str>) -> pbps_dialect::slots::Occupant {
+    let at = name(at);
+    pbps_dialect::slots::Occupant {
+        slot: SlotKey {
+            namespace: Namespace::Relations(at.schema),
+            name: at.name,
+        },
+        kind: "sequence".into(),
+        owner: Some(name(owner)),
+        column: column.map(str::to_owned),
     }
 }
 
@@ -328,7 +360,7 @@ fn only_the_first_and_last_holders_of_a_name_are_ordered_by_evidence() {
         ids: &plan.before_ids,
     };
     let slots = analyse(logical.as_slice(), &owners, before, &exact);
-    let found: Vec<(usize, usize)> = edges(&slots, None)
+    let found: Vec<(usize, usize)> = edges(&slots, None, &[])
         .into_iter()
         .filter(|e| e.slot.name == "t")
         .map(|e| (e.before, e.after))
@@ -638,4 +670,155 @@ fn an_unchanged_name_alike_to_a_moves_stop_is_compared() {
             .any(|s| s.claimed == key("dbo", "x") && s.held == key("dbo", "X")),
         "{skipped:?}"
     );
+}
+
+/// #1957: a catalog occupant is the first holder of its name. `s1.a`'s move
+/// carries its sequence onto `s2.a_id_seq`, which `s2.b`'s sequence holds
+/// until `s2.b` moves away: the move waits for that rename, by the catalog's
+/// evidence. Negatives: an occupant in another schema hands over nothing the
+/// move takes, and on an engine that compares names under a collation, a
+/// spelling the catalog did not report alike is not ordered by a guess.
+#[test]
+fn a_catalog_occupant_hands_its_name_to_what_its_owners_move_lands_there() {
+    let plan = Plan::new(
+        &[("a", "s1.a"), ("b", "s2.b")],
+        &[("a", "s2.a"), ("b", "s3.b")],
+        vec![
+            rename_table("a", "s1.a", "s2.a"),
+            rename_table("b", "s2.b", "s3.b"),
+        ],
+    );
+    let exact = Slotted { exact: true };
+    let facts = |held: &str| CatalogFacts {
+        occupants: vec![
+            occupant("s1.a_id_seq", "s1.a", None),
+            occupant(held, "s2.b", None),
+        ],
+        ..CatalogFacts::default()
+    };
+    let found: Vec<(usize, usize, String, bool)> = plan
+        .handovers(&exact, &facts("s2.a_id_seq"))
+        .into_iter()
+        .map(|e| (e.before, e.after, e.slot.to_string(), e.catalog))
+        .collect();
+    assert_eq!(found, [(1, 0, "s2.a_id_seq".to_owned(), true)]);
+
+    // Negatives.
+    assert!(
+        plan.handovers(&exact, &facts("s9.a_id_seq")).is_empty(),
+        "another schema's name is another slot"
+    );
+    let collated = Slotted { exact: false };
+    assert!(
+        plan.handovers(&collated, &facts("s2.A_ID_SEQ")).is_empty(),
+        "no fact says the two spellings are one name"
+    );
+    let mut alike = facts("s2.A_ID_SEQ");
+    let key = |s: &str| SlotKey {
+        namespace: Namespace::Relations("s2".into()),
+        name: s.into(),
+    };
+    alike.alike.insert((key("A_ID_SEQ"), key("a_id_seq")));
+    assert_eq!(
+        plan.handovers(&collated, &alike)
+            .into_iter()
+            .map(|e| (e.before, e.after))
+            .collect::<Vec<_>>(),
+        [(1, 0)],
+        "the catalog's word makes them one"
+    );
+}
+
+/// #1957: an occupant that two steps of the plan may take away has no step
+/// the evidence fixes, so it hands its name over by no edge: which one frees
+/// it is the engine's walk to say. With one such step, the claim waits for
+/// it.
+#[test]
+fn an_occupant_two_steps_may_free_is_ordered_by_neither() {
+    let column_uid = Uid::derived(UidKind::Column, "app.t.c", 0);
+    let mut plan = Plan::new(
+        &[("t", "app.t")],
+        &[("t", "app.t"), ("n", "app.DF_t_c")],
+        vec![
+            Change::AlterColumnDefault {
+                uid: column_uid.clone(),
+                column: name("app.t").column("c"),
+                from: Some("1".into()),
+                to: None,
+            },
+            Change::CreateTable {
+                uid: uid("n"),
+                name: name("app.DF_t_c"),
+                table: Box::default(),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        ],
+    );
+    for (schema, ids) in [
+        (&mut plan.before, &mut plan.before_ids),
+        (&mut plan.after, &mut plan.after_ids),
+    ] {
+        schema
+            .tables
+            .get_mut(&name("app.t"))
+            .unwrap()
+            .columns
+            .insert("c".into(), pbps_model::Column::new("int".parse().unwrap()));
+        ids.columns
+            .insert(column_uid.clone(), name("app.t").column("c"));
+    }
+    let facts = CatalogFacts {
+        occupants: vec![occupant("app.DF_t_c", "app.t", Some("c"))],
+        ..CatalogFacts::default()
+    };
+    let exact = Slotted { exact: true };
+    let found: Vec<(usize, usize, bool)> = plan
+        .handovers(&exact, &facts)
+        .into_iter()
+        .map(|e| (e.before, e.after, e.catalog))
+        .collect();
+    assert_eq!(found, [(0, 1, true)]);
+
+    // A rename of the same column may take the default away too.
+    plan.logical.push(PlannedChange::new(Change::RenameColumn {
+        uid: column_uid.clone(),
+        table: name("app.t"),
+        from: "c".into(),
+        to: "d".into(),
+        table_was: None,
+    }));
+    let columns = &mut plan.after.tables.get_mut(&name("app.t")).unwrap().columns;
+    let column = columns.shift_remove("c").unwrap();
+    columns.insert("d".into(), column);
+    plan.after_ids
+        .columns
+        .insert(column_uid.clone(), name("app.t").column("d"));
+    assert!(plan.handovers(&exact, &facts).is_empty());
+}
+
+/// #1957: a move to another schema passes through its old name there, which
+/// makes it a holder of that name between its two statements: it waits for
+/// the drop that frees the name, by the plan's own evidence. Verifying, the
+/// statement-level check names the fault, and the edge check does not name it
+/// twice.
+#[test]
+fn a_move_waits_for_what_frees_the_name_it_passes_through() {
+    let plan = Plan::new(
+        &[("x", "s1.x"), ("y", "s2.x")],
+        &[("x", "s2.z")],
+        vec![drop_table("y", "s2.x"), rename_table("x", "s1.x", "s2.z")],
+    );
+    let exact = Slotted { exact: true };
+    let found: Vec<(usize, usize, String, bool)> = plan
+        .handovers(&exact, &CatalogFacts::default())
+        .into_iter()
+        .map(|e| (e.before, e.after, e.slot.to_string(), e.catalog))
+        .collect();
+    assert!(
+        found.contains(&(0, 1, "s2.x".to_owned(), false)),
+        "{found:?}"
+    );
+    let (wrong, _, _) = plan.run(&[1, 0], &exact, None);
+    assert_eq!(held(&wrong), ["intermediate s2.x"], "{wrong:?}");
 }

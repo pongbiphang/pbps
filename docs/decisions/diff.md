@@ -5981,3 +5981,165 @@ Pinned by `a_row_update_waits_for_a_check_replaced_under_its_name_and_not_for_on
 `a_unique_constraint_kept_through_a_rename_or_a_parameter_change_is_not_replaced`,
 `a_storage_type_change_waits_for_every_key_and_index_over_its_column` and
 `a_varchar_widening_requires_no_check_gone_and_a_base_type_change_does`.
+
+<a id="dec-1957-1"></a>
+
+**DEC-1957.1. A name's handover is an `Identity` edge `settle` orders by:
+from the plan's names, the names a move passes through, and a catalog
+occupant the plan takes away at exactly one step.** (#1957, S4 of #1776)
+
+`order::slots::edges` keeps DEC-1964.2's rule: a name's first holder only
+gives it up and every other claim follows that release; its last holder only
+takes it and follows every other release; a holder that takes the name and
+gives it up again in between gets no edge from its position. S4 adds two
+kinds of holder:
+
+- **A catalog occupant** (`order::slots::carried`) is a first holder: it holds
+  its name from the start, and the plan takes it away at the step that drops
+  or moves its table, or drops, renames, retypes or re-defaults its column, as
+  DEC-1964.2's replay reads it. Carried to another schema, it takes the name
+  it lands on there. An occupant that two steps may take away, a column
+  given another default and then renamed, has no step the evidence fixes,
+  and so no edge. Which one frees it is the engine's walk to say.
+- **A move passing through a name** between its two statements (`SET SCHEMA`
+  before `RENAME TO`, `TRANSFER` before `sp_rename`) holds it for that step
+  alone: it waits for the name's first holder, and the last holder waits for
+  it.
+
+Two spellings are one name only by a catalog fact (`alike`). Without one,
+nothing is ordered by a guess.
+
+Each edge is `Identity` (DEC-1956.1). Its source is `Catalog` when an
+occupant is one end, and `Effect` otherwise. `order::slots::handovers` builds
+a plan's schedule from them, for a pass that orders by them.
+
+The verifier's slot edge check leaves occupants and passed-through names to
+the replay, which already refuses a claim on one still held. An edge would
+name the same fault twice.
+
+Pinned by `a_catalog_occupant_hands_its_name_to_what_its_owners_move_lands_there`,
+`an_occupant_two_steps_may_free_is_ordered_by_neither` and
+`a_move_waits_for_what_frees_the_name_it_passes_through`. The existing
+`only_the_first_and_last_holders_of_a_name_are_ordered_by_evidence` pins that
+two claims with no evidence between them are not ordered by position.
+
+<a id="dec-1957-2"></a>
+
+**DEC-1957.2. A connected PostgreSQL plan orders its carried moves by the name
+handovers, keeping the result only where table renames alone pass one another
+and the replay finds fewer clashes; this replaces DEC-1767.1's hoist.**
+(#1957; amends DEC-1767.1)
+
+`order_carried_moves` still runs only where the replay (`name_clashes`) finds
+a move landing on a held name. It then settles the plan over
+`order::slots::handovers`, with the occupants `relation_name_occupants` read.
+The order settled is kept on two conditions:
+
+- **Only table renames pass one another.** A release build computes no
+  effects, so the schedule holds the names alone. Two table renames meet only
+  through the names both see, which the edges and the replay hold. Any other
+  change has an address or a value a rename can move, which only the effect
+  graph orders. A move that would pass one keeps the order and the refusal,
+  as the hoist did.
+- **The replay finds fewer clashes in it.** This is the hoist's own
+  acceptance rule, kept as the judge of every order. After the
+  passed-through names became edges, no known input trips it: its revert
+  fails no test. It stays as the backstop for a step whose names cannot be
+  read.
+
+Otherwise, and on a cycle, the plan keeps its order, and
+`refuse_uninventoried_occupants` refuses it with today's text.
+
+**What the hoist covered, and what covers it now.** The hoist is deleted,
+behaviour by behaviour:
+
+| The hoist | Now | Pinned by |
+|---|---|---|
+| A later rename moving the holder away runs before the move | the occupant's handover edge | `a_move_runs_after_the_rename_that_moves_its_carried_names_holder_away`; live `a_rename_that_moves_a_carried_names_holder_away_runs_first_on_both_servers` |
+| Only across other table renames | the crossing rule above | the same unit test's `between` negative |
+| None it passes may free a name it takes on its way | the plan's names and the passed-through names as edges | the same unit test's `through_a` case |
+| Two moves that wait on each other keep their order | `settle` refuses the cycle | the same unit test's `cyclic` negative |
+| A plan already clear is left as it is | the replay's gate before anything is settled | the same unit test |
+| Ordered again after a module pass plans again | unchanged: the pass runs twice | live `a_hoisted_rename_stays_ahead_when_a_view_rebuild_plans_again` |
+
+**Where the result differs.** `settle` sinks the move to right after the
+rename it waits for (DEC-1956.2), where the hoist moved the rename up to the
+move. Table renames between them now run before both. Both orders are
+valid: only table renames pass one another, and the names each takes are
+free when it runs, by the edges and the replay. A holder chain that needs more
+than one move, which the hoist refused ("one hoist cannot clear this"), is now
+ordered by the same evidence, as #1776's holder chains require. Pinned live
+on 16 and 18 by `a_chain_of_carried_name_handovers_is_ordered_on_both_servers`.
+
+**Side by side.** The hoist ran beside the new pass over the full local gate
+(unit, doc and the live suites on both engines), on every plan the replay
+found a clash in: 17 calls. 13 were identical: 7 moved the same way, and 6 were
+refused by both with the same text. The other 4 were refused by the hoist and
+are planned now, each a holder chain:
+- the unit test's chain and its pass-through case;
+- the live chain test on 16 and on 18.
+
+No order differed by the tie-break: the gate has no plan with a table rename
+between the move and the rename it waits for.
+
+**The name `Keep` of DEC-1956.3 stays.** Sinking a claim past a held drop
+would move it past changes whose other constraints are still not edges in a
+release build.
+
+<a id="dec-1957-3"></a>
+
+**DEC-1957.3. On a connected SQL Server plan the rename search proposes its
+order as `Search` edges and `settle` applies them; the search stays.**
+(#1957)
+
+`object_order`'s search is unchanged: it walks the region's orders (the table
+renames, the drops of classes 2 and 6, and the module drops the computed
+edges placed) over the catalog's `sys.objects` names, depth first, under
+`TRIALS`. It no longer moves changes itself. The order it finds becomes
+edges:
+
+- each change of the region before the next one it ran;
+- every change ahead of the region before the region's first;
+- the region's last before every change after it.
+
+They have the `Search` source and `Identity` reason. Beside them, the computed
+edges' order of the drops is `Catalog` and `Structural`. These edges are the
+order the walk cleared, so `settle` returns that order, and the walk runs
+again over the result. A drop on a renamed table is addressed for where it
+runs, as before.
+
+**Why the search stays.** On SQL Server the name a generated default takes on
+a rename depends on which names are free when it runs (DEC-981.1). So the
+walk's state decides an order, and handover edges alone cannot. Each
+behaviour it covers keeps its test, and nothing replaces it yet:
+
+- the generated name a default holds: `the_generated_name_a_default_holds_decides_the_order`;
+- a rename that would strand a later one: `a_rename_that_would_strand_a_later_one_waits`;
+- catalog-only holders: `an_adopted_default_name_is_free_once_its_table_moves`;
+- collation pairs: `the_databases_alike_pairs_order_a_case_chain`;
+- module drops (#1461, #1680): the `a_module_drop_*`, `a_leading_module_drop_*`
+  and `a_follower_module_drop_*` tests.
+
+**Column renames.** `order_column_renames` orders each table's renames over
+their handovers, through `settle`: `Effect` where the spellings are equal,
+`Catalog` where the collation reads them alike. The renames keep the
+positions they had and trade them, as before. A cycle, such as `a -> B`
+beside `b -> A` on a case-insensitive database, is refused with DEC-1366.3's
+text, naming every rename left unordered
+(`column_renames_trading_names_under_the_collation_are_refused`).
+
+**Side by side.** The old list mover and column loop ran beside their
+replacements over the full local gate. All 21 search results were
+identical. So were all 21 column-rename results, orders and refusal texts
+alike; 2 of them moved renames or refused.
+
+**#1558 assessed.** An engine-chosen clone name handed between two detaches
+is a catalog occupant's handover under DEC-1957.1, once the connected plan
+reads each detached partition's clone names. That read is #1558's, so the
+issue stays open.
+
+Pinned by `the_search_proposes_its_order_as_edges_and_settling_again_proposes_nothing`.
+It checks:
+- the proposal's source;
+- that a change the search does not move stays after the region;
+- that a settled plan clears the walk and is left as it is.
