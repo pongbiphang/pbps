@@ -435,6 +435,21 @@ pub fn prepare(engine: &str, dialect: &dyn Dialect, scenario: &Scenario, role: &
     }
 }
 
+/// The new-uid result: `None` when the plan with new uids ended as the
+/// plan did, the difference when it ended otherwise (it ran to another
+/// state, was refused, or left a next plan), and the error when it could not
+/// be read at all.
+pub fn reminted_of(
+    plan: &Outcome,
+    reminted: Result<Outcome, Finding>,
+) -> Result<Option<String>, Finding> {
+    match reminted.and_then(|c| same("the plan with new uids", plan, &c)) {
+        Ok(()) => Ok(None),
+        Err(Finding::Differs(e)) => Ok(Some(e)),
+        Err(other) => Err(other),
+    }
+}
+
 /// Whose an outcome's failure is. The plan's own order not converging is a
 /// broken scenario; a swapped order that runs and does not converge is the
 /// pair not commuting, which a listed gap may hold.
@@ -611,7 +626,9 @@ async fn checked<E: Engine>(
     )
     .await?;
     // The plan with new uids first: whatever the pair shows, an unstable
-    // plan is a failure of its own.
+    // plan is a failure of its own. It is read as a swapped order is (`own`
+    // false): refused or left short of the declarations, it ended otherwise,
+    // which is the new-uid result and not a broken harness.
     let reminted: Vec<usize> = (0..changes2.changes.len()).collect();
     let c = outcome_of(
         engine,
@@ -621,14 +638,10 @@ async fn checked<E: Engine>(
         &changes2,
         &reminted,
         &ids2,
-        true,
+        false,
     )
-    .await?;
-    let reminted = match same("the plan with new uids", &a, &c) {
-        Ok(()) => None,
-        Err(Finding::Differs(e)) => Some(e),
-        Err(other) => return Err(other),
-    };
+    .await;
+    let reminted = reminted_of(&a, c)?;
     // The swapped run, whatever the plan with new uids did.
     let pair = match outcome_of(
         engine,
@@ -831,6 +844,30 @@ mod verdict_tests {
         ));
         let unread = || Finding::Harness("pull failed".into());
         assert!(matches!(converged(false, unread()), Finding::Harness(_)));
+    }
+
+    fn held() -> Outcome {
+        Outcome {
+            catalog: Schema::default(),
+            columns: Vec::new(),
+            access: Vec::new(),
+            rows: Vec::new(),
+        }
+    }
+
+    /// The plan with new uids refused, or left short of the declarations,
+    /// ended otherwise: that is its result, kept beside the pair's, never a
+    /// broken harness that would stop the swapped run being judged.
+    #[test]
+    fn a_new_uid_plan_that_does_not_converge_is_its_result_not_the_harness() {
+        let refused = Err(Finding::Differs("c: the next plan is not empty".into()));
+        assert!(matches!(reminted_of(&held(), refused), Ok(Some(_))));
+        assert!(matches!(reminted_of(&held(), Ok(held())), Ok(None)));
+        let unread = Err(Finding::Harness("c: pull failed".into()));
+        assert!(matches!(
+            reminted_of(&held(), unread),
+            Err(Finding::Harness(_))
+        ));
     }
 
     #[test]
