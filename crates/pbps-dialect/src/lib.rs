@@ -117,6 +117,21 @@ pub enum DialectError {
         message: String,
     },
 
+    /// [`DialectError::Invalid`] for a message that writes text of its own that
+    /// `Invalid` would change when it escapes the whole message, such as the
+    /// backslash of PostgreSQL's `\x` spelling of a `bytea` (#2081).
+    ///
+    /// The caller passes every plan-carried value through `Escaped` as it
+    /// builds the message, and `Display` does not escape it again, so the
+    /// text the tool wrote is shown as written and the values stay inert. A
+    /// value left unescaped here is shown raw: use `Invalid` unless the message
+    /// needs this.
+    #[error("{dialect}: {message}")]
+    InvalidVerbatim {
+        dialect: &'static str,
+        message: String,
+    },
+
     /// A change this dialect will not perform, with the statement a human runs
     /// instead.
     ///
@@ -3961,6 +3976,16 @@ mod tests {
         assert_eq!(
             by_hand.to_string(),
             "pg: role `r` is not here. Run it by hand, then plan again:\n\n    CREATE ROLE \"r\";"
+        );
+        // Tool-authored text is not escaped, only the plan-carried values in it
+        // (#2081): `InvalidVerbatim` is shown as it was built.
+        let verbatim = DialectError::InvalidVerbatim {
+            dialect: "pg",
+            message: "reads a `bytea` as `\\x` followed by hex".into(),
+        };
+        assert_eq!(
+            verbatim.to_string(),
+            "pg: reads a `bytea` as `\\x` followed by hex"
         );
         // Negative: an ordinary refusal, and a Unicode name, are shown as written.
         let ordinary = DialectError::Invalid {

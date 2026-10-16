@@ -1347,7 +1347,11 @@ serialization, so it cannot escape itself (#2035).
   emitter's and validator's refusals (about 250 of them) at once. The one
   message that has line breaks of its own, the statement to run by hand, is a
   variant of its own (`DialectError::ByHand`) so that escaping the message does
-  not escape the tool's layout. A sentence built outside an error type escapes
+  not escape the tool's layout. Tool-authored text is not escaped, only the
+  plan-carried values in it: a message that writes a backslash of its own, such
+  as PostgreSQL's `\x` spelling of a `bytea`, escapes its values as it builds
+  and is carried by `DialectError::InvalidVerbatim` (#2081), which `Invalid`
+  would otherwise show as `\\x`. A sentence built outside an error type escapes
   the name where it prints it (the `PUBLIC` execution decisions, the staged-run
   refusal, the statements that cannot run in a transaction). The text serde
   repeats from the identity file, which is committed text of the same kind, goes

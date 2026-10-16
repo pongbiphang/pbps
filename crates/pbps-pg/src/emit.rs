@@ -4445,11 +4445,18 @@ fn cell_sql(v: &Value, ty: Option<&ColumnType>) -> Result<String, DialectError> 
         Value::Int(i) => value_literal(&i.to_string()),
         Value::Text(t) if bytea => {
             let hex = t.strip_prefix("\\x").ok_or_else(|| {
-                invalid(format!(
-                    "the value {t:?} is declared for a `bytea` column and is not in the spelling \
-                     this engine reads a `bytea` back in: `\\x` followed by hex digits, which is \
-                     what `pull --data` writes"
-                ))
+                // The `\x` is the tool's own text and the value is the plan's:
+                // `Invalid` would double the first, so the value is escaped
+                // here and the message carried as it is (#2081).
+                DialectError::InvalidVerbatim {
+                    dialect: DIALECT,
+                    message: format!(
+                        "the value {} is declared for a `bytea` column and is not in the \
+                         spelling this engine reads a `bytea` back in: `\\x` followed by hex \
+                         digits, which is what `pull --data` writes",
+                        pbps_model::escape::Escaped(&format!("{t:?}"))
+                    ),
+                }
             })?;
             // No emptiness test: `\x` is this engine's canonical spelling of
             // the empty `bytea` and `decode('', 'hex')` is valid — measured,
@@ -8552,6 +8559,40 @@ mod tests {
         // And a spelling this engine would not read back that way is refused
         // rather than written as something else.
         cell_sql(&Value::Text("0102".into()), Some(&bytea)).expect_err("not the engine's spelling");
+    }
+
+    /// The refusal writes PostgreSQL's `\x` itself and names the plan's value:
+    /// the `\x` is shown once, as the tool wrote it, and the value escaped
+    /// (DEC-2032.1, #2081).
+    #[test]
+    fn the_bytea_refusal_shows_its_own_backslash_once_and_the_value_escaped() {
+        let bytea = "bytea".parse::<ColumnType>().expect("a type");
+        let refusal = cell_sql(
+            &Value::Text("0102\n\u{1b}[31m\u{202e}".into()),
+            Some(&bytea),
+        )
+        .expect_err("not the engine's spelling")
+        .to_string();
+        assert!(!refusal.chars().any(char::is_control), "{refusal:?}");
+        // The value is quoted with `Debug`, which escapes the control characters
+        // first, and the escape then doubles those backslashes (DEC-2032.1).
+        assert!(
+            refusal.contains(r#""0102\\n\\u{1b}[31m\\u{202e}""#),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("in: `\\x` followed by hex digits"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("`\\\\x`"), "{refusal}");
+        // Negative: a plain value gives the plain message.
+        let plain = cell_sql(&Value::Text("0102".into()), Some(&bytea))
+            .expect_err("not the engine's spelling")
+            .to_string();
+        assert!(
+            plain.starts_with("postgres: the value \"0102\" is declared"),
+            "{plain}"
+        );
     }
 
     /// Never a bare `5` or a bare `true`: this engine has no implicit cast

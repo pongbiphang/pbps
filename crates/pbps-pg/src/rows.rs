@@ -1751,12 +1751,21 @@ pub(crate) fn data_problems(
             if let (Value::Text(t), "bytea") = (value, base.as_str())
                 && let Some(why) = not_a_bytea(t)
             {
-                errs.push(invalid(format!(
-                    "row `{key}` sets `{column}`, a `bytea` column, to {t:?}, {why}. This engine \
-                     reads a `bytea` back as `\\x` followed by hex digits and pbps writes it back \
-                     as `decode('...','hex')` (ADR-0013 section 3); a declaration in any other spelling \
-                     would be restated by every plan."
-                )));
+                // The `\x` is the tool's own text, so the plan's values are
+                // escaped here and the message is carried as it is (#2081).
+                use pbps_model::escape::Escaped;
+                errs.push(DialectError::InvalidVerbatim {
+                    dialect: crate::types::DIALECT,
+                    message: format!(
+                        "row `{}` sets `{}`, a `bytea` column, to {}, {why}. This engine reads a \
+                         `bytea` back as `\\x` followed by hex digits and pbps writes it back as \
+                         `decode('...','hex')` (ADR-0013 section 3); a declaration in any other \
+                         spelling would be restated by every plan.",
+                        Escaped(&key.to_string()),
+                        Escaped(column),
+                        Escaped(&format!("{t:?}"))
+                    ),
+                });
             }
         }
     }
@@ -1769,10 +1778,15 @@ pub(crate) fn data_problems(
     {
         for key in data.rows.keys() {
             if let Some(why) = not_a_bytea(key.as_str()) {
-                errs.push(invalid(format!(
-                    "row key `{key}` cannot be a `bytea`, the type of the key column \
-                     `{key_column}`: {why}"
-                )));
+                // `why` holds the tool's own `\x`: see the cell refusal above.
+                errs.push(DialectError::InvalidVerbatim {
+                    dialect: crate::types::DIALECT,
+                    message: format!(
+                        "row key `{}` cannot be a `bytea`, the type of the key column `{}`: {why}",
+                        pbps_model::escape::Escaped(&key.to_string()),
+                        pbps_model::escape::Escaped(key_column)
+                    ),
+                });
             }
         }
     }
@@ -2755,6 +2769,76 @@ mod tests {
         );
         assert!(messages[3].contains("does not begin with"), "{messages:?}");
         assert!(messages[4].contains("odd number of digits"), "{messages:?}");
+    }
+
+    /// The refusal of a `bytea` spelling writes PostgreSQL's `\x` itself and
+    /// names plan-carried values (a key, a column, the value): the `\x` is
+    /// shown once, as the tool wrote it, and the values are shown escaped
+    /// (DEC-2032.1, #2081).
+    #[test]
+    fn the_bytea_refusal_shows_its_own_backslash_once_and_the_values_escaped() {
+        const HOSTILE: &str = "x\n\u{1b}[31mred\r\u{202e}";
+        const SHOWN: &str = "x\\n\\u{1b}[31mred\\r\\u{202e}";
+        // The value is quoted with `Debug`, which escapes the control
+        // characters first, and the escape then doubles those backslashes.
+        const VALUE_SHOWN: &str = "x\\\\n\\\\u{1b}[31mred\\\\r\\\\u{202e}";
+        let blob = format!("blob{HOSTILE}");
+        let mut t = table(
+            Some(vec!["code"]),
+            &[("code", "text", None), (&blob, "bytea", None)],
+        );
+        with_rows(
+            &mut t,
+            &[(HOSTILE, &[(&blob, Value::Text(format!("0102{HOSTILE}")))])],
+        );
+        let messages: Vec<String> = data_problems(&name(), &t, Default::default())
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(messages.len(), 1, "{messages:#?}");
+        let message = &messages[0];
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+        assert!(
+            message.contains(&format!("row `{SHOWN}` sets `blob{SHOWN}`")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("\"0102{VALUE_SHOWN}\"")),
+            "{message}"
+        );
+        // The tool's own spelling, once; not doubled with the values' escapes.
+        assert!(
+            message.contains("back as `\\x` followed by hex digits"),
+            "{message}"
+        );
+        assert!(!message.contains("`\\\\x`"), "{message}");
+        // The refusal of a key names the same `\x` through `not_a_bytea`.
+        let mut keyed = table(Some(vec![blob.as_str()]), &[(&blob, "bytea", None)]);
+        with_rows(&mut keyed, &[(HOSTILE, &[])]);
+        let message = data_problems(&name(), &keyed, Default::default())[0].to_string();
+        assert!(!message.chars().any(char::is_control), "{message:?}");
+        assert!(
+            message.contains(&format!("row key `{SHOWN}` cannot be a `bytea`")),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("which does not begin with `\\x`"),
+            "{message}"
+        );
+        // Negative: plain values give the plain message.
+        let mut plain = table(
+            Some(vec!["code"]),
+            &[("code", "text", None), ("blob", "bytea", None)],
+        );
+        with_rows(
+            &mut plain,
+            &[("a", &[("blob", Value::Text("0102".into()))])],
+        );
+        let message = data_problems(&name(), &plain, Default::default())[0].to_string();
+        assert!(
+            message.starts_with("postgres: row `a` sets `blob`, a `bytea` column, to \"0102\""),
+            "{message}"
+        );
     }
 
     /// The offline half of ADR-0013 §5: `validate` cannot judge the keys, and
