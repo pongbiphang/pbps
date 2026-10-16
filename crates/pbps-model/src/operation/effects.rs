@@ -38,7 +38,8 @@
 //! - What an expression or a body names is a lexical question, answered by the
 //!   dialect's lexer. It is the engine's, so `Dialect::engine_effects` adds it
 //!   (DEC-1954.3), and `Lexical` edges come from S6a.
-//! - Name slots, the claims a step makes on an address: S1b-ii (#1964). A step
+//! - Name slots, the claims a step makes on an address: [`super::names`]
+//!   (DEC-1964.1), read beside these by `pbps_diff::order::slots`. A step
 //!   that reads a table by name is ordered against the renames of the table by
 //!   the name it spells (DEC-1954.4), which is the evidence and not a
 //!   position.

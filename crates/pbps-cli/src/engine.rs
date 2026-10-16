@@ -781,6 +781,30 @@ impl NameFacts {
         crate::deploy::order_carried_moves(cs, &self.occupants, &self.relations);
         crate::deploy::refuse_uninventoried_occupants(cs, &self.occupants, &self.relations, label)
     }
+
+    /// The occupants as name slots, for the slot replay (#1964, DEC-1964.2).
+    /// The tables and views at the carried names are not occupants: the plan
+    /// manages them or refuses them already (`refuse_uninventoried_occupants`).
+    #[cfg(any(test, debug_assertions))]
+    pub fn slots(&self) -> pbps_dialect::slots::CatalogFacts {
+        use pbps_dialect::slots::{CatalogFacts, Namespace, Occupant, SlotKey};
+        CatalogFacts {
+            occupants: self
+                .occupants
+                .iter()
+                .map(|o| Occupant {
+                    slot: SlotKey {
+                        namespace: Namespace::Relations(o.name.schema.clone()),
+                        name: o.name.name.clone(),
+                    },
+                    kind: o.kind.to_owned(),
+                    owner: o.owner.clone(),
+                    column: o.owner_column.clone(),
+                })
+                .collect(),
+            ..CatalogFacts::default()
+        }
+    }
 }
 
 /// Refuses an `UNLOGGED` partition this plan creates under a parent that a
@@ -1019,9 +1043,9 @@ pub async fn order_created_object_names(
     ids: &pbps_model::IdsFile,
     label: &str,
     precedence: &[(pbps_model::Change, pbps_model::Change)],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<pbps_dialect::slots::CatalogFacts>> {
     if conn.driver() != Driver::Mssql {
-        return Ok(());
+        return Ok(None);
     }
     // Column renames first: each one may move a generated default, which the
     // `sys.objects` walk below follows in the order they run (DEC-1366.3).
@@ -1081,7 +1105,38 @@ pub async fn order_created_object_names(
     // collation (#1215).
     let candidates = crate::deploy::alike_candidates(cs, &names, &occupants);
     let alike = pbps_mssql::catalog::object_names_alike(conn, &candidates).await?;
-    crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label, precedence)
+    crate::object_order::order_occupied_objects_under(cs, &occupants, &alike, label, precedence)?;
+    Ok(Some(object_slots(&occupants, &candidates, &alike)))
+}
+
+/// What the `sys.objects` reads found, as name slots for the slot replay
+/// (#1964, DEC-1964.2): the occupants, every name compared under the
+/// collation, and the pairs it reports alike. Column and role names are
+/// compared by their own reads, which this does not carry: a slot check on
+/// one is skipped and reported on a connected plan too.
+fn object_slots(
+    occupants: &[pbps_mssql::catalog::NameOccupant],
+    candidates: &[TableName],
+    alike: &[(TableName, TableName)],
+) -> pbps_dialect::slots::CatalogFacts {
+    use pbps_dialect::slots::{CatalogFacts, Namespace, Occupant, SlotKey};
+    let key = |t: &TableName| SlotKey {
+        namespace: Namespace::Relations(t.schema.clone()),
+        name: t.name.clone(),
+    };
+    CatalogFacts {
+        occupants: occupants
+            .iter()
+            .map(|o| Occupant {
+                slot: key(&o.name),
+                kind: o.kind.clone(),
+                owner: o.parent.clone(),
+                column: o.parent_column.clone(),
+            })
+            .collect(),
+        compared: candidates.iter().map(key).collect(),
+        alike: alike.iter().map(|(a, b)| (key(a), key(b))).collect(),
+    }
 }
 
 /// Proves the tables a catalog read did not return are absent, not hidden,

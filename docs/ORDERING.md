@@ -197,6 +197,18 @@ builds; the passes below still decide the order. The last column of the table
 is what the code reports for the kind, and `ordering_audit` refuses a
 difference, so a new kind or a new effect updates both (DEC-1954.1).
 
+Names are stated the same way, apart from the effects, because a name is an
+address and not an identity. `pbps_model::operation::names` reports, for each
+operation, the names it claims and releases. The dialect's `slots::slot`
+says which namespace holds each one. Whether two spellings are one name is the
+engine's rule, or the catalog's answer under a collation (DEC-1964.1).
+`pbps_diff::order::slots` then does three things beside every order
+(DEC-1964.2):
+- orders a name's first holder before every other claim, and every other
+  release before its last holder;
+- replays the order and refuses a claim on a name still held;
+- refuses a move whose intermediate name is held at that statement.
+
 ## What each change requires
 
 `P` is PostgreSQL and `S` is SQL Server; no marker means both. Every change

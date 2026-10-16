@@ -43,6 +43,7 @@ pub mod engine_effects;
 pub mod estimate;
 pub mod lower;
 pub mod plan_rows;
+pub mod slots;
 
 #[cfg(test)]
 use pbps_model::ChangeSet;
@@ -2602,6 +2603,16 @@ pub trait Dialect {
     /// again or it does not come back. `diff_roles` treats an `AlterModule`
     /// exactly as it treats a `DropModule` when this answers `true`.
     fn rebuilds_modules(&self) -> bool {
+        false
+    }
+
+    /// Whether this engine compares two names it holds by their exact
+    /// spelling, so that two different spellings are never one name (#1964,
+    /// DEC-1964.1). PostgreSQL's identifiers are compared byte for byte once
+    /// quoted, and pbps quotes every one. SQL Server compares them under the
+    /// database's collation, which only its catalog knows: the default, "no",
+    /// leaves that a catalog fact, and a check without it is skipped.
+    fn compares_names_exactly(&self) -> bool {
         false
     }
 

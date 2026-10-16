@@ -5439,3 +5439,110 @@ run of the final-order check (`Stage::Final`) failed nine tests that pass on
 
 What the narrowing gives up is recorded in #1998: a rewritten computed column
 whose function is altered before its drop is not refused.
+
+<a id="dec-1964-1"></a>
+
+**DEC-1964.1. A step's names are the model's; their namespace and whether
+two spellings are one name are the dialect's, and a missing fact is skipped,
+never read as "different".** (#1964, S1b-ii of #1776)
+
+`pbps_model::operation::names` lists, for every kind of change, the names a
+step claims and releases, each with its kind, its schema, the table that
+scopes it and the object that holds it. Like `effects`, it is an exhaustive
+match with no wildcard arm. The model never says which namespace a name is
+in. `pbps_dialect::slots::slot` maps an address to its slot from the
+dialect's existing answers, so no namespace is written down twice:
+
+- `indexes_share_namespace_with_tables`;
+- `constraints_share_namespace_with_tables`;
+- `shares_namespace_with_tables`;
+- `overloads`.
+
+A table's own names are four namespaces, not one: its columns, its indexes,
+its constraints and its triggers (review of #2052). A named key is a
+constraint backed by an index, so it holds its name in both namespaces. On
+SQL Server those are the schema's objects and the table's indexes. On
+PostgreSQL they are the schema's relations and the table's constraints.
+
+Two spellings in one namespace are one name when the engine compares them
+equal. `Dialect::compares_names_exactly` says whether that is the spelling
+itself:
+- PostgreSQL: yes. Identifiers are compared byte for byte once quoted, and
+  pbps quotes every one.
+- SQL Server: no. Names are compared under the database's collation. There the
+  answer is a catalog fact (`object_names_alike`). Without it the comparison
+  is recorded as skipped, with the engine and whether the plan was connected.
+
+**Why not:**
+- **Case folding:** a fold is a guess about a collation that a
+  case-sensitive database contradicts (DEC-981.3).
+- **Treating absence as distinct:** that would pass the misorder the check
+  exists to find.
+
+Only declared names are slots. A name the engine generates is one alternative
+of several (review of #1346): an unnamed primary key's, or a SQL Server
+default constraint's. A PostgreSQL array type is not a slot at all (#1503).
+Such names reach the check only as catalog occupants.
+
+<a id="dec-1964-2"></a>
+
+**DEC-1964.2. Name slots run beside the order, as the effects do: evidence
+edges for a name's first and last holders, a replay of the order given, and
+a statement-level check of intermediate names.** (#1964)
+
+`order::slots` reads the slots three ways and decides no order.
+
+- **Edges.** A name's first holder only gives it up; every other claim follows
+  that release. Its last holder only takes it; it follows every other
+  holder's release. An object that takes the name and gives it up again in
+  between has no place the evidence fixes, so it gets no edge. Ordering two
+  such borrowers from their positions would invent an order. Proposing one is
+  S4's search (#1957).
+- **Replay.** The replay walks the order given and refuses a claim on a name
+  another object still holds. The names held at the start are of three kinds
+  (review of #2052):
+  - those a step gives up before taking;
+  - the catalog's occupants;
+  - what the baseline holds, unchanged, at a name some step claims or passes
+    through. The baseline names are selected by the engine's comparison, not
+    by spelling, so a name it cannot tell apart is asked and recorded as
+    skipped.
+
+  A catalog row at a name a baseline object holds is that object, which its
+  own claims and releases track: a table, a part, a view, a routine or a
+  trigger.
+  - If that object gives the name up later in the plan, the order is wrong.
+  - If it never does, the declarations collide and no order fixes them. The
+    claim is recorded as contested and fails nothing; the collision is the
+    loader's to refuse (`check_constraint_names`).
+  - A part the plan drops is not carried by its table's move, as
+    `rename_order` reads it (review of #1346).
+  - A catalog occupant goes with its table: it leaves when the table is
+    dropped and claims its name again in the schema the table moves to.
+  - An occupant that belongs to a column leaves at the first step that may
+    drop or rename it: an owned sequence, or a SQL Server default constraint.
+    Such a step drops, renames or retypes the column, gives it another
+    default or numbering, or renames its table with that default. Whether the
+    step really gives the name up is the engine's walk to say (`object_order`,
+    `order_carried_moves`). Reading it as given up can let a misorder pass,
+    and never refuses a valid plan.
+- **Statement level.** A move to another schema passes through its old name in
+  the new schema, between `SET SCHEMA` and `RENAME` on PostgreSQL and between
+  `TRANSFER` and `sp_rename` on SQL Server. That name is in neither the
+  baseline nor the plan, so only the operation's lowering (`Lowered::
+  intermediate_tables`, #1961) shows it. The replay claims it at that
+  statement.
+
+The connected plan's catalog reads become the replay's facts:
+- **PostgreSQL:** the occupants `relation_name_occupants` found.
+- **SQL Server:** the occupants `object_name_occupants` found, every name
+  `object_names_alike` compared, and the pairs it reported alike.
+
+Column and role names are compared by reads these facts do not carry
+(`column_names_alike`, `names_alike`), so a slot check on one is skipped on a
+connected SQL Server plan too.
+
+A claim on a held name and a broken handover fail the run as an effect
+violation does (DEC-1954.6). Skipped comparisons, contested claims and steps
+whose names or statements cannot be read are recorded in the
+`PBPS_ORDER_SHADOW` file.
