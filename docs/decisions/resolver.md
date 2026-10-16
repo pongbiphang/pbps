@@ -3153,9 +3153,15 @@ against the measured fresh-install inventory as `db_owner` (#619).**
   - Seen means one instance. Then scratch is not the target database, and
     the account must be confined.
 - **A login reads its own server reach without privilege.** It reads
-  `fn_my_permissions(NULL, 'SERVER')` and `sys.login_token`:
-  - Confined means `CONNECT SQL` and `VIEW ANY DATABASE` only, and no
-    server role but `public`.
+  `fn_my_permissions(NULL, 'SERVER')`, `sys.login_token` and its token's own
+  rows in `sys.server_permissions`:
+  - Confined means `CONNECT SQL` and `VIEW ANY DATABASE` only, no server
+    role but `public`, and no grant on a server-scoped securable beyond
+    `public`'s defaults (those two and `CONNECT` on the endpoints).
+  - The first two reads are not enough. They are securable-wide, and a
+    login granted `IMPERSONATE` on an administrator's login reads exactly
+    as a confined one there, then becomes `sysadmin` by `EXECUTE AS LOGIN`.
+    Its own grant row is visible to it, and is what refuses it.
   - The run-owned layout needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`
     (`securityadmin`, `dbcreator`), so it never runs on the target's
     instance.

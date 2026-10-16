@@ -182,10 +182,16 @@ for a moment keeps that type.
   - Seen means the same instance. Then the same-instance rules below apply,
     and scratch may never be the target database itself.
 - **A confined account.** A login reads its own server reach without
-  privilege, from `fn_my_permissions(NULL, 'SERVER')` and `sys.login_token`
+  privilege, from `fn_my_permissions(NULL, 'SERVER')`, `sys.login_token`
+  and its own rows in `sys.server_permissions`
   [`a_login_reads_its_own_server_reach_without_privilege`]:
   - Confined means server permissions of `CONNECT SQL` and
-    `VIEW ANY DATABASE` only, and no server role but `public`.
+    `VIEW ANY DATABASE` only, no server role but `public`, and no grant to
+    any principal in its token on a server-scoped securable beyond
+    `public`'s defaults (those two and `CONNECT` on the endpoints).
+  - The third read is needed: a login granted `IMPERSONATE` on an
+    administrator's login reads exactly as a confined one in the first two,
+    and becomes `sysadmin` by `EXECUTE AS LOGIN`. Its grant row shows it.
   - `securityadmin` adds `ALTER ANY LOGIN` and `CREATE LOGIN`; `dbcreator`
     adds `CREATE ANY DATABASE`; `sysadmin` holds `CONTROL SERVER`.
 - **The layout.** The run-owned layout creates the run's login and database,

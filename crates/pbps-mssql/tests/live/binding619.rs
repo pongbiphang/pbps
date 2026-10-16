@@ -1001,21 +1001,36 @@ async fn a_ddl_witness_trigger_misses_some_changes_and_fails_other_users_ddl() {
 }
 
 /// What a login can read of its own server reach, without any privilege:
-/// its server permissions and its server roles. A confined account holds
-/// only `CONNECT SQL` and `VIEW ANY DATABASE`; `securityadmin` and
-/// `dbcreator` each add a permission that reaches past one database.
+/// its server permissions, its server roles, and every grant its token holds
+/// on a server-scoped securable. The first two are not enough: a login that
+/// may impersonate an administrator reads exactly as a confined one there,
+/// and becomes `sysadmin` by `EXECUTE AS LOGIN`; only its own row in
+/// `sys.server_permissions` shows it. A confined account holds `CONNECT SQL`
+/// and `VIEW ANY DATABASE` and nothing else; `securityadmin` and `dbcreator`
+/// each add a permission that reaches past one database.
 #[tokio::test]
 #[ignore = "needs live SQL Server"]
 async fn a_login_reads_its_own_server_reach_without_privilege() {
     let pid = std::process::id();
     let password = "Pbps!Reach619x";
     let mut admin = connect_live(&conn_str()).await.unwrap();
+    let administrator = text(&mut admin, "SELECT CONVERT(nvarchar(128), SUSER_NAME());").await;
     let logins = [
         (format!("pbps619_confined_{pid}"), None),
-        (format!("pbps619_security_{pid}"), Some("securityadmin")),
-        (format!("pbps619_creator_{pid}"), Some("dbcreator")),
+        (
+            format!("pbps619_security_{pid}"),
+            Some("ALTER SERVER ROLE securityadmin ADD MEMBER"),
+        ),
+        (
+            format!("pbps619_creator_{pid}"),
+            Some("ALTER SERVER ROLE dbcreator ADD MEMBER"),
+        ),
+        (
+            format!("pbps619_impersonator_{pid}"),
+            Some("GRANT IMPERSONATE ON LOGIN::[{administrator}] TO"),
+        ),
     ];
-    for (login, role) in &logins {
+    for (login, grant) in &logins {
         run(
             &mut admin,
             &[&*format!(
@@ -1023,40 +1038,66 @@ async fn a_login_reads_its_own_server_reach_without_privilege() {
             )],
         )
         .await;
-        if let Some(role) = role {
-            run(
-                &mut admin,
-                &[&*format!("ALTER SERVER ROLE {role} ADD MEMBER [{login}];")],
-            )
-            .await;
+        if let Some(grant) = grant {
+            let grant = grant.replace("{administrator}", &administrator);
+            run(&mut admin, &[&*format!("{grant} [{login}];")]).await;
         }
     }
     let reach = "SELECT CONVERT(nvarchar(4000), STRING_AGG(CONVERT(nvarchar(4000), permission_name), N',') \
                      WITHIN GROUP (ORDER BY permission_name)) FROM fn_my_permissions(NULL, N'SERVER');";
     let roles = "SELECT CONVERT(nvarchar(4000), STRING_AGG(CONVERT(nvarchar(4000), name), N',') \
                      WITHIN GROUP (ORDER BY name)) FROM sys.login_token WHERE type = N'SERVER ROLE';";
+    // Every grant to a principal in the login's token, but `public`'s
+    // defaults: connecting, listing databases, and the endpoints.
+    let grants = "SELECT CONVERT(nvarchar(4000), STRING_AGG(CONVERT(nvarchar(4000), \
+                         p.class_desc + N':' + p.permission_name), N',')) \
+                  FROM sys.server_permissions p JOIN sys.login_token t ON t.principal_id = p.grantee_principal_id \
+                  WHERE p.state IN ('G', 'W') \
+                    AND NOT (p.class = 100 AND p.permission_name IN (N'CONNECT SQL', N'VIEW ANY DATABASE')) \
+                    AND NOT (p.class = 105 AND p.permission_name = N'CONNECT');";
     let mut seen = Vec::new();
     for (login, _) in &logins {
         let mut conn = connect_live(&super::resolver_tests::login_url(login, password, "master"))
             .await
             .unwrap();
-        seen.push((text(&mut conn, reach).await, text(&mut conn, roles).await));
+        seen.push((
+            text(&mut conn, reach).await,
+            text(&mut conn, roles).await,
+            text(&mut conn, grants).await,
+        ));
+        if login.starts_with("pbps619_impersonator_") {
+            assert_eq!(
+                number(
+                    &mut conn,
+                    &format!(
+                        "EXECUTE AS LOGIN = N'{administrator}'; \
+                         SELECT CONVERT(bigint, IS_SRVROLEMEMBER(N'sysadmin')); REVERT;"
+                    )
+                )
+                .await,
+                1,
+                "the impersonation reaches the administrator"
+            );
+        }
     }
+    let confined = "CONNECT SQL,VIEW ANY DATABASE".to_owned();
+    let public = "public".to_owned();
+    let none = "NULL".to_owned();
     assert_eq!(
         seen,
         [
-            (
-                "CONNECT SQL,VIEW ANY DATABASE".to_owned(),
-                "public".to_owned()
-            ),
+            (confined.clone(), public.clone(), none.clone()),
             (
                 "ALTER ANY LOGIN,CONNECT SQL,CREATE LOGIN,VIEW ANY DATABASE".to_owned(),
-                "public,securityadmin".to_owned()
+                "public,securityadmin".to_owned(),
+                none.clone()
             ),
             (
                 "CONNECT SQL,CREATE ANY DATABASE,VIEW ANY DATABASE".to_owned(),
-                "dbcreator,public".to_owned()
+                "dbcreator,public".to_owned(),
+                none.clone()
             ),
+            (confined, public, "SERVER_PRINCIPAL:IMPERSONATE".to_owned()),
         ]
     );
     assert!(
