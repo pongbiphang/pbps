@@ -190,8 +190,17 @@ for a moment keeps that type.
     - its token (`sys.login_token`: itself, `public` and its server roles);
     - its server permissions (`fn_my_permissions(NULL, 'SERVER')`);
     - every grant to a principal in its token (`sys.server_permissions`);
+    - every server securable a principal in its token owns: a server role
+      (`sys.server_principals.owning_principal_id`), an endpoint, a
+      database. An owner may add itself to its role, so a role holding
+      `CONTROL SERVER` is the login's though no token, permission or grant
+      read shows it [`a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`];
     - every database it can enter (`HAS_DBACCESS` over the databases
       `VIEW ANY DATABASE` lists);
+    - its own scratch database's `is_trustworthy_on` and
+      `is_db_chaining_on` in `sys.databases`. A `db_owner` of a
+      `TRUSTWORTHY` database owned by an administrator runs an
+      `EXECUTE AS OWNER` module with the owner's server authority [`a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`];
     - in each of `master`, `tempdb` and `msdb`, its database token
       (`sys.user_token`), every grant to a principal in that token
       (`sys.database_permissions`), and every securable such a principal
@@ -204,7 +213,9 @@ for a moment keeps that type.
     - the server role `public`;
     - the server permissions `CONNECT SQL` and `VIEW ANY DATABASE`;
     - `public`'s default grants: those two and `CONNECT` on the endpoints;
-    - its own scratch database;
+    - its own scratch database, owned or not, with `TRUSTWORTHY` and
+      database ownership chaining off, as a fresh database has them;
+    - no other server securable owned;
     - in `master`, `tempdb` and `msdb`, a token of `guest` and `public`
       only, and the grants and ownership the fresh-install inventory holds
       for them, measured as §7's inventory is. On the pinned build that inventory is identical on
@@ -228,7 +239,9 @@ for a moment keeps that type.
       everyone: its token holds its own user, not `guest`;
     - `CONTROL` or a schema permission granted to `guest` or `public` in a
       system database, `guest` added to a role there, or a schema `guest`
-      owns: each differs from the fresh-install inventory.
+      owns: each differs from the fresh-install inventory;
+    - a server role the login owns, even one it is not a member of;
+    - a scratch database with `TRUSTWORTHY` or ownership chaining on.
 - **The layout.** The run-owned layout creates the run's login and database,
   so it needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`, which no confined
   account holds. On the target's instance only the supplied layout runs: a

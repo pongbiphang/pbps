@@ -3161,21 +3161,25 @@ inventory as `db_owner` (#619).**
     - its token (`sys.login_token`);
     - its server permissions (`fn_my_permissions(NULL, 'SERVER')`);
     - every grant to a principal in its token (`sys.server_permissions`);
+    - every server securable a principal in its token owns;
     - every database it can enter (`HAS_DBACCESS` over the databases
       `VIEW ANY DATABASE` lists);
+    - its own scratch database's `TRUSTWORTHY` and ownership-chaining flags;
     - in `master`, `tempdb` and `msdb`, its database token, every grant to
       a principal in it, and every securable one owns.
   - The allowlist is:
     - the server role `public`;
     - `CONNECT SQL` and `VIEW ANY DATABASE`;
     - endpoint `CONNECT`;
-    - its own scratch database;
+    - its own scratch database, with `TRUSTWORTHY` and ownership chaining
+      off, as a fresh database has them, and no other server securable
+      owned;
     - in those three system databases, a token of `guest` and `public`
       only, holding exactly the grants and ownership of the fresh-install
       inventory (identical on Developer and Express).
   - Anything else is unconfined and named, including a kind no rule names.
   - **Why an allowlist.** The design first listed what makes a login
-    unconfined, and review found three cases it missed, one round at a time:
+    unconfined, and review found the cases it missed one round at a time:
     - `IMPERSONATE` on an administrator's login, which reads as confined in
       the server permissions and the token and becomes `sysadmin` by
       `EXECUTE AS LOGIN`;
@@ -3187,7 +3191,14 @@ inventory as `db_owner` (#619).**
       `msdb` is the login's, and moves neither its access nor its own
       principal. Reading the token's grants and ownership against the
       fresh-install inventory closes it the way PostgreSQL's `REACH`
-      includes `PUBLIC`.
+      includes `PUBLIC`;
+    - ownership of a server role holding `CONTROL SERVER`: the owner adds
+      itself, though its token, permissions and grants read as confined;
+    - a `TRUSTWORTHY` scratch owned by an administrator, where the
+      `db_owner` account's `EXECUTE AS OWNER` module holds `CONTROL SERVER`.
+
+    Each was measured on 17.0 and is read without privilege; the last two
+    are what DEC-1672.1's ownership read covers on PostgreSQL.
 
     PostgreSQL went the same way on #1678 before its single read (DEC-1672.1).
     The maintainer decided on 2026-10-16 that SQL Server follows the
@@ -3208,6 +3219,7 @@ inventory as `db_owner` (#619).**
 `a_login_reads_its_own_server_reach_without_privilege`,
 `a_login_reads_every_database_it_can_enter`,
 `a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`,
+`a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`,
 `a_database_born_from_model_holds_only_the_fresh_install_inventory` and
 `an_account_that_is_not_db_owner_cannot_see_what_its_database_holds`.
 

@@ -1389,6 +1389,143 @@ async fn a_guest_login_reads_what_guest_and_public_hold_in_a_system_database() {
     drop_login(&mut admin, &login).await;
 }
 
+/// Two reaches no token or grant read shows. A login that owns a server role
+/// may add itself to it, so a role holding `CONTROL SERVER` is the login's
+/// though its token, its server permissions and its grants read as confined;
+/// only the role's `owning_principal_id` shows it. And a `db_owner` of a
+/// `TRUSTWORTHY` database owned by an administrator runs an `EXECUTE AS
+/// OWNER` module with the owner's server authority, which the login reads
+/// in `sys.databases` and which a fresh database has off.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database() {
+    let mut db = TestDb::create("trust619").await;
+    let pid = std::process::id();
+    let password = "Pbps!Owner619x";
+    let login = format!("pbps619_owner_{pid}");
+    let role = format!("pbps619_role_{pid}");
+    let mut admin = connect_live(&conn_str()).await.unwrap();
+    run(
+        &mut admin,
+        &[
+            &*format!("CREATE LOGIN [{login}] WITH PASSWORD = N'{password}', CHECK_POLICY = OFF;"),
+            &*format!("CREATE SERVER ROLE [{role}] AUTHORIZATION [{login}];"),
+            &*format!("GRANT CONTROL SERVER TO [{role}];"),
+        ],
+    )
+    .await;
+    let url = super::resolver_tests::login_url(&login, password, "master");
+    let control = "SELECT CONVERT(bigint, HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER'));";
+    let mut conn = connect_live(&url).await.unwrap();
+    assert_eq!(
+        texts(
+            &mut conn,
+            "SELECT CONVERT(nvarchar(128), permission_name) FROM fn_my_permissions(NULL, 'SERVER') ORDER BY 1;"
+        )
+        .await,
+        ["CONNECT SQL", "VIEW ANY DATABASE"],
+        "it reads as confined"
+    );
+    assert_eq!(
+        texts(
+            &mut conn,
+            "SELECT CONVERT(nvarchar(128), name) FROM sys.login_token ORDER BY 1;"
+        )
+        .await,
+        [&*login, "public"]
+    );
+    assert_eq!(
+        texts(
+            &mut conn,
+            "SELECT CONVERT(nvarchar(128), name) FROM sys.server_principals \
+             WHERE owning_principal_id = SUSER_ID();"
+        )
+        .await,
+        [&*role],
+        "only ownership shows the role"
+    );
+    run(
+        &mut conn,
+        &[&*format!(
+            "ALTER SERVER ROLE [{role}] ADD MEMBER [{login}];"
+        )],
+    )
+    .await;
+    drop(conn);
+    let mut conn = connect_live(&url).await.unwrap();
+    assert_eq!(
+        number(&mut conn, control).await,
+        1,
+        "the owner joined its role"
+    );
+    drop(conn);
+    run(
+        &mut admin,
+        &[
+            &*format!("ALTER SERVER ROLE [{role}] DROP MEMBER [{login}];"),
+            &*format!("DROP SERVER ROLE [{role}];"),
+        ],
+    )
+    .await;
+
+    run(
+        &mut db.conn,
+        &[
+            &*format!("CREATE USER [{login}] FOR LOGIN [{login}];"),
+            &*format!("ALTER ROLE db_owner ADD MEMBER [{login}];"),
+        ],
+    )
+    .await;
+    let mut conn = connect_live(&super::resolver_tests::login_url(
+        &login, password, &db.name,
+    ))
+    .await
+    .unwrap();
+    run(
+        &mut conn,
+        &["CREATE PROCEDURE dbo.up WITH EXECUTE AS OWNER AS \
+           SELECT CONVERT(bigint, HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER'));"],
+    )
+    .await;
+    let flags = format!(
+        "SELECT CONVERT(bigint, is_trustworthy_on * 10 + is_db_chaining_on) FROM sys.databases WHERE name = N'{}';",
+        db.name
+    );
+    assert_eq!(
+        number(&mut conn, &flags).await,
+        0,
+        "a fresh database trusts nothing"
+    );
+    assert_eq!(number(&mut conn, "EXEC dbo.up;").await, 0);
+    run(
+        &mut admin,
+        &[&*format!(
+            "ALTER DATABASE [{}] SET TRUSTWORTHY ON;",
+            db.name
+        )],
+    )
+    .await;
+    assert_eq!(number(&mut conn, &flags).await, 10);
+    assert_eq!(number(&mut conn, control).await, 0);
+    assert_eq!(
+        number(&mut conn, "EXEC dbo.up;").await,
+        1,
+        "the owner's server authority"
+    );
+    run(
+        &mut admin,
+        &[&*format!(
+            "ALTER DATABASE [{}] SET TRUSTWORTHY OFF;",
+            db.name
+        )],
+    )
+    .await;
+    assert_eq!(number(&mut conn, "EXEC dbo.up;").await, 0);
+    drop(conn);
+    drop_login(&mut admin, &login).await;
+    db.drop().await;
+}
+
 /// Two more things a creation reads from an object it does not own: a
 /// foreign key binds the referenced table's primary key or unique index
 /// (`key_index_id`) and is refused without one (1776), and a `PERSISTED`
