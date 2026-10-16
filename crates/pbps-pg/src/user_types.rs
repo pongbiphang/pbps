@@ -90,15 +90,19 @@
 //! is read from `typnotnull` and read the same on 16. What it leaves out is
 //! the ACL, which [`Unreadable`] answers, and a comment.
 //!
-//! A base type outside `pg_catalog` that another type holds (an extension's,
+//! A base type the engine did not make that another type holds (an extension's,
 //! such as `citext`, or a superuser's own) keeps its OID when `ALTER TYPE …
 //! SET (…)` changes it in place, so its OID, name, kind and owner are not
-//! enough. The columns that statement can change (`typstorage` and the OIDs of
-//! `typreceive`, `typsend`, `typanalyze`, `typsubscript`, `typmodin` and
-//! `typmodout`) are part of the pin, and so is the `extversion` of the
-//! extension that owns it (#2043). A function is pinned by OID, as the type,
-//! the owner and the collation are: a name would need the argument types to
-//! tell overloads apart, and the OID of the function is what `SET` changes.
+//! enough. Which base type that is, is decided by its OID and never by its
+//! schema: the engine's own are those below `FirstNormalObjectId` (16384),
+//! and a superuser can create a type in `pg_catalog`, or install an extension
+//! there, with an OID above it (#2061). The columns that statement can change
+//! (`typstorage` and the OIDs of `typreceive`, `typsend`, `typanalyze`,
+//! `typsubscript`, `typmodin` and `typmodout`) are part of the pin, and so is
+//! the `extversion` of the extension that owns it (#2043). A function is
+//! pinned by OID, as the type, the owner and the collation are: a name would
+//! need the argument types to tell overloads apart, and the OID of the
+//! function is what `SET` changes.
 //!
 //! # One read
 //!
@@ -121,6 +125,7 @@ use pbps_model::TypeRef;
 use sha2::{Digest, Sha256};
 
 use crate::pins::Within;
+use crate::resolver::scratch::FIRST_NORMAL_OBJECT_ID;
 
 /// A catalog OID, read as `int8` because the driver has no unsigned type.
 pub type Oid = i64;
@@ -134,7 +139,9 @@ const MAX_TYPES: usize = 10_000;
 
 /// Which rule produced a digest, hashed ahead of the definition. A change to the
 /// encoding below is a new rule, never an edit. `v2` adds a base type's mutable
-/// properties to [`Component::Other`] (#2043).
+/// properties to [`Component::Other`] (#2043), for every base type whose OID is
+/// not the engine's own (#2061: decided before any pin was sealed, so it is not
+/// a `v3`).
 const RULE: &str = "pbps/type-pin/v2";
 
 // -- the result ------------------------------------------------------------
@@ -516,15 +523,16 @@ pub enum Component {
         subtype: Box<Component>,
     },
     /// Anything else (a built-in, an extension's type), by OID and name. A
-    /// built-in cannot be changed in place; a base type outside `pg_catalog`
-    /// can, and carries what `ALTER TYPE … SET (…)` changes.
+    /// built-in cannot be changed in place; a base type the engine did not make
+    /// (OID at or above `FirstNormalObjectId`, in any schema) can, and carries
+    /// what `ALTER TYPE … SET (…)` changes.
     Other {
         oid: Oid,
         schema: String,
         name: String,
         typtype: String,
         owner: Oid,
-        /// `Some` for a base type (`typtype = 'b'`) outside `pg_catalog`.
+        /// `Some` for a base type (`typtype = 'b'`) the engine did not make.
         base: Option<BaseProperties>,
     },
 }
@@ -934,16 +942,24 @@ struct TypeRow {
     default: Option<String>,
     relkind: Option<String>,
     /// What `ALTER TYPE … SET (…)` can change, read for every row and kept
-    /// only for a base type outside `pg_catalog` (see [`TypeRow::base`]).
+    /// only for a base type the engine did not make (see [`TypeRow::base`]).
     properties: BaseProperties,
 }
 
 impl TypeRow {
     /// The properties a component of this type is pinned by: those of a base
-    /// type outside `pg_catalog`, which `ALTER TYPE … SET (…)` changes in
+    /// type the engine did not make, which `ALTER TYPE … SET (…)` changes in
     /// place, and none for the built-ins and every other kind.
+    ///
+    /// "Did not make" is the OID, not the schema. A superuser can create a base
+    /// type in `pg_catalog` by name, or install an extension there, and `SET`
+    /// on it then moves nothing a schema test would pin; its OID is at or above
+    /// `FirstNormalObjectId`, as every object made after initdb is, while every
+    /// type initdb made is below it (#2061, measured on 16.15 and 18.6 with
+    /// `allow_system_table_mods = off`).
     fn base(&self) -> Option<BaseProperties> {
-        (self.typtype == "b" && self.schema != "pg_catalog").then(|| self.properties.clone())
+        (self.typtype == "b" && self.oid >= Oid::from(FIRST_NORMAL_OBJECT_ID))
+            .then(|| self.properties.clone())
     }
 
     fn is_array(&self) -> bool {
@@ -1559,7 +1575,7 @@ mod tests {
         }
     }
 
-    /// A base type outside `pg_catalog`, the shape of `public.citext`.
+    /// A base type the engine did not make, the shape of `public.citext`.
     fn extension_base() -> BaseProperties {
         BaseProperties {
             storage: "x".to_owned(),
@@ -1697,7 +1713,7 @@ mod tests {
         );
     }
 
-    /// A base type outside `pg_catalog` is pinned by what `ALTER TYPE … SET`
+    /// A base type the engine did not make is pinned by what `ALTER TYPE … SET`
     /// can change on it (#2043), and a built-in is not: its text is the
     /// six fields it always had.
     #[test]
@@ -1783,9 +1799,9 @@ mod tests {
         assert_eq!(ids, BTreeSet::from([10]));
     }
 
-    fn row(typtype: &str, schema: &str) -> TypeRow {
+    fn row(typtype: &str, schema: &str, oid: Oid) -> TypeRow {
         TypeRow {
-            oid: 5000,
+            oid,
             schema: schema.to_owned(),
             name: "t".to_owned(),
             owner: 10,
@@ -1802,15 +1818,32 @@ mod tests {
         }
     }
 
-    /// Only a base type outside `pg_catalog` is pinned by its properties; the
-    /// built-ins, and every kind that is not a base type, are not.
+    /// Only a base type the engine did not make is pinned by its properties,
+    /// and that is decided by its OID: the schema says nothing, because a
+    /// superuser can make a type in `pg_catalog` (#2061). The built-ins, and
+    /// every kind that is not a base type, are not.
     #[test]
-    fn only_a_base_type_outside_pg_catalog_carries_properties() {
-        assert_eq!(row("b", "public").base(), Some(extension_base()));
-        assert_eq!(row("b", "app").base(), Some(extension_base()));
-        assert_eq!(row("b", "pg_catalog").base(), None);
+    fn only_a_base_type_above_the_engines_own_oids_carries_properties() {
+        let first = Oid::from(FIRST_NORMAL_OBJECT_ID);
+        for schema in ["public", "app", "pg_catalog"] {
+            assert_eq!(
+                row("b", schema, first).base(),
+                Some(extension_base()),
+                "{schema}"
+            );
+            assert_eq!(
+                row("b", schema, first + 5000).base(),
+                Some(extension_base()),
+                "{schema}"
+            );
+            assert_eq!(row("b", schema, first - 1).base(), None, "{schema}");
+            assert_eq!(row("b", schema, 23).base(), None, "{schema}");
+        }
+        // The engine's own, wherever it is filed.
+        assert_eq!(row("b", "information_schema", 1043).base(), None);
         for typtype in ["p", "r", "m", "e", "d", "c"] {
-            assert_eq!(row(typtype, "public").base(), None, "{typtype}");
+            assert_eq!(row(typtype, "public", first).base(), None, "{typtype}");
+            assert_eq!(row(typtype, "pg_catalog", first).base(), None, "{typtype}");
         }
     }
 
