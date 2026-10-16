@@ -437,7 +437,7 @@ impl Cx<'_> {
                 // goes first: the engine refuses a retype that leaves the
                 // key's two sides incompatible. One that stands throughout is
                 // no order (it is rebuilt or kept by the engine).
-                self.requires_foreign_keys_over_column_gone(&owner, &column.name);
+                self.requires_foreign_keys_over_column_gone(&owner, uid);
             }
             Change::AlterColumnNullability {
                 uid,
@@ -1312,15 +1312,20 @@ impl Cx<'_> {
         }
     }
 
-    /// The foreign keys over a column, and those into it, must be gone.
-    fn requires_foreign_keys_over_column_gone(&mut self, owner: &Recorded, column: &str) {
+    /// The foreign keys over a column, and those into it, must be gone. The
+    /// keys are the baseline's, so the column is named as the baseline names
+    /// it: through its uid, since the step spells the name it ends with.
+    fn requires_foreign_keys_over_column_gone(&mut self, owner: &Recorded, column: &crate::Uid) {
         let Some((name, table)) = self.base_of(owner) else {
+            return;
+        };
+        let Some(column) = self.before.ids.columns.get(column).map(|c| c.name.clone()) else {
             return;
         };
         let name = name.clone();
         let mut gone = Vec::new();
         for (n, fk) in &table.foreign_keys {
-            if fk.columns.iter().any(|c| c == column) {
+            if fk.columns.iter().any(|c| *c == column) {
                 gone.push(Self::part(owner, PartKey::ForeignKey(n.clone())));
             }
         }
@@ -1329,7 +1334,7 @@ impl Cx<'_> {
                 continue;
             };
             for (fk_name, fk) in &other.foreign_keys {
-                if fk.references_table == name && fk.references_columns.iter().any(|c| c == column)
+                if fk.references_table == name && fk.references_columns.iter().any(|c| *c == column)
                 {
                     gone.push(Self::part(
                         &other_owner,

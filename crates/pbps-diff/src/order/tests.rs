@@ -2610,3 +2610,149 @@ fn a_base_spelled_reader_precedes_the_rename_of_what_it_names_and_not_a_retype()
     let (ops, fx, baseline) = retyped.analysed(ModuleEdits::InPlace);
     assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
 }
+
+/// The default of `t.a` taken off under the name the rename gave the column,
+/// `b`: the removal is the plan's second step, so it spells the name the
+/// column has once the rename has run (DEC-1968.2, review of #2120).
+fn default_taken_off_after_the_rename() -> Plan {
+    use pbps_model::ValueSource;
+    let table = |name: &str, default: Option<&str>| {
+        let mut table = table_with(&["id"]);
+        let mut column = Column::new(int());
+        if let Some(text) = default {
+            column.value_source = ValueSource::Default(text.into());
+        }
+        table.columns.insert(name.into(), column);
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table("a", Some("1")));
+    after.tables.insert(t("t"), table("b", None));
+    let moved = uid(UidKind::Column, "t.a");
+    let named = |column: &str| {
+        let mut ids = Plan::ids(&["t"], &[("t", "id")]);
+        ids.columns.insert(moved.clone(), t("t").column(column));
+        ids
+    };
+    Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("t"),
+                from: "a".into(),
+                to: "b".into(),
+                table_was: None,
+            }),
+            p(Change::AlterColumnDefault {
+                uid: moved.clone(),
+                column: t("t").column("b"),
+                from: Some("1".into()),
+                to: None,
+            }),
+        ],
+        before,
+        after,
+        before_ids: named("a"),
+        after_ids: named("b"),
+    }
+}
+
+#[test]
+fn a_final_spelled_reader_of_the_base_follows_the_rename_it_names_the_column_by() {
+    let none = ModuleDeps::new();
+    let plan = default_taken_off_after_the_rename();
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let rewrites: Vec<(usize, usize)> = graph(ops.as_slice(), &fx, &baseline, &none, Checks::ALL)
+        .edges
+        .iter()
+        .filter(|e| matches!(e.because, Because::Rewrites(_)))
+        .map(|e| (e.before, e.after))
+        .collect();
+    assert_eq!(rewrites, [(0, 1)]);
+    // The removal first would name a column that has no such name yet.
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    let violations = run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL);
+    assert!(
+        violations.iter().any(|v| matches!(
+            v,
+            Violation::Edge { edge, .. } if matches!(edge.because, Because::Rewrites(_))
+        )),
+        "{violations:?}"
+    );
+}
+
+/// A column renamed and retyped in one plan: the retype names the column by
+/// its new name, and the foreign key into it is the baseline's, spelled by
+/// the old one (review of #2120).
+#[test]
+fn a_retype_of_a_renamed_column_still_waits_for_the_foreign_key_into_it() {
+    use pbps_model::ValueSource;
+    let _ = ValueSource::None;
+    let mut before = Schema::default();
+    before.tables.insert(t("p"), table_with(&["id"]));
+    let mut child = table_with(&["pid"]);
+    child.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: vec!["pid".into()],
+            references_table: t("p"),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    before.tables.insert(t("c"), child.clone());
+    let mut after = Schema::default();
+    after.tables.insert(t("p"), table_with(&["key"]));
+    child.foreign_keys.clear();
+    after.tables.insert(t("c"), child);
+    let moved = uid(UidKind::Column, "p.id");
+    let mut before_ids = Plan::ids(&["p", "c"], &[("c", "pid")]);
+    before_ids
+        .columns
+        .insert(moved.clone(), t("p").column("id"));
+    let mut after_ids = Plan::ids(&["p", "c"], &[("c", "pid")]);
+    after_ids
+        .columns
+        .insert(moved.clone(), t("p").column("key"));
+    let plan = Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("p"),
+                from: "id".into(),
+                to: "key".into(),
+                table_was: None,
+            }),
+            p(Change::AlterColumnType {
+                uid: moved,
+                column: t("p").column("key"),
+                from: int(),
+                to: "bigint".parse().unwrap(),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+            }),
+            p(Change::DropForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+            }),
+        ],
+        before,
+        after,
+        before_ids,
+        after_ids,
+    };
+    let (ops, fx, _) = plan.analysed(ModuleEdits::InPlace);
+    let waits = |x: &Effects| {
+        x.requires
+            .iter()
+            .any(|r| matches!(r, Requirement::Absent(ObjectKey::Part { .. })))
+    };
+    assert!(waits(&fx[1]), "{:?}", fx[1].requires);
+    // Negative: a retype of a column no foreign key names waits for none.
+    assert!(!waits(&fx[0]), "{:?}", fx[0].requires);
+    let _ = ops;
+}
