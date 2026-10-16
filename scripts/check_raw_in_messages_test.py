@@ -76,6 +76,28 @@ class WhatItRefuses(unittest.TestCase):
     def test_the_function_passed_on_is_refused_too(self):
         self.assertEqual(lines('format!("{:?}", d.as_ref().map(Text::raw))'), [1])
 
+    def test_a_spelling_rustfmt_keeps_is_still_the_call(self):
+        # A comment or a line break between the pieces is whitespace once
+        # comments are blanked; a raw identifier is the same name.
+        for call in [
+            'println!("{}", text. /* original bytes */ raw())',
+            'println!("{}", Text:: /* method */ raw(&text))',
+            'println!("{}", text\n    .\n    raw())',
+            'println!("{}", text.r#raw())',
+            'println!("{:?}", d.map(Text::r#raw))',
+            'println!("{}", text.raw ())',
+        ]:
+            self.assertEqual(len(lines(call)), 1, call)
+
+    def test_a_macro_spelled_with_spaces_or_a_comment_is_still_the_macro(self):
+        for call in [
+            'format /* m */ ! /* d */ ("{}", n.raw())',
+            'std::format ! ("{}", n.raw())',
+            '# [ error ( "no {}", .0.raw() ) ]',
+            '#[ /* a */ error /* b */ ("no {}", .0.raw())]',
+        ]:
+            self.assertEqual(len(lines(call)), 1, call)
+
     def test_each_finding_names_its_own_line(self):
         text = 'format!("{}", a.raw());\nlet ok = b.raw();\nbail!("{}", c.raw());\n'
         self.assertEqual(lines(text), [1, 3])

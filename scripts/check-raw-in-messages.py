@@ -32,9 +32,11 @@ MACROS = ("format", "bail", "anyhow", "print", "println", "eprint", "eprintln", 
 MACRO_CALL = re.compile(r"\b(" + "|".join(MACROS) + r")\s*!\s*[(\[{]")
 # thiserror's `#[error("..", args)]`; the opening parenthesis ends the match.
 ERROR_ATTR = re.compile(r"#\s*\[\s*error\s*\(")
-# A call, which may start on the line after its receiver, or the function
-# itself passed along (`.map(Text::raw)`). `..raw` (struct update) is neither.
-RAW = re.compile(r"\.raw\s*\(|::raw\b")
+# A call, or the function itself passed along (`.map(Text::raw)`). Rust lets
+# whitespace, a line break or a comment (blanked to whitespace by `mask`) sit
+# between the pieces, and `r#raw` is the same name. `..raw` (struct update) is
+# neither.
+RAW = re.compile(r"\.\s*(?:r#)?raw\s*\(|::\s*(?:r#)?raw\b")
 # The opening of a raw string, `r#"`; its prefix cannot follow an identifier.
 RAW_STRING = re.compile(r"(?:br|cr|r)(#*)\"")
 
