@@ -3132,7 +3132,7 @@ The rest is fixed as follows:
 
 **DEC-619.3. SQL Server scratch is told from the target by a live global
 temporary marker, not by a reported identifier; a same-instance scratch
-needs an account confined by one reach read against an allowlist, in the
+runs every scratch statement in a loginless database sandbox, in the
 supplied layout, and is proven empty against the measured fresh-install
 inventory as `db_owner` (#619).**
 
@@ -3152,60 +3152,57 @@ inventory as `db_owner` (#619).**
   - It needs no privilege: a login with only `CONNECT SQL` sees it.
   - It ends with its session, so a stale marker cannot match.
   - Seen means one instance. Then scratch is not the target database, and
-    the account must be confined.
-- **Confinement is one read of the login's reach against an allowlist**,
-  PostgreSQL's form (`pbps-pg` `scratch.rs`, `REACH` and
-  `CONTAINED_PREDEFINED`; #2085). Every part of the read needs no
-  privilege:
-  - The reach is:
-    - its token (`sys.login_token`);
-    - its server permissions (`fn_my_permissions(NULL, 'SERVER')`);
-    - every grant to a principal in its token (`sys.server_permissions`);
-    - every server securable a principal in its token owns;
-    - every database it can enter (`HAS_DBACCESS` over the databases
-      `VIEW ANY DATABASE` lists);
-    - its own scratch database's `TRUSTWORTHY` and ownership-chaining flags;
-    - in `master`, `tempdb` and `msdb`, its database token, every grant to
-      a principal in it, and every securable one owns.
-  - The allowlist is:
-    - the server role `public`;
-    - `CONNECT SQL` and `VIEW ANY DATABASE`;
-    - endpoint `CONNECT`;
-    - its own scratch database, with `TRUSTWORTHY` and ownership chaining
-      off, as a fresh database has them, and no other server securable
-      owned;
-    - in those three system databases, a token of `guest` and `public`
-      only, holding exactly the grants and ownership of the fresh-install
-      inventory (identical on Developer and Express).
-  - Anything else is unconfined and named, including a kind no rule names.
-  - **Why an allowlist.** The design first listed what makes a login
-    unconfined, and review found the cases it missed one round at a time:
-    - `IMPERSONATE` on an administrator's login, which reads as confined in
-      the server permissions and the token and becomes `sysadmin` by
-      `EXECUTE AS LOGIN`;
-    - a user in another database, or a target with `guest` enabled, which is
-      #1667's "no access to another database";
-    - a `db_owner` user in `msdb`, where access reads 1 for everyone;
-    - a grant to `guest` or `public` in a system database: an unmapped
-      login enters there as `guest`, so `CONTROL` granted to `guest` in
-      `msdb` is the login's, and moves neither its access nor its own
-      principal. Reading the token's grants and ownership against the
-      fresh-install inventory closes it the way PostgreSQL's `REACH`
-      includes `PUBLIC`;
-    - ownership of a server role holding `CONTROL SERVER`: the owner adds
-      itself, though its token, permissions and grants read as confined;
-    - a `TRUSTWORTHY` scratch owned by an administrator, where the
-      `db_owner` account's `EXECUTE AS OWNER` module holds `CONTROL SERVER`.
-
-    Each was measured on 17.0 and is read without privilege; the last two
-    are what DEC-1672.1's ownership read covers on PostgreSQL.
-
-    PostgreSQL went the same way on #1678 before its single read (DEC-1672.1).
-    The maintainer decided on 2026-10-16 that SQL Server follows the
-    PostgreSQL side's form first.
-  - The run-owned layout needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`
-    (`securityadmin`, `dbcreator`), so it never runs on the target's
-    instance.
+    the sandbox's three reads below must pass.
+- **Every scratch statement runs in a database sandbox.** The supplied
+  account, `db_owner` of the scratch database, creates a user without a
+  login there, `db_owner` of that database only. It impersonates the user
+  `EXECUTE AS USER … WITH NO REVERT` before the first declared, externals
+  or baseline statement.
+  - Measured from an `sa` session, the sandbox holds no server permission.
+  - It cannot create a login or a database, impersonate a login, revert,
+    or trust its database or chain it.
+  - It still runs every kind of DDL a run needs.
+  - The supplied account's own server reach stays outside, whatever it is.
+- **Three reads before the first write cover what still reaches out.**
+  Each is a property of the instance or of the scratch database, not of an
+  account:
+  - **Guest admission.** The sandbox enters, and writes, a database whose
+    `guest` admits it.
+    - The supplied session lists every database; the sandbox sees only
+      `master`, `tempdb` and its own.
+    - The sandbox reads `HAS_DBACCESS` for each. Only scratch, `master`,
+      `tempdb` and `msdb` may admit it; this is #1667's "no access to
+      another database".
+    - A list that cannot be read refuses.
+  - **The scratch flags.** `TRUSTWORTHY` and ownership chaining must be off,
+    as a fresh database has them: a `TRUSTWORTHY` scratch owned by an
+    administrator lends an `EXECUTE AS OWNER` module `CONTROL SERVER`.
+  - **The system databases.** In `master`, `tempdb` and `msdb` the
+    sandbox's token must be `guest` and `public` only. Their grants and
+    ownership must equal the fresh-install inventory, which is identical on
+    Developer and Express.
+- **Why a sandbox and not a confined login.** The design first read the
+  supplied login's reach against an allowlist, PostgreSQL's form (#2085).
+  - Review found, one round at a time, reaches no read of a login's token,
+    server permissions and grants shows, each measured on 17.0:
+    - `IMPERSONATE` on an administrator's login, which becomes `sysadmin`
+      by `EXECUTE AS LOGIN`;
+    - a user in another database, including a `db_owner` user in `msdb`;
+    - a server role the login owns and may add itself to.
+  - Certificate-signed modules, linked servers and Agent proxies are further
+    known routes. A SQL Server login's reach has no closed list. The
+    sandbox's has three entries, all read without privilege.
+  - The maintainer chose the sandbox on 2026-10-16.
+- **PostgreSQL keeps the confined account (DEC-1672.1).** This is the
+  measured engine difference behind not following the PostgreSQL side here:
+  - a PostgreSQL connection enters one database, with no `USE` and no
+    three-part name;
+  - its cluster-wide authority is the closed set `REACH` reads;
+  - `SET ROLE` is undone by `RESET ROLE`, so it offers no sandbox a
+    declared statement cannot leave.
+- **The run-owned layout** needs `ALTER ANY LOGIN` and `CREATE ANY
+  DATABASE` (`securityadmin`, `dbcreator`), so it never runs on the target's
+  instance.
 - **An empty scratch is the fresh-install inventory**
   (`docs/RESOLVER-MSSQL.md` §7), measured from a pristine installation of
   the pinned build, identical on Developer and Express. A table or user
@@ -3218,6 +3215,7 @@ inventory as `db_owner` (#619).**
 **Pinned by** `a_global_temporary_table_marks_one_instance_to_every_login_on_it`,
 `a_login_reads_its_own_server_reach_without_privilege`,
 `a_login_reads_every_database_it_can_enter`,
+`a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_admits_it`,
 `a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`,
 `a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`,
 `a_database_born_from_model_holds_only_the_fresh_install_inventory` and

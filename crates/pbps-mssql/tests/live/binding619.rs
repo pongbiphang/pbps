@@ -44,6 +44,30 @@ async fn texts(conn: &mut Conn, sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// The same, rerun while the engine picks the read as a deadlock victim
+/// (1205). A scan of `sys.server_principals` deadlocks with another test's
+/// `CREATE LOGIN` or `DROP LOGIN`, and 1205 is the engine's own "rerun".
+async fn texts_past_deadlocks(conn: &mut Conn, sql: &str) -> Vec<String> {
+    for _ in 0..20 {
+        match conn.query(sql).await {
+            Ok(rows) => {
+                return rows
+                    .iter()
+                    .map(|row| {
+                        row.try_get_at::<&str>(0)
+                            .unwrap()
+                            .unwrap_or("NULL")
+                            .to_owned()
+                    })
+                    .collect();
+            }
+            Err(e) if e.server_error_code().as_deref() == Some("1205") => continue,
+            Err(e) => panic!("{sql}\n{e}"),
+        }
+    }
+    panic!("{sql}\nstill a deadlock victim after 20 runs");
+}
+
 /// Runs each batch in turn; a batch the engine refuses fails the test.
 async fn run(conn: &mut Conn, batches: &[&str]) {
     for batch in batches {
@@ -1435,7 +1459,7 @@ async fn a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_data
         [&*login, "public"]
     );
     assert_eq!(
-        texts(
+        texts_past_deadlocks(
             &mut conn,
             "SELECT CONVERT(nvarchar(128), name) FROM sys.server_principals \
              WHERE owning_principal_id = SUSER_ID();"
@@ -1524,6 +1548,156 @@ async fn a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_data
     drop(conn);
     drop_login(&mut admin, &login).await;
     db.drop().await;
+}
+
+/// The scratch sandbox: a user without a login, `db_owner` of the scratch
+/// database, impersonated `WITH NO REVERT` before any declared statement.
+/// From an `sa` session it holds no server permission, cannot leave, cannot
+/// trust its database, and still runs every kind of DDL a resolver run
+/// needs. It enters another database only where `guest` admits it, and a
+/// `TRUSTWORTHY` scratch owned by an administrator lends an `EXECUTE AS
+/// OWNER` module the owner's server authority: those two are what the
+/// checks before the first write read.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_admits_it() {
+    let mut scratch = TestDb::create("sandbox619").await;
+    let mut target = TestDb::create("sandboxtgt619").await;
+    run(&mut target.conn, &["CREATE TABLE dbo.t (c int);"]).await;
+    run(
+        &mut scratch.conn,
+        &[
+            "CREATE USER pbps_sandbox WITHOUT LOGIN;",
+            "ALTER ROLE db_owner ADD MEMBER pbps_sandbox;",
+        ],
+    )
+    .await;
+    let mut sandbox = session(&scratch).await;
+    run(
+        &mut sandbox,
+        &["EXECUTE AS USER = N'pbps_sandbox' WITH NO REVERT;"],
+    )
+    .await;
+
+    assert_eq!(
+        number(
+            &mut sandbox,
+            "SELECT CONVERT(bigint, HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER') * 10 \
+             + IS_SRVROLEMEMBER('sysadmin'));"
+        )
+        .await,
+        0,
+        "the sa session's authority stays outside"
+    );
+    for (sql, code) in [
+        (
+            "CREATE LOGIN pbps619_escape WITH PASSWORD = N'Pbps!Escape619x';",
+            "15247",
+        ),
+        ("CREATE DATABASE pbps619_escape;", "262"),
+        ("EXECUTE AS LOGIN = N'sa';", "15406"),
+        ("REVERT;", "15196"),
+        ("EXEC sp_configure 'show advanced options', 1;", "15247"),
+        (
+            &*format!("ALTER DATABASE [{}] SET TRUSTWORTHY ON;", scratch.name),
+            "15247",
+        ),
+        (
+            &*format!("ALTER DATABASE [{}] SET DB_CHAINING ON;", scratch.name),
+            "15247",
+        ),
+        (
+            &*format!("INSERT [{}].dbo.t VALUES (1);", target.name),
+            "916",
+        ),
+    ] {
+        assert_eq!(
+            refusal(&mut sandbox, sql).await.as_deref(),
+            Some(code),
+            "{sql}"
+        );
+    }
+    run(
+        &mut sandbox,
+        &[
+            "CREATE SCHEMA s;",
+            "CREATE TYPE s.code FROM int NOT NULL;",
+            "CREATE TABLE s.a (k s.code PRIMARY KEY);",
+            "CREATE VIEW s.v WITH SCHEMABINDING AS SELECT k FROM s.a;",
+            "CREATE FUNCTION s.f (@x int) RETURNS int AS BEGIN RETURN @x END;",
+            "CREATE ROLE app_reader;",
+            "GRANT SELECT ON SCHEMA::s TO app_reader;",
+            "CREATE USER app_user WITHOUT LOGIN;",
+            "ALTER ROLE app_reader ADD MEMBER app_user;",
+            "CREATE TABLE #work (c int); INSERT #work VALUES (1);",
+            "CREATE PROCEDURE dbo.owner_reach WITH EXECUTE AS OWNER AS \
+             SELECT CONVERT(bigint, HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER'));",
+        ],
+    )
+    .await;
+
+    let enters = format!("SELECT CONVERT(bigint, HAS_DBACCESS(N'{}'));", target.name);
+    assert_eq!(number(&mut sandbox, &enters).await, 0);
+    run(
+        &mut target.conn,
+        &[
+            "GRANT CONNECT TO guest;",
+            "GRANT INSERT ON dbo.t TO public;",
+        ],
+    )
+    .await;
+    assert_eq!(
+        number(&mut sandbox, &enters).await,
+        1,
+        "guest admits the sandbox"
+    );
+    assert_eq!(
+        refusal(
+            &mut sandbox,
+            &format!("INSERT [{}].dbo.t VALUES (1);", target.name)
+        )
+        .await,
+        None,
+        "and it writes the target"
+    );
+
+    assert_eq!(number(&mut sandbox, "EXEC dbo.owner_reach;").await, 0);
+    run(
+        &mut target.conn,
+        &[&*format!(
+            "ALTER DATABASE [{}] SET TRUSTWORTHY ON;",
+            scratch.name
+        )],
+    )
+    .await;
+    assert_eq!(
+        number(&mut sandbox, "EXEC dbo.owner_reach;").await,
+        1,
+        "a trusted scratch lends its owner's authority"
+    );
+    assert_eq!(
+        number(
+            &mut sandbox,
+            &format!(
+                "SELECT CONVERT(bigint, is_trustworthy_on) FROM sys.databases WHERE name = N'{}';",
+                scratch.name
+            )
+        )
+        .await,
+        1,
+        "which the sandbox reads"
+    );
+    drop(sandbox);
+    run(
+        &mut target.conn,
+        &[&*format!(
+            "ALTER DATABASE [{}] SET TRUSTWORTHY OFF;",
+            scratch.name
+        )],
+    )
+    .await;
+    target.drop().await;
+    scratch.drop().await;
 }
 
 /// Two more things a creation reads from an object it does not own: a

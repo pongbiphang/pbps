@@ -181,72 +181,83 @@ for a moment keeps that type.
     [`a_global_temporary_table_marks_one_instance_to_every_login_on_it`].
   - Seen means the same instance. Then the same-instance rules below apply,
     and scratch may never be the target database itself.
-- **A confined account**, in PostgreSQL's form (#2085): one read of
-  everything the login reaches, checked against an allowlist, as
-  `pbps-pg`'s `scratch.rs` does with `REACH` and `CONTAINED_PREDEFINED`.
-  Anything outside the allowlist, including a kind no rule names, is
-  unconfined and named. Every read needs no privilege.
-  - **The reach:**
-    - its token (`sys.login_token`: itself, `public` and its server roles);
-    - its server permissions (`fn_my_permissions(NULL, 'SERVER')`);
-    - every grant to a principal in its token (`sys.server_permissions`);
-    - every server securable a principal in its token owns: a server role
-      (`sys.server_principals.owning_principal_id`), an endpoint, a
-      database. An owner may add itself to its role, so a role holding
-      `CONTROL SERVER` is the login's though no token, permission or grant
-      read shows it [`a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`];
-    - every database it can enter (`HAS_DBACCESS` over the databases
-      `VIEW ANY DATABASE` lists);
-    - its own scratch database's `is_trustworthy_on` and
-      `is_db_chaining_on` in `sys.databases`. A `db_owner` of a
-      `TRUSTWORTHY` database owned by an administrator runs an
-      `EXECUTE AS OWNER` module with the owner's server authority [`a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`];
-    - in each of `master`, `tempdb` and `msdb`, its database token
-      (`sys.user_token`), every grant to a principal in that token
-      (`sys.database_permissions`), and every securable such a principal
-      owns. An unmapped login enters as `guest`, so what `guest` and
-      `public` hold there is the login's: `CONTROL` granted to `guest`, a
-      role `guest` joins, a schema `guest` owns. None of it moves
-      `HAS_DBACCESS` or the login's own principal
-      [`a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`].
-  - **The allowlist:**
-    - the server role `public`;
-    - the server permissions `CONNECT SQL` and `VIEW ANY DATABASE`;
-    - `public`'s default grants: those two and `CONNECT` on the endpoints;
-    - its own scratch database, owned or not, with `TRUSTWORTHY` and
-      database ownership chaining off, as a fresh database has them;
-    - no other server securable owned;
-    - in `master`, `tempdb` and `msdb`, a token of `guest` and `public`
-      only, and the grants and ownership the fresh-install inventory holds
-      for them, measured as §7's inventory is. On the pinned build that inventory is identical on
-      Developer and Express: at database scope `CONNECT` to `guest` and the
-      two `VIEW ANY COLUMN … KEY DEFINITION` permissions to `public`; the
-      rest are object grants on system objects; `guest` owns the `guest`
-      schema.
-  - **What the read refuses, measured**
+- **A sandbox, not a confined login**
+  ([DEC-619.3](decisions/resolver.md#dec-619-3)). Every statement pbps runs
+  on scratch for the plan runs as a user without a login, `db_owner` of the
+  scratch database only. These are the declared objects, the externals file
+  and the baseline:
+  - **How it is entered.** The supplied account creates the user after the
+    empty check, and impersonates it with `EXECUTE AS USER … WITH NO
+    REVERT` before the first such statement. The session cannot leave it.
+    A fresh session of the supplied account drops the user in the cleanup.
+  - **Measured from an `sa` session**
+    [`a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_admits_it`].
+    In the sandbox:
+    - `CONTROL SERVER` and `sysadmin` read 0;
+    - `CREATE LOGIN`, `CREATE DATABASE`, `sp_configure`, and setting the
+      scratch `TRUSTWORTHY` or `DB_CHAINING` are refused (15247, 262);
+    - `EXECUTE AS LOGIN` and `REVERT` are refused (15406, 15196);
+    - a database whose `guest` is disabled is refused (916);
+    - every kind of DDL a run needs works: schemas, types, tables, views,
+      functions, roles, loginless users, grants and temporary tables.
+  - **The supplied account is no longer the boundary.** It must be
+    `db_owner` of its scratch database, to create and impersonate the
+    sandbox. Its server permissions, roles, ownership and mappings stay
+    outside the sandbox, whatever they are.
+  - **What still reaches out**, read before the first write. Each is a
+    property of the instance or of the scratch database, not of an account:
+    - **A database whose `guest` admits the sandbox.** The sandbox entered,
+      and wrote, a target with `guest` enabled.
+      - The supplied session lists every database in `sys.databases`. The
+        sandbox lists only `master`, `tempdb` and its own, so it cannot
+        list them itself.
+      - The sandbox then reads `HAS_DBACCESS` for each. Only the scratch
+        database, `master`, `tempdb` and `msdb` may admit it. This is
+        #1667's "no access to another database".
+      - A list the supplied session cannot read refuses: unreadable is not
+        empty.
+    - **The scratch database's `TRUSTWORTHY` and ownership chaining.** Both
+      must be off, as a fresh database has them. The sandbox cannot turn
+      them on. But a `TRUSTWORTHY` scratch owned by an administrator lends
+      an `EXECUTE AS OWNER` module the owner's `CONTROL SERVER`, and the
+      sandbox reads the flag in `sys.databases`.
+    - **What `guest` and `public` hold in `master`, `tempdb` and `msdb`.**
+      The sandbox enters them as `guest`. Its token there must be `guest`
+      and `public` only, holding exactly the grants and ownership of the
+      fresh-install inventory, measured as §7's inventory is.
+      - On the pinned build that inventory is identical on Developer and
+        Express. At database scope it is `CONNECT` to `guest` and the two
+        `VIEW ANY COLUMN … KEY DEFINITION` permissions to `public`. The rest
+        are object grants on system objects, and `guest` owns the `guest`
+        schema.
+      - A grant to `guest` or `public` there, a role `guest` joins, or a
+        schema `guest` owns would be the sandbox's
+        [`a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`].
+  - **Why not a confined login.** The design first checked the supplied
+    login's own reach against an allowlist, in PostgreSQL's form (#2085).
+    Review kept finding reaches a SQL Server login carries that no read of
+    its token, server permissions and grants shows. Each was measured, and
+    the sandbox carries none of them
     [`a_login_reads_its_own_server_reach_without_privilege`,
-    `a_login_reads_every_database_it_can_enter`]:
-    - `securityadmin` (`ALTER ANY LOGIN`, `CREATE LOGIN`), `dbcreator`
-      (`CREATE ANY DATABASE`) and `sysadmin` (`CONTROL SERVER`);
-    - `IMPERSONATE` on an administrator's login. It reads as confined in the
-      first two reads, and the login becomes `sysadmin` by
-      `EXECUTE AS LOGIN`;
-    - a user in another database, as its owner or any user, and a target
-      with `guest` enabled. These are #1667's "no access to another
-      database", and either would let a scratch statement reach the target
-      by `USE` or a three-part name;
-    - a user mapped as `db_owner` in `msdb`, where access alone reads 1 for
-      everyone: its token holds its own user, not `guest`;
-    - `CONTROL` or a schema permission granted to `guest` or `public` in a
-      system database, `guest` added to a role there, or a schema `guest`
-      owns: each differs from the fresh-install inventory;
-    - a server role the login owns, even one it is not a member of;
-    - a scratch database with `TRUSTWORTHY` or ownership chaining on.
-- **The layout.** The run-owned layout creates the run's login and database,
-  so it needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`, which no confined
-  account holds. On the target's instance only the supplied layout runs: a
-  confined account in its own pre-created database. The run-owned layout runs
-  on another instance.
+    `a_login_reads_every_database_it_can_enter`,
+    `a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`]:
+    - `IMPERSONATE` on an administrator's login;
+    - a user in another database, including a `db_owner` user in `msdb`;
+    - a server role the login owns, which it may add itself to.
+
+    A login's reach has no closed list on SQL Server. Other known routes
+    include certificate-signed modules, linked servers and Agent proxies.
+  - **PostgreSQL keeps its confined account.** There the difference
+    measured on SQL Server does not arise, and no sandbox exists:
+    - a connection enters one database, with no `USE` and no three-part
+      name;
+    - its cluster-wide authority is the closed set `REACH` reads;
+    - `SET ROLE` is undone by `RESET ROLE`.
+- **The layout.** The run-owned layout creates the run's login and
+  database, so it needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`. It runs
+  on another instance. On the target's instance only the supplied layout
+  runs: an account that is `db_owner` of its own pre-created database, its
+  statements in the sandbox.
 
 ## 7. An empty scratch database
 
@@ -383,8 +394,8 @@ Fixture names are the tests #620 adds.
   - Plain component reads, compared (DEC-619.1).
   - The schema-bound `engine_effects` of §5.
 - **(b) Separation, reconstruction and assessment.**
-  - The marker, the confined-account reads (server and database reach) and
-    the layout rule of §6.
+  - The marker, the sandbox and the three reads before the first write,
+    and the layout rule of §6.
   - #723's inventory check, run as `db_owner` (§7), and emptying the
     supplied layout.
   - The externals shapes of §8.
