@@ -609,8 +609,8 @@ macro_rules! list_or_spec {
 /// A partition: `default`, or a mapping of its bound, `{from: [...], to:
 /// [...]}` with one value per key column, `{in: [...]}` (#1632), `{modulus: m,
 /// remainder: r}` (#1632), or `default: true`, and what it has of its own
-/// beside its parent's: `checks:` and `indexes:`, written as a table's
-/// (#1577).
+/// beside its parent's: `checks:` and `indexes:` (#1577) and `foreign_keys:`
+/// (#1632), written as a table's.
 #[derive(Debug, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum PartitionDto {
@@ -688,6 +688,11 @@ pub struct PartitionEntryDto {
     /// written here.
     #[serde(default)]
     pub indexes: BTreeMap<String, IndexDto>,
+    /// The partition's own foreign keys (#1632); the parent's reach it as
+    /// clones without being written here, and one equal to a parent's is
+    /// refused, since the engine may take it for the parent's clone.
+    #[serde(default)]
+    pub foreign_keys: BTreeMap<String, ForeignKeyDto>,
     /// What the partition holds of its parent's columns otherwise than its
     /// parent: a default, a NOT NULL (#1578). Never a type, which is the
     /// parent's.

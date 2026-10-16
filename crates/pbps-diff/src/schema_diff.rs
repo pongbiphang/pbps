@@ -771,11 +771,13 @@ fn diff_partial_rebuilding(
                 .ok_or_else(|| vec![format!("its parent {} is not in the base", of.parent)])
                 // The parent as this plan leaves it: a foreign key to a
                 // table renamed in the same plan is declared under the new
-                // name, as `diff_constraints` reads it below.
+                // name, as `diff_constraints` reads it below. And the
+                // partition as well, whose own foreign keys are matched by
+                // name and definition (#1632).
                 .and_then(|parent| {
                     detached_names(
                         &renames.apply(parent, &of.parent),
-                        base_table,
+                        &renames.apply(base_table, base_name),
                         declared_table,
                         dialect,
                     )
@@ -837,7 +839,16 @@ fn diff_partial_rebuilding(
                         bound: of.bound.clone(),
                         shape: Box::new(declared_table.clone()),
                     });
-                    diff_constraints(declared_name, &table, declared_table, &mut changes);
+                    // Compared as this plan leaves them: an own foreign key
+                    // to a table renamed in the same plan is declared under
+                    // the new name (#1632). Matched to the parent's above on
+                    // the base side, where the engine matches by relation.
+                    diff_constraints(
+                        declared_name,
+                        &renames.apply(&table, base_name),
+                        declared_table,
+                        &mut changes,
+                    );
                     diff_storage_parameters(
                         uid,
                         declared_name,
@@ -3208,9 +3219,9 @@ fn refuse_temporal_changes(
 /// partition declared as `declared` once detached, or what keeps the
 /// declaration from being the shape a detach gives it: the parent's columns
 /// in order, every key, constraint and index matched one to one by
-/// definition, its name aside (#1544, DEC-1544.1), and the checks and indexes
-/// `partition` has of its own, which a detach leaves as they are, under their
-/// own names (#1577).
+/// definition, its name aside (#1544, DEC-1544.1), and the checks, indexes
+/// (#1577) and foreign keys (#1632) `partition` has of its own, which a
+/// detach leaves as they are, under their own names.
 fn detached_names(
     parent: &Table,
     partition: &Table,
@@ -3261,6 +3272,18 @@ fn detached_names(
         } else {
             what.push(format!(
                 "its own index `{name}` is not declared as it stands"
+            ));
+        }
+    }
+    // Its own foreign keys, as its own checks (#1632): measured on 16 and
+    // 18, a detach keeps them under their names beside the parent's clones,
+    // which it makes local.
+    for (name, own) in &partition.foreign_keys {
+        if declared.foreign_keys.get(name) == Some(own) {
+            declared.foreign_keys.remove(name);
+        } else {
+            what.push(format!(
+                "its own foreign key `{name}` is not declared as it stands"
             ));
         }
     }
@@ -3696,12 +3719,17 @@ fn attached(
              its own yet"
         ));
     }
-    for name in unmatched(&table.foreign_keys, &parent.foreign_keys) {
-        what.push(format!(
-            "its foreign key `{name}` is not its parent's, and a partition holds none of its own \
-             yet"
-        ));
-    }
+    // Measured on 16 and 18: one equal to a parent's is taken as the
+    // parent's clone, and every other stays the partition's own, under its
+    // name (#1632). The plan then compares those with what the partition
+    // declares of its own, as for any table. Validation keeps the partition
+    // from declaring one equal to a parent's, so none of those is its own.
+    let own_foreign_keys: BTreeMap<String, pbps_model::ForeignKey> = table
+        .foreign_keys
+        .iter()
+        .filter(|(_, fk)| !parent.foreign_keys.values().any(|p| p == *fk))
+        .map(|(name, fk)| (name.clone(), fk.clone()))
+        .collect();
     let mut checks = table.checks.clone();
     for (name, p) in &parent_spelled.checks {
         checks.remove(name);
@@ -3804,6 +3832,35 @@ fn attached(
             });
         }
     }
+    // A foreign key the engine takes for the parent's clone keeps its own
+    // name (measured on 16 and 18), so a check or foreign key the partition
+    // declares of its own under that name would meet it as `already exists`.
+    // And of two equal to one of the parent's, the engine takes one by an
+    // order the model does not hold (measured on 16 and 18: `a_fk`, created
+    // after `z_fk`, was taken), and the other stays local under a name this
+    // plan cannot tell. Each such one is dropped before the attach,
+    // leaving the engine to clone the parent's under the parent's name, which
+    // no own name takes (#1632 review).
+    let twins = |fk: &pbps_model::ForeignKey| {
+        table
+            .foreign_keys
+            .values()
+            .filter(|other| *other == fk)
+            .count()
+            > 1
+    };
+    for (name, fk) in &table.foreign_keys {
+        if !own_foreign_keys.contains_key(name)
+            && (twins(fk)
+                || declared.foreign_keys.contains_key(name)
+                || declared.checks.contains_key(name))
+        {
+            released.push(Change::DropForeignKey {
+                table: declared_name.clone(),
+                name: name.clone(),
+            });
+        }
+    }
     if table.replica_identity.is_some() {
         what.push(
             "it has a replica identity of its own, which a partition does not hold yet".to_owned(),
@@ -3861,6 +3918,7 @@ fn attached(
         table: Table {
             checks,
             indexes,
+            foreign_keys: own_foreign_keys,
             storage_parameters: table.storage_parameters.clone(),
             unlogged: table.unlogged,
             partition_of: Some(pbps_model::PartitionOf {
@@ -4079,6 +4137,24 @@ fn refuse_partition_changes(
             }
         })
         .collect();
+    // A partition this plan drops under its standing parent: the foreign
+    // keys of its own are dropped before it, as any table's are (#1632
+    // review).
+    let dropping: BTreeSet<&TableName> = changes
+        .iter()
+        .filter_map(|c| {
+            if let Change::DropTable {
+                name,
+                detach_from: Some(_),
+                ..
+            } = c
+            {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
     // The names the plan takes from a column, by a drop or a rename away,
     // and the name a change gives a column, by an addition or a rename into.
     // A partition dropped under its parent is a transition too: its rows
@@ -4120,13 +4196,17 @@ fn refuse_partition_changes(
         // A standing partition's own: its indexes and checks, which the
         // reader never confuses with its parent's clones (#1577), its
         // defaults and NOT NULLs, its storage parameters and its persistence
-        // (#1581). A clone is its parent's to change (#1546).
+        // (#1581), and its foreign keys, a clone of the parent's being one
+        // with a `conparentid` the reader never reads (#1632). A clone is its
+        // parent's to change (#1546).
         let own = matches!(
             change,
             Change::AddIndex { .. }
                 | Change::DropIndex { .. }
                 | Change::AddCheck { .. }
                 | Change::DropCheck { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
                 | Change::SetStorageParameters { .. }
@@ -4144,6 +4224,12 @@ fn refuse_partition_changes(
             && change.table().is_some_and(|t| {
                 (standing(base.schema, t) || attaching.contains(t)) && standing(declared.schema, t)
             })
+        {
+            continue;
+        }
+        if let Change::DropForeignKey { table, .. } = change
+            && standing(base.schema, table)
+            && dropping.contains(table)
         {
             continue;
         }
@@ -10804,15 +10890,6 @@ mod tests {
             ),
             (
                 ordinary(&|t| {
-                    t.foreign_keys.get_mut("t_fk").unwrap().on_delete =
-                        pbps_model::ReferentialAction::Cascade;
-                }),
-                &declared,
-                &[][..],
-                "its foreign key `t_fk` is not its parent's",
-            ),
-            (
-                ordinary(&|t| {
                     t.checks.remove("ev_n_ck");
                 }),
                 &declared,
@@ -10877,6 +10954,119 @@ mod tests {
                 "{expected}: {found:?}"
             );
         }
+
+        // A foreign key the parent's does not match stays the partition's
+        // own through the attach (#1632): kept where it declares it as its
+        // own, dropped where it does not, as an own check is.
+        let cascade = pbps_model::ForeignKey {
+            on_delete: pbps_model::ReferentialAction::Cascade,
+            ..fk.clone()
+        };
+        let cascading = ordinary(&|t| {
+            t.foreign_keys.insert("t_fk".into(), cascade.clone());
+        });
+        let mut keeps = declared.clone();
+        keeps
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .foreign_keys
+            .insert("t_fk".into(), cascade.clone());
+        let planned = outcome(&cascading, &keeps, &[])
+            .2
+            .expect("an attach keeping its own foreign key is planned");
+        assert!(
+            !kinds(&planned)
+                .iter()
+                .any(|k| k == "DropForeignKey" || k == "AddForeignKey"),
+            "{:?}",
+            planned.changes
+        );
+        // `t_fk`, equal to the parent's `ev_n_fk`, becomes its clone and
+        // keeps its name; declared again as its own with another action, it
+        // is dropped before the attach and added after it, or the add would
+        // meet the clone as `already exists` (#1632 review).
+        let mut reused = declared.clone();
+        reused
+            .tables
+            .get_mut(&"app.t".parse::<TableName>().unwrap())
+            .unwrap()
+            .foreign_keys
+            .insert("t_fk".into(), cascade.clone());
+        let planned = outcome(&base, &reused, &[])
+            .2
+            .expect("an attach reusing an adopted name is planned");
+        let at = |f: &dyn Fn(&Change) -> bool| {
+            planned
+                .changes
+                .iter()
+                .position(|c| f(&c.change))
+                .unwrap_or_else(|| panic!("{:?}", planned.changes))
+        };
+        let dropped = at(&|c| matches!(c, Change::DropForeignKey { name, .. } if name == "t_fk"));
+        let attach = at(&|c| matches!(c, Change::AttachPartition { .. }));
+        let added = at(&|c| matches!(c, Change::AddForeignKey { name, .. } if name == "t_fk"));
+        assert!(dropped < attach && attach < added, "{:?}", planned.changes);
+        // Two equal to the parent's: the engine takes one by an order the
+        // model does not hold, so both are dropped before the attach and
+        // the engine clones the parent's; nothing is dropped after it, where
+        // the name could be the clone's (#1632 review).
+        let twins = ordinary(&|t| {
+            t.foreign_keys.insert("t_fk2".into(), fk.clone());
+        });
+        let planned = outcome(&twins, &declared, &[])
+            .2
+            .expect("an attach of twins is planned");
+        let attach = planned
+            .changes
+            .iter()
+            .position(|c| matches!(c.change, Change::AttachPartition { .. }))
+            .unwrap_or_else(|| panic!("{:?}", planned.changes));
+        let dropped: Vec<(usize, &str)> = planned
+            .changes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| match &c.change {
+                Change::DropForeignKey { name, .. } => Some((i, name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dropped.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
+            ["t_fk", "t_fk2"],
+            "{:?}",
+            planned.changes
+        );
+        assert!(
+            dropped.iter().all(|(i, _)| *i < attach),
+            "{:?}",
+            planned.changes
+        );
+        assert!(
+            !planned
+                .changes
+                .iter()
+                .any(|c| matches!(c.change, Change::AddForeignKey { .. })),
+            "{:?}",
+            planned.changes
+        );
+        // Negative: its name not reused, it is the clone and nothing else.
+        let (_, _, plain) = outcome(&base, &declared, &[]);
+        assert!(!plain.expect("planned").changes.iter().any(|c| matches!(
+            c.change,
+            Change::DropForeignKey { .. } | Change::AddForeignKey { .. }
+        )),);
+        let planned = outcome(&cascading, &declared, &[])
+            .2
+            .expect("an attach dropping its own foreign key is planned");
+        assert!(
+            planned.changes.iter().any(|c| matches!(
+                &c.change,
+                Change::DropForeignKey { table, name } if table.to_string() == "app.t" && name == "t_fk"
+            )),
+            "{:?}",
+            planned.changes
+        );
 
         // In another schema, a default of the parent's text may name another
         // schema's object: it is the table's own, and the parent's is set
@@ -11865,6 +12055,330 @@ mod tests {
             let errors = said(outcome(&tree, &shape(edit)).expect_err(expected));
             assert!(errors.iter().any(|e| e.contains(expected)), "{errors:?}");
         }
+    }
+
+    /// A partition's own foreign key is matched through a detach as this
+    /// plan leaves it (#1632): the table it references renamed in the same
+    /// plan is declared under its new name on the detached table, and the
+    /// detach is planned beside the rename. Declared under the old name, or
+    /// otherwise changed, it is still refused by name.
+    #[test]
+    fn a_partitions_own_foreign_key_follows_a_renamed_target_through_a_detach() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+        let fk = |to: &str| pbps_model::ForeignKey {
+            columns: vec!["s".into()],
+            references_table: to.parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        };
+        let mut parent = table(&[
+            ("ts", Column::new(ty("date")).not_null()),
+            ("s", Column::new(ty("int"))),
+        ]);
+        parent.partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["ts".into()],
+            strategy: Default::default(),
+        });
+        let mut own = Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        own.foreign_keys.insert("p_s_fk".into(), fk("app.s"));
+        let mut target = table(&[("id", Column::new(ty("int")).not_null())]);
+        target.primary_key = Some(PrimaryKey {
+            name: Some("s_pk".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        let p: TableName = "app.p".parse().unwrap();
+        let mut tree = schema_of("app.ev", parent.clone());
+        tree.tables.insert(p.clone(), own);
+        tree.tables.insert("app.s".parse().unwrap(), target.clone());
+        let rename = [Intent::RenameTable {
+            from: "app.s".parse().unwrap(),
+            to: "app.s2".parse().unwrap(),
+        }];
+        let declared = |references: &str| {
+            let mut declared = tree.clone();
+            let moved = declared
+                .tables
+                .remove(&"app.s".parse::<TableName>().unwrap())
+                .unwrap();
+            declared.tables.insert("app.s2".parse().unwrap(), moved);
+            let mut detached = Table {
+                partition_by: None,
+                ..parent.clone()
+            };
+            detached
+                .foreign_keys
+                .insert("p_s_fk".into(), fk(references));
+            declared.tables.insert(p.clone(), detached);
+            declared
+        };
+        let outcome = |declared: &Schema| {
+            let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &rename, &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: &tree,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+        };
+        let planned = outcome(&declared("app.s2")).expect("a detach beside the rename");
+        let kinds: Vec<String> = planned
+            .changes
+            .iter()
+            .map(|c| change_in_words(&c.change))
+            .collect();
+        assert!(
+            planned
+                .changes
+                .iter()
+                .any(|c| matches!(c.change, Change::DetachPartition { .. }))
+                && planned
+                    .changes
+                    .iter()
+                    .any(|c| matches!(c.change, Change::RenameTable { .. }))
+                && !planned.changes.iter().any(|c| matches!(
+                    c.change,
+                    Change::DropForeignKey { .. } | Change::AddForeignKey { .. }
+                )),
+            "{kinds:?}"
+        );
+        // Negative: declared under the target's old name.
+        let errors: Vec<String> = outcome(&declared("app.s"))
+            .expect_err("refused")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("its own foreign key `p_s_fk` is not declared as it stands")),
+            "{errors:?}"
+        );
+    }
+
+    /// A partition with a foreign key of its own is dropped under its
+    /// standing parent with drop intent, its foreign key dropped first as a
+    /// table's is (#1632 review). Without the intent it is still refused.
+    #[test]
+    fn a_partition_with_its_own_foreign_key_is_dropped_under_its_parent() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+        let mut parent = table(&[
+            ("ts", Column::new(ty("date")).not_null()),
+            ("s", Column::new(ty("int"))),
+        ]);
+        parent.partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["ts".into()],
+            strategy: Default::default(),
+        });
+        let mut own = Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.ev".parse().unwrap(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        own.foreign_keys.insert(
+            "p_s_fk".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["s".into()],
+                references_table: "app.s".parse().unwrap(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        let p: TableName = "app.p".parse().unwrap();
+        let mut tree = schema_of("app.ev", parent);
+        tree.tables.insert(p.clone(), own);
+        let declared = schema_of(
+            "app.ev",
+            tree.tables[&"app.ev".parse::<TableName>().unwrap()].clone(),
+        );
+        let outcome = |intents: &[Intent]| {
+            let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(&declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: &tree,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: &declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+        };
+        let planned = outcome(&[Intent::DropTable {
+            table: p.clone(),
+            reason: "gone".parse().unwrap(),
+        }])
+        .expect("the partition is dropped");
+        let kinds: Vec<String> = planned
+            .changes
+            .iter()
+            .map(|c| change_in_words(&c.change))
+            .collect();
+        let at = |f: &dyn Fn(&Change) -> bool| planned.changes.iter().position(|c| f(&c.change));
+        let fk = at(&|c| matches!(c, Change::DropForeignKey { name, .. } if name == "p_s_fk"));
+        let table = at(&|c| matches!(c, Change::DropTable { name, .. } if *name == p));
+        assert!(
+            matches!((fk, table), (Some(fk), Some(table)) if fk < table),
+            "{kinds:?}"
+        );
+        // Negative: without drop intent, no plan: its identity is refused as
+        // a drop that records no reason.
+        let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        assert!(crate::resolve(&declared, &base_ids, &[], &ctx()).is_err());
+    }
+
+    /// An attached table's own foreign key is compared with what the
+    /// partition declares as this plan leaves it (#1632): to a table renamed
+    /// in the same plan, declared under the new name, it is neither dropped
+    /// nor added again. Declared otherwise, it is dropped and added as on any
+    /// table.
+    #[test]
+    fn an_attached_tables_own_foreign_key_follows_a_renamed_target() {
+        use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionOf};
+        let fk = |to: &str, on_delete| pbps_model::ForeignKey {
+            columns: vec!["s".into()],
+            references_table: to.parse().unwrap(),
+            references_columns: vec!["id".into()],
+            on_delete,
+            on_update: Default::default(),
+        };
+        let columns = || {
+            table(&[
+                ("ts", Column::new(ty("date")).not_null()),
+                ("s", Column::new(ty("int"))),
+            ])
+        };
+        let mut parent = columns();
+        parent.partition_by = Some(PartitionBy {
+            external: false,
+            columns: vec!["ts".into()],
+            strategy: Default::default(),
+        });
+        let mut target = table(&[("id", Column::new(ty("int")).not_null())]);
+        target.primary_key = Some(PrimaryKey {
+            name: Some("s_pk".into()),
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        let t: TableName = "app.t".parse().unwrap();
+        let mut base = schema_of("app.ev", parent);
+        base.tables.insert("app.s".parse().unwrap(), target);
+        let mut ordinary = columns();
+        ordinary
+            .foreign_keys
+            .insert("t_s_fk".into(), fk("app.s", Default::default()));
+        base.tables.insert(t.clone(), ordinary);
+        let rename = [Intent::RenameTable {
+            from: "app.s".parse().unwrap(),
+            to: "app.s2".parse().unwrap(),
+        }];
+        let declared = |references: &str, on_delete| {
+            let mut declared = base.clone();
+            let moved = declared
+                .tables
+                .remove(&"app.s".parse::<TableName>().unwrap())
+                .unwrap();
+            declared.tables.insert("app.s2".parse().unwrap(), moved);
+            let mut partition = Table {
+                partition_of: Some(PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: PartitionBound::Range {
+                        from: vec![BoundDatum::Value("2025-01-01".into())],
+                        to: vec![BoundDatum::Value("2026-01-01".into())],
+                    },
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            };
+            partition
+                .foreign_keys
+                .insert("t_s_fk".into(), fk(references, on_delete));
+            declared.tables.insert(t.clone(), partition);
+            declared
+        };
+        let fk_changes = |declared: &Schema| -> Vec<String> {
+            let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, &rename, &ctx())
+                .unwrap()
+                .ids;
+            let planned = diff(
+                Side {
+                    schema: &base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .expect("an attach beside the rename");
+            assert!(
+                planned
+                    .changes
+                    .iter()
+                    .any(|c| matches!(c.change, Change::AttachPartition { .. })),
+                "{:?}",
+                planned.changes
+            );
+            planned
+                .changes
+                .iter()
+                .filter(|c| {
+                    matches!(
+                        c.change,
+                        Change::DropForeignKey { .. } | Change::AddForeignKey { .. }
+                    )
+                })
+                .map(|c| change_in_words(&c.change))
+                .collect()
+        };
+        assert!(
+            fk_changes(&declared("app.s2", Default::default())).is_empty(),
+            "kept as it stands"
+        );
+        // Negative: declared with another action, it is dropped and added.
+        assert_eq!(
+            fk_changes(&declared("app.s2", pbps_model::ReferentialAction::Cascade)).len(),
+            2
+        );
     }
 
     /// A partition's persistence and storage parameters (#1580) are created

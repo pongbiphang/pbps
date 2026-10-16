@@ -429,24 +429,7 @@ pub(crate) fn convert_for_diagnostics(
         unique.insert(k, constraint);
     }
 
-    let mut foreign_keys = std::collections::BTreeMap::new();
-    for (k, fk) in dto.foreign_keys {
-        match parse_reference(src, &fk.references) {
-            Ok((references_table, references_columns)) => {
-                foreign_keys.insert(
-                    k,
-                    ForeignKey {
-                        columns: fk.columns,
-                        references_table,
-                        references_columns,
-                        on_delete: fk.on_delete,
-                        on_update: fk.on_update,
-                    },
-                );
-            }
-            Err(e) => errs.push(e),
-        }
-    }
+    let foreign_keys = convert_foreign_keys(src, dto.foreign_keys, &mut errs);
 
     let checks = dto
         .checks
@@ -724,6 +707,8 @@ pub(crate) fn convert_for_diagnostics(
                             .map(|(k, expression)| (k, CheckConstraint { expression }))
                             .collect(),
                         indexes: convert_indexes(src, e.indexes, &mut errs),
+                        // Its own, beside its parent's clones (#1632).
+                        foreign_keys: convert_foreign_keys(src, e.foreign_keys, &mut errs),
                         // Its own, as a table's, spelled by the same rule
                         // (#1580).
                         storage_parameters: storage_parameters_of(
@@ -965,6 +950,34 @@ fn parse_reference(
 
 /// A table's or a partition's `indexes:` (#1577), each error pushed to `errs`
 /// and its index left out.
+/// A table's foreign keys, or a partition's own (#1632): the same entry
+/// under either.
+fn convert_foreign_keys(
+    src: &SourceFile,
+    dtos: std::collections::BTreeMap<String, crate::dto::ForeignKeyDto>,
+    errs: &mut Vec<LoadError>,
+) -> std::collections::BTreeMap<String, ForeignKey> {
+    let mut foreign_keys = std::collections::BTreeMap::new();
+    for (k, fk) in dtos {
+        match parse_reference(src, &fk.references) {
+            Ok((references_table, references_columns)) => {
+                foreign_keys.insert(
+                    k,
+                    ForeignKey {
+                        columns: fk.columns,
+                        references_table,
+                        references_columns,
+                        on_delete: fk.on_delete,
+                        on_update: fk.on_update,
+                    },
+                );
+            }
+            Err(e) => errs.push(e),
+        }
+    }
+    foreign_keys
+}
+
 fn convert_indexes(
     src: &SourceFile,
     dtos: std::collections::BTreeMap<String, crate::dto::IndexDto>,

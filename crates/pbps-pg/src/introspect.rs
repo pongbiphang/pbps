@@ -867,6 +867,17 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             {
                 add_constraint(constraint, &parts, &lookups, &mut table, &mut pulled);
             }
+            // Its own foreign keys (#1632), in the second pass as a table's
+            // are: the query reads no clone (`conparentid`), so each is the
+            // partition's own.
+            for constraint in constraints_by_table
+                .get(&raw_table.oid)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .filter(|c| c.kind == 'f')
+            {
+                deferred.push((parts.clone(), *constraint));
+            }
             let mut unread = Vec::new();
             // An index's key class is judged by its column's type (a GIN over
             // `jsonb`), and a partition's columns are its parent's, which it

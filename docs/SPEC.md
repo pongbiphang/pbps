@@ -316,9 +316,13 @@ indexes:
   partitions that overlap. A tree's strategy never changes in a plan
   (DEC-1632.1). A partition in another schema is named qualified. A partition is a table of its own, with
   an identity. Its columns and keys are its parent's, and so are the clones of
-  its parent's checks and indexes. It may declare checks and indexes of its
-  own: its entry is then a block of `from:` and `to:`, or `default: true`, with
-  `checks:` and `indexes:` written as a table's (DEC-1577.1). It may also hold
+  its parent's checks, indexes and foreign keys. It may declare checks and
+  indexes of its own: its entry is then a block of `from:` and `to:`, or
+  `default: true`, with `checks:` and `indexes:` written as a table's
+  (DEC-1577.1). It may declare foreign keys of its own under `foreign_keys:`,
+  as a table's; one equal to a parent's foreign key, which the engine may take
+  for its clone, or named as one of the parent's checks or foreign keys, is
+  refused (DEC-1632.2). It may also hold
   a column default of its own, and a NOT NULL its parent's column lacks, under
   `columns:`, never a type (DEC-1578.1). A grant on a partition is written in
   its role's file as on any table, and is the partition's own: one on the
