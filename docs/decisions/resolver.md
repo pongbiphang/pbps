@@ -3186,9 +3186,14 @@ inventory as `db_owner` (#619).**
       `VIEW ANY DATABASE`, read with `HAS_PERMS_BY_NAME`. Under a `DENY` the
       query still succeeds and silently omits the target, so a list that
       cannot be shown whole refuses.
-  - **The scratch flags.** `TRUSTWORTHY` and ownership chaining must be off,
-    as a fresh database has them: a `TRUSTWORTHY` scratch owned by an
-    administrator lends an `EXECUTE AS OWNER` module `CONTROL SERVER`.
+  - **The scratch database's options.** Its whole `sys.databases` row must
+    read as a fresh database's, identity columns aside, with the collation
+    and compatibility level compared with the target instead.
+    - Checking chosen flags missed one after another: `TRUSTWORTHY` lends an
+      `EXECUTE AS OWNER` module `CONTROL SERVER`, and `LEDGER = ON` makes
+      every later table a ledger table a drop only renames.
+    - Two fresh databases, and a used one, differ only in identity, so the
+      comparison by default refuses nothing valid.
   - **The system databases.** In `master`, `tempdb` and `msdb` the
     sandbox's token must be `guest` and `public` only. Their grants and
     ownership must equal the fresh-install inventory, which is identical on
@@ -3242,7 +3247,8 @@ inventory as `db_owner` (#619).**
 `a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`,
 `a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`,
 `a_database_born_from_model_holds_only_the_fresh_install_inventory`,
-`a_database_holds_securables_no_object_catalog_lists` and
+`a_database_holds_securables_no_object_catalog_lists`,
+`a_scratch_databases_options_are_compared_whole_with_a_fresh_databases` and
 `an_account_that_is_not_db_owner_cannot_see_what_its_database_holds`.
 
 <a id="dec-619-4"></a>

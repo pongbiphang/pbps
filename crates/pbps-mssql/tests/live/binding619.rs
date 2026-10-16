@@ -1985,6 +1985,86 @@ async fn a_database_holds_securables_no_object_catalog_lists() {
     db.drop().await;
 }
 
+/// The columns of `sys.databases` in which two databases differ, each
+/// compared as text under a binary collation.
+async fn differing_options(conn: &mut Conn, a: &str, b: &str) -> Vec<String> {
+    let sql = format!(
+        "DECLARE @sql nvarchar(max) = N''; \
+         SELECT @sql = @sql + N'SELECT N''' + c.name + N''' WHERE EXISTS (SELECT 1 FROM sys.databases a, sys.databases b \
+           WHERE a.name = N''{a}'' AND b.name = N''{b}'' AND ISNULL(CONVERT(nvarchar(4000), a.' + QUOTENAME(c.name) \
+           + N') COLLATE Latin1_General_BIN2, N''~'') <> ISNULL(CONVERT(nvarchar(4000), b.' + QUOTENAME(c.name) \
+           + N') COLLATE Latin1_General_BIN2, N''~'')) UNION ALL ' \
+         FROM sys.all_columns c WHERE c.object_id = OBJECT_ID(N'sys.databases') \
+           AND TYPE_NAME(c.system_type_id) NOT IN (N'varbinary', N'image'); \
+         SET @sql = LEFT(@sql, LEN(@sql) - 10) + N' ORDER BY 1;'; \
+         EXEC (@sql);"
+    );
+    texts(conn, &sql).await
+}
+
+/// A database's options are compared whole with a fresh database's, not
+/// option by option. Two fresh databases, and one that has been used, differ
+/// only in identity columns; a database created `WITH LEDGER = ON` differs
+/// only in `is_ledger_on`, which turns every later table into a ledger table
+/// that a drop only renames, and `TRUSTWORTHY` only in `is_trustworthy_on`.
+/// A comparison by default catches each without a rule naming it.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_scratch_databases_options_are_compared_whole_with_a_fresh_databases() {
+    let mut fresh = TestDb::create("optfresh619").await;
+    let mut used = TestDb::create("optused619").await;
+    run(
+        &mut used.conn,
+        &[
+            "CREATE TABLE dbo.t (c int);",
+            "INSERT dbo.t VALUES (1);",
+            "DROP TABLE dbo.t;",
+            "CHECKPOINT;",
+        ],
+    )
+    .await;
+    let identity = [
+        "database_id",
+        "name",
+        "physical_database_name",
+        "service_broker_guid",
+    ];
+    let mut differ = differing_options(&mut fresh.conn, &fresh.name, &used.name).await;
+    differ.retain(|column| column != "create_date");
+    assert_eq!(differ, identity, "a used database reads as a fresh one");
+
+    let ledger = format!("pbps_test_ledger619_{}", std::process::id());
+    run(
+        &mut fresh.conn,
+        &[&*format!(
+            "USE master; CREATE DATABASE [{ledger}] WITH LEDGER = ON;"
+        )],
+    )
+    .await;
+    let mut differ = differing_options(&mut fresh.conn, &fresh.name, &ledger).await;
+    differ.retain(|column| column != "create_date" && !identity.contains(&column.as_str()));
+    assert_eq!(differ, ["is_ledger_on"]);
+    run(
+        &mut fresh.conn,
+        &[&*format!("USE master; DROP DATABASE [{ledger}];")],
+    )
+    .await;
+
+    run(
+        &mut fresh.conn,
+        &[&*format!(
+            "ALTER DATABASE [{}] SET TRUSTWORTHY ON;",
+            used.name
+        )],
+    )
+    .await;
+    let mut differ = differing_options(&mut fresh.conn, &fresh.name, &used.name).await;
+    differ.retain(|column| column != "create_date" && !identity.contains(&column.as_str()));
+    assert_eq!(differ, ["is_trustworthy_on"]);
+    used.drop().await;
+    fresh.drop().await;
+}
+
 /// SQL Server has no `DROP OWNED`, so cleanup drops what the inventory read
 /// finds beyond the fresh-install inventory, in dependency order. A database
 /// role is one of those objects: `DROP ROLE` refuses while the role has a

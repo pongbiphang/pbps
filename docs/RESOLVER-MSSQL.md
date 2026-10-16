@@ -233,11 +233,21 @@ for a moment keeps that type.
         other database, a guest-enabled target included, and `DB_NAME`
         hides the same ones. A list that cannot be shown whole refuses:
         hidden is not empty [`a_database_list_without_view_any_database_hides_the_target_and_says_so`].
-    - **The scratch database's `TRUSTWORTHY` and ownership chaining.** Both
-      must be off, as a fresh database has them. The sandbox cannot turn
-      them on. But a `TRUSTWORTHY` scratch owned by an administrator lends
-      an `EXECUTE AS OWNER` module the owner's `CONTROL SERVER`, and the
-      sandbox reads the flag in `sys.databases`.
+    - **The scratch database's options, compared whole.** Its
+      `sys.databases` row is compared with a fresh database's, every column
+      by default [`a_scratch_databases_options_are_compared_whole_with_a_fresh_databases`].
+      - Only identity is skipped: `name`, `database_id`, `create_date`,
+        `physical_database_name`, `service_broker_guid` and `owner_sid`.
+        Two fresh databases differ in exactly those, and so does one that
+        has been used.
+      - The collation and compatibility level are compared with the target
+        instead, as reported facts.
+      - The sandbox cannot change an option. An option set before it
+        arrives is caught without a rule naming it. A `TRUSTWORTHY` scratch
+        owned by an administrator lends an `EXECUTE AS OWNER` module the
+        owner's `CONTROL SERVER`. `LEDGER = ON` turns every later table
+        into a ledger table, which a drop only renames, so cleanup could
+        not restore the inventory.
     - **What `guest` and `public` hold in `master`, `tempdb` and `msdb`.**
       The sandbox enters them as `guest`. Its token there must be `guest`
       and `public` only, holding exactly the grants and ownership of the
