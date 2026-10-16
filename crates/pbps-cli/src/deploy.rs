@@ -5020,7 +5020,7 @@ pub fn cmd_baseline(
         let mut conn = db::connect(target).await?;
         crate::engine::lock(&mut conn, &operator).await?;
         let result = async {
-            let removed = crate::engine::remove_scan_checks(&mut conn).await?;
+            let removed = crate::engine::remove_scan_checks(&mut conn, &ids).await?;
             let scoped = managed_state(
                 &mut conn,
                 &ids,

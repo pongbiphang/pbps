@@ -9937,6 +9937,43 @@ fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
     );
     assert_eq!(temporaries(), 0);
 
+    // B'': the same, under a newest entry this build cannot read. `baseline`
+    // is that entry's remedy (DECISIONS 203), so the CHECK is found by the
+    // project's identities, not the ledger's.
+    on_server(
+        &connection,
+        &format!(
+            "ALTER TABLE app.t ADD CONSTRAINT \"{name}\" \
+             CHECK (ts >= DATE '2024-01-01') NOT VALID; \
+             UPDATE public.__pbps_state \
+             SET state_json = jsonb_set(state_json::jsonb, '{{version}}', '5')::text \
+             WHERE id = (SELECT max(id) FROM public.__pbps_state)"
+        ),
+    );
+    let o = d.run(&["verify", "--db", &connection]);
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        code(&o) != 0 && said.contains("this is a version 5 state"),
+        "{said}"
+    );
+    let o = succeeds(d.run(&["baseline", "--db", &connection, "--reason", "an old ledger"]));
+    assert!(
+        stdout(&o).contains(&format!(
+            "Removed the staged attach's temporary CHECK `{name}`"
+        )),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(temporaries(), 0);
+    let reason = latest_snapshot(&connection).reason.unwrap_or_default();
+    assert_eq!(
+        reason,
+        format!(
+            "an old ledger (first removed the staged attach's temporary CHECK `{name}` on \
+             `app.t`)"
+        )
+    );
+
     // C: stopped there again, and resumed: the run drops the CHECK itself.
     let plan = connected_artifact(&d, &connection, true);
     let o = approved_apply(

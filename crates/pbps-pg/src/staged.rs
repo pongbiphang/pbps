@@ -161,8 +161,7 @@ async fn remove_unvalidated(conn: &mut Conn, check: &ScanCheck) -> Result<String
 /// Takes out the temporary CHECKs a staged attach left, before a `baseline`
 /// reads the database (#1638, DEC-1638.1).
 ///
-/// `tables` are the tables the newest ledger entry names, with their
-/// identities; a staged attach's CHECK is named after its table's identity
+/// `tables` are the project's tables, with their identities; a staged attach's CHECK is named after its table's identity
 /// ([`crate::emit::scan_check_name`]), so each is looked for by that exact
 /// name on that table, and nothing else is touched. No declared check can
 /// hold such a name ([`crate::emit::SCAN_CHECK_PREFIX`]), so one that stands

@@ -6214,10 +6214,11 @@ the namespace a table's constraints share.
 - *Later failures keep it.* A run stopped after the `VALIDATE` keeps the
   validated CHECK for `--resume`, whose last statement drops it.
 - *Abandoning goes through `baseline`.* Leon chose this route. `baseline`
-  first drops a CHECK named after a table's identity in the newest ledger
-  entry, on that table, and its recorded reason says what it removed. It
-  does so whatever that entry's kind: a run that dies between the `ADD` and
-  the `VALIDATE`'s checkpoint records neither a checkpoint nor a failure.
+  first drops a CHECK named after a table's identity in the project's ids
+  file, on that table, and its recorded reason says what it removed. It asks
+  the ledger nothing: a run that dies between the `ADD` and the `VALIDATE`'s
+  checkpoint records neither a checkpoint nor a failure, and `baseline` is
+  the remedy for an entry this build cannot read (DECISIONS 203).
 
 Against #1776 it adds no change kind and no order. The attach stays one
 operation, and the temporary name is claimed and released inside it.
@@ -6229,7 +6230,7 @@ Pinned by the live
 - an attach stopped after its checkpoint leaves the validated CHECK, which
   `baseline` removes by name;
 - a `NOT VALID` CHECK left with no checkpoint after it is removed by
-  `baseline` too;
+  `baseline` too, also under a newest entry of an obsolete version;
 - the same stop resumed drops it, and the next plan is empty;
 - a staged attach scans its table as often as a transactional one, which a
   CHECK that does not imply the bound fails (3 against 2).
