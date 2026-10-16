@@ -2829,6 +2829,51 @@ mod generated_surface_coverage {
         );
         folded.proof.validate(&folded.changes).unwrap();
 
+        // Both at once (review of #2120): the old `a` loses its default under
+        // its final name `b` while the old `b` rebinds. The appended teardown,
+        // spelled `b`, holds `b` to `c` back, and with it `a` to `b`; the
+        // removal spelled `b` follows that last rename, not the teardown's
+        // position.
+        let both = plan(
+            "teardown and final-spelled removal",
+            "b",
+            &schema(&[("a", Some("1")), ("b", Some("1"))]),
+            &schema(&[("b", None), ("c", Some("1"))]),
+            &[
+                SurfaceResolution {
+                    surface: Surface::Default(t.column("a")),
+                    current: attrdef("int4in"),
+                    desired: None,
+                },
+                SurfaceResolution {
+                    surface: Surface::Default(t.column("b")),
+                    current: attrdef("f"),
+                    desired: None,
+                },
+                SurfaceResolution {
+                    surface: Surface::Default(t.column("c")),
+                    current: None,
+                    desired: attrdef("f_exact"),
+                },
+            ],
+        );
+        let mut removals: Vec<usize> = both
+            .changes
+            .changes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| removal(&p.change))
+            .map(|(i, _)| i)
+            .collect();
+        removals.sort_unstable();
+        let (away, into) = (position(&both, &rename("b")), position(&both, &rename("a")));
+        assert!(
+            matches!(removals[..], [teardown, spelled] if teardown < away && away < into && into < spelled),
+            "{:?}",
+            both.changes.changes
+        );
+        both.proof.validate(&both.changes).unwrap();
+
         // A drop frees the name instead: the old `b` is dropped, `a` takes
         // its name and loses its default. The drop goes first, as the
         // ordinary plan orders it, then the rename, then the removal.
