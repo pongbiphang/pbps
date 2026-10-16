@@ -4032,7 +4032,7 @@ fn a_rename_under_a_denied_referrer_function_is_refused_by_name() {
         &format!("USE master; IF USER_ID('{login}') IS NOT NULL DROP USER [{login}];"),
     );
     drop(own);
-    on_server(
+    after_test_on_server(
         &server,
         &format!("IF SUSER_ID('{login}') IS NOT NULL DROP LOGIN [{login}];"),
     );
@@ -4308,7 +4308,7 @@ fn a_hidden_referrer_refuses_the_plan_rather_than_reading_as_no_edge() {
     ok(&d.run(&["plan"]));
     d.commit();
     ok(&d.run(&["plan", "--db", &as_login]));
-    on_server(&server, &format!("DROP LOGIN [{login}];"));
+    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
 }
 
 /// A connected plan judges a standing computed column by the catalog's
@@ -5309,7 +5309,7 @@ fn a_hidden_table_is_not_recorded_as_missing() {
     let o = d.run(&["plan", "--db", own.connection()]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
     assert!(stdout(&o).contains("dbo.keep"), "{}", stdout(&o));
-    on_server(&server, &format!("DROP LOGIN [{login}];"));
+    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
 }
 
 /// #1606: a role hidden from this login is not recorded as missing.
@@ -5406,7 +5406,7 @@ fn a_hidden_role_is_not_recorded_as_missing() {
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
     let o = d.run(&["verify", "--db", own.connection()]);
     assert_eq!(code(&o), 0, "{}{}", stdout(&o), stderr(&o));
-    on_server(&server, &format!("DROP LOGIN [{login}];"));
+    after_test_on_server(&server, &format!("DROP LOGIN [{login}];"));
 }
 
 /// #1192: metadata visibility filters `sys.objects`, so a sequence this login
