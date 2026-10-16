@@ -1876,6 +1876,16 @@ impl Dialect for Postgres {
         emit::emit(self, change, strategy)
     }
 
+    /// An attach validates a CHECK that implies its bound first, so that it
+    /// skips its scan (#1638, DEC-1638.1); every other change is [`emit`]'s.
+    fn emit_staged(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+    ) -> Result<Vec<Statement>, DialectError> {
+        emit::staged_attach(change).unwrap_or_else(|| emit::emit(self, change, strategy))
+    }
+
     /// What this plan implies about the data, asked before its first
     /// statement (SPEC §7.5).
     ///

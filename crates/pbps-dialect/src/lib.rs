@@ -295,6 +295,34 @@ pub struct Statement {
     /// lets go of it, so it says so here, and nothing derives it elsewhere
     /// (#1961).
     pub releases: Vec<Released>,
+
+    /// The temporary CHECK a staged attach writes so that its attach skips
+    /// the scan, on the two statements the executor treats otherwise
+    /// (#1638, DEC-1638.1). `None` on every other statement.
+    pub scan_check: Option<ScanCheck>,
+}
+
+/// A staged attach's temporary CHECK, as the statement that adds or
+/// validates it names it (#1638, DEC-1638.1).
+///
+/// Measured on 16 and 18, a `NOT VALID` check makes every read of its table
+/// refuse as a fact the model cannot hold. So no checkpoint is taken after
+/// the [`ScanCheckStep::Add`], and a [`ScanCheckStep::Validate`] that fails
+/// takes the check out again before it reports, which leaves the database as
+/// the last checkpoint recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanCheck {
+    pub table: TableName,
+    pub name: String,
+    pub step: ScanCheckStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanCheckStep {
+    /// `ADD CONSTRAINT … NOT VALID`.
+    Add,
+    /// `VALIDATE CONSTRAINT`.
+    Validate,
 }
 
 /// The reference-data operation performed by a guarded statement.
@@ -346,7 +374,24 @@ impl Statement {
             role_renames: Vec::new(),
             creates: Vec::new(),
             releases: Vec::new(),
+            scan_check: None,
         }
+    }
+
+    /// Records that this statement adds or validates a staged attach's
+    /// temporary CHECK `name` on `table`.
+    pub fn scan_check(
+        mut self,
+        table: TableName,
+        name: impl Into<String>,
+        step: ScanCheckStep,
+    ) -> Self {
+        self.scan_check = Some(ScanCheck {
+            table,
+            name: name.into(),
+            step,
+        });
+        self
     }
 
     pub fn writing_rows(mut self, table: TableName, operation: RowOperation) -> Self {
@@ -2851,6 +2896,23 @@ pub trait Dialect {
     /// without it rather than failing, because the desired state is the same
     /// either way and refusing would turn a performance hint into an outage.
     fn emit(&self, change: &Change, strategy: Strategy) -> Result<Vec<Statement>, DialectError>;
+
+    /// The statements for `change` in a staged plan, which commits each one
+    /// on its own (SPEC §7.5).
+    ///
+    /// The same as [`Dialect::emit`] but where a sequence of statements is
+    /// worth something only when each commits before the next: a
+    /// PostgreSQL attach then validates a CHECK that implies its bound
+    /// before it attaches, so the attach skips its scan (#1638,
+    /// DEC-1638.1). Inside one transaction the CHECK's lock is held to the
+    /// commit, so a transactional plan keeps [`Dialect::emit`]'s form.
+    fn emit_staged(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+    ) -> Result<Vec<Statement>, DialectError> {
+        self.emit(change, strategy)
+    }
 
     /// Questions to ask the data before this **plan** runs (SPEC §7.5).
     ///

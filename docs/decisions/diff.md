@@ -6158,3 +6158,77 @@ It checks:
 - the proposal's source;
 - that a change the search does not move stays after the region;
 - that a settled plan clears the walk and is left as it is.
+
+<a id="dec-1638-1"></a>
+
+**DEC-1638.1. A staged attach validates a CHECK that implies its bound before
+it attaches, so the attach skips its scan; a transactional plan keeps the
+single statement (#1638).**
+
+Leon chose the staged-only form on #1638 (2026-10-16). Measured on 16 and 18:
+
+- **Only separate commits help.** `ADD CONSTRAINT … NOT VALID` takes ACCESS
+  EXCLUSIVE on the table, held to the commit. In one transaction a concurrent
+  `SELECT` waited from the `ADD` until the commit, and `VALIDATE` scanned
+  under that lock. Committed one by one, `VALIDATE` scans under SHARE UPDATE
+  EXCLUSIVE, and the attach logs `partition constraint … is implied by
+  existing constraints` and leaves `seq_scan` where it was.
+- **The CHECK spells the bound** as the engine's own partition constraint
+  does: every key column `IS NOT NULL`, a range's ends compared column by
+  column (`(a > 1 OR (a = 1 AND b >= 'x'))`), a list by `IN`, a list's NULL by
+  `IS NULL`. Untyped literals take the columns' types, and a `MINVALUE` or
+  `MAXVALUE` end leaves out the columns after it. Each form was implied:
+  - LIST with and without NULL, and NULL alone;
+  - single- and multi-column RANGE, with and without infinite ends;
+  - integer and date keys;
+  - a parent with a DEFAULT partition.
+- **HASH keeps the single statement.** `satisfies_hash_partition` over a
+  text key column is not proved by the same call in a CHECK, with or without
+  `COLLATE`, though an integer key is. A CHECK not proved costs a second scan.
+
+So the change carries its parent's key (`AttachPartition::key`), and
+`Dialect::emit_staged` writes four statements where `emit` writes one:
+1. add the CHECK `NOT VALID`;
+2. validate it;
+3. attach;
+4. drop it.
+
+Its name is `pbps_attach_<uid>`, the table's own identity. Nothing finds it by
+prefix.
+
+**What runs beside the plan.**
+- *No checkpoint after the `ADD`.* Measured, a `NOT VALID` check makes every
+  read of its table refuse as a fact the model cannot hold, so the
+  `VALIDATE`'s checkpoint covers both statements.
+- *A failed `VALIDATE` takes the check out.* It removes only a `NOT VALID`
+  CHECK of that name on that table, as the failed concurrent index build's
+  recovery does (DECISIONS 463). The database is then as the last checkpoint
+  recorded it, and the run starts again, or resumes from an earlier
+  checkpoint.
+- *The checkpoint comparison leaves the CHECK out of both reads.* The plan's
+  changes do not hold it, and its statements name it. The checkpoint itself
+  records it as the database holds it.
+- *Later failures keep it.* A run stopped after the `VALIDATE` keeps the
+  validated CHECK for `--resume`, whose last statement drops it.
+- *Abandoning goes through `baseline`.* Leon chose this route. When the newest
+  ledger entry is a staged checkpoint or a failed attempt, `baseline` first
+  drops a CHECK named after a table's identity in that entry, on that table,
+  and its recorded reason says what it removed.
+
+Against #1776 it adds no change kind and no order. The attach stays one
+operation, and the temporary name is claimed and released inside it.
+
+Pinned by the live
+`a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody` (on 16 and
+18):
+- a `VALIDATE` stopped by an event trigger leaves no CHECK and no checkpoint;
+- an attach stopped after its checkpoint leaves the validated CHECK, which
+  `baseline` removes by name;
+- the same stop resumed drops it, and the next plan is empty;
+- a staged attach scans its table as often as a transactional one, which a
+  CHECK that does not imply the bound fails (3 against 2).
+
+Each mechanism fails the test when reverted. Also pinned by the unit
+`a_staged_attach_validates_a_check_its_bound_implies_first`, and by the staged
+step of `a_table_is_attached_as_a_partition_through_the_cli`, which fails
+without the comparison filter.

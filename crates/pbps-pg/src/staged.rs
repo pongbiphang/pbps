@@ -1,4 +1,5 @@
-//! Recovery of a concurrent index build's own non-transactional artifact.
+//! Recovery of a concurrent index build's own non-transactional artifact,
+//! and of a staged attach's temporary CHECK (#1638).
 //!
 //! The emitter supplies the target identity. Capture its absence before the
 //! statement, then remove only an invalid index on that same table after a
@@ -7,11 +8,32 @@
 //! lock against a separate session replacing objects during recovery (decision 463).
 
 use pbps_db::{Conn, DbError};
-use pbps_dialect::{IndexBuild, Statement};
+use pbps_dialect::{IndexBuild, ScanCheck, ScanCheckStep, Statement};
 
 /// Execute a staged statement and attach its recovery outcome to the original
 /// error, so the failure ledger retains both the SQLSTATE and our own account.
 pub async fn execute(conn: &mut Conn, statement: &Statement) -> Result<(), DbError> {
+    if let Some(check) = statement
+        .scan_check
+        .as_ref()
+        .filter(|c| c.step == ScanCheckStep::Validate)
+    {
+        let Err(error) = conn.execute(&statement.sql).await else {
+            return Ok(());
+        };
+        let outcome = match remove_unvalidated(conn, check).await {
+            Ok(outcome) => outcome,
+            // As for an index: the cleanup driver's message stays out of the
+            // durable context (DECISIONS 455/456).
+            Err(_) => format!(
+                "Removing the temporary CHECK `{}` on `{}` failed; it may remain `NOT VALID`, \
+                 which every read of the table refuses. `pbps baseline --reason ...` removes it \
+                 by name before it records; the original error follows.",
+                check.name, check.table
+            ),
+        };
+        return Err(error.context(outcome));
+    }
     let Some(build) = statement
         .index_build
         .as_ref()
@@ -90,6 +112,93 @@ async fn recover(conn: &mut Conn, build: &IndexBuild, table_oid: i64) -> Result<
     Ok(format!(
         "Index recovery removed invalid index `{name}` left by the failed build."
     ))
+}
+
+/// Takes out a staged attach's temporary CHECK after its `VALIDATE` failed
+/// (#1638, DEC-1638.1). No checkpoint is taken after the `ADD`, because a
+/// `NOT VALID` check makes every read of its table refuse, so the database
+/// is back where the last checkpoint recorded it once the check is gone.
+/// Only a CHECK of that name still `NOT VALID` on that table is removed: one
+/// validated, of another kind, or on another table is not this run's.
+async fn remove_unvalidated(conn: &mut Conn, check: &ScanCheck) -> Result<String, DbError> {
+    let rows = conn
+        .query_with(
+            "SELECT k.contype::text AS kind, k.convalidated AS validated \
+             FROM pg_catalog.pg_constraint k \
+             JOIN pg_catalog.pg_class c ON c.oid = k.conrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 AND k.conname = $3",
+            &[
+                check.table.schema.as_str().into(),
+                check.table.name.as_str().into(),
+                check.name.as_str().into(),
+            ],
+        )
+        .await?;
+    let Some(row) = rows.first() else {
+        return Ok(format!(
+            "The temporary CHECK `{}` is not on `{}`; nothing was removed.",
+            check.name, check.table
+        ));
+    };
+    if row.try_get::<&str>("kind")? != Some("c") || row.try_get::<bool>("validated")? != Some(false)
+    {
+        return Ok(format!(
+            "`{}` on `{}` is not a `NOT VALID` CHECK, so it was left as it is.",
+            check.name, check.table
+        ));
+    }
+    let sql =
+        crate::emit::drop_scan_check(check).map_err(|error| DbError::Refused(error.to_string()))?;
+    conn.execute(&sql).await?;
+    Ok(format!(
+        "The temporary CHECK `{}` on `{}` was removed; the database is as the last \
+         checkpoint recorded it.",
+        check.name, check.table
+    ))
+}
+
+/// Takes out the temporary CHECKs a staged attach left, before a `baseline`
+/// reads the database (#1638, DEC-1638.1).
+///
+/// `tables` are the tables the newest ledger entry names, with their
+/// identities; a staged attach's CHECK is named after its table's identity
+/// ([`crate::emit::scan_check_name`]), so each is looked for by that exact
+/// name on that table, and nothing else is touched. Returns what was
+/// removed, for the record.
+pub async fn remove_scan_checks<'a>(
+    conn: &mut Conn,
+    tables: impl IntoIterator<Item = (&'a pbps_model::Uid, &'a pbps_model::TableName)>,
+) -> Result<Vec<ScanCheck>, DbError> {
+    let mut removed = Vec::new();
+    for (uid, table) in tables {
+        let check = ScanCheck {
+            table: table.clone(),
+            name: crate::emit::scan_check_name(uid),
+            step: ScanCheckStep::Add,
+        };
+        let rows = conn
+            .query_with(
+                "SELECT 1 FROM pg_catalog.pg_constraint k \
+                 JOIN pg_catalog.pg_class c ON c.oid = k.conrelid \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2 AND k.conname = $3 AND k.contype = 'c'",
+                &[
+                    check.table.schema.as_str().into(),
+                    check.table.name.as_str().into(),
+                    check.name.as_str().into(),
+                ],
+            )
+            .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        let sql = crate::emit::drop_scan_check(&check)
+            .map_err(|error| DbError::Refused(error.to_string()))?;
+        conn.execute(&sql).await?;
+        removed.push(check);
+    }
+    Ok(removed)
 }
 
 fn missing(column: &str) -> DbError {

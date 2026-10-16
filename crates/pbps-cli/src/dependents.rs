@@ -5841,6 +5841,7 @@ mod tests {
                 table: TableName::new("app", "t"),
                 parent: TableName::new("app", "p"),
                 bound,
+                key: Vec::new(),
                 shape: Box::new(partition),
             },
             alter(&s, "app.f(integer)"),
@@ -6401,6 +6402,7 @@ mod tests {
             table: p_1.clone(),
             parent: ev.clone(),
             bound,
+            key: Vec::new(),
             shape: Box::new(plain),
         };
         let mut cs = plan(vec![attach, alter(&s, "app.f(integer)")]);

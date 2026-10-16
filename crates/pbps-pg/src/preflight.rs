@@ -5331,6 +5331,7 @@ mod tests {
                     table: "app.t".parse().unwrap(),
                     parent: "app.ev".parse().unwrap(),
                     bound,
+                    key: Vec::new(),
                     shape: Box::default(),
                 })],
             })

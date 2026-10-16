@@ -370,7 +370,10 @@ indexes:
   same plan, and its column uids leave the ids file. The apply's pre-flight
   refuses rows of the table outside the range, and DEFAULT-partition rows
   inside it (DEC-1545.1); outside a list's values, or a hash's remainder,
-  likewise (DEC-1632.1). A standing parent's columns change as a table's
+  likewise (DEC-1632.1). In a staged plan a range or list attach first adds
+  and validates a CHECK that implies its bound, so the attach skips the scan
+  that holds the table locked; the CHECK is dropped after, and one a stopped
+  run leaves is taken out by `baseline` (DEC-1638.1). A standing parent's columns change as a table's
   do: added, dropped, retyped, renamed, a default or NOT NULL changed, the
   engine recursing each into every partition, whose own defaults and NOT
   NULLs follow (DEC-1687.1). A partition's column is its parent's in the

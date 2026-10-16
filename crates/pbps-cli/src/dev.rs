@@ -176,7 +176,7 @@ pub fn rehearse(
         dialect,
     )?
     .changes;
-    let build = crate::statements(&build, dialect)?;
+    let build = crate::statements(&build, dialect, pbps_model::PlanMode::Transactional)?;
 
     let container = match spec {
         Spec::Docker(image) => Some(Container::start(image)?),

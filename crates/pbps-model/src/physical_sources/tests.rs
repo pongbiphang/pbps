@@ -76,6 +76,7 @@ fn attach() -> Change {
         table: table("child"),
         parent: table("parent"),
         bound: PartitionBound::Default,
+        key: Vec::new(),
         shape: Box::new(plain()),
     }
 }

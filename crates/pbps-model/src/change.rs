@@ -263,6 +263,13 @@ pub enum Change {
         table: TableName,
         parent: TableName,
         bound: crate::schema::PartitionBound,
+        /// The parent's key columns, in order, as the plan was made against
+        /// them. A staged attach writes a CHECK on them that implies the
+        /// bound, so the attach skips its scan (#1638, DEC-1638.1). Empty in
+        /// a plan made before it, which then attaches by the single
+        /// statement.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        key: Vec<String>,
         /// The partition as declared: what the apply holds the read-back to
         /// once every statement has run, as it holds a created table to its
         /// `CREATE`.

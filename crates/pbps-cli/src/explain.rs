@@ -426,7 +426,7 @@ fn explain(
                 reason: u.reason,
             })
             .collect(),
-        statement_count: crate::statements(cs, dialect)?.len(),
+        statement_count: crate::statements(cs, dialect, plan.mode)?.len(),
         target: match target {
             Resolved::None => None,
             Resolved::Reachable(t) => Some(target_state(t)?),

@@ -186,6 +186,44 @@ pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
     }
 }
 
+/// Takes out the temporary CHECK a staged attach left on its table, before
+/// `baseline` takes the database as it stands (#1638, DEC-1638.1).
+///
+/// Only when the newest entry is a staged checkpoint or a failed attempt,
+/// the two a run that stopped leaves, and only under the exact name the
+/// table's identity in that entry gives: never by a prefix. The database
+/// cannot be read while a `NOT VALID` one stands, and a validated one is
+/// pbps's own and no declaration's. SQL Server's staged plans write none.
+/// Returns each removed, named, for the record.
+pub async fn remove_scan_checks(conn: &mut Conn) -> anyhow::Result<Vec<String>> {
+    let Some(entry) = latest(conn).await? else {
+        return Ok(Vec::new());
+    };
+    if !matches!(
+        entry.snapshot.kind,
+        pbps_model::StateKind::Staged | pbps_model::StateKind::Failed
+    ) {
+        return Ok(Vec::new());
+    }
+    let removed = match conn.driver() {
+        Driver::Mssql => Vec::new(),
+        Driver::Postgres => {
+            pbps_pg::staged::remove_scan_checks(conn, &entry.snapshot.ids.tables).await?
+        }
+    };
+    Ok(removed
+        .into_iter()
+        .map(|check| {
+            let said = format!(
+                "the staged attach's temporary CHECK `{}` on `{}`",
+                check.name, check.table
+            );
+            println!("Removed {said}.");
+            said
+        })
+        .collect())
+}
+
 pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError> {
     match conn.driver() {
         Driver::Mssql => pbps_mssql::state::latest(conn).await,

@@ -2547,6 +2547,44 @@ async fn refuse_taken_role_names(
     );
 }
 
+/// `schema` without the temporary CHECKs the plan's staged attach writes and
+/// drops itself (#1638, DEC-1638.1), for the comparison of one checkpoint
+/// with the last. Neither the declarations nor the plan's changes hold it,
+/// so to the comparison it is a check that moved for no reason the plan
+/// gives; the emitter names it, and the checkpoint still records it, as the
+/// database holds it.
+fn without_scan_checks<'a>(
+    schema: &'a Schema,
+    statements: &[pbps_dialect::Statement],
+) -> std::borrow::Cow<'a, Schema> {
+    let mut schema = std::borrow::Cow::Borrowed(schema);
+    for check in statements.iter().filter_map(|s| s.scan_check.as_ref()) {
+        if schema
+            .tables
+            .get(&check.table)
+            .is_some_and(|t| t.checks.contains_key(&check.name))
+            && let Some(table) = schema.to_mut().tables.get_mut(&check.table)
+        {
+            table.checks.remove(&check.name);
+        }
+    }
+    schema
+}
+
+/// Whether `stmt` is the `step` of a staged attach's temporary CHECK.
+fn is_scan_check(stmt: &pbps_dialect::Statement, step: pbps_dialect::ScanCheckStep) -> bool {
+    stmt.scan_check.as_ref().is_some_and(|c| c.step == step)
+}
+
+/// The mode `plan --db` makes a plan in.
+fn plan_mode(staged: bool) -> pbps_model::PlanMode {
+    if staged {
+        pbps_model::PlanMode::Staged
+    } else {
+        pbps_model::PlanMode::Transactional
+    }
+}
+
 /// The role names the statements after `completed` still have to find free
 /// (`CREATE ROLE`, the new name of a rename) and the ones they free first
 /// (`DROP ROLE`, the old name of a rename): `(wanted, vacated)`. Counted per
@@ -2555,16 +2593,14 @@ async fn refuse_taken_role_names(
 fn role_name_expectations(
     cs: &pbps_model::ChangeSet,
     dialect: &dyn pbps_dialect::Dialect,
+    mode: pbps_model::PlanMode,
     completed: usize,
 ) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let mut wanted = Vec::new();
     let mut vacated = Vec::new();
     let mut at = 0usize;
     for p in &cs.changes {
-        let n = dialect
-            .emit(&p.change, p.strategy)
-            .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?
-            .len();
+        let n = crate::emitted(dialect, p, mode)?.len();
         // A change is pending while any of its statements is: a half-done
         // role drop has removed members and still holds the name.
         if completed < at + n {
@@ -4984,6 +5020,7 @@ pub fn cmd_baseline(
         let mut conn = db::connect(target).await?;
         crate::engine::lock(&mut conn, &operator).await?;
         let result = async {
+            let removed = crate::engine::remove_scan_checks(&mut conn).await?;
             let scoped = managed_state(
                 &mut conn,
                 &ids,
@@ -5007,7 +5044,14 @@ pub fn cmd_baseline(
                 StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
             );
             snapshot.module_deps = loaded.hints.module_deps.clone();
-            snapshot.reason = Some(reason.to_string().into());
+            snapshot.reason = Some(
+                if removed.is_empty() {
+                    reason.to_string()
+                } else {
+                    format!("{reason} (first removed {})", removed.join(", "))
+                }
+                .into(),
+            );
 
             let tables = snapshot.schema.tables.len();
             let id = crate::engine::record(&mut conn, &snapshot).await?;
@@ -5258,7 +5302,7 @@ pub fn cmd_bootstrap(
     // Emitted now and rendered at the write: the pins carry the zone the
     // build ran in, which a target tells only once connected (DEC-1916.1).
     let script = sql_out
-        .map(|_| crate::statements(&cs, dialect.as_ref()))
+        .map(|_| crate::statements(&cs, dialect.as_ref(), pbps_model::PlanMode::Transactional))
         .transpose()?;
     let write_script = |zone: &SessionZone| -> anyhow::Result<()> {
         if let (Some(path), Some(statements)) = (sql_out, &script) {
@@ -5281,7 +5325,7 @@ pub fn cmd_bootstrap(
         return write_script(&SessionZone::offline_utc());
     };
 
-    let statements = crate::statements(&cs, dialect.as_ref())?;
+    let statements = crate::statements(&cs, dialect.as_ref(), pbps_model::PlanMode::Transactional)?;
     let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
@@ -5347,7 +5391,12 @@ pub fn cmd_bootstrap(
             // Only names the plan creates need to be free (DECISIONS 118).
             // PostgreSQL grants use existing cluster roles; their existence
             // is outside this database's ownership (DECISIONS 211).
-            let (wanted, vacated) = role_name_expectations(&cs, dialect.as_ref(), 0)?;
+            let (wanted, vacated) = role_name_expectations(
+                &cs,
+                dialect.as_ref(),
+                pbps_model::PlanMode::Transactional,
+                0,
+            )?;
             refuse_taken_role_names(&mut conn, &wanted, &vacated).await?;
             // A history name already taken: SQL Server takes an existing
             // table whose columns match as the history, with its rows,
@@ -6279,7 +6328,8 @@ pub fn cmd_plan_db(
         // users, roles and application roles share one namespace, and
         // `CREATE ROLE` on a name a user holds fails after everything
         // ordered before it has run (DECISIONS 118, 119).
-        let (wanted, vacated) = role_name_expectations(&cs, dialect.as_ref(), 0)?;
+        let (wanted, vacated) =
+            role_name_expectations(&cs, dialect.as_ref(), plan_mode(staged), 0)?;
         refuse_taken_role_names(&mut conn, &wanted, &vacated).await?;
 
         // A role this plan drops, its members already written into it by the
@@ -6530,7 +6580,7 @@ pub fn cmd_plan_db(
         }
     };
 
-    let statements = crate::statements(&cs, dialect.as_ref())?;
+    let statements = crate::statements(&cs, dialect.as_ref(), plan_mode(staged))?;
     if staged {
         // A staged plan is one logical change isolated in a deployment of its
         // own (ADR-0003). The limit is the whole point: what cannot be rolled
@@ -6940,7 +6990,7 @@ fn apply_identified(
         );
     }
 
-    let statements = crate::statements(&plan.changes, dialect)?;
+    let statements = crate::statements(&plan.changes, dialect, plan.mode)?;
     crate::engine::require_transactional_rebuilds(target.driver(), &plan.changes, staged)?;
     // Only for a transactional plan. A staged one exists *because* its
     // statement cannot run inside a transaction (ADR-0003): `plan --db
@@ -7621,12 +7671,13 @@ async fn apply_staged_under_lock(
         // deployment was paused (DECISIONS 102).
         check_role_drops(
             conn,
-            &role_drop_expectations(&plan.changes, dialect, progress.completed)?,
+            &role_drop_expectations(&plan.changes, dialect, plan.mode, progress.completed)?,
         )
         .await?;
         // And a principal created while it was paused, under a name a
         // remaining statement needs (119).
-        let (wanted, vacated) = role_name_expectations(&plan.changes, dialect, progress.completed)?;
+        let (wanted, vacated) =
+            role_name_expectations(&plan.changes, dialect, plan.mode, progress.completed)?;
         refuse_taken_role_names(conn, &wanted, &vacated).await?;
         println!(
             "Resuming at statement {} of {} (checkpoint entry #{}).",
@@ -7780,6 +7831,9 @@ async fn apply_staged_under_lock(
     // steps created; the union keeps those managed too.
     let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes);
     let written_routines = crate::engine::written_routines(&plan.changes);
+    // Whether this run has a checkpoint to resume from: a resumed run starts
+    // on one.
+    let mut checkpointed = entry.snapshot.staged.is_some();
     for (i, stmt) in statements.iter().enumerate().skip(start) {
         // Before each step, including the first after a resume, which skips
         // the check before the probes along with the probes.
@@ -7867,6 +7921,12 @@ async fn apply_staged_under_lock(
             let recovery = if !stmt.transactional && i == 0 && entry.snapshot.staged.is_none() {
                 "There is no staged checkpoint: the first non-transactional statement failed. \
                  Fix the cause, then start this plan again with `pbps apply --staged` without `--resume`."
+            } else if is_scan_check(stmt, pbps_dialect::ScanCheckStep::Validate) && !checkpointed {
+                // The `ADD` before it took no checkpoint, and the failed
+                // `VALIDATE` took its check out again (#1638).
+                "There is no staged checkpoint: the attach's temporary CHECK did not validate. \
+                 Fix the rows it names, then start this plan again with `pbps apply --staged` \
+                 without `--resume`."
             } else {
                 "The ledger records everything that did complete. Fix the cause, then continue \
                  with `pbps apply --staged --resume`."
@@ -7888,6 +7948,19 @@ async fn apply_staged_under_lock(
             live_ids.rename_role(from, to);
         }
         adopt_created(&mut live_ids, &plan.ids, &stmt.creates);
+
+        // No checkpoint after a staged attach's `ADD … NOT VALID`: measured,
+        // every read of a table holding a `NOT VALID` check refuses as a fact
+        // the model cannot hold, so this read would stop the run on a
+        // statement that worked. The `VALIDATE` after it checkpoints both,
+        // and takes the check out again if it fails (#1638, DEC-1638.1).
+        if is_scan_check(stmt, pbps_dialect::ScanCheckStep::Add) {
+            println!(
+                "  statement {} of {total} done (checkpointed with the next)",
+                i + 1
+            );
+            continue;
+        }
 
         // The unmanaged policy is deliberately not enforced between two
         // committed statements. It is a hygiene gate for the start of a
@@ -7949,6 +8022,7 @@ async fn apply_staged_under_lock(
         )
         .await;
         let id = crate::engine::record(conn, &checkpoint).await?;
+        checkpointed = true;
         println!("  statement {} of {total} done (checkpoint #{id})", i + 1);
         pins_after_step.map_err(|e| {
             e.context(format!(
@@ -7968,8 +8042,8 @@ async fn apply_staged_under_lock(
         staged_pinned_movement(
             dialect,
             statement_plan.staged(),
-            &previous,
-            &recorded,
+            &without_scan_checks(&previous, statements),
+            &without_scan_checks(&recorded, statements),
             &target.label,
             target.environment(),
             StagedRead::Checkpoint {
@@ -8278,15 +8352,13 @@ fn refuse_mid_deployment(entry: &pbps_db::LedgerEntry, label: &str) -> anyhow::R
 fn role_drop_expectations(
     cs: &pbps_model::ChangeSet,
     dialect: &dyn pbps_dialect::Dialect,
+    mode: pbps_model::PlanMode,
     completed: usize,
 ) -> anyhow::Result<Vec<(String, Vec<String>)>> {
     let mut out = Vec::new();
     let mut at = 0usize;
     for p in &cs.changes {
-        let n = dialect
-            .emit(&p.change, p.strategy)
-            .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?
-            .len();
+        let n = crate::emitted(dialect, p, mode)?.len();
         if let pbps_model::Change::DropRole { name, members, .. } = &p.change {
             let done = completed.saturating_sub(at).min(n);
             if done <= members.len() {
@@ -8463,12 +8535,16 @@ async fn preflight(
     // environment's own and outside the managed state on purpose. Read
     // again here, before statement one (DECISIONS 92), and again on a
     // resume, for the members whose statements have not run yet (102).
-    check_role_drops(conn, &role_drop_expectations(&plan.changes, dialect, 0)?).await?;
+    check_role_drops(
+        conn,
+        &role_drop_expectations(&plan.changes, dialect, plan.mode, 0)?,
+    )
+    .await?;
     // The same for a name this plan needs free: a user created since the
     // plan is outside the managed state, so the checksum above cannot see
     // it either, and `CREATE ROLE` would meet it after everything ordered
     // before had run (119).
-    let (wanted, vacated) = role_name_expectations(&plan.changes, dialect, 0)?;
+    let (wanted, vacated) = role_name_expectations(&plan.changes, dialect, plan.mode, 0)?;
     refuse_taken_role_names(conn, &wanted, &vacated).await?;
 
     // A SCHEMABINDING referrer this plan is about to drop is not a blocker: the
@@ -10317,6 +10393,7 @@ mod tests {
                 table: TableName::new("app", "t"),
                 parent: TableName::new("app", "ev"),
                 bound: PartitionBound::Default,
+                key: Vec::new(),
                 shape: Box::new(shape.clone()),
             })],
         };
@@ -10437,6 +10514,7 @@ mod tests {
                 table: TableName::new("app", "t"),
                 parent: parent.clone(),
                 bound: PartitionBound::Default,
+                key: Vec::new(),
                 shape: Box::new(Table {
                     unlogged,
                     ..Table::default()
@@ -18285,8 +18363,15 @@ mod tests {
                 }),
             ],
         };
-        let expect =
-            |completed: usize| role_drop_expectations(&cs, &pbps_mssql::Mssql, completed).unwrap();
+        let expect = |completed: usize| {
+            role_drop_expectations(
+                &cs,
+                &pbps_mssql::Mssql,
+                pbps_model::PlanMode::Staged,
+                completed,
+            )
+            .unwrap()
+        };
         let both = vec![("reporting".to_owned(), vec!["a".to_owned(), "b".to_owned()])];
         assert_eq!(expect(0), both, "before statement one");
         assert_eq!(
@@ -18338,8 +18423,15 @@ mod tests {
                 }),
             ],
         };
-        let expect =
-            |completed: usize| role_name_expectations(&cs, &pbps_mssql::Mssql, completed).unwrap();
+        let expect = |completed: usize| {
+            role_name_expectations(
+                &cs,
+                &pbps_mssql::Mssql,
+                pbps_model::PlanMode::Staged,
+                completed,
+            )
+            .unwrap()
+        };
         let s = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(
             expect(0),
