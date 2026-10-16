@@ -2504,4 +2504,109 @@ fn a_replica_identity_switched_to_an_index_over_a_new_not_null_column_verifies_c
     );
     // Negative: the switch before the index it selects.
     assert!(!run(&ops, &fx, &baseline, &[0, 2, 1], &none, Checks::ALL).is_empty());
+/// `t(a)` with a default, and a plan that takes the default off and then
+/// either renames the column or retypes it. Ops 0 (the removal) and 1.
+fn default_taken_off(then_rename: bool) -> Plan {
+    use pbps_model::ValueSource;
+    let with_default = |name: &str, default: Option<&str>, ty: &str| {
+        let mut table = table_with(&["id"]);
+        let mut column = Column::new(ty.parse().unwrap());
+        if let Some(text) = default {
+            column.value_source = ValueSource::Default(text.into());
+        }
+        table.columns.insert(name.into(), column);
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before
+        .tables
+        .insert(t("t"), with_default("a", Some("1"), "int"));
+    let moved = uid(UidKind::Column, "t.a");
+    let named = |column: &str| {
+        let mut ids = Plan::ids(&["t"], &[("t", "id")]);
+        ids.columns.insert(moved.clone(), t("t").column(column));
+        ids
+    };
+    let removal = p(Change::AlterColumnDefault {
+        uid: moved.clone(),
+        column: t("t").column("a"),
+        from: Some("1".into()),
+        to: None,
+    });
+    let (second, later, ids) = if then_rename {
+        after.tables.insert(t("t"), with_default("b", None, "int"));
+        (
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("t"),
+                from: "a".into(),
+                to: "b".into(),
+                table_was: None,
+            }),
+            "b",
+            named("b"),
+        )
+    } else {
+        after
+            .tables
+            .insert(t("t"), with_default("a", None, "bigint"));
+        (
+            p(Change::AlterColumnType {
+                uid: moved.clone(),
+                column: t("t").column("a"),
+                from: "int".parse().unwrap(),
+                to: "bigint".parse().unwrap(),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+            }),
+            "a",
+            named("a"),
+        )
+    };
+    let _ = later;
+    Plan {
+        logical: vec![removal, second],
+        before,
+        after,
+        before_ids: named("a"),
+        after_ids: ids,
+    }
+}
+
+/// A removal that spells the column by its old name goes before the rename
+/// that moves the name; a retype of the same column is no such move, and the
+/// default goes before it by `Absent` alone (DEC-1168.1, DEC-1968.2).
+#[test]
+fn a_base_spelled_reader_precedes_the_rename_of_what_it_names_and_not_a_retype() {
+    let none = ModuleDeps::new();
+    let rewrite_edges = |plan: &Plan| -> Vec<(usize, usize)> {
+        let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+        graph(ops.as_slice(), &fx, &baseline, &none, Checks::ALL)
+            .edges
+            .iter()
+            .filter(|e| matches!(e.because, Because::Rewrites(_)))
+            .map(|e| (e.before, e.after))
+            .collect()
+    };
+    let renamed = default_taken_off(true);
+    assert_eq!(rewrite_edges(&renamed), [(0, 1)]);
+    // The order that runs the rename first is refused by that edge.
+    let (ops, fx, baseline) = renamed.analysed(ModuleEdits::InPlace);
+    let violations = run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL);
+    assert!(
+        violations.iter().any(|v| matches!(
+            v,
+            Violation::Edge { edge, .. } if matches!(edge.because, Because::Rewrites(_))
+        )),
+        "{violations:?}"
+    );
+    // Negative: a retype of the same column draws no rewrite edge, either
+    // way, so the removal is ordered by the default alone.
+    let retyped = default_taken_off(false);
+    assert_eq!(rewrite_edges(&retyped), []);
+    let (ops, fx, baseline) = retyped.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
 }

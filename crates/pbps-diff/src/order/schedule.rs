@@ -12,9 +12,9 @@
 //! [`Source`]. An effect edge's reason is [`reason`]'s exhaustive match over
 //! the effect behind it, not its source (DEC-1956.1).
 //!
-//! In this slice the resolver, `order_after_releases` and the SQL Server
-//! computed-column release order through it in every build, each over its own
-//! edges. In tests and debug builds the verifier settles every observed order
+//! The resolver, `order_after_releases` and the SQL Server computed-column
+//! release order through it in every build, the resolver over the effects and
+//! the others over their own edges. In tests and debug builds the verifier settles every observed order
 //! over the full effect graph and requires the order it was given back: that
 //! is how "every edge is respected" is checked (DEC-1956.3).
 
@@ -541,6 +541,7 @@ fn components(n: usize, constraints: &[&Constraint]) -> Vec<Vec<usize>> {
 pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
     match edge.source {
         Source::Binding => OrderReason::Binding,
+        Source::Execution => OrderReason::Authorization,
         Source::Declared => OrderReason::Structural,
         // A proposed edge orders a slot's handover (#1957).
         Source::Search => OrderReason::Identity,

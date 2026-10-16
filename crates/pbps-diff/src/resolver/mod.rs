@@ -3,9 +3,6 @@
 
 mod assess;
 mod graph;
-// The ordering benchmark (#1965) times the constraints beside the effects.
-#[cfg(test)]
-pub(crate) use graph::constraints_of_logical;
 mod prepare;
 
 #[cfg(test)]
@@ -22,9 +19,10 @@ fn part_effects(change: &pbps_model::Change) -> Vec<pbps_model::part_effects::Pa
 
 pub use assess::{Answer, Assessment, assess};
 
+use crate::order::{Baseline, Checks, Schedule, Source, analyse, graph};
 use pbps_dialect::Dialect;
-use pbps_model::operation::{ModuleEdits, Operations, PlanOwners};
-use pbps_model::resolver::{OrderEdge, OrderReason, OrderingProof, Surface, SurfaceResolution};
+use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+use pbps_model::resolver::{OrderReason, OrderingProof, Surface, SurfaceResolution};
 use pbps_model::{ChangeSet, IdsFile};
 use std::collections::BTreeSet;
 
@@ -159,27 +157,18 @@ pub fn plan_operations(
     let names = pbps_model::plan_names::PlanNames::of(&logical.changes, desired.ids)
         .map_err(|e| Error::Names(e.to_string()))?;
     let owners = PlanOwners::new(names, base.ids, desired.ids);
-    let edges = graph::constraints(
+    let schedule = scheduled(
         &prepared.changes,
-        prepared.ordinary,
         &prepared.origins,
+        &operations,
         &owners,
         resolution,
         &hints.module_deps,
         base,
         desired,
-    );
-    #[cfg(any(test, debug_assertions))]
-    crate::order::shadow::observe_constraints(
-        base,
-        desired,
         dialect,
-        hints,
-        &logical,
-        &operations,
-        &edges,
     );
-    let (ordered, sequence) = ordered(prepared.changes, edges)?;
+    let (ordered, sequence) = settle(prepared.changes, &schedule)?;
     let operations = operations.reordered(&sequence);
     #[cfg(any(test, debug_assertions))]
     crate::order::shadow::observe(
@@ -197,6 +186,95 @@ pub fn plan_operations(
         operations,
         logical,
     })
+}
+
+/// Every constraint the prepared steps are held to, in one schedule: the
+/// effects an ordinary plan's order is checked against, read in every build
+/// because the resolver's order is made from them; the name slots' handovers;
+/// the `depends_on:` annotations; and the two kinds only the resolver's
+/// evidence states (DEC-1968.1, DEC-1968.2).
+#[allow(clippy::too_many_arguments)]
+fn scheduled(
+    changes: &ChangeSet,
+    origins: &[pbps_model::operation::Origin],
+    operations: &Operations,
+    owners: &PlanOwners<'_>,
+    resolution: &[SurfaceResolution],
+    declared: &pbps_model::ModuleDeps,
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    dialect: &dyn Dialect,
+) -> Schedule {
+    let (before, after) = (
+        Snapshot {
+            schema: base.schema,
+            ids: base.ids,
+        },
+        Snapshot {
+            schema: desired.schema,
+            ids: desired.ids,
+        },
+    );
+    let baseline = Baseline::of(before, owners);
+    let shadowed = analyse(operations, owners, before, after, dialect);
+    let effect_graph = graph(
+        operations.as_slice(),
+        &shadowed.effects,
+        &baseline,
+        declared,
+        Checks::ALL,
+    );
+    let mut schedule = Schedule::of_graph(&effect_graph, operations.as_slice());
+    let slots = crate::order::slots::analyse(operations.as_slice(), owners, before, dialect);
+    // The resolver reads no catalog: the names are the plan's own.
+    crate::order::slots::schedule(
+        &mut schedule,
+        &crate::order::slots::edges(&slots, None, &[]),
+    );
+    for c in graph::constraints(changes, origins, owners, resolution, base, desired) {
+        schedule.edge(c.before, c.after, c.source, c.reason);
+    }
+    schedule
+}
+
+/// [`plan_operations`]' ordering over a plan that is its own logical plan,
+/// each step whole: the shape a test builds by hand.
+#[cfg(test)]
+fn order_logical(
+    changes: ChangeSet,
+    resolution: &[SurfaceResolution],
+    declared: &pbps_model::ModuleDeps,
+    base: crate::Side<'_>,
+    desired: crate::Side<'_>,
+    dialect: &dyn Dialect,
+) -> Result<Ordered, Error> {
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, desired.ids)
+        .map_err(|e| Error::Names(e.to_string()))?;
+    let owners = PlanOwners::new(names, base.ids, desired.ids);
+    let origins: Vec<_> = (0..changes.changes.len())
+        .map(pbps_model::operation::Origin::Whole)
+        .collect();
+    let operations = Operations::expanded(
+        changes.changes.len(),
+        origins.iter().cloned().zip(changes.changes.iter().cloned()),
+        if dialect.rebuilds_modules() {
+            ModuleEdits::Rebuilt
+        } else {
+            ModuleEdits::InPlace
+        },
+    );
+    let schedule = scheduled(
+        &changes,
+        &origins,
+        &operations,
+        &owners,
+        resolution,
+        declared,
+        base,
+        desired,
+        dialect,
+    );
+    settle(changes, &schedule).map(|(ordered, _)| ordered)
 }
 
 /// The ordinary plan and the resolver's input built from it: its splits,
@@ -250,33 +328,34 @@ fn prepare(
     Ok((ordinary, prepared))
 }
 
+/// [`settle`] over edges stated by hand: the shape the tests of the
+/// schedule's refusals build.
 #[cfg(test)]
-fn order(changes: ChangeSet, edges: BTreeSet<OrderEdge>) -> Result<Ordered, Error> {
-    ordered(changes, edges).map(|(ordered, _)| ordered)
-}
-
-/// The ordered plan and the positions it took its steps from: `settle` over
-/// the resolver's own edges, which it keeps until #1968 (S7a). The order the
-/// steps arrive in is the tie-break, as before: it preserves the differ's
-/// identity and data order wherever no dependency requires movement
-/// (DEC-1956.2).
-fn ordered(changes: ChangeSet, edges: BTreeSet<OrderEdge>) -> Result<(Ordered, Vec<usize>), Error> {
-    use crate::order::{Refusal, Schedule, Source};
+fn order(
+    changes: ChangeSet,
+    edges: BTreeSet<pbps_model::resolver::OrderEdge>,
+) -> Result<Ordered, Error> {
     let mut schedule = Schedule::new(changes.changes.len());
     for edge in edges {
-        // `graph::constraints` states evidence and the differ's own
-        // relations in one set; only its binding edges are evidence. None is
-        // an annotation, so a cycle among them is refused as before.
         let source = match edge.reason {
             OrderReason::Binding => Source::Binding,
+            OrderReason::Authorization => Source::Execution,
             OrderReason::Structural
             | OrderReason::Identity
             | OrderReason::Data
-            | OrderReason::Authorization
             | OrderReason::Restoration => Source::Effect,
         };
         schedule.edge(edge.before, edge.after, source, edge.reason);
     }
+    settle(changes, &schedule).map(|(ordered, _)| ordered)
+}
+
+/// The ordered plan and the positions it took its steps from. The order the
+/// steps arrive in is the tie-break: it preserves the differ's identity and
+/// data order wherever no dependency requires movement (DEC-1956.2). A cycle
+/// is refused by name (DEC-1956.3).
+fn settle(changes: ChangeSet, schedule: &Schedule) -> Result<(Ordered, Vec<usize>), Error> {
+    use crate::order::Refusal;
     let described = changes.clone();
     let settled = schedule.settle(changes).map_err(|refusal| match refusal {
         Refusal::Outside { .. } | Refusal::Mismatch { .. } => Error::Edge,

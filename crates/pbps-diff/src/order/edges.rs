@@ -23,6 +23,11 @@ pub enum Source {
     Catalog,
     /// What the resolver's evidence binds an object to (S7a).
     Binding,
+    /// What the executing principal must hold when a step runs: a grant the
+    /// resolver's binding DDL and rows need first. Not an effect, so the
+    /// verifier cannot re-derive it, and an engine's resolver supplies it
+    /// with its bindings (DEC-1968.1).
+    Execution,
     /// An edge a bounded search proposed (S4).
     Search,
 }

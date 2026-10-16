@@ -433,6 +433,11 @@ impl Cx<'_> {
                 if self.default_goes(&owner, &key) {
                     self.requires(Requirement::Absent(ObjectKey::Default(key)));
                 }
+                // A foreign key the plan drops, over the column or into it,
+                // goes first: the engine refuses a retype that leaves the
+                // key's two sides incompatible. One that stands throughout is
+                // no order (it is rebuilt or kept by the engine).
+                self.requires_foreign_keys_over_column_gone(&owner, &column.name);
             }
             Change::AlterColumnNullability {
                 uid,
@@ -623,6 +628,7 @@ impl Cx<'_> {
                 parent,
                 column,
                 to,
+                fallback,
                 ..
             } => {
                 self.exists(ObjectKey::Table(Recorded(uid.clone())));
@@ -643,6 +649,22 @@ impl Cx<'_> {
                 // (DEC-1954.9).
                 if to.is_some() {
                     self.after_parent(parent, column, ParentAttribute::Default);
+                }
+                // A partition declares no column: its entry is spelled by its
+                // parent's column, so the parent's rename moves the name this
+                // step uses. A release (nothing own, nothing to fall back
+                // to) takes the old default off under the name it was set
+                // under, and runs before the rename (DEC-1699.1); anything
+                // that sets one is spelled by the name the column ends with.
+                // The release reads the base incarnation, not `Exists`, so
+                // that the parent's retype does not order it (DEC-1168.1).
+                if let Ok(uid) = self.owners.column(&parent.column(column), self.spelling) {
+                    let key = ObjectKey::Column(ColumnKey::Recorded(Recorded(uid)));
+                    if to.is_none() && fallback.is_none() {
+                        self.requires(Requirement::Is(key, Incarnation::Base));
+                    } else {
+                        self.exists(key);
+                    }
                 }
             }
             Change::SetPartitionNotNull {
@@ -774,6 +796,24 @@ impl Cx<'_> {
                 }
                 for c in &index.include {
                     self.requires_column(table, c, false);
+                }
+                // A partitioned parent's index, built after a partition's
+                // own of its shape, would take that one as its clone: the
+                // parent's goes first (DEC-1688.1). Which of the partition's
+                // indexes it could take is a question of shape, so every
+                // index the parent ends with is waited for; one that stands
+                // throughout, or a parent that is not rebuilt, draws no edge.
+                if let Some((_, own)) = self.final_of(&owner)
+                    && let Some(of) = &own.partition_of
+                    && let Ok(parent) = self.table(&of.parent)
+                    && let Some((_, parent_table)) = self.final_of(&parent)
+                {
+                    for name in parent_table.indexes.keys() {
+                        self.requires(Requirement::Is(
+                            Self::part(&parent, PartKey::Index(name.clone())),
+                            Incarnation::Final,
+                        ));
+                    }
                 }
             }
             Change::InsertRow {
@@ -1251,6 +1291,37 @@ impl Cx<'_> {
                 .any(|c| matches!(&c.key, IndexKey::Column(k) if k == column));
             if keyed || index.include.iter().any(|c| c == column) {
                 gone.push(Self::part(owner, PartKey::Index(n.clone())));
+            }
+        }
+        for (other_name, other) in &self.before.schema.tables {
+            let Some(other_owner) = self.base_table(other_name) else {
+                continue;
+            };
+            for (fk_name, fk) in &other.foreign_keys {
+                if fk.references_table == name && fk.references_columns.iter().any(|c| c == column)
+                {
+                    gone.push(Self::part(
+                        &other_owner,
+                        PartKey::ForeignKey(fk_name.clone()),
+                    ));
+                }
+            }
+        }
+        for key in gone {
+            self.requires(Requirement::Absent(key));
+        }
+    }
+
+    /// The foreign keys over a column, and those into it, must be gone.
+    fn requires_foreign_keys_over_column_gone(&mut self, owner: &Recorded, column: &str) {
+        let Some((name, table)) = self.base_of(owner) else {
+            return;
+        };
+        let name = name.clone();
+        let mut gone = Vec::new();
+        for (n, fk) in &table.foreign_keys {
+            if fk.columns.iter().any(|c| c == column) {
+                gone.push(Self::part(owner, PartKey::ForeignKey(n.clone())));
             }
         }
         for (other_name, other) in &self.before.schema.tables {
