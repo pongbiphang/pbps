@@ -6186,7 +6186,8 @@ Leon chose the staged-only form on #1638 (2026-10-16). Measured on 16 and 18:
   text key column is not proved by the same call in a CHECK, with or without
   `COLLATE`, though an integer key is. A CHECK not proved costs a second scan.
 
-So the change carries its parent's key (`AttachPartition::key`), and
+So the change carries its parent's key (`AttachPartition::key`, which moves
+the plan format to 42), and
 `Dialect::emit_staged` writes four statements where `emit` writes one:
 1. add the CHECK `NOT VALID`;
 2. validate it;
