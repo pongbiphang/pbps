@@ -3156,8 +3156,17 @@ inventory as `db_owner` (#619).**
 - **Every scratch statement runs in a database sandbox.** The supplied
   account, `db_owner` of the scratch database, creates a user without a
   login there, `db_owner` of that database only. It impersonates the user
-  `EXECUTE AS USER … WITH NO REVERT` before the first declared, externals
-  or baseline statement.
+  `EXECUTE AS USER … WITH NO REVERT` before the first baseline or externals
+  statement.
+  - The sandbox sets scratch up: the baseline, the externals file, and the
+    deployer's reproduction (#611), a second loginless user carrying only
+    the target deployer's default schema, role memberships and database
+    permissions.
+  - The declared objects then compile as that user, entered from the
+    sandbox `WITH NO REVERT`. Compiling as `db_owner` would admit a creation
+    the deployer cannot make: without `CREATE VIEW` the reproduced deployer
+    is refused (262), and it can return neither to the sandbox (15517) nor
+    anywhere (15196).
   - Measured from an `sa` session, the sandbox holds no server permission.
   - It cannot create a login or a database, impersonate a login, revert,
     or trust its database or chain it.
@@ -3219,6 +3228,7 @@ inventory as `db_owner` (#619).**
 `a_login_reads_its_own_server_reach_without_privilege`,
 `a_login_reads_every_database_it_can_enter`,
 `a_scratch_sandbox_holds_no_server_reach_and_enters_only_where_guest_admits_it`,
+`the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_rights`,
 `a_database_list_without_view_any_database_hides_the_target_and_says_so`,
 `a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`,
 `a_login_reaches_the_server_through_a_role_it_owns_or_a_trustworthy_database`,

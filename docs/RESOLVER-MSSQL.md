@@ -143,9 +143,17 @@ for a moment keeps that type.
 
 ## 5. Reconstruction
 
-- **The deployer.** Scratch reproduces it with #611's context, through
-  `EXECUTE AS USER`: its default schema, which statement-level names need
-  (§2), and its role memberships.
+- **The deployer.** Scratch reproduces it with #611's context, as a second
+  user without a login that the sandbox (§6) creates. The user carries:
+  - its default schema, which statement-level names need (§2);
+  - its role memberships;
+  - the database permissions the target grants it, and no more.
+
+  The declared objects compile as this user, entered from the sandbox
+  `WITH NO REVERT`. A statement the deployer may not run then refuses on
+  scratch as on the target: `CREATE VIEW` without the permission (262), or
+  a table in a schema it cannot alter (2760). It can return neither to the
+  sandbox (15517) nor anywhere else (15196) [`the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_rights`].
 - **Fingerprints.** A module's fingerprint carries `uses_ansi_nulls`,
   `uses_quoted_identifier` and `is_schema_bound`. The database collation and
   compatibility level are compared as reported facts (`mssql-reported-scope-v1`).
@@ -183,9 +191,14 @@ for a moment keeps that type.
     and scratch may never be the target database itself.
 - **A sandbox, not a confined login**
   ([DEC-619.3](decisions/resolver.md#dec-619-3)). Every statement pbps runs
-  on scratch for the plan runs as a user without a login, `db_owner` of the
-  scratch database only. These are the declared objects, the externals file
-  and the baseline:
+  on scratch for the plan runs as a user without a login:
+  - the baseline, the externals file and the deployer's reproduction run as
+    the sandbox user, `db_owner` of the scratch database only;
+  - the declared objects run as the reproduced deployer (§5), a second
+    loginless user entered from the sandbox `WITH NO REVERT`.
+
+  Both are loginless, so what is measured below holds for both, and the
+  deployer has less:
   - **How it is entered.** The supplied account creates the user after the
     empty check, and impersonates it with `EXECUTE AS USER … WITH NO
     REVERT` before the first such statement. The session cannot leave it.

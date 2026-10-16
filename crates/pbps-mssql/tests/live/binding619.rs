@@ -1839,6 +1839,72 @@ async fn a_persisted_column_needs_its_functions_owner_to_be_the_tables() {
     db.drop().await;
 }
 
+/// The sandbox sets scratch up; the declared objects compile as the reproduced
+/// deployer, a second loginless user the sandbox creates with only what the
+/// target grants the deployer, entered from the sandbox `WITH NO REVERT`. It
+/// has its default schema and none of the sandbox's rights: a statement the
+/// deployer may not run refuses on scratch as on the target, and it can
+/// return neither to the sandbox nor to the session's own login.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn the_reproduced_deployer_compiles_inside_the_sandbox_with_only_its_own_rights() {
+    let mut db = TestDb::create("deployer619").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE USER pbps_sandbox WITHOUT LOGIN;",
+            "ALTER ROLE db_owner ADD MEMBER pbps_sandbox;",
+        ],
+    )
+    .await;
+    let mut conn = session(&db).await;
+    run(
+        &mut conn,
+        &[
+            "EXECUTE AS USER = N'pbps_sandbox' WITH NO REVERT;",
+            "CREATE SCHEMA app;",
+            "CREATE USER deployer WITHOUT LOGIN WITH DEFAULT_SCHEMA = app;",
+            "GRANT CREATE TABLE TO deployer;",
+            "GRANT ALTER ON SCHEMA::app TO deployer;",
+            "EXECUTE AS USER = N'deployer' WITH NO REVERT;",
+        ],
+    )
+    .await;
+    assert_eq!(
+        texts(
+            &mut conn,
+            "SELECT CONVERT(nvarchar(200), CONCAT(USER_NAME(), N':', SCHEMA_NAME(), N':', \
+             HAS_PERMS_BY_NAME(NULL, NULL, 'CONTROL SERVER'), N':', IS_MEMBER('db_owner')));"
+        )
+        .await,
+        ["deployer:app:0:0"]
+    );
+    assert_eq!(refusal(&mut conn, "CREATE TABLE t (c int);").await, None);
+    assert_eq!(
+        text(
+            &mut conn,
+            "SELECT CONVERT(nvarchar(128), SCHEMA_NAME(schema_id)) FROM sys.tables WHERE name = N't';"
+        )
+        .await,
+        "app",
+        "a one-part name lands in the deployer's default schema"
+    );
+    for (sql, code) in [
+        ("CREATE VIEW app.v AS SELECT c FROM app.t;", "262"),
+        ("CREATE TABLE dbo.x (c int);", "2760"),
+        ("REVERT;", "15196"),
+        ("EXECUTE AS USER = N'pbps_sandbox';", "15517"),
+    ] {
+        assert_eq!(
+            refusal(&mut conn, sql).await.as_deref(),
+            Some(code),
+            "{sql}"
+        );
+    }
+    drop(conn);
+    db.drop().await;
+}
+
 /// SQL Server has no `DROP OWNED`, so cleanup drops what the inventory read
 /// finds beyond the fresh-install inventory, in dependency order. A database
 /// role is one of those objects: `DROP ROLE` refuses while the role has a
