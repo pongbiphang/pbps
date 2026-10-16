@@ -554,51 +554,52 @@ pub(crate) fn drop_precedence(
     out
 }
 
-/// Moves each drop to right after the last change it waits for
+/// Settles each drop right after the last change it waits for
 /// ([`waits_for`]): a function's drop after the last removal of a computed
 /// column calling it, what it is schema-bound to after it, and a computed
 /// column's drop, and what that column reads, after a module bound to it.
+///
+/// The edges are the catalog's and do not depend on the order, so they are
+/// read once over the plan as it stands and settled (DEC-1956.3), where a
+/// fixpoint once moved one drop at a time and read them again after each
+/// move, bounded by the square of the plan's length.
 fn release(
     cs: &mut ChangeSet,
     ids: &IdsFile,
     edges: &[ExpressionEdge],
     alike: &Alike,
 ) -> Result<usize, String> {
-    let mut moved = 0;
-    // Bounded: each move puts one drop after another, and a plan whose drops
-    // would have to keep chasing each other has no order to settle on.
-    let limit = cs.changes.len() * cs.changes.len() + 1;
-    let mut steps = 0;
-    loop {
-        let names = PlanNames::of(&cs.changes, ids).map_err(|e| e.to_string())?;
-        let mut changed = false;
-        for at in 0..cs.changes.len() {
-            let Some(last) = waits_for(&cs.changes, at, edges, &names, alike)
-                .into_iter()
-                .max()
-            else {
-                continue;
-            };
-            if last <= at {
-                continue;
-            }
-            steps += 1;
-            if steps > limit {
-                return Err(format!(
-                    "the drops of {} and what it depends on cannot be ordered: each waits for \
-                     another. Drop them in plans of their own.",
-                    cs.changes[at].change.subject()
-                ));
-            }
-            let change: PlannedChange = cs.changes.remove(at);
-            cs.changes.insert(last, change);
-            moved += 1;
-            changed = true;
-            break;
+    use pbps_diff::order::{Refusal, Schedule, Source};
+    let names = PlanNames::of(&cs.changes, ids).map_err(|e| e.to_string())?;
+    let mut schedule = Schedule::new(cs.changes.len());
+    for at in 0..cs.changes.len() {
+        for p in waits_for(&cs.changes, at, edges, &names, alike) {
+            schedule.edge(
+                p,
+                at,
+                Source::Catalog,
+                pbps_model::resolver::OrderReason::Structural,
+            );
         }
-        if !changed {
-            return Ok(moved);
+    }
+    match schedule.settle(cs.clone()) {
+        Ok(settled) => {
+            *cs = settled.changes;
+            Ok(pbps_diff::order::schedule::moved(&settled.sequence))
         }
+        Err(Refusal::Cycle { members, .. }) => Err(format!(
+            "the drops of {} and what it depends on cannot be ordered: each waits for \
+             another. Drop them in plans of their own.",
+            members
+                .first()
+                .map_or_else(String::new, |&m| cs.changes[m].change.subject())
+        )),
+        Err(
+            refusal @ (Refusal::Outside { .. }
+            | Refusal::Mismatch { .. }
+            | Refusal::Unmet(_)
+            | Refusal::Kept(_)),
+        ) => Err(refusal.to_string()),
     }
 }
 
@@ -946,6 +947,11 @@ mod tests {
         };
         let mut cs = ChangeSet { changes: plan() };
         order_by_edges(&mut cs, &edges, &Alike::default()).unwrap();
+        // Settled again under the same edges, the plan does not change
+        // (#1956).
+        let settled = cs.clone();
+        assert_eq!(order_by_edges(&mut cs, &edges, &Alike::default()), Ok(0));
+        assert_eq!(cs, settled);
         let at = |c: &Change| cs.changes.iter().position(|p| p.change == *c).unwrap();
         let (a, f) = (
             at(&drop_table("dbo.a").change),

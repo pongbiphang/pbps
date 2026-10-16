@@ -1868,3 +1868,169 @@ fn a_partition_created_beside_a_parent_column_add_runs_in_either_order() {
     let early = run(&ops, &fx, &baseline, &[1, 0, 2], &none, Checks::ALL);
     assert!(!early.is_empty(), "{early:?}");
 }
+
+/// The effect graph over `order`, settled with either tie-break: the
+/// positions in `order` that the settled plan takes, in turn.
+fn settled(
+    ops: &Operations,
+    fx: &[Effects],
+    baseline: &Baseline,
+    order: &[usize],
+    hoist: bool,
+) -> Vec<usize> {
+    let reordered = ops.reordered(order);
+    let effects: Vec<Effects> = order.iter().map(|&i| fx[i].clone()).collect();
+    let g = graph(
+        reordered.as_slice(),
+        &effects,
+        baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    let mut schedule = super::schedule::Schedule::of_graph(&g, reordered.as_slice());
+    if hoist {
+        schedule = schedule.hoisting();
+    }
+    let changes = pbps_model::ChangeSet {
+        changes: reordered.iter().map(|o| o.planned().clone()).collect(),
+    };
+    let settled = schedule.settle(changes).unwrap();
+    settled.sequence.iter().map(|&i| order[i]).collect()
+}
+
+/// #1956: two writes of one resource keep their base order whichever
+/// tie-break settles them, from either order they arrive in.
+#[test]
+fn two_writes_to_one_resource_settle_in_their_base_order_under_either_tie_break() {
+    let plan = two_rows_of_one_table();
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    for hoist in [false, true] {
+        for order in [[0, 1], [1, 0]] {
+            assert_eq!(
+                settled(&ops, &fx, &baseline, &order, hoist),
+                [0, 1],
+                "{order:?} hoist={hoist}"
+            );
+        }
+    }
+}
+
+/// #1956: whatever order a plan arrives in, settling its effect graph gives
+/// an order the replay accepts, and settling that again changes nothing.
+#[test]
+fn every_settled_order_passes_the_replay_and_settles_to_itself() {
+    let none = ModuleDeps::new();
+    for plan in [
+        create_then_add_column(),
+        two_dropped_tables(),
+        two_rows_of_one_table(),
+    ] {
+        let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+        let n = ops.as_slice().len();
+        let orders: Vec<Vec<usize>> = if n == 2 {
+            vec![vec![0, 1], vec![1, 0]]
+        } else {
+            vec![(0..n).collect()]
+        };
+        for order in orders {
+            for hoist in [false, true] {
+                let out = settled(&ops, &fx, &baseline, &order, hoist);
+                assert_eq!(
+                    run(&ops, &fx, &baseline, &out, &none, Checks::ALL),
+                    [],
+                    "{order:?} -> {out:?}"
+                );
+                assert_eq!(settled(&ops, &fx, &baseline, &out, hoist), out);
+            }
+        }
+        // Negative: the order the plan arrives in is refused where it is
+        // not the settled one.
+        if n == 2 {
+            assert_ne!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+        }
+    }
+}
+
+/// DEC-1956.1: the reason of an effect edge is the effect's, not the
+/// source's; a write-write pair is identity on an object and data on values
+/// or rows; a search's proposal is a handover.
+#[test]
+fn each_edge_maps_to_one_sealed_reason_by_the_effect_behind_it() {
+    use super::edges::{Edge, Source};
+    use super::schedule::reason;
+    use pbps_model::resolver::OrderReason;
+    let plan = two_rows_of_one_table();
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    let ww = g
+        .edges
+        .iter()
+        .find(|e| matches!(e.because, Because::WriteWrite(_)))
+        .expect("two rows of one table are two writes of it");
+    assert_eq!(reason(ww, ops.as_slice()), OrderReason::Data);
+    // The table's key, as the effects hold it: no caller can make one up.
+    let table = fx[0]
+        .requires
+        .iter()
+        .find_map(|r| {
+            if let Requirement::Exists(key @ ObjectKey::Table(_)) = r {
+                Some(key.clone())
+            } else {
+                None
+            }
+        })
+        .expect("a row requires its table");
+    let edge = |source, because| Edge {
+        before: 0,
+        after: 1,
+        source,
+        because,
+    };
+    let of = |source, because| reason(&edge(source, because), ops.as_slice());
+    assert_eq!(
+        of(
+            Source::Effect,
+            Because::WriteWrite(Resource::Object(table.clone(), Incarnation::Final))
+        ),
+        OrderReason::Identity
+    );
+    assert_eq!(
+        of(
+            Source::Effect,
+            Because::WriteWrite(Resource::Column(table.clone()))
+        ),
+        OrderReason::Data
+    );
+    assert_eq!(
+        of(Source::Effect, Because::Creates(table.clone())),
+        OrderReason::Structural
+    );
+    assert_eq!(
+        of(Source::Effect, Because::Replaces(table.clone())),
+        OrderReason::Identity
+    );
+    // The source decides only where it is the whole story.
+    assert_eq!(
+        of(Source::Binding, Because::Creates(table.clone())),
+        OrderReason::Binding
+    );
+    assert_eq!(
+        of(Source::Search, Because::Creates(table.clone())),
+        OrderReason::Identity
+    );
+    assert_eq!(
+        of(Source::Declared, Because::Declared),
+        OrderReason::Structural
+    );
+    // Negative: a catalog edge is read by its effect like any other.
+    assert_eq!(
+        of(Source::Catalog, Because::Writes(table)),
+        OrderReason::Data
+    );
+}

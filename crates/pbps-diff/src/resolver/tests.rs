@@ -56,7 +56,7 @@ fn cycles_and_edges_outside_the_change_set_refuse_before_output() {
             reason: OrderReason::Binding,
         },
     ]);
-    assert!(matches!(order(example(), edges), Err(Error::Cycle)));
+    assert!(matches!(order(example(), edges), Err(Error::Cycle(_))));
     assert!(matches!(
         order(
             example(),
@@ -207,7 +207,7 @@ fn independent_table_changes_can_cross_the_old_name_order_without_a_false_cycle(
             &observations,
             &pbps_dialect::MinimalDialect
         ),
-        Err(Error::Cycle)
+        Err(Error::Cycle(_))
     ));
     assert!(matches!(
         plan(
