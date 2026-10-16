@@ -146,12 +146,15 @@ pub async fn missing_roles(
 /// difference between a refusal that blocks and one that unblocks.
 pub fn refuse_missing(name: &str) -> DialectError {
     match crate::quote(name) {
-        Ok(quoted) => invalid(format!(
-            "role `{name}` is declared here and the cluster does not have it. A PostgreSQL role \
-             is a cluster object, so pbps manages what a role is granted in this database and \
-             not whether the role exists (ADR-0010 section 3). Run it by hand, then plan again:\n\n    \
-             CREATE ROLE {quoted};"
-        )),
+        Ok(quoted) => DialectError::ByHand {
+            dialect: DIALECT,
+            why: format!(
+                "role `{name}` is declared here and the cluster does not have it. A PostgreSQL \
+                 role is a cluster object, so pbps manages what a role is granted in this \
+                 database and not whether the role exists (ADR-0010 section 3)"
+            ),
+            statement: format!("CREATE ROLE {quoted};"),
+        },
         Err(e) => e,
     }
 }
@@ -225,13 +228,18 @@ pub fn refuse_rename(from: &str, to: &str, evidence: RenameEvidence) -> Option<D
              and none to grant on (ADR-0010 section 3). Restore the intended principal or correct \
              the declarations, then plan again."
         ),
-        RenameEvidence::NotRunYet => format!(
-            "`{from}` is still in the cluster and `{to}` is not: the rename this revision \
-             declares has not been run. A PostgreSQL role is a cluster object and pbps does not \
-             own it (ADR-0010 section 3); the grants follow the role's oid, so nothing has to be \
-             re-granted afterwards. Run it by hand, then plan again:\n\n    ALTER ROLE \
-             {quoted_from} RENAME TO {quoted_to};"
-        ),
+        RenameEvidence::NotRunYet => {
+            return Some(DialectError::ByHand {
+                dialect: DIALECT,
+                why: format!(
+                    "`{from}` is still in the cluster and `{to}` is not: the rename this \
+                     revision declares has not been run. A PostgreSQL role is a cluster object \
+                     and pbps does not own it (ADR-0010 section 3); the grants follow the \
+                     role's oid, so nothing has to be re-granted afterwards"
+                ),
+                statement: format!("ALTER ROLE {quoted_from} RENAME TO {quoted_to};"),
+            });
+        }
     };
     Some(invalid(why))
 }

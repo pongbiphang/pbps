@@ -8,20 +8,32 @@
 use std::fmt;
 use std::str::FromStr;
 
+/// A refusal of a name, which shows the text it was given escaped.
+///
+/// The text is whatever the file spelled, control characters included: SPEC
+/// §4.3 keeps scalar text verbatim and a name that holds one is valid, so a
+/// refusal that echoed it raw would let a hand-made plan start a line the tool
+/// never wrote (DEC-2032.1, #2035). The escape is in the error's own `Display`,
+/// beside `TableName`'s, which cannot escape itself because it is also the
+/// serialization.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum NameError {
-    #[error("a table name must have the two parts `schema.table`, got `{0}`")]
+    #[error("a table name must have the two parts `schema.table`, got `{}`", crate::escape::Escaped(.0))]
     TableShape(String),
 
-    #[error("a column reference must have the three parts `schema.table.column`, got `{0}`")]
+    #[error(
+        "a column reference must have the three parts `schema.table.column`, got `{}`",
+        crate::escape::Escaped(.0)
+    )]
     ColumnShape(String),
 
-    #[error("`{0}` contains an empty identifier")]
+    #[error("`{}` contains an empty identifier", crate::escape::Escaped(.0))]
     EmptySegment(String),
 
     #[error(
-        "`{0}` contains a `.`, which pbps uses to separate schema, table and column; it cannot \
-         be stored as part of a name"
+        "`{}` contains a `.`, which pbps uses to separate schema, table and column; it cannot \
+         be stored as part of a name",
+        crate::escape::Escaped(.0)
     )]
     ContainsSeparator(String),
 }
@@ -254,5 +266,39 @@ mod tests {
             v.iter().map(ToString::to_string).collect::<Vec<_>>(),
             ["app.a", "dbo.a", "dbo.z"]
         );
+    }
+
+    /// A name out of a file may hold a line break or a terminal sequence, and a
+    /// refusal that echoed it raw would start a line of its own or rewrite the
+    /// ones before it (DEC-2032.1, #2035). `TableName`'s `Display` is its
+    /// serialization and stays as it is; the error escapes.
+    #[test]
+    fn a_refusal_shows_the_name_it_was_given_escaped() {
+        let hostile = "app\n\u{1b}[31m.t\r\u{202e}";
+        for refusal in [
+            NameError::TableShape(hostile.into()),
+            NameError::ColumnShape(hostile.into()),
+            NameError::EmptySegment(hostile.into()),
+            NameError::ContainsSeparator(hostile.into()),
+        ] {
+            let text = refusal.to_string();
+            assert!(!text.chars().any(char::is_control), "{text:?}");
+            assert!(
+                text.contains("app\\n\\u{1b}[31m.t\\r\\u{202e}"),
+                "the escaped name is shown: {text}"
+            );
+        }
+        // The refusals `FromStr` raises carry the same text.
+        let refusal = "a\nb".parse::<TableName>().unwrap_err().to_string();
+        assert!(
+            refusal.contains("`a\\nb`") && !refusal.contains('\n'),
+            "{refusal:?}"
+        );
+        // Negative: the serialization is not touched, so a name round-trips.
+        let table = TableName::new("app", "a\nb");
+        assert_eq!(table.to_string(), "app.a\nb");
+        // Negative: a Unicode name is shown as spelled.
+        let refusal = NameError::TableShape("名前_ünï".into()).to_string();
+        assert!(refusal.contains("`名前_ünï`"), "{refusal}");
     }
 }

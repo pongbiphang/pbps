@@ -23,6 +23,7 @@
 
 use anyhow::Context as _;
 use pbps_dialect::Dialect;
+use pbps_model::escape::Escaped;
 use pbps_model::{PlanMode, PlanOrigin, RiskClass, SavedPlan};
 
 use crate::report::{placeholder, shell_arg};
@@ -293,7 +294,7 @@ fn dialect_of(plan: &SavedPlan) -> anyhow::Result<(pbps_db::Driver, Box<dyn Dial
         serde_json::from_value(serde_json::Value::String(plan.dialect.clone())).map_err(|_| {
             anyhow::anyhow!(
                 "this plan was computed for `{}`, which this build cannot explain",
-                pbps_model::escape::Escaped(&plan.dialect)
+                Escaped(&plan.dialect)
             )
         })?;
     Ok((db::driver_for(name), crate::dialect_for(name)))
@@ -592,6 +593,15 @@ fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
     out
 }
 
+/// The reviewer's text report.
+///
+/// Every string out of the plan goes through [`Escaped`] here, at the one place
+/// the report is put into words, and not in [`Explanation`], which is also the
+/// JSON a machine reads and which JSON already escapes (DEC-2032.1, #2035). A
+/// name, a description or a time in a hand-made plan may hold a line break or a
+/// terminal sequence, and printed as it is it would forge a line of the report
+/// the reviewer approves from, or erase one. The report's own line breaks are
+/// the literals below; none comes from a value.
 fn render(plan: &SavedPlan, e: &Explanation) -> String {
     let mut out = String::from("Plan\n");
     out.push_str(&format!(
@@ -606,12 +616,12 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
     if let Some(detail) = &e.resolver {
         out.push_str(&format!("  resolver    {}\n", resolver::line(detail)));
     }
-    out.push_str(&format!("  dialect     {}\n", e.dialect));
-    out.push_str(&format!("  created     {}\n", e.created_at));
+    out.push_str(&format!("  dialect     {}\n", Escaped(&e.dialect)));
+    out.push_str(&format!("  created     {}\n", Escaped(&e.created_at)));
     if let Some(sha) = &e.git_sha {
-        out.push_str(&format!("  git sha     {sha}\n"));
+        out.push_str(&format!("  git sha     {}\n", Escaped(sha)));
     }
-    out.push_str(&format!("  baseline    {}\n", e.baseline));
+    out.push_str(&format!("  baseline    {}\n", Escaped(&e.baseline)));
     out.push_str(&format!(
         "  execution   {}\n",
         match plan.mode {
@@ -635,7 +645,7 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
             plan.data.len(),
             plan.data
                 .iter()
-                .map(|(t, s)| format!("{t} ({})", s.mode))
+                .map(|(t, s)| Escaped(&format!("{t} ({})", s.mode)).to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -658,7 +668,7 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         for r in &e.risks {
             out.push_str(&format!("  {:<12} {}\n", r.class, r.why));
             for c in &r.changes {
-                out.push_str(&format!("               {c}\n"));
+                out.push_str(&format!("               {}\n", Escaped(c)));
             }
         }
     }
@@ -673,7 +683,7 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         out.push_str("  None can run: each check this plan implies is listed below.\n");
     } else {
         for p in &e.probes {
-            out.push_str(&format!("  - {p}\n"));
+            out.push_str(&format!("  - {}\n", Escaped(p)));
         }
         out.push_str(
             "  Each counts the rows that would break. A non-zero count stops the apply before\n  \
@@ -686,7 +696,11 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         // in apply's warnings approved without seeing them (#478).
         out.push_str("\nChecks that cannot run before the plan\n");
         for u in &e.unchecked {
-            out.push_str(&format!("  - {}: {}\n", u.check, u.reason));
+            out.push_str(&format!(
+                "  - {}: {}\n",
+                Escaped(&u.check),
+                Escaped(&u.reason)
+            ));
         }
         out.push_str(
             "  Nothing counts these rows beforehand. The engine enforces each one when the\n  \

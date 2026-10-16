@@ -8628,10 +8628,13 @@ async fn probe_query(
 
 /// §7.5: a plan containing a non-transactional statement fails before it runs.
 fn reject_non_transactional(statements: &[pbps_dialect::Statement]) -> anyhow::Result<()> {
-    let offenders: Vec<&str> = statements
+    // The statement is SQL out of the plan's names, and a quoted identifier may
+    // hold a line break or a terminal sequence; it is shown escaped, with the
+    // layout around it the tool's own (DEC-2032.1, #2035).
+    let offenders: Vec<String> = statements
         .iter()
         .filter(|s| !s.transactional)
-        .map(|s| s.sql.as_str())
+        .map(|s| pbps_model::escape::Escaped(&s.sql).to_string())
         .collect();
     if offenders.is_empty() {
         return Ok(());
@@ -8796,6 +8799,39 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The refusal prints the SQL of the statements that cannot run in a
+    /// transaction, and the SQL carries the plan's names: a quoted identifier
+    /// may hold a line break or a terminal sequence, which the refusal shows
+    /// escaped and not as a line of its own (DEC-2032.1, #2035).
+    #[test]
+    fn the_non_transactional_refusal_shows_the_sql_escaped() {
+        use pbps_dialect::Statement;
+        let hostile = "CREATE INDEX CONCURRENTLY \"x\n\u{1b}[31mred\r\u{202e}\" ON t (c);";
+        let e = super::reject_non_transactional(&[
+            Statement::new("SELECT 1;"),
+            Statement::new(hostile).non_transactional(),
+        ])
+        .expect_err("a statement that cannot run in a transaction")
+        .to_string();
+        // The refusal's own four lines, and nothing the name added.
+        assert!(!e.chars().any(|c| c.is_control() && c != '\n'), "{e:?}");
+        assert_eq!(e.lines().count(), 4, "{e}");
+        assert!(e.contains("\"x\\n\\u{1b}[31mred\\r\\u{202e}\""), "{e}");
+        // Negative: the statements that can run are not listed, and a plain one
+        // is listed as written.
+        assert!(!e.contains("SELECT 1"), "{e}");
+        let e = super::reject_non_transactional(&[Statement::new(
+            "CREATE INDEX CONCURRENTLY ix ON t (名前);",
+        )
+        .non_transactional()])
+        .expect_err("a statement that cannot run in a transaction")
+        .to_string();
+        assert!(
+            e.contains("CREATE INDEX CONCURRENTLY ix ON t (名前);"),
+            "{e}"
+        );
+    }
+
     #[test]
     fn verify_keeps_the_recorded_entry_and_distinguishes_its_absence_from_emptiness() {
         let entry = pbps_db::LedgerEntry {

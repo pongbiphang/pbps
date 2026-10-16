@@ -17,6 +17,13 @@ use crate::uid::{Uid, UidKind};
 /// later; adding it once it is needed is already too late.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// What the identity file or a plan's final identities got wrong.
+///
+/// A name in a message is shown escaped by this type's own `Display`: the file
+/// is committed text, and a plan carries one that nobody here wrote, so a name
+/// that holds a line break or a terminal sequence must not start a line of the
+/// refusal (DEC-2032.1, #2035). A uid is safe as it is: it is parsed against a
+/// fixed alphabet.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum IdsError {
     #[error("the identity file is version {found}, but this tool only supports {supported}")]
@@ -29,20 +36,21 @@ pub enum IdsError {
     // this state usually comes from two branches adding a same-named object and
     // git auto-merging the two lines cleanly (SPEC §5.3).
     #[error(
-        "{a} and {b} both point at the name `{name}`; decide which uid survives and delete the other entry from the identity file"
+        "{a} and {b} both point at the name `{}`; decide which uid survives and delete the other entry from the identity file",
+        crate::escape::Escaped(.name)
     )]
     DuplicateName { a: Uid, b: Uid, name: String },
 
     #[error("the prefix of {uid} does not match the section it appears in")]
     KindMismatch { uid: Uid },
 
-    #[error("{uid} points at `{column}`, but no live table entry owns it")]
+    #[error("{uid} points at `{}`, but no live table entry owns it", crate::escape::Escaped(.column))]
     OrphanColumn { uid: Uid, column: String },
 
     #[error("a move is recorded for {uid}, but no live table entry has that uid")]
     OrphanMove { uid: Uid },
 
-    #[error("{uid} points at `{name}`, but the snapshot schema does not hold it")]
+    #[error("{uid} points at `{}`, but the snapshot schema does not hold it", crate::escape::Escaped(.name))]
     NotHeld { uid: Uid, name: String },
 }
 
@@ -969,5 +977,52 @@ mod tests {
             assert_eq!(index.columns_of(&absent).count(), 0);
             assert_eq!(index.column_uid(&absent.column("id")), None);
         }
+    }
+
+    /// The names in a refusal are the file's, and a file may hold a line break
+    /// or a terminal sequence in a name (DEC-2032.1, #2035).
+    #[test]
+    fn a_refusal_shows_the_name_it_names_escaped() {
+        let hostile = "x\n\u{1b}[31mred\r";
+        let shown = "x\\n\\u{1b}[31mred\\r";
+        let mut duplicate = sample();
+        duplicate.tables.clear();
+        duplicate.columns.clear();
+        duplicate
+            .tables
+            .insert(uid("t_a9k2mq"), TableName::new("app", hostile));
+        duplicate
+            .tables
+            .insert(uid("t_b9k2mq"), TableName::new("app", hostile));
+        let mut orphan = IdsFile::default();
+        orphan
+            .columns
+            .insert(uid("c_k7x2mq"), TableName::new("app", hostile).column("c"));
+        let mut not_held = sample();
+        not_held.tables.clear();
+        not_held.columns.clear();
+        not_held
+            .tables
+            .insert(uid("t_a9k2mq"), TableName::new("app", hostile));
+        for (what, refusal) in [
+            ("a duplicate name", duplicate.validate().unwrap_err()),
+            ("an orphan column", orphan.validate().unwrap_err()),
+            (
+                "a name the schema does not hold",
+                IdsError::NotHeld {
+                    uid: uid("t_a9k2mq"),
+                    name: format!("app.{hostile}"),
+                },
+            ),
+        ] {
+            let text = refusal.to_string();
+            assert!(!text.chars().any(char::is_control), "{what}: {text:?}");
+            assert!(text.contains(shown), "{what}: {text}");
+        }
+        // Negative: a Unicode name is shown as the file spells it.
+        let mut unicode = IdsFile::default();
+        unicode.columns.insert(uid("c_k7x2mq"), col("app.名前.ünï"));
+        let text = unicode.validate().unwrap_err().to_string();
+        assert!(text.contains("`app.名前.ünï`"), "{text}");
     }
 }

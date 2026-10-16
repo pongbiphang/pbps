@@ -1997,9 +1997,11 @@ fn attached_to(id: &ModuleId) -> Result<&TableName, DialectError> {
 /// sends whoever is holding the plan to the manual; the `CREATE ROLE` they can
 /// paste is the difference between a refusal that blocks and one that unblocks.
 fn by_hand(why: String, statement: String) -> DialectError {
-    invalid(format!(
-        "{why}. Run it by hand, then plan again:\n\n    {statement}"
-    ))
+    DialectError::ByHand {
+        dialect: DIALECT,
+        why,
+        statement,
+    }
 }
 
 /// A grant target as PostgreSQL spells a securable, with the object class

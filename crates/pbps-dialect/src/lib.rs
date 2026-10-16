@@ -50,25 +50,45 @@ use pbps_model::{
     RoutineArg, Schema, SessionZone, Strategy, Table, TableName,
 };
 
+/// What a dialect refuses, in a sentence that names the object it refused.
+///
+/// The names in it are the declarations' or a saved plan's, and either may hold
+/// any character, a line break or a terminal sequence included (SPEC §4.3). A
+/// refusal is a line of the tool's own, so every free-text field is shown
+/// escaped by this type's `Display` (DEC-2032.1, #2035): hundreds of messages
+/// build a `String` out of names with `format!`, and escaping the field here
+/// covers all of them where editing each would miss the next one written. The
+/// one message that is not a single line, a statement to run by hand, has a
+/// variant of its own so that its line breaks stay the tool's.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DialectError {
-    #[error("{dialect} has no type `{ty}`")]
+    #[error("{dialect} has no type `{}`", pbps_model::escape::Escaped(.ty))]
     UnknownType { dialect: &'static str, ty: String },
 
-    #[error("wrong number of arguments for `{ty}` in {dialect}: {detail}")]
+    #[error(
+        "wrong number of arguments for `{}` in {dialect}: {}",
+        pbps_model::escape::Escaped(.ty),
+        pbps_model::escape::Escaped(.detail)
+    )]
     BadTypeArity {
         dialect: &'static str,
         ty: String,
         detail: String,
     },
 
-    #[error("{dialect} does not support {feature}")]
+    #[error(
+        "{dialect} does not support {}",
+        pbps_model::escape::Escaped(.feature)
+    )]
     Unsupported {
         dialect: &'static str,
         feature: String,
     },
 
-    #[error("the identifier `{0}` cannot be written into SQL safely")]
+    #[error(
+        "the identifier `{}` cannot be written into SQL safely",
+        pbps_model::escape::Escaped(.0)
+    )]
     UnquotableIdent(String),
 
     /// A part of a dialect this build has not implemented **yet**.
@@ -80,7 +100,10 @@ pub enum DialectError {
     /// tell the first lie to report the second. Returning an empty answer
     /// instead is the one thing neither may do — a plan that applies cleanly
     /// and changes nothing is the silent wrong answer.
-    #[error("the {dialect} dialect does not implement {part} yet")]
+    #[error(
+        "the {dialect} dialect does not implement {} yet",
+        pbps_model::escape::Escaped(.part)
+    )]
     NotBuilt { dialect: &'static str, part: String },
 
     /// A declaration that parses but that this dialect will not accept — a
@@ -88,10 +111,29 @@ pub enum DialectError {
     /// cannot carry one. Distinct from [`DialectError::Unsupported`], which says
     /// "this database has no such feature"; this one says "this database has the
     /// feature, and you used it wrongly".
-    #[error("{dialect}: {message}")]
+    #[error("{dialect}: {}", pbps_model::escape::Escaped(.message))]
     Invalid {
         dialect: &'static str,
         message: String,
+    },
+
+    /// A change this dialect will not perform, with the statement a human runs
+    /// instead.
+    ///
+    /// Its own variant, not an [`DialectError::Invalid`] with a line break in
+    /// its message, because `Invalid` escapes every line break it holds: a
+    /// break the tool wrote and one a name carried cannot be told apart in a
+    /// finished string. Here the two parts are kept apart, each is escaped, and
+    /// the layout around them is the tool's own.
+    #[error(
+        "{dialect}: {}. Run it by hand, then plan again:\n\n    {}",
+        pbps_model::escape::Escaped(.why),
+        pbps_model::escape::Escaped(.statement)
+    )]
+    ByHand {
+        dialect: &'static str,
+        why: String,
+        statement: String,
     },
 }
 
@@ -3864,6 +3906,72 @@ mod tests {
     use pbps_model::{CheckConstraint, Index, IndexColumn, PrimaryKey, UniqueConstraint};
 
     use super::*;
+
+    /// A refusal names an object out of a declaration or a saved plan, and the
+    /// name may hold a line break or a terminal sequence. Every free-text
+    /// field of the error is shown escaped by the error's own `Display`, so no
+    /// message built with `format!` can start a line of its own
+    /// (DEC-2032.1, #2035).
+    #[test]
+    fn a_refusal_shows_the_names_it_carries_escaped() {
+        const HOSTILE: &str = "x\n\u{1b}[31mred\r\u{202e}";
+        const SHOWN: &str = "x\\n\\u{1b}[31mred\\r\\u{202e}";
+        let hostile = || HOSTILE.to_owned();
+        for refusal in [
+            DialectError::UnknownType {
+                dialect: "pg",
+                ty: hostile(),
+            },
+            DialectError::BadTypeArity {
+                dialect: "pg",
+                ty: hostile(),
+                detail: hostile(),
+            },
+            DialectError::Unsupported {
+                dialect: "pg",
+                feature: hostile(),
+            },
+            DialectError::UnquotableIdent(hostile()),
+            DialectError::NotBuilt {
+                dialect: "pg",
+                part: hostile(),
+            },
+            DialectError::Invalid {
+                dialect: "pg",
+                message: format!("table `app.{HOSTILE}` has no primary key"),
+            },
+            DialectError::ByHand {
+                dialect: "pg",
+                why: format!("role `{HOSTILE}` is not here"),
+                statement: format!("CREATE ROLE \"{HOSTILE}\";"),
+            },
+        ] {
+            let text = refusal.to_string();
+            let body = text.replace("\n\n    ", " ");
+            assert!(!body.chars().any(char::is_control), "{text:?}");
+            assert!(text.contains(SHOWN), "{text}");
+        }
+        // The one message with a layout of its own keeps it: the statement to
+        // run is on a line of its own, indented, and nothing else is.
+        let by_hand = DialectError::ByHand {
+            dialect: "pg",
+            why: "role `r` is not here".into(),
+            statement: "CREATE ROLE \"r\";".into(),
+        };
+        assert_eq!(
+            by_hand.to_string(),
+            "pg: role `r` is not here. Run it by hand, then plan again:\n\n    CREATE ROLE \"r\";"
+        );
+        // Negative: an ordinary refusal, and a Unicode name, are shown as written.
+        let ordinary = DialectError::Invalid {
+            dialect: "pg",
+            message: "table `app.名前_ünï` has no primary key".into(),
+        };
+        assert_eq!(
+            ordinary.to_string(),
+            "pg: table `app.名前_ünï` has no primary key"
+        );
+    }
 
     /// The scan finds a name in code whatever its case or brackets, and not
     /// inside a longer name, a literal or a comment: an over-approximation
