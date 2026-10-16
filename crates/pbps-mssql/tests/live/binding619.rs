@@ -67,8 +67,24 @@ async fn refusal(conn: &mut Conn, sql: &str) -> Option<String> {
 /// Another session in the test's database.
 async fn session(db: &TestDb) -> Conn {
     let mut conn = connect_live(&conn_str()).await.expect("connect");
-    conn.execute(&*format!("USE [{}];", db.name)).await.unwrap();
+    conn.execute(&format!("USE [{}];", db.name)).await.unwrap();
     conn
+}
+
+/// Drops a login once its sessions have ended. A closed connection's session
+/// ends asynchronously, and `DROP LOGIN` refuses a login still logged in
+/// (15434), so the wait is for the engine, not for the client.
+async fn drop_login(admin: &mut Conn, login: &str) {
+    let open = format!(
+        "SELECT CONVERT(bigint, COUNT(*)) FROM sys.dm_exec_sessions WHERE login_name = N'{login}';"
+    );
+    for _ in 0..100 {
+        if number(admin, &open).await == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    run(admin, &[&*format!("DROP LOGIN [{login}];")]).await;
 }
 
 /// What each object reference of `referencing` names when the catalog is
@@ -76,7 +92,7 @@ async fn session(db: &TestDb) -> Conn {
 async fn bindings(conn: &mut Conn, referencing: &str) -> Vec<String> {
     let mut names = texts(
         conn,
-        &*format!(
+        &format!(
             "SELECT CONVERT(nvarchar(300), COALESCE(OBJECT_SCHEMA_NAME(d.referenced_id) + N'.' \
                  + OBJECT_NAME(d.referenced_id), N'unresolved:' + d.referenced_entity_name)) \
              FROM sys.sql_expression_dependencies d \
@@ -1016,7 +1032,7 @@ async fn a_login_reads_its_own_server_reach_without_privilege() {
         "the negative: an administrator reads its reach the same way"
     );
     for (login, _) in &logins {
-        run(&mut admin, &[&*format!("DROP LOGIN [{login}];")]).await;
+        drop_login(&mut admin, login).await;
     }
 }
 
@@ -1208,5 +1224,5 @@ async fn a_global_temporary_table_marks_one_instance_to_every_login_on_it() {
     }
     assert_eq!(gone, 0, "the marker outlived its session");
     drop(confined);
-    run(&mut admin, &[&*format!("DROP LOGIN [{login}];")]).await;
+    drop_login(&mut admin, &login).await;
 }
