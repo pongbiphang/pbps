@@ -182,7 +182,7 @@ pub fn in_checkout(dir: &std::path::Path) -> bool {
 /// Asked about the *project* directory, not the process's. `--project` points
 /// somewhere else, and a sha read from the shell's location would stamp a plan
 /// with a commit that has nothing to do with the declarations in it.
-pub fn git_sha(dir: &std::path::Path) -> Option<String> {
+pub fn git_sha(dir: &std::path::Path) -> Option<pbps_model::Text> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -193,7 +193,7 @@ pub fn git_sha(dir: &std::path::Path) -> Option<String> {
         return None;
     }
     let sha = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    (!sha.is_empty()).then_some(sha)
+    (!sha.is_empty()).then(|| sha.into())
 }
 
 #[cfg(test)]

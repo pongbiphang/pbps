@@ -11842,7 +11842,7 @@ async fn a_reason_at_the_columns_width_is_stored_whole_and_one_more_is_refused()
     // them are 2000 UTF-16 units and do not fit an `NVARCHAR(1000)`.
     let full = "😀".repeat(state::REASON_CHARS);
     let mut wide = snapshot(StateKind::Baseline);
-    wide.reason = Some(full.clone());
+    wide.reason = Some(full.clone().into());
     state::record(&mut db.conn, &wide)
         .await
         .expect("a reason of exactly the declared width");
@@ -11853,11 +11853,11 @@ async fn a_reason_at_the_columns_width_is_stored_whole_and_one_more_is_refused()
             .unwrap()
             .snapshot
             .reason,
-        Some(full.clone())
+        Some(pbps_model::Text::from(full.clone()))
     );
 
     let mut over = snapshot(StateKind::Baseline);
-    over.reason = Some(format!("{full}😀"));
+    over.reason = Some(format!("{full}😀").into());
     let error = state::record(&mut db.conn, &over)
         .await
         .expect_err("one character too many must be refused, not truncated");
@@ -11871,7 +11871,7 @@ async fn a_reason_at_the_columns_width_is_stored_whole_and_one_more_is_refused()
     // And the audit paths, which cut rather than fail: what `truncate_reason`
     // leaves fits by construction.
     let mut cut = snapshot(StateKind::Failed);
-    cut.reason = Some(state::truncate_reason(&format!("{full}😀")));
+    cut.reason = Some(state::truncate_reason(&format!("{full}😀")).into());
     state::record(&mut db.conn, &cut)
         .await
         .expect("a truncated reason fits");
@@ -11918,7 +11918,10 @@ async fn an_entry_from_a_newer_build_is_refused_by_its_version_and_still_appears
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].operator, "a-later-pbps");
     assert_eq!(rows[0].kind, "apply");
-    assert_eq!(rows[0].reason.as_deref(), Some("from the future"));
+    assert_eq!(
+        rows[0].reason.as_ref().map(pbps_model::Text::raw),
+        Some("from the future")
+    );
     assert!(
         matches!(&rows[0].state, Err(Unreadable::UnsupportedVersion(m)) if m.contains("999")),
         "{:?}",
@@ -33970,7 +33973,11 @@ async fn a_malformed_timeline_row_is_refused_alone_and_the_rest_are_read() {
         .expect("the whole call must still succeed — only the bad rows are refused");
     assert_eq!(rows.len(), 5);
     for row in &rows {
-        let reason = row.reason.as_deref().unwrap_or_default();
+        let reason = row
+            .reason
+            .as_ref()
+            .map(pbps_model::Text::raw)
+            .unwrap_or_default();
         match (reason, &row.state) {
             ("well-formed", Ok(state)) => {
                 assert_eq!((state.tables, state.modules), (2, 1), "{reason}");

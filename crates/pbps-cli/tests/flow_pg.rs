@@ -13488,7 +13488,10 @@ fn the_cli_refuses_the_second_lock_holder_and_unlock_releases_only_the_gate() {
     succeeds(d.run(&["unlock", "--db", connection]));
     succeeds(d.run(&["baseline", "--db", connection, "--reason", "after unlock"]));
     assert_eq!(
-        latest_snapshot(connection).reason.as_deref(),
+        latest_snapshot(connection)
+            .reason
+            .as_ref()
+            .map(pbps_model::Text::raw),
         Some("after unlock")
     );
 }
@@ -13590,7 +13593,11 @@ fn a_triggers_own_exception_keeps_the_row_value_off_the_ledger_but_not_off_the_o
 
     let after = latest_snapshot(connection);
     assert_eq!(after.kind, pbps_model::StateKind::Failed);
-    let reason = after.reason.clone().unwrap_or_default();
+    let reason = after
+        .reason
+        .as_ref()
+        .map(|r| r.raw().to_owned())
+        .unwrap_or_default();
     assert!(
         !reason.contains("super-secret-value-167"),
         "a value nobody declared to this tool must never reach the durable \
@@ -13664,7 +13671,11 @@ fn an_unapproved_triggers_own_refusal_keeps_naming_it_on_the_ledger() {
 
     let after = latest_snapshot(connection);
     assert_eq!(after.kind, pbps_model::StateKind::Failed);
-    let reason = after.reason.clone().unwrap_or_default();
+    let reason = after
+        .reason
+        .as_ref()
+        .map(|r| r.raw().to_owned())
+        .unwrap_or_default();
     assert!(
         reason.contains("unsafe data trigger") && reason.contains("audit"),
         "a tool-composed refusal names its own trigger, and must survive on \
@@ -18083,7 +18094,10 @@ fn a_cascade_lock_denial_keeps_its_remedy_on_the_failed_ledger() {
         );
         let after = latest_snapshot(connection);
         assert_eq!(after.kind, pbps_model::StateKind::Failed);
-        let reason = after.reason.unwrap_or_default();
+        let reason = after
+            .reason
+            .map(pbps_model::Text::into_raw)
+            .unwrap_or_default();
         for text in [
             "42501",
             "cannot lock `public.c`",
@@ -18996,7 +19010,7 @@ CREATE EVENT TRIGGER duplicate_at_index_build ON ddl_command_start
         let recorded = latest_snapshot(connection);
         assert_eq!(recorded.kind, pbps_model::StateKind::Failed);
         assert!(recorded.staged.is_none());
-        let reason = recorded.reason.as_deref().unwrap();
+        let reason = recorded.reason.as_ref().map(pbps_model::Text::raw).unwrap();
         assert!(
             reason.contains("ix_recovery") && reason.contains("removed invalid index"),
             "{reason}"
@@ -19045,7 +19059,7 @@ CREATE EVENT TRIGGER deny_recovery ON ddl_command_start WHEN TAG IN ('DROP INDEX
         "{}",
         stderr(&failed)
     );
-    let reason = latest_snapshot(connection).reason.unwrap();
+    let reason = latest_snapshot(connection).reason.unwrap().into_raw();
     assert!(
         reason.contains("Recovery of index") && reason.contains("artifact may remain"),
         "{reason}"

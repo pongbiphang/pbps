@@ -868,7 +868,7 @@ pub struct Module {
     pub kind: ModuleKind,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: Option<crate::Text>,
 
     /// The body, kept verbatim and **never parsed**.
     ///

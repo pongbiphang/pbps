@@ -412,7 +412,7 @@ mod producer {
                 let provenance = Provenance {
                     entry: request.selection.name.to_owned(),
                     scratch: pbps_model::resolver::ScratchSource::Docker {
-                        image: image.clone(),
+                        image: image.as_str().into(),
                     },
                     outside_writes,
                 };

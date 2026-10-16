@@ -83,10 +83,10 @@ pub struct TimelineEntry {
     /// it can be read without parsing it.
     pub kind: String,
 
-    pub git_sha: Option<String>,
+    pub git_sha: Option<pbps_model::Text>,
     pub plan_checksum: Option<String>,
     pub operator: String,
-    pub reason: Option<String>,
+    pub reason: Option<pbps_model::Text>,
 
     /// The four numbers a timeline row draws, or why this build could not read
     /// them.

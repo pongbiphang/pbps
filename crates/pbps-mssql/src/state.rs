@@ -582,10 +582,10 @@ pub async fn timeline(conn: &mut Conn, limit: u32) -> Result<Vec<TimelineEntry>,
             id: r.id,
             applied_at: r.applied_at,
             kind: r.kind,
-            git_sha: r.git_sha,
+            git_sha: r.git_sha.map(pbps_model::Text::from),
             plan_checksum: r.plan_checksum,
             operator: r.operator,
-            reason: r.reason,
+            reason: r.reason.map(pbps_model::Text::from),
             state: match r.state {
                 // A version this build does not read, refused before the
                 // JSON fallback ever runs — see [`ProjectedRow`]'s doc
@@ -669,11 +669,11 @@ fn ordinary_params<'a>(snapshot: &'a StateSnapshot, state_json: &'a str) -> (Vec
     let modules_count = saturating_i32(snapshot.schema.modules.len() as u64);
     let mut params: Vec<Param<'a>> = vec![
         kind.into(),
-        snapshot.git_sha.as_deref().into(),
+        snapshot.git_sha.as_ref().map(pbps_model::Text::raw).into(),
         snapshot.plan_checksum.as_deref().into(),
         state_json.into(),
         snapshot.operator.as_str().into(),
-        snapshot.reason.as_deref().into(),
+        snapshot.reason.as_ref().map(pbps_model::Text::raw).into(),
         state_version.into(),
         tables_count.into(),
         modules_count.into(),

@@ -125,7 +125,7 @@ fn modules_section(s: &mut String, modules: &BTreeMap<ModuleId, Module>) {
             .unwrap_or_default();
         let _ = writeln!(s, "<p class=\"muted\">{}{on}</p>", m.kind);
         if let Some(d) = &m.description {
-            let _ = writeln!(s, "<p>{}</p>", esc(d));
+            let _ = writeln!(s, "<p>{}</p>", esc(d.raw()));
         }
         let _ = writeln!(s, "<pre>{}</pre>", esc(m.definition.trim_end()));
     }
@@ -141,7 +141,7 @@ fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
     for (name, role) in roles {
         let _ = writeln!(s, "<h3>{}</h3>", code(name));
         if let Some(description) = &role.description {
-            let _ = writeln!(s, "<p>{}</p>", esc(description));
+            let _ = writeln!(s, "<p>{}</p>", esc(description.raw()));
         }
         if role.grants.is_empty() {
             s.push_str("<p class=\"muted\">No grants.</p>\n");
@@ -169,7 +169,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
         code(&name.to_string())
     );
     if let Some(d) = &table.description {
-        let _ = writeln!(s, "<p>{}</p>", esc(d));
+        let _ = writeln!(s, "<p>{}</p>", esc(d.raw()));
     }
     s.push_str("<table>\n<tr><th>Column</th><th>Type</th><th>Null</th><th>Default</th><th>Description</th></tr>\n");
     for (col_name, c) in &table.columns {
@@ -196,7 +196,11 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
                 | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => dash(),
             },
-            c.description.as_deref().map(esc).unwrap_or_else(dash)
+            c.description
+                .as_ref()
+                .map(pbps_model::Text::raw)
+                .map(esc)
+                .unwrap_or_else(dash)
         );
     }
     s.push_str("</table>\n");
@@ -282,7 +286,7 @@ fn deprecated_section(s: &mut String, schema: &Schema) {
             s,
             "<tr><td>{}</td><td>{}</td></tr>",
             code(&name),
-            esc(&reason)
+            esc(reason.raw())
         );
     }
     s.push_str("</table>\n");

@@ -658,7 +658,7 @@ impl Run<'_> {
             resolver_build: reported_build(self.key, &prepared.scratch_catalog)?,
             channels: format!("scratch|{}|{}", self.tokens.target, self.tokens.scratch),
             runtime: ResolverRuntime::Scratch {
-                entry: self.provenance.entry.clone(),
+                entry: self.provenance.entry.as_str().into(),
                 scratch: self.provenance.scratch.clone(),
                 layout: match provisioning {
                     Provisioning::RunOwned => ScratchLayout::RunOwned,

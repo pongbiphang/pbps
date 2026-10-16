@@ -105,9 +105,9 @@ mod tests {
             crate::IdsFile::default(),
             "old-client",
         );
-        snapshot.reason = Some(String::new());
+        snapshot.reason = Some(crate::Text::default());
         let back: crate::StateSnapshot =
             serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
-        assert_eq!(back.reason.as_deref(), Some(""));
+        assert_eq!(back.reason.as_ref().map(crate::Text::raw), Some(""));
     }
 }

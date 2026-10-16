@@ -16244,7 +16244,7 @@ fn a_failed_apply_is_audited_and_emitted_to_the_hook() {
         assert!(latest
             .snapshot
             .reason
-            .as_deref()
+            .as_ref().map(pbps_model::Text::raw)
             .is_some_and(|r| r.contains("data will not accept")));
         let pulled = pbps_mssql::catalog::introspect(&mut conn).await.unwrap();
         assert!(!pulled.schema.tables[&"dbo.pbps_failed_audit".parse().unwrap()]
@@ -16346,7 +16346,12 @@ fn a_triggers_own_throw_is_redacted_without_being_called_a_sqlstate() {
         let mut conn = connect_live(&db).await.unwrap();
         let latest = pbps_mssql::state::latest(&mut conn).await.unwrap().unwrap();
         assert_eq!(latest.snapshot.kind, pbps_model::StateKind::Failed);
-        let reason = latest.snapshot.reason.clone().unwrap_or_default();
+        let reason = latest
+            .snapshot
+            .reason
+            .as_ref()
+            .map(|r| r.raw().to_owned())
+            .unwrap_or_default();
         assert!(
             !reason.contains("super-secret-mssql-value-167"),
             "a value nobody declared to this tool must never reach the durable \
@@ -17181,7 +17186,10 @@ fn a_failed_resume_does_not_relabel_the_interrupted_plan() {
                 latest.snapshot.plan_checksum.as_deref(),
                 Some(interrupted_checksum.as_str())
             );
-            assert_eq!(latest.snapshot.git_sha.as_deref(), Some("plan-a-revision"));
+            assert_eq!(
+                latest.snapshot.git_sha.as_ref().map(pbps_model::Text::raw),
+                Some("plan-a-revision")
+            );
             let progress = latest.snapshot.staged.as_ref().unwrap();
             assert_eq!((progress.completed, progress.total), (1, 2));
         });

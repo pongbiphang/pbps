@@ -283,7 +283,7 @@ pub struct StateSnapshot {
     /// The commit that produced this state. `None` for a baseline taken outside
     /// version control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git_sha: Option<String>,
+    pub git_sha: Option<crate::Text>,
 
     /// Checksum of the plan that was applied, matching the saved-plan pinning
     /// mechanism (SPEC §7.3).
@@ -295,7 +295,7 @@ pub struct StateSnapshot {
     /// Required for a baseline: "why were the differences skipped?" is precisely
     /// what an audit asks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub reason: Option<crate::Text>,
 
     /// Present only on a [`StateKind::Staged`] checkpoint: how far through the
     /// staged plan this environment is.

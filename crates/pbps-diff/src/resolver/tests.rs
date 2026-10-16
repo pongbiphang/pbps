@@ -483,7 +483,7 @@ fn deprecation_does_not_rebuild_unchanged_column_dependents() {
             .columns
             .get_mut(&input.name)
             .unwrap()
-            .deprecated = from.map(str::to_owned);
+            .deprecated = from.map(pbps_model::Text::from);
         let mut desired = base.clone();
         desired
             .tables
@@ -492,7 +492,7 @@ fn deprecation_does_not_rebuild_unchanged_column_dependents() {
             .columns
             .get_mut(&input.name)
             .unwrap()
-            .deprecated = to.map(str::to_owned);
+            .deprecated = to.map(pbps_model::Text::from);
         let old = crate::Side {
             schema: &base,
             ids: &identities,

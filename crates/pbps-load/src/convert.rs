@@ -102,7 +102,7 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
     }
 
     let mut role = Role {
-        description: dto.description,
+        description: dto.description.map(pbps_model::Text::from),
         grants: Default::default(),
     };
     // The spelling each parsed target was first written in: `SCHEMA::dbo`
@@ -376,8 +376,8 @@ pub(crate) fn convert_for_diagnostics(
                 ty,
                 nullable,
                 value_source,
-                description: c.description,
-                deprecated: c.deprecated,
+                description: c.description.map(pbps_model::Text::from),
+                deprecated: c.deprecated.map(pbps_model::Text::from),
                 collation: c.collation.map(pbps_model::Collation::new),
             },
         );
@@ -781,7 +781,7 @@ pub(crate) fn convert_for_diagnostics(
             LoadedTable {
                 name,
                 table: Table {
-                    description: dto.description,
+                    description: dto.description.map(pbps_model::Text::from),
                     columns,
                     computed: dto
                         .computed
@@ -1365,7 +1365,7 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
             id,
             module: Module {
                 kind,
-                description: dto.description,
+                description: dto.description.map(pbps_model::Text::from),
                 definition: dto.definition,
             },
             depends_on,

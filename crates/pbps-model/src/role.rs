@@ -38,7 +38,7 @@ use crate::name::NameError;
 #[serde(deny_unknown_fields)]
 pub struct Role {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: Option<crate::Text>,
 
     /// Target to the permissions granted on it. An empty set is never stored:
     /// a target with nothing granted is the same declaration as no target.

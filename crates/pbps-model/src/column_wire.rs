@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Collation, Column, ColumnType, Generated, Identity, OwnedSequence, ValueSource};
+use crate::{Collation, Column, ColumnType, Generated, Identity, OwnedSequence, Text, ValueSource};
 
 #[derive(Serialize)]
 struct ColumnRef<'a> {
@@ -21,9 +21,9 @@ struct ColumnRef<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     collation: Option<&'a Collation>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<&'a str>,
+    description: Option<&'a Text>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    deprecated: Option<&'a str>,
+    deprecated: Option<&'a Text>,
 }
 
 impl Serialize for Column {
@@ -44,8 +44,8 @@ impl Serialize for Column {
             sequence,
             generated,
             collation: self.collation.as_ref(),
-            description: self.description.as_deref(),
-            deprecated: self.deprecated.as_deref(),
+            description: self.description.as_ref(),
+            deprecated: self.deprecated.as_ref(),
         }
         .serialize(serializer)
     }
@@ -68,9 +68,9 @@ struct ColumnWire {
     #[serde(default, deserialize_with = "present")]
     collation: Option<Option<Collation>>,
     #[serde(default, deserialize_with = "present")]
-    description: Option<Option<String>>,
+    description: Option<Option<Text>>,
     #[serde(default, deserialize_with = "present")]
-    deprecated: Option<Option<String>>,
+    deprecated: Option<Option<Text>>,
 }
 
 // Keep explicit null distinct from an unread field until serde has checked

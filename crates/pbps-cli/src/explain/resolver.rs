@@ -3,6 +3,7 @@
 //! credentials and no resolver. A fingerprint's presence is shown, never its
 //! value, and a surface's verdict is what its sealed bindings say.
 
+use pbps_model::Text;
 use pbps_model::escape::Escaped;
 use pbps_model::resolver::{
     ObjectIdentity, OrderReason, OutsideWrites, Prerequisite, ResolverEvidence, ResolverRuntime,
@@ -13,13 +14,13 @@ use pbps_model::resolver::{
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct ResolverDetail {
     /// The `pbps.yml` resolver entry that ran.
-    pub entry: String,
+    pub entry: Text,
     /// `server` or `docker`.
     pub scratch: &'static str,
     /// A docker scratch's image reference as configured: unverified, since
     /// the content behind a tag can change.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    pub image: Option<Text>,
     /// `run-owned`: a login and database the run created and dropped.
     /// `supplied`: the database the entry names, emptied after the run.
     pub layout: &'static str,
@@ -46,14 +47,14 @@ pub struct ResolverDetail {
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct Limitation {
-    pub name: String,
-    pub description: String,
+    pub name: Text,
+    pub description: Text,
 }
 
 #[derive(serde::Serialize, schemars::JsonSchema)]
 pub struct SurfaceVerdict {
     /// Its kind and name, such as `default app.t.c`.
-    pub surface: String,
+    pub surface: Text,
     /// `unaffected`, `rebuilt`, `created` or `removed`.
     pub verdict: &'static str,
 }
@@ -200,7 +201,7 @@ fn surface_verdict(resolution: &SurfaceResolution) -> SurfaceVerdict {
         (None, None) => "absent",
     };
     SurfaceVerdict {
-        surface: surface(&resolution.surface),
+        surface: Text::new(surface(&resolution.surface)),
         verdict,
     }
 }
@@ -232,20 +233,20 @@ fn reason(reason: OrderReason) -> &'static str {
 /// scratch, <layout>)`, with an unverified image and an allowed outside
 /// write said after it.
 ///
-/// The entry and the image are the plan's text, shown escaped (DEC-2032.1,
-/// #2035); the rest of this module's text is escaped for the same reason, and
-/// [`ResolverDetail`] itself stays raw because it is also the JSON.
+/// The entry and the image are the plan's text, a [`Text`] shown escaped
+/// (DEC-2032.1, #2035); the rest of this module's text is escaped for the same
+/// reason, and [`ResolverDetail`] itself stays raw because it is also the JSON.
 pub fn line(detail: &ResolverDetail) -> String {
     let mut out = format!(
         "{} ({} scratch, {})",
-        Escaped(&detail.entry),
+        detail.entry.shown(),
         detail.scratch,
         detail.layout
     );
     if let Some(image) = &detail.image {
         out.push_str(&format!(
             "; image {}, as configured, not verified",
-            Escaped(image)
+            image.shown()
         ));
     }
     if detail.outside_writes == "allowed" {
@@ -272,8 +273,8 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
         for limitation in &detail.limitations {
             out.push_str(&format!(
                 "    {}: {}\n",
-                Escaped(&limitation.name),
-                Escaped(&limitation.description)
+                limitation.name.shown(),
+                limitation.description.shown()
             ));
         }
     }
@@ -282,7 +283,7 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
         out.push_str(&format!(
             "    {:<11} {}\n",
             surface.verdict,
-            Escaped(&surface.surface)
+            surface.surface.shown()
         ));
     }
     if !detail.order.is_empty() {
@@ -351,7 +352,7 @@ mod tests {
         ResolverDetail {
             entry: "ci".into(),
             scratch,
-            image: image.map(str::to_owned),
+            image: image.map(Into::into),
             layout: "run-owned",
             outside_writes: writes,
             rule: String::new(),
@@ -490,7 +491,7 @@ mod tests {
                 description: text.into(),
             }];
             d.surfaces = vec![SurfaceVerdict {
-                surface: format!("table app.{text}"),
+                surface: format!("table app.{text}").into(),
                 verdict: "created",
             }];
             d.prerequisites = vec![PrerequisiteDetail {

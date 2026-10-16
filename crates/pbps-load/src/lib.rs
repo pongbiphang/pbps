@@ -485,7 +485,10 @@ indexes:
     fn full_document_loads() {
         let t = load(FULL);
         assert_eq!(t.name.to_string(), "dbo.customer");
-        assert_eq!(t.table.description.as_deref(), Some("Customer master"));
+        assert_eq!(
+            t.table.description.as_ref().map(pbps_model::Text::raw),
+            Some("Customer master")
+        );
         assert_eq!(t.table.columns.len(), 6);
     }
 
@@ -601,7 +604,10 @@ indexes:
         };
         assert_eq!((id.seed, id.increment), (1, 1));
         assert_eq!(
-            t.table.columns["legacy_code"].deprecated.as_deref(),
+            t.table.columns["legacy_code"]
+                .deprecated
+                .as_ref()
+                .map(pbps_model::Text::raw),
             Some("superseded by email as the identifier")
         );
     }
@@ -1154,7 +1160,10 @@ indexes:
             panic!("not a role: {f:?}");
         };
         assert_eq!(r.name, "app_reader");
-        assert_eq!(r.role.description.as_deref(), Some("Read-only access"));
+        assert_eq!(
+            r.role.description.as_ref().map(pbps_model::Text::raw),
+            Some("Read-only access")
+        );
         let customer = &r.role.grants[&"dbo.customer".parse().unwrap()];
         assert!(customer.contains(&pbps_model::Permission::ViewDefinition));
         assert!(r.intents.is_empty());

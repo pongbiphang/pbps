@@ -18,6 +18,8 @@
 //! which case this is, and an unreachable environment is `unanswerable` with
 //! no `data` at all (SPEC §9.8).
 
+use pbps_model::Text;
+
 use crate::{db, output};
 
 /// One ledger row, without opening its recorded schema.
@@ -59,14 +61,14 @@ pub struct LedgerRow {
     pub operator: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_sha: Option<String>,
+    pub git_sha: Option<pbps_model::Text>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_checksum: Option<String>,
 
     /// Why a baseline skipped the differences, or how an attempt failed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub reason: Option<pbps_model::Text>,
 
     /// Present only on a `staged` checkpoint: how far through the plan this
     /// environment is. Its absence is what "not mid-deployment" means, so it is
@@ -363,16 +365,21 @@ fn render(data: &StateListData) -> String {
                 },
                 e.operator.clone(),
                 e.git_sha
-                    .as_deref()
+                    .as_ref()
                     // Seven characters is what `git log --oneline` shows and
                     // what a reviewer pastes back; the full sha is in the JSON.
-                    .map(|s| s.chars().take(7).collect())
+                    // Cut before it is shown, so an escape is never cut in half.
+                    .map(|s| {
+                        Text::new(s.raw().chars().take(7).collect::<String>())
+                            .shown()
+                            .to_string()
+                    })
                     .unwrap_or_else(|| "-".to_owned()),
                 match (&e.reason, &e.unreadable) {
                     // The reason is the row's own text; an unreadable entry
                     // has none of its own and says why instead of nothing —
                     // which of the two, because they are not the same news.
-                    (Some(r), _) => r.clone(),
+                    (Some(r), _) => r.shown().to_string(),
                     (None, Some(Unreadable::UnsupportedVersion { .. })) => {
                         "(state format not read by this build)".to_owned()
                     }
@@ -432,9 +439,9 @@ mod tests {
             state_version: Some(1),
             unreadable: None,
             operator: operator.to_owned(),
-            git_sha: Some("0123456789abcdef".to_owned()),
+            git_sha: Some("0123456789abcdef".into()),
             plan_checksum: None,
-            reason: reason.map(str::to_owned),
+            reason: reason.map(Into::into),
             staged: None,
             tables: Some(1),
             modules: Some(0),
@@ -469,6 +476,45 @@ mod tests {
         // The escape is visible, not a dropped character: the reason is the
         // reason the row exists.
         assert!(!out.contains("ticket-9explained"), "{out}");
+    }
+
+    /// The reason and the commit are text the database carries, shown through
+    /// the one escape the other reports use, and the JSON keeps what was
+    /// recorded (#2084).
+    #[test]
+    fn a_reason_and_a_sha_with_control_characters_are_shown_escaped() {
+        let hostile = "a\nb\r\u{1b}[31mred\u{9b}2J\u{202e}";
+        let mut hostile_row = row_with("someone", Some(hostile));
+        hostile_row.git_sha = Some(hostile.into());
+        let json = serde_json::to_string(&hostile_row).unwrap();
+        let data = StateListData {
+            environment: "demo".to_owned(),
+            initialized: true,
+            limit: 50,
+            entries: vec![hostile_row],
+        };
+        let out = render(&data);
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "a raw control character in {out:?}"
+        );
+        assert!(
+            out.contains("a\\nb\\r\\u{1b}[31mred\\u{9b}2J\\u{202e}"),
+            "{out}"
+        );
+        assert_eq!(
+            json.matches(&serde_json::to_string(hostile).unwrap())
+                .count(),
+            2
+        );
+
+        // Negative: plain Unicode text is shown as it was recorded.
+        let data = StateListData {
+            entries: vec![row_with("someone", Some("工單 ünï 'q' {} 9"))],
+            ..data
+        };
+        assert!(render(&data).contains("工單 ünï 'q' {} 9"));
     }
 
     /// The columns still line up once a cell has been escaped, because the
@@ -549,7 +595,7 @@ mod tests {
         let mut data = unreadable(Unreadable::Malformed {
             detail: "x".to_owned(),
         });
-        data.entries[0].reason = Some("ticket-9".to_owned());
+        data.entries[0].reason = Some("ticket-9".into());
         let kept = render(&data);
         assert!(
             kept.contains("ticket-9") && !kept.contains("damaged"),

@@ -100,7 +100,9 @@ pub(crate) fn column(expected: &ColumnExpected<'_>, now: &pbps_model::Column) ->
         (expected.nullable.accepts(nullable), "nullability"),
         (expected.default.accepts(source.default), "default"),
         (
-            expected.deprecated.accepts(&deprecated.as_deref()),
+            expected
+                .deprecated
+                .accepts(&deprecated.as_ref().map(pbps_model::Text::raw)),
             "deprecation",
         ),
         (expected.collation.accepts(&collation.as_ref()), "collation"),
@@ -123,7 +125,7 @@ pub(crate) fn column(expected: &ColumnExpected<'_>, now: &pbps_model::Column) ->
         (expected.identity.accepts(&source.identity), "identity"),
         (expected.sequence.accepts(&source.sequence), "sequence"),
         (
-            expected.description == description.as_deref(),
+            expected.description == description.as_ref().map(pbps_model::Text::raw),
             "description",
         ),
     ] {

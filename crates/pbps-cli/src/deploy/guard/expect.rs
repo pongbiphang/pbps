@@ -57,7 +57,7 @@ impl<'a> ColumnExpected<'a> {
             nullable: kept(*nullable, changed.contains(&ColumnField::Nullable)),
             default: expression(source.default, ColumnField::Default),
             deprecated: kept(
-                deprecated.as_deref(),
+                deprecated.as_ref().map(pbps_model::Text::raw),
                 changed.contains(&ColumnField::Deprecated),
             ),
             collation: kept(
@@ -73,7 +73,7 @@ impl<'a> ColumnExpected<'a> {
             // source it gives the column at the close.
             identity: kept(source.identity, changed.contains(&ColumnField::Numbering)),
             sequence: kept(source.sequence, changed.contains(&ColumnField::Numbering)),
-            description: description.as_deref(),
+            description: description.as_ref().map(pbps_model::Text::raw),
         }
     }
 }

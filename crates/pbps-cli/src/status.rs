@@ -29,7 +29,7 @@ pub struct EnvStatus {
     pub environment: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: Option<pbps_model::Text>,
 
     /// `ok`, `warning`, `policy`, `failed`, `staged`, `drift`, `uninitialized`,
     /// `unreachable` or `unconfigured`.
@@ -46,7 +46,7 @@ pub struct EnvStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub git_sha: Option<String>,
+    pub git_sha: Option<pbps_model::Text>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
 
@@ -158,7 +158,7 @@ pub fn cmd_status(project: &Project, json: bool) -> anyhow::Result<()> {
             &checked_at,
             project.config.unmanaged,
         ));
-        row.description = environment.description.clone();
+        row.description = environment.description.as_deref().map(Into::into);
         rows.push(row);
     }
 
@@ -290,7 +290,12 @@ async fn one(
     if entry.snapshot.kind == pbps_model::StateKind::Failed {
         row.state = "failed";
         row.detail = Some(match &entry.snapshot.reason {
-            Some(reason) => format!("the last deployment attempt failed: {reason}"),
+            // `.raw()`: this sentence is the JSON `detail` as well as the line
+            // `render` prints, and `--format json` keeps what was recorded.
+            // Showing it escaped here would change the JSON, so the human line
+            // stays as it was until #2084 step 5 gives `detail` a type of its
+            // own.
+            Some(reason) => format!("the last deployment attempt failed: {}", reason.raw()),
             None => "the last deployment attempt failed".to_owned(),
         });
     }
@@ -653,10 +658,15 @@ fn render(rows: &[EnvStatus]) -> String {
             r.state,
             r.applied_at.as_deref().unwrap_or("-"),
             // Eight characters is what a person recognizes a commit by.
+            // Cut before it is shown, so an escape is never cut in half.
             r.git_sha
-                .as_deref()
-                .map(|s| &s[..s.len().min(8)])
-                .unwrap_or("-"),
+                .as_ref()
+                .map(|s| {
+                    pbps_model::Text::new(s.raw().chars().take(8).collect::<String>())
+                        .shown()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "-".to_owned()),
             r.operator.as_deref().unwrap_or("-"),
         ));
     }
@@ -1213,6 +1223,36 @@ mod tests {
         let mut r = row("prod", "ok");
         r.git_sha = Some("abc".into());
         assert!(render(&[r]).contains("abc"));
+    }
+
+    /// The recorded commit is database text. Shown, it is escaped and cut
+    /// before the escape, so a character is never cut in half; the JSON keeps
+    /// what was recorded (#2084).
+    #[test]
+    fn a_recorded_sha_is_shown_escaped_and_the_json_keeps_it() {
+        let hostile = "ab\n\r\u{1b}[31mred\u{9b}2J";
+        let mut r = row("prod", "ok");
+        r.git_sha = Some(hostile.into());
+        let out = render(std::slice::from_ref(&r));
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "a raw control character in {out:?}"
+        );
+        assert_eq!(out.lines().count(), 2, "a value started a line:\n{out}");
+        assert!(out.contains("ab\\n\\r\\u{1b}[31"), "{out}");
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains(&serde_json::to_string(hostile).unwrap()),
+            "{json}"
+        );
+        // Negative: a long Unicode sha is cut at a character, not a byte, and
+        // is not rewritten.
+        r.git_sha = Some("名前_ünï_0123456789".into());
+        let out = render(&[r]);
+        assert!(
+            out.contains("名前_ünï_0 ") && !out.contains("名前_ünï_01"),
+            "{out}"
+        );
     }
 
     #[test]
