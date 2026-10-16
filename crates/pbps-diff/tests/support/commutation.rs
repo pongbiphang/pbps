@@ -273,14 +273,16 @@ pub async fn run<E: Engine>(
 }
 
 /// Reads the three checks' facts from `db`, and holds it to an empty next
-/// plan against `desired`.
+/// plan against `desired`. A read that fails is the harness's (`Harness`);
+/// a database read whole that has not converged on the declarations is a
+/// difference (`Differs`), which [`converged`] says whose it is.
 pub async fn outcome<E: Engine>(
     engine: &E,
     db: &mut E::Db,
     desired: &pbps_load::Loaded,
     ids: &IdsFile,
     seeded: &[TableName],
-) -> Result<Outcome, String> {
+) -> Result<Outcome, Finding> {
     let Pulled { catalog, mut base } = engine.pull(db, &desired.schema).await?;
     let columns = catalog
         .tables
@@ -314,10 +316,10 @@ pub async fn outcome<E: Engine>(
             .iter()
             .map(|p| format!("{:?}", p.change))
             .collect();
-        return Err(format!(
+        return Err(Finding::Differs(format!(
             "the next plan is not empty:\n{}",
             changes.join("\n")
-        ));
+        )));
     }
     let access = engine.texts(db, &engine.access_sql()).await?;
     let mut rows = Vec::new();
@@ -433,6 +435,19 @@ pub fn prepare(engine: &str, dialect: &dyn Dialect, scenario: &Scenario, role: &
     }
 }
 
+/// Whose an outcome's failure is. The plan's own order not converging is a
+/// broken scenario; a swapped order that runs and does not converge is the
+/// pair not commuting, which a listed gap may hold.
+pub fn converged(own: bool, found: Finding) -> Finding {
+    match found {
+        Finding::Differs(e) if own => Finding::Harness(e),
+        kept @ (Finding::Harness(_)
+        | Finding::Differs(_)
+        | Finding::Stale(_)
+        | Finding::Nondeterministic(_)) => kept,
+    }
+}
+
 /// Runs `changes` in `order` on a database of its own, built from
 /// `creation`, and reads its outcome. `own` says whether this is the plan's
 /// own order, whose refusal is a broken scenario rather than a finding.
@@ -453,7 +468,7 @@ pub async fn outcome_of<E: Engine>(
         Err(e) => Err(Finding::Differs(e)),
         Ok(()) => outcome(engine, &mut db, &p.desired, ids, &p.seeded)
             .await
-            .map_err(Finding::Harness),
+            .map_err(|f| converged(own, f)),
     };
     engine.drop(db).await;
     out.map_err(|f| match f {
@@ -798,6 +813,24 @@ mod verdict_tests {
         assert!(verdict(&ordered, found(differs(), Some("x"))).is_some());
         let harness = Err(Finding::Harness("the swapped run failed".into()));
         assert!(verdict(&ordered, found(harness, Some("x"))).is_some());
+    }
+
+    /// A swapped order that runs but leaves a next plan is the pair's
+    /// difference, which a gap may list; the plan's own order doing so is a
+    /// broken scenario, and a read that fails is the harness's either way.
+    #[test]
+    fn a_swapped_order_that_does_not_converge_differs() {
+        let unconverged = || Finding::Differs("the next plan is not empty".into());
+        assert!(matches!(
+            converged(false, unconverged()),
+            Finding::Differs(_)
+        ));
+        assert!(matches!(
+            converged(true, unconverged()),
+            Finding::Harness(_)
+        ));
+        let unread = || Finding::Harness("pull failed".into());
+        assert!(matches!(converged(false, unread()), Finding::Harness(_)));
     }
 
     #[test]
