@@ -28,6 +28,9 @@ use pbps_pg::Postgres;
 #[path = "support/alias_batches.rs"]
 mod alias_batches;
 
+#[path = "support/commutation.rs"]
+mod commutation;
+
 #[path = "support/plan_names.rs"]
 mod plan_names_tests;
 

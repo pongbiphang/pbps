@@ -564,8 +564,10 @@ fn standing_default(
     })
 }
 
+// Visible in the crate for the ordering benchmark, which times planning
+// without the test-only observer that `diff` runs (#1965).
 #[allow(clippy::too_many_arguments)]
-fn diff_partial_rebuilding(
+pub(crate) fn diff_partial_rebuilding(
     base: Side<'_>,
     declared: Side<'_>,
     dialect: &dyn Dialect,

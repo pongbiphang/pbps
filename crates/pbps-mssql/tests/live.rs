@@ -32,6 +32,9 @@ use pbps_model::{
 };
 use pbps_mssql::Mssql;
 
+#[path = "support/commutation.rs"]
+mod commutation;
+
 #[path = "support/plan_names.rs"]
 mod plan_names_tests;
 

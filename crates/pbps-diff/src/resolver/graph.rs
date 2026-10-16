@@ -169,7 +169,7 @@ fn expression(c: &Change) -> Option<bool> {
 /// [`constraints`] over a plan that is its own logical plan, each step
 /// whole: the shape a test builds by hand.
 #[cfg(test)]
-pub(super) fn constraints_of_logical(
+pub(crate) fn constraints_of_logical(
     changes: &ChangeSet,
     observations: &[SurfaceResolution],
     annotations: &pbps_model::ModuleDeps,
