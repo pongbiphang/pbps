@@ -3,6 +3,9 @@
 
 mod assess;
 mod graph;
+// The ordering benchmark (#1965) times the constraints beside the effects.
+#[cfg(test)]
+pub(crate) use graph::constraints_of_logical;
 mod prepare;
 
 #[cfg(test)]

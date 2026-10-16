@@ -5905,3 +5905,44 @@ Also pinned by the units
 `a_partitions_own_names_stay_clear_of_its_parents_cloned_triggers`,
 `a_partition_change_under_a_standing_parent_is_probed` and
 `an_ordinary_table_declared_as_a_partition_is_attached`.
+
+<a id="dec-1965-1"></a>
+
+**DEC-1965.1. The commutation suite holds a listed sample to the engine, and
+lists the pairs it finds wrong rather than skipping them.** The verifier
+checks an order against the declared effects, so it cannot see an effect
+nobody declared. Each engine's live tests carry at most 30 scenarios. Each
+names a pair of steps the effects call independent, and runs the plan three
+times, each on its own database: in its own order, in the order
+`order::commute::swapped` gives, and made with new uids. The three runs must
+agree on the catalog as a pull reads it, the grants and owners, and the rows
+the base seeded. Choices:
+
+- **The swap moves only what it must.** Steps between the pair that lead to
+  the later one go before it, in their own order; the rest stay after the
+  earlier one. No step between them can both follow the earlier step and lead
+  to the later one, or a path would join the pair, so every edge still holds.
+- **One core, two engines.** The engine-independent half is
+  `pbps-diff/tests/support/commutation.rs`, included by path from each engine
+  crate's `live.rs`. The engines supply only how to run SQL and how to read
+  grants and rows. `order::commute` is public because those tests are outside
+  the crate; it plans nothing and changes no plan.
+- **A gap stays in the sample.** A pair the engine shows the effects wrong
+  about names the issue that tracks it. The suite requires it to keep showing
+  `Differs`, so the day the effects order the pair, the list has to change.
+  Dropping it would hide the gap the suite exists to show.
+- **The equivalence negative runs on SQL Server only.** A dependent pair
+  forced into both orders must fail the row check. PostgreSQL's `ADD COLUMN`
+  with a default fills the rows already there, so a column added before and
+  after an insert ends with the same value either way. SQL Server's does not
+  fill them for a nullable column. A default the insert's postcondition does
+  not pin, a non-constant one, leaves the row `NULL` in one order and filled
+  in the other.
+- **The PostgreSQL sample runs in `live-pg (capture)`.** `dialect` was
+  already the longest live shard. `docs/CI-PERFORMANCE.md` records both
+  samples' times.
+- **The benchmark is an ordinary test, small by default.** Every `#[ignore]`
+  test needs a CI job that runs it, and the full-size shapes take minutes.
+  Small, the shapes must plan and the effects must find no violation in the
+  pipeline's order; a negative runs the chain backwards. `PBPS_ORDER_BENCHMARK`
+  selects the full size for a report.

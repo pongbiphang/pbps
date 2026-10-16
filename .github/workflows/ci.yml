@@ -536,8 +536,12 @@ jobs:
       # Thirty seconds of this is one test waiting out `CONNECT_TIMEOUT` on
       # purpose: a firewall that drops rather than refuses is a category of its
       # own, and what proves the wait is bounded is waiting it out.
-      - run: cargo test -p pbps-pg --test live -- --ignored
+      - run: cargo test -p pbps-pg --test live -- --ignored --skip commutation::pairs
         if: matrix.suite == 'dialect'
+      # The commutation sample (#1965) rides with the capture half: `dialect`
+      # is the longest PostgreSQL shard, and the sample must not lengthen it.
+      - run: cargo test -p pbps-pg --test live -- --ignored commutation::pairs
+        if: matrix.suite == 'capture'
       - run: cargo test -p pbps-db --test live_pg -- --ignored
         if: matrix.suite == 'dialect'
       - run: python3 scripts/live-transport.py pg

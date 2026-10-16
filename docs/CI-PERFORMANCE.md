@@ -106,3 +106,27 @@ case unselected. To rebalance, move a word between the filter and its
 cargo test -p pbps-cli --test flow_pg -- --ignored --list --format terse \
   trigger routine function grant | grep -c ': test$'
 ```
+
+## The commutation sample
+
+The commutation suite (#1965) runs at most 30 pairs per engine. Each pair
+takes three databases: one for the plan's own order, one for the swapped
+order, and one for the plan made with new uids. Measured on the local host above, against one pinned
+server each:
+
+| Engine | Pairs | Wall time | Job and variant |
+| --- | ---: | ---: | --- |
+| PostgreSQL 18 | 30 | about 19s | `live-pg (capture)` |
+| SQL Server | 30 | about 60s | `live (dialect)` |
+
+Merge-group run 38839823549 gives the room each shard had:
+
+- `live-pg (dialect)` was the longest live shard at 21 minutes, so the
+  PostgreSQL sample runs in `capture` (7 minutes) instead. `dialect` skips it
+  by name, `commutation::pairs`, and `capture` selects it by the same
+  filter, so the two remain exact complements.
+- SQL Server's `live (dialect)` took 5 minutes, beside `live (flow)` at 11.
+
+Even several times slower on a runner, neither sample makes its shard the
+longest. A pair added past the cap is a recorded change: it replaces one or
+raises the cap, and then this table is re-measured.

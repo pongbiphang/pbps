@@ -24,6 +24,9 @@ tiberius.workspace = true
 
 [dev-dependencies]
 pbps-diff.workspace = true
+# The commutation suite (#1965) declares its scenarios in YAML and loads them
+# the way `plan` loads a schema directory.
+pbps-load.workspace = true
 indexmap.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 

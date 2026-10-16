@@ -1065,7 +1065,9 @@
         "future_grants_tests::future_grant_proof_respects_collation_missing_schemas_and_recorded_modules",
         "future_grants_tests::existing_unrecorded_modules_use_object_authority_and_preserve_denials",
         "positional_preflight_tests::tightening_reads_prior_writes_and_never_future_writes",
-        "positional_preflight_tests::a_catalog_key_counts_only_references_that_survive_the_current_delete"
+        "positional_preflight_tests::a_catalog_key_counts_only_references_that_survive_the_current_delete",
+        "commutation::a_row_written_before_and_after_the_column_it_fills_fails_the_row_check",
+        "commutation::pairs_the_effects_call_independent_commute_on_the_engine"
       ]
     },
     {
@@ -1559,7 +1561,8 @@
         "user_types_tests::a_vector_type_is_not_an_array_of_its_element",
         "user_types_tests::the_closure_names_what_a_type_reaches",
         "user_types_tests::a_nested_base_types_properties_move_the_pin_of_the_type_that_holds_it",
-        "user_types_tests::a_base_type_filed_in_pg_catalog_after_initdb_is_pinned_by_its_properties"
+        "user_types_tests::a_base_type_filed_in_pg_catalog_after_initdb_is_pinned_by_its_properties",
+        "commutation::pairs_the_effects_call_independent_commute_on_the_engine"
       ]
     },
     {
