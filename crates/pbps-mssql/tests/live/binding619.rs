@@ -1109,6 +1109,67 @@ async fn a_login_reads_its_own_server_reach_without_privilege() {
     }
 }
 
+/// A login can also read, without privilege, every database it can enter:
+/// `HAS_DBACCESS` over the databases `VIEW ANY DATABASE` lists. A login
+/// mapped into another database — as its owner or any user — or a database
+/// with `guest` enabled reads 1, as `master`, `tempdb` and `msdb` always do.
+/// Server-level reads show none of it, so a confined account is also one
+/// that enters no database but its own scratch and those three.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn a_login_reads_every_database_it_can_enter() {
+    let mut db = TestDb::create("dbaccess619").await;
+    let pid = std::process::id();
+    let password = "Pbps!Enter619x";
+    let login = format!("pbps619_enter_{pid}");
+    let mut admin = connect_live(&conn_str()).await.unwrap();
+    run(
+        &mut admin,
+        &[&*format!(
+            "CREATE LOGIN [{login}] WITH PASSWORD = N'{password}', CHECK_POLICY = OFF;"
+        )],
+    )
+    .await;
+    let mut conn = connect_live(&super::resolver_tests::login_url(
+        &login, password, "master",
+    ))
+    .await
+    .unwrap();
+    let enters = format!(
+        "SELECT CONVERT(bigint, HAS_DBACCESS(N'{}') * 1000 + HAS_DBACCESS(N'master') * 100 \
+             + HAS_DBACCESS(N'tempdb') * 10 + HAS_DBACCESS(N'msdb'));",
+        db.name
+    );
+    assert_eq!(number(&mut conn, &enters).await, 111);
+    run(
+        &mut db.conn,
+        &[
+            &*format!("CREATE USER [{login}] FOR LOGIN [{login}];"),
+            &*format!("ALTER ROLE db_owner ADD MEMBER [{login}];"),
+        ],
+    )
+    .await;
+    assert_eq!(number(&mut conn, &enters).await, 1111);
+    run(
+        &mut db.conn,
+        &[
+            &*format!("ALTER ROLE db_owner DROP MEMBER [{login}];"),
+            &*format!("DROP USER [{login}];"),
+        ],
+    )
+    .await;
+    assert_eq!(number(&mut conn, &enters).await, 111);
+    run(&mut db.conn, &["GRANT CONNECT TO guest;"]).await;
+    assert_eq!(
+        number(&mut conn, &enters).await,
+        1111,
+        "guest admits every login"
+    );
+    drop(conn);
+    drop_login(&mut admin, &login).await;
+    db.drop().await;
+}
+
 /// A database born from an unmodified `model` on the pinned build holds the
 /// fresh-install inventory #723's empty-at-birth check compares with. The
 /// same reads find a user object once there is one.

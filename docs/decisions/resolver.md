@@ -3162,6 +3162,12 @@ against the measured fresh-install inventory as `db_owner` (#619).**
     login granted `IMPERSONATE` on an administrator's login reads exactly
     as a confined one there, then becomes `sysadmin` by `EXECUTE AS LOGIN`.
     Its own grant row is visible to it, and is what refuses it.
+  - Confined also means entering no database but its own scratch and
+    `master`, `tempdb` and `msdb`: `HAS_DBACCESS` over every database
+    `VIEW ANY DATABASE` lists. A login mapped into the target, or a target
+    with `guest` enabled, reads 1 there, and no server-level read shows it.
+    This is the SQL Server half of #1667's rule, and the counterpart of
+    DEC-1672.1's ownership of another database.
   - The run-owned layout needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`
     (`securityadmin`, `dbcreator`), so it never runs on the target's
     instance.
@@ -3176,6 +3182,7 @@ against the measured fresh-install inventory as `db_owner` (#619).**
 
 **Pinned by** `a_global_temporary_table_marks_one_instance_to_every_login_on_it`,
 `a_login_reads_its_own_server_reach_without_privilege`,
+`a_login_reads_every_database_it_can_enter`,
 `a_database_born_from_model_holds_only_the_fresh_install_inventory` and
 `an_account_that_is_not_db_owner_cannot_see_what_its_database_holds`.
 

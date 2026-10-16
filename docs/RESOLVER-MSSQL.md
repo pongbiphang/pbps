@@ -194,6 +194,15 @@ for a moment keeps that type.
     and becomes `sysadmin` by `EXECUTE AS LOGIN`. Its grant row shows it.
   - `securityadmin` adds `ALTER ANY LOGIN` and `CREATE LOGIN`; `dbcreator`
     adds `CREATE ANY DATABASE`; `sysadmin` holds `CONTROL SERVER`.
+  - **And it enters no other database.** Confined means that `HAS_DBACCESS`
+    reads 1 only for its own scratch database and `master`, `tempdb` and
+    `msdb`, over every database `VIEW ANY DATABASE` lists. A login mapped
+    into the target, as its owner or any user, reads 1 there, and so does
+    every login on a target with `guest` enabled. Neither shows in a
+    server-level read, and either would let a scratch statement reach the
+    target by `USE` or a three-part name. This is #1667's SQL Server half:
+    no server-level permission and no access to another database
+    [`a_login_reads_every_database_it_can_enter`].
 - **The layout.** The run-owned layout creates the run's login and database,
   so it needs `ALTER ANY LOGIN` and `CREATE ANY DATABASE`, which no confined
   account holds. On the target's instance only the supplied layout runs: a
@@ -315,7 +324,8 @@ Fixture names are the tests #620 adds.
   - Plain component reads, compared (DEC-619.1).
   - The schema-bound `engine_effects` of §5.
 - **(b) Separation, reconstruction and assessment.**
-  - The marker, the confined-account read and the layout rule of §6.
+  - The marker, the confined-account reads (server and database reach) and
+    the layout rule of §6.
   - #723's inventory check, run as `db_owner` (§7), and emptying the
     supplied layout.
   - The externals shapes of §8.

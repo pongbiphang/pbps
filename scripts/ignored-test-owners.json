@@ -873,6 +873,7 @@
         "binding619::a_schema_lock_needs_ownership_a_deployer_lacks_and_misses_database_scope_changes",
         "binding619::a_ddl_witness_trigger_misses_some_changes_and_fails_other_users_ddl",
         "binding619::a_login_reads_its_own_server_reach_without_privilege",
+        "binding619::a_login_reads_every_database_it_can_enter",
         "binding619::a_database_born_from_model_holds_only_the_fresh_install_inventory",
         "binding619::an_account_that_is_not_db_owner_cannot_see_what_its_database_holds",
         "a_bare_name_in_another_schema_is_not_an_edge",
