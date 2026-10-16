@@ -1806,10 +1806,14 @@ pub(crate) fn order_after_releases(
                 .map(move |d| (table.clone(), d.base.clone()))
         })
         .collect();
+    use pbps_diff::order::{Refusal, Schedule, Source};
+    use pbps_model::resolver::OrderReason;
     let n = changes.changes.len();
-    // What each change waits for, by position.
-    let mut waits: Vec<std::collections::BTreeSet<usize>> =
-        vec![std::collections::BTreeSet::new(); n];
+    // What each change waits for, by position, and where that edge comes
+    // from: the catalog's live readers, the new text's names, or the
+    // changes' own payloads.
+    let mut waits: Vec<std::collections::BTreeMap<usize, Source>> =
+        vec![std::collections::BTreeMap::new(); n];
     for (i, p) in changes.changes.iter().enumerate() {
         let Some((table, live, column, _)) = changed_column(&names, &p.change) else {
             continue;
@@ -1823,7 +1827,7 @@ pub(crate) fn order_after_releases(
             .collect();
         for generated in &readers {
             if let Some(r) = release_of(changes, &names, &table, generated, &live, column) {
-                waits[i].insert(r);
+                waits[i].insert(r, Source::Catalog);
             }
         }
         // A generated column the catalog does not see reading the column,
@@ -1875,7 +1879,7 @@ pub(crate) fn order_after_releases(
                 continue;
             }
             if matches!(p.change, Change::AlterColumnType { .. }) {
-                waits[j].insert(i);
+                waits[j].entry(i).or_insert(Source::Lexical);
             } else if !reused(changes, column) {
                 let what = if added {
                     "the expression of the new"
@@ -1895,64 +1899,76 @@ pub(crate) fn order_after_releases(
                 if matches!(&q.change,
                     Change::AlterColumnDefault { uid: u, to: Some(_), .. } if u == uid)
                 {
-                    waits[j].insert(i);
+                    waits[j].entry(i).or_insert(Source::Effect);
                 }
             }
         }
     }
-    // Each change in the differ's order, a held one where what it waits for
-    // has run, checked against what it passed on the way.
-    let mut order: Vec<usize> = Vec::with_capacity(n);
-    let mut done = vec![false; n];
-    // Each held change, with where the order stood when it was held.
-    let mut held: Vec<(usize, usize)> = Vec::new();
-    let mut moved = 0;
-    for i in 0..n {
-        if !waits[i].iter().all(|w| done[*w]) {
-            held.push((i, order.len()));
-            moved += 1;
+    // Settled over those edges: a change runs where the differ put it unless
+    // an edge holds it back, then right after the last change it waits for
+    // (DEC-1391.1, DEC-1956.2). What a held change must not pass is kept, not
+    // moved along with it: the edges that would move it safely, its name
+    // slots and what its text names, are not stated yet (DEC-1956.3).
+    let mut schedule = Schedule::new(n);
+    for (i, ws) in waits.iter().enumerate() {
+        for (&w, &source) in ws {
+            schedule.edge(w, i, source, OrderReason::Structural);
+        }
+    }
+    for (h, ws) in waits.iter().enumerate() {
+        if ws.is_empty() {
             continue;
         }
-        order.push(i);
-        done[i] = true;
-        while let Some(k) = held
-            .iter()
-            .position(|(h, _)| waits[*h].iter().all(|w| done[*w]))
-        {
-            let (h, from) = held.remove(k);
-            passes(changes, &names, &required, h, &order[from..])?;
-            order.push(h);
-            done[h] = true;
+        // The furthest change it waits for, through what that waits for:
+        // settled, it lands right after it, and passes exactly the changes
+        // the differ put between (#1956 review). Bounding the kept orders by
+        // it states only the crossings that happen, not one per later change.
+        let mut reach = h;
+        let mut seen = std::collections::BTreeSet::from([h]);
+        let mut stack: Vec<usize> = ws.keys().copied().collect();
+        while let Some(w) = stack.pop() {
+            if seen.insert(w) {
+                reach = reach.max(w);
+                stack.extend(waits[w].keys().copied());
+            }
         }
+        keep_ahead(&mut schedule, changes, &names, &required, h, reach);
     }
-    if let Some(&(first, _)) = held.first() {
-        let column = changed_column(&names, &changes.changes[first].change).map_or_else(
-            || changes.changes[first].change.subject(),
-            |c| c.2.to_string(),
-        );
-        let waiting: Vec<String> = held
-            .iter()
-            .map(|(h, _)| {
-                let change = &changes.changes[*h].change;
-                format!("`{}` {}", change.subject(), crate::report::describe(change))
-            })
-            .collect();
-        return Err(format!(
-            "{column} cannot be retyped in this plan: these changes wait on one another, as two \
-             generated columns trading retyped inputs do: {}. Change those generated columns to \
-             expressions that read neither input in a plan of its own first, then this one.",
-            waiting.join(", ")
-        ));
-    }
-    let mut taken: Vec<Option<pbps_model::PlannedChange>> = std::mem::take(&mut changes.changes)
-        .into_iter()
-        .map(Some)
-        .collect();
-    changes.changes = order
-        .into_iter()
-        .map(|i| taken[i].take().expect("each change runs once"))
-        .collect();
-    Ok(moved)
+    let settled = match schedule.settle(changes.clone()) {
+        Ok(settled) => settled,
+        Err(refusal) => {
+            return Err(match refusal {
+                Refusal::Kept(keep) => keep.refusal,
+                Refusal::Cycle { waiting, .. } => {
+                    let first = waiting[0];
+                    let column = changed_column(&names, &changes.changes[first].change)
+                        .map_or_else(
+                            || changes.changes[first].change.subject(),
+                            |c| c.2.to_string(),
+                        );
+                    let waiting: Vec<String> = waiting
+                        .iter()
+                        .map(|&h| {
+                            let change = &changes.changes[h].change;
+                            format!("`{}` {}", change.subject(), crate::report::describe(change))
+                        })
+                        .collect();
+                    format!(
+                        "{column} cannot be retyped in this plan: these changes wait on one \
+                         another, as two generated columns trading retyped inputs do: {}. \
+                         Change those generated columns to expressions that read neither \
+                         input in a plan of its own first, then this one.",
+                        waiting.join(", ")
+                    )
+                }
+                Refusal::Outside { .. } | Refusal::Mismatch { .. } | Refusal::Unmet(_) => {
+                    refusal.to_string()
+                }
+            });
+        }
+    };
+    *changes = settled.changes;
+    Ok(pbps_diff::order::schedule::moved(&settled.sequence))
 }
 
 /// Whether the plan gives a dropped column's name to another column: a reader
@@ -1966,18 +1982,41 @@ fn reused(changes: &ChangeSet, column: &pbps_model::ColumnRef) -> bool {
     })
 }
 
-/// Refuses moving the change at `held` past `passed`, the changes that ran
-/// since it was held, where one of them needs what it holds back.
-fn passes(
+/// What the change at `held`, which waits for its release, must stay ahead
+/// of: a later change that needs what it holds back. A held change that
+/// would pass one is refused by name with the two-plan remedy (DEC-1316.1,
+/// DEC-1391.1). These are kept, not edges: moving the later change along
+/// would need the edges its own readers hang on, its name slots (#1957) and
+/// what texts name (#1967), which are not stated yet (DEC-1956.3).
+///
+/// `reach` is the furthest position among what `held` waits for, directly or
+/// not. Settled, `held` lands after it and passes every change the differ put
+/// before it, none of which is ever held itself: an insert, a name's taker, a
+/// row, key, module or grant waits for nothing here. So only the changes
+/// before `reach` are kept, and of each kind only the first, which is the one
+/// the refusal names: a plan of many retypes and rows states a few kept
+/// orders per held change, not one per pair (#1956 review). Stated in the
+/// order the refusals are checked.
+fn keep_ahead(
+    schedule: &mut pbps_diff::order::Schedule,
     changes: &ChangeSet,
     names: &pbps_model::plan_names::PlanNames<'_>,
     required: &std::collections::BTreeSet<(TableName, String)>,
     held: usize,
-    passed: &[usize],
-) -> Result<(), String> {
+    reach: usize,
+) {
     let change = &changes.changes[held].change;
     let Some((table, live, column, _)) = changed_column(names, change) else {
-        return Ok(());
+        return;
+    };
+    let later = || {
+        changes
+            .changes
+            .iter()
+            .enumerate()
+            .take(reach)
+            .skip(held + 1)
+            .map(|(i, p)| (i, &p.change))
     };
     // A drop holds its column until it runs, and an input that is `NOT NULL`
     // with no default refuses a row inserted without it, as every row of its
@@ -1986,36 +2025,40 @@ fn passes(
     // nullable or defaulted input lets the row in, and that plan applies.
     if matches!(change, pbps_model::Change::DropColumn { .. })
         && required.contains(&(table, live))
-        && let Some(insert) = passed.iter().map(|i| &changes.changes[*i].change).find(
-            |c| matches!(c, pbps_model::Change::InsertRow { table, .. } if *table == column.table),
+        && let Some((i, insert)) = later().find(
+            |(_, c)| matches!(c, pbps_model::Change::InsertRow { table, .. } if *table == column.table),
         )
     {
-        return Err(format!(
-            "{column} is dropped after the expression change that releases it, which \
-             follows `{}`: the column is NOT NULL with no default, so that row, which does \
-             not write it, is refused while the column stands. Apply the expression change \
-             in a plan of its own first, then this one.",
-            insert.subject()
-        ));
+        schedule.keep(
+            held,
+            i,
+            format!(
+                "{column} is dropped after the expression change that releases it, which \
+                 follows `{}`: the column is NOT NULL with no default, so that row, which \
+                 does not write it, is refused while the column stands. Apply the \
+                 expression change in a plan of its own first, then this one.",
+                insert.subject()
+            ),
+        );
     }
     // A drop holds its name until it runs: a change taking the name needs it
     // free, and the release needs the column still there.
-    if let Some(taker) = passed
-        .iter()
-        .map(|i| &changes.changes[*i].change)
-        .find(|c| {
-            matches!(c, pbps_model::Change::AddColumn { table, name, .. }
+    if let Some((i, taker)) = later().find(|(_, c)| {
+        matches!(c, pbps_model::Change::AddColumn { table, name, .. }
             if *table == column.table && *name == column.name)
-                || matches!(c, pbps_model::Change::RenameColumn { table, to, .. }
-                if *table == column.table && *to == column.name)
-        })
-    {
-        return Err(format!(
-            "{column} is released from its generated column by an expression change in this \
-             plan, and `{}` takes its name before that change runs. Apply the expression \
-             change in a plan of its own first, then this one.",
-            taker.subject()
-        ));
+            || matches!(c, pbps_model::Change::RenameColumn { table, to, .. }
+            if *table == column.table && *to == column.name)
+    }) {
+        schedule.keep(
+            held,
+            i,
+            format!(
+                "{column} is released from its generated column by an expression change in \
+                 this plan, and `{}` takes its name before that change runs. Apply the \
+                 expression change in a plan of its own first, then this one.",
+                taker.subject()
+            ),
+        );
     }
     // A retype never moves past what the differ puts after the column
     // alterations. A release that follows a function the plan creates
@@ -2025,19 +2068,19 @@ fn passes(
     // is checked against it. The retype cannot both follow the release and
     // precede them, so the plan is refused by name (DEC-1316.1).
     if matches!(change, pbps_model::Change::AlterColumnType { .. })
-        && let Some(past) = passed
-            .iter()
-            .map(|i| &changes.changes[*i].change)
-            .find(|c| after_the_alterations(c))
+        && let Some((i, past)) = later().find(|(_, c)| after_the_alterations(c))
     {
-        return Err(format!(
-            "{column} is retyped after the expression change that releases it, which \
-             follows `{}`: that change may need the new type. Apply the expression change \
-             in a plan of its own first, then this one.",
-            past.subject()
-        ));
+        schedule.keep(
+            held,
+            i,
+            format!(
+                "{column} is retyped after the expression change that releases it, which \
+                 follows `{}`: that change may need the new type. Apply the expression \
+                 change in a plan of its own first, then this one.",
+                past.subject()
+            ),
+        );
     }
-    Ok(())
 }
 
 /// A change the differ puts after the column alterations: rows, keys and
@@ -3571,6 +3614,11 @@ mod tests {
             "{:?}",
             cs.changes
         );
+        // Settled again under the same facts, the plan does not change
+        // (#1956).
+        let settled = cs.clone();
+        assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(0));
+        assert_eq!(cs, settled);
         assert!(matches!(&cs.changes[3].change,
             Change::AlterColumnDefault { column, .. } if column.name == "a"));
         // Released, the check has nothing left to refuse; unreleased, it
@@ -3891,6 +3939,83 @@ mod tests {
         assert_eq!(unreleased(&cs, &reads_a).len(), 1);
         assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(1));
         assert!(unreleased(&cs, &reads_a).is_empty(), "{:?}", cs.changes);
+    }
+
+    /// #1956 review: the kept orders a released retype states are the
+    /// crossings that happen, not one per later change. Released before the
+    /// rows, it passes none and keeps none; released after them, it keeps
+    /// only the first, the one its refusal names.
+    #[test]
+    fn a_released_retype_keeps_only_the_changes_it_would_pass() {
+        use pbps_model::{Change, ColumnRef, PlannedChange};
+        let t: TableName = "app.t".parse().unwrap();
+        let uid = |u: &str| -> pbps_model::Uid { u.parse().unwrap() };
+        let retype = PlannedChange::new(Change::AlterColumnType {
+            uid: uid("c_bbbbbb"),
+            column: ColumnRef::new(t.clone(), "a"),
+            from: "integer".parse().unwrap(),
+            to: "bigint".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+        });
+        let release = PlannedChange::new(Change::AlterColumnExpression {
+            uid: uid("c_dddddd"),
+            column: ColumnRef::new(t.clone(), "g"),
+            from: "(a * 2)".into(),
+            to: "b * 2".into(),
+        });
+        let update = |key: usize| {
+            PlannedChange::new(Change::UpdateRow {
+                table: t.clone(),
+                key_column: "id".into(),
+                key: pbps_model::RowKey::from(key.to_string().as_str()),
+                columns: BTreeMap::from([(
+                    "b".to_owned(),
+                    (
+                        pbps_model::Cell::Value(pbps_model::Value::Int(1)),
+                        pbps_model::Cell::Value(pbps_model::Value::Int(2)),
+                    ),
+                )]),
+                unchanged: BTreeMap::new(),
+                types: BTreeMap::new(),
+                after_types: BTreeMap::new(),
+                key_type: None,
+            })
+        };
+        let rows = 200;
+        let kept = |changes: Vec<PlannedChange>, held: usize, reach: usize| {
+            let cs = ChangeSet { changes };
+            let ids = crate::plan_fixture::ids(&cs);
+            let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
+            let mut schedule = pbps_diff::order::Schedule::new(cs.changes.len());
+            keep_ahead(
+                &mut schedule,
+                &cs,
+                &names,
+                &std::collections::BTreeSet::new(),
+                held,
+                reach,
+            );
+            schedule.kept_orders().to_vec()
+        };
+        // Released first: the retype waits for nothing after it.
+        let mut early = vec![release.clone(), retype.clone()];
+        early.extend((0..rows).map(update));
+        assert_eq!(kept(early, 1, 1), []);
+        // Released after every row: one kept order, the first row's.
+        let mut late = vec![retype];
+        late.extend((0..rows).map(update));
+        late.push(release);
+        let late = kept(late, 0, rows + 1);
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert_eq!((late[0].before, late[0].after), (0, 1));
+        assert!(
+            late[0].refusal.contains("may need the new type"),
+            "{late:?}"
+        );
     }
 
     /// The one frame the ready-phase review named: a `DbError::Driver`'s

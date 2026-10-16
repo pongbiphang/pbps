@@ -21,7 +21,7 @@ pub use assess::{Answer, Assessment, assess};
 
 use pbps_dialect::Dialect;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners};
-use pbps_model::resolver::{OrderEdge, OrderingProof, Surface, SurfaceResolution};
+use pbps_model::resolver::{OrderEdge, OrderReason, OrderingProof, Surface, SurfaceResolution};
 use pbps_model::{ChangeSet, IdsFile};
 use std::collections::BTreeSet;
 
@@ -33,8 +33,8 @@ pub enum Error {
     Coverage(Surface),
     #[error("resolver rebuild has no declared identity or definition: {0:?}")]
     Definition(Surface),
-    #[error("resolver ordering contains an unsupported dependency cycle")]
-    Cycle,
+    #[error("resolver ordering contains an unsupported dependency cycle: {0}")]
+    Cycle(String),
     #[error("resolver ordering refers to a change outside the plan")]
     Edge,
     #[error("resolver ordering cannot split this data-bearing operation: {0:?}")]
@@ -252,71 +252,42 @@ fn order(changes: ChangeSet, edges: BTreeSet<OrderEdge>) -> Result<Ordered, Erro
     ordered(changes, edges).map(|(ordered, _)| ordered)
 }
 
-/// The ordered plan and the positions it took its steps from.
+/// The ordered plan and the positions it took its steps from: `settle` over
+/// the resolver's own edges, which it keeps until #1968 (S7a). The order the
+/// steps arrive in is the tie-break, as before: it preserves the differ's
+/// identity and data order wherever no dependency requires movement
+/// (DEC-1956.2).
 fn ordered(changes: ChangeSet, edges: BTreeSet<OrderEdge>) -> Result<(Ordered, Vec<usize>), Error> {
-    let n = changes.changes.len();
-    let sequence = sequence(n, &edges)?;
-    let mut positions = vec![0; n];
-    let ordered = ChangeSet {
-        changes: sequence
-            .iter()
-            .enumerate()
-            .map(|(position, &i)| {
-                positions[i] = position;
-                changes.changes[i].clone()
-            })
-            .collect(),
-    };
-    let proof = OrderingProof::new(
-        &ordered,
-        edges
-            .into_iter()
-            .map(|e| OrderEdge {
-                before: positions[e.before],
-                after: positions[e.after],
-                reason: e.reason,
-            })
-            .collect(),
-    )
-    .map_err(|_| Error::Edge)?;
+    use crate::order::{Refusal, Schedule, Source};
+    let mut schedule = Schedule::new(changes.changes.len());
+    for edge in edges {
+        // `graph::constraints` states evidence and the differ's own
+        // relations in one set; only its binding edges are evidence. None is
+        // an annotation, so a cycle among them is refused as before.
+        let source = match edge.reason {
+            OrderReason::Binding => Source::Binding,
+            OrderReason::Structural
+            | OrderReason::Identity
+            | OrderReason::Data
+            | OrderReason::Authorization
+            | OrderReason::Restoration => Source::Effect,
+        };
+        schedule.edge(edge.before, edge.after, source, edge.reason);
+    }
+    let described = changes.clone();
+    let settled = schedule.settle(changes).map_err(|refusal| match refusal {
+        Refusal::Outside { .. } | Refusal::Mismatch { .. } => Error::Edge,
+        Refusal::Cycle { .. } | Refusal::Unmet(_) | Refusal::Kept(_) => {
+            Error::Cycle(refusal.describe(&described))
+        }
+    })?;
     Ok((
         Ordered {
-            changes: ordered,
-            proof,
+            changes: settled.changes,
+            proof: settled.proof,
         },
-        sequence,
+        settled.sequence,
     ))
-}
-
-/// The order of `n` steps under `edges`, as positions into them.
-fn sequence(n: usize, edges: &BTreeSet<OrderEdge>) -> Result<Vec<usize>, Error> {
-    let mut incoming = vec![0usize; n];
-    let mut outgoing = vec![BTreeSet::new(); n];
-    for edge in edges {
-        if edge.before >= n || edge.after >= n {
-            return Err(Error::Edge);
-        }
-        if outgoing[edge.before].insert(edge.after) {
-            incoming[edge.after] += 1;
-        }
-    }
-    // Original position is the deterministic tie-break. It preserves the
-    // differ's identity/data order wherever no dependency requires movement.
-    let mut ready: BTreeSet<_> = (0..n).filter(|&i| incoming[i] == 0).collect();
-    let mut sequence = Vec::with_capacity(n);
-    while let Some(i) = ready.pop_first() {
-        sequence.push(i);
-        for &after in &outgoing[i] {
-            incoming[after] -= 1;
-            if incoming[after] == 0 {
-                ready.insert(after);
-            }
-        }
-    }
-    if sequence.len() != n {
-        return Err(Error::Cycle);
-    }
-    Ok(sequence)
 }
 
 #[cfg(test)]

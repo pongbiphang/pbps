@@ -24,7 +24,8 @@ pub enum Violation {
         operation: OperationId,
         key: ObjectKey,
     },
-    /// An edge the effects imply runs the other way.
+    /// An edge the effects imply runs the other way: settled over the
+    /// effect graph, the order would not come back as given (DEC-1956.3).
     Edge {
         before: OperationId,
         after: OperationId,
@@ -45,13 +46,14 @@ struct Standing {
 
 /// Replays `operations` in the order given and refuses it where a
 /// requirement is not satisfied at its step, an `Absent` dependency is still
-/// present, a `depends_on:` edge is broken, or an edge the effects imply is
-/// not respected.
+/// present, or a `depends_on:` edge is broken; and settles the effect graph
+/// over the order, refusing it where `settle` would not give it back.
 ///
-/// Independent of whatever produced the order: it reads only the effects, the
-/// baseline and the annotations. In this slice the orders come from today's
-/// passes, so the edge check is a real one; once `settle` produces the order
-/// it holds by construction and is dropped. The replay stays (DEC-1954.6).
+/// The replay is independent of whatever produced the order: it reads only
+/// the effects, the baseline and the annotations (DEC-1954.6). The edges are
+/// no longer checked one by one: an order `settle` makes respects them by
+/// construction, and one a pass made is held to what `settle` would make of
+/// it (DEC-1956.3).
 pub fn verify(
     operations: &[Operation],
     effects: &[Effects],
@@ -167,19 +169,23 @@ pub(crate) fn verify_with(
             }
         }
     }
-    // Every edge the effects imply is respected by the order given.
+    // The edges the effects imply: settled over the order given, they must
+    // give it back (DEC-1956.3). Where they would not, each edge the order
+    // runs the other way is named. A `depends_on:` edge run the other way is
+    // the replay's own finding, whatever settle makes of it (#2083).
     let g = graph(operations, effects, baseline, declared, checks);
+    let unsettled: BTreeSet<Edge> = super::schedule::unsettled(&g, operations)
+        .into_iter()
+        .collect();
     for e in &g.edges {
-        if e.before >= e.after {
-            let (before, after) = (operations[e.before].id(), operations[e.after].id());
-            out.push(if e.source == Source::Declared {
-                Violation::BrokenDeclared { before, after }
-            } else {
-                Violation::Edge {
-                    before,
-                    after,
-                    edge: e.clone(),
-                }
+        let (before, after) = (operations[e.before].id(), operations[e.after].id());
+        if e.source == Source::Declared && e.before >= e.after {
+            out.push(Violation::BrokenDeclared { before, after });
+        } else if unsettled.contains(e) {
+            out.push(Violation::Edge {
+                before,
+                after,
+                edge: e.clone(),
             });
         }
     }

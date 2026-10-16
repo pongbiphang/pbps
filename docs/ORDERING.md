@@ -126,7 +126,9 @@ Then, in this order:
     `release_generated_inputs` then moves the retype or drop of a column a
     generated column reads after the expression change that stops reading it,
     and what needs the retype after it, by edges from the catalog and the
-    expressions' text (DEC-1316.1, DEC-1391.1). `release_generated_inputs` is
+    expressions' text (DEC-1316.1, DEC-1391.1), settled by
+    `Schedule::settle`; a moved change that would pass what needs it first
+    is refused by name (DEC-1956.3). `release_generated_inputs` is
     one of the passes that read the catalog themselves and so stay
     `plan --db`'s own calls after `schedule` (DEC-1955.1).
   - `split_new_tables` splits the parts of a new table whose text names a
@@ -193,7 +195,15 @@ requirement before the removal, a removal before what needs it gone, a
 rewrite before its readers, and two writes of one resource in their base
 order), replays the operations from the baseline and refuses an order they
 contradict (DEC-1954.6). It runs beside every order in tests and debug
-builds; the passes below still decide the order. The last column of the table
+builds; the passes below still decide the order. Where a pass moves changes
+by edges, the resolver's, the generated-column releases and the SQL Server
+computed-column releases, `order::schedule::Schedule::settle` orders them:
+Kahn's algorithm, the lowest position first among the changes that are
+ready, so a change an edge holds back sinks to right after what it waits for
+and nothing else moves (DEC-1956.2). Each edge carries one `OrderReason`
+(DEC-1956.1). The verifier settles the effect graph over every order it
+observes and requires the order back, so an edge the order reverses is
+named there (DEC-1956.3). The last column of the table
 is what the code reports for the kind, and `ordering_audit` refuses a
 difference, so a new kind or a new effect updates both (DEC-1954.1).
 
