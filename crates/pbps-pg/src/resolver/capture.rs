@@ -16,7 +16,7 @@ mod profile;
 mod scope;
 
 use pbps_db::resolver::capture::ObjectIdentity;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What a stored expression's node tree binds, by class (#1523, #2046).
 ///
@@ -30,11 +30,21 @@ pub(crate) struct Bound {
     /// Every function the tree names: calls, cast functions, an operator's
     /// own function (`opfuncid`).
     pub routines: BTreeSet<u32>,
-    /// Every operator, which runs its `pg_operator.oprcode`.
+    /// Every operator an operator node names, which runs its
+    /// `pg_operator.oprcode`.
     pub operators: BTreeSet<u32>,
+    /// The operators of a row comparison, each with the operator family the
+    /// engine finds it in. The executor does not call such an operator: it
+    /// calls the family's btree comparison support function for the
+    /// operator's types, so that is the code a row comparison runs.
+    pub row_compares: BTreeSet<(u32, u32)>,
     /// Every type: the type a coercion or a literal names.
     pub types: BTreeSet<u32>,
 }
+
+/// Where in the tree a row comparison's operator or family sits: the path to
+/// the node and the position in its lists.
+type RowCompareSlot = (Vec<String>, String);
 
 /// The objects a stored expression binds, or why the tree cannot be certified
 /// complete. The reason is the decoder's category only: a tree can hold a
@@ -43,9 +53,30 @@ pub(crate) fn bound_objects(text: &str, major: u32) -> Result<Bound, String> {
     let tree = nodes::decode(text, major)
         .map_err(|e| format!("the stored expression is not one this release can read ({e:?})"))?;
     let mut bound = Bound::default();
+    // A row comparison lists its operators and their families side by side, so
+    // each pair is found by the node and the position they share.
+    let mut compared: BTreeMap<RowCompareSlot, (Option<u32>, Option<u32>)> = BTreeMap::new();
     for reference in nodes::references(&tree, major).map_err(|e| {
         format!("the stored expression has a reference this release cannot read ({e:?})")
     })? {
+        if reference.node == "ROWCOMPAREEXPR"
+            && matches!(
+                reference.class,
+                nodes::ReferenceClass::Operator | nodes::ReferenceClass::OperatorFamily
+            )
+        {
+            let mut path = reference.path.clone();
+            let (Some(position), Some(_field)) = (path.pop(), path.pop()) else {
+                return Err("a row comparison's reference has no position".to_owned());
+            };
+            let entry = compared.entry((path, position)).or_default();
+            if reference.class == nodes::ReferenceClass::Operator {
+                entry.0 = Some(reference.oid);
+            } else {
+                entry.1 = Some(reference.oid);
+            }
+            continue;
+        }
         // A relation, collation, role, constraint or operator class an
         // expression names is not code of its own: what runs is the function
         // or the operator that takes it, and that is listed above.
@@ -60,6 +91,18 @@ pub(crate) fn bound_objects(text: &str, major: u32) -> Result<Bound, String> {
             | nodes::ReferenceClass::OperatorClass
             | nodes::ReferenceClass::OperatorFamily => false,
         };
+    }
+    for (operator, family) in compared.into_values() {
+        match (operator, family) {
+            (Some(operator), Some(family)) => {
+                bound.row_compares.insert((operator, family));
+            }
+            // An operator with no family, or the reverse, is a tree this cannot
+            // read to the end.
+            (Some(_), None) | (None, Some(_)) | (None, None) => {
+                return Err("a row comparison's operators and families do not pair".to_owned());
+            }
+        }
     }
     Ok(bound)
 }

@@ -19,7 +19,9 @@
 //!   built-ins that run SQL text or a type's code by name ([`RUNS_SQL`]). No
 //!   user function runs, so no user SQL runs, and no trigger, rule, policy or
 //!   view is reached: every route review kept finding by enumeration is absent by
-//!   construction.
+//!   construction. A row comparison is the one operator the executor does not
+//!   call: it runs its operator family's btree comparison function for the
+//!   operator's types, so that function is the code judged, not the operator's.
 //! - **(b) the types are owned by trusted roles.** Only the owner of a type can
 //!   change what its input path runs, and so can every role that can act as that
 //!   owner: by membership with `SET` or `INHERIT`, or by `ADMIN`, which can grant
@@ -769,6 +771,8 @@ async fn gather(
     // Where each routine is used, by OID.
     let mut functions: BTreeMap<Oid, Vec<Use>> = BTreeMap::new();
     let mut operators: BTreeMap<Oid, Vec<Use>> = BTreeMap::new();
+    // Operator and operator family of a row comparison.
+    let mut row_compares: BTreeMap<(Oid, Oid), Vec<Use>> = BTreeMap::new();
     let mut runs_code = false;
 
     let mut roots: Vec<Oid> = vec![root];
@@ -848,6 +852,12 @@ async fn gather(
                     .or_default()
                     .push(used_by.clone());
             }
+            for (operator, family) in &bound.row_compares {
+                row_compares
+                    .entry((Oid::from(*operator), Oid::from(*family)))
+                    .or_default()
+                    .push(used_by.clone());
+            }
             // A type an expression names is on the path: a cast to a domain
             // runs that domain's CHECKs. One the engine made is a leaf.
             for ty in &bound.types {
@@ -867,7 +877,8 @@ async fn gather(
         roots = next.into_iter().collect();
     }
 
-    let routines = unadmitted_routines(conn, runs_sql, &functions, &operators).await?;
+    let routines =
+        unadmitted_routines(conn, runs_sql, &functions, &operators, &row_compares).await?;
     let owned = types
         .values()
         .filter(|t| !is_builtin(t.oid))
@@ -1038,15 +1049,28 @@ async fn unadmitted_routines(
     runs_sql: &BTreeSet<Oid>,
     functions: &BTreeMap<Oid, Vec<Use>>,
     operators: &BTreeMap<Oid, Vec<Use>>,
+    row_compares: &BTreeMap<(Oid, Oid), Vec<Use>>,
 ) -> Result<Vec<RoutineReason>, Failure> {
-    let operator_rows = operator_rows(conn, &operators.keys().copied().collect::<Vec<_>>()).await?;
-    for (oid, row) in &operator_rows {
+    let mut operator_ids: BTreeSet<Oid> = operators.keys().copied().collect();
+    operator_ids.extend(row_compares.keys().map(|(operator, _)| *operator));
+    let operator_rows = operator_rows(conn, &operator_ids.into_iter().collect::<Vec<_>>()).await?;
+    for oid in operators.keys() {
+        let row = operator_rows.get(oid).ok_or_else(|| {
+            Failure::Uncertified(format!("the operator with OID {oid} is not in the catalog"))
+        })?;
         operator_function(*oid, row).map_err(Failure::Uncertified)?;
     }
+    let supports =
+        comparison_supports(conn, &row_compares.keys().copied().collect::<Vec<_>>()).await?;
     let mut wanted: BTreeSet<Oid> = BTreeSet::new();
     for oid in functions
         .keys()
-        .chain(operator_rows.values().map(|row| &row.code))
+        .chain(
+            operators
+                .keys()
+                .filter_map(|o| operator_rows.get(o).map(|row| &row.code)),
+        )
+        .chain(supports.values())
     {
         if why_not_admitted(*oid, runs_sql).is_some() {
             wanted.insert(*oid);
@@ -1104,6 +1128,76 @@ async fn unadmitted_routines(
                 why,
                 used_by: used_by.clone(),
             });
+        }
+    }
+    // A row comparison runs its operator family's btree comparison function for
+    // the operator's types, never the operator's own function.
+    for ((operator, family), uses) in row_compares {
+        let row = operator_rows.get(operator).ok_or_else(|| {
+            Failure::Uncertified(format!(
+                "the operator with OID {operator} is not in the catalog"
+            ))
+        })?;
+        let support = supports.get(&(*operator, *family)).ok_or_else(|| {
+            Failure::Uncertified(format!(
+                "the operator `{}` of a row comparison has no btree comparison function in its \
+                 operator family (OID {family})",
+                row.identity
+            ))
+        })?;
+        let Some(why) = why_not_admitted(*support, runs_sql) else {
+            continue;
+        };
+        let runs = function(*support)?;
+        for used_by in uses {
+            out.push(RoutineReason {
+                kind: RoutineKind::Operator,
+                identity: row.identity.clone(),
+                runs: Some(runs.identity.clone()),
+                owner: row.owner.clone(),
+                why,
+                used_by: used_by.clone(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The btree comparison function (support function 1) of the operator family
+/// for each (operator, family) of a row comparison, found by the types the
+/// operator has in the family, as the executor finds it.
+async fn comparison_supports(
+    conn: &mut Conn,
+    pairs: &[(Oid, Oid)],
+) -> Result<BTreeMap<(Oid, Oid), Oid>, DbError> {
+    if pairs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let operators: Vec<Oid> = pairs.iter().map(|(operator, _)| *operator).collect();
+    let families: Vec<Oid> = pairs.iter().map(|(_, family)| *family).collect();
+    let rows = conn
+        .query(&format!(
+            "SELECT o.amopopr::pg_catalog.int8 AS operator,
+                    o.amopfamily::pg_catalog.int8 AS family,
+                    p.amproc::pg_catalog.oid::pg_catalog.int8 AS support
+               FROM pg_catalog.pg_amop o
+               JOIN pg_catalog.pg_am am ON am.oid = o.amopmethod AND am.amname = 'btree'
+               JOIN pg_catalog.pg_amproc p
+                 ON p.amprocfamily = o.amopfamily
+                AND p.amproclefttype = o.amoplefttype
+                AND p.amprocrighttype = o.amoprighttype
+                AND p.amprocnum = 1
+              WHERE o.amopopr = ANY({}) AND o.amopfamily = ANY({})",
+            oid_array(&operators),
+            oid_array(&families)
+        ))
+        .await?;
+    let wanted: BTreeSet<(Oid, Oid)> = pairs.iter().copied().collect();
+    let mut out = BTreeMap::new();
+    for row in &rows {
+        let key = (need(row, "operator")?, need(row, "family")?);
+        if wanted.contains(&key) {
+            out.insert(key, need(row, "support")?);
         }
     }
     Ok(out)
@@ -1516,6 +1610,32 @@ mod tests {
             assert!(bound.types.contains(&25), "{major}");
             assert!(bound.routines.iter().all(|f| is_builtin(Oid::from(*f))));
         }
+    }
+
+    /// `CHECK (ROW(VALUE, 1) OPERATOR(app.@<@) ROW(5, 5))` over a user operator
+    /// class: the operator is 1498445 and its family 1498446 (16: 196995 and
+    /// 196996, `:rctype` for `:cmptype`).
+    const ROW_COMPARE_18: &str = "{ROWCOMPAREEXPR :cmptype 1 :opnos (o 1498445 1498445) :opfamilies (o 1498446 1498446) :inputcollids (o 0 0) :largs ({COERCETODOMAINVALUE :typeId 23 :typeMod -1 :collation 0 :location -1} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :rargs ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location -1 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]})}";
+    const ROW_COMPARE_16: &str = "{ROWCOMPAREEXPR :rctype 1 :opnos (o 196995 196995) :opfamilies (o 196996 196996) :inputcollids (o 0 0) :largs ({COERCETODOMAINVALUE :typeId 23 :typeMod -1 :collation 0 :location 45} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location 52 :constvalue 4 [ 1 0 0 0 0 0 0 0 ]}) :rargs ({CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location 77 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]} {CONST :consttype 23 :consttypmod -1 :constcollid 0 :constlen 4 :constbyval true :constisnull false :location 80 :constvalue 4 [ 5 0 0 0 0 0 0 0 ]})}";
+
+    #[test]
+    fn a_row_comparison_is_its_operator_and_family_and_not_a_call_of_the_operator() {
+        for (text, major, pair) in [
+            (ROW_COMPARE_18, 18, (1_498_445, 1_498_446)),
+            (ROW_COMPARE_16, 16, (196_995, 196_996)),
+        ] {
+            let bound = bound_objects(text, major).expect("a measured tree decodes");
+            // The executor calls the family's comparison function, so the
+            // operator is not listed as one that runs its own function.
+            assert!(bound.operators.is_empty(), "{major}: {bound:?}");
+            assert!(bound.routines.is_empty(), "{major}: {bound:?}");
+            assert_eq!(bound.row_compares, BTreeSet::from([pair]), "{major}");
+        }
+        // Negative: operators and families that do not pair are an error and
+        // never a smaller set.
+        let unpaired =
+            ROW_COMPARE_18.replace(":opfamilies (o 1498446 1498446)", ":opfamilies (o 1498446)");
+        assert!(bound_objects(&unpaired, 18).is_err());
     }
 
     #[test]

@@ -1575,7 +1575,8 @@
         "input_path_tests::every_function_on_the_runs_sql_list_exists_is_built_in_and_runs_what_it_is_given",
         "input_path_tests::reading_the_gate_runs_none_of_the_types_code",
         "input_path_tests::only_the_declared_types_own_default_is_on_the_input_path",
-        "input_path_tests::a_default_the_statement_carries_replaces_the_domains_and_its_checks_still_run"
+        "input_path_tests::a_default_the_statement_carries_replaces_the_domains_and_its_checks_still_run",
+        "input_path_tests::a_row_comparison_runs_its_familys_comparison_function_and_not_the_operators"
       ]
     },
     {

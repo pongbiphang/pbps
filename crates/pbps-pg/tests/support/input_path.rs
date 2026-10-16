@@ -705,6 +705,77 @@ async fn a_default_the_statement_carries_replaces_the_domains_and_its_checks_sti
     }
 }
 
+/// A row comparison runs its operator family's btree comparison function for
+/// the operator's types and never the operator's own function (measured on 16
+/// and 18): a user operator over a family with a built-in comparison function
+/// runs no user code, and a built-in operator in a family whose comparison
+/// function a role wrote runs it.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_row_comparison_runs_its_familys_comparison_function_and_not_the_operators() {
+    for server in servers() {
+        let mut db = Scratch::create(&server, "growcmp").await;
+        let (_, mut me) = deployer(&mut db).await;
+        let label = server.label;
+        // An operator class takes a superuser.
+        db.sql(
+            "CREATE FUNCTION app.op_boom(integer, integer) RETURNS boolean LANGUAGE plpgsql
+                 IMMUTABLE AS $$ BEGIN RAISE EXCEPTION 'operator ran'; END $$;
+             CREATE FUNCTION app.cmp_boom(integer, integer) RETURNS integer LANGUAGE plpgsql
+                 IMMUTABLE AS $$ BEGIN RAISE EXCEPTION 'comparison ran'; END $$;
+             -- a user operator, in a family whose comparison function is built in
+             CREATE OPERATOR app.@<@ (leftarg = integer, rightarg = integer,
+                 function = app.op_boom);
+             CREATE OPERATOR CLASS app.user_op_ops FOR TYPE integer USING btree AS
+                 OPERATOR 1 app.@<@, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >,
+                 FUNCTION 1 btint4cmp(integer, integer);
+             -- a built-in operator function, in a family whose comparison is a user's
+             CREATE OPERATOR app.@<# (leftarg = integer, rightarg = integer,
+                 function = int4lt);
+             CREATE OPERATOR CLASS app.user_cmp_ops FOR TYPE integer USING btree AS
+                 OPERATOR 1 app.@<#, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >,
+                 FUNCTION 1 app.cmp_boom(integer, integer);",
+        )
+        .await;
+        run(
+            &mut me,
+            label,
+            "CREATE DOMAIN app.user_operator AS integer
+                 CHECK (ROW(VALUE, 1) OPERATOR(app.@<@) ROW(5, 5));
+             CREATE DOMAIN app.user_comparison AS integer
+                 CHECK (ROW(VALUE, 1) OPERATOR(app.@<#) ROW(5, 5));
+             CREATE TABLE app.rows (i integer);
+             INSERT INTO app.rows VALUES (1), (2);
+             ALTER TABLE app.rows ADD COLUMN a app.user_operator DEFAULT 3;",
+        )
+        .await;
+        let err = me
+            .execute("ALTER TABLE app.rows ADD COLUMN b app.user_comparison DEFAULT 3")
+            .await
+            .expect_err("the comparison function must run");
+        assert!(err.to_string().contains("comparison ran"), "{err}");
+
+        let path = gate(&mut me, &[], "user_operator").await;
+        assert!(
+            admitted(&path, &format!("user_operator on {label}")),
+            "the operator's own function is not what runs"
+        );
+        let path = gate(&mut me, &[], "user_comparison").await;
+        let all = refused(&path, "user_comparison");
+        let hits = routines(all);
+        assert_eq!(hits.len(), 1, "on {label}: {all:?}");
+        assert_eq!(hits[0].kind, RoutineKind::Operator);
+        assert_eq!(hits[0].why, Why::NotBuiltin);
+        assert!(hits[0].identity.contains("@<#"), "{:?}", hits[0]);
+        assert_eq!(
+            hits[0].runs.as_deref(),
+            Some("app.cmp_boom(integer,integer)")
+        );
+        drop(me);
+        db.drop().await;
+    }
+}
+
 /// The node tree finds every user routine the engine's own record (`pg_depend`)
 /// does, in every shape an expression can hold one (a branch, an argument, a
 /// list, a range of `BETWEEN`, a row, a subscript, a coercion, a constructor),
