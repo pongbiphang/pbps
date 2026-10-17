@@ -196,7 +196,8 @@ impl<'a> Tables<'a> {
         for name in &self.kept {
             if !after.tables.contains_key(*name) {
                 moved.push(format!(
-                    "{name} is gone, and no change of this plan drops it"
+                    "{name} is gone, and no change of this plan drops it",
+                    name = name.shown()
                 ));
             }
         }
@@ -205,12 +206,14 @@ impl<'a> Tables<'a> {
     pub(crate) fn after(&self, after: &Schema, moved: &mut Vec<String>) {
         for (name, expected) in &self.final_presence {
             match (expected, after.tables.contains_key(*name)) {
-                (Presence::Present, false) => {
-                    moved.push(format!("{name} is not there, and this plan creates it"))
-                }
-                (Presence::Absent, true) => {
-                    moved.push(format!("{name} is still there, and this plan removes it"))
-                }
+                (Presence::Present, false) => moved.push(format!(
+                    "{name} is not there, and this plan creates it",
+                    name = name.shown()
+                )),
+                (Presence::Absent, true) => moved.push(format!(
+                    "{name} is still there, and this plan removes it",
+                    name = name.shown()
+                )),
                 (Presence::Present, true) | (Presence::Absent, false) => {}
             }
         }

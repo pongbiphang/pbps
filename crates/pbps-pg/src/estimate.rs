@@ -1,3 +1,6 @@
+// Estimate descriptions are shared cost JSON; keep operands raw until #2084 step 5 (DEC-2084.1).
+// The cost text renderer escapes the complete description once.
+
 //! How expensive a change is, which is a different question from how dangerous
 //! it is ([ADR-0012](../docs/ADR-0012-postgres-type-catalogue.md) §3–§4,
 //! SPEC 14.1's P1 row).
@@ -476,7 +479,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                 }
             };
             e(
-                format!("changing {column} to {to}"),
+                format!("changing {column} to {to}", column = column.raw()),
                 &column.table,
                 rewrite,
                 reads,
@@ -491,7 +494,8 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         } => e(
             format!(
                 "switching {table} to {}",
-                if *unlogged { "unlogged" } else { "logged" }
+                if *unlogged { "unlogged" } else { "logged" },
+                table = table.raw()
             ),
             table,
             Rewrite::Yes,
@@ -517,7 +521,10 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                 }
             };
             e(
-                format!("setting storage parameters of {of} on {table}"),
+                format!(
+                    "setting storage parameters of {of} on {table}",
+                    table = table.raw()
+                ),
                 table,
                 Rewrite::No,
                 Reads::Nothing,
@@ -538,7 +545,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             let catalog =
                 set.contains_key("user_catalog_table") || reset.contains("user_catalog_table");
             e(
-                format!("setting storage parameters of {table}"),
+                format!("setting storage parameters of {table}", table = table.raw()),
                 table,
                 Rewrite::No,
                 Reads::Nothing,
@@ -555,7 +562,10 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // Measured on 16 and 18 against a 473 MB table, each form ran in
         // about a millisecond and left `seq_scan` unchanged (#1478).
         Change::SetReplicaIdentity { table, .. } => e(
-            format!("setting the replica identity of {table}"),
+            format!(
+                "setting the replica identity of {table}",
+                table = table.raw()
+            ),
             table,
             Rewrite::No,
             Reads::Nothing,
@@ -571,7 +581,8 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         } => e(
             format!(
                 "making {column} {}",
-                if *to_nullable { "nullable" } else { "NOT NULL" }
+                if *to_nullable { "nullable" } else { "NOT NULL" },
+                column = column.raw()
             ),
             &column.table,
             Rewrite::No,
@@ -590,7 +601,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             column,
             ..
         } => {
-            let about = format!("adding the column {}", table.column(name));
+            let about = format!("adding the column {}", table.column(name).raw());
             // Measured, `ADD COLUMN d integer DEFAULT 7` rewrites nothing and
             // reads nothing, and `ADD COLUMN d uuid DEFAULT gen_random_uuid()`
             // rebuilds the table. Both are one `AddColumn` carrying a default,
@@ -644,7 +655,10 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // smaller" are different claims, and an estimate that ran them together
         // would be wrong in the direction that surprises an operator.
         Change::DropColumn { column, .. } => e(
-            format!("dropping {column}, which does not reclaim its space"),
+            format!(
+                "dropping {column}, which does not reclaim its space",
+                column = column.raw()
+            ),
             &column.table,
             Rewrite::No,
             Reads::Nothing,
@@ -733,7 +747,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // Catalog-only, measured: a default is a property of the column here
         // and existing rows keep whatever they hold.
         Change::AlterColumnDefault { column, .. } => e(
-            format!("changing the default of {column}"),
+            format!("changing the default of {column}", column = column.raw()),
             &column.table,
             Rewrite::No,
             Reads::Nothing,
@@ -743,7 +757,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // The same two statements on a partition alone (#1581): a default
         // is catalog-only, and a NOT NULL reads the partition's rows.
         Change::SetPartitionDefault { table, column, .. } => e(
-            format!("changing the default of {}", table.column(column)),
+            format!("changing the default of {}", table.column(column).raw()),
             table,
             Rewrite::No,
             Reads::Nothing,
@@ -757,7 +771,7 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         } => e(
             format!(
                 "making {} {}",
-                table.column(column),
+                table.column(column).raw(),
                 if *not_null { "NOT NULL" } else { "nullable" }
             ),
             table,
@@ -774,7 +788,10 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         // and rewrites the table under `ACCESS EXCLUSIVE`, rebuilding its
         // indexes (DEC-1168.1).
         Change::AlterColumnExpression { column, .. } => e(
-            format!("recomputing the generated column {column}"),
+            format!(
+                "recomputing the generated column {column}",
+                column = column.raw()
+            ),
             &column.table,
             Rewrite::Yes,
             Reads::EveryRow,
@@ -797,13 +814,14 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         } => {
             let installed = pbps_model::NumberingKind::installed(from, to);
             let mut estimate = e(
-                format!("changing how {column} is numbered"),
+                format!("changing how {column} is numbered", column = column.raw()),
                 &column.table,
                 Rewrite::No,
                 if installed {
                     Reads::Unknown(format!(
                         "the greatest value of {column}: one index probe where an index leads \
-                         with it, every row where none does"
+                         with it, every row where none does",
+                        column = column.raw()
                     ))
                 } else {
                     Reads::Nothing
@@ -840,14 +858,14 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         }
 
         Change::RenameColumn { table, from, .. } => e(
-            format!("renaming {}", table.column(from)),
+            format!("renaming {}", table.column(from).raw()),
             table,
             Rewrite::No,
             Reads::Nothing,
             Lock::AccessExclusive,
         ),
         Change::RenameTable { from, .. } => e(
-            format!("renaming the table {from}"),
+            format!("renaming the table {from}", from = from.raw()),
             from,
             Rewrite::No,
             Reads::Nothing,
@@ -874,7 +892,9 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                 format!(
                     "creating the partition {name} of {} by moving the rows of its range out of \
                      the DEFAULT partition {default} and attaching it",
-                    of.parent
+                    of.parent.raw(),
+                    name = name.raw(),
+                    default = default.raw()
                 ),
                 default,
                 Rewrite::No,
@@ -884,7 +904,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         }),
         Change::CreateTable { name, table, .. } => table.partition_of.as_ref().and_then(|of| {
             e(
-                format!("creating the partition {name} of {}", of.parent),
+                format!(
+                    "creating the partition {name} of {}",
+                    of.parent.raw(),
+                    name = name.raw()
+                ),
                 &of.parent,
                 Rewrite::No,
                 Reads::Unknown(
@@ -896,7 +920,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             )
         }),
         Change::DetachPartition { table, parent, .. } => e(
-            format!("detaching the partition {table} from {parent}"),
+            format!(
+                "detaching the partition {table} from {parent}",
+                table = table.raw(),
+                parent = parent.raw()
+            ),
             parent,
             Rewrite::No,
             Reads::Unknown(
@@ -915,7 +943,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             bound: pbps_model::PartitionBound::Default,
             ..
         } => e(
-            format!("attaching {table} to {parent} as its DEFAULT partition"),
+            format!(
+                "attaching {table} to {parent} as its DEFAULT partition",
+                table = table.raw(),
+                parent = parent.raw()
+            ),
             table,
             Rewrite::No,
             Reads::EveryRow,
@@ -929,7 +961,9 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         Change::AttachPartition { table, parent, .. } => e(
             format!(
                 "attaching {table} to {parent} as a partition; the parent's DEFAULT partition, if \
-                 it has one, is scanned for rows inside the range as well"
+                 it has one, is scanned for rows inside the range as well",
+                table = table.raw(),
+                parent = parent.raw()
             ),
             table,
             Rewrite::No,
@@ -941,7 +975,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             detach_from: Some(parent),
             ..
         } => e(
-            format!("detaching and dropping the partition {name} of {parent}"),
+            format!(
+                "detaching and dropping the partition {name} of {parent}",
+                name = name.raw(),
+                parent = parent.raw()
+            ),
             parent,
             Rewrite::No,
             Reads::Unknown(
@@ -1543,7 +1581,7 @@ mod tests {
                 let CatalogSource::Stored { table, .. } = &e.source else {
                     panic!("no table in this plan is new");
                 };
-                (e.table.to_string(), table.to_string())
+                (e.table.raw().to_string(), table.raw().to_string())
             })
             .collect();
         assert_eq!(

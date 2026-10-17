@@ -413,8 +413,8 @@ pub type ObservedRows = BTreeMap<TableName, ObservedTable>;
 /// every connected command that projects rows.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "{table}: rows `{first}` and `{second}` are the same row to the database (its key is \
-     `{canonical}`); declare it once"
+    "{}: rows `{first}` and `{second}` are the same row to the database (its key is \
+     `{canonical}`); declare it once", .table.shown()
 )]
 pub struct RowConflict {
     pub table: TableName,
@@ -867,7 +867,8 @@ pub fn check_with_sources(
     let key_column = match &table.primary_key {
         None => {
             problems.push(format!(
-                "{name}: a `data:` block needs a primary key — the row keys are primary-key values"
+                "{name}: a `data:` block needs a primary key — the row keys are primary-key values",
+                name = name.shown()
             ));
             None
         }
@@ -880,7 +881,8 @@ pub fn check_with_sources(
                 "{name}: a `data:` block needs a single-column primary key; this one has {} \
                  ({}). Composite keys are not supported yet",
                 pk.columns.len(),
-                pk.columns.join(", ")
+                pk.columns.join(", "),
+                name = name.shown()
             ));
             None
         }
@@ -895,7 +897,8 @@ pub fn check_with_sources(
         for source in sources.get(column, spec) {
             match source {
                 ValueSource::Generated(_) => problems.push(format!(
-                    "{name}: declared rows set `{column}` through their primary-key values, but it is a generated column the engine computes — use an ordinary declared key or leave the rows outside reference-data management"
+                    "{name}: declared rows set `{column}` through their primary-key values, but it is a generated column the engine computes — use an ordinary declared key or leave the rows outside reference-data management",
+                    name = name.shown(),
                 )),
                 // A `serial` key is refused by the dialect that holds one (#1631).
                 ValueSource::None
@@ -909,7 +912,8 @@ pub fn check_with_sources(
         for column in row.0.keys() {
             if !table.columns.contains_key(column) {
                 problems.push(format!(
-                    "{name}: row `{key}` sets `{column}`, which the table does not declare"
+                    "{name}: row `{key}` sets `{column}`, which the table does not declare",
+                    name = name.shown()
                 ));
             }
             // The key is the one identity column a row may pin, and it pins it
@@ -924,13 +928,15 @@ pub fn check_with_sources(
                             if key_column.as_deref() != Some(column.as_str()) {
                                 problems.push(format!(
                                     "{name}: row `{key}` sets `{column}`, which is an IDENTITY column the engine \
-                                     assigns — leave it out"
+                                     assigns — leave it out",
+                                    name = name.shown(),
                                 ));
                             }
                         }
                         ValueSource::Generated(_) => problems.push(format!(
                             "{name}: row `{key}` sets `{column}`, which is a generated column the engine \
-                             computes — leave it out"
+                             computes — leave it out",
+                            name = name.shown(),
                         )),
                         // The engine's to number, as an identity is, and never
                         // read back (#1631, DECISIONS 94). A `serial` key is
@@ -939,7 +945,8 @@ pub fn check_with_sources(
                             if key_column.as_deref() != Some(column.as_str()) {
                                 problems.push(format!(
                                     "{name}: row `{key}` sets `{column}`, which is a `serial` column \
-                                     its sequence numbers — leave it out"
+                                     its sequence numbers — leave it out",
+                                    name = name.shown(),
                                 ));
                             }
                         }
@@ -953,7 +960,8 @@ pub fn check_with_sources(
                 // row is this" — the bug map keys exist to make unwritable.
                 problems.push(format!(
                     "{name}: row `{key}` sets `{column}`, which is the primary key — the row's key \
-                     is already its value"
+                     is already its value",
+                    name = name.shown()
                 ));
             }
         }
@@ -981,7 +989,8 @@ pub fn check_with_sources(
                         " — leave it out to get the default"
                     } else {
                         ""
-                    }
+                    },
+                    name = name.shown()
                 )),
                 None if sources.get(column, spec).iter().all(|source| match source {
                     ValueSource::None => true,
@@ -992,7 +1001,8 @@ pub fn check_with_sources(
                 }) =>
                 {
                     problems.push(format!(
-                        "{name}: row `{key}` leaves `{column}` unset, but it is NOT NULL with no default"
+                        "{name}: row `{key}` leaves `{column}` unset, but it is NOT NULL with no default",
+                        name = name.shown(),
                     ));
                 }
                 _ => {}

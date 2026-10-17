@@ -39,7 +39,8 @@ pub enum DiffError {
     /// has to be rebuilt. That is beyond what declarative automation should do on
     /// its own — a human has to choose the migration strategy.
     #[error(
-        "the IDENTITY property of {column} changed, but IDENTITY cannot be modified with ALTER"
+        "the IDENTITY property of {column} changed, but IDENTITY cannot be modified with ALTER",
+        column = .column.shown(),
     )]
     IdentityChangeUnsupported { column: ColumnRef },
 
@@ -49,7 +50,8 @@ pub enum DiffError {
     /// sequence changed on an engine without one (#1889).
     #[error(
         "column {column}: a `serial` put on an UNLOGGED table, or an owned sequence changed \
-         where this engine has none, is not planned yet. Make the change by hand, then pull."
+         where this engine has none, is not planned yet. Make the change by hand, then pull.",
+        column = .column.shown(),
     )]
     SequenceChangeUnsupported { column: ColumnRef },
 
@@ -60,7 +62,8 @@ pub enum DiffError {
     #[error(
         "column {column}: its identity or `serial` sequence changes on a partitioned table or a \
          partition, which is not planned yet (issues #1681, #1893). Make the change by hand, \
-         then pull."
+         then pull.",
+        column = .column.shown(),
     )]
     NumberingChangeOnPartitionedTable { column: ColumnRef },
 
@@ -71,7 +74,8 @@ pub enum DiffError {
     #[error(
         "column {column}: its identity or `serial` sequence changes direction, from counting up \
          to counting down or back, which is not planned. Give the column a new source in two \
-         steps, removing the old one first, or make the change by hand, then pull."
+         steps, removing the old one first, or make the change by hand, then pull.",
+        column = .column.shown(),
     )]
     NumberingDirectionChange { column: ColumnRef },
 
@@ -82,7 +86,8 @@ pub enum DiffError {
     #[error(
         "rows of {table} reference {referenced}, whose rows this plan inserts after putting a \
          numbering source on it, once its deleted rows are gone; {table}'s rows would be \
-         written first. Apply the row changes of {referenced} in a plan of their own first."
+         written first. Apply the row changes of {referenced} in a plan of their own first.",
+        table = .table.shown(), referenced = .referenced.shown(),
     )]
     RowsReferenceLateIdentityRows {
         table: TableName,
@@ -96,7 +101,8 @@ pub enum DiffError {
     /// the expression of a column that stays generated is changed in place.
     #[error(
         "column {column}: a change between generated and not generated, or between stored and \
-         virtual, has no in-place form. To change it, add a new column and drop this one."
+         virtual, has no in-place form. To change it, add a new column and drop this one.",
+        column = .column.shown(),
     )]
     GenerationChangeUnsupported { column: ColumnRef },
 
@@ -108,7 +114,8 @@ pub enum DiffError {
     #[error(
         "computed column {computed} may read `{column}`, which this plan {change}, and SQL \
          Server refuses that while the computed column stands. Drop the computed column, or \
-         change its expression, in a plan of its own first, then this one."
+         change its expression, in a plan of its own first, then this one.",
+        computed = .computed.shown(),
     )]
     ComputedInputChanged {
         computed: ColumnRef,
@@ -122,7 +129,8 @@ pub enum DiffError {
     /// (#1174).
     #[error(
         "computed column {computed} may call `{function}`, which this plan {change}. Apply \
-         the function change and the computed column change in separate plans."
+         the function change and the computed column change in separate plans.",
+        computed = .computed.shown(),
     )]
     ComputedFunctionChanged {
         computed: ColumnRef,
@@ -135,7 +143,8 @@ pub enum DiffError {
     /// line; this is here so that a differ reached another way never quietly
     /// produces a plan with the rows left out of it.
     #[error(
-        "{table} declares `data:` but has no single-column primary key, so its rows have no identity"
+        "{table} declares `data:` but has no single-column primary key, so its rows have no identity",
+        table = .table.shown(),
     )]
     DataWithoutKey { table: TableName },
 
@@ -145,7 +154,8 @@ pub enum DiffError {
     #[error(
         "{table}: its foreign key `{key}` references {target}, which is unlogged, and \
          PostgreSQL lets only an unlogged table reference an unlogged one. Make {table} \
-         unlogged too, or {target} permanent."
+         unlogged too, or {target} permanent.",
+        table = .table.shown(), target = .target.shown(),
     )]
     PermanentReferencesUnlogged {
         table: TableName,
@@ -163,7 +173,8 @@ pub enum DiffError {
         "{table}: its foreign key `{key}` references {target}, whose partition {partition} \
          is unlogged; a crash would empty {partition} and leave rows of {table} referencing \
          nothing, which PostgreSQL does not refuse through a partitioned table. Make \
-         {partition} permanent, or {table} unlogged."
+         {partition} permanent, or {table} unlogged.",
+        table = .table.shown(), target = .target.shown(), partition = .partition.shown(),
     )]
     PermanentReferencesUnloggedPartition {
         table: TableName,
@@ -184,7 +195,8 @@ pub enum DiffError {
          a nullable column; this plan would also {}. SQL Server refuses some of these and \
          does others by rewriting or deleting the table's history. Declare {table} as it is \
          recorded apart from nullable columns it gains, and make the rest by hand.",
-        what.join(", ")
+        what.join(", "),
+        table = .table.shown(),
     )]
     TemporalTableChange { table: TableName, what: Vec<String> },
 
@@ -195,7 +207,8 @@ pub enum DiffError {
         "{table} is a partitioned table or a partition, and pbps can create one but not change \
          it yet; this plan would {}. Declare {table} as it is recorded, and make the change by \
          hand.",
-        what.join(", ")
+        what.join(", "),
+        table = .table.shown(),
     )]
     PartitionedTableChange { table: TableName, what: Vec<String> },
 
@@ -206,7 +219,8 @@ pub enum DiffError {
         "{table} is detached from {parent}, and declared as other than its parent's shape: {}. \
          Declare it with its parent's columns, keys, constraints and indexes (under any names), \
          and change it in a later revision.",
-        what.join("; ")
+        what.join("; "),
+        table = .table.shown(), parent = .parent.shown(),
     )]
     DetachedShape {
         table: TableName,
@@ -221,7 +235,8 @@ pub enum DiffError {
     #[error(
         "{table} is attached to {parent} as a partition, but {}. Bring the table to its \
          parent's shape in an earlier plan, then attach it.",
-        what.join("; ")
+        what.join("; "),
+        table = .table.shown(), parent = .parent.shown(),
     )]
     AttachedShape {
         table: TableName,
@@ -237,12 +252,14 @@ pub enum DiffError {
     #[error(
         "{table} declares `data:` and its primary key moved to another column, so the declared \
          rows cannot be matched to the recorded ones. Remove the block, apply the key change, \
-         then declare the rows again — or rename the column instead of replacing it"
+         then declare the rows again — or rename the column instead of replacing it",
+        table = .table.shown(),
     )]
     DataKeyColumnChanged { table: TableName },
 
     #[error(
-        "{table} has no baseline primary key and this plan does not restore the declared key, so its data rows cannot be matched"
+        "{table} has no baseline primary key and this plan does not restore the declared key, so its data rows cannot be matched",
+        table = .table.shown(),
     )]
     DataBaselineKeyAbsent { table: TableName },
 
@@ -255,7 +272,8 @@ pub enum DiffError {
         "{table} renames columns {} into each other's names in a cycle, and no order of those \
          renames is one the engine performs. Apply the revisions that form it in separate \
          deployments, or rename one of the columns through a temporary name first",
-        columns.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", ")
+        columns.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "),
+        table = .table.shown(),
     )]
     ColumnRenameCycle {
         table: TableName,
@@ -272,7 +290,7 @@ pub enum DiffError {
         "the table renames {} each need a name another of them still holds, in a cycle, and no \
          order of those renames is one the engine performs. Apply the revisions that form it in \
          separate deployments, or rename one of the tables through a temporary name first",
-        renames.iter().map(|(from, to)| format!("`{from} -> {to}`")).collect::<Vec<_>>().join(", ")
+        renames.iter().map(|(from, to)| format!("`{from} -> {to}`", from = from.shown(), to = to.shown())).collect::<Vec<_>>().join(", ")
     )]
     TableRenameCycle {
         renames: Vec<(TableName, TableName)>,
@@ -287,7 +305,7 @@ pub enum DiffError {
         "the sequence renames {} each need a name another of them still holds, in a cycle, and \
          no order of those renames is one the engine performs. Apply the revisions that form it \
          in separate deployments, or rename one of the sequences through a temporary name first",
-        renames.iter().map(|(from, to)| format!("`{from} -> {to}`")).collect::<Vec<_>>().join(", ")
+        renames.iter().map(|(from, to)| format!("`{from} -> {to}`", from = from.shown(), to = to.shown())).collect::<Vec<_>>().join(", ")
     )]
     SequenceRenameCycle {
         renames: Vec<(TableName, TableName)>,
@@ -302,11 +320,12 @@ pub enum DiffError {
         "{table} has no baseline primary key and this plan restores it on `{column}`, a column \
          the baseline does not have, so the recorded data rows cannot be matched to the declared \
          ones. Restore the key on a column the table already has, or remove the block, apply \
-         the key change, then declare the rows again"
+         the key change, then declare the rows again",
+        table = .table.shown(),
     )]
     DataBaselineKeyOnNewColumn { table: TableName, column: String },
 
-    #[error("{table} has a baseline primary key with {} columns ({columns:?}); pbps matches data rows only on a single-column key", columns.len())]
+    #[error("{table} has a baseline primary key with {} columns ({columns:?}); pbps matches data rows only on a single-column key", columns.len(), table = .table.shown())]
     DataBaselineKeyNotSingle {
         table: TableName,
         columns: Vec<String>,
@@ -770,7 +789,12 @@ pub(crate) fn diff_partial_rebuilding(
                 .schema
                 .tables
                 .get(&of.parent)
-                .ok_or_else(|| vec![format!("its parent {} is not in the base", of.parent)])
+                .ok_or_else(|| {
+                    vec![format!(
+                        "its parent {} is not in the base",
+                        of.parent.shown()
+                    )]
+                })
                 // The parent as this plan leaves it: a foreign key to a
                 // table renamed in the same plan is declared under the new
                 // name, as `diff_constraints` reads it below. And the
@@ -3465,13 +3489,14 @@ fn attached(
         return Err(vec![format!(
             "its parent {} is not a partitioned table before this plan; create the partition \
              with its parent, or attach the table in a later plan",
-            of.parent
+            of.parent.shown()
         )]);
     };
     if base_name != declared_name {
         what.push(format!(
             "it is renamed from {base_name} in the same plan; rename it in one plan and attach it \
-             in another"
+             in another",
+            base_name = base_name.shown()
         ));
     }
     if table.partition_by.is_some() {
@@ -3899,7 +3924,8 @@ fn attached(
             if &fk.references_table == base_name {
                 what.push(format!(
                     "the foreign key `{name}` of {other} references it, and nothing references a \
-                     partition yet"
+                     partition yet",
+                    other = other.shown()
                 ));
             }
         }
@@ -4058,7 +4084,7 @@ fn refuse_partition_changes(
                             .as_ref()
                             .is_some_and(|of| &of.parent == base_name)
                     })
-                    .map(|(n, _)| n.to_string())
+                    .map(|(n, _)| n.shown().to_string())
                     .collect();
                 if !is {
                     refuse(
@@ -4268,7 +4294,8 @@ fn refuse_partition_changes(
                 // The same two plans as a column change (DEC-1687.1): a
                 // detach's shape and a unique index's probe each read the
                 // tree on one side of the other (#1737 review).
-                let tables: Vec<String> = tables.iter().map(ToString::to_string).collect();
+                let tables: Vec<String> =
+                    tables.iter().map(|name| name.shown().to_string()).collect();
                 changes_meet_moves.insert(table.clone());
                 refuse(
                     table,
@@ -4339,7 +4366,8 @@ fn refuse_partition_changes(
                 // holds them as declared at the other end of the plan: each
                 // column change would need its own place against each
                 // transition (#1692 review). Two plans keep each simple.
-                let tables: Vec<String> = tables.iter().map(ToString::to_string).collect();
+                let tables: Vec<String> =
+                    tables.iter().map(|name| name.shown().to_string()).collect();
                 changes_meet_moves.insert(table.clone());
                 refuse(
                     table,
@@ -4363,7 +4391,7 @@ fn refuse_partition_changes(
                 .get(to)
                 .into_iter()
                 .flatten()
-                .map(ToString::to_string)
+                .map(|name| name.shown().to_string())
                 .collect();
             if !tables.is_empty() {
                 changes_meet_moves.insert(to.clone());
@@ -4495,7 +4523,7 @@ fn refuse_parent_index(
     if let Change::AddCheck { name, .. } = change {
         let held: Vec<String> = partitions()
             .filter(|(_, t)| t.checks.contains_key(name.as_str()))
-            .map(|(partition, _)| partition.to_string())
+            .map(|(partition, _)| partition.shown().to_string())
             .collect();
         return (!held.is_empty()).then(|| {
             format!(
@@ -4549,7 +4577,9 @@ fn refuse_parent_index(
                     })
                 })
                 .filter(|(_, own)| adopts(index, own))
-                .map(move |(own, _)| format!("{partition}'s `{own}`"))
+                .map(move |(own, _)| {
+                    format!("{partition}'s `{own}`", partition = partition.shown())
+                })
         })
         .collect();
     (!adopted.is_empty()).then(|| {
@@ -7785,12 +7815,19 @@ mod tests {
             let graph = ForeignKeyGraph::of(&schema);
             let (members, depths) = reference_graph(&schema);
             for a in schema.tables.keys() {
-                assert_eq!(graph.depth(a), depths[a], "round {round}, {a}: {edges:?}");
+                assert_eq!(
+                    graph.depth(a),
+                    depths[a],
+                    "round {round}, {a}: {edges:?}",
+                    a = a.shown()
+                );
                 for b in schema.tables.keys() {
                     assert_eq!(
                         graph.same_component(a, b),
                         members[a].contains(b),
-                        "round {round}, {a} and {b}: {edges:?}"
+                        "round {round}, {a} and {b}: {edges:?}",
+                        a = a.shown(),
+                        b = b.shown()
                     );
                 }
             }
@@ -7953,7 +7990,7 @@ mod tests {
                 .map(|p| match &p.change {
                     Change::SetTablePersistence {
                         table, unlogged, ..
-                    } => format!("{table} {unlogged}"),
+                    } => format!("{table} {unlogged}", table = table.shown()),
                     other => format!("{other:?}"),
                 })
                 .collect()
@@ -8223,7 +8260,7 @@ mod tests {
             let tables: Vec<String> = cs
                 .changes
                 .iter()
-                .map(|p| p.change.table().unwrap().to_string())
+                .map(|p| p.change.table().unwrap().raw().to_string())
                 .collect();
             assert_eq!(tables, ["app.ev", partition], "{:?}", cs.changes);
         }
@@ -8299,7 +8336,7 @@ mod tests {
                 format!(
                     "{} {}",
                     change_in_words(&p.change),
-                    p.change.table().unwrap()
+                    p.change.table().unwrap().shown()
                 )
             })
             .collect();
@@ -9103,7 +9140,7 @@ mod tests {
                 [
                     Change::AlterColumnDefault { .. },
                     Change::SetPartitionDefault { table, to: Some(own), fallback: Some(f), .. },
-                ] if table.to_string() == "app.a" && own == "7" && f == "1"
+                ] if table.raw().to_string() == "app.a" && own == "7" && f == "1"
             ),
             "{defaulted:?}"
         );
@@ -9137,7 +9174,7 @@ mod tests {
                     column,
                     not_null,
                     ..
-                } if column == "n" => Some((table.to_string(), *not_null)),
+                } if column == "n" => Some((table.raw().to_string(), *not_null)),
                 _ => None,
             })
             .collect();
@@ -9735,7 +9772,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::CreateTable { name, .. } => Some(name.to_string()),
+                Change::CreateTable { name, .. } => Some(name.raw().to_string()),
                 _ => None,
             })
             .collect();
@@ -9788,7 +9825,7 @@ mod tests {
             dropped.changes.iter().any(|p| matches!(
                 &p.change,
                 Change::DropTable { name, detach_from: Some(parent), .. }
-                    if name.to_string() == "app.z_rest" && parent.to_string() == "app.ev"
+                    if name.raw().to_string() == "app.z_rest" && parent.raw().to_string() == "app.ev"
             )),
             "{:?}",
             dropped.changes
@@ -10045,8 +10082,8 @@ mod tests {
                         beside_default,
                         ..
                     } => Some((
-                        name.to_string(),
-                        beside_default.as_ref().map(ToString::to_string),
+                        name.raw().to_string(),
+                        beside_default.as_ref().map(|name| name.raw().to_string()),
                     )),
                     _ => None,
                 })
@@ -10173,14 +10210,17 @@ mod tests {
             .iter()
             .filter_map(|p| {
                 if let Change::CreateTable { name, .. } = &p.change {
-                    Some(format!("create {name}"))
+                    Some(format!("create {name}", name = name.shown()))
                 } else if let Change::SetPartitionNotNull {
                     table, not_null, ..
                 } = &p.change
                 {
-                    Some(format!("not null {table} {not_null}"))
+                    Some(format!(
+                        "not null {table} {not_null}",
+                        table = table.shown()
+                    ))
                 } else if let Change::AlterColumnDefault { column, .. } = &p.change {
-                    Some(format!("default {}", column.table))
+                    Some(format!("default {}", column.table.shown()))
                 } else {
                     None
                 }
@@ -10409,7 +10449,7 @@ mod tests {
             panic!("{:?}", planned.changes)
         };
         assert_eq!(
-            (t.to_string(), p.to_string()),
+            (t.raw().to_string(), p.raw().to_string()),
             ("app.t".into(), "app.ev".into())
         );
         assert_eq!(*bound, range("2024-01-01", "2025-01-01"));
@@ -10431,7 +10471,7 @@ mod tests {
         let on = |ids: &IdsFile, name: &str| -> Vec<Uid> {
             ids.columns
                 .iter()
-                .filter(|(_, c)| c.table.to_string() == name)
+                .filter(|(_, c)| c.table.raw().to_string() == name)
                 .map(|(u, _)| u.clone())
                 .collect()
         };
@@ -10442,12 +10482,12 @@ mod tests {
             base_ids
                 .tables
                 .iter()
-                .find(|(_, n)| n.to_string() == "app.t")
+                .find(|(_, n)| n.raw().to_string() == "app.t")
                 .map(|(u, _)| u),
             declared_ids
                 .tables
                 .iter()
-                .find(|(_, n)| n.to_string() == "app.t")
+                .find(|(_, n)| n.raw().to_string() == "app.t")
                 .map(|(u, _)| u),
         );
 
@@ -10577,7 +10617,7 @@ mod tests {
             .iter()
             .map(|p| {
                 if let Change::InsertRow { table, .. } = &p.change {
-                    format!("insert {table}")
+                    format!("insert {table}", table = table.shown())
                 } else {
                     format!("{:?}", p.change)
                         .split([' ', '{'])
@@ -10713,7 +10753,7 @@ mod tests {
             .iter()
             .filter_map(|p| {
                 if let Change::AttachPartition { table, .. } = &p.change {
-                    Some(table.to_string())
+                    Some(table.raw().to_string())
                 } else {
                     None
                 }
@@ -11086,7 +11126,7 @@ mod tests {
         assert!(
             planned.changes.iter().any(|c| matches!(
                 &c.change,
-                Change::DropForeignKey { table, name } if table.to_string() == "app.t" && name == "t_fk"
+                Change::DropForeignKey { table, name } if table.raw().to_string() == "app.t" && name == "t_fk"
             )),
             "{:?}",
             planned.changes
@@ -11113,7 +11153,7 @@ mod tests {
             set_back.changes.iter().any(|p| matches!(
                 &p.change,
                 Change::SetPartitionDefault { table, column, from: Some(f), to: None, .. }
-                    if table.to_string() == "x.t" && column == "n" && f == "0"
+                    if table.raw().to_string() == "x.t" && column == "n" && f == "0"
             )),
             "{:?}",
             set_back.changes
@@ -11433,8 +11473,8 @@ mod tests {
         else {
             panic!("{:?}", planned.changes)
         };
-        assert_eq!(detached.to_string(), "app.ev_1");
-        assert_eq!(from.to_string(), "app.ev");
+        assert_eq!(detached.raw().to_string(), "app.ev_1");
+        assert_eq!(from.raw().to_string(), "app.ev");
         let pairs: Vec<(DetachedKind, &str, Option<&str>)> = names
             .iter()
             .map(|n| (n.kind, n.parent.as_str(), n.name.as_deref()))
@@ -12020,7 +12060,7 @@ mod tests {
         assert!(
             errors.iter().any(
                 |e| e.starts_with("app.ev is a partitioned table or a partition")
-                    && e.contains(&format!("which can take {p}'s `p_ts`"))
+                    && e.contains(&format!("which can take {p}'s `p_ts`", p = p.shown()))
             ),
             "{errors:?}"
         );
@@ -13041,7 +13081,8 @@ mod tests {
                     Change::SetReplicaIdentity { table, to, .. } => format!(
                         "identity {table} {}",
                         to.as_ref()
-                            .map_or("default".to_owned(), ToString::to_string)
+                            .map_or("default".to_owned(), ToString::to_string),
+                        table = table.shown()
                     ),
                     Change::AddIndex { name, .. } => format!("add {name}"),
                     Change::DropIndex { name, .. } => format!("drop {name}"),
@@ -13506,15 +13547,22 @@ mod tests {
                 .iter()
                 .filter_map(|p| match &p.change {
                     Change::AlterColumnNullability { column, .. } => {
-                        Some(format!("tighten {}", column.table))
+                        Some(format!("tighten {}", column.table.shown()))
                     }
                     Change::AlterColumnType {
                         column,
                         to_nullable,
                         ..
-                    } => Some(format!("retype {} nullable={to_nullable}", column.table)),
-                    Change::UpdateRow { table, .. } => Some(format!("update {table}")),
-                    Change::DeleteRow { table, .. } => Some(format!("delete {table}")),
+                    } => Some(format!(
+                        "retype {} nullable={to_nullable}",
+                        column.table.shown()
+                    )),
+                    Change::UpdateRow { table, .. } => {
+                        Some(format!("update {table}", table = table.shown()))
+                    }
+                    Change::DeleteRow { table, .. } => {
+                        Some(format!("delete {table}", table = table.shown()))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -13993,7 +14041,10 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            inserts.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            inserts
+                .iter()
+                .map(|name| name.raw().to_string())
+                .collect::<Vec<_>>(),
             ["dbo.status", "dbo.sub"],
             "the referenced table's rows must go in first"
         );
@@ -14004,7 +14055,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::DeleteRow { table, .. } => Some(table.to_string()),
+                Change::DeleteRow { table, .. } => Some(table.raw().to_string()),
                 _ => None,
             })
             .collect();
@@ -15290,7 +15341,11 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::RenameTable { from, to, .. } => Some(format!("{from} -> {to}")),
+                    Change::RenameTable { from, to, .. } => Some(format!(
+                        "{from} -> {to}",
+                        from = from.shown(),
+                        to = to.shown()
+                    )),
                     Change::DropCheck { name, .. } => Some(format!("drop check {name}")),
                     _ => None,
                 })
@@ -15366,8 +15421,14 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::DropTable { name, .. } => Some(format!("drop {name}")),
-                    Change::RenameTable { from, to, .. } => Some(format!("{from} -> {to}")),
+                    Change::DropTable { name, .. } => {
+                        Some(format!("drop {name}", name = name.shown()))
+                    }
+                    Change::RenameTable { from, to, .. } => Some(format!(
+                        "{from} -> {to}",
+                        from = from.shown(),
+                        to = to.shown()
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -15473,7 +15534,7 @@ mod tests {
                 .changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::RenameTable { from, .. } => Some(from.to_string()),
+                    Change::RenameTable { from, .. } => Some(from.raw().to_string()),
                     _ => None,
                 })
                 .collect();
@@ -15508,7 +15569,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(from.to_string()),
+                Change::RenameTable { from, .. } => Some(from.raw().to_string()),
                 _ => None,
             })
             .collect()
@@ -15561,7 +15622,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(from.to_string()),
+                Change::RenameTable { from, .. } => Some(from.raw().to_string()),
                 _ => None,
             })
             .collect();
@@ -15598,7 +15659,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(from.to_string()),
+                Change::RenameTable { from, .. } => Some(from.raw().to_string()),
                 _ => None,
             })
             .collect();
@@ -15639,7 +15700,7 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::RenameTable { from, .. } => Some(from.to_string()),
+                    Change::RenameTable { from, .. } => Some(from.raw().to_string()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -15702,7 +15763,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(from.to_string()),
+                Change::RenameTable { from, .. } => Some(from.raw().to_string()),
                 Change::DropCheck { name, .. } => Some(format!("drop {name}")),
                 _ => None,
             })
@@ -15745,7 +15806,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, .. } => Some(from.to_string()),
+                Change::RenameTable { from, .. } => Some(from.raw().to_string()),
                 _ => None,
             })
             .collect();
@@ -15829,11 +15890,11 @@ mod tests {
         };
         let child_key = at(&|c| {
             matches!(c, Change::DropForeignKey { table, name }
-                if table.to_string() == "app.child" && name == "fk_child_target")
+                if table.raw().to_string() == "app.child" && name == "fk_child_target")
         });
         let own_key = at(&|c| {
             matches!(c, Change::DropForeignKey { table, name }
-                if table.to_string() == "app.target" && name == "fk_target_parent")
+                if table.raw().to_string() == "app.target" && name == "fk_target_parent")
         });
         let drop = at(&|c| matches!(c, Change::DropTable { .. }));
         let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
@@ -15952,7 +16013,12 @@ mod tests {
         // table's, and the renamed table's source.
         let addresses: BTreeSet<String> = drops
             .iter()
-            .filter_map(|d| cs.changes[*d].change.table().map(ToString::to_string))
+            .filter_map(|d| {
+                cs.changes[*d]
+                    .change
+                    .table()
+                    .map(|name| name.raw().to_string())
+            })
             .collect();
         assert_eq!(
             addresses,
@@ -16030,14 +16096,15 @@ mod tests {
         };
         let key = at(&|c| {
             matches!(c, Change::DropForeignKey { table, name }
-                if table.to_string() == "app.other" && name == "fk_other_target")
+                if table.raw().to_string() == "app.other" && name == "fk_other_target")
         });
         let target = at(
-            &|c| matches!(c, Change::DropTable { name, .. } if name.to_string() == "app.target"),
+            &|c| matches!(c, Change::DropTable { name, .. } if name.raw().to_string() == "app.target"),
         );
         let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
-        let other =
-            at(&|c| matches!(c, Change::DropTable { name, .. } if name.to_string() == "app.other"));
+        let other = at(
+            &|c| matches!(c, Change::DropTable { name, .. } if name.raw().to_string() == "app.other"),
+        );
         assert!(
             key < target && target < rename && rename < other,
             "{:?}",
@@ -16314,7 +16381,7 @@ mod tests {
         assert!(
             diffed.errors.iter().any(|e| matches!(e,
                 DiffError::ColumnRenameCycle { table, columns }
-                    if table.to_string() == "dbo.t"
+                    if table.raw().to_string() == "dbo.t"
                         && columns == &BTreeSet::from(["a".to_owned(), "b".to_owned()]))),
             "{:?}",
             diffed.errors
@@ -16372,8 +16439,14 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::DropTable { name, .. } => Some(format!("drop {name}")),
-                    Change::RenameTable { from, to, .. } => Some(format!("{from} -> {to}")),
+                    Change::DropTable { name, .. } => {
+                        Some(format!("drop {name}", name = name.shown()))
+                    }
+                    Change::RenameTable { from, to, .. } => Some(format!(
+                        "{from} -> {to}",
+                        from = from.shown(),
+                        to = to.shown()
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -16468,7 +16541,9 @@ mod tests {
                     DiffError::TableRenameCycle { renames } => Some(
                         renames
                             .iter()
-                            .map(|(from, to)| format!("{from} -> {to}"))
+                            .map(|(from, to)| {
+                                format!("{from} -> {to}", from = from.shown(), to = to.shown())
+                            })
                             .collect(),
                     ),
                     _ => None,
@@ -16673,7 +16748,11 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameTable { from, to, .. } => Some(format!("{from} -> {to}")),
+                Change::RenameTable { from, to, .. } => Some(format!(
+                    "{from} -> {to}",
+                    from = from.shown(),
+                    to = to.shown()
+                )),
                 _ => None,
             })
             .collect();
@@ -19021,7 +19100,7 @@ mod tests {
         };
         let key = at(&|c| {
             matches!(c, Change::DropForeignKey { table, name }
-                if table.to_string() == "app.child" && name == "fk_child_other")
+                if table.raw().to_string() == "app.child" && name == "fk_child_other")
         });
         let unique = at(&|c| matches!(c, Change::DropUnique { .. }));
         let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
@@ -19263,7 +19342,7 @@ mod tests {
             "the drop must precede SET SCHEMA and carry its source address: {cs:?}"
         );
         assert!(
-            matches!(&cs.changes[0].change, Change::DropIndex { table, .. } if table.to_string() == "s1.old")
+            matches!(&cs.changes[0].change, Change::DropIndex { table, .. } if table.raw().to_string() == "s1.old")
         );
         let mut recorded = pbps_model::Declared::from_schema(&base);
         recorded.advance(&cs);
@@ -19294,7 +19373,7 @@ mod tests {
         );
         assert_eq!(kinds(&cs), ["DropForeignKey", "DropUnique", "RenameTable"]);
         assert!(
-            matches!(&cs.changes[0].change, Change::DropForeignKey { table, .. } if table.to_string() == "app.old")
+            matches!(&cs.changes[0].change, Change::DropForeignKey { table, .. } if table.raw().to_string() == "app.old")
         );
     }
 
@@ -19351,10 +19430,10 @@ mod tests {
                 "{cs:?}"
             );
             assert!(
-                matches!(&cs.changes[0].change, Change::RenameTable { to, .. } if to.to_string() == "app.owner_new")
+                matches!(&cs.changes[0].change, Change::RenameTable { to, .. } if to.raw().to_string() == "app.owner_new")
             );
             assert_eq!(
-                cs.changes[1].change.table().unwrap().to_string(),
+                cs.changes[1].change.table().unwrap().raw().to_string(),
                 "app.owner_new"
             );
         }
@@ -19393,7 +19472,7 @@ mod tests {
             "{cs:?}"
         );
         assert_eq!(
-            cs.changes[2].change.table().unwrap().to_string(),
+            cs.changes[2].change.table().unwrap().raw().to_string(),
             "app.target"
         );
     }

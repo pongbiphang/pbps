@@ -223,7 +223,7 @@ impl Reconstruction {
                             defaults.push((column.clone(), default));
                         }
                     }
-                    let declaration = format!("table {name}");
+                    let declaration = format!("table {name}", name = name.shown());
                     let generated_columns: Vec<String> = bare
                         .columns
                         .iter()
@@ -266,7 +266,7 @@ impl Reconstruction {
                         steps.push(step(
                             dialect,
                             Phase::Expressions,
-                            &format!("the default of {name}.{column}"),
+                            &format!("the default of {name}.{column}", name = name.shown()),
                             &Change::AlterColumnDefault {
                                 uid: uid.clone(),
                                 column: pbps_model::ColumnRef::new(name.clone(), column),
@@ -281,7 +281,7 @@ impl Reconstruction {
                         steps.push(step(
                             dialect,
                             Phase::Expressions,
-                            &format!("check {check} on {name}"),
+                            &format!("check {check} on {name}", name = name.shown()),
                             &Change::AddCheck {
                                 table: name.clone(),
                                 name: check,
@@ -309,7 +309,7 @@ impl Reconstruction {
                         steps.push(step(
                             dialect,
                             phase,
-                            &format!("index {index} on {name}"),
+                            &format!("index {index} on {name}", name = name.shown()),
                             &Change::AddIndex {
                                 table: name.clone(),
                                 name: index.clone(),
@@ -326,7 +326,7 @@ impl Reconstruction {
                         steps.push(step(
                             dialect,
                             Phase::Keys,
-                            &format!("replica identity of {name}"),
+                            &format!("replica identity of {name}", name = name.shown()),
                             &Change::SetReplicaIdentity {
                                 uid: uid.clone(),
                                 table: name.clone(),
@@ -382,7 +382,7 @@ impl Reconstruction {
                     steps.push(step(
                         dialect,
                         Phase::Keys,
-                        &format!("table {table}"),
+                        &format!("table {table}", table = table.shown()),
                         change,
                         Vec::new(),
                         None,
@@ -910,7 +910,10 @@ fn after_their_functions(
         for &at in &modules[..point] {
             if held.iter().any(|name| names(at, name)) {
                 if called.contains(&at) {
-                    return Err(ReconstructError::Cycle(format!("table {}", table.table)));
+                    return Err(ReconstructError::Cycle(format!(
+                        "table {}",
+                        table.table.shown()
+                    )));
                 }
                 held.extend(steps[at].names.iter().map(|(_, _, name)| name.clone()));
                 moved.push(at);

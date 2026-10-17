@@ -1,3 +1,6 @@
+// Names in whole-escaped DialectError fields and shared probe text stay raw
+// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
+
 //! What a plan is asked about a live database before its first statement runs
 //! (SPEC §7.5).
 //!
@@ -1048,7 +1051,8 @@ fn delete_probe(
     Ok(Probe::new(
         format!(
             "rows in other tables that still reference {table} row `{key}`, which its delete \
-             would orphan or cascade into"
+             would orphan or cascade into",
+            table = table.raw()
         ),
         format!(
             "SELECT {} AS n;",
@@ -1120,7 +1124,8 @@ pub(crate) fn still_referenced(
              actions are not. Measured, an `ON DELETE CASCADE` child the policy hides is \
              deleted anyway, which is the silent loss this guard exists to prevent. Nothing \
              was applied. Delete the row as a role the policy does not filter, or remove the \
-             row-level security from the referencing table."
+             row-level security from the referencing table.",
+            table = table.raw()
         )),
         counting_expression(&Referencing {
             parent: &parent,
@@ -1158,7 +1163,8 @@ pub(crate) fn still_referenced(
         crate::emit::refuse(&format!(
             "{table} row `{key}` is referenced by row(s) that arrived after this plan was \
              checked; the delete would orphan or cascade into them. Nothing was applied. \
-             Plan again."
+             Plan again.",
+            table = table.raw()
         ))
     )))
 }
@@ -1523,7 +1529,8 @@ fn hidden_children_probe(
              itself, whose key and referenced columns every count reads, so the count of what \
              references row `{key}` is not the count, while this engine's referential actions \
              see every row; delete as a role that can read every referencing table unfiltered \
-             and {table}'s referenced columns, or take the policy off"
+             and {table}'s referenced columns, or take the policy off",
+            table = table.raw()
         ),
         format!(
             "SELECT {} AS n;",
@@ -1672,7 +1679,9 @@ fn unprobeable_probe(
             "foreign-key column(s) of {child} that reference {table} and that this plan writes to \
              a default the probe cannot evaluate, which may be row `{key}` being deleted: {}; \
              spell the value",
-            described.join(", ")
+            described.join(", "),
+            child = child.raw(),
+            table = table.raw()
         ),
         format!(
             "SELECT {} AS n\n  \
@@ -2355,7 +2364,8 @@ fn planned_key_probes(
                 "rows of {} that reference {table} row `{key}` through the foreign key this plan \
                  adds on a column it also adds, whose default is what every stored row will hold \
                  there; the key cannot be added once the row is gone{guard_note}",
-                a.child
+                a.child.raw(),
+                table = table.raw()
             ),
             format!(
                 "SELECT {} AS n;",
@@ -2415,7 +2425,7 @@ fn planned_key_probes(
                 "row{} {} of {} written against that backfill",
                 if listed.len() == 1 { "" } else { "s" },
                 listed.join(", "),
-                a.child
+                a.child.raw()
             ));
         }
         out.push(Probe::new(
@@ -2423,8 +2433,9 @@ fn planned_key_probes(
                 "column(s) of the foreign key this plan adds from {} into {table} that hold a \
                  default the probe cannot evaluate, which may be row `{key}` being deleted: {}; \
                  spell the value",
-                a.child,
-                described.join(", ")
+                a.child.raw(),
+                described.join(", "),
+                table = table.raw()
             ),
             format!("SELECT {} AS n;", saturated_count(&terms.join(" + "))),
         ));
@@ -2449,11 +2460,20 @@ fn planned_key_probes(
 /// the identity sequence hands every stored row, or the default expression.
 fn described_backfill(column: &str, table: &TableName, added: Option<&AddedColumn>) -> String {
     if added.is_some_and(|a| a.serial) {
-        format!("{column} of {table} (its `serial` sequence, assigned to every stored row)")
+        format!(
+            "{column} of {table} (its `serial` sequence, assigned to every stored row)",
+            table = table.raw()
+        )
     } else if added.is_some_and(|a| a.identity) {
-        format!("{column} of {table} (its identity, assigned to every stored row)")
+        format!(
+            "{column} of {table} (its identity, assigned to every stored row)",
+            table = table.raw()
+        )
     } else {
-        format!("{column} of {table} (its default, backfilled into every stored row)")
+        format!(
+            "{column} of {table} (its default, backfilled into every stored row)",
+            table = table.raw()
+        )
     }
 }
 
@@ -2852,7 +2872,10 @@ fn keys(n: usize) -> Vec<String> {
 /// this plan is the one deciding what is there.
 fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Probe {
     Probe::new(
-        format!("existing NULLs in {column}, which NOT NULL would reject"),
+        format!(
+            "existing NULLs in {column}, which NOT NULL would reject",
+            column = column.raw()
+        ),
         format!(
             "SELECT {} AS n FROM {from} WHERE {reads} IS NULL;",
             saturated_count("count(*)")
@@ -3036,7 +3059,7 @@ fn build<'v, 'p: 'v>(
             Ok(vec![Probe::new(
                 format!(
                     "rows that have no value for the new NOT NULL column {}",
-                    table.column(name)
+                    table.column(name).raw()
                 ),
                 format!("SELECT {} AS n FROM {};", saturated_count("count(*)"), qualified(&stored)?),
             )])
@@ -3112,7 +3135,7 @@ fn build<'v, 'p: 'v>(
             };
             if let Some(fails) = crate::types::cannot_become(&from, &to, &quoted) {
                 out.push(Probe::new(
-                    format!("values in {column} that cannot become {to}"),
+                    format!("values in {column} that cannot become {to}", column = column.raw()),
                     // The NULLs are excluded here and counted by the probe
                     // above where there is one: a NULL converts to a NULL
                     // whatever the target, and counting it under "cannot
@@ -3351,7 +3374,8 @@ fn build<'v, 'p: 'v>(
                     "the counter of {column}'s sequence outside the bounds {}..={} this plan \
                      gives it, or not readable",
                     bounds.start(),
-                    bounds.end()
+                    bounds.end(),
+                    column = column.raw(),
                 ),
                 format!(
                     "SELECT {} AS n FROM pg_catalog.pg_sequence q \
@@ -3431,7 +3455,8 @@ fn build<'v, 'p: 'v>(
             Ok(vec![Probe::new(
                 format!(
                     "values in {column} too near its sequence's bound for numbering to \
-                     continue past them"
+                     continue past them",
+                    column = column.raw(),
                 ),
                 format!(
                     "SELECT {} AS n FROM {} WHERE {} OPERATOR(pg_catalog.{operator}) \
@@ -3652,7 +3677,10 @@ fn key_collation_probe(
         pairs = vec!["(NULL::oid, NULL::oid)".into()];
     }
     Ok(Probe::new(
-        format!("foreign keys with incompatible collations for {table}.{name}"),
+        format!(
+            "foreign keys with incompatible collations for {table}.{name}",
+            table = table.raw()
+        ),
         format!(
             "SELECT CASE \
              WHEN bool_or(k.child <> k.parent AND \
@@ -4326,7 +4354,9 @@ fn partition_range_probe(
         format!(
             "rows of {parent} {inside} its new partition {partition}: they are in its \
              DEFAULT partition now, and the engine will not {making} over them; move or delete \
-             them first, then plan again"
+             them first, then plan again",
+            parent = parent.raw(),
+            partition = partition.raw()
         ),
         format!(
             "SELECT {}",
@@ -4396,7 +4426,10 @@ fn default_reference_probe(
              {parent}'s new partition beside it: moving those rows into {partition} deletes \
              them from {default}, which fires the foreign key's action on the rows referencing \
              them; delete or repoint the referencing rows, or move the rows first, then plan \
-             again"
+             again",
+            default = default.raw(),
+            partition = partition.raw(),
+            parent = parent.raw()
         ),
         format!(
             "SELECT {}",
@@ -4546,7 +4579,9 @@ fn default_insert_publication_probe(
              it is attached, and a subscriber receives them as rows of a table it does not \
              have, which stops its replication; move the rows by hand, or take the inserts \
              out of the publication for the move, then plan again",
-            partition.schema
+            partition.schema,
+            default = default.raw(),
+            partition = partition.raw()
         ),
         format!(
             "SELECT CASE WHEN {} > 0 THEN {} ELSE 0 END",
@@ -4572,7 +4607,9 @@ fn default_publication_probe(
             "publications that publish deletes from {default}: moving its rows inside the \
              range of {partition} sends their delete to subscribers and not their insert, so a \
              subscriber loses them; move the rows by hand, or take {default} out of the \
-             publication for the move, then plan again"
+             publication for the move, then plan again",
+            default = default.raw(),
+            partition = partition.raw()
         ),
         format!(
             "SELECT CASE WHEN {} > 0 THEN {} ELSE 0 END",
@@ -4744,7 +4781,10 @@ fn default_hidden_referencers_probe(
              partition, fires, that this session cannot fully read (row-level security, or no \
              SELECT): moving the rows of {default} inside the \
              range of {partition} fires that key's action on rows the pre-flight cannot count; \
-             apply as a role that reads them, or move the rows first, then plan again"
+             apply as a role that reads them, or move the rows first, then plan again",
+            default = default.raw(),
+            parent = parent.raw(),
+            partition = partition.raw()
         ),
         format!(
             "SELECT CASE WHEN {} > 0 THEN {} ELSE 0 END",
@@ -4787,7 +4827,10 @@ fn default_trigger_probe(
             "rows of {default} {inside} {partition}, its parent {parent}'s new \
              partition beside it, under a row trigger on {default} that fires on delete: moving \
              them into {partition} deletes them from {default}, which runs the trigger for each; \
-             drop or disable it, or move the rows first, then plan again"
+             drop or disable it, or move the rows first, then plan again",
+            default = default.raw(),
+            partition = partition.raw(),
+            parent = parent.raw()
         ),
         format!(
             "SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t \
@@ -4813,7 +4856,9 @@ fn default_statement_probe(
         format!(
             "statement triggers or rules on {default} that a DELETE fires: making {partition} \
              beside it moves the rows of its range out with one, which fires them even when no \
-             row moves; drop or disable them first, then plan again"
+             row moves; drop or disable them first, then plan again",
+            default = default.raw(),
+            partition = partition.raw()
         ),
         format!(
             "SELECT {}",
@@ -4858,11 +4903,12 @@ fn attach_range_probe(
         pbps_model::PartitionBound::Hash { .. } => "outside the remainder it takes under {parent}",
         pbps_model::PartitionBound::Default => "that its parent routes elsewhere",
     }
-    .replace("{parent}", &parent.to_string());
+    .replace("{parent}", &parent.raw().to_string());
     Ok(Probe::new(
         format!(
             "rows of {table} {outside}: the engine will not attach it over them; move or delete \
-             them first, then plan again"
+             them first, then plan again",
+            table = table.raw()
         ),
         format!(
             "SELECT {}",
@@ -4924,7 +4970,9 @@ fn attach_default_rows_probe(
         format!(
             "rows of {table} that another partition of {parent} takes: as its DEFAULT partition \
              it may hold only rows no other partition does, and the engine will not attach it \
-             over them; move or delete them first, then plan again"
+             over them; move or delete them first, then plan again",
+            table = table.raw(),
+            parent = parent.raw()
         ),
         format!(
             "SELECT {}",
@@ -4960,7 +5008,9 @@ fn standing_default_probe(
         format!(
             "a DEFAULT partition of {parent} that this plan neither detaches nor drops: a parent \
              has one DEFAULT partition, so {table} cannot be attached as another; detach or drop \
-             it first, then plan again"
+             it first, then plan again",
+            parent = parent.raw(),
+            table = table.raw()
         ),
         format!(
             "SELECT count(*)::int FROM pg_catalog.pg_partitioned_table pt \
@@ -5012,7 +5062,9 @@ fn attach_trigger_probe(
         format!(
             "triggers on {table} named as a row trigger of {parent}, which the engine clones \
              onto it under that name as it attaches it: rename or drop them before it is \
-             attached, then plan again"
+             attached, then plan again",
+            table = table.raw(),
+            parent = parent.raw()
         ),
         format!(
             "SELECT {}",
@@ -5044,7 +5096,8 @@ fn attach_column_grant_probe(table: &TableName) -> Result<Probe, DialectError> {
     Ok(Probe::new(
         format!(
             "columns of {table} with grants of their own, which a partition does not hold: \
-             revoke them before it is attached, then plan again"
+             revoke them before it is attached, then plan again",
+            table = table.raw()
         ),
         format!(
             "SELECT {}",
@@ -5102,7 +5155,9 @@ fn partition_reference_probe(
         format!(
             "rows that reference {partition} through a foreign key to {parent}: the engine will \
              not detach it, and so not drop it, while any remain; delete or repoint them first, \
-             then plan again"
+             then plan again",
+            partition = partition.raw(),
+            parent = parent.raw()
         ),
         format!(
             "SELECT {}",

@@ -546,7 +546,7 @@ mod tests {
             "a table rename must not make its columns look brand new"
         );
         assert_eq!(
-            r.ids.columns.get(&col_uid).unwrap().to_string(),
+            r.ids.columns.get(&col_uid).unwrap().raw().to_string(),
             "dbo.client.email",
             "a column's qualified name must follow the table rename"
         );

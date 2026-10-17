@@ -1,3 +1,6 @@
+// Names in whole-escaped DialectError fields and shared probe text stay raw
+// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
+
 //! The Microsoft SQL Server dialect.
 //!
 //! Everything the rest of `pbps` must not know about T-SQL lives here: which
@@ -375,7 +378,9 @@ impl Dialect for Mssql {
                 dialect: types::DIALECT,
                 message: format!(
                     "table `{name}` names `{history}` as its history table, which is one of the \
-                     ledger tables this tool owns (SPEC §8.1); name another table"
+                     ledger tables this tool owns (SPEC §8.1); name another table",
+                    name = name.raw(),
+                    history = history.raw()
                 ),
             });
         }
@@ -385,7 +390,8 @@ impl Dialect for Mssql {
                 message: format!(
                     "table `{name}` is one of the ledger tables this tool owns (SPEC §8.1). \
                      Only those names in schema `dbo` are reserved; the same table name in \
-                     another schema is read back normally."
+                     another schema is read back normally.",
+                    name = name.raw()
                 ),
             });
         }

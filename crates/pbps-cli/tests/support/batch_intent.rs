@@ -257,7 +257,9 @@ pub fn tables_and_roles(dialect: &str) {
     );
     let renamed: IdsFile = serde_json::from_slice(&ids(&d)).unwrap();
     assert_eq!(
-        renamed.tables[old.tables.keys().next().unwrap()].to_string(),
+        renamed.tables[old.tables.keys().next().unwrap()]
+            .raw()
+            .to_string(),
         to
     );
     assert_eq!(renamed.roles[old.roles.keys().next().unwrap()], "Auditor");

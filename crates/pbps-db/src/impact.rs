@@ -80,9 +80,9 @@ impl RenameTarget {
 impl std::fmt::Display for RenameTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RenameTarget::Table(t) => write!(f, "table {t}"),
-            RenameTarget::Column(c) => write!(f, "column {c}"),
-            RenameTarget::Module(m) => write!(f, "module {m}"),
+            RenameTarget::Table(t) => write!(f, "table {t}", t = t.shown()),
+            RenameTarget::Column(c) => write!(f, "column {c}", c = c.shown()),
+            RenameTarget::Module(m) => write!(f, "module {m}", m = m.shown()),
         }
     }
 }

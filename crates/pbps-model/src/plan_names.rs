@@ -68,7 +68,7 @@ pub enum PlanNamesError {
     End { namespace: &'static str },
     #[error(
         "column {} has no managed owning table before change {step}",
-        crate::escape::Escaped(&.column.to_string())
+        .column.shown()
     )]
     Owner { column: ColumnRef, step: usize },
     #[error("column identity {uid} changes owning table")]

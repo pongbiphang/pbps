@@ -1,3 +1,5 @@
+// Shared Pulled warnings remain raw until #2084 step 5 (DEC-2084.1); terminal warning boundaries escape them.
+
 //! `pbps` — declarative database schema version control.
 
 mod adopt;
@@ -1430,14 +1432,18 @@ fn cmd_pull(
             if left_out {
                 pulled.warnings.push(format!(
                     "--data {name}: its rows were not read, because the table itself was left \
-                     out above"
+                     out above",
+                    name = name.shown()
                 ));
             }
             !left_out
         });
         for name in &data {
             if !pulled.schema.tables.contains_key(name) {
-                anyhow::bail!("--data {name}: this database has no such table");
+                anyhow::bail!(
+                    "--data {name}: this database has no such table",
+                    name = name.shown()
+                );
             }
         }
         let read: std::collections::BTreeMap<TableName, pbps_model::RowScope> = data
@@ -1492,7 +1498,8 @@ fn cmd_pull(
                             .iter()
                             .map(|e| format!("  - {e}"))
                             .collect::<Vec<_>>()
-                            .join("\n")
+                            .join("\n"),
+                        name = name.shown()
                     );
                 }
             }
@@ -1500,8 +1507,11 @@ fn cmd_pull(
         Ok::<_, anyhow::Error>(pulled)
     })?;
 
-    for w in pulled.onboarding_notices.iter().chain(&pulled.warnings) {
-        eprintln!("warning: {w}");
+    for notice in &pulled.onboarding_notices {
+        eprintln!("warning: {}", pbps_model::escape::Escaped(notice));
+    }
+    for warning in &pulled.warnings {
+        eprintln!("warning: {warning}");
     }
     // A role's permission the model cannot hold: for `pull` a warning like
     // the others, since nothing is being compared yet; for `verify` the same
@@ -1522,7 +1532,12 @@ fn cmd_pull(
             pulled.unmanaged_modules.len()
         );
         for m in &pulled.unmanaged_modules {
-            eprintln!("  {} {} — {}", m.kind, m.target, m.why);
+            eprintln!(
+                "  {} {} — {}",
+                m.kind,
+                pbps_model::escape::Escaped(&m.target.to_string()),
+                m.why
+            );
         }
         eprintln!(
             "  They are left untouched: pbps will neither change nor drop them, and they do not appear in any plan."
@@ -1938,6 +1953,8 @@ pub(crate) fn declaration_problems(
     declaration_problems_with_sources(loaded, dialect, &Default::default())
 }
 
+// Diagnostic prose combines shown names with escaped DialectError displays;
+// never escape these sentences whole until #2084 step 5 (DEC-2084.1).
 fn declaration_problems_with_sources(
     loaded: &pbps_load::Loaded,
     dialect: &dyn Dialect,
@@ -1952,7 +1969,10 @@ fn declaration_problems_with_sources(
     for (name, table) in &schema.tables {
         let sources = pbps_model::diagnostic::ColumnSources::new(conflicts.get(name));
         for e in dialect.validate_table_sources(name, table, sources) {
-            out.push(("dialect.rejected", format!("{name}: {e}")));
+            out.push((
+                "dialect.rejected",
+                format!("{name}: {e}", name = name.shown()),
+            ));
         }
         // A partition's own checks and indexes, against the columns it has
         // from its parent (#1577). A missing parent is `check_partitions`'s.
@@ -1964,7 +1984,10 @@ fn declaration_problems_with_sources(
             let parent_sources =
                 pbps_model::diagnostic::ColumnSources::new(conflicts.get(parent_name));
             for e in dialect.validate_partition_with_sources(name, table, parent, parent_sources) {
-                out.push(("dialect.rejected", format!("{name}: {e}")));
+                out.push((
+                    "dialect.rejected",
+                    format!("{name}: {e}", name = name.shown()),
+                ));
             }
         }
     }
@@ -2239,7 +2262,14 @@ fn validate_inspected(
             dialect
                 .declaration_notes(&l.schema)
                 .into_iter()
-                .map(|note| output::Finding::note("dialect.not-checked", note)),
+                .map(|note| {
+                    // Raw probe data becomes finding prose here until #2084 step 5
+                    // (DEC-2084.1); it contains no rendered error.
+                    output::Finding::note(
+                        "dialect.not-checked",
+                        pbps_model::escape::Escaped(&note).to_string(),
+                    )
+                }),
         );
 
         // The project's own rules (ADR-0008): the declaration point. The block
@@ -2269,7 +2299,7 @@ fn validate_inspected(
                     // The checked baseline cannot contain a source conflict.
                     // Recovery's `None` can equal its old ordinary column,
                     // but the supplied conflicting declaration did change.
-                    changed.extend(source_conflicts.keys().map(ToString::to_string));
+                    changed.extend(source_conflicts.keys().map(|name| name.raw().to_string()));
                     Some(changed)
                 }
                 (Err(e), _) => {

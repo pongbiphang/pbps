@@ -1,3 +1,6 @@
+// Names in whole-escaped DialectError fields and shared probe text stay raw
+// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
+
 //! A series of RANGE partitions, generated from the declarations
 //! (#1789, DEC-1789.1).
 //!
@@ -518,46 +521,53 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
         .schema
         .tables
         .get(parent)
-        .ok_or_else(|| invalid(format!("`{parent}` is not declared")))?;
+        .ok_or_else(|| invalid(format!("`{parent}` is not declared", parent = parent.raw())))?;
     if let Some(of) = &table.partition_of {
         return Err(invalid(format!(
             "`{parent}` is a partition of `{}`, and a partition is not extended; name its parent",
-            of.parent
+            of.parent.raw(),
+            parent = parent.raw()
         )));
     }
     let by = table.partition_by.as_ref().ok_or_else(|| {
         invalid(format!(
-            "`{parent}` declares no `partition_by:`; a series extends a RANGE-partitioned table"
+            "`{parent}` declares no `partition_by:`; a series extends a RANGE-partitioned table",
+            parent = parent.raw()
         ))
     })?;
     if !by.strategy.is_range() {
         return Err(invalid(format!(
             "`{parent}` is partitioned by {}: a series extends a RANGE-partitioned table",
-            by.strategy.keyword()
+            by.strategy.keyword(),
+            parent = parent.raw()
         )));
     }
     if by.external {
         return Err(invalid(format!(
             "`{parent}` declares `partitions: external`: its partitions are another tool's, and \
-             pbps declares none of them. Extend them with that tool"
+             pbps declares none of them. Extend them with that tool",
+            parent = parent.raw()
         )));
     }
     let [column] = by.columns.as_slice() else {
         return Err(invalid(format!(
             "`{parent}` is partitioned by {} columns, and a series has one frontier: only a \
              single-column key is generated",
-            by.columns.len()
+            by.columns.len(),
+            parent = parent.raw()
         )));
     };
     let ty = table.columns.get(column).map(|c| &c.ty).ok_or_else(|| {
         invalid(format!(
-            "`{parent}` is partitioned by `{column}`, which it does not declare"
+            "`{parent}` is partitioned by `{column}`, which it does not declare",
+            parent = parent.raw()
         ))
     })?;
     let key = Key::of(ty).ok_or_else(|| {
         invalid(format!(
             "`{parent}` is partitioned by `{column}`, a {ty}: a series is generated for a \
-             `date`, `timestamp`, `timestamptz`, `smallint`, `integer` or `bigint` key"
+             `date`, `timestamp`, `timestamptz`, `smallint`, `integer` or `bigint` key",
+            parent = parent.raw()
         ))
     })?;
 
@@ -576,7 +586,8 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
             // A series is of ranges (#1632).
             PartitionBound::List { .. } | PartitionBound::Hash { .. } => {
                 return Err(invalid(format!(
-                    "partition {name} is not a range: only a RANGE parent's partitions extend"
+                    "partition {name} is not a range: only a RANGE parent's partitions extend",
+                    name = name.raw()
                 )));
             }
             PartitionBound::Range { from, to } => {
@@ -585,19 +596,22 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
                         "partition {name} is bounded by {} value(s) from and {} to, and the key \
                          is one column",
                         from.len(),
-                        to.len()
+                        to.len(),
+                        name = name.raw()
                     )));
                 };
                 match end {
                     BoundDatum::MaxValue => {
                         return Err(invalid(format!(
                             "partition {name} reaches MAXVALUE, so no range can follow it; \
-                             there is nothing to extend"
+                             there is nothing to extend",
+                            name = name.raw()
                         )));
                     }
                     BoundDatum::MinValue => {
                         return Err(invalid(format!(
-                            "partition {name} ends at MINVALUE, which no range can"
+                            "partition {name} ends at MINVALUE, which no range can",
+                            name = name.raw()
                         )));
                     }
                     BoundDatum::Value(text) => ends.push((name.clone(), text.clone())),
@@ -636,7 +650,8 @@ fn named(req: &RangeSeriesRequest<'_>, suffix: &str) -> Result<TableName, Dialec
     if req.schema.tables.contains_key(&name) {
         return Err(invalid(format!(
             "`{name}` is already declared, and the series would name a partition so; declare \
-             these partitions by hand, or rename that table"
+             these partitions by hand, or rename that table",
+            name = name.raw()
         )));
     }
     Ok(name)
@@ -663,11 +678,16 @@ fn temporal(
         let c = parse_civil(key, text).map_err(|r| {
             invalid(format!(
                 "partition {name} ends at `{text}`, {}",
-                why(key, &r)
+                why(key, &r),
+                name = name.raw()
             ))
         })?;
         if frontier.as_ref().is_none_or(|(best, ..)| c > *best) {
-            frontier = Some((c, text, format!("partition {name} ends at `{text}`")));
+            frontier = Some((
+                c,
+                text,
+                format!("partition {name} ends at `{text}`", name = name.raw()),
+            ));
         }
     }
     let until = parse_civil(key, req.until)
@@ -677,7 +697,7 @@ fn temporal(
             return Err(invalid(format!(
                 "--from `{from}` is accepted only for a parent that declares no range yet; \
                  `{}` already ends at `{end}`, where the series continues",
-                req.parent
+                req.parent.raw()
             )));
         }
         (Some((c, text, origin)), None) => (c, text.to_owned(), origin),
@@ -690,7 +710,7 @@ fn temporal(
             return Err(invalid(format!(
                 "`{}` declares no range to continue from: say where the series starts with \
                  --from, as `--from {}`",
-                req.parent,
+                req.parent.raw(),
                 key.example()
             )));
         }
@@ -815,10 +835,17 @@ fn integers(
 
     let mut frontier: Option<(i128, String)> = None;
     for (name, text) in &declared.ends {
-        let v = parse_integer(int, text)
-            .map_err(|why| invalid(format!("partition {name} ends at `{text}`, {why}")))?;
+        let v = parse_integer(int, text).map_err(|why| {
+            invalid(format!(
+                "partition {name} ends at `{text}`, {why}",
+                name = name.raw()
+            ))
+        })?;
         if frontier.as_ref().is_none_or(|(best, _)| v > *best) {
-            frontier = Some((v, format!("partition {name} ends at `{text}`")));
+            frontier = Some((
+                v,
+                format!("partition {name} ends at `{text}`", name = name.raw()),
+            ));
         }
     }
     let until = parse_integer(int, req.until)
@@ -828,7 +855,7 @@ fn integers(
             return Err(invalid(format!(
                 "--from `{from}` is accepted only for a parent that declares no range yet; \
                  `{}` already ends at `{v}`, where the series continues",
-                req.parent
+                req.parent.raw()
             )));
         }
         (Some(found), None) => found,
@@ -841,7 +868,7 @@ fn integers(
             return Err(invalid(format!(
                 "`{}` declares no range to continue from: say where the series starts with \
                  --from, as `--from 0`",
-                req.parent
+                req.parent.raw()
             )));
         }
     };

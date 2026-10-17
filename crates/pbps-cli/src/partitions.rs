@@ -77,7 +77,8 @@ pub fn cmd_extend(
         println!(
             "{parent} already reaches `{}`, which is at or past --until `{until}`; nothing to \
              add.",
-            series.start
+            series.start,
+            parent = parent.shown()
         );
         return Ok(());
     }
@@ -194,7 +195,8 @@ pub fn cmd_extend(
     println!(
         "Added {count} partition(s) to {parent} in `{}`, from `{}` to `{until}`:",
         path.display(),
-        series.start
+        series.start,
+        parent = parent.shown()
     );
     for (i, p) in series.partitions.iter().enumerate() {
         if count > LISTED && (LISTED / 2..count - LISTED / 2).contains(&i) {
@@ -203,7 +205,7 @@ pub fn cmd_extend(
             }
             continue;
         }
-        println!("  {}  [{}, {})", p.name, p.from, p.to);
+        println!("  {}  [{}, {})", p.name.shown(), p.from, p.to);
     }
     if loaded.schema.tables.values().any(|t| {
         t.partition_of
@@ -213,7 +215,8 @@ pub fn cmd_extend(
         println!(
             "{parent} has a DEFAULT partition: a new range beside it is made as a plain table \
              and attached, and takes the DEFAULT's rows of its range only as far as a \
-             `pbps move-rows` allows."
+             `pbps move-rows` allows.",
+            parent = parent.shown()
         );
     }
     println!(
@@ -268,7 +271,8 @@ fn parents_file(
     }
     bail!(
         "no file under `{}` declares `{parent}` as a table",
-        dir.display()
+        dir.display(),
+        parent = parent.shown()
     )
 }
 

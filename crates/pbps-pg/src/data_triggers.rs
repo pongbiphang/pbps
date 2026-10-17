@@ -320,7 +320,8 @@ async fn lock_by_oid(conn: &mut Conn, relation: i64) -> Result<(), DbError> {
     .map_err(|e| {
         if e.server_error_code().as_deref() == Some(DENIED) {
             return e.context(format!(
-                "the data-trigger guard cannot lock `{table}`, which this row operation writes through a foreign-key referential action. The deployment role needs INSERT, UPDATE, DELETE or TRUNCATE on it to hold its triggers still through the write."
+                "the data-trigger guard cannot lock `{table}`, which this row operation writes through a foreign-key referential action. The deployment role needs INSERT, UPDATE, DELETE or TRUNCATE on it to hold its triggers still through the write.",
+                table = table.shown(),
             ));
         }
         e
@@ -489,7 +490,8 @@ async fn refuse_rules(conn: &mut Conn, statement: &Statement) -> Result<(), DbEr
     );
     let name = row.try_get::<&str>("name")?.ok_or_else(missing)?;
     Err(DbError::Refused(format!(
-        "unsafe rewrite rule `{name}` on `{table}`: a rule decides what a write does, and this row operation reaches that table. The statements a rule adds are not part of the plan and their triggers cannot be authenticated, so the write is refused rather than executed as the deployment role. Remove the rule before planning again."
+        "unsafe rewrite rule `{name}` on `{table}`: a rule decides what a write does, and this row operation reaches that table. The statements a rule adds are not part of the plan and their triggers cannot be authenticated, so the write is refused rather than executed as the deployment role. Remove the rule before planning again.",
+        table = table.shown()
     )))
 }
 
@@ -823,13 +825,16 @@ fn refused(trigger: &Trigger, written: &TableName) -> DbError {
     let name = &trigger.name;
     let reached = if trigger.through_an_action {
         format!(
-            " `{table}` is written by a foreign-key referential action of the row operation on `{written}`, so its triggers run under the deployment role too."
+            " `{table}` is written by a foreign-key referential action of the row operation on `{written}`, so its triggers run under the deployment role too.",
+            table = table.shown(),
+            written = written.shown()
         )
     } else {
         String::new()
     };
     DbError::Refused(format!(
-        "unsafe data trigger `{name}` on `{table}`: reference-data writes require an unchanged recorded managed trigger whose function ownership rights are held only by roles that can act as the deployment role.{reached} Remove the trigger or establish that managed/trusted definition before planning again. `unmanaged: ignore` and `warn` do not authorize executing external trigger code."
+        "unsafe data trigger `{name}` on `{table}`: reference-data writes require an unchanged recorded managed trigger whose function ownership rights are held only by roles that can act as the deployment role.{reached} Remove the trigger or establish that managed/trusted definition before planning again. `unmanaged: ignore` and `warn` do not authorize executing external trigger code.",
+        table = table.shown()
     ))
 }
 

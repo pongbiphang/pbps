@@ -1,3 +1,6 @@
+// Default-check warnings can include escaped database errors: their names are
+// shown once in prose until #2084 step 5 (DEC-2084.1).
+
 //! The catalog queries behind [`crate::introspect`].
 //!
 //! Only this file runs SQL against a live server; it converts `pg_catalog` rows
@@ -2797,7 +2800,8 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
             {
                 out.defaults_unasked.push(format!(
                     "partition {partition} column `{column}`: its declared text may name a \
-                     temporary schema, whose objects another session can change"
+                     temporary schema, whose objects another session can change",
+                    partition = partition.shown()
                 ));
                 continue;
             }
@@ -2813,7 +2817,8 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
                 Err(_) => out.defaults_unasked.push(format!(
                     "partition {partition} column `{column}`: its type `{}` is not one this \
                      check can create a column of",
-                    theirs.ty
+                    theirs.ty,
+                    partition = partition.shown()
                 )),
             }
         }
@@ -2867,11 +2872,13 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
         };
     }
     if let Some(why) = refused {
-        out.defaults_unasked.extend(
-            asked
-                .iter()
-                .map(|d| format!("partition {} column `{}`: {why}", d.partition, d.column)),
-        );
+        out.defaults_unasked.extend(asked.iter().map(|d| {
+            format!(
+                "partition {} column `{}`: {why}",
+                d.partition.shown(),
+                d.column
+            )
+        }));
         return;
     }
     let result = store_and_read(conn, &asked).await;
@@ -2893,16 +2900,19 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
                     Ok(_) => {}
                     Err(why) => out.defaults_unasked.push(format!(
                         "partition {} column `{}`: {why}",
-                        d.partition, d.column
+                        d.partition.shown(),
+                        d.column
                     )),
                 }
             }
         }
-        Err(why) => out.defaults_unasked.extend(
-            asked
-                .iter()
-                .map(|d| format!("partition {} column `{}`: {why}", d.partition, d.column)),
-        ),
+        Err(why) => out.defaults_unasked.extend(asked.iter().map(|d| {
+            format!(
+                "partition {} column `{}`: {why}",
+                d.partition.shown(),
+                d.column
+            )
+        })),
     }
 }
 

@@ -290,11 +290,9 @@ async fn one(
     if entry.snapshot.kind == pbps_model::StateKind::Failed {
         row.state = "failed";
         row.detail = Some(match &entry.snapshot.reason {
-            // `.raw()`: this sentence is the JSON `detail` as well as the line
-            // `render` prints, and `--format json` keeps what was recorded.
-            // Showing it escaped here would change the JSON, so the human line
-            // stays as it was until #2084 step 5 gives `detail` a type of its
-            // own.
+            // This pre-existing free-text reason is outside the 1a name types.
+            // Its prose boundary remains for #2084 step 5 (DEC-2084.1), when
+            // recorded reasons and already rendered error sentences separate.
             Some(reason) => format!("the last deployment attempt failed: {}", reason.raw()),
             None => "the last deployment attempt failed".to_owned(),
         });
@@ -1062,6 +1060,52 @@ mod tests {
             &Default::default(),
         );
         (entry, pulled, scoped)
+    }
+
+    #[test]
+    fn unmanaged_status_prose_shows_raw_inventory_names_once() {
+        for (part, shown) in [
+            (
+                "a\nb\r\u{1b}[31m\\c\u{200b}",
+                r"a\nb\r\u{1b}[31m\\c\u{200b}",
+            ),
+            ("名前_ünï", "名前_ünï"),
+        ] {
+            let (entry, mut pulled, _) = stray_table();
+            let name = pbps_model::TableName::new("app", part);
+            pulled.schema.tables = [(name, pbps_model::Table::default())].into();
+            let scoped = pbps_diff::scope(
+                &pulled.schema,
+                &entry.snapshot.ids,
+                &recorded_modules(&entry),
+                &Default::default(),
+            );
+            let mut r = row("prod", "ok");
+            record_catalog_findings(
+                &mut r,
+                &entry,
+                &pulled,
+                &scoped,
+                Ok(Default::default()),
+                pbps_config::Unmanaged::Warn,
+            );
+            let json = serde_json::to_value(&r).unwrap();
+            assert_eq!(
+                json["detail"],
+                format!("`unmanaged: warn` sees 1 object(s) outside the managed set: app.{shown}")
+            );
+            assert!(render(std::slice::from_ref(&r)).contains(&format!("app.{shown}")));
+            // The typed inventory is machine data; only its prose labels show names.
+            let raw_names = serde_json::to_value(&scoped.unmanaged).unwrap();
+            assert_eq!(raw_names[0], format!("app.{part}"));
+            let findings_json = serde_json::to_value(findings(&[r])).unwrap();
+            assert!(
+                findings_json[0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("app.{shown}"))
+            );
+        }
     }
 
     /// The row read is the last thing `status` reads, and the inventory after

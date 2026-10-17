@@ -433,7 +433,7 @@ fn resolve_with_provenance(
                 Blocker::RenameTargetExists { target } if column_blockers.contains(&index) => {
                     provisional_tables
                         .keys()
-                        .find(|table| target.starts_with(&format!("{table}.")))
+                        .find(|table| target.starts_with(&format!("{table}.", table = table.raw())))
                         .cloned()
                 }
                 Blocker::ProvisionalTableIdentity { .. }
@@ -503,8 +503,9 @@ struct Claim<'a, T> {
 /// `Err`, so the order-dependent decision goes nowhere — while skipping the
 /// loop leaves every *other* intent of that kind unmatched, and the sweep then
 /// reports each of those as a likely typo too.
-fn contested_rename_claims<T: Ord + Clone + std::fmt::Display>(
+fn contested_rename_claims<T: Ord + Clone>(
     claims: &[Claim<'_, T>],
+    raw: impl Fn(&T) -> String,
 ) -> Contested {
     let mut out = Vec::new();
     let mut conflicting = Conflicting::default();
@@ -530,13 +531,13 @@ fn contested_rename_claims<T: Ord + Clone + std::fmt::Display>(
             }
             conflicting
                 .sources
-                .extend(group.iter().map(|c| c.source.to_string()));
+                .extend(group.iter().map(|c| raw(&c.source)));
             conflicting
                 .targets
-                .extend(group.iter().map(|c| c.target.to_string()));
+                .extend(group.iter().map(|c| raw(&c.target)));
             out.push(Blocker::ConflictingRenameIntents {
                 side,
-                name: name.to_string(),
+                name: raw(name),
                 intents: distinct.into_iter().cloned().collect(),
             });
         }
@@ -558,7 +559,7 @@ fn contested_rename_claims<T: Ord + Clone + std::fmt::Display>(
 
 type Contested = (Vec<Blocker>, Conflicting);
 
-/// Both ends of every contested claim, by display name. The conflict blocker
+/// Both ends of every contested claim, by raw name text. The conflict blocker
 /// already accounts for them, so neither may reappear as an ambiguity
 /// candidate: whichever claim the matching loop happened to take, the other's
 /// source or target would otherwise be offered to an unrelated object, and
@@ -719,7 +720,7 @@ fn resolve_roles(
             })
         })
         .collect();
-    let (rename_blockers, conflicting) = contested_rename_claims(&claims);
+    let (rename_blockers, conflicting) = contested_rename_claims(&claims, |n| (*n).clone());
     blockers.extend(rename_blockers);
 
     // A target that is already known and still declared is not in `appeared`,
@@ -864,7 +865,7 @@ fn resolve_tables(
             })
         })
         .collect();
-    let (rename_blockers, conflicting) = contested_rename_claims(&claims);
+    let (rename_blockers, conflicting) = contested_rename_claims(&claims, |n| n.raw().to_string());
     blockers.extend(rename_blockers);
 
     // Check both sets before the matching loop mutates either one. If the
@@ -894,7 +895,7 @@ fn resolve_tables(
                 && occupied_targets.insert(to.clone())
             {
                 blockers.push(Blocker::RenameTargetExists {
-                    target: to.clone().to_string(),
+                    target: to.clone().raw().to_string(),
                 });
             }
             used.insert(i);
@@ -930,10 +931,10 @@ fn resolve_tables(
 
     // Keep conflicted sources out of both ambiguity and missing-drop reports;
     // matching one contender above does not make the other a new decision.
-    disappeared.retain(|table| !conflicting.sources.contains(&table.to_string()));
+    disappeared.retain(|table| !conflicting.sources.contains(&table.raw().to_string()));
     let candidates: Vec<_> = appeared
         .iter()
-        .filter(|table| !conflicting.targets.contains(&table.to_string()))
+        .filter(|table| !conflicting.targets.contains(&table.raw().to_string()))
         .cloned()
         .collect();
     if !candidates.is_empty() && !disappeared.is_empty() {
@@ -1048,7 +1049,8 @@ fn resolve_columns(
                 )
             })
             .collect();
-        let (rename_blockers, conflicting) = contested_rename_claims(&claims);
+        let (rename_blockers, conflicting) =
+            contested_rename_claims(&claims, |n| n.raw().to_string());
         blockers.extend(rename_blockers);
 
         // The target must be checked while both sets still describe the
@@ -1082,7 +1084,7 @@ fn resolve_columns(
                     && occupied_targets.insert(to.clone())
                 {
                     blockers.push(Blocker::RenameTargetExists {
-                        target: table_name.column(to).to_string(),
+                        target: table_name.column(to).raw().to_string(),
                     });
                 }
                 used.insert(i);
@@ -1116,7 +1118,7 @@ fn resolve_columns(
                 r.ids.tombstones.insert(
                     uid.clone(),
                     Tombstone {
-                        was: column.to_string(),
+                        was: column.raw().to_string(),
                         dropped_at: ctx.today.clone(),
                         reason: reason.to_string(),
                         operator: ctx.operator.clone(),
@@ -1132,14 +1134,14 @@ fn resolve_columns(
         disappeared.retain(|name| {
             !conflicting
                 .sources
-                .contains(&table_name.column(name).to_string())
+                .contains(&table_name.column(name).raw().to_string())
         });
         let candidates: Vec<_> = appeared
             .iter()
             .filter(|name| {
                 !conflicting
                     .targets
-                    .contains(&table_name.column(name.as_str()).to_string())
+                    .contains(&table_name.column(name.as_str()).raw().to_string())
             })
             .cloned()
             .collect();
@@ -1362,7 +1364,8 @@ fn drop_table_in_ids(
 
     ids.tables.remove(uid);
     ids.moves.remove(uid);
-    ids.tombstones.insert(uid.clone(), make(table.to_string()));
+    ids.tombstones
+        .insert(uid.clone(), make(table.raw().to_string()));
 
     let cols: Vec<(Uid, ColumnRef)> = ids
         .columns
@@ -1372,7 +1375,7 @@ fn drop_table_in_ids(
         .collect();
     for (u, c) in cols {
         ids.columns.remove(&u);
-        ids.tombstones.insert(u, make(c.to_string()));
+        ids.tombstones.insert(u, make(c.raw().to_string()));
     }
 }
 
@@ -1405,6 +1408,181 @@ fn sort_resolution(r: &mut Resolution) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_provisional_tables_raw_prefix_finds_its_column_target_blocker() {
+        let part = "a\nb\\c\u{200b}";
+        let from = TableName::new("app", format!("{part}old"));
+        let to = TableName::new("app", format!("{part}new"));
+        let other = TableName::new("app", format!("{part}other"));
+        let mut ids = IdsFile::default();
+        ids.tables.insert("t_aaaaaa".parse().unwrap(), from.clone());
+        for (uid, column) in [("c_aaaaaa", "source"), ("c_bbbbbb", part)] {
+            ids.columns
+                .insert(uid.parse().unwrap(), from.column(column));
+        }
+        let mut declared = Schema::default();
+        let mut table = Table::default();
+        table
+            .columns
+            .insert(part.into(), Column::new("int".parse().unwrap()));
+        declared.tables.insert(to.clone(), table);
+        declared.tables.insert(other.clone(), Default::default());
+        let intents = [
+            Intent::RenameTable {
+                from: from.clone(),
+                to: to.clone(),
+            },
+            Intent::RenameTable { from, to: other },
+            Intent::RenameColumn {
+                table: to.clone(),
+                from: "source".into(),
+                to: part.into(),
+            },
+        ];
+        let errors = resolve(&declared, &ids, &intents, &ctx()).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(e,
+                Blocker::ProvisionalTableIdentity { blocker, .. }
+                    if matches!(blocker.as_ref(), Blocker::RenameTargetExists { target }
+                        if target == &format!("app.{part}new.{part}"))
+            )),
+            "{errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| matches!(e, Blocker::RenameTargetExists { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn contested_table_rename_keys_match_both_raw_lookup_sides() {
+        use super::*;
+        let part = "a\nb\\c\u{200b}";
+        let from = TableName::new("app", part);
+        let to = |suffix: &str| TableName::new("app", format!("{part}{suffix}"));
+        let mut declared = Schema::default();
+        declared.tables.insert(to("1"), Default::default());
+        declared.tables.insert(to("2"), Default::default());
+        let mut ids = IdsFile::default();
+        ids.tables.insert("t_aaaaaa".parse().unwrap(), from.clone());
+        let intents = [
+            Intent::RenameTable {
+                from: from.clone(),
+                to: to("1"),
+            },
+            Intent::RenameTable {
+                from: from.clone(),
+                to: to("2"),
+            },
+        ];
+        let errors = resolve(&declared, &ids, &intents, &ctx()).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            matches!(&errors[0], Blocker::ConflictingRenameIntents { name, .. } if name == &format!("app.{part}"))
+        );
+        // One explicit rename leaves an ordinary addition, without a contested key.
+        assert!(resolve(&declared, &ids, &intents[..1], &ctx()).is_ok());
+    }
+
+    #[test]
+    fn contested_column_rename_keys_match_both_qualified_raw_lookup_sides() {
+        use super::*;
+        let part = "a\nb\\c\u{200b}";
+        let table_name = TableName::new("app", part);
+        let mut table = Table::default();
+        for suffix in ["1", "2"] {
+            table.columns.insert(
+                format!("{part}{suffix}"),
+                Column::new("int".parse().unwrap()),
+            );
+        }
+        let mut declared = Schema::default();
+        declared.tables.insert(table_name.clone(), table);
+        let mut ids = IdsFile::default();
+        ids.tables
+            .insert("t_aaaaaa".parse().unwrap(), table_name.clone());
+        ids.columns
+            .insert("c_aaaaaa".parse().unwrap(), table_name.column(part));
+        let intents: Vec<_> = ["1", "2"]
+            .map(|suffix| Intent::RenameColumn {
+                table: table_name.clone(),
+                from: part.into(),
+                to: format!("{part}{suffix}"),
+            })
+            .into();
+        let errors = resolve(&declared, &ids, &intents, &ctx()).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            matches!(&errors[0], Blocker::ConflictingRenameIntents { name, .. } if name == &format!("app.{part}.{part}"))
+        );
+        assert!(resolve(&declared, &ids, &intents[..1], &ctx()).is_ok());
+    }
+
+    #[test]
+    fn table_and_column_tombstones_keep_raw_addresses() {
+        use super::*;
+        let part = "a\nb\\c\u{200b}";
+        let name = TableName::new("app", part);
+        let t: Uid = "t_aaaaaa".parse().unwrap();
+        let c: Uid = "c_aaaaaa".parse().unwrap();
+        let mut ids = IdsFile::default();
+        ids.tables.insert(t.clone(), name.clone());
+        ids.columns.insert(c.clone(), name.column(part));
+        drop_table_in_ids(&mut ids, &t, &name, &"retired".parse().unwrap(), &ctx());
+        assert_eq!(ids.tombstones[&t].was, format!("app.{part}"));
+        assert_eq!(ids.tombstones[&c].was, format!("app.{part}.{part}"));
+        assert!(ids.tables.is_empty() && ids.columns.is_empty());
+    }
+
+    #[test]
+    fn a_column_drop_tombstone_keeps_its_raw_address() {
+        let part = "a\nb\\c\u{200b}";
+        let name = TableName::new("app", part);
+        let t: Uid = "t_aaaaaa".parse().unwrap();
+        let c: Uid = "c_aaaaaa".parse().unwrap();
+        let mut ids = IdsFile::default();
+        ids.tables.insert(t.clone(), name.clone());
+        ids.columns.insert(c.clone(), name.column(part));
+        let mut declared = Schema::default();
+        declared.tables.insert(name.clone(), Table::default());
+        let intent = Intent::DropColumn {
+            column: name.column(part),
+            reason: "retired".parse().unwrap(),
+        };
+        let resolved = resolve(&declared, &ids, &[intent], &ctx()).unwrap();
+        assert_eq!(
+            resolved.ids.tombstones[&c].was,
+            format!("app.{part}.{part}")
+        );
+        assert_eq!(resolved.ids.tables[&t], name);
+        assert!(!resolved.ids.tombstones.contains_key(&t));
+    }
+
+    #[test]
+    fn an_occupied_table_rename_target_keeps_its_raw_key() {
+        let part = "a\nb\\c\u{200b}";
+        let from = TableName::new("app", "old");
+        let to = TableName::new("app", part);
+        let mut ids = IdsFile::default();
+        ids.tables.insert("t_aaaaaa".parse().unwrap(), from.clone());
+        ids.tables.insert("t_bbbbbb".parse().unwrap(), to.clone());
+        let mut declared = Schema::default();
+        declared.tables.insert(to.clone(), Table::default());
+        let errors =
+            resolve(&declared, &ids, &[Intent::RenameTable { from, to }], &ctx()).unwrap_err();
+        assert!(
+            errors.iter().any(|e| matches!(e,
+                Blocker::RenameTargetExists { target } if target == &format!("app.{part}")
+            )),
+            "{errors:?}"
+        );
+        assert!(!errors.iter().any(|e| matches!(e,
+            Blocker::RenameTargetExists { target } if target == r"app.a\nb\c\u{200b}"
+        )));
+    }
+
     use super::*;
 
     /// Resolves as `plan` does when every intent came from a declaration's

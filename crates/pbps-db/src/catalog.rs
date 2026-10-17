@@ -36,6 +36,8 @@ pub struct Pulled {
     /// order a reader should see them. Never empty silence: the caller must
     /// show these, because each one is a difference that would otherwise
     /// surface as phantom drift or a destructive plan later.
+    // Prose beside validation error displays until #2084 step 5 (DEC-2084.1).
+    // Refusal/detail prose is copied as is, with no whole-message escape pass.
     pub warnings: Vec<String>,
     /// Permissions the model cannot hold and a drift check must not call
     /// clean. A grant `WITH GRANT OPTION`, a DENY, a column-level grant, a
@@ -159,6 +161,7 @@ pub struct Unexpressible {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Limitation {
     pub target: LimitationTarget,
+    // Prose beside rendered errors, printed as is until #2084 step 5 (DEC-2084.1).
     pub detail: String,
 }
 
@@ -207,11 +210,12 @@ impl LimitationTarget {
     }
 }
 
+// Raw shared inventory spelling until #2084 step 5 (DEC-2084.1) separates its text renderer.
 impl std::fmt::Display for LimitationTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Relation(name) | Self::SharedModule(name) | Self::UnnameableModule(name) => {
-                name.fmt(f)
+                name.raw().fmt(f)
             }
             Self::Module(id) => id.fmt(f),
         }
@@ -227,13 +231,14 @@ pub struct UnmanagedModule {
     /// SQL Server modules use `SharedModule` for its shared object namespace.
     pub target: LimitationTarget,
     /// Why it is not managed, in the operator's words.
+    // Prose beside validation errors, printed as is until #2084 step 5 (DEC-2084.1).
     pub why: String,
 }
 
 /// Why a table's rows could not be read back.
 #[derive(Debug, thiserror::Error)]
 pub enum RowsError {
-    #[error("{table}: its rows cannot be read back -- {why}")]
+    #[error("{table}: its rows cannot be read back -- {why}", table = .table.shown())]
     Unreadable { table: TableName, why: String },
 
     /// `{source}` is deliberately not in this format string. `pbps-cli`'s
@@ -249,7 +254,7 @@ pub enum RowsError {
     /// since the leak had already happened one frame up. `#[source]` alone
     /// (below) is enough for `.chain()` and `.source()` to keep walking into
     /// it; only the *text* has to stop repeating it.
-    #[error("{table}: reading its rows back failed")]
+    #[error("{table}: reading its rows back failed", table = .table.shown())]
     Read {
         table: TableName,
         // Boxed so the error is not larger than every `Ok` it travels beside.
@@ -260,7 +265,7 @@ pub enum RowsError {
     /// The engine sent a value the mapping cannot hold — an integer column
     /// whose text does not parse, say. A bug in the engine's row reader, not
     /// bad data.
-    #[error("{table}.{column}: the engine sent `{text}`, which is not a {kind}")]
+    #[error("{table}.{column}: the engine sent `{text}`, which is not a {kind}", table = .table.shown())]
     BadValue {
         table: TableName,
         column: String,

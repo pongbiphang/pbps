@@ -1374,7 +1374,8 @@ async fn dotted_names_survive_introspection_in_keys_indexes_and_foreign_keys() {
         let parent = pulled.schema.tables.get(&parent_name).unwrap_or_else(|| {
             panic!(
                 "{tag}: `{parent_name}` in {:?}",
-                pulled.schema.tables.keys()
+                pulled.schema.tables.keys(),
+                parent_name = parent_name.shown()
             )
         });
         assert_eq!(
@@ -2171,7 +2172,11 @@ async fn system_versioned_tables_round_trip_through_an_empty_database() {
         TableName::new("hist", "named_history"),
         TableName::new("dbo", &engine_named),
     ] {
-        assert!(!pulled.schema.tables.contains_key(&history), "{history}");
+        assert!(
+            !pulled.schema.tables.contains_key(&history),
+            "{history}",
+            history = history.shown()
+        );
     }
     // A history of its own layout keeps its pair out, both named.
     for (name, says) in [
@@ -5331,7 +5336,8 @@ async fn a_cross_schema_rename_stops_where_the_emitter_says_it_does() {
     assert_eq!(
         names,
         vec![to.clone()],
-        "the emitter said the table would be at `{to}`; the catalog says `{names:?}`"
+        "the emitter said the table would be at `{to}`; the catalog says `{names:?}`",
+        to = to.shown()
     );
 
     // And the second statement finishes the move it declared.
@@ -14355,7 +14361,8 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
     for name in [&dot, &hyphen] {
         assert!(
             matches!(held.granted_objects.get(name), Some(pbps_mssql::doctor::GrantedAt::Object(rights)) if rights.contains("CONTROL")),
-            "{name}: {held:?}"
+            "{name}: {held:?}",
+            name = name.shown()
         );
     }
     assert!(held.referenced_objects[&bracket].contains("REFERENCES"));
@@ -14365,7 +14372,8 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
             !gaps
                 .iter()
                 .any(|g| g.securable == pbps_mssql::doctor::Securable::Object(name.clone())),
-            "a gap on a permission `sa` holds, on {name}: {gaps:?}"
+            "a gap on a permission `sa` holds, on {name}: {gaps:?}",
+            name = name.shown()
         );
     }
     // Absent is still a gap: the object question asks every named target.
@@ -14437,7 +14445,8 @@ async fn a_role_granted_on_more_tables_than_one_statement_holds_is_read_whole() 
         assert!(
             matches!(&held.granted_objects[o], pbps_mssql::doctor::GrantedAt::Object(rights) if rights.contains("CONTROL")),
             "`sa` holds CONTROL on {o}: {:?}",
-            held.granted_objects[o]
+            held.granted_objects[o],
+            o = o.shown()
         );
     }
     let gaps = pbps_mssql::doctor::missing(&held);

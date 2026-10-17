@@ -85,7 +85,8 @@ impl GrantTarget {
 impl fmt::Display for GrantTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            GrantTarget::Object(o) => o.fmt(f),
+            // raw until #2084 step 3 (RoleName): this Display is also serialization.
+            GrantTarget::Object(o) => o.raw().fmt(f),
             GrantTarget::Routine(r) => r.fmt(f),
             GrantTarget::Schema(s) => write!(f, "schema::{s}"),
         }
@@ -273,7 +274,8 @@ pub fn check(schema: &crate::schema::Schema) -> Vec<String> {
                     problems.push(format!(
                         "role `{name}`: grants on `{object}`, which the declarations do not have; \
                          declare the object, or grant on `schema::{}` if it is outside pbps",
-                        object.schema
+                        object.schema,
+                        object = object.shown()
                     ));
                 }
                 // A signature names one overload, so nothing but that exact

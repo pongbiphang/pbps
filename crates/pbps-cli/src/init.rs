@@ -1,3 +1,5 @@
+// Shared Pulled warnings remain raw until #2084 step 5 (DEC-2084.1); terminal warning boundaries escape them.
+
 //! First-run project creation (SPEC §14.2).
 //!
 //! `init` is deliberately separate from ordinary project discovery: it creates
@@ -238,7 +240,10 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         public_execute,
         unexpressible,
     };
-    for warning in onboarding_notices.iter().chain(&prepared.warnings) {
+    for notice in &onboarding_notices {
+        eprintln!("warning: {}", pbps_model::escape::Escaped(notice));
+    }
+    for warning in &prepared.warnings {
         eprintln!("warning: {warning}");
     }
     // Every one of them, unfiltered, as `cmd_pull` reports them: this command
@@ -253,7 +258,12 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
             prepared.unmanaged.len()
         );
         for module in &prepared.unmanaged {
-            eprintln!("  {} {} — {}", module.kind, module.target, module.why);
+            eprintln!(
+                "  {} {} — {}",
+                module.kind,
+                pbps_model::escape::Escaped(&module.target.to_string()),
+                module.why
+            );
         }
         eprintln!("  They are left untouched and do not appear in any plan.");
     }
@@ -293,19 +303,21 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
                     &prepared.ids,
                     &crate::deploy::managed_modules(None, Some(&prepared.schema)),
                 );
+                let environment_arg = crate::report::env_arg(name);
                 if settle.is_empty() {
                     println!(
-                        "Then commit the generated files and initialize this database's ledger:\n  `pbps baseline --env {name} --reason initial-adoption`\nAfter editing a declaration, run `pbps plan --env {name} --out plan.json --sql plan.sql`."
+                        "Then commit the generated files and initialize this database's ledger:\n  `pbps baseline --env {environment_arg} --reason initial-adoption`\nAfter editing a declaration, run `pbps plan --env {environment_arg} --out plan.json --sql plan.sql`."
                     );
                 } else {
                     println!(
-                        "Then settle the {} permission(s) above — `baseline` refuses a database holding one the declarations cannot express — and initialize this database's ledger:\n  `pbps baseline --env {name} --reason initial-adoption`\nAfter editing a declaration, run `pbps plan --env {name} --out plan.json --sql plan.sql`.",
+                        "Then settle the {} permission(s) above — `baseline` refuses a database holding one the declarations cannot express — and initialize this database's ledger:\n  `pbps baseline --env {environment_arg} --reason initial-adoption`\nAfter editing a declaration, run `pbps plan --env {environment_arg} --out plan.json --sql plan.sql`.",
                         settle.len()
                     );
                 }
             } else {
                 println!(
-                    "To adopt the existing database first, run `pbps pull --env {name}`; otherwise add declarations under `schema/`."
+                    "To adopt the existing database first, run `pbps pull --env {environment_arg}`; otherwise add declarations under `schema/`.",
+                    environment_arg = crate::report::env_arg(name)
                 );
             }
         }

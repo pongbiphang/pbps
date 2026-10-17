@@ -1,3 +1,6 @@
+// Names in whole-escaped DialectError fields and shared probe text stay raw
+// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
+
 //! Probes derived from the plan itself (SPEC §7.5).
 //!
 //! Each risky change knows how it can fail, so each one can be turned into a
@@ -499,7 +502,7 @@ fn build<'v, 'p: 'v>(
             Ok(vec![Probe::new(
                 format!(
                     "rows that have no value for the new NOT NULL column {}",
-                    table.column(name)
+                    table.column(name).raw()
                 ),
                 format!("SELECT COUNT(*) AS n FROM {};", qualified(&stored)?),
             )])
@@ -1156,7 +1159,8 @@ fn delete_probe(
     Ok(Probe::new(
         format!(
             "rows in other tables that still reference {table} row `{key}`, which its delete \
-             would orphan or cascade into"
+             would orphan or cascade into",
+            table = table.raw()
         ),
         format!(
             "{}\nSELECT @n AS n;",
@@ -1311,7 +1315,8 @@ pub(crate) fn still_referenced(
         literal(&format!(
             "{table} row `{key}` is referenced by row(s) that arrived after this plan was \
              checked; the delete would orphan or cascade into them. Nothing was applied. \
-             Plan again."
+             Plan again.",
+            table = table.raw()
         ))
     ))
 }
@@ -1493,7 +1498,9 @@ fn unprobeable_probe(
             "foreign-key column(s) of {child} that reference {table} and that this plan writes to \
              a default the probe cannot evaluate, which may be row `{key}` being deleted: {}; \
              spell the value",
-            described.join(", ")
+            described.join(", "),
+            child = child.raw(),
+            table = table.raw()
         ),
         format!(
             "SELECT COUNT(*) AS n\n  \
@@ -1953,7 +1960,10 @@ fn schema_probe(role: &str, schema: &str) -> Probe {
 /// behind (DECISIONS 171).
 fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Result<Probe, DialectError> {
     Ok(Probe::new(
-        format!("existing NULLs in {column}, which NOT NULL would reject"),
+        format!(
+            "existing NULLs in {column}, which NOT NULL would reject",
+            column = column.raw()
+        ),
         format!("SELECT COUNT(*) AS n FROM {from} WHERE {reads} IS NULL;"),
     ))
 }
@@ -2023,7 +2033,10 @@ fn conversion_probe(
     };
     let character_loss_probe = || {
         Probe::new(
-            format!("values in {column} changed when converted to {to}"),
+            format!(
+                "values in {column} changed when converted to {to}",
+                column = column.raw()
+            ),
             format!(
                 "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {target_input})) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), {col}) COLLATE Latin1_General_BIN2;"
             ),
@@ -2066,7 +2079,10 @@ fn conversion_probe(
                         format!("DATALENGTH(RTRIM(TRY_CONVERT(nvarchar(max), {col}))) > {bytes}")
                     };
                 return Ok(vec![Probe::new(
-                    format!("values in {column} too long for {to} or that cannot become {to}"),
+                    format!(
+                        "values in {column} too long for {to} or that cannot become {to}",
+                        column = column.raw()
+                    ),
                     format!(
                         "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND \
                          (TRY_CONVERT({to}, {col}) IS NULL OR {over_capacity});"
@@ -2081,7 +2097,10 @@ fn conversion_probe(
                     _ => format!("LEN({col})"),
                 };
                 let mut probes = vec![Probe::new(
-                    format!("values in {column} too long for {to}"),
+                    format!(
+                        "values in {column} too long for {to}",
+                        column = column.raw()
+                    ),
                     format!(
                         "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND {len} > {n};"
                     ),
@@ -2100,7 +2119,10 @@ fn conversion_probe(
             }
             "binary" | "varbinary" => {
                 return Ok(vec![Probe::new(
-                    format!("values in {column} too long for {to}"),
+                    format!(
+                        "values in {column} too long for {to}",
+                        column = column.raw()
+                    ),
                     format!(
                         "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND DATALENGTH({col}) > {n};"
                     ),
@@ -2125,7 +2147,10 @@ fn conversion_probe(
     // dialect's own catalogue, never from user text — `normalize` has already
     // rejected anything that is not a type this dialect knows.
     Ok(vec![Probe::new(
-        format!("values in {column} that cannot become {to}"),
+        format!(
+            "values in {column} that cannot become {to}",
+            column = column.raw()
+        ),
         format!(
             "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND TRY_CONVERT({to}, {col}) IS NULL;"
         ),

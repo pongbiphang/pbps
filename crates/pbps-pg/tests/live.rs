@@ -93,11 +93,16 @@ async fn the_pull_keeps_project_ledger_names_beside_the_real_ledger() {
             .schema
             .tables
             .get(&name)
-            .unwrap_or_else(|| panic!("missing {name}"));
-        assert!(table.columns.contains_key("id"), "{name}");
+            .unwrap_or_else(|| panic!("missing {name}", name = name.shown()));
+        assert!(
+            table.columns.contains_key("id"),
+            "{name}",
+            name = name.shown()
+        );
         assert!(
             Postgres::new().validate_table(&name, table).is_empty(),
-            "{name}"
+            "{name}",
+            name = name.shown()
         );
     }
     for name in [
@@ -3313,7 +3318,7 @@ async fn macaddr8_and_a_gin_over_a_tsvector_stay_reported_limitations() {
     let read = pull(&mut db).await;
     let named: Vec<String> = ours_limitations(&read, &s)
         .iter()
-        .map(|l| l.target.object_name().to_string())
+        .map(|l| l.target.object_name().raw().to_string())
         .collect();
     drop_schema(&mut db, &s).await;
     db.drop().await;
@@ -5439,20 +5444,26 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
                 },
             ),
         ] {
-            assert_eq!(held.tables.get(&name), Some(&expected), "{name}");
+            assert_eq!(
+                held.tables.get(&name),
+                Some(&expected),
+                "{name}",
+                name = name.shown()
+            );
         }
         // Nothing held is also named: a clone dropped as unreadable would be a
         // limitation on its table, which refuses every command on it.
         let named: Vec<String> = pulled
             .limitations
             .iter()
-            .map(|l| l.target.object_name().to_string())
+            .map(|l| l.target.object_name().raw().to_string())
             .collect();
         for name in held.tables.keys() {
             assert!(
-                !named.contains(&name.to_string()),
+                !named.contains(&name.raw().to_string()),
                 "{name}: {:?}",
-                pulled.limitations
+                pulled.limitations,
+                name = name.shown()
             );
         }
         // The foreign key, once: its clones to each partition are the engine's.
@@ -5490,7 +5501,7 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
                 pulled
                     .limitations
                     .iter()
-                    .any(|l| l.target.object_name().to_string() == format!("{s}.{name}")),
+                    .any(|l| l.target.object_name().raw().to_string() == format!("{s}.{name}")),
                 "{name} is not named: {:?}",
                 pulled.limitations
             );
@@ -5727,10 +5738,12 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
             assert_eq!(bound(&held, name), Some(expected), "{name}");
         }
         assert!(
-            pulled
-                .limitations
-                .iter()
-                .all(|l| !l.target.object_name().to_string().starts_with(&s)),
+            pulled.limitations.iter().all(|l| !l
+                .target
+                .object_name()
+                .raw()
+                .to_string()
+                .starts_with(&s)),
             "{:?}",
             pulled.limitations
         );
@@ -17123,7 +17136,10 @@ async fn native_routine_symbols_do_not_report_callers_or_trigger_rebuilds() {
     ] {
         let id: pbps_model::ModuleId = id.parse().unwrap();
         db.conn
-            .execute(&format!("CREATE FUNCTION {}{definition}", id.object_name()))
+            .execute(&format!(
+                "CREATE FUNCTION {}{definition}",
+                id.object_name().raw()
+            ))
             .await
             .unwrap();
         declared
@@ -22842,7 +22858,7 @@ async fn narrowing_projection_keeps_added_foreign_key_checks_for_fitting_rows() 
             });
         }
         let column = if side == "child" {
-            child.column(child_column).to_string()
+            child.column(child_column).raw().to_string()
         } else {
             "public.parent.v".to_owned()
         };
@@ -28070,7 +28086,7 @@ async fn a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded(
         .schema
         .tables
         .keys()
-        .map(ToString::to_string)
+        .map(|name| name.raw().to_string())
         .collect();
     assert_eq!(
         tables,
@@ -31559,7 +31575,7 @@ async fn a_check_the_engine_may_prove_the_column_from_takes_the_scan_back_to_unk
 /// Measure only the statement under discussion: a replacement CHECK's later
 /// validation also scans, and must not be mistaken for the nullability scan.
 async fn nullability_scan(conn: &mut Conn, table: &TableName, sql: &str) -> (i32, bool) {
-    let relation = table.to_string();
+    let relation = table.raw().to_string();
     let stat = format!(
         "SELECT seq_tup_read::int FROM pg_stat_user_tables WHERE relid = '{relation}'::regclass"
     );

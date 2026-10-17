@@ -42,7 +42,7 @@ pub fn ids(changes: &ChangeSet) -> IdsFile {
         if let Some(name) = p.change.table()
             && !known.contains(name)
         {
-            ids.tables.insert(Uid::derived(UidKind::Table, &name.to_string(), 0), name.clone());
+            ids.tables.insert(Uid::derived(UidKind::Table, &name.raw().to_string(), 0), name.clone());
         }
     }
     let mut columns: BTreeMap<Uid, (Uid, String)> = BTreeMap::new();
@@ -87,7 +87,7 @@ pub fn ids(changes: &ChangeSet) -> IdsFile {
         };
         if let Some((uid, address, after)) = column {
             let owner = ids.tables.iter().find(|(_, name)| **name == address.table)
-                .unwrap_or_else(|| panic!("fixture has no owner for {address}" )).0.clone();
+                .unwrap_or_else(|| panic!("fixture has no owner for {address}" , address = address.raw())).0.clone();
             columns.retain(|old, (held, name)| !(generated.contains(old) && *held == owner && *name == address.name));
             if let Some(name) = after {
                 columns.insert(uid.clone(), (owner, name.into()));
@@ -100,5 +100,21 @@ pub fn ids(changes: &ChangeSet) -> IdsFile {
         (uid, ColumnRef { table: ids.tables[&owner].clone(), name })
     }).collect();
     ids
+}
+
+#[test]
+fn fixture_table_identities_use_raw_name_seeds() {
+    let part = "a\nb\\c\u{200b}";
+    let name = pbps_model::TableName::new("app", part);
+    let changes = ChangeSet {
+        changes: vec![pbps_model::PlannedChange::new(Change::AddColumn {
+            uid: "c_aaaaaa".parse().unwrap(), table: name.clone(), name: part.into(),
+            column: Box::new(pbps_model::Column::new("int".parse().unwrap())),
+        })],
+    };
+    let actual = ids(&changes);
+    assert_eq!(actual.table_uid(&name), Some(&Uid::derived(UidKind::Table, &format!("app.{part}"), 0)));
+    assert_eq!(actual.column_uid(&name.column(part)), Some(&"c_aaaaaa".parse().unwrap()));
+    assert!(actual.table_uid(&pbps_model::TableName::new("app", r"a\nb\c\u{200b}")).is_none());
 }
 

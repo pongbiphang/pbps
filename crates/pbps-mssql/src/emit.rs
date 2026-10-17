@@ -1,3 +1,6 @@
+// Names in whole-escaped DialectError fields and shared probe text stay raw
+// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
+
 //! The T-SQL emitter: the one place in the codebase where SQL is written.
 //!
 //! # Two rules that shape almost every statement here
@@ -305,7 +308,9 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         | Change::AttachPartition { table, parent, .. } => Err(DialectError::Invalid {
             dialect: crate::types::DIALECT,
             message: format!(
-                "{table} is a partition of {parent}, which SQL Server's model does not hold"
+                "{table} is a partition of {parent}, which SQL Server's model does not hold",
+                table = table.raw(),
+                parent = parent.raw()
             ),
         }),
 
@@ -464,26 +469,41 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // it anyway came from somewhere else and has no statement here.
         Change::SetReplicaIdentity { table, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
-            feature: format!("a replica identity on `{table}`, which is PostgreSQL's"),
+            feature: format!(
+                "a replica identity on `{table}`, which is PostgreSQL's",
+                table = table.raw()
+            ),
         }),
         Change::SetStorageParameters { table, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
-            feature: format!("storage parameters on `{table}`, which are PostgreSQL's"),
+            feature: format!(
+                "storage parameters on `{table}`, which are PostgreSQL's",
+                table = table.raw()
+            ),
         }),
         // A partition is PostgreSQL's in this model (#1581).
         Change::SetPartitionDefault { table, .. } | Change::SetPartitionNotNull { table, .. } => {
             Err(DialectError::Invalid {
                 dialect: crate::types::DIALECT,
-                message: format!("{table} is a partition, which SQL Server's model does not hold"),
+                message: format!(
+                    "{table} is a partition, which SQL Server's model does not hold",
+                    table = table.raw()
+                ),
             })
         }
         Change::SetTablePersistence { table, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
-            feature: format!("an unlogged `{table}`, which is PostgreSQL's"),
+            feature: format!(
+                "an unlogged `{table}`, which is PostgreSQL's",
+                table = table.raw()
+            ),
         }),
         Change::SetIndexStorageParameters { table, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
-            feature: format!("index storage parameters on `{table}`, which are PostgreSQL's"),
+            feature: format!(
+                "index storage parameters on `{table}`, which are PostgreSQL's",
+                table = table.raw()
+            ),
         }),
         Change::PublicExecution { routine, .. } => Err(DialectError::Unsupported {
             dialect: DIALECT,
@@ -604,7 +624,8 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                     dialect: DIALECT,
                     message: format!(
                         "column `{column}` has type `{ty}`, which SQL Server refuses to name in \
-                         ALTER COLUMN; its nullability cannot be changed"
+                         ALTER COLUMN; its nullability cannot be changed",
+                        column = column.raw()
                     ),
                 });
             }
@@ -648,7 +669,8 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         Change::AlterColumnExpression { column, .. } => Err(DialectError::Invalid {
             dialect: DIALECT,
             message: format!(
-                "{column} is a generated column, which this model holds for PostgreSQL only"
+                "{column} is a generated column, which this model holds for PostgreSQL only",
+                column = column.raw()
             ),
         }),
 
@@ -658,7 +680,8 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             message: format!(
                 "{column}: a change to its identity has no ALTER on SQL Server, and this model \
-                 changes one on PostgreSQL only"
+                 changes one on PostgreSQL only",
+                column = column.raw()
             ),
         }),
 
@@ -1063,7 +1086,10 @@ fn update_row(
     if sets.is_empty() {
         return Err(DialectError::Invalid {
             dialect: DIALECT,
-            message: format!("{table}: a row update with no changed column"),
+            message: format!(
+                "{table}: a row update with no changed column",
+                table = table.raw()
+            ),
         });
     }
     // The key locates this row through the engine's aliases; UPDATE does
@@ -1293,7 +1319,8 @@ fn gone_row(table: &TableName, key: &RowKey, key_column: &str) -> Result<String,
         row_key(key),
         literal(&format!(
             "{table} row `{key}` is back after this plan deleted it — a trigger on the table, \
-             or another writer inside it. Nothing was applied."
+             or another writer inside it. Nothing was applied.",
+            table = table.raw()
         ))
     ))
 }
@@ -1438,7 +1465,8 @@ fn wrote_the_row(
             "{table} row `{key}` is not what this plan wrote once the statement had run — a \
              trigger on the table, another writer inside it, or a value the engine stores \
              differently from the way it is declared. Nothing was applied; `pbps plan --db` \
-             says which."
+             says which.",
+            table = table.raw()
         ))
     ))
 }
@@ -1448,7 +1476,8 @@ fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
         "IF @@ROWCOUNT <> 1 THROW 50000, {}, 1;",
         literal(&format!(
             "{table} row `{key}` is not as the plan recorded it: changed or deleted since the \
-             plan was made. Plan again."
+             plan was made. Plan again.",
+            table = table.raw()
         ))
     )
 }
@@ -1744,7 +1773,8 @@ fn create_index(
             dialect: DIALECT,
             message: format!(
                 "index `{name}` on `{table}` is the clustered index, which can have neither \
-                 INCLUDE columns nor a WHERE filter"
+                 INCLUDE columns nor a WHERE filter",
+                table = table.raw()
             ),
         });
     }
@@ -1863,7 +1893,7 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     if table.columns.is_empty() {
         return Err(DialectError::Invalid {
             dialect: DIALECT,
-            message: format!("table `{name}` has no columns"),
+            message: format!("table `{name}` has no columns", name = name.raw()),
         });
     }
     let qualified_name = qualified(name)?;
@@ -2816,11 +2846,12 @@ mod tests {
             let table = tname(table);
             let generated = default_constraint_name(&table, "d");
             let fallback = fallback_default_constraint_name(&table, "d");
-            assert_ne!(generated, fallback, "{table}");
+            assert_ne!(generated, fallback, "{table}", table = table.raw());
             assert_eq!(
                 fallback == digested_default_constraint_name(&table, "d"),
                 !digested_already,
-                "{table}: {fallback}"
+                "{table}: {fallback}",
+                table = table.raw()
             );
             assert!(fallback.starts_with("DF_pbps_"), "{fallback}");
             assert_eq!(generated_default_names(&table, "d"), [generated, fallback]);

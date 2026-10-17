@@ -3,10 +3,11 @@
 
 A name or a free text that can come from an artifact has no `Display`: it is
 used as text only through `.shown()`, which escapes it, or `.raw()`, which does
-not (`pbps_model::Text` today; the name types as steps 1-4 of #2084 convert
-them). The compiler forces that choice but cannot stop `.raw()` being the one
-chosen for a message, and an unescaped line break in a message starts a line the
-tool never wrote. This is the one hole the types leave, so this check closes it.
+not (`pbps_model::Text`, `TableName`/`ObjectName` and `ColumnRef` today; the
+remaining name types follow in #2084). The compiler forces that choice but cannot
+stop `.raw()` being the one chosen for a message, and an unescaped line break in
+a message starts a line the tool never wrote. This is the one hole the types
+leave, so this check closes it.
 
 It refuses `.raw()` (and the function path `Type::raw`) in the arguments of
 `format!`, `bail!`, `anyhow!`, `ensure!`, `print!`, `println!`, `eprint!`,
@@ -73,13 +74,113 @@ ALLOWED = {
         None,
         "writes the Markdown document, which is a file, not a terminal message",
     ),
-    # Known holes. Each is a message a person reads that prints a raw text, and
-    # neither is fixed here: #2084 step 5 types the sentence both are part of.
+    # Counted exceptions: shared sentences await #2084 step 5. Stable raw keys,
+    # adapters and fixture builders are counted too, so a new raw message in
+    # those files cannot hide behind their non-message uses.
     "crates/pbps-cli/src/report.rs": (
-        1,
-        "describe() prints the deprecation reason raw: the line is the JSON "
-        "`risks[].changes` text too and the report escapes it whole; "
+        22,
+        "Canonical shell arguments and describe() names stay raw: the latter is "
+        "the JSON `risks[].changes` text too and the report escapes it whole; "
         "#2084 step 5 removes that cover",
+    ),
+    "crates/pbps-cli/src/explain/resolver.rs": (
+        5,
+        "surface() becomes shared JSON/Text and is escaped once when rendered; "
+        "#2084 step 5 removes the shared-sentence boundary",
+    ),
+    "crates/pbps-dialect/src/lib.rs": (
+        21,
+        "Unchecked::for_change labels are shared JSON and explain prose, "
+        "escaped at rendering until #2084 step 5",
+    ),
+    "crates/pbps-mssql/src/lib.rs": (
+        3,
+        "reserved-table refusals feed whole-escaped DialectError::Invalid "
+        "until #2084 step 5",
+    ),
+    "crates/pbps-mssql/src/validate.rs": (
+        12,
+        "validation sentences feed whole-escaped DialectError fields "
+        "until #2084 step 5",
+    ),
+    "crates/pbps-pg/src/lib.rs": (
+        3,
+        "reserved-schema/table refusals feed whole-escaped DialectError::Invalid "
+        "until #2084 step 5",
+    ),
+    "crates/pbps-pg/src/validate.rs": (
+        2,
+        "target-kind refusals feed whole-escaped DialectError::Invalid "
+        "until #2084 step 5",
+    ),
+    "crates/pbps-pg/src/partition_series.rs": (
+        22,
+        "series refusals and frontier descriptions feed whole-escaped "
+        "DialectError::Invalid until #2084 step 5",
+    ),
+    "crates/pbps-policy/src/evaluate.rs": (
+        6,
+        "policy sentences are shared JSON and findings that report::changes "
+        "escapes whole until #2084 step 5; subjects remain raw identity keys",
+    ),
+    "crates/pbps-model/src/name.rs": (
+        1,
+        "the raw ColumnRef adapter delegates to the raw TableName adapter; "
+        "serialization remains raw after #2084 step 5",
+    ),
+    "crates/pbps-model/src/module.rs": (
+        2,
+        "raw routine/trigger serialization bridges until #2084 step 1b; "
+        "#2084 step 5 must retain their canonical serialized spelling",
+    ),
+    "crates/pbps-diff/src/identity.rs": (
+        1,
+        "matches a raw column target against its raw table-address prefix; "
+        "this identity key remains raw after #2084 step 5",
+    ),
+    "crates/pbps-diff/src/order/compare.rs": (
+        5,
+        "builds raw name-slot identity keys that remain raw after #2084 step 5",
+    ),
+    "crates/pbps-dialect/tests/support/positional_preflight.rs": (
+        6,
+        "builds fixture SQL, whose identifiers remain raw after #2084 step 5",
+    ),
+    "crates/pbps-pg/tests/live.rs": (
+        1,
+        "builds a routine's fixture SQL; SQL remains raw after #2084 step 5",
+    ),
+    "crates/pbps-cli/tests/flow_pg.rs": (
+        1,
+        "writes a trigger's fixture YAML; serialization remains raw after #2084 step 5",
+    ),
+    "crates/pbps-cli/src/adopt.rs": (
+        3,
+        'raw onboarding notices are escaped at their boundary until #2084 step 5 (DEC-2084.1)',
+    ),
+    "crates/pbps-cli/src/deploy.rs": (
+        2,
+        'data.adoption messages are shared finding JSON; text output escapes once until #2084 step 5',
+    ),
+    "crates/pbps-cli/src/engine.rs": (
+        3,
+        'removal descriptions are recorded state and logical-slot labels are connected-check JSON; text boundaries escape once until #2084 step 5',
+    ),
+    "crates/pbps-mssql/src/estimate.rs": (
+        1,
+        'Estimate.about feeds cost JSON; cost::render escapes the shared description until #2084 step 5',
+    ),
+    "crates/pbps-mssql/src/introspect.rs": (
+        2,
+        'raw onboarding notices are escaped at their boundary until #2084 step 5 (DEC-2084.1)',
+    ),
+    "crates/pbps-pg/src/estimate.rs": (
+        29,
+        'Estimate.about feeds cost JSON; cost::render escapes the shared description until #2084 step 5',
+    ),
+    "crates/pbps-pg/src/impact.rs": (
+        4,
+        'DialectError::Invalid escapes the complete refusal once until #2084 step 5',
     ),
     "crates/pbps-cli/src/status.rs": (
         2,

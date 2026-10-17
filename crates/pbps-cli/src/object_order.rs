@@ -204,7 +204,8 @@ pub(crate) fn order_column_renames(
                      its collation, and they wait on one another, so no order runs them: {}. \
                      Rename one of them through a name nothing here uses, in a plan of its own \
                      first, then this one (DEC-1366.3).",
-                    waiting.join(", ")
+                    waiting.join(", "),
+                    table = table.shown()
                 );
             }
             Err(refusal) => anyhow::bail!("{refusal}"),
@@ -665,7 +666,7 @@ mod tests {
             .iter()
             .filter_map(|p| {
                 if let Change::RenameTable { from, to, .. } = &p.change {
-                    Some((from.to_string(), to.to_string()))
+                    Some((from.raw().to_string(), to.raw().to_string()))
                 } else {
                     None
                 }
@@ -988,7 +989,7 @@ mod tests {
                     table, from, to, ..
                 } = &p.change
                 {
-                    Some((table.to_string(), from.clone(), to.clone()))
+                    Some((table.raw().to_string(), from.clone(), to.clone()))
                 } else {
                     None
                 }
@@ -1780,7 +1781,7 @@ mod tests {
                     if let Change::DropCheck { table, .. }
                     | Change::DropComputedColumn { table, .. } = &p.change
                     {
-                        Some(table.to_string())
+                        Some(table.raw().to_string())
                     } else {
                         None
                     }

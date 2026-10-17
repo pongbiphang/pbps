@@ -7,7 +7,7 @@ async fn tightening_reads_prior_writes_and_never_future_writes() {
     let mut db = TestDb::create("positional1775").await;
     let dialect = positional_dialect();
     let table = TableName::new(positional_schema(), "items");
-    db.conn.execute(&format!("CREATE TABLE {table} (id int PRIMARY KEY, value int NULL); INSERT INTO {table} VALUES (1, NULL);")).await.unwrap();
+    db.conn.execute(&format!("CREATE TABLE {table} (id int PRIMARY KEY, value int NULL); INSERT INTO {table} VALUES (1, NULL);", table = table.raw())).await.unwrap();
     let column = Uid::derived(UidKind::Column, "value", 0);
     let tighten = Change::AlterColumnNullability {
         uid: column.clone(), column: table.column("value"), ty: ty("int"), to_nullable: false,
@@ -81,7 +81,8 @@ async fn check_deleted_self_reference(catalog_key: bool) {
     db.conn
         .execute(
             &format!("CREATE TABLE {table} (id int PRIMARY KEY, parent int);
-        INSERT INTO {table} VALUES (1, 1), (2, 2);"),
+        INSERT INTO {table} VALUES (1, 1), (2, 2);", table = table.raw(),
+            ),
         )
         .await
         .unwrap();
@@ -141,7 +142,8 @@ async fn check_deleted_self_reference(catalog_key: bool) {
         db.conn
             .execute(
                 &format!("ALTER TABLE {table} ADD CONSTRAINT nodes_parent_fkey
-            FOREIGN KEY (parent) REFERENCES {table} (id);"),
+            FOREIGN KEY (parent) REFERENCES {table} (id);", table = table.raw(),
+                ),
             )
             .await
             .unwrap();
@@ -149,16 +151,16 @@ async fn check_deleted_self_reference(catalog_key: bool) {
     for rewritten in [false, true] {
         for other_reference in [false, true] {
             db.conn
-                .execute(&format!("DELETE FROM {table} WHERE id = 3;"))
+                .execute(&format!("DELETE FROM {table} WHERE id = 3;", table = table.raw()))
                 .await
                 .unwrap();
             db.conn
-                .execute(&format!("UPDATE {table} SET parent = {} WHERE id = 1;", if rewritten { 2 } else { 1 }))
+                .execute(&format!("UPDATE {table} SET parent = {} WHERE id = 1;", if rewritten { 2 } else { 1 }, table = table.raw()))
                 .await
                 .unwrap();
             if other_reference {
                 db.conn
-                    .execute(&format!("INSERT INTO {table} VALUES (3, 1);"))
+                    .execute(&format!("INSERT INTO {table} VALUES (3, 1);", table = table.raw()))
                     .await
                     .unwrap();
             }

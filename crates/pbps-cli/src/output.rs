@@ -73,6 +73,8 @@ pub struct Finding {
     pub severity: Severity,
 
     /// What is wrong, in the user's vocabulary.
+    // Prose in every format until #2084 step 5 (DEC-2084.1): producers show
+    // names once beside error displays; renderers print this sentence as is.
     pub message: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -388,6 +390,8 @@ pub fn human(findings: &[Finding]) -> String {
             Severity::Warning => "warning",
             Severity::Note => "note",
         };
+        // Prose already contains shown names and escaped error displays.
+        // A whole-message pass would double them (#2084 step 5, DEC-2084.1).
         out.push_str(&format!("  {where_}{label}: {}\n", f.message));
         if let Some(r) = &f.remedy {
             out.push_str(&format!("    {r}\n"));
@@ -398,6 +402,48 @@ pub fn human(findings: &[Finding]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prose_is_shown_once_beside_escaped_errors_while_data_stays_raw() {
+        for (part, shown) in [
+            (
+                "a\nb\r\u{1b}[31m\u{9b}\\c\u{200b}",
+                r"a\nb\r\u{1b}[31m\u{9b}\\c\u{200b}",
+            ),
+            ("名前_ünï", "名前_ünï"),
+        ] {
+            let table = pbps_model::TableName::new("app", part);
+            let error = pbps_dialect::DialectError::Invalid {
+                dialect: "test",
+                message: format!("column `{part}` is invalid"),
+            };
+            let finding = super::Finding::error(
+                "dialect.rejected",
+                format!("{table}: {error}", table = table.shown()),
+            )
+            .remedy(format!(
+                "Repair {table}.\nThen validate again.",
+                table = table.shown()
+            ));
+            let message = format!("app.{shown}: test: column `{shown}` is invalid");
+            let remedy = format!("Repair app.{shown}.\nThen validate again.");
+            assert_eq!(finding.message, message);
+            assert_eq!(finding.remedy.as_deref(), Some(remedy.as_str()));
+            assert_eq!(
+                super::human(std::slice::from_ref(&finding)),
+                format!("  error: {message}\n    {remedy}\n")
+            );
+            let report = super::Report::new(
+                "validate",
+                vec![finding],
+                Some(serde_json::json!({ "table": table })),
+            );
+            let json = serde_json::to_value(report).unwrap();
+            assert_eq!(json["findings"][0]["message"], message);
+            assert_eq!(json["findings"][0]["remedy"], remedy);
+            assert_eq!(json["data"]["table"], format!("app.{part}"));
+        }
+    }
+
     #[test]
     fn diff_refusals_keep_each_reason_before_warnings_through_context() {
         let reasons = vec![

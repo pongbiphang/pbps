@@ -1,3 +1,6 @@
+// Catalog refusal/detail sentences are prose beside rendered type errors.
+// Show names once until #2084 step 5 (DEC-2084.1); typed targets stay raw.
+
 //! Reading a live PostgreSQL back into the model: the pure half.
 //!
 //! The split is [`crate::catalog`]'s doc comment's, and it is the one the SQL
@@ -1682,7 +1685,8 @@ fn target_named(
                 "{} on sequence `{name}` is a grant on a sequence, which this model does not \
                  declare yet -- an identity column needs no such grant, and a role inserting \
                  into a `serial` column does (ADR-0010 section 7, issue #1892)",
-                permission
+                permission,
+                name = name.shown()
             ),
         )),
         // A relation this model does not hold. **Measured**, a `GRANT SELECT`
@@ -1694,7 +1698,8 @@ fn target_named(
             format!(
                 "{} on `{name}` is on {}, which this model does not declare",
                 permission,
-                relation_kind(other)
+                relation_kind(other),
+                name = name.shown()
             ),
         )),
         // A routine, written with its signature: a name is not an identity
@@ -1716,7 +1721,8 @@ fn target_named(
                         return Err(Unsupported::nameless(format!(
                             "{} on `{name}` is on a routine whose argument `{spelled}` a \
                              declaration cannot spell",
-                            permission
+                            permission,
+                            name = name.shown()
                         )));
                     }
                 }
@@ -1732,7 +1738,8 @@ fn target_named(
             let what = format!(
                 "{} on `{name}` is on {}, which this model does not declare",
                 permission,
-                routine_kind(other)
+                routine_kind(other),
+                name = name.shown()
             );
             let mut args = Vec::new();
             for spelled in spelled_args.iter() {
@@ -1751,7 +1758,8 @@ fn target_named(
         // apart, and it says so rather than picking one.
         GrantedKind::Schema => Err(Unsupported::nameless(format!(
             "{} on `{name}` came back as a grant on a schema that also names an object",
-            permission
+            permission,
+            name = name.shown()
         ))),
     }
 }
@@ -1853,7 +1861,8 @@ fn add_module(
                                  an identity: {e}. It is left out of the pull, because a routine \
                                  keyed by the wrong signature is one whose `DROP` names another \
                                  object.",
-                                arg.position
+                                arg.position,
+                                here = here.shown()
                             ),
                         );
                     }
@@ -1889,7 +1898,8 @@ fn add_module(
                 LimitationTarget::UnnameableModule(here.clone()),
                 format!(
                     "`{here}` is a module of a kind this reader does not know (`{other}`). It is \
-                     left out of the pull rather than read back as one of the kinds it is not."
+                     left out of the pull rather than read back as one of the kinds it is not.",
+                    here = here.shown()
                 ),
             );
         }
@@ -1904,7 +1914,8 @@ fn add_module(
                 "`{here}` is a module whose definition this reader could not separate from the \
                  statement the engine deparsed for it. It is left out of the pull rather than \
                  recorded with a body that is not its own -- an empty definition would read as a \
-                 module with nothing in it, and the next plan would write that back."
+                 module with nothing in it, and the next plan would write that back.",
+                here = here.shown()
             ),
         );
     };
@@ -2049,26 +2060,29 @@ fn a_name_the_declaration_cannot_write(name: &TableName, columns: &[&RawColumn])
             } else {
                 "columns"
             },
-            unwritable.join(", ")
+            unwritable.join(", "),
+            name = name.shown()
         ));
     }
-    if TableName::from_str(&name.to_string()).as_ref() != Ok(name) {
+    if TableName::from_str(&name.raw().to_string()).as_ref() != Ok(name) {
         return Some(format!(
             "`{name}` is a table whose name the declaration format cannot write back: it is \
              stored as `schema.table` and read by splitting on every `.`, and this one does not \
              survive that. It is left out of the pull entirely rather than pulled into a schema \
-             that will not load."
+             that will not load.",
+            name = name.shown()
         ));
     }
     columns.iter().find_map(|c| {
         let reference = ColumnRef::new(name.clone(), &c.name);
-        (ColumnRef::from_str(&reference.to_string()).as_ref() != Ok(&reference)).then(|| {
+        (ColumnRef::from_str(&reference.raw().to_string()).as_ref() != Ok(&reference)).then(|| {
             format!(
                 "`{name}` has the column `{}`, whose name the declaration format cannot write \
                  back: a column is addressed as `schema.table.column` and read by splitting on \
                  every `.`. The whole table is left out of the pull, because a table missing one \
                  column is a table a plan would add it to.",
-                c.name
+                c.name,
+                name = name.shown()
             )
         })
     })
@@ -2280,7 +2294,8 @@ fn sequence_limitations(raw: &RawColumn, parts: &Parts, held: Option<&str>, pull
                  shape `serial` creates. This model holds the default and has nowhere to put the \
                  sequence, so a declaration pulled from here does not create it, and a rebuild \
                  of this table can drop it before the default is applied again.",
-                parts.name, raw.name
+                parts.name.shown(),
+                raw.name
             ),
         );
     }
@@ -2302,7 +2317,8 @@ fn sequence_limitations(raw: &RawColumn, parts: &Parts, held: Option<&str>, pull
                  declaration pulled from here creates a table whose default names an object that \
                  is not there -- and `nextval` resolves that name when the table is created, not \
                  when a row is inserted.",
-                parts.name, raw.name
+                parts.name.shown(),
+                raw.name
             ),
         );
     }
@@ -2374,7 +2390,9 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                     "column `{}`.`{}` has the type `{}`, which this dialect's catalogue cannot \
                      spell. It is read back as an opaque type, so a plan will not try to change \
                      it and drift on it cannot be seen (issue #130).",
-                    parts.name, raw.name, raw.ty
+                    parts.name.shown(),
+                    raw.name,
+                    raw.ty
                 ),
             );
             opaque
@@ -2406,7 +2424,7 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                      Its expression is `{}`, and it is **not** read back as a `default:` -- a \
                      default is computed once when a row is inserted, and this is recomputed on \
                      every {}.",
-                    parts.name,
+                    parts.name.shown(),
                     raw.name,
                     if kind == 'v' { "virtual" } else { "stored" },
                     expression.as_deref().unwrap_or("not readable"),
@@ -2441,7 +2459,8 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                  type. Read back it is a column with the type's own collation, which orders and \
                  compares differently -- so a unique key over it accepts a different set of \
                  values.",
-                parts.name, raw.name
+                parts.name.shown(),
+                raw.name
             ),
         );
     }
@@ -2455,7 +2474,8 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                     "column `{}`.`{}` is `GENERATED BY DEFAULT AS IDENTITY`, and this model holds \
                      only `GENERATED ALWAYS`. Read back it is indistinguishable from \
                      `GENERATED ALWAYS`, which is the one a plan would emit.",
-                    parts.name, raw.name
+                    parts.name.shown(),
+                    raw.name
                 ),
             );
         }
@@ -2477,7 +2497,9 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                     "column `{}`.`{}` is an identity whose sequence is not `AS` the column's \
                      type `{}`, which this model cannot hold. Its bounds, cycle and cache read \
                      back as the engine's defaults for the column's type.",
-                    parts.name, raw.name, raw.ty
+                    parts.name.shown(),
+                    raw.name,
+                    raw.ty
                 ),
             );
         }
@@ -2512,7 +2534,8 @@ fn column(raw: &RawColumn, parts: &Parts, pulled: &mut Pulled) -> Column {
                 &parts.name,
                 format!(
                     "column `{}.{}` has conflicting value sources in the catalog; no source can be represented faithfully",
-                    parts.name, raw.name
+                    parts.name.shown(),
+                    raw.name
                 ),
             );
             pbps_model::ValueSource::None
@@ -2741,7 +2764,9 @@ fn add_constraint(
                      nothing against it, ever. This model has no word for that -- read back it is \
                      an ordinary constraint, which a plan would recreate as one that enforces -- \
                      so it is left out. Its definition is `{}`.",
-                    raw.name, parts.name, raw.definition
+                    raw.name,
+                    parts.name.shown(),
+                    raw.definition
                 ),
             );
             false
@@ -2760,7 +2785,9 @@ fn add_constraint(
                      rows and for no table that inherits from it. This model holds only the \
                      expression, so it is left out rather than read back as a check a plan would \
                      recreate on the children too. Its definition is `{}`.",
-                    raw.name, parts.name, raw.definition
+                    raw.name,
+                    parts.name.shown(),
+                    raw.definition
                 ),
             );
             false
@@ -2781,7 +2808,9 @@ fn add_constraint(
                      here -- while the catalog still calls the constraint validated and enforced. \
                      This model holds only the constraint, so it is left out rather than read \
                      back as one whose checks are running. Its definition is `{}`.",
-                    raw.name, parts.name, raw.definition
+                    raw.name,
+                    parts.name.shown(),
+                    raw.definition
                 ),
             );
             false
@@ -2801,7 +2830,9 @@ fn add_constraint(
                      asks is about ranges, not values, and this model holds only the columns, so \
                      it is left out rather than read back as the constraint it is not. Its \
                      definition is `{}`.",
-                    raw.name, parts.name, raw.definition
+                    raw.name,
+                    parts.name.shown(),
+                    raw.definition
                 ),
             );
             false
@@ -2827,7 +2858,8 @@ fn add_constraint(
                      and this model holds a key constraint's key columns and nothing else. Read \
                      back it is the same constraint over a narrower index, so it is left out \
                      rather than read back as one that covers less than it does.",
-                    raw.name, parts.name
+                    raw.name,
+                    parts.name.shown()
                 ),
             );
             false
@@ -2848,7 +2880,8 @@ fn add_constraint(
                      admits at most one null key where an ordinary unique constraint admits any \
                      number. This model holds only `unique`, so the constraint is left out \
                      rather than read back as the weaker one it is not.",
-                    raw.name, parts.name
+                    raw.name,
+                    parts.name.shown()
                 ),
             );
             false
@@ -2865,7 +2898,7 @@ fn add_constraint(
                      on rows that violate it in the middle of one, would break with no plan \
                      saying anything had changed. Its definition is `{}`.",
                     raw.name,
-                    parts.name,
+                    parts.name.shown(),
                     if raw.deferred {
                         " INITIALLY DEFERRED"
                     } else {
@@ -2918,7 +2951,8 @@ fn add_constraint(
                         "check constraint `{}` on `{}` is `NOT VALID`: it holds for new rows and \
                          has never been checked against the rows already there. This model holds \
                          only the expression, so it is read back as an ordinary check.",
-                        raw.name, parts.name
+                        raw.name,
+                        parts.name.shown()
                     ),
                 );
             }
@@ -2934,7 +2968,9 @@ fn add_constraint(
                     format!(
                         "check constraint `{}` on `{}` has no readable expression, so it is left \
                          out. Its definition is `{}`.",
-                        raw.name, parts.name, raw.definition
+                        raw.name,
+                        parts.name.shown(),
+                        raw.definition
                     ),
                 );
                 return false;
@@ -2957,7 +2993,8 @@ fn add_constraint(
                 "`{}` on `{}` is an exclusion constraint, which this model does not hold. It is \
                  left out of the pull, so a plan cannot see it and `verify` cannot report a \
                  change to it.",
-                raw.name, parts.name
+                raw.name,
+                parts.name.shown()
             ),
         ),
 
@@ -2967,7 +3004,9 @@ fn add_constraint(
             format!(
                 "constraint `{}` on `{}` is of kind `{other}`, which this dialect does not read. \
                  Its definition is `{}`.",
-                raw.name, parts.name, raw.definition
+                raw.name,
+                parts.name.shown(),
+                raw.definition
             ),
         ),
     }
@@ -2998,7 +3037,9 @@ fn add_foreign_key(
                  table that this pull left out, so it is left out too -- read back it would be a \
                  key with nothing to point at, and recreating this schema would fail on it. Its \
                  definition is `{}`.",
-                raw.name, parts.name, raw.definition
+                raw.name,
+                parts.name.shown(),
+                raw.definition
             ),
         );
         return false;
@@ -3016,7 +3057,8 @@ fn add_foreign_key(
                 "foreign key `{}` on `{}` is `NOT VALID`: rows already there have never been \
                  checked against it, and this model holds only the key. Read back it is an \
                  ordinary foreign key, which is one that would be validated on being recreated.",
-                raw.name, parts.name
+                raw.name,
+                parts.name.shown()
             ),
         );
     }
@@ -3032,7 +3074,9 @@ fn add_foreign_key(
             format!(
                 "foreign key `{}` on `{}` references a table this pull did not read, so it is \
                  left out. Its definition is `{}`.",
-                raw.name, parts.name, raw.definition
+                raw.name,
+                parts.name.shown(),
+                raw.definition
             ),
         );
         return false;
@@ -3050,7 +3094,9 @@ fn add_foreign_key(
                  and this model holds only the action. Read back it would null or default every \
                  referencing column instead of the named ones, so it is left out. Its definition \
                  is `{}`.",
-                raw.name, parts.name, raw.definition
+                raw.name,
+                parts.name.shown(),
+                raw.definition
             ),
         );
         return false;
@@ -3070,7 +3116,7 @@ fn add_foreign_key(
                  columns are partly null -- accepted by SIMPLE, refused by FULL -- so the key is \
                  left out rather than read back as the one it is not.",
                 raw.name,
-                parts.name,
+                parts.name.shown(),
                 match raw.match_type {
                     'f' => "FULL",
                     'p' => "PARTIAL",
@@ -3106,7 +3152,10 @@ fn add_foreign_key(
                 format!(
                     "foreign key `{}` on `{}` names columns on `{references_table}` that this \
                      pull cannot resolve, so it is left out. Its definition is `{}`.",
-                    raw.name, parts.name, raw.definition
+                    raw.name,
+                    parts.name.shown(),
+                    raw.definition,
+                    references_table = references_table.shown()
                 ),
             );
             return false;
@@ -3125,7 +3174,7 @@ fn add_foreign_key(
                  model does not know, so the key is left out rather than read back as an action \
                  it is not.",
                 raw.name,
-                parts.name,
+                parts.name.shown(),
                 action_name(raw.on_delete),
                 action_name(raw.on_update)
             ),
@@ -3180,7 +3229,7 @@ fn unknown_match(pulled: &mut Pulled, parts: &Parts, name: &str, kind: char) {
         format!(
             "foreign key `{name}` on `{}` has the match type `{kind}`, which this dialect does \
              not know. It is left out rather than read back as the default one.",
-            parts.name
+            parts.name.shown()
         ),
     );
 }
@@ -3198,7 +3247,8 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 format!(
                     "index `{}` on `{}` uses the `{other}` method, and this model holds only \
                      `btree` and `gin`. It is left out of the pull, so a plan cannot see it.",
-                    raw.name, parts.name
+                    raw.name,
+                    parts.name.shown()
                 ),
             );
             return false;
@@ -3213,7 +3263,8 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             format!(
                 "index `{}` on `{}` is a GIN index over an expression, which this model does not \
                  hold. It is left out of the pull, so a plan cannot see it.",
-                raw.name, parts.name
+                raw.name,
+                parts.name.shown()
             ),
         );
         return false;
@@ -3231,7 +3282,8 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                  planner does not use it, which is what a `CREATE INDEX CONCURRENTLY` that \
                  failed leaves behind. It is left out of the pull, so a declaration of the same \
                  shape reads as an index that is missing rather than one that is present.",
-                raw.name, parts.name
+                raw.name,
+                parts.name.shown()
             ),
         );
         return false;
@@ -3245,7 +3297,8 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                  -- `COLLATE \"C\"` is the one that comes up -- and `IndexColumn` has no field \
                  for it. Read back it is an ordinary index, which compares different values \
                  equal, so it is left out.",
-                raw.name, parts.name
+                raw.name,
+                parts.name.shown()
             ),
         );
         return false;
@@ -3259,7 +3312,8 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                  where an ordinary unique index admits any number. This model holds only \
                  `unique:`, so the index is left out rather than read back as the weaker one it \
                  is not.",
-                raw.name, parts.name
+                raw.name,
+                parts.name.shown()
             ),
         );
         return false;
@@ -3271,7 +3325,8 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             format!(
                 "index `{}` on `{}` enforces an exclusion constraint, which this model does not \
                  hold.",
-                raw.name, parts.name
+                raw.name,
+                parts.name.shown()
             ),
         );
         return false;
@@ -3304,7 +3359,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                         "index `{}` on `{}`: the catalog did not render its expression key at \
                          position {}, so the index is left out rather than read without it.",
                         raw.name,
-                        parts.name,
+                        parts.name.shown(),
                         position + 1
                     ),
                 );
@@ -3341,7 +3396,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                      only the direction. Read back it is the default ordering for that \
                      direction, which puts the nulls at the other end.",
                     raw.name,
-                    parts.name,
+                    parts.name.shown(),
                     if descending { "DESC" } else { "ASC" },
                     if nulls_first { "FIRST" } else { "LAST" },
                 ),
@@ -3398,7 +3453,8 @@ fn key_class(
             format!(
                 "index `{}` on `{}`: the catalog did not say which operator class orders \
                  `{column}`, so the index is left out rather than read as the default.",
-                raw.name, parts.name
+                raw.name,
+                parts.name.shown()
             ),
         );
         return None;
@@ -3410,7 +3466,8 @@ fn key_class(
             format!(
                 "index `{}` on `{}` {why}. Read back without it, it would be an ordinary index \
                  that answers different queries, so it is left out.",
-                raw.name, parts.name
+                raw.name,
+                parts.name.shown()
             ),
         );
     };
@@ -3475,7 +3532,7 @@ fn unresolved(pulled: &mut Pulled, parts: &Parts, kind: &str, name: &str, attnum
             "{kind} `{name}` on `{}` names column number {attnum}, which this pull did not read \
              back. It is left out rather than read back with a column missing, because a key with \
              fewer columns than it has is a different key.",
-            parts.name
+            parts.name.shown()
         ),
     );
 }
@@ -4092,7 +4149,7 @@ mod tests {
         assert_eq!(found.role, "app_reader");
         assert_eq!(found.permission, pbps_model::Permission::Select);
         assert!(
-            matches!(&found.target, pbps_model::GrantTarget::Object(o) if o.to_string() == "app.customer"),
+            matches!(&found.target, pbps_model::GrantTarget::Object(o) if o.raw().to_string() == "app.customer"),
             "{:?}",
             found.target
         );

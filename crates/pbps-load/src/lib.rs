@@ -246,7 +246,7 @@ fn collect_schema_dir(
         let file = match file {
             LoadedFile::Table(t) => {
                 if let Some(first) = seen_tables.get(&t.name) {
-                    errs.push(already(&path, &format!("`{}`", t.name), first));
+                    errs.push(already(&path, &format!("`{}`", t.name.shown()), first));
                     continue;
                 }
                 // A partition is a table too, declared in its parent's file
@@ -254,7 +254,11 @@ fn collect_schema_dir(
                 let mut taken = false;
                 for (child, _) in &t.partitions {
                     if let Some(first) = seen_tables.get(child) {
-                        errs.push(already(&path, &format!("`{child}`"), first));
+                        errs.push(already(
+                            &path,
+                            &format!("`{child}`", child = child.shown()),
+                            first,
+                        ));
                         taken = true;
                     }
                 }
@@ -484,7 +488,7 @@ indexes:
     #[test]
     fn full_document_loads() {
         let t = load(FULL);
-        assert_eq!(t.name.to_string(), "dbo.customer");
+        assert_eq!(t.name.raw().to_string(), "dbo.customer");
         assert_eq!(
             t.table.description.as_ref().map(pbps_model::Text::raw),
             Some("Customer master")
@@ -622,7 +626,7 @@ indexes:
         assert_eq!(t.table.unique["uq_customer_email"].columns, ["email"]);
 
         let fk = &t.table.foreign_keys["fk_customer_region"];
-        assert_eq!(fk.references_table.to_string(), "dbo.region");
+        assert_eq!(fk.references_table.raw().to_string(), "dbo.region");
         assert_eq!(fk.references_columns, ["region_id"]);
         assert_eq!(fk.on_delete, ReferentialAction::Cascade);
 
@@ -929,7 +933,7 @@ indexes:
             }
         );
         assert_eq!(m.id.to_string(), "app.orders.audit");
-        assert_eq!(m.id.attached_to().unwrap().to_string(), "app.orders");
+        assert_eq!(m.id.attached_to().unwrap().raw().to_string(), "app.orders");
     }
 
     /// A trigger's schema is its table's — SQL Server puts it there and
@@ -958,7 +962,7 @@ indexes:
         let pbps_model::ModuleId::Routine(r) = &m.id else {
             panic!("not a routine: {:?}", m.id);
         };
-        assert_eq!(r.name.to_string(), "app.f");
+        assert_eq!(r.name.raw().to_string(), "app.f");
         assert_eq!(
             r.args.iter().map(ToString::to_string).collect::<Vec<_>>(),
             ["int", "text"]
