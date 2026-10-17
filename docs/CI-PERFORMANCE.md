@@ -357,3 +357,119 @@ issue-2117 backtrace probe
 ```
 
 The probe was removed, and the original 414 model library tests passed.
+
+## JSON parsing crate comparison
+
+Measured #2129 on `591474f560ff38ed8bb8fb136785840fa416e3b4`, including
+#2113, #2114 and #2117, on the shared Intel Core i7-8850H host with Rust
+1.99.0, two build jobs, incremental compilation and line-tables-only debug
+information. Both variants used lane 4's pinned PostgreSQL 18.6/16.15 targets
+and separate PostgreSQL 18.6 scratch. A kept the existing profiles; B set
+`profile.dev.package.serde_json.opt-level=3` and
+`profile.dev.package.indexmap.opt-level=3` through Cargo's `--config`, in a
+separate target directory. Builds and timed executions never overlapped.
+
+Crate screening used the production scratch case
+`resolver_run_owned_keeps_what_the_reproduction_put_on_its_database` under
+`test`, with a warm-up and three alternating pairs per set. Median paired
+user-CPU ratios to baseline were 0.763 for all three candidates, 0.764 without
+`hashbrown`, 0.847 without `indexmap`, 0.800 for `serde_json` alone and 1.018
+without `serde_json`. The noisy single-crate comparison was followed by three
+direct pairs: adding `indexmap` to `serde_json` reduced user CPU from
+18.69/19.89/19.51 s to 17.31/17.88/17.45 s. The full comparisons therefore
+used only `serde_json` 1.0.151 and `indexmap` 2.14.1. No `itoa`, `memchr` or
+`zmij` frames appeared within sampled deserialization stacks; `ryu` was absent
+from the lockfile.
+
+These build observations use `/usr/bin/time -f '%e %U %S'` and report wall /
+user CPU seconds. Cold targets started empty; scratch compilation followed
+the ordinary workspace build. Incremental runs appended a model constant,
+then a passing test in `crates/pbps-cli/tests/flow.rs`, keeping the model
+probe for the leaf run; both probes were removed afterwards. Cargo recorded
+52 workspace artifacts rebuilt for each model change and only `flow` for
+each leaf change, with no third-party compilation.
+
+| Build | A wall / user CPU | B wall / user CPU |
+| --- | ---: | ---: |
+| Cold workspace, `test --workspace --all-targets --no-run` | 762.47 / 1130.15 s | 473.61 / 830.02 s |
+| Additional scratch, `test --profile live-test -p pbps-cli --lib --no-run` | 887.15 / 1447.18 s | 606.58 / 1116.26 s |
+| Model change, workspace | 51.50 / 76.09 s | 42.81 / 65.93 s |
+| Leaf change, workspace | 6.55 / 6.42 s | 6.55 / 8.66 s |
+| Dependency cache hit, workspace rebuild | 303.60 / 569.29 s | 414.65 / 706.35 s |
+| Dependency cache hit, scratch rebuild | 332.22 / 630.56 s | 328.55 / 627.94 s |
+
+The cache-hit measurements cleaned only the 12 workspace packages for each
+profile. Cargo confirmed 56 rebuilt workspace artifacts under `test`, 12
+under `live-test`, and zero third-party rebuilds in all four observations.
+The observed ordinary workspace rebuild premium was 137.06 s user CPU;
+the scratch rebuild difference was -2.62 s. These are single observations
+on a shared host; the faster cold candidate builds do not establish a causal
+compile-time saving. Third-party compilation is a cache-miss cost, whereas
+workspace recompilation recurs with CI's dependency-only cache (DEC-1370.1).
+
+After a full warm-up per workload and variant, execution order was A B A B.
+The ordinary workspace command was `cargo test --locked --workspace
+--all-targets`, without live-fixture variables; its measured runs compiled
+nothing. The other workloads used Cargo's recorded test executables with
+`--ignored --test-threads=1`: the two complementary `flow_pg` CI selections,
+all ignored `pbps` bin tests, and the scratch module under `live-test`.
+User CPU includes child processes and decides the comparison; wall time is
+reported alongside it. Warm-ups are excluded below.
+
+| Workload | Pair | A wall / user CPU | B wall / user CPU |
+| --- | ---: | ---: | ---: |
+| Workspace | 1 | 135.57 / 278.78 s | 169.27 / 285.74 s |
+| Workspace | 2 | 187.33 / 302.92 s | 128.36 / 271.40 s |
+| `flow-programs` | 1 | 255.69 / 46.57 s | 312.46 / 51.08 s |
+| `flow-programs` | 2 | 259.14 / 47.54 s | 260.89 / 44.83 s |
+| `flow-rest` | 1 | 1340.72 / 595.39 s | 1142.97 / 463.31 s |
+| `flow-rest` | 2 | 1179.34 / 517.28 s | 1174.79 / 492.94 s |
+| `pbps` bin | 1 | 4.20 / 0.53 s | 4.35 / 0.50 s |
+| `pbps` bin | 2 | 4.35 / 0.54 s | 4.22 / 0.50 s |
+| Scratch, `live-test` | 1 | 655.31 / 240.11 s | 639.36 / 233.52 s |
+| Scratch, `live-test` | 2 | 721.90 / 242.91 s | 668.43 / 242.54 s |
+
+Every warm-up and measured execution passed. Each workspace trial ran the
+same 3,503 tests across 43 harnesses, the flow shards ran 86/204 cases, the
+bin ran 11 and scratch ran all 89. Test-name lists matched between variants.
+
+Cargo's artifact records matched all 324 `test` and 270 `live-test` records
+between A and B, including targets, features and other profile fields.
+Only the optimization levels of
+`serde_json` (host and runtime variants) and `indexmap` changed. All 56
+workspace artifacts under `test`, including 43 harnesses, retained opt 0;
+all 12 workspace artifacts under `live-test` retained opt 1. Both kept
+line-tables-only debug information, debug assertions and overflow checks.
+`hashbrown` stayed at 0/1, and both SCRAM overrides stayed at 3.
+
+One full-module GDB session per variant and profile selected the same 89
+scratch cases. The sampler slept one second between observations, selected
+threads in state `R` before attaching, and collected `thread apply all bt 80`.
+The denominator below excludes stacks whose top frame contains `syscall`;
+shares count visible inclusive frames for `capture_identifying`,
+`capture::read::batch`, and deserialization inside that batch.
+
+| Profile / variant | On-CPU stacks | Capture | Batch | Deserializer in batch |
+| --- | ---: | ---: | ---: | ---: |
+| `test`, A | 985 | 58.3% | 36.1% | 31.7% |
+| `test`, B | 564 | 55.1% | 20.7% | 16.7% |
+| `live-test`, A | 175 | 47.4% | 9.7% | 7.4% |
+| `live-test`, B | 132 | 49.2% | 10.6% | 9.1% |
+
+The 80-frame limit was reached by 193/82 `test` stacks and 39/20 `live-test`
+stacks (A/B). Inlining and truncated ancestry limit these visible shares,
+especially with the small `live-test` sample counts. Profiled timings are
+excluded from the execution comparison. Only A's `test` session hit #2121:
+its role-cost gap was 39.45 s under GDB against the 20 s bound; one exact
+unprofiled retry passed with a 14.81 s gap. All other sampled cases passed.
+
+The two-crate candidate is **not adopted**. Summing one execution of each
+workload gives user-CPU savings of 127.23/58.98 s across the two pairs,
+short of the 134.44 s premium for the measured cache-hit workspace and
+scratch rebuilds together (137.06 - 2.62 s). These observations do not
+establish CI payback. Ordinary workspace gains changed direction;
+`flow-rest` saved 132.08/24.34 s, while scratch already at opt 1 saved only
+6.59/0.37 s.
+The microcase improvement therefore does not justify this profile change.
+The manifest, release settings and DEC-2113.1's override scope remain as they
+were.
