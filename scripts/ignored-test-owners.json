@@ -473,6 +473,7 @@
         "type_refs::partition_null_defaults_keep_domains_but_erase_enum_and_composite_constants",
         "type_refs::a_domains_default_populates_a_new_primary_key_without_a_null_projection",
         "type_refs::a_null_generated_composite_evaluates_no_attribute_domain_check",
+        "type_refs::routine_overloads_and_relations_have_distinct_dependency_identities",
         "abrupt_committed_apply_without_caller_success_is_not_replayed",
         "abrupt_staged_ddl_refuses_unrecorded_progress",
         "abrupt_staged_row_write_refuses_unproved_replay",

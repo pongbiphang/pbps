@@ -637,3 +637,92 @@ fn a_null_generated_composite_evaluates_no_attribute_domain_check() {
         assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 1);
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn routine_overloads_and_relations_have_distinct_dependency_identities() {
+    for server in servers() {
+        for managed in ["overload", "relation", "dependency"] {
+            let own = OwnDatabase::new(&server, &format!("refs_identity_{managed}"));
+            let db = own.connection();
+            on_server(
+                db,
+                "CREATE SCHEMA app;
+                 CREATE FUNCTION app.f(v text) RETURNS boolean LANGUAGE sql IMMUTABLE
+                     RETURN length(v) > 0;
+                 CREATE FUNCTION app.f(v integer) RETURNS boolean LANGUAGE sql IMMUTABLE
+                     RETURN v > 0;
+                 CREATE TABLE app.f (id integer);
+                 CREATE DOMAIN app.value AS text CHECK (app.f(VALUE))",
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_catalog.pg_proc WHERE oid IN ('app.f(text)'::regprocedure, 'app.f(integer)'::regprocedure)"
+                ),
+                2
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_catalog.pg_depend WHERE classid='pg_catalog.pg_constraint'::regclass AND refclassid='pg_catalog.pg_proc'::regclass AND refobjid='app.f(text)'::regprocedure AND objid IN (SELECT oid FROM pg_catalog.pg_constraint WHERE contypid='app.value'::regtype)"
+                ),
+                1
+            );
+            let dependency = scalar(db, "SELECT 'app.f(text)'::regprocedure::oid::bigint");
+            // Neither a different overload nor a same-named relation owns this dependency.
+            on_server(db, "DROP FUNCTION app.f(integer); DROP TABLE app.f");
+            let d = Demo::new(&format!("refs-identity-{managed}"));
+            d.keyed(db);
+            d.table(&declarations("  value: {type: app.value}\n"));
+            let other = if managed == "relation" {
+                "table: app.f\ncolumns:\n  id: {type: integer}\n".to_owned()
+            } else {
+                let arg = if managed == "overload" {
+                    "integer"
+                } else {
+                    "text"
+                };
+                let body = if managed == "overload" {
+                    "v > 0"
+                } else {
+                    "length(v) > 0"
+                };
+                format!(
+                    "function: app.f({arg})\npublic_execute: true\ndefinition: (v {arg}) RETURNS boolean LANGUAGE sql IMMUTABLE RETURN {body}\n"
+                )
+            };
+            std::fs::write(d.dir.join("schema/other.yml"), other).unwrap();
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let bootstrap = d.run(&["bootstrap", "--db", db]);
+            if managed == "dependency" {
+                assert_ne!(code(&bootstrap), 0);
+                assert!(
+                    stderr(&bootstrap)
+                        .contains("depends on managed function `app.f(pg_catalog.text)`"),
+                    "{}{}",
+                    stdout(&bootstrap),
+                    stderr(&bootstrap)
+                );
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*)::bigint FROM pg_catalog.pg_class WHERE relname IN ('t','__pbps_state')"
+                    ),
+                    0
+                );
+            } else {
+                succeeds(bootstrap);
+                succeeds(d.run(&["verify", "--db", db]));
+                let next: pbps_model::SavedPlan =
+                    serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
+                assert!(next.changes.is_empty(), "{managed}: {:?}", next.changes);
+            }
+            assert_eq!(
+                scalar(db, "SELECT 'app.f(text)'::regprocedure::oid::bigint"),
+                dependency
+            );
+        }
+    }
+}

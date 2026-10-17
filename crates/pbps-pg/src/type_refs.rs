@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
-use pbps_model::{Change, ChangeSet, ColumnType, Schema, TypePin, TypeRef};
+use pbps_model::{Change, ChangeSet, ColumnType, ModuleKind, Schema, TypePin, TypeRef};
 
 use crate::pins::Within;
 use crate::user_types::{self, TypeRead, UserType};
@@ -171,17 +171,34 @@ pub async fn seal(
             }
         }
     }
+    // Names alone conflate overloads and objects in different system catalogs.
+    let mut managed_modules = BTreeSet::new();
+    for schema in schemas {
+        for (id, module) in &schema.modules {
+            let catalog = match module.kind {
+                ModuleKind::View => "pg_class",
+                ModuleKind::Function | ModuleKind::Procedure => "pg_proc",
+                ModuleKind::Trigger => "pg_trigger",
+            };
+            if types.iter().flat_map(UserType::reached).any(|r| {
+                r.catalog == catalog
+                    && r.schema.as_deref() == Some(id.schema())
+                    && r.name.as_deref() == Some(id.name())
+            }) && let Some(oid) = crate::modules::module_oid(conn, id, module.kind).await?
+            {
+                managed_modules.insert((catalog, oid));
+            }
+        }
+    }
     for ty in &types {
         if let Some(reached) = ty.reaches_managed(|r| {
-            schemas.iter().any(|s| {
-                s.tables.keys().any(|t| {
-                    r.schema.as_deref() == Some(&t.schema) && r.name.as_deref() == Some(&t.name)
-                }) || s.modules.keys().any(|m| {
-                    let name = m.object_name();
-                    r.schema.as_deref() == Some(&name.schema)
-                        && r.name.as_deref() == Some(&name.name)
+            r.catalog == "pg_class"
+                && schemas.iter().any(|s| {
+                    s.tables.keys().any(|t| {
+                        r.schema.as_deref() == Some(&t.schema) && r.name.as_deref() == Some(&t.name)
+                    })
                 })
-            })
+                || managed_modules.contains(&(r.catalog.as_str(), r.oid))
         }) {
             return Err(failed(format!(
                 "type `{}` depends on managed {} `{}`; a referenced type cannot depend on an object pbps changes",
