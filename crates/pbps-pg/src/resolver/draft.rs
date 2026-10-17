@@ -847,6 +847,41 @@ pub struct Staging {
     /// One finding for each object fill cannot stage, for a compile that
     /// fails for want of one.
     pub unfillable: Vec<String>,
+    /// Each chained object, in order: its description, its SQL, and the
+    /// managed relations it waits for, its own and those of the chained
+    /// objects it names.
+    links: Vec<Link>,
+}
+
+/// A chained object: its description, its SQL, and the managed relations
+/// it waits for.
+type Link = (String, String, BTreeSet<(String, String)>);
+
+impl Staging {
+    /// Keeps the chained objects whose managed relations are all
+    /// `available` (the scratch compile creates each). One that waits for a
+    /// relation it does not create, such as a base table the plan renames,
+    /// is not filled and is named in the findings; what names it waits for
+    /// that relation too, so it goes with it. The rest still are (#1778).
+    pub fn keep_chained(&mut self, available: impl Fn(&BTreeSet<(String, String)>) -> bool) {
+        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut self.links)
+            .into_iter()
+            .partition(|(_, _, after)| available(after));
+        for (described, _, _) in gone {
+            self.filled.remove(&described);
+            self.chained_objects.remove(&described);
+            self.unfillable.push(format!(
+                "{described} is not filled: its shape names a managed relation the scratch \
+                 compile does not create"
+            ));
+        }
+        self.chained = kept.iter().map(|(_, sql, _)| sql.as_str()).collect();
+        self.chained_after = kept
+            .iter()
+            .flat_map(|(_, _, after)| after.iter().cloned())
+            .collect();
+        self.links = kept;
+    }
 }
 
 impl Fill {
@@ -932,6 +967,11 @@ impl Fill {
             if state == State::Chained {
                 staging.chained_objects.insert(object.described.clone());
                 staging.chained_after.extend(after.iter().cloned());
+                if let How::Ahead(sql) | How::Chained(sql) = &object.how {
+                    staging
+                        .links
+                        .push((object.described.clone(), sql.clone(), after.clone()));
+                }
             }
             states.push(state);
             afters.push(after);
@@ -942,6 +982,14 @@ impl Fill {
             .chain(ahead.into_iter().map(str::to_owned))
             .collect();
         staging.chained = chained.concat();
+        debug_assert_eq!(
+            staging.chained,
+            staging
+                .links
+                .iter()
+                .map(|(_, sql, _)| sql.as_str())
+                .collect::<String>()
+        );
         staging
     }
 }

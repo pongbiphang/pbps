@@ -776,3 +776,66 @@ fn a_chained_shape_waits_for_every_managed_relation_it_names() {
         "both, not the first the chain kept"
     );
 }
+
+/// A chained shape waiting for a managed relation the compile does not
+/// create goes, with what names it; one waiting only for relations it
+/// creates stays.
+#[test]
+fn only_the_chains_waiting_for_an_absent_relation_are_dropped() {
+    let mut target = Target::default();
+    let kept = target.relation(20400, 'r', "app", "m", &[("id", "integer")]);
+    let renamed = target.relation(20410, 'r', "app", "n", &[("id", "integer")]);
+    target.managed(&kept);
+    target.managed(&renamed);
+    let on_kept = target.relation(20420, 'r', "ext", "c", &[("m", "app.m")]);
+    target.depend(&on_kept, &key("pg_type", 20401), 'n', true);
+    let on_renamed = target.relation(20430, 'r', "ext", "d", &[("n", "app.n")]);
+    target.depend(&on_renamed, &key("pg_type", 20411), 'n', true);
+    let naming = target.relation(20440, 'r', "ext", "x", &[("d", "ext.d")]);
+    target.depend(&naming, &key("pg_type", 20431), 'n', true);
+    for (oid, name, read) in [(20450, "a", &on_kept), (20460, "b", &naming)] {
+        let reader = target.relation(oid, 'v', "app", name, &[("id", "integer")]);
+        target.depend(&reader, read, 'n', false);
+        target.managed(&reader);
+    }
+    let mut staging = target.fill().staging(&BTreeSet::new());
+    for table in ["ext.c", "ext.d", "ext.x"] {
+        assert!(
+            staging.chained.contains(&format!("CREATE TABLE {table} ")),
+            "{table}"
+        );
+    }
+    let absent = ("app".to_owned(), "n".to_owned());
+    staging.keep_chained(|after| !after.contains(&absent));
+    assert!(
+        staging.chained.contains("CREATE TABLE ext.c "),
+        "{}",
+        staging.chained
+    );
+    for table in ["ext.d", "ext.x"] {
+        assert!(
+            !staging.chained.contains(&format!("CREATE TABLE {table} ")),
+            "{table}: {}",
+            staging.chained
+        );
+        assert!(
+            !staging.filled.contains(&format!("table {table}")),
+            "{table}"
+        );
+        assert!(
+            staging
+                .unfillable
+                .iter()
+                .any(|line| line.starts_with(&format!(
+                    "table {table} is not filled: its shape names a managed relation"
+                ))),
+            "{table}: {:?}",
+            staging.unfillable
+        );
+    }
+    assert!(staging.filled.contains("table ext.c"));
+    assert_eq!(
+        staging.chained_after,
+        BTreeSet::from([("app".to_owned(), "m".to_owned())])
+    );
+}

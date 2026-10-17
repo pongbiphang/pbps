@@ -2420,6 +2420,67 @@ async fn after_its_function(calling: bool) -> Result<ResolvedPlan, ProduceError>
     result
 }
 
+/// The supplied layout compiles on the session chained fill ran in, and
+/// fill's check ends in `RESET ALL`. A declaration after the split still
+/// compiles under the deployer's settings: under the target database's
+/// `array_nulls = off` the literal `{NULL}` holds the string `NULL`, which
+/// is no integer, and under the default `on` it holds a null. So the plan is
+/// refused there, as the target would refuse it. Negative: on a target
+/// without that setting the same plan is resolved.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_compiles_after_a_chained_fill_under_the_deployers_settings() {
+    let filter = format!(" WHERE {MANAGED}.f(id) > 0");
+    let a = format!("{}{filter}", reading("id", "e"));
+    let b = format!("{a} AND '{{NULL}}'::integer[] IS NOT NULL");
+    let inputs = Inputs::from_pair((
+        generating(declared(&[("a", &a)], &["m"])),
+        generating(declared(&[("a", &a), ("b", &b)], &["m"])),
+    ));
+    let key = ProjectKey::new(true);
+    for (off, server) in [true, false]
+        .into_iter()
+        .flat_map(|off| SERVERS.iter().map(move |&server| (off, server)))
+    {
+        let mut setup = generating_target();
+        setup.extend([
+            format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
+            format!("CREATE VIEW {MANAGED}.a AS {a}"),
+        ]);
+        if off {
+            setup.push(
+                "DO $$BEGIN EXECUTE pg_catalog.format('ALTER DATABASE %I SET array_nulls = off', \
+                 pg_catalog.current_database()); END$$"
+                    .into(),
+            );
+        }
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &setup).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let result = produce_filled(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            None,
+        )
+        .await;
+        fixture.drop().await;
+        if off {
+            let refused = match result {
+                Ok(_) => panic!("{server}: compiled with array_nulls on"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                refused.contains("invalid input syntax for type integer"),
+                "{server}: {refused}"
+            );
+        } else {
+            assert_staged(result, "e", server);
+        }
+    }
+}
+
 /// On the target `ext.d(NULL)` casts to the domain `ext.d`, which names
 /// `m`'s row type; scratch compiles the views before fill creates the
 /// domain, and they bind the externals file's `ext.d(text)` instead

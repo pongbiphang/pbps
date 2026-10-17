@@ -3423,7 +3423,13 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
 
   That step can be among the modules: a table whose generated column calls
   a declared function follows the function there. The split waits for every
-  managed relation the shapes name, not the one the chain keeps. The order
+  managed relation the shapes name, not the one the chain keeps. Each
+  chained object carries its own prerequisites, so one waiting for a
+  relation the compile does not create (a base table the plan renames) is
+  dropped with what names it, and the rest are still filled. In the supplied
+  layout fill runs on the compiling session, and its check ends in `RESET
+  ALL`, so the deployer's reproduced settings are applied again before the
+  rest compiles. The order
   check that leaves a binding unresolved when a same-named object came later
   (`Reconstruction::later_names`) counts the chained shapes' names, read
   from scratch's catalog after fill, as created at the split. A module
@@ -3446,6 +3452,7 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
 (and its named refusal),
 `resolver_refuses_an_outside_write_fill_sets_off_and_leaves_none`,
 `resolver_leaves_unresolved_a_binding_a_chained_shape_would_take`,
+`resolver_compiles_after_a_chained_fill_under_the_deployers_settings`,
 `resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it`,
 `resolver_fills_the_external_objects_no_externals_file_stages`,
 `resolver_refuses_a_routine_fill_cannot_stage_naming_it` and
@@ -3456,7 +3463,8 @@ copy is not filled over), live; and the `resolver::draft` unit tests
 `what_fill_cannot_stage_is_named_with_what_names_it` and
 `an_object_whose_part_the_externals_file_created_is_the_files` and
 `a_chained_shape_waits_for_every_managed_relation_it_names`,
-`what_names_a_partly_staged_object_is_not_filled` and
+`what_names_a_partly_staged_object_is_not_filled`,
+`only_the_chains_waiting_for_an_absent_relation_are_dropped` and
 `an_extension_whose_member_the_externals_file_created_is_the_files`, with
 `reconstruct`'s
 `chained_shapes_wait_for_the_step_that_creates_what_they_name` and

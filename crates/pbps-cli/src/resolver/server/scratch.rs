@@ -541,26 +541,16 @@ impl Run<'_> {
         let mut reconstruction =
             engine::reconstruction(driver, extras, binding.bootstrap).map_err(Error::Binding)?;
         // Where the chained shapes go: just after the last step that creates
-        // a managed relation they name. One scratch never creates is not
-        // filled, and the chain stays a finding (DEC-1778.2).
+        // a managed relation they name. A shape waiting for one scratch never
+        // creates is not filled, and its chain stays a finding; the others
+        // still are (DEC-1778.2).
+        prepared
+            .staging
+            .keep_chained(|after| reconstruction.after_creating(after).is_some());
         let split = if prepared.staging.chained.is_empty() {
             None
         } else {
-            match reconstruction.after_creating(&prepared.staging.chained_after) {
-                Some(split) => Some(split),
-                None => {
-                    let staging = &mut prepared.staging;
-                    for object in std::mem::take(&mut staging.chained_objects) {
-                        staging.filled.remove(&object);
-                        staging.unfillable.push(format!(
-                            "{object} is not filled: its shape names a managed relation the \
-                             scratch compile does not create"
-                        ));
-                    }
-                    staging.chained.clear();
-                    None
-                }
-            }
+            reconstruction.after_creating(&prepared.staging.chained_after)
         };
         // A chain through a filled object is lifted: fill created it once
         // the managed relations it names existed.
@@ -667,6 +657,18 @@ impl Run<'_> {
                 .map_err(db("the filled objects' names"))?;
             reconstruction.created_before(split, names);
             let chained = externals::created(&before, &after);
+            // The supplied layout compiles on the session fill ran in, and
+            // fill's check ends in `RESET ALL`: the deployer's settings
+            // reproduced there are set again before anything compiles on
+            // it, as the first part compiled under them.
+            if prepared.compile.is_none() && prepared.capture.is_none() {
+                if let scope::Authorization::Postgres(context) = &authorization {
+                    pbps_pg::resolver::authorization::apply_session_settings(admin, context)
+                        .await
+                        .map_err(db("the deployer's settings"))?;
+                }
+                pinned(admin, self.backend).await?;
+            }
             let compile = match prepared.compile.as_mut() {
                 Some(compile) => compile,
                 None => &mut *admin,
