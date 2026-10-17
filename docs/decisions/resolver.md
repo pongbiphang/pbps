@@ -3579,6 +3579,11 @@ Planning does not use it yet (#2143).
   by index id, the key it references; its column pairs and actions are
   properties. A key rebuilt under the same name on another column would
   otherwise read as unchanged, though no column did.
+- **A state that keeps its text is a property.** A CHECK disabled with
+  `NOCHECK`, or enabled without `WITH CHECK`, keeps its definition; so does
+  a disabled trigger or a disabled key index. Each stops enforcing what it
+  says, so its disabled (and a CHECK's trusted) state is captured, as a
+  foreign key's is.
 - **Ownership matches the catalog's spelling.** A declaration spelled
   differently owns nothing, which leaves its record unqualified, never
   another object's.
@@ -3593,6 +3598,6 @@ Planning does not use it yet (#2143).
 `mssql_a_candidate_is_matched_under_the_databases_collation`,
 `mssql_an_encrypted_module_refuses_by_name` and
 `mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_it`
-and `mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured`,
-live;
+`mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured` and
+`mssql_a_checks_disabled_and_untrusted_states_are_differences`, live;
 and the `resolver::capture` unit tests.

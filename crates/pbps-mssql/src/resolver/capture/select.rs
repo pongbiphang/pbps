@@ -285,9 +285,15 @@ impl Builder<'_> {
                 }
             };
             properties.insert("definition".into(), json!(constraint.definition));
+            properties.insert("disabled".into(), json!(constraint.disabled));
+            properties.insert("trusted".into(), json!(constraint.trusted));
             properties.insert("column".into(), column);
         }
         let mut bindings = BTreeSet::new();
+        if let Some((disabled, instead_of)) = catalog.triggers.get(&id) {
+            properties.insert("disabled".into(), json!(disabled));
+            properties.insert("instead_of".into(), json!(instead_of));
+        }
         if let Some(key) = catalog.keys.get(&id) {
             let mut columns = key.columns.clone();
             columns.sort();
@@ -297,7 +303,7 @@ impl Builder<'_> {
                 .collect();
             properties.insert(
                 "key".into(),
-                json!({"index": key.index, "columns": columns}),
+                json!({"index": key.index, "disabled": key.disabled, "columns": columns}),
             );
         }
         if let Some(indexes) = catalog.unique_indexes.get(&id) {
@@ -314,7 +320,7 @@ impl Builder<'_> {
                         .collect();
                     (
                         name.clone(),
-                        json!({"index": index.index, "columns": columns}),
+                        json!({"index": index.index, "disabled": index.disabled, "columns": columns}),
                     )
                 })
                 .collect();

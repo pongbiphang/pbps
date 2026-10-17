@@ -813,3 +813,89 @@ async fn mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured() {
     );
     db.drop().await;
 }
+
+/// A CHECK disabled with `NOCHECK` keeps its text and stops constraining
+/// writes, and one enabled without `WITH CHECK` stays untrusted: both are
+/// differences. Trusted again, it reads as it did.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_checks_disabled_and_untrusted_states_are_differences() {
+    let mut db = TestDb::create("check2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE TABLE app.t (a int, CONSTRAINT ck_a CHECK (a > 0));",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t")]))
+        .await
+        .expect("capture");
+    let check = object("app", "ck_a");
+    let changed = |differences: &[pbps_db::resolver::capture::CaptureDifference]| {
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(&check) && d.change == InputChange::Properties)
+    };
+    run(
+        &mut db.conn,
+        &["ALTER TABLE app.t NOCHECK CONSTRAINT ck_a;"],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(changed(&differences), "disabled: {differences:?}");
+
+    run(&mut db.conn, &["ALTER TABLE app.t CHECK CONSTRAINT ck_a;"]).await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        changed(&differences),
+        "enabled but untrusted: {differences:?}"
+    );
+
+    run(
+        &mut db.conn,
+        &["ALTER TABLE app.t WITH CHECK CHECK CONSTRAINT ck_a;"],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert_eq!(differences, Vec::new(), "trusted again");
+
+    // The same for a trigger and a key's index: disabled, each keeps its
+    // definition and stops enforcing it.
+    run(
+        &mut db.conn,
+        &[
+            "ALTER TABLE app.t ALTER COLUMN a int NOT NULL;",
+            "ALTER TABLE app.t ADD CONSTRAINT uq_a UNIQUE NONCLUSTERED (a);",
+            "CREATE TRIGGER app.tr_t ON app.t AFTER INSERT AS SELECT 1;",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t")]))
+        .await
+        .expect("capture");
+    for (object_name, disable) in [
+        ("tr_t", "DISABLE TRIGGER app.tr_t ON app.t;"),
+        ("uq_a", "ALTER INDEX uq_a ON app.t DISABLE;"),
+    ] {
+        run(&mut db.conn, &[disable]).await;
+        let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+            .await
+            .expect("recapture");
+        assert!(
+            differences
+                .iter()
+                .any(|d| d.object.as_ref() == Some(&object("app", object_name))
+                    && d.change == InputChange::Properties),
+            "{object_name}: {differences:?}"
+        );
+    }
+    db.drop().await;
+}

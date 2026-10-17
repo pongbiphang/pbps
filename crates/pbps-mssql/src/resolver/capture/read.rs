@@ -75,6 +75,9 @@ pub(super) struct Parameter {
 #[derive(Default)]
 pub(super) struct Key {
     pub index: String,
+    /// `ALTER INDEX ... DISABLE` leaves the key's columns and stops it
+    /// enforcing anything.
+    pub disabled: bool,
     pub columns: Vec<(i64, String, bool)>,
 }
 
@@ -147,6 +150,9 @@ pub(super) struct Type {
 pub(super) struct Constraint {
     pub column: i64,
     pub definition: String,
+    /// A CHECK's state, `None` for a DEFAULT.
+    pub disabled: Option<bool>,
+    pub trusted: Option<bool>,
 }
 
 pub(super) struct Dependency {
@@ -194,6 +200,10 @@ pub(super) struct Catalog {
     pub parameters: Vec<Parameter>,
     pub types: Vec<Type>,
     pub synonyms: BTreeMap<i64, String>,
+    /// Each DML trigger's state, by its object id: whether it is disabled,
+    /// which leaves its text and stops it firing, and whether it runs
+    /// instead of its statement.
+    pub triggers: BTreeMap<i64, (bool, bool)>,
     /// Each key constraint's key, by the constraint's object id.
     pub keys: BTreeMap<i64, Key>,
     /// Each table's unique indexes that are no constraint, by the table's
@@ -299,8 +309,13 @@ const TYPES: &str = "SELECT CONVERT(nvarchar(20), user_type_id) AS id, \
     CONVERT(nvarchar(1), is_table_type) AS table_type \
     FROM sys.types;";
 
+const TRIGGERS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
+    CONVERT(nvarchar(1), is_disabled) AS disabled, CONVERT(nvarchar(1), is_instead_of_trigger) AS instead_of \
+    FROM sys.triggers WHERE parent_class = 1 AND is_ms_shipped = 0;";
+
 const KEYS: &str = "SELECT CONVERT(nvarchar(20), kc.object_id) AS id, \
-    CONVERT(nvarchar(60), i.type_desc) AS [index], CONVERT(nvarchar(20), ic.key_ordinal) AS ordinal, \
+    CONVERT(nvarchar(60), i.type_desc) AS [index], CONVERT(nvarchar(1), i.is_disabled) AS disabled, \
+    CONVERT(nvarchar(20), ic.key_ordinal) AS ordinal, \
     CONVERT(nvarchar(128), c.name) AS [column], CONVERT(nvarchar(1), ic.is_descending_key) AS descending \
     FROM sys.key_constraints kc \
     JOIN sys.indexes i ON i.object_id = kc.parent_object_id AND i.index_id = kc.unique_index_id \
@@ -310,6 +325,7 @@ const KEYS: &str = "SELECT CONVERT(nvarchar(20), kc.object_id) AS id, \
 
 const UNIQUE_INDEXES: &str = "SELECT CONVERT(nvarchar(20), i.object_id) AS id, \
     CONVERT(nvarchar(128), i.name) AS name, CONVERT(nvarchar(60), i.type_desc) AS [index], \
+    CONVERT(nvarchar(1), i.is_disabled) AS disabled, \
     CONVERT(nvarchar(20), ic.key_ordinal) AS ordinal, CONVERT(nvarchar(128), c.name) AS [column], \
     CONVERT(nvarchar(1), ic.is_descending_key) AS descending \
     FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id AND o.is_ms_shipped = 0 \
@@ -363,10 +379,15 @@ const TABLE_TYPE_KEYS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) AS 
 const SYNONYMS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
     CONVERT(nvarchar(1035), base_object_name) AS base FROM sys.synonyms;";
 
+// A DEFAULT is never disabled or untrusted; a CHECK can be both, with its
+// text unchanged (`ALTER TABLE ... NOCHECK CONSTRAINT`).
 const CONSTRAINTS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
-    CONVERT(nvarchar(20), parent_column_id) AS [column], definition FROM sys.default_constraints \
+    CONVERT(nvarchar(20), parent_column_id) AS [column], definition, \
+    CONVERT(nvarchar(1), NULL) AS disabled, CONVERT(nvarchar(1), NULL) AS not_trusted \
+    FROM sys.default_constraints \
     UNION ALL SELECT CONVERT(nvarchar(20), object_id), CONVERT(nvarchar(20), parent_column_id), \
-    definition FROM sys.check_constraints;";
+    definition, CONVERT(nvarchar(1), is_disabled), CONVERT(nvarchar(1), is_not_trusted) \
+    FROM sys.check_constraints;";
 
 const DEPENDENCIES: &str = "SELECT CONVERT(nvarchar(20), referencing_id) AS referencing, \
     CONVERT(nvarchar(20), referencing_minor_id) AS referencing_column, \
@@ -653,11 +674,20 @@ pub(super) async fn read(
             table_type: row.flag("table_type")?,
         });
     }
+    let mut triggers = BTreeMap::new();
+    for row in rows(conn, TRIGGERS).await? {
+        let row = Text(&row);
+        triggers.insert(
+            row.number("id")?,
+            (row.flag("disabled")?, row.flag("instead_of")?),
+        );
+    }
     let mut keys: BTreeMap<i64, Key> = BTreeMap::new();
     for row in rows(conn, KEYS).await? {
         let row = Text(&row);
         let key = keys.entry(row.number("id")?).or_default();
         key.index = row.required("index")?;
+        key.disabled = row.flag("disabled")?;
         key.columns.push((
             row.number("ordinal")?,
             row.required("column")?,
@@ -673,6 +703,7 @@ pub(super) async fn read(
             .entry(row.required("name")?)
             .or_default();
         index.index = row.required("index")?;
+        index.disabled = row.flag("disabled")?;
         index.columns.push((
             row.number("ordinal")?,
             row.required("column")?,
@@ -764,6 +795,8 @@ pub(super) async fn read(
             Constraint {
                 column: row.number("column")?,
                 definition: row.required("definition")?,
+                disabled: row.optional("disabled")?.map(|v| v == "1"),
+                trusted: row.optional("not_trusted")?.map(|v| v != "1"),
             },
         );
     }
@@ -855,6 +888,7 @@ pub(super) async fn read(
         parameters,
         types,
         synonyms,
+        triggers,
         keys,
         unique_indexes,
         foreign_keys,

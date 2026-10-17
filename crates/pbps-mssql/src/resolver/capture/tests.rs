@@ -85,6 +85,7 @@ fn catalog() -> Catalog {
         parameters: Vec::new(),
         types: Vec::new(),
         synonyms: BTreeMap::new(),
+        triggers: BTreeMap::new(),
         keys: BTreeMap::new(),
         unique_indexes: BTreeMap::new(),
         foreign_keys: BTreeMap::new(),
