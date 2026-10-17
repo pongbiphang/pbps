@@ -490,6 +490,7 @@
         "type_refs::routine_overloads_and_relations_have_distinct_dependency_identities",
         "type_refs::domain_coercions_keep_null_defaults_on_enum_columns_and_partition_overrides",
         "type_refs::empty_array_defaults_evaluate_no_element_domain_check",
+        "type_refs::stored_generated_empty_arrays_evaluate_no_element_domain_check",
         "type_refs::empty_arrays_still_evaluate_outer_domain_checks_and_keep_array_type_ownership",
         "type_refs::polymorphic_index_defaults_survive_multiple_domain_layers",
         "abrupt_committed_apply_without_caller_success_is_not_replayed",

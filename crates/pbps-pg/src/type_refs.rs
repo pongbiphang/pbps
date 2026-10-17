@@ -3,7 +3,9 @@
 use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
-use pbps_model::{Change, ChangeSet, ColumnType, ModuleKind, Schema, TypePin, TypeRef};
+use pbps_model::{
+    Change, ChangeSet, Column, ColumnType, ModuleKind, Schema, TypePin, TypeRef, ValueSource,
+};
 
 use crate::pins::Within;
 use crate::user_types::{self, TypeRead, UserType};
@@ -132,21 +134,12 @@ pub async fn seal(
     let types = read(conn, Within::OwnTransaction, &references).await?;
     for schema in schemas {
         for (table, definition) in &schema.tables {
-            let check_default = |column: &str, ty: &ColumnType, expr: Option<&str>| {
+            let check_default = |column: &str, spec: &Column| {
+                let ty = &spec.ty;
                 let Some(reference) = ty.type_ref() else {
                     return Ok(());
                 };
-                let is_null = expr.is_some_and(|expr| {
-                    let (core, casts) = crate::rows::unwrapped_with_casts(expr);
-                    core.eq_ignore_ascii_case("null")
-                        && casts.iter().all(|cast| {
-                            cast.parse::<ColumnType>()
-                                .ok()
-                                .and_then(|t| crate::types::normalize(&t).ok())
-                                .is_some_and(|cast| cast == *ty)
-                        })
-                });
-                if is_null
+                if fill(spec) == Fill::Null
                     && (ty.is_array()
                         || types.iter().any(|ty| {
                             ty.reference() == reference && ty.kind() != user_types::Kind::Domain
@@ -160,8 +153,8 @@ pub async fn seal(
                 Ok(())
             };
             for (column, spec) in &definition.columns {
-                if let pbps_model::ValueSource::Default(expr) = &spec.value_source {
-                    check_default(column, &spec.ty, Some(expr))?;
+                if matches!(&spec.value_source, ValueSource::Default(_)) {
+                    check_default(column, spec)?;
                 }
             }
             // Partitions declare only overrides; their column types live on the parent.
@@ -169,8 +162,12 @@ pub async fn seal(
                 && let Some(parent) = schema.tables.get(&part.parent)
             {
                 for (column, own) in &part.columns {
-                    if let Some(spec) = parent.columns.get(column) {
-                        check_default(column, &spec.ty, own.default.as_deref())?;
+                    if let Some(spec) = parent.columns.get(column)
+                        && let Some(expr) = &own.default
+                    {
+                        let mut override_column = Column::new(spec.ty.clone());
+                        override_column.value_source = ValueSource::Default(expr.clone());
+                        check_default(column, &override_column)?;
                     }
                 }
             }
@@ -249,20 +246,36 @@ pub async fn check(
     Ok(())
 }
 
-fn null_default(column: &pbps_model::Column) -> bool {
-    matches!(&column.value_source, pbps_model::ValueSource::Default(expr)
-        if crate::rows::unwrapped_with_type(expr).0.eq_ignore_ascii_case("null"))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    Null,
+    EmptyArray,
+    Constructs,
 }
 
-fn empty_array_default(column: &pbps_model::Column) -> bool {
-    let pbps_model::ValueSource::Default(expr) = &column.value_source else {
-        return false;
+// #2155: admission and erased-NULL sealing must agree for every value source.
+// Unrecognised shapes keep the full input-path check; no expression runs here.
+fn fill(column: &Column) -> Fill {
+    let expr = match &column.value_source {
+        ValueSource::Default(expr) => expr,
+        ValueSource::Generated(g) if g.stored => &g.expression,
+        ValueSource::None
+        | ValueSource::Identity(_)
+        | ValueSource::Sequence(_)
+        | ValueSource::Generated(_) => return Fill::Constructs,
     };
-    if !column.ty.is_array() {
-        // In particular, a domain over an array still evaluates its own CHECK.
-        return false;
-    }
     let (core, casts) = crate::rows::unwrapped_with_casts(expr);
+    if !casts.iter().all(|cast| {
+        cast.parse::<ColumnType>()
+            .ok()
+            .and_then(|ty| crate::types::normalize(&ty).ok())
+            .is_some_and(|ty| ty == column.ty)
+    }) {
+        return Fill::Constructs;
+    }
+    if core.eq_ignore_ascii_case("null") {
+        return Fill::Null;
+    }
     let empty = core == "'{}'"
         || (core
             .get(..6)
@@ -271,14 +284,12 @@ fn empty_array_default(column: &pbps_model::Column) -> bool {
             && core[6..core.len() - 1]
                 .bytes()
                 .all(|b| b.is_ascii_whitespace()));
-    empty
-        && !casts.is_empty()
-        && casts.iter().all(|cast| {
-            cast.parse::<ColumnType>()
-                .ok()
-                .and_then(|ty| crate::types::normalize(&ty).ok())
-                .is_some_and(|ty| ty == column.ty)
-        })
+    // A domain over an array still evaluates its own CHECK.
+    if empty && column.ty.is_array() && !casts.is_empty() {
+        Fill::EmptyArray
+    } else {
+        Fill::Constructs
+    }
 }
 
 /// Checking for rows reads no values through a user-defined type.
@@ -324,15 +335,10 @@ pub async fn check_added(
         let own_default = !matches!(column.value_source, pbps_model::ValueSource::None);
         let added =
             crate::input_path::Added::new(&types[0], own_default).array(column.ty.is_array());
-        let fills_null = null_default(column)
-            || matches!(&column.value_source, pbps_model::ValueSource::Generated(g)
-                if crate::rows::unwrapped_with_type(&g.expression).0.eq_ignore_ascii_case("null"));
-        let added = if fills_null {
-            added.null_fill()
-        } else if empty_array_default(column) {
-            added.empty_array_fill()
-        } else {
-            added
+        let added = match fill(column) {
+            Fill::Null => added.null_fill(),
+            Fill::EmptyArray => added.empty_array_fill(),
+            Fill::Constructs => added,
         };
         let trusted: Vec<_> = trusted.iter().cloned().collect();
         let answers = crate::input_path::read(conn, within, &trusted, &[added]).await;
@@ -377,40 +383,140 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_measured_empty_arrays_cast_to_the_column_element_type_skip_elements() {
-        let ty = "app.checked[]".parse::<ColumnType>().unwrap();
-        for expr in [
-            "ARRAY[]::app.checked[]",
-            "ARRAY[ \t\n ]::app.checked[]",
-            "CAST(ARRAY[] AS app.checked[])",
-            "'{}'::app.checked[]",
-            "CAST('{}' AS app.checked[])",
-            "(ARRAY[]::app.checked[])::app.checked[]",
-        ] {
-            let mut column = pbps_model::Column::new(ty.clone());
-            column.value_source = pbps_model::ValueSource::Default(expr.into());
-            assert!(empty_array_default(&column), "{expr}");
+    fn defaults_and_stored_generated_fills_share_the_same_cast_checked_shapes() {
+        for ty in ["app.checked", "app.checked[]"] {
+            for expr in [
+                "NULL".to_owned(),
+                format!("NULL::{ty}"),
+                format!("CAST(NULL AS {ty})"),
+                format!("(NULL::{ty})::{ty}"),
+            ] {
+                for source in [
+                    ValueSource::Default(expr.clone()),
+                    ValueSource::Generated(pbps_model::Generated {
+                        expression: expr.clone(),
+                        stored: true,
+                    }),
+                ] {
+                    let mut column = Column::new(ty.parse().unwrap());
+                    column.value_source = source;
+                    assert_eq!(fill(&column), Fill::Null, "{ty}: {:?}", column.value_source);
+                }
+            }
         }
-        for expr in [
-            "ARRAY[NULL]::app.checked[]",
-            "ARRAY['x']::app.checked[]",
-            "'{x}'::app.checked[]",
-            "'{{}}'::app.checked[]",
-            "ARRAY[ARRAY[]]::app.checked[]",
-            "app.empty_array()::app.checked[]",
-            "'{}'",
-            "ARRAY[]",
-            "ARRAY[]::app.other[]",
-            "ARRAY[]::app.other[]::app.checked[]",
-            "ARRAY[\u{a0}]::app.checked[]",
+        for (ty, expr, expected) in [
+            ("app.checked[]", "ARRAY[]::app.checked[]", Fill::EmptyArray),
+            (
+                "app.checked[]",
+                "ARRAY[ \t\n ]::app.checked[]",
+                Fill::EmptyArray,
+            ),
+            (
+                "app.checked[]",
+                "CAST(ARRAY[] AS app.checked[])",
+                Fill::EmptyArray,
+            ),
+            ("app.checked[]", "'{}'::app.checked[]", Fill::EmptyArray),
+            (
+                "app.checked[]",
+                "CAST('{}' AS app.checked[])",
+                Fill::EmptyArray,
+            ),
+            (
+                "app.checked[]",
+                "(ARRAY[]::app.checked[])::app.checked[]",
+                Fill::EmptyArray,
+            ),
+            (
+                "app.checked[]",
+                "ARRAY[NULL]::app.checked[]",
+                Fill::Constructs,
+            ),
+            (
+                "app.checked[]",
+                "ARRAY['x']::app.checked[]",
+                Fill::Constructs,
+            ),
+            ("app.checked[]", "'{x}'::app.checked[]", Fill::Constructs),
+            ("app.checked[]", "'{{}}'::app.checked[]", Fill::Constructs),
+            (
+                "app.checked[]",
+                "ARRAY[ARRAY[]]::app.checked[]",
+                Fill::Constructs,
+            ),
+            (
+                "app.checked[]",
+                "app.empty_array()::app.checked[]",
+                Fill::Constructs,
+            ),
+            ("app.checked[]", "'{}'", Fill::Constructs),
+            ("app.checked[]", "ARRAY[]", Fill::Constructs),
+            ("app.checked[]", "ARRAY[]::app.other[]", Fill::Constructs),
+            (
+                "app.checked[]",
+                "ARRAY[]::app.other[]::app.checked[]",
+                Fill::Constructs,
+            ),
+            (
+                "app.checked[]",
+                "ARRAY[\u{a0}]::app.checked[]",
+                Fill::Constructs,
+            ),
+            (
+                "app.checked",
+                "NULL::app.domain_over_checked",
+                Fill::Constructs,
+            ),
+            (
+                "app.checked",
+                "NULL::app.domain_over_checked::app.checked",
+                Fill::Constructs,
+            ),
+            (
+                "app.checked",
+                "CAST(NULL::app.domain_over_checked AS app.checked)",
+                Fill::Constructs,
+            ),
+            (
+                "app.outer_domain",
+                "'{}'::app.outer_domain",
+                Fill::Constructs,
+            ),
+            (
+                "app.outer_domain",
+                "ARRAY[]::app.checked[]",
+                Fill::Constructs,
+            ),
         ] {
-            let mut column = pbps_model::Column::new(ty.clone());
-            column.value_source = pbps_model::ValueSource::Default(expr.into());
-            assert!(!empty_array_default(&column), "{expr}");
+            for source in [
+                ValueSource::Default(expr.into()),
+                ValueSource::Generated(pbps_model::Generated {
+                    expression: expr.into(),
+                    stored: true,
+                }),
+            ] {
+                let mut column = Column::new(ty.parse().unwrap());
+                column.value_source = source;
+                assert_eq!(fill(&column), expected, "{ty}: {:?}", column.value_source);
+            }
         }
-        let mut outer = pbps_model::Column::new("app.outer_domain".parse().unwrap());
-        outer.value_source = pbps_model::ValueSource::Default("ARRAY[]::app.checked[]".into());
-        assert!(!empty_array_default(&outer));
+    }
+
+    #[test]
+    fn sources_without_a_stored_fill_expression_construct_values() {
+        for source in [
+            ValueSource::None,
+            ValueSource::Identity(pbps_model::Identity::new(1, 1)),
+            ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
+            ValueSource::Generated(pbps_model::Generated {
+                expression: "'{}'::app.checked[]".into(),
+                stored: false,
+            }),
+        ] {
+            let mut column = Column::new("app.checked[]".parse().unwrap());
+            column.value_source = source;
+            assert_eq!(fill(&column), Fill::Constructs, "{:?}", column.value_source);
+        }
     }
 
     #[test]

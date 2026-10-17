@@ -980,6 +980,111 @@ fn empty_array_defaults_evaluate_no_element_domain_check() {
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
+fn stored_generated_empty_arrays_evaluate_no_element_domain_check() {
+    let setup = |role: &str| {
+        format!(
+            "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO {role};
+            CREATE TABLE app.calls (n integer);
+            CREATE FUNCTION app.seen(text) RETURNS boolean LANGUAGE plpgsql AS $$
+            BEGIN INSERT INTO app.calls VALUES (1); RETURN true; END $$;
+            ALTER FUNCTION app.seen(text) OWNER TO {role};
+            CREATE DOMAIN app.checked AS text CHECK (app.seen(VALUE))"
+        )
+    };
+    // Measure both majors before the admission assertion can fail on either one.
+    for server in servers() {
+        let role = UntrustedRole::new(&server, "generated_measure");
+        let own = OwnDatabase::new(&server, "refs_generated_measure");
+        let db = own.connection();
+        on_server(db, &setup(&role.name));
+        on_server(
+            db,
+            "CREATE TABLE app.measure (id integer); INSERT INTO app.measure VALUES (1), (2);
+            ALTER TABLE app.measure ADD COLUMN items app.checked[]
+                GENERATED ALWAYS AS ('{}'::app.checked[]) STORED",
+        );
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.measure WHERE cardinality(items)=0"
+            ),
+            2
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_catalog.pg_type t
+                JOIN pg_catalog.pg_type a ON a.oid=t.typarray
+                JOIN pg_catalog.pg_roles r ON r.oid=t.typowner
+                WHERE t.oid='app.checked'::regtype AND a.typowner=t.typowner
+                  AND r.rolname=current_user"
+            ),
+            1
+        );
+        on_server(db, "SELECT '{x}'::app.checked[]");
+        assert!(scalar(db, "SELECT count(*)::bigint FROM app.calls") > 0);
+        let major = scalar(db, "SELECT current_setting('server_version_num')::bigint") / 10000;
+        eprintln!(
+            "PostgreSQL {major}: a stored generated empty array evaluates no element CHECK; a nonempty array evaluates it"
+        );
+    }
+    for server in servers() {
+        let role = UntrustedRole::new(&server, "generated_fill");
+        let own = OwnDatabase::new(&server, "refs_generated_empty");
+        let db = own.connection();
+        on_server(db, &setup(&role.name));
+        let d = Demo::new("refs-generated-empty");
+        d.keyed(db);
+        d.table(&declarations(""));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        on_server(db, "INSERT INTO app.t VALUES (1), (2)");
+        let generated = "  items: {type: 'app.checked[]', generated: {expression: \"'{}'::app.checked[]\", stored: true}}\n";
+        d.table(&declarations(generated));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = plan(&d, db);
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+        succeeds(apply_plan(&d, db, &path, false));
+        succeeds(d.run(&["verify", "--db", db]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.t WHERE cardinality(items)=0"
+            ),
+            2
+        );
+        let next: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
+        assert!(next.changes.is_empty());
+        d.table(&declarations(&format!(
+            "{generated}  refused: {{type: 'app.checked[]', generated: {{expression: \"'{{x}}'::app.checked[]\", stored: true}}}}\n"
+        )));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("app.seen") && stderr(&out).contains(&role.name),
+            "{}",
+            stderr(&out)
+        );
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_catalog.pg_attribute
+                WHERE attrelid='app.t'::regclass AND attname='refused' AND NOT attisdropped"
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
 fn empty_arrays_still_evaluate_outer_domain_checks_and_keep_array_type_ownership() {
     for server in servers() {
         let role = UntrustedRole::new(&server, "empty_outer");
