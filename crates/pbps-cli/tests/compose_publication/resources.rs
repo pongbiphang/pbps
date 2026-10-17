@@ -2,6 +2,7 @@
 
 mod admission;
 mod batching;
+mod fixtures;
 mod lifecycle;
 mod private_refs;
 mod revisions;
@@ -688,6 +689,140 @@ fn legacy_and_unknown_evidence_refuse_without_modifying_retained_data() {
 
 #[test]
 fn every_receipt_and_retirement_io_failure_preserves_unresolved_evidence() {
+    fn fault(
+        f: &Fixture,
+        preview: &Preview,
+        delivered: &Outcome,
+        kind: &str,
+        after: bool,
+    ) -> (Vec<Outcome>, Option<fixtures::Pristine>) {
+        let fault_kind = kind.to_owned();
+        let armed = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let (enabled, hit) = (armed.clone(), fired.clone());
+        let record_path = root(f).join(format!("resources/{}.json", preview.operation_id));
+        let records_path = root(f).join("resources");
+        let snapshot_file = root(f)
+            .join("snapshots")
+            .join(&preview.operation_id)
+            .join("repository")
+            .join("project/schema/t.yml");
+        let pin_path = f.repo.root.join(format!(
+            ".git/refs/pbps-compose/{}/base",
+            preview.operation_id
+        ));
+        let observer = ResourceObserver::new(move |point| {
+            let selected = match fault_kind.as_str() {
+                "open" => {
+                    point.operation == ResourceOperation::Open
+                        && point.path.ends_with("resources.lock")
+                }
+                "read" => point.operation == ResourceOperation::Read && point.path == record_path,
+                "create" => {
+                    point.operation == ResourceOperation::Create
+                        && point.path.parent() == Some(records_path.as_path())
+                }
+                "write" => {
+                    point.operation == ResourceOperation::Write
+                        && point.path.parent() == Some(records_path.as_path())
+                }
+                "file-sync" => {
+                    point.operation == ResourceOperation::Sync
+                        && point.path.parent() == Some(records_path.as_path())
+                }
+                "directory-sync" => {
+                    point.operation == ResourceOperation::Sync && point.path == records_path
+                }
+                "rename" => {
+                    point.operation == ResourceOperation::Rename && point.path == record_path
+                }
+                "remove" => {
+                    point.operation == ResourceOperation::Remove && point.path == snapshot_file
+                }
+                "pin-remove" => {
+                    point.operation == ResourceOperation::Remove && point.path == pin_path
+                }
+                "unlock" => {
+                    point.operation == ResourceOperation::Unlock
+                        && point.path.ends_with("resources.lock")
+                }
+                _ => unreachable!(),
+            };
+            !(enabled.load(Ordering::SeqCst)
+                && selected
+                && point.after == after
+                && !hit.swap(true, Ordering::SeqCst))
+        });
+        let mut publisher = observed(f, observer);
+        armed.store(true, Ordering::SeqCst);
+        let stopped = publisher.cleanup(&preview.operation_id);
+        let mut outcomes = vec![stopped.clone()];
+        assert!(fired.load(Ordering::SeqCst), "unexercised {kind}/{after}");
+        assert_eq!(
+            stopped.status,
+            Status::RecoveryRequired,
+            "{kind}/{after}: {stopped:?}"
+        );
+        assert!(stopped.cleanup_pending);
+        assert!(f.record(&preview.operation_id).exists());
+        assert_eq!(
+            f.remote_ref(&preview.output_ref).as_deref(),
+            Some(commit(delivered))
+        );
+        drop(publisher);
+        let pending: Vec<_> = fs::read_dir(root(f).join("resources"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("pending-")
+            })
+            .collect();
+        let mut publisher = f.publisher();
+        for _ in 0..2 {
+            let recovered = publisher.cleanup(&preview.operation_id);
+            if pending.is_empty() {
+                assert_eq!(
+                    recovered.status,
+                    Status::Delivered,
+                    "{kind}/{after}: {recovered:?}"
+                );
+                assert!(!recovered.cleanup_pending);
+            } else {
+                assert_eq!(recovered.status, Status::RecoveryRequired);
+                assert!(recovered.cleanup_pending);
+                assert!(
+                    pending.iter().all(|p| p.exists()),
+                    "unacknowledged temporary ownership was guessed"
+                );
+            }
+            assert!(f.record(&preview.operation_id).exists());
+            outcomes.push(recovered);
+        }
+        drop(publisher);
+        (
+            outcomes,
+            (kind == "open" && !after).then(|| fixtures::Pristine::capture(f)),
+        )
+    }
+    let f = Fixture::new("io-replay");
+    let (_store, preview, candidate) = f.ready();
+    let mut publisher = f.publisher();
+    let delivered = publisher.confirm(&candidate);
+    assert_eq!(delivered.status, Status::Delivered, "{delivered:?}");
+    drop(publisher);
+    // All snapshot bytes and inventory names come from this real delivery.
+    // Only fresh inode/timestamp observations are substituted on replay.
+    let real = fixtures::Pristine::capture(&f);
+    real.assert(&f);
+    let (real_outcomes, real_evidence) = fault(&f, &preview, &delivered, "open", false);
+    let pristine = real.minimal_snapshot(
+        &preview.operation_id,
+        Path::new("repository/project/schema/t.yml"),
+    );
+    pristine.restore(&f);
     for kind in [
         "open",
         "read",
@@ -701,116 +836,21 @@ fn every_receipt_and_retirement_io_failure_preserves_unresolved_evidence() {
         "unlock",
     ] {
         for after in [false, true] {
-            let f = Fixture::new(&format!("io-{kind}-{after}"));
-            let (_store, preview, candidate) = f.ready();
-            let armed = Arc::new(AtomicBool::new(false));
-            let fired = Arc::new(AtomicBool::new(false));
-            let (enabled, hit) = (armed.clone(), fired.clone());
-            let record_path = root(&f).join(format!("resources/{}.json", preview.operation_id));
-            let records_path = root(&f).join("resources");
-            let snapshot_file = candidate.snapshot_repository().join("project/schema/t.yml");
-            let pin_path = f.repo.root.join(format!(
-                ".git/refs/pbps-compose/{}/base",
-                preview.operation_id
-            ));
-            let observer = ResourceObserver::new(move |point| {
-                let selected = match kind {
-                    "open" => {
-                        point.operation == ResourceOperation::Open
-                            && point.path.ends_with("resources.lock")
-                    }
-                    "read" => {
-                        point.operation == ResourceOperation::Read && point.path == record_path
-                    }
-                    "create" => {
-                        point.operation == ResourceOperation::Create
-                            && point.path.parent() == Some(records_path.as_path())
-                    }
-                    "write" => {
-                        point.operation == ResourceOperation::Write
-                            && point.path.parent() == Some(records_path.as_path())
-                    }
-                    "file-sync" => {
-                        point.operation == ResourceOperation::Sync
-                            && point.path.parent() == Some(records_path.as_path())
-                    }
-                    "directory-sync" => {
-                        point.operation == ResourceOperation::Sync && point.path == records_path
-                    }
-                    "rename" => {
-                        point.operation == ResourceOperation::Rename && point.path == record_path
-                    }
-                    "remove" => {
-                        point.operation == ResourceOperation::Remove && point.path == snapshot_file
-                    }
-                    "pin-remove" => {
-                        point.operation == ResourceOperation::Remove && point.path == pin_path
-                    }
-                    "unlock" => {
-                        point.operation == ResourceOperation::Unlock
-                            && point.path.ends_with("resources.lock")
-                    }
-                    _ => unreachable!(),
-                };
-                !(enabled.load(Ordering::SeqCst)
-                    && selected
-                    && point.after == after
-                    && !hit.swap(true, Ordering::SeqCst))
-            });
-            let mut publisher = observed(&f, observer);
-            let delivered = publisher.confirm(&candidate);
-            assert_eq!(
-                delivered.status,
-                Status::Delivered,
-                "{kind}/{after}: {delivered:?}"
-            );
-            armed.store(true, Ordering::SeqCst);
-            let stopped = publisher.cleanup(&preview.operation_id);
-            assert!(fired.load(Ordering::SeqCst), "unexercised {kind}/{after}");
-            assert_eq!(
-                stopped.status,
-                Status::RecoveryRequired,
-                "{kind}/{after}: {stopped:?}"
-            );
-            assert!(stopped.cleanup_pending);
-            assert!(f.record(&preview.operation_id).exists());
-            assert_eq!(
-                f.remote_ref(&preview.output_ref).as_deref(),
-                Some(commit(&delivered))
-            );
-            drop(publisher);
-            let pending: Vec<_> = fs::read_dir(root(&f).join("resources"))
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .filter(|p| {
-                    p.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .starts_with("pending-")
-                })
-                .collect();
-            let mut publisher = f.publisher();
-            for _ in 0..2 {
-                let recovered = publisher.cleanup(&preview.operation_id);
-                if pending.is_empty() {
-                    assert_eq!(
-                        recovered.status,
-                        Status::Delivered,
-                        "{kind}/{after}: {recovered:?}"
-                    );
-                    assert!(!recovered.cleanup_pending);
-                } else {
-                    assert_eq!(recovered.status, Status::RecoveryRequired);
-                    assert!(recovered.cleanup_pending);
-                    assert!(
-                        pending.iter().all(|p| p.exists()),
-                        "unacknowledged temporary ownership was guessed"
-                    );
-                }
-                assert!(f.record(&preview.operation_id).exists());
+            pristine.assert(&f);
+            let (outcomes, evidence) = fault(&f, &preview, &delivered, kind, after);
+            if kind == "open" && !after {
+                // The extra calibration ran on the untouched real delivery;
+                // replay must leave the same outcomes and surviving evidence.
+                assert_eq!(real_outcomes, outcomes);
+                real_evidence
+                    .as_ref()
+                    .unwrap()
+                    .assert_same(evidence.as_ref().unwrap());
             }
+            pristine.restore(&f);
         }
     }
+    pristine.assert(&f);
 }
 
 #[test]
@@ -2099,6 +2139,13 @@ fn a_bounded_live_tree_with_an_over_budget_base_union_leaves_no_capture_obligati
 
 #[test]
 fn identity_and_aggregate_input_bounds_retire_only_completed_capture_checks() {
+    let padding = vec![b' '; 65 * 1024 * 1024];
+    let comment = |path: &Path, size: usize| {
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(b"#").unwrap();
+        file.write_all(&padding[..size * 1024 * 1024]).unwrap();
+        file.write_all(b"\n").unwrap();
+    };
     for mode in [
         "identity",
         "aggregate",
@@ -2113,10 +2160,9 @@ fn identity_and_aggregate_input_bounds_retire_only_completed_capture_checks() {
         if matches!(mode, "attributes" | "attribute-object") {
             f.repo.table(ORIGINAL);
             let size = if mode == "attributes" { 31 } else { 65 };
-            let comment = format!("#{}\n", " ".repeat(size * 1024 * 1024));
-            fs::write(f.repo.root.join(".gitattributes"), &comment).unwrap();
+            comment(&f.repo.root.join(".gitattributes"), size);
             if mode == "attributes" {
-                fs::write(f.repo.project.join(".gitattributes"), &comment).unwrap();
+                comment(&f.repo.project.join(".gitattributes"), size);
             }
             f.repo.commit();
         }
@@ -2130,7 +2176,7 @@ fn identity_and_aggregate_input_bounds_retire_only_completed_capture_checks() {
                 .unwrap(),
             "aggregate" => {
                 let mut file = fs::OpenOptions::new().append(true).open(&ids).unwrap();
-                file.write_all(&vec![b' '; 62 * 1024 * 1024]).unwrap();
+                file.write_all(&padding[..62 * 1024 * 1024]).unwrap();
                 f.repo
                     .table(&format!("{RENAMED}#{}\n", " ".repeat(3 * 1024 * 1024)));
             }
@@ -2140,10 +2186,9 @@ fn identity_and_aggregate_input_bounds_retire_only_completed_capture_checks() {
             "attribute-object" => (),
             "live-attribute" | "live-attribute-total" => {
                 let size = if mode == "live-attribute" { 65 } else { 33 };
-                let comment = format!("#{}\n", " ".repeat(size * 1024 * 1024));
-                fs::write(f.repo.root.join(".gitattributes"), &comment).unwrap();
+                comment(&f.repo.root.join(".gitattributes"), size);
                 if mode == "live-attribute-total" {
-                    fs::write(f.repo.project.join(".gitattributes"), &comment).unwrap();
+                    comment(&f.repo.project.join(".gitattributes"), size);
                 }
             }
             _ => unreachable!(),

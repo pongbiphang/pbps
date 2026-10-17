@@ -67,58 +67,131 @@ fn retain(f: &Fixture) -> Preview {
 
 #[test]
 fn discovery_and_admission_have_bounded_passes_and_linear_record_reads() {
-    for n in [2, 5] {
-        let f = Fixture::new(&format!("batch-counts-{n}"));
-        for _ in 0..n {
-            retain(&f);
-            let mut store = f.repo.store();
-            let preview = store.preview(request(), SystemTime::now()).unwrap();
-            f.publisher()
-                .discard_preview(&preview.operation_id)
-                .unwrap();
-        }
-        // Inflate only valid spent tombstones from an actual discarded
-        // preview; these synthetic identities carry no refs or capabilities.
-        let resources = root(&f).join("resources");
-        let template = fs::read_dir(&resources)
-            .unwrap()
-            .find_map(|entry| {
-                let value: serde_json::Value =
-                    serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
-                (value["state"] == "spent").then_some(value)
-            })
+    fn updates(repository: &Path, refs: &[(String, String)]) {
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["update-ref", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        for (name, value) in refs {
+            writeln!(stdin, "update {name} {value}").unwrap();
+        }
+        drop(stdin);
+        checked(child.wait_with_output().unwrap());
+    }
+    fn expand(
+        f: &Fixture,
+        seed: &str,
+        id: &str,
+        local: &mut Vec<(String, String)>,
+        remote: &mut Vec<(String, String)>,
+    ) {
+        let resources = root(f).join("resources");
+        let mut resource: serde_json::Value =
+            serde_json::from_slice(&fs::read(resources.join(format!("{seed}.json"))).unwrap())
+                .unwrap();
+        resource["operation"] = id.into();
+        let target = resources.join(format!("{id}.json"));
+        assert!(!target.exists());
+        fs::write(target, serde_json::to_vec(&resource).unwrap()).unwrap();
+        if resource["state"] == "retained" {
+            let mut receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(f.record(seed)).unwrap()).unwrap();
+            receipt["description"]["operation_id"] = id.into();
+            let output = format!("refs/heads/pbps-compose/{id}");
+            receipt["description"]["output_ref"] = output.clone().into();
+            assert!(!f.record(id).exists());
+            fs::write(f.record(id), serde_json::to_vec(&receipt).unwrap()).unwrap();
+            let pin = resource["pins"]["commit"]["value"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            local.push((format!("refs/pbps-compose/{id}/commit"), pin));
+            let commit = resource["pins"]["commit"]["target"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            local.push((output.clone(), commit.clone()));
+            remote.push((output, commit));
+        }
+    }
+    let f = Fixture::new("batch-counts-replay");
+    let retained = retain(&f);
+    let mut store = f.repo.store();
+    let spent = store.preview(request(), SystemTime::now()).unwrap();
+    f.publisher().discard_preview(&spent.operation_id).unwrap();
+    drop(store);
+    let linked = f.repo.root.with_extension("linked");
+    git(
+        &f.repo.root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "-q",
+            linked.to_str().unwrap(),
+            "master",
+        ],
+    );
+    let other = Fixture {
+        repo: Repository {
+            project: linked.join("project"),
+            root: linked,
+        },
+        remote: f.remote.clone(),
+    };
+    other.repo.table(RENAMED);
+    let unrelated = retain(&other);
+    let pristine = fixtures::Pristine::capture(&f);
+    for n in [2, 5] {
+        pristine.assert(&f);
+        // Retained/spent/other-source shapes all come from real operations.
+        // Copies have new operation/output identities and matching actual refs,
+        // but share the immutable commit objects, not candidate capabilities.
+        let (mut local, mut remote) = (Vec::new(), Vec::new());
+        for number in 1..n {
+            expand(
+                &f,
+                &retained.operation_id,
+                &format!("{number:064x}"),
+                &mut local,
+                &mut remote,
+            );
+            expand(
+                &f,
+                &spent.operation_id,
+                &format!("{:064x}", 0x100 + number),
+                &mut local,
+                &mut remote,
+            );
+            expand(
+                &f,
+                &unrelated.operation_id,
+                &format!("{:064x}", 0x200 + number),
+                &mut local,
+                &mut remote,
+            );
+        }
         for number in 0..16 * n {
-            let id = format!("{number:064x}");
-            let mut value = template.clone();
-            value["operation"] = id.clone().into();
-            let path = resources.join(format!("{id}.json"));
-            assert!(!path.exists());
-            fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+            expand(
+                &f,
+                &spent.operation_id,
+                &format!("{:064x}", 0x1000 + number),
+                &mut local,
+                &mut remote,
+            );
         }
-        let linked = f.repo.root.with_extension("linked");
-        git(
-            &f.repo.root,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                "-q",
-                linked.to_str().unwrap(),
-                "master",
-            ],
-        );
-        let other = Fixture {
-            repo: Repository {
-                project: linked.join("project"),
-                root: linked,
-            },
-            remote: f.remote.clone(),
-        };
-        other.repo.table(RENAMED);
-        for _ in 0..n {
-            retain(&other);
-        }
+        updates(&f.repo.root, &local);
+        updates(&f.remote, &remote);
+        let populated = fixtures::Pristine::capture(&f);
+        populated.assert(&f);
         let before = f.repo.preserved();
         let (observer, counts) = counter(&f, false);
         let mut publisher = observed(&f, observer);
@@ -158,11 +231,21 @@ fn discovery_and_admission_have_bounded_passes_and_linear_record_reads() {
             .discard_preview(&preview.operation_id)
             .unwrap();
         assert_eq!(f.repo.preserved(), before);
+        drop(store);
+        pristine.restore(&f);
     }
+    pristine.assert(&f);
 }
 
 #[test]
 fn discovery_refuses_incomplete_or_changing_batches_without_consuming_evidence() {
+    let f = Fixture::new("batch-negative-replay");
+    let retained = retain(&f);
+    let mut store = f.repo.store();
+    let spent = store.preview(request(), SystemTime::now()).unwrap();
+    f.publisher().discard_preview(&spent.operation_id).unwrap();
+    drop(store);
+    let pristine = fixtures::Pristine::capture(&f);
     for receipts in [false, true] {
         for mode in [
             "unknown",
@@ -174,11 +257,7 @@ fn discovery_refuses_incomplete_or_changing_batches_without_consuming_evidence()
             "late-unknown",
             "interrupted-scan",
         ] {
-            let f = Fixture::new(&format!("batch-negative-{receipts}-{mode}"));
-            let retained = retain(&f);
-            let mut store = f.repo.store();
-            let spent = store.preview(request(), SystemTime::now()).unwrap();
-            f.publisher().discard_preview(&spent.operation_id).unwrap();
+            pristine.assert(&f);
             let directory = if receipts {
                 root(&f)
             } else {
@@ -284,8 +363,11 @@ fn discovery_refuses_incomplete_or_changing_batches_without_consuming_evidence()
                 assert_eq!(fs::read(evidence).unwrap(), original, "{receipts}/{mode}");
             }
             assert_eq!(f.repo.preserved(), before, "{receipts}/{mode}");
+            drop(publisher);
+            pristine.restore(&f);
         }
     }
+    pristine.assert(&f);
 }
 
 #[test]
