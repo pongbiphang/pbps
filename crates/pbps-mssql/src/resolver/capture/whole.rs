@@ -15,6 +15,9 @@ use std::collections::BTreeMap;
 /// The views whose rows each describe one object, keyed by `object_id`.
 const PER_OBJECT: &[&str] = &[
     "objects",
+    "tables",
+    "views",
+    "procedures",
     "sql_modules",
     "synonyms",
     "sequences",

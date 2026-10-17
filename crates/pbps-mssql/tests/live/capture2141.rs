@@ -1493,3 +1493,67 @@ async fn mssql_a_heap_and_an_index_of_any_name_are_both_compared() {
     );
     db.drop().await;
 }
+
+/// What only a table has, in `sys.tables`, is compared too: turning a
+/// temporal table's system versioning off, or changing its lock escalation,
+/// differs though no column or index does. `sys.views` and `sys.procedures`
+/// are read whole alike; the coverage test checks their columns.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_tables_own_settings_are_compared() {
+    let mut db = TestDb::create("kinds2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE TABLE app.versioned (id int NOT NULL CONSTRAINT pk_v PRIMARY KEY, \
+             vf datetime2 GENERATED ALWAYS AS ROW START NOT NULL, \
+             vt datetime2 GENERATED ALWAYS AS ROW END NOT NULL, PERIOD FOR SYSTEM_TIME (vf, vt)) \
+             WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = app.versioned_history));",
+            "CREATE VIEW app.checked AS SELECT id FROM app.versioned WHERE id > 0;",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "versioned"), ("app", "checked")]),
+    )
+    .await
+    .expect("capture");
+    let differs = |differences: &[pbps_db::resolver::capture::CaptureDifference],
+                   what: &ObjectIdentity| {
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(what) && d.change == InputChange::Properties)
+    };
+    let versioned = object("app", "versioned");
+    run(
+        &mut db.conn,
+        &["ALTER TABLE app.versioned SET (SYSTEM_VERSIONING = OFF);"],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differs(&differences, &versioned),
+        "versioning: {differences:?}"
+    );
+
+    run(
+        &mut db.conn,
+        &[
+            "ALTER TABLE app.versioned SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = app.versioned_history));",
+            "ALTER TABLE app.versioned SET (LOCK_ESCALATION = DISABLE);",
+        ],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differs(&differences, &versioned),
+        "lock escalation: {differences:?}"
+    );
+    db.drop().await;
+}

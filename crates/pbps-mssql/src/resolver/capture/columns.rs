@@ -18,6 +18,11 @@
 /// they describe.
 pub(super) const VIEWS: &[&str] = &[
     "objects",
+    // Each kind's own view adds what only that kind has: a table's temporal
+    // and ledger settings, a view's CHECK OPTION, a procedure's startup flag.
+    "tables",
+    "views",
+    "procedures",
     "sql_modules",
     "synonyms",
     "sequences",
@@ -94,6 +99,9 @@ pub(super) fn rule(view: &str, column: &str) -> Option<Rule> {
             "objects"
             | "sql_modules"
             | "synonyms"
+            | "tables"
+            | "views"
+            | "procedures"
             | "sequences"
             | "check_constraints"
             | "default_constraints"
@@ -122,6 +130,14 @@ pub(super) fn rule(view: &str, column: &str) -> Option<Rule> {
             Rule::Skip("a status: the last value the identity issued")
         }
         ("sql_modules", "execute_as_principal_id") => Rule::ExecuteAs,
+        // The highest column number a table has ever used grows with every
+        // column added and dropped: the same shape reads differently by its
+        // history, not by what it is.
+        ("tables", "max_column_id_used") => {
+            Rule::Skip("a history: the highest column number ever used")
+        }
+        ("tables", "history_table_id" | "ledger_view_id") => Rule::Object,
+        ("tables", "lob_data_space_id" | "filestream_data_space_id") => Rule::DataSpace,
         (_, "principal_id") => Rule::Principal,
         (_, "schema_id") => Rule::Schema,
         (

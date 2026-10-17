@@ -3711,6 +3711,12 @@ column after another, which is why §8 rejected it for the externals file.
   an index's name. A system-procedure candidate must name `sys`, the only
   schema that holds one; any other refuses rather than seal `sys` members
   under it. This answers #2150's sixth ready review.
+- **Each kind's own view is read whole.** `sys.tables`, `sys.views` and
+  `sys.procedures` add what only that kind has: a table's temporal, ledger,
+  lock-escalation and durability settings, a view's CHECK OPTION, a
+  procedure's startup flag. A table's `max_column_id_used` is skipped as
+  history, since the same shape reads differently by the columns it once
+  had. This answers #2150's seventh ready review.
 - **The typed reads stay.** The dependency classification, the closure,
   the candidates and ownership read them (DEC-2141.1). The whole rows are
   what a capture compares.
