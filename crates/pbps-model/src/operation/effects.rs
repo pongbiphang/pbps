@@ -48,11 +48,11 @@ use std::collections::BTreeSet;
 
 use super::{
     ColumnKey, Definition, Incarnation, ObjectKey, Operation, OwnerError, Owners, PartKey,
-    Recorded, Spelling, Transition,
+    Recorded, RowSide, Spelling, Transition,
 };
 use crate::{
     Change, ColumnRef, GrantTarget, IdsFile, IndexKey, ReplicaIdentity, RowKey, Schema, Table,
-    TableName, Value, ValueSource,
+    TableName, ValueSource,
 };
 
 /// A thing a step makes, ends or rewrites.
@@ -840,26 +840,19 @@ impl Cx<'_> {
                     }
                 }
                 self.row_meets_constraints(&owner, table, &written);
-                // A row's payload leaves its key column to `key`, and a
-                // column it omits takes its default: a literal one names the
-                // value as surely as a cell does.
-                let key_value = Value::Text(key.0.clone());
-                let literals: Vec<(&str, Value)> = defaults
-                    .iter()
-                    .filter(|(c, _)| !row.columns().any(|(r, _)| r == *c))
-                    .filter_map(|(c, expression)| Some((c.as_str(), literal_value(expression)?)))
-                    .collect();
-                let mut cells: Vec<(&str, &Value)> =
-                    row.columns().map(|(c, v)| (c.as_str(), v)).collect();
-                cells.extend(literals.iter().map(|(c, v)| (*c, v)));
-                cells.push((key_column.as_str(), &key_value));
-                self.row_references(&owner, &cells, true);
-                self.row_aliases(&owner, &cells, None, false);
-                for (c, v) in &cells {
+                self.row_parents(&owner, true);
+                for (c, v) in row.columns() {
                     if v.is_null() {
                         self.row_needs_nullable(&owner, table, c);
                     }
                 }
+                self.creates(Resource::Object(
+                    ObjectKey::Rows {
+                        table: owner.clone(),
+                        side: RowSide::Written,
+                    },
+                    Incarnation::Final,
+                ));
                 self.creates(Resource::Object(
                     ObjectKey::Row {
                         table: owner,
@@ -896,11 +889,9 @@ impl Cx<'_> {
                     }
                 }
                 self.row_meets_constraints(&owner, table, &written);
-                let mut cells: Vec<(&str, &Value)> = Vec::new();
-                for (c, (from, to)) in columns {
+                for (c, (_, to)) in columns {
                     match to {
                         crate::Cell::Value(v) => {
-                            cells.push((c.as_str(), v));
                             if v.is_null() {
                                 self.row_needs_nullable(&owner, table, c);
                             }
@@ -917,57 +908,15 @@ impl Cx<'_> {
                             }
                         }
                     }
-                    let _ = from;
                 }
-                // The tuples it ends with and starts from: the cells it sets
-                // or sets from, those it leaves alone, and its key.
-                // A cell that is the column's default is its value when the
-                // default is a literal, as for an insert that omits it.
-                let literal = |cell: &crate::Cell| match cell {
-                    crate::Cell::Default(expression) => literal_value(expression),
-                    crate::Cell::Value(_) => None,
-                };
-                let set_to: Vec<(&str, Value)> = columns
-                    .iter()
-                    .filter_map(|(c, (_, to))| Some((c.as_str(), literal(to)?)))
-                    .collect();
-                let set_from: Vec<(&str, Value)> = columns
-                    .iter()
-                    .filter_map(|(c, (from, _))| Some((c.as_str(), literal(from)?)))
-                    .collect();
-                let held: Vec<(&str, Value)> = unchanged
-                    .iter()
-                    .filter_map(|(c, cell)| Some((c.as_str(), literal(cell)?)))
-                    .collect();
-                let key_value = Value::Text(key.0.clone());
-                let kept: Vec<(&str, &Value)> = unchanged
-                    .iter()
-                    .filter_map(|(c, cell)| match cell {
-                        crate::Cell::Value(v) => Some((c.as_str(), v)),
-                        crate::Cell::Default(_) => None,
-                    })
-                    .chain(held.iter().map(|(c, v)| (*c, v)))
-                    .chain([(key_column.as_str(), &key_value)])
-                    .collect();
-                let now: Vec<(&str, &Value)> = cells
-                    .iter()
-                    .copied()
-                    .chain(set_to.iter().map(|(c, v)| (*c, v)))
-                    .chain(kept.iter().copied())
-                    .collect();
-                self.row_references(&owner, &now, true);
-                self.row_aliases(&owner, &now, Some(&written), false);
-                let old: Vec<(&str, &Value)> = columns
-                    .iter()
-                    .filter_map(|(c, (from, _))| match from {
-                        crate::Cell::Value(v) => Some((c.as_str(), v)),
-                        crate::Cell::Default(_) => None,
-                    })
-                    .chain(set_from.iter().map(|(c, v)| (*c, v)))
-                    .chain(kept.iter().copied())
-                    .collect();
-                self.row_references(&owner, &old, false);
-                self.row_aliases(&owner, &old, Some(&written), true);
+                self.row_parents(&owner, true);
+                self.creates(Resource::Object(
+                    ObjectKey::Rows {
+                        table: owner.clone(),
+                        side: RowSide::Written,
+                    },
+                    Incarnation::Final,
+                ));
                 // The row must stand; its values change, its identity does
                 // not, so a lookup of it by another row waits for nothing
                 // here.
@@ -977,38 +926,20 @@ impl Cx<'_> {
                 });
             }
             Change::DeleteRow {
-                table,
-                key_column,
-                key,
-                row,
-                ..
+                table, key, row, ..
             } => {
                 let owner = self.table(table)?;
                 self.row_basics(&owner, table, key);
                 let written: Vec<&str> = row.keys().map(String::as_str).collect();
                 self.row_writes(table, &owner, &written);
-                let key_value = Value::Text(key.0.clone());
-                // A cell the row held as the column's default is its value
-                // when the default is a literal.
-                let literals: Vec<(&str, Value)> = row
-                    .iter()
-                    .filter_map(|(c, cell)| match cell {
-                        crate::Cell::Default(expression) => {
-                            Some((c.as_str(), literal_value(expression)?))
-                        }
-                        crate::Cell::Value(_) => None,
-                    })
-                    .collect();
-                let mut cells: Vec<(&str, &Value)> = vec![(key_column.as_str(), &key_value)];
-                for (c, cell) in row {
-                    if let crate::Cell::Value(v) = cell {
-                        cells.push((c.as_str(), v));
-                    }
-                }
-                cells.extend(literals.iter().map(|(c, v)| (*c, v)));
-                self.row_references(&owner, &cells, false);
-                self.row_aliases(&owner, &cells, None, true);
-                self.row_blockers_gone(&owner);
+                self.row_parents(&owner, false);
+                self.removes(Resource::Object(
+                    ObjectKey::Rows {
+                        table: owner,
+                        side: RowSide::Held,
+                    },
+                    Incarnation::Base,
+                ));
             }
             Change::SetDataMode { table, .. } | Change::SetEnsureKeys { table, .. } => {
                 let owner = self.table(table)?;
@@ -1721,19 +1652,22 @@ impl Cx<'_> {
         }
     }
 
-    /// A row that references a parent row needs it to stand; a row that stops
-    /// referencing one leaves before it goes.
-    fn row_references(&mut self, owner: &Recorded, cells: &[(&str, &Value)], _adds: bool) {
-        // Only a key that stands throughout constrains the row: one the plan
-        // adds is installed after the rows it checks, one it drops is gone
-        // before them.
-        let (Some((base_name, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner))
+    /// A row waits for the rows of the tables its foreign keys reference, and
+    /// a row that goes leaves before they do (DEC-1968.2). Table against
+    /// table, never row against row: a value does not name the row it needs
+    /// (a default, a unique key, a tuple, a rename), and the differ already
+    /// orders the rows of two tables by the foreign key between them. A key
+    /// counts only if it stands throughout, compared through the plan's
+    /// renames as the differ compares it: one the plan adds is installed
+    /// after the rows it checks, one it drops is gone before them. Two tables
+    /// in one cycle of foreign keys, a table and itself included, are left in
+    /// the order given, as the differ leaves them (`data::supply_order`).
+    fn row_parents(&mut self, owner: &Recorded, writes: bool) {
+        let (Some((base_name, was)), Some((own_name, will))) =
+            (self.base_of(owner), self.final_of(owner))
         else {
             return;
         };
-        // Compared as the differ compares them, through the plan's renames
-        // of the tables and columns a key names: a key whose referenced table
-        // is renamed stands.
         let forward = self
             .renames_of(base_name, was)
             .apply(
@@ -1745,240 +1679,60 @@ impl Cx<'_> {
                 base_name,
             )
             .into_owned();
-        let mut wanted = Vec::new();
+        let mut parents = BTreeSet::new();
         for (name, fk) in &will.foreign_keys {
             if forward.foreign_keys.get(name) != Some(fk) {
                 continue;
             }
-            let Some(parent) = self
+            if self.references_back(&fk.references_table, own_name) {
+                continue;
+            }
+            if let Some(parent) = self
                 .final_table(&fk.references_table)
                 .or_else(|| self.base_table(&fk.references_table))
-            else {
-                continue;
-            };
-            // A row is keyed by its primary key: a reference to exactly that
-            // key, through one column, names the row this plan writes.
-            let keyed = match (fk.columns.as_slice(), fk.references_columns.as_slice()) {
-                ([column], [referenced]) => self
-                    .final_of(&parent)
-                    .or_else(|| self.base_of(&parent))
-                    .is_some_and(|(_, t)| {
-                        t.primary_key.as_ref().is_some_and(|pk| {
-                            pk.columns.as_slice() == std::slice::from_ref(referenced)
-                        })
-                    })
-                    .then_some(column),
-                _ => None,
-            };
-            if let Some(column) = keyed {
-                let Some((_, value)) = cells.iter().find(|(c, _)| c == column) else {
-                    continue;
-                };
-                let key = match value {
-                    Value::Int(i) => i.to_string(),
-                    Value::Text(t) => t.clone(),
-                    Value::Bool(b) => b.to_string(),
-                    Value::Null => continue,
-                };
-                wanted.push(ObjectKey::Row {
-                    table: parent,
-                    key: RowKey(key),
-                });
-                continue;
-            }
-            // Any other reference, to a unique column or through several, is
-            // not a row key: the row that holds those values goes by them
-            // instead (`row_aliases`).
-            let mut pairs: Vec<(&String, Option<String>)> = fk
-                .references_columns
-                .iter()
-                .zip(&fk.columns)
-                .map(|(referenced, column)| {
-                    let value = cells
-                        .iter()
-                        .find(|(c, _)| c == column)
-                        .and_then(|(_, v)| cell_text(v));
-                    (referenced, value)
-                })
-                .collect();
-            pairs.sort();
-            let (columns, values): (Vec<&String>, Vec<Option<String>>) = pairs.into_iter().unzip();
-            if let Some(values) = values.into_iter().collect::<Option<Vec<_>>>() {
-                wanted.push(ObjectKey::RowByUnique {
-                    table: parent,
-                    columns: columns.into_iter().cloned().collect(),
-                    values,
-                });
+            {
+                parents.insert(parent);
             }
         }
-        for key in wanted {
-            self.exists(key);
-        }
-    }
-
-    /// The keys a row also goes by: each unique key of its table other than
-    /// a single-column primary key, which names the row itself. A foreign
-    /// key over one of them names the row by those values, so the row that
-    /// holds them creates the name and the row that gives them up ends it
-    /// (`cells` says what it holds, `ends` which side it is).
-    fn row_aliases(
-        &mut self,
-        owner: &Recorded,
-        cells: &[(&str, &Value)],
-        changed: Option<&[&str]>,
-        ends: bool,
-    ) {
-        let (Some((base_name, was)), Some((will_name, will))) =
-            (self.base_of(owner), self.final_of(owner))
-        else {
-            return;
-        };
-        // Only a key that stands throughout names a row: one the plan adds or
-        // rebuilds is absent while rows move, so it constrains none, and a
-        // foreign key over it is not one that stands either. Compared as the
-        // differ compares, through the plan's renames and without storage
-        // parameters, which change in place.
-        let forward = self
-            .renames_of(base_name, was)
-            .apply(
-                &Table {
-                    primary_key: was.primary_key.clone(),
-                    unique: was.unique.clone(),
-                    indexes: was.indexes.clone(),
-                    partition_of: was.partition_of.clone(),
-                    ..Table::default()
-                },
-                base_name,
-            )
-            .into_owned();
-        // A key that stands is the same on both sides, and a payload spells
-        // its columns by the names the plan ends with, an old value too.
-        let table = will;
-        let mut keys: Vec<Vec<String>> = Vec::new();
-        if let Some(pk) = &table.primary_key
-            && pk.columns.len() > 1
-            && forward.primary_key == will.primary_key
-        {
-            keys.push(pk.columns.clone());
-        }
-        let unique_bare = |u: &crate::UniqueConstraint| {
-            let mut u = u.clone();
-            u.storage_parameters.clear();
-            u
-        };
-        keys.extend(
-            table
-                .unique
-                .iter()
-                .filter(|(n, _)| {
-                    forward.unique.get(*n).map(unique_bare).is_some()
-                        && forward.unique.get(*n).map(unique_bare)
-                            == will.unique.get(*n).map(unique_bare)
-                })
-                .map(|(_, u)| u.columns.clone()),
-        );
-        let index_bare = |i: &crate::Index| {
-            let mut i = i.clone();
-            i.storage_parameters.clear();
-            i
-        };
-        keys.extend(
-            table
-                .indexes
-                .iter()
-                .filter(|(n, i)| {
-                    i.unique
-                        && i.filter.is_none()
-                        && forward.indexes.get(*n).map(index_bare).is_some()
-                        && forward.indexes.get(*n).map(index_bare)
-                            == will.indexes.get(*n).map(index_bare)
-                })
-                .filter_map(|(_, i)| {
-                    i.columns
-                        .iter()
-                        .map(|c| match &c.key {
-                            IndexKey::Column(k) => Some(k.clone()),
-                            _ => None,
-                        })
-                        .collect::<Option<Vec<_>>>()
-                }),
-        );
-        // The engine may rebuild a key around a retype of one of its columns
-        // (SQL Server drops and adds it), and it is absent while rows move.
-        let retyped = |column: &str| {
-            self.final_column(&will_name.column(column))
-                .and_then(|key| self.names_of(&key))
-                .is_some_and(|(was_name, now_name)| {
-                    was.columns.get(&was_name).map(|c| &c.ty)
-                        != will.columns.get(&now_name).map(|c| &c.ty)
-                })
-        };
-        keys.retain(|columns| !columns.iter().any(|c| retyped(c)));
-        let mut made = Vec::new();
-        for mut columns in keys {
-            columns.sort();
-            // An update that leaves the key's columns alone makes no new name.
-            if changed.is_some_and(|c| !columns.iter().any(|k| c.contains(&k.as_str()))) {
-                continue;
-            }
-            let values: Option<Vec<String>> = columns
-                .iter()
-                .map(|k| {
-                    cells
-                        .iter()
-                        .find(|(c, _)| c == k)
-                        .and_then(|(_, v)| cell_text(v))
-                })
-                .collect();
-            if let Some(values) = values {
-                let refs: Vec<&String> = columns.iter().collect();
-                made.push(Resource::Object(
-                    ObjectKey::RowByUnique {
-                        table: owner.clone(),
-                        columns: refs.iter().map(|c| (*c).clone()).collect(),
-                        values,
+        for parent in parents {
+            if writes {
+                self.requires(Requirement::Is(
+                    ObjectKey::Rows {
+                        table: parent,
+                        side: RowSide::Written,
                     },
-                    if ends {
-                        Incarnation::Base
-                    } else {
-                        Incarnation::Final
+                    Incarnation::Final,
+                ));
+            } else {
+                self.requires(Requirement::Is(
+                    ObjectKey::Rows {
+                        table: parent,
+                        side: RowSide::Held,
                     },
+                    Incarnation::Base,
                 ));
             }
         }
-        for r in made {
-            if ends {
-                self.removes(r);
-            } else {
-                self.creates(r);
+    }
+
+    /// Whether `from` reaches `to` through the desired state's foreign keys,
+    /// or is it: they are then in one cycle with the foreign key that was
+    /// followed.
+    fn references_back(&self, from: &TableName, to: &TableName) -> bool {
+        let mut seen: BTreeSet<&TableName> = BTreeSet::new();
+        let mut queue = vec![from];
+        while let Some(current) = queue.pop() {
+            if current == to {
+                return true;
+            }
+            if !seen.insert(current) {
+                continue;
+            }
+            if let Some(table) = self.after.schema.tables.get(current) {
+                queue.extend(table.foreign_keys.values().map(|fk| &fk.references_table));
             }
         }
-    }
-
-    /// The rows the baseline's constraints held: nothing here. Deleting a
-    /// row is blocked by a child row only; that is `row_references`' edge.
-    fn row_blockers_gone(&mut self, _owner: &Recorded) {}
-}
-
-/// The value a default expression spells when it is a plain literal: an
-/// integer, or a quoted string with no quote inside. Any other expression
-/// names no value before it runs.
-fn literal_value(expression: &str) -> Option<Value> {
-    let text = expression.trim();
-    if let Ok(i) = text.parse::<i64>() {
-        return Some(Value::Int(i));
-    }
-    let inner = text.strip_prefix('\'')?.strip_suffix('\'')?;
-    (!inner.contains('\'')).then(|| Value::Text(inner.to_owned()))
-}
-
-/// A value as the row keys spell it; NULL names nothing.
-fn cell_text(value: &Value) -> Option<String> {
-    match value {
-        Value::Int(i) => Some(i.to_string()),
-        Value::Text(t) => Some(t.clone()),
-        Value::Bool(b) => Some(b.to_string()),
-        Value::Null => None,
+        false
     }
 }
 
@@ -2106,7 +1860,7 @@ pub fn baseline_keys(before: Snapshot<'_>, owners: &dyn Owners) -> BTreeSet<Obje
 /// Whether the baseline model can say if it holds `key` at all.
 pub fn holds_unknown(key: &ObjectKey) -> bool {
     match key {
-        ObjectKey::Row { .. } | ObjectKey::RowByUnique { .. } | ObjectKey::Grant { .. } => true,
+        ObjectKey::Row { .. } | ObjectKey::Rows { .. } | ObjectKey::Grant { .. } => true,
         ObjectKey::Column(ColumnKey::Partition { .. })
         | ObjectKey::NotNull(ColumnKey::Partition { .. }) => true,
         ObjectKey::Table(_)

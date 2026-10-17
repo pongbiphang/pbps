@@ -4794,3 +4794,100 @@ mod operations {
         }
     }
 }
+
+/// Two reference tables that reference each other, rows in both: the differ
+/// plans them in name order and does not refuse the cycle
+/// (`data::supply_order`), and the resolver, which settles the same plan, does
+/// not refuse it either and keeps the differ's order (DEC-1968.2).
+#[test]
+fn two_reference_tables_referencing_each_other_plan_and_settle_in_the_differs_order() {
+    use pbps_model::{
+        Column, DataMode, ForeignKey, Hints, IdsFile, PrimaryKey, Row, RowKey, Schema, Table,
+        TableData, Value,
+    };
+    let reference = |to: &str, column: &str| ForeignKey {
+        columns: vec![column.into()],
+        references_table: to.parse().unwrap(),
+        references_columns: vec!["id".into()],
+        on_delete: Default::default(),
+        on_update: Default::default(),
+    };
+    let table = |other: &str, column: &str, name: &str| {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        table
+            .columns
+            .insert(column.into(), Column::new("int".parse().unwrap()));
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        table
+            .foreign_keys
+            .insert(format!("fk_{name}"), reference(other, column));
+        table.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [(
+                RowKey::from("1"),
+                [(column.to_owned(), Value::Int(1))]
+                    .into_iter()
+                    .collect::<Row>(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        table
+    };
+    let mut desired = Schema::default();
+    desired
+        .tables
+        .insert("app.a".parse().unwrap(), table("app.b", "b_id", "a"));
+    desired
+        .tables
+        .insert("app.b".parse().unwrap(), table("app.a", "a_id", "b"));
+    // The tables and their keys stand; the plan inserts the rows.
+    let mut base = desired.clone();
+    for table in base.tables.values_mut() {
+        table.data = None;
+    }
+    let wanted_ids = ids(&desired, &IdsFile::default());
+    let (base_side, desired_side) = (
+        crate::Side {
+            schema: &base,
+            ids: &wanted_ids,
+        },
+        crate::Side {
+            schema: &desired,
+            ids: &wanted_ids,
+        },
+    );
+    let differ = crate::diff(
+        base_side,
+        desired_side,
+        &pbps_dialect::MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    assert!(
+        differ
+            .changes
+            .iter()
+            .filter(|p| matches!(p.change, Change::InsertRow { .. }))
+            .count()
+            == 2,
+        "{differ:?}"
+    );
+    let ordered = plan(
+        base_side,
+        desired_side,
+        &Hints::default(),
+        &[],
+        &pbps_dialect::MinimalDialect,
+    )
+    .unwrap_or_else(|error| panic!("a cycle of reference tables is refused: {error:?}"));
+    assert_eq!(ordered.changes, differ);
+    ordered.proof.validate(&ordered.changes).unwrap();
+}
