@@ -878,12 +878,14 @@ impl Fill {
             let state = if created.contains(&(object.catalog.clone(), object.described.clone())) {
                 State::Created
             } else if let Some((_, part)) = part {
+                // Neither the file's nor fill's: what names it cannot be
+                // filled either.
                 staging.unfillable.push(format!(
                     "{} is not filled: the externals file created its {part}; write the whole \
                      of it in the externals file if a binding needs it",
                     object.described
                 ));
-                State::Created
+                State::Missing
             } else if let Some(&missing) = object
                 .names
                 .iter()
@@ -1039,9 +1041,11 @@ fn survey_fill(facts: &Facts, managed: &dyn Fn(&Key) -> bool) -> Fill {
                 }
                 (Some(Chain::Through(_)) | None, Body::Sql(sql)) => How::Ahead(sql.clone()),
             };
+            // An extension's members are its parts too.
             let parts = folded
                 .carriers
                 .keys()
+                .chain(folded.members.keys())
                 .filter(|part| folded.top(part) == *key)
                 .filter_map(|part| {
                     facts

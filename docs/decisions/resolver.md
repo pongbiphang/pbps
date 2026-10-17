@@ -3408,9 +3408,11 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
   created, such as an event trigger, runs on fill's statements too. So fill
   runs in a `REPEATABLE READ` transaction with the same shared-state reads,
   and a write outside the scratch database is rolled back and refused.
-- **An object one of whose parts the file created is the file's.** A file
+- **An object one of whose parts the file created is not filled.** A file
   that stages an owned sequence alone keeps it, and fill does not create
-  the table that carries it again.
+  the table that carries it again. An extension's members are its parts, so
+  no `CREATE EXTENSION` recreates a member the file staged. The object
+  itself exists nowhere, so a shape naming it is not filled either.
 - **A chain is lifted for what fill writes.** A shape that names a managed
   relation's row type is created between two parts of the compile:
   - the deployer's session compiles up to the step that creates the last
@@ -3453,7 +3455,9 @@ copy is not filled over), live; and the `resolver::draft` unit tests
 `a_shape_naming_a_managed_row_type_is_filled_once_the_managed_tables_exist`
 `what_fill_cannot_stage_is_named_with_what_names_it` and
 `an_object_whose_part_the_externals_file_created_is_the_files` and
-`a_chained_shape_waits_for_every_managed_relation_it_names`, with
+`a_chained_shape_waits_for_every_managed_relation_it_names`,
+`what_names_a_partly_staged_object_is_not_filled` and
+`an_extension_whose_member_the_externals_file_created_is_the_files`, with
 `reconstruct`'s
 `chained_shapes_wait_for_the_step_that_creates_what_they_name` and
 `names_created_between_steps_are_later_only_for_modules_before_them`.

@@ -676,6 +676,82 @@ fn an_object_whose_part_the_externals_file_created_is_the_files() {
     );
 }
 
+/// Negative of the part rule: the table is the file's in part only, so a
+/// shape naming its row type is not filled, rather than sent to fail on a
+/// type nobody created.
+#[test]
+fn what_names_a_partly_staged_object_is_not_filled() {
+    let (mut target, table, _, _) = reading_a_view();
+    let sequence = target.object("pg_class", 20005, "ext", "sequence ext.t_id_seq");
+    target.depend(&sequence, &table, 'a', true);
+    let reader = target.relation(20030, 'v', "app", "s", &[("n", "bigint")]);
+    target.depend(&reader, &sequence, 'n', false);
+    target.managed(&reader);
+    let shaped = target.relation(20040, 'r', "ext", "c", &[("t", "ext.t")]);
+    target.depend(&shaped, &key("pg_type", 20001), 'n', true);
+    let other = target.relation(20050, 'v', "app", "o", &[("t", "ext.t")]);
+    target.depend(&other, &shaped, 'n', false);
+    target.managed(&other);
+    let fill = target.fill();
+    assert!(
+        fill.staging(&BTreeSet::new())
+            .filled
+            .contains("table ext.c"),
+        "filled when the file holds no part of ext.t"
+    );
+    let held = fill.staging(&file_created(&[("pg_class", "sequence ext.t_id_seq")]));
+    assert!(
+        !held.filled.contains("table ext.c") && !held.ahead.contains("ext.c "),
+        "{}",
+        held.ahead
+    );
+    assert!(
+        held.unfillable.iter().any(|line| line
+            == "table ext.c cannot be filled: its shape names table ext.t, which cannot be \
+                filled either"),
+        "{:?}",
+        held.unfillable
+    );
+}
+
+/// An extension's members are its parts: a file that created one of them
+/// holds the extension, and fill sends no `CREATE EXTENSION` whose script
+/// would create that member again.
+#[test]
+fn an_extension_whose_member_the_externals_file_created_is_the_files() {
+    let mut target = Target::default();
+    let extension = target.object("pg_extension", 20100, "", "extension citext");
+    target.facts.extensions.insert(
+        20100,
+        Extension {
+            name: "citext".into(),
+            schema: "public".into(),
+            version: "'1.6'".into(),
+        },
+    );
+    let citext = target.object("pg_type", 20101, "public", "type public.citext");
+    target.depend(&citext, &extension, 'e', true);
+    let reader = target.relation(20130, 'v', "app", "a", &[("c", "public.citext")]);
+    target.depend(&reader, &citext, 'n', true);
+    target.managed(&reader);
+    let fill = target.fill();
+    assert!(
+        fill.staging(&BTreeSet::new())
+            .ahead
+            .contains("CREATE EXTENSION"),
+        "filled when the file holds no member"
+    );
+    let held = fill.staging(&file_created(&[("pg_type", "type public.citext")]));
+    assert!(!held.ahead.contains("CREATE EXTENSION"), "{}", held.ahead);
+    assert!(
+        held.unfillable.iter().any(|line| line.contains(
+            "extension citext is not filled: the externals file created its type public.citext"
+        )),
+        "{:?}",
+        held.unfillable
+    );
+}
+
 #[test]
 fn a_chained_shape_waits_for_every_managed_relation_it_names() {
     let mut target = Target::default();

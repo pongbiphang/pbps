@@ -2197,8 +2197,9 @@ DEC-1778.2).**
   - It is held to the file's outside-write rule: something the file
     created, such as an event trigger, runs on fill's statements too, and a
     write outside the scratch database is rolled back and refused.
-  - An object one of whose parts the file created (an owned sequence, for
-    instance) is the file's, and is not filled.
+  - An object one of whose parts the file created (an owned sequence, or an
+    extension's member) is not filled, and neither is anything whose shape
+    names it.
 - **It lifts a chain through what it writes.** A shape that names a managed
   relation's row type cannot exist before that relation does, so the compile
   then runs in two parts:
