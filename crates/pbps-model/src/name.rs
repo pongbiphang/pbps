@@ -13,9 +13,8 @@ use std::str::FromStr;
 /// The text is whatever the file spelled, control characters included: SPEC
 /// §4.3 keeps scalar text verbatim and a name that holds one is valid, so a
 /// refusal that echoed it raw would let a hand-made plan start a line the tool
-/// never wrote (DEC-2032.1, #2035). The escape is in the error's own `Display`,
-/// beside `TableName`'s, which cannot escape itself because it is also the
-/// serialization.
+/// never wrote (DEC-2032.1, #2035). The error escapes the original text even
+/// when it cannot be parsed into a name with its own `.shown()` adapter.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum NameError {
     #[error("a table name must have the two parts `schema.table`, got `{}`", crate::escape::Escaped(.0))]
@@ -42,7 +41,7 @@ pub enum NameError {
 /// name — is one [`TableName`] or [`ColumnRef`] can carry.
 ///
 /// Both types cross the JSON/YAML boundary as `.`-joined strings and parse
-/// back by splitting on that character (see their `Display`/`FromStr` below),
+/// back by splitting on that character (see their `.raw()`/`FromStr` below),
 /// so a `.` embedded in a part is not merely an odd identifier — once joined,
 /// it is indistinguishable from the separator between two real parts. A
 /// column literally named `a.b` on table `dbo.customer` serializes as
@@ -57,7 +56,7 @@ pub enum NameError {
 /// a YAML column key (`pbps-load::convert`), which is a mapping key rather
 /// than a parsed string, or a name a live database handed back
 /// (`pbps-diff::identity::resolve`, fed by a dialect's introspection). By the
-/// time either reaches `Display`, refusing is too late: the value has already
+/// time either is serialized, refusing is too late: the value has already
 /// been written into a plan or an ids file that cannot load it back.
 pub fn check_segment(part: &str) -> Result<(), NameError> {
     if part.contains('.') {
@@ -70,6 +69,18 @@ pub fn check_segment(part: &str) -> Result<(), NameError> {
 ///
 /// `Ord` is decided by `(schema, name)`, which is what makes serialization order
 /// stable.
+///
+/// Choose `.shown()` for a person or `.raw()` for SQL, serialization and keys.
+///
+/// ```compile_fail,E0277
+/// let name = pbps_model::TableName::new("app", "table");
+/// let _ = format!("{}", name);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let name = pbps_model::TableName::new("app", "table");
+/// let _ = name.to_string();
+/// ```
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -94,11 +105,34 @@ impl TableName {
             name: column.into(),
         }
     }
+
+    /// The qualified name for a person, escaped through [`crate::escape::Escaped`].
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        ShownTableName(self)
+    }
+
+    /// The canonical spelling for SQL quoting, serialization and identity keys.
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        RawTableName(self)
+    }
 }
 
-impl fmt::Display for TableName {
+#[derive(Clone, Copy)]
+struct RawTableName<'a>(&'a TableName);
+
+impl fmt::Display for RawTableName<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.schema, self.name)
+        write!(f, "{}.{}", self.0.schema, self.0.name)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ShownTableName<'a>(&'a TableName);
+
+impl fmt::Display for ShownTableName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::escape::Escaped;
+        write!(f, "{}.{}", Escaped(&self.0.schema), Escaped(&self.0.name))
     }
 }
 
@@ -118,6 +152,16 @@ impl FromStr for TableName {
 }
 
 /// A fully qualified column reference, such as `dbo.customer.email`.
+///
+/// ```compile_fail,E0277
+/// let name = pbps_model::TableName::new("app", "table").column("column");
+/// let _ = format!("{}", name);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let name = pbps_model::TableName::new("app", "table").column("column");
+/// let _ = name.to_string();
+/// ```
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -134,11 +178,38 @@ impl ColumnRef {
             name: name.into(),
         }
     }
+
+    /// The qualified reference for a person, with every part escaped once.
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        ShownColumnRef(self)
+    }
+
+    /// The canonical spelling for SQL quoting, serialization and identity keys.
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        RawColumnRef(self)
+    }
 }
 
-impl fmt::Display for ColumnRef {
+#[derive(Clone, Copy)]
+struct RawColumnRef<'a>(&'a ColumnRef);
+
+impl fmt::Display for RawColumnRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.table, self.name)
+        write!(f, "{}.{}", self.0.table.raw(), self.0.name)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ShownColumnRef<'a>(&'a ColumnRef);
+
+impl fmt::Display for ShownColumnRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}.{}",
+            self.0.table.shown(),
+            crate::escape::Escaped(&self.0.name)
+        )
     }
 }
 
@@ -169,7 +240,7 @@ macro_rules! string_serde {
         }
         impl From<$t> for String {
             fn from(v: $t) -> String {
-                v.to_string()
+                v.raw().to_string()
             }
         }
     };
@@ -183,19 +254,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_qualified_part_is_shown_once_and_raw_bytes_are_preserved() {
+        let part = "a\nb\r\u{1b}[31m\\\u{200b}";
+        let shown = r"a\nb\r\u{1b}[31m\\\u{200b}";
+        let table = TableName::new(part, part);
+        let column = table.column(part);
+        assert_eq!(table.shown().to_string(), format!("{shown}.{shown}"));
+        assert_eq!(
+            column.shown().to_string(),
+            format!("{shown}.{shown}.{shown}")
+        );
+        assert_eq!(table.raw().to_string(), format!("{part}.{part}"));
+        assert_eq!(column.raw().to_string(), format!("{part}.{part}.{part}"));
+        assert_eq!(
+            serde_json::to_string(&table).unwrap(),
+            serde_json::to_string(&format!("{part}.{part}")).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&column).unwrap(),
+            serde_json::to_string(&format!("{part}.{part}.{part}")).unwrap()
+        );
+        // The outer name types keep their raw interim serialization bridges.
+        for (id, expected) in [
+            (
+                crate::ModuleId::Named(table.clone()),
+                format!("{part}.{part}"),
+            ),
+            (
+                crate::ModuleId::Routine(crate::RoutineId::new(table.clone(), vec![])),
+                format!("{part}.{part}()"),
+            ),
+            (
+                crate::ModuleId::Trigger {
+                    on: table.clone(),
+                    name: part.into(),
+                },
+                format!("{part}.{part}.{part}"),
+            ),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&id).unwrap(),
+                serde_json::to_string(&expected).unwrap()
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&crate::GrantTarget::Object(table)).unwrap(),
+            serde_json::to_string(&format!("{part}.{part}")).unwrap()
+        );
+        // Ordinary Unicode letters and visible punctuation keep their spelling.
+        let unicode = TableName::new("名前", "ünï").column("emoji🙂");
+        assert_eq!(unicode.shown().to_string(), "名前.ünï.emoji🙂");
+    }
+
+    #[test]
     fn table_round_trips() {
         let t: TableName = "dbo.customer".parse().unwrap();
         assert_eq!(t.schema, "dbo");
         assert_eq!(t.name, "customer");
-        assert_eq!(t.to_string(), "dbo.customer");
+        assert_eq!(t.raw().to_string(), "dbo.customer");
     }
 
     #[test]
     fn column_round_trips() {
         let c: ColumnRef = "dbo.customer.email".parse().unwrap();
-        assert_eq!(c.table.to_string(), "dbo.customer");
+        assert_eq!(c.table.raw().to_string(), "dbo.customer");
         assert_eq!(c.name, "email");
-        assert_eq!(c.to_string(), "dbo.customer.email");
+        assert_eq!(c.raw().to_string(), "dbo.customer.email");
     }
 
     #[test]
@@ -263,15 +387,17 @@ mod tests {
         ];
         v.sort();
         assert_eq!(
-            v.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            v.iter()
+                .map(|name| name.shown().to_string())
+                .collect::<Vec<_>>(),
             ["app.a", "dbo.a", "dbo.z"]
         );
     }
 
     /// A name out of a file may hold a line break or a terminal sequence, and a
     /// refusal that echoed it raw would start a line of its own or rewrite the
-    /// ones before it (DEC-2032.1, #2035). `TableName`'s `Display` is its
-    /// serialization and stays as it is; the error escapes.
+    /// ones before it (DEC-2032.1, #2035). Serialization stays raw; the error
+    /// escapes the text even when it is not a valid name.
     #[test]
     fn a_refusal_shows_the_name_it_was_given_escaped() {
         let hostile = "app\n\u{1b}[31m.t\r\u{202e}";
@@ -296,7 +422,7 @@ mod tests {
         );
         // Negative: the serialization is not touched, so a name round-trips.
         let table = TableName::new("app", "a\nb");
-        assert_eq!(table.to_string(), "app.a\nb");
+        assert_eq!(table.raw().to_string(), "app.a\nb");
         // Negative: a Unicode name is shown as spelled.
         let refusal = NameError::TableShape("名前_ünï".into()).to_string();
         assert!(refusal.contains("`名前_ünï`"), "{refusal}");

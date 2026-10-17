@@ -1,3 +1,6 @@
+// Names in whole-escaped DialectError fields and shared probe text stay raw
+// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
+
 //! PostgreSQL declaration structure and roles, checked before anything connects.
 //!
 //! The counterpart of `pbps-mssql/src/validate.rs`'s role half, and the place
@@ -508,7 +511,9 @@ fn target_kind(
                  by its name (ADR-0009 section 1): `pull` reads the grant back as `{}`, so a declaration \
                  spelling it `{object}` would differ from the database on every plan and each \
                  plan would revoke and re-grant it. Write `{}` instead",
-                signatures[0], signatures[0]
+                signatures[0],
+                signatures[0],
+                object = object.raw()
             )
         } else {
             format!(
@@ -516,7 +521,8 @@ fn target_kind(
                  on (`routine name \"{object}\" is not unique`); write the signature instead -- \
                  one of {}",
                 answering.len(),
-                signatures.join(", ")
+                signatures.join(", "),
+                object = object.raw()
             )
         }));
     }

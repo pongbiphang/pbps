@@ -147,6 +147,8 @@ pub struct Tombstone {
 }
 
 impl IdsFile {
+    // Error payloads keep raw name text for the error's existing value escape.
+    // #2084 step 5 (DEC-2084.1) must preserve that single pass when changing message producers.
     pub fn validated(self) -> Result<ValidIds, IdsError> {
         self.validate()?;
         Ok(ValidIds(self))
@@ -162,7 +164,7 @@ impl IdsFile {
             if !schema.tables.contains_key(name) {
                 return Err(IdsError::NotHeld {
                     uid: uid.clone(),
-                    name: name.to_string(),
+                    name: name.raw().to_string(),
                 });
             }
         }
@@ -174,7 +176,7 @@ impl IdsFile {
             {
                 return Err(IdsError::NotHeld {
                     uid: uid.clone(),
-                    name: column.to_string(),
+                    name: column.raw().to_string(),
                 });
             }
         }
@@ -346,8 +348,8 @@ impl IdsFile {
             }
         }
 
-        check_unique(self.tables.iter().map(|(u, n)| (u, n.to_string())))?;
-        check_unique(self.columns.iter().map(|(u, n)| (u, n.to_string())))?;
+        check_unique(self.tables.iter().map(|(u, n)| (u, n.raw().to_string())))?;
+        check_unique(self.columns.iter().map(|(u, n)| (u, n.raw().to_string())))?;
         check_unique(self.roles.iter().map(|(u, n)| (u, n.clone())))?;
 
         // A live column whose table has no entry cannot be produced by the tool:
@@ -361,7 +363,7 @@ impl IdsFile {
             if !live.contains(&c.table) {
                 return Err(IdsError::OrphanColumn {
                     uid: uid.clone(),
-                    column: c.to_string(),
+                    column: c.raw().to_string(),
                 });
             }
         }
@@ -471,6 +473,35 @@ fn check_unique<'a>(it: impl Iterator<Item = (&'a Uid, String)>) -> Result<(), I
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duplicate_name_keys_keep_the_raw_table_and_column_spelling() {
+        use super::*;
+        let part = "a\nb\\c\u{200b}";
+        let table = TableName::new("app", part);
+        let mut ids = IdsFile::default();
+        ids.tables
+            .insert("t_aaaaaa".parse().unwrap(), table.clone());
+        ids.tables
+            .insert("t_bbbbbb".parse().unwrap(), table.clone());
+        let IdsError::DuplicateName { name, .. } = ids.validate().unwrap_err() else {
+            panic!("the duplicate table must be refused");
+        };
+        assert_eq!(name, format!("app.{part}"));
+        ids.tables.remove(&"t_bbbbbb".parse::<Uid>().unwrap());
+        let column = table.column(part);
+        ids.columns
+            .insert("c_aaaaaa".parse().unwrap(), column.clone());
+        ids.columns.insert("c_bbbbbb".parse().unwrap(), column);
+        let IdsError::DuplicateName { name, .. } = ids.validate().unwrap_err() else {
+            panic!("the duplicate column must be refused");
+        };
+        assert_eq!(name, format!("app.{part}.{part}"));
+        // A literal escape is a different key from the character it resembles.
+        ids.columns
+            .insert("c_bbbbbb".parse().unwrap(), table.column(r"a\nb\c\u{200b}"));
+        assert!(ids.validate().is_ok());
+    }
+
     use super::*;
 
     fn uid(s: &str) -> Uid {
@@ -959,14 +990,24 @@ mod tests {
             let other = sample();
             for t in tables {
                 let t: TableName = t.parse().unwrap();
-                assert_eq!(index.table_uid(&t), f.table_uid(&t), "round {round}: {t}");
+                assert_eq!(
+                    index.table_uid(&t),
+                    f.table_uid(&t),
+                    "round {round}: {t}",
+                    t = t.raw()
+                );
                 assert_eq!(index.resolved_in(&t, &other), f.resolved_in(&t, &other));
                 let scanned: Vec<(&Uid, &ColumnRef)> =
                     f.columns.iter().filter(|(_, c)| c.table == t).collect();
                 assert_eq!(index.columns_of(&t).collect::<Vec<_>>(), scanned);
                 for c in columns {
                     let c = t.column(c);
-                    assert_eq!(index.column_uid(&c), f.column_uid(&c), "round {round}: {c}");
+                    assert_eq!(
+                        index.column_uid(&c),
+                        f.column_uid(&c),
+                        "round {round}: {c}",
+                        c = c.raw()
+                    );
                 }
             }
             for r in roles.iter().chain(&["absent"]) {

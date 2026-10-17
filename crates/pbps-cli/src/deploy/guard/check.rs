@@ -141,9 +141,15 @@ pub(crate) fn implied(expected: &Implied<'_>, now: &Schema, moved: &mut Vec<Stri
         let present = now.tables.contains_key(*name);
         if !presence.accepts(&present) {
             moved.push(if present {
-                format!("{name} is there, and no change of this plan creates it")
+                format!(
+                    "{name} is there, and no change of this plan creates it",
+                    name = name.shown()
+                )
             } else {
-                format!("{name} is gone, and no change of this plan drops it")
+                format!(
+                    "{name} is gone, and no change of this plan drops it",
+                    name = name.shown()
+                )
             });
         }
     }
@@ -173,7 +179,8 @@ pub(crate) fn own(
     });
     if changed {
         moved.push(format!(
-            "{name}'s own column defaults or NOT NULLs are not the ones this plan leaves"
+            "{name}'s own column defaults or NOT NULLs are not the ones this plan leaves",
+            name = name.shown()
         ));
     }
 }
@@ -189,7 +196,8 @@ pub(crate) fn created_place(
     // even at the first staged read, before it could become a baseline.
     if !Req::Planned(place(declared)).accepts(&now.place()) {
         moved.push(format!(
-            "{name}'s partition parent, bound or key is not the one this plan creates"
+            "{name}'s partition parent, bound or key is not the one this plan creates",
+            name = name.shown()
         ));
     }
 }
@@ -204,10 +212,16 @@ pub(crate) fn table(
     if !expected.identity.accepts(&now.replica_identity.as_ref()) {
         moved.push(match expected.identity {
             Req::Keep(_) => {
-                format!("{name} replica identity changed, and no change of this plan sets it")
+                format!(
+                    "{name} replica identity changed, and no change of this plan sets it",
+                    name = name.shown()
+                )
             }
             Req::Planned(_) | Req::PlannedOrKeep(_, _) | Req::Unpromised => {
-                format!("{name} replica identity is not the one this plan sets")
+                format!(
+                    "{name} replica identity is not the one this plan sets",
+                    name = name.shown()
+                )
             }
         });
     }
@@ -216,18 +230,21 @@ pub(crate) fn table(
         .accepts(&Cow::Borrowed(now.storage_parameters))
     {
         moved.push(format!(
-            "{name} storage parameters are not the ones this plan leaves"
+            "{name} storage parameters are not the ones this plan leaves",
+            name = name.shown()
         ));
     }
     if !expected.persistence.accepts(&now.unlogged) {
         moved.push(format!(
             "{name} is {} and this plan does not leave it so",
-            if now.unlogged { "unlogged" } else { "logged" }
+            if now.unlogged { "unlogged" } else { "logged" },
+            name = name.shown()
         ));
     }
     if !expected.place.accepts(&placed.place()) {
         moved.push(format!(
-            "{name}'s partition parent, bound or key is not the one the plan was approved over"
+            "{name}'s partition parent, bound or key is not the one the plan was approved over",
+            name = name.shown()
         ));
     }
 }
@@ -242,7 +259,8 @@ pub(crate) fn system_time(
 ) {
     if !expected.system_time.accepts(&now.system_time.as_ref()) {
         moved.push(format!(
-            "{name} period or system versioning changed, and this plan does not change it"
+            "{name} period or system versioning changed, and this plan does not change it",
+            name = name.shown()
         ));
     }
 }
@@ -305,11 +323,13 @@ pub(crate) fn columns_after(
         match (expected, table.columns.contains_key(&column.name)) {
             (pbps_model::Presence::Present, false) => moved.push(format!(
                 "{} column `{}` is not there, and this plan writes it",
-                column.table, column.name
+                column.table.shown(),
+                column.name
             )),
             (pbps_model::Presence::Absent, true) => moved.push(format!(
                 "{} column `{}` is still there, and this plan removes it",
-                column.table, column.name
+                column.table.shown(),
+                column.name
             )),
             _ => {}
         }
@@ -344,7 +364,8 @@ pub(crate) fn columns_after(
         if !kept {
             moved.push(format!(
                 "{} column `{}` does not have the {what} this plan gives it",
-                column.table, column.name
+                column.table.shown(),
+                column.name
             ));
         }
     }
@@ -387,10 +408,10 @@ pub(crate) fn columns(
         let column = &required.name;
         let observed = now.columns.get(column);
         if !required.present.accepts(&observed.is_some()) {
-            moved.push(format!("{name} column `{column}` is not on both sides, and no change of this plan adds or removes it"));
+            moved.push(format!("{name} column `{column}` is not on both sides, and no change of this plan adds or removes it", name = name.shown()));
         } else if let (Some(fields), Some(observed)) = (&required.fields, observed) {
             for what in self::column(fields, observed) {
-                moved.push(format!("{name} column `{column}` has a different {what} from the one the plan was approved over, and no change of this plan moves it"));
+                moved.push(format!("{name} column `{column}` has a different {what} from the one the plan was approved over, and no change of this plan moves it", name = name.shown()));
             }
         }
     }

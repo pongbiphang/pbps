@@ -1301,6 +1301,7 @@ pub fn decode(
 /// The PostgreSQL note keeps its stronger sentence because that engine really
 /// does require the read-back to equal the declared spelling, for a key as
 /// well as a cell (`pbps-pg::catalog::misspelt`).
+// Shared finding JSON stays raw until #2084 step 5 (DEC-2084.1); text escapes it once.
 pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
     let mut out = Vec::new();
     for (name, table) in &schema.tables {
@@ -1334,7 +1335,8 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
              it both: a key the column cannot read is refused, and two declared keys that \
              converge are reported. It does not require the engine to spell a key back as \
              written — `01` under an `int` key is stored as `1` and read back under the \
-             declaration's own spelling (DECISIONS 71)."
+             declaration's own spelling (DECISIONS 71).",
+            name = name.raw()
         ));
     }
     out

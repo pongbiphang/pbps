@@ -130,7 +130,8 @@ pub fn scope(
                 "{name} is a partition pbps holds of the managed table {}, whose partitions are \
                  external; drop or detach it in a plan of its own while the parent's partitions \
                  are declared, then make them external",
-                of.parent
+                of.parent.shown(),
+                name = name.shown()
             ));
             continue;
         }
@@ -155,7 +156,8 @@ pub fn scope(
                     "{name} is a partition of the managed table {} and is not declared; declare \
                      it with `pbps pull` and record it with `pbps baseline --reason …`, or detach \
                      it by hand",
-                    of.parent
+                    of.parent.shown(),
+                    name = name.shown()
                 ));
             } else if let parts @ [_, ..] = own_parts(table).as_slice() {
                 unexpressible.push(format!(
@@ -163,8 +165,9 @@ pub fn scope(
                      external, and holds {} of its own; pbps holds an external partition only \
                      as its parent makes it, so drop them from {name}, or declare the \
                      partitions",
-                    of.parent,
-                    parts.join(", ")
+                    of.parent.shown(),
+                    parts.join(", "),
+                    name = name.shown()
                 ));
             } else {
                 external.push(name.clone());
@@ -371,7 +374,7 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
     for (name, table) in &live.tables {
         let uid = match tables_by_name.get(name) {
             Some(u) => (*u).clone(),
-            None => free_uid(UidKind::Table, &name.to_string(), &mut taken),
+            None => free_uid(UidKind::Table, &name.raw().to_string(), &mut taken),
         };
         observed.tables.insert(uid, name.clone());
 
@@ -379,7 +382,7 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
             let cref = name.column(column);
             let uid = match columns_by_ref.get(&cref) {
                 Some(u) => (*u).clone(),
-                None => free_uid(UidKind::Column, &cref.to_string(), &mut taken),
+                None => free_uid(UidKind::Column, &cref.raw().to_string(), &mut taken),
             };
             observed.columns.insert(uid, cref);
         }
@@ -410,6 +413,38 @@ fn free_uid(kind: UidKind, seed: &str, taken: &mut BTreeSet<Uid>) -> Uid {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observed_uids_use_raw_table_and_column_seeds() {
+        use super::*;
+        let part = "a\nb\\c\u{200b}";
+        let name = TableName::new("app", part);
+        let mut live = pbps_model::Schema::default();
+        let mut table = pbps_model::Table::default();
+        table
+            .columns
+            .insert(part.into(), pbps_model::Column::new("int".parse().unwrap()));
+        live.tables.insert(name.clone(), table);
+        let observed = observed_ids(&live, &IdsFile::default());
+        assert_eq!(
+            observed.table_uid(&name),
+            Some(&Uid::derived(UidKind::Table, &format!("app.{part}"), 0))
+        );
+        assert_eq!(
+            observed.column_uid(&name.column(part)),
+            Some(&Uid::derived(
+                UidKind::Column,
+                &format!("app.{part}.{part}"),
+                0
+            ))
+        );
+        // Re-reading the same names retains both identities, without deriving new ones.
+        assert_eq!(observed_ids(&live, &observed), observed);
+        assert_ne!(
+            Uid::derived(UidKind::Table, &format!("app.{part}"), 0),
+            Uid::derived(UidKind::Table, r"app.a\nb\c\u{200b}", 0)
+        );
+    }
+
     use super::*;
     use indexmap::IndexMap;
     use pbps_model::{Column, ColumnType, Table};
@@ -730,7 +765,11 @@ mod tests {
 
         // Sorted by name, because the map is keyed by uid and uid order is not
         // name order.
-        let mut names: Vec<String> = observed.columns.values().map(ToString::to_string).collect();
+        let mut names: Vec<String> = observed
+            .columns
+            .values()
+            .map(|name| name.raw().to_string())
+            .collect();
         names.sort();
         assert_eq!(names, ["dbo.customer.email", "dbo.customer.nickname"]);
         assert!(

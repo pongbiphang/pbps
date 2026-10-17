@@ -7,7 +7,7 @@ use std::path::Path;
 fn show(title: &str, yaml: &str) {
     println!("\n\x1b[1m### {title}\x1b[0m");
     match pbps_load::load_table_str(Path::new("schema/dbo.café.yml"), yaml) {
-        Ok(t) => println!("(loaded successfully: {})", t.name),
+        Ok(t) => println!("(loaded successfully: {})", t.name.shown()),
         Err(errs) => {
             for e in errs {
                 println!("{:?}", miette::Report::new(e));

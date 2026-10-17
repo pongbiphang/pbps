@@ -198,12 +198,19 @@ fn what_pull_writes_reads_back_as_the_same_schema() {
 
     for (name, table) in &pulled.schema.tables {
         let yaml = pbps_load::render(name, table, &[], None);
-        let loaded = pbps_load::load_table_str(Path::new("pulled.yml"), &yaml)
-            .unwrap_or_else(|e| panic!("{name}: pulled YAML does not parse: {e:?}"));
+        let loaded =
+            pbps_load::load_table_str(Path::new("pulled.yml"), &yaml).unwrap_or_else(|e| {
+                panic!(
+                    "{name}: pulled YAML does not parse: {e:?}",
+                    name = name.shown()
+                )
+            });
         assert_eq!(&loaded.name, name);
         assert_eq!(
-            &loaded.table, table,
-            "{name}: the pulled declaration is lossy\n---\n{yaml}"
+            &loaded.table,
+            table,
+            "{name}: the pulled declaration is lossy\n---\n{yaml}",
+            name = name.shown()
         );
         assert!(loaded.intents.is_empty());
     }

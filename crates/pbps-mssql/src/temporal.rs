@@ -143,7 +143,8 @@ pub fn refused_without_retention(
                      none: SQL Server 2016 keeps every history row; leave `retention` out \
                      for this target",
                     retention.count,
-                    retention.unit.keyword().to_ascii_lowercase()
+                    retention.unit.keyword().to_ascii_lowercase(),
+                    name = name.shown()
                 ));
             }
             for (key, fk) in &table.foreign_keys {
@@ -169,7 +170,8 @@ fn cascade_refusal(table: &TableName, key: &str) -> String {
     format!(
         "foreign key `{key}` on `{table}` cascades, and `{table}` is system-versioned: SQL \
          Server 2016 refuses `ON DELETE CASCADE` and `ON UPDATE CASCADE` on a key from a \
-         system-versioned table; use `no_action` for this target"
+         system-versioned table; use `no_action` for this target",
+        table = table.shown()
     )
 }
 

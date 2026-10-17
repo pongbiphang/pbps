@@ -645,7 +645,7 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
             plan.data.len(),
             plan.data
                 .iter()
-                .map(|(t, s)| Escaped(&format!("{t} ({})", s.mode)).to_string())
+                .map(|(t, s)| format!("{} ({})", t.shown(), s.mode))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));

@@ -1329,8 +1329,15 @@ identifier raw.
 The rule covers the rest of what `explain` and `apply` print out of a plan, in
 two further places, and not by refusing the plan for the values it holds: the
 names and free text of a plan are valid with control characters in them (SPEC
-§4.3), there are hundreds of sites, and `TableName`'s `Display` is also its
-serialization, so it cannot escape itself (#2035).
+§4.3). This interim cover was introduced when a name's `Display` was also its
+serialization (#2035). #2084 step 1a removes `Display` from `TableName` (also
+`ObjectName`) and `ColumnRef`: each use chooses `.shown()` or `.raw()`, and
+serialization and identity keys keep the original raw spelling. Shared JSON
+sentences, dialect refusals and probe labels keep their name operands raw until
+#2084 step 5 removes whole-message escaping; showing them at both places would
+double an escape. The guard counts those interim exceptions. The name
+compatibility fixtures captured on master 1c3db445 pin hostile-name artifact
+bytes, checksums and SQL, and exact-string regressions pin one escaping pass.
 
 - **The text report.** `explain`'s `render`, `report::changes` and
   `explain/resolver.rs` put every string out of the plan through `Escaped` at
@@ -1458,3 +1465,17 @@ the target fails to resolve, forced and not, with the block still named for name
 parse, and its twin with a valid block (a reachable `--db` and the unresolvable targets);
 and the overwrite guard and a damaged identity file said ahead of an unresolved target,
 with `--force` passing the guard to reach it.
+
+<a id="dec-2084-1"></a>
+
+**DEC-2084.1. Until #2084 step 5, data stays raw and prose carries individually
+shown names in every format.** Data fields that identify an object or carry a
+value a program acts on keep `.raw()` spellings; their human writer escapes
+them once. Prose fields, including finding messages, remedies, refusals and
+detail sentences, use `.shown()` names beside already escaped error displays,
+and are printed as written, never escaped whole. Their JSON bytes therefore
+change only for names holding escaped characters; plan and explain data remain
+byte-identical. Commands embedded in prose still take raw names through
+`shell_arg`, with a placeholder when no safe argument can be offered. Escaping
+a whole mixed sentence would double escape its errors, and a second human
+override would give one diagnostic two competing representations.

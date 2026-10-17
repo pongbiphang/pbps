@@ -198,7 +198,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 path: std::path::PathBuf::from(&src.name),
                 message: format!(
                     "column `{}.{column}` can have only one of default, identity, a `serial` type or generated",
-                    table.name
+                    table.name.shown()
                 ),
             })
             .collect())
@@ -1286,7 +1286,9 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
                     format!(
                         "trigger `{name}` is on `{table}`, which is in schema `{}`; a trigger \
                          lives in the schema of the table it is on",
-                        table.schema
+                        table.schema,
+                        name = name.shown(),
+                        table = table.shown()
                     ),
                     format!("name it `{}.{}`", table.schema, name.name),
                 ));

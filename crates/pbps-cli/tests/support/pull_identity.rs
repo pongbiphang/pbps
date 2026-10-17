@@ -264,7 +264,7 @@ pub fn intent_and_drift(server: &str, pg: bool, drift: bool) {
         let old_ids: pbps_model::IdsFile = serde_json::from_slice(&ids).unwrap();
         if rename {
             let uid = old_ids.tables.keys().next().unwrap();
-            assert_eq!(intent_ids.tables[uid].to_string(), new);
+            assert_eq!(intent_ids.tables[uid].raw().to_string(), new);
         } else {
             let uid = old_ids.tables.keys().next().unwrap();
             assert_eq!(intent_ids.tombstones[uid].reason, "retired reference list");
@@ -457,7 +457,10 @@ pub fn column_history(server: &str, pg: bool) {
         let bytes = std::fs::read(&ids_path).unwrap();
         let ids: pbps_model::IdsFile = serde_json::from_slice(&bytes).unwrap();
         if rename {
-            assert_eq!(ids.columns[uid].to_string(), format!("{table}.deprecated"));
+            assert_eq!(
+                ids.columns[uid].raw().to_string(),
+                format!("{table}.deprecated")
+            );
         } else {
             assert_eq!(ids.tombstones[uid].reason, "unused source field");
         }

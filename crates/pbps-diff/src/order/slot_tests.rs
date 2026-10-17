@@ -40,8 +40,10 @@ impl Dialect for Slotted {
         {
             let stop = TableName::new(to.schema.clone(), from.name.clone());
             return Ok(vec![
-                Statement::new(format!("move {from}")).renaming(from.clone(), stop.clone()),
-                Statement::new(format!("rename {stop}")).renaming(stop, to.clone()),
+                Statement::new(format!("move {from}", from = from.shown()))
+                    .renaming(from.clone(), stop.clone()),
+                Statement::new(format!("rename {stop}", stop = stop.shown()))
+                    .renaming(stop, to.clone()),
             ]);
         }
         MinimalDialect.emit(change, strategy)

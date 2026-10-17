@@ -43,6 +43,15 @@ use crate::name::TableName;
 /// modules in **one** `sys.objects` namespace per schema, so "a view may not be
 /// named after a table" is not a rule to remember but a consequence of the two
 /// names having one type. [`check_names`] is that consequence made checkable.
+/// ```compile_fail,E0277
+/// let name = pbps_model::ObjectName::new("app", "object");
+/// let _ = format!("{}", name);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let name = pbps_model::ObjectName::new("app", "object");
+/// let _ = name.to_string();
+/// ```
 pub type ObjectName = TableName;
 
 /// One argument type of a routine's identity, in the engine's own spelling.
@@ -467,7 +476,8 @@ impl RoutineId {
 
 impl fmt::Display for RoutineId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}(", self.name)?;
+        // Raw interim serialization bridge until #2084 step 1b types routine text.
+        write!(f, "{}(", self.name.raw())?;
         for (i, a) in self.args.iter().enumerate() {
             if i > 0 {
                 f.write_str(",")?;
@@ -612,9 +622,10 @@ pub enum ModuleIdError {
 impl fmt::Display for ModuleId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ModuleId::Named(n) => n.fmt(f),
+            ModuleId::Named(n) => n.raw().fmt(f),
             ModuleId::Routine(r) => r.fmt(f),
-            ModuleId::Trigger { on, name } => write!(f, "{on}.{name}"),
+            // Raw interim serialization bridge until #2084 step 1b.
+            ModuleId::Trigger { on, name } => write!(f, "{}.{name}", on.raw()),
         }
     }
 }
@@ -1619,7 +1630,8 @@ pub fn check_names(schema: &crate::schema::Schema) -> Vec<String> {
                 if !schema.tables.contains_key(on) && !on_a_view {
                     problems.push(format!(
                         "trigger `{id}` is on `{on}`, which is not declared here as a table or a \
-                         view"
+                         view",
+                        on = on.shown()
                     ));
                 }
             }
@@ -1627,7 +1639,8 @@ pub fn check_names(schema: &crate::schema::Schema) -> Vec<String> {
                 "trigger `{id}` does not say which table it is on (`on:`)"
             )),
             (kind, ModuleId::Trigger { on, .. }) => problems.push(format!(
-                "`{id}` is a {kind} and cannot be `on: {on}`; only a trigger names a table"
+                "`{id}` is a {kind} and cannot be `on: {on}`; only a trigger names a table",
+                on = on.shown()
             )),
             (_, ModuleId::Named(_) | ModuleId::Routine(_)) => {}
         }

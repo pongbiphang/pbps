@@ -326,7 +326,9 @@ fn fingerprint_key_findings(project: &Project, names: &[String]) -> Vec<output::
                         ),
                     )
                     .remedy(format!(
-                        "pbps key generate --out {name}.fingerprint.key   # then set                          `fingerprint_key_file` for `{name}` in pbps.yml"
+                        "pbps key generate --out {}   # then set `fingerprint_key_file` in pbps.yml",
+                        crate::report::shell_arg(&format!("{name}.fingerprint.key"))
+                            .unwrap_or_else(|| crate::report::placeholder("key path"))
                     ));
                 }
                 Some(pbps_config::FingerprintKeySource::Env(var)) => FingerprintKey::from_env(var),
@@ -1416,7 +1418,10 @@ fn env_findings(
         // learned three times, in SQL instead of a shell. Where the name cannot
         // be quoted at all, no command is offered rather than a broken one: the
         // message already names the schema.
-        if let Ok(quoted) = dialect.quote_ident(schema) {
+        let visible = schema.replace('\\', "");
+        if pbps_model::escape::Escaped(&visible).to_string() == visible
+            && let Ok(quoted) = dialect.quote_ident(schema)
+        {
             finding = finding.remedy(format!("CREATE SCHEMA {quoted};"));
         }
         out.push(finding);
@@ -1459,11 +1464,13 @@ const NAMED: usize = 3;
 /// The partitioned parents' findings (#1789, DEC-1789.2), all warnings: a
 /// series about to run out, or rows in the DEFAULT, stops no deployment, and a
 /// question that could not be asked is not a clean bill either.
+// Names in diagnosis prose are shown once in every format until #2084 step 5
+// (DEC-2084.1); pasteable arguments below keep their raw spelling.
 fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
     use pbps_db::doctor::{DefaultRows, Reach, Runway};
     let recheck = || format!("pbps doctor {}", target_arg(d));
     let parent_arg = |parent: &pbps_model::ObjectName| {
-        crate::report::shell_arg(&parent.to_string())
+        crate::report::shell_arg(&parent.raw().to_string())
             .unwrap_or_else(|| crate::report::placeholder("table"))
     };
     let report = match &d.partitions {
@@ -1504,7 +1511,10 @@ fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
                 };
                 let past = match &short.default {
                     Some(default) => {
-                        format!("rows past it land in the DEFAULT partition {default}")
+                        format!(
+                            "rows past it land in the DEFAULT partition {default}",
+                            default = default.shown()
+                        )
                     }
                     None => "rows past it are refused, as no partition takes them".to_owned(),
                 };
@@ -1535,7 +1545,11 @@ fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
                             "{}: {parent}'s partitions end at `{}`, which is short of the horizon \
                              ({}): its newest rows are in the partition from `{}`, so the series \
                              should run {reach}, and {past}.{declared}",
-                            d.environment, short.frontier, short.horizon, short.held_from
+                            d.environment,
+                            short.frontier,
+                            short.horizon,
+                            short.held_from,
+                            parent = parent.shown()
                         ),
                     )
                     .remedy(remedy),
@@ -1547,7 +1561,8 @@ fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
                     format!(
                         "{}: whether {parent}'s partitions run out could not be determined \
                          ({why}); that is undetermined, not fine",
-                        d.environment
+                        d.environment,
+                        parent = parent.shown()
                     ),
                 )
                 .remedy(recheck()),
@@ -1567,8 +1582,11 @@ fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
                 } else {
                     (holding, "the range of")
                 };
-                let named: Vec<String> =
-                    shown.iter().take(NAMED).map(ToString::to_string).collect();
+                let named: Vec<String> = shown
+                    .iter()
+                    .take(NAMED)
+                    .map(|name| name.shown().to_string())
+                    .collect();
                 let more = shown.len().saturating_sub(NAMED);
                 let names = if more == 0 {
                     named.join(", ")
@@ -1583,7 +1601,9 @@ fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
                              declarations give and this database does not have yet. Creating \
                              a partition moves its rows out of the DEFAULT (DEC-1547.1), and only \
                              as far as `pbps move-rows` allowed (DEC-1788.1)",
-                            d.environment
+                            d.environment,
+                            default = default.shown(),
+                            parent = parent.shown()
                         ),
                     )
                     .remedy(format!(
@@ -1609,7 +1629,8 @@ fn partition_findings(d: &EnvDiagnosis) -> Vec<output::Finding> {
                         "{}: whether {parent}'s DEFAULT partition holds rows of partitions not \
                          created yet could not be determined ({why}); that is undetermined, not \
                          fine",
-                        d.environment
+                        d.environment,
+                        parent = parent.shown()
                     ),
                 )
                 .remedy(recheck()),
@@ -2335,7 +2356,7 @@ mod tests {
         }
 
         let out = data_tables_of(&schema);
-        let mut named: Vec<String> = out.keys().map(ToString::to_string).collect();
+        let mut named: Vec<String> = out.keys().map(|name| name.raw().to_string()).collect();
         named.sort();
         assert_eq!(
             named,
@@ -2348,7 +2369,8 @@ mod tests {
             assert_eq!(
                 out.get(&key).cloned(),
                 pbps_db::doctor::DataDemand::of(table),
-                "{name}"
+                "{name}",
+                name = name.shown()
             );
         }
     }
@@ -2883,6 +2905,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn schema_commands_preserve_raw_unicode_and_backslashes_and_refuse_controls() {
+        for name in ["a\u{1b}[31mb", "a\rb", "a\u{9b}b", "a\u{200b}b"] {
+            assert_eq!(remedy(name), None, "{name:?}");
+        }
+        assert_eq!(
+            remedy(r"one\backslash").as_deref(),
+            Some(r"CREATE SCHEMA [one\backslash];")
+        );
+        assert_eq!(remedy("名前").as_deref(), Some("CREATE SCHEMA [名前];"));
+    }
+
     /// The three per-environment remedies, for a target named each way.
     ///
     /// `--env` takes a key of `pbps.yml`, and a `--db` target has none: its
@@ -3200,8 +3234,9 @@ mod tests {
         // No candidate is recorded as the target, whichever it is.
         for candidate in &missing {
             assert!(
-                !remedy.contains(&candidate.to_string()),
-                "{candidate} in {remedy}"
+                !remedy.contains(&candidate.raw().to_string()),
+                "{candidate} in {remedy}",
+                candidate = candidate.shown()
             );
         }
         // Several holding partitions: the first of them is named, not a

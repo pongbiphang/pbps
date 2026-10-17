@@ -97,6 +97,8 @@ pub enum Refused {
 }
 
 /// The surfaces only the engine can answer, as a report names them.
+// These descriptions become prose beside escaped resolver errors. Keep their
+// names shown once until #2084 step 5 (DEC-2084.1), including in finding JSON.
 pub fn named(assessment: &Assessment) -> String {
     let names: Vec<String> = assessment.unresolved().map(describe).collect();
     names.join(", ")
@@ -106,12 +108,12 @@ fn describe(surface: &pbps_model::resolver::Surface) -> String {
     use pbps_model::resolver::Surface;
     match surface {
         Surface::Module(id) => id.to_string(),
-        Surface::Default(column) => format!("the default of {column}"),
-        Surface::Check { table, name } => format!("check {name} on {table}"),
-        Surface::Index { table, name } => format!("index {name} on {table}"),
+        Surface::Default(column) => format!("the default of {column}", column = column.shown()),
+        Surface::Check { table, name } => format!("check {name} on {table}", table = table.shown()),
+        Surface::Index { table, name } => format!("index {name} on {table}", table = table.shown()),
         Surface::Namespace(schema) => format!("schema {schema}"),
-        Surface::Table(table) => table.to_string(),
-        Surface::Column(column) => column.to_string(),
+        Surface::Table(table) => table.shown().to_string(),
+        Surface::Column(column) => column.shown().to_string(),
     }
 }
 

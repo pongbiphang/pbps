@@ -315,12 +315,13 @@ impl<'a> PartChanges<'a> {
             }
             if before != after {
                 moved.push(if *slot == Slot::PrimaryKey {
-                    format!("{name} has a different primary key")
+                    format!("{name} has a different primary key", name = name.shown())
                 } else {
                     format!(
                         "{name} {} `{}` is not as the plan left it",
                         slot.kind(),
-                        slot.name()
+                        slot.name(),
+                        name = name.shown()
                     )
                 });
             }
@@ -366,7 +367,7 @@ impl<'a> PartChanges<'a> {
                 } else {
                     format!("{} `{}`", slot.kind(), slot.name())
                 };
-                moved.push(format!("{name} {what} is not the one this plan leaves: its index storage parameters set, and nothing else changed"));
+                moved.push(format!("{name} {what} is not the one this plan leaves: its index storage parameters set, and nothing else changed", name = name.shown()));
             }
         }
     }
@@ -391,7 +392,7 @@ impl<'a> PartChanges<'a> {
                 .any(|(slot, _)| before == Some(*slot) || after == Some(*slot))
         });
         if !touched || !(after.is_none() || after == expected) {
-            moved.push(format!("{name} is clustered differently from the table the plan was approved over, and no change of this plan moves its clustered index there"));
+            moved.push(format!("{name} is clustered differently from the table the plan was approved over, and no change of this plan moves its clustered index there", name = name.shown()));
         }
     }
 
@@ -412,16 +413,17 @@ impl<'a> PartChanges<'a> {
                             part_as_planned(definition, table, part_name)
                         }) == Some(false)
                         {
-                            moved.push(format!("{name} {kind} `{part_name}` is there, and is not the one this plan adds"));
+                            moved.push(format!("{name} {kind} `{part_name}` is there, and is not the one this plan adds", name = name.shown()));
                         } else if slot.read(table).is_none() {
                             moved.push(format!(
-                                "{name} {kind} `{part_name}` is not there, and this plan writes it"
+                                "{name} {kind} `{part_name}` is not there, and this plan writes it",
+                                name = name.shown()
                             ));
                         }
                     }
                     PartAfter::Gone(_) => {
                         if slot.read(table).is_some() {
-                            moved.push(format!("{name} {kind} `{part_name}` is still there, and this plan removes it"));
+                            moved.push(format!("{name} {kind} `{part_name}` is still there, and this plan removes it", name = name.shown()));
                         }
                     }
                 }

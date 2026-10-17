@@ -132,7 +132,7 @@ class WhatItAccepts(unittest.TestCase):
         self.assertEqual(guard.check({p: BAIL for p in unbounded}, unbounded), [])
 
     def test_the_real_allowlist_refuses_it_anywhere_else(self):
-        elsewhere = "crates/pbps-cli/src/deploy.rs"
+        elsewhere = "crates/pbps-cli/src/prompt.rs"
         self.assertNotIn(elsewhere, guard.ALLOWED)
         self.assertEqual(len(guard.check({elsewhere: BAIL}, {})), 1)
 
@@ -235,10 +235,35 @@ class TheAllowlist(unittest.TestCase):
             self.assertTrue(path.startswith(guard.SCANNED) and path.endswith(".rs"), path)
             self.assertTrue(count is None or count >= 1, path)
 
-    def test_the_known_holes_cite_the_step_that_removes_them(self):
+    def test_counted_exceptions_cite_the_step_that_revisits_them(self):
         holes = {p: v for p, v in guard.ALLOWED.items() if v[0] is not None}
         self.assertEqual(
-            sorted(holes), ["crates/pbps-cli/src/report.rs", "crates/pbps-cli/src/status.rs"]
+            sorted(holes), [
+                'crates/pbps-cli/src/adopt.rs',
+                'crates/pbps-cli/src/deploy.rs',
+                'crates/pbps-cli/src/engine.rs',
+                'crates/pbps-cli/src/explain/resolver.rs',
+                'crates/pbps-cli/src/report.rs',
+                'crates/pbps-cli/src/status.rs',
+                'crates/pbps-cli/tests/flow_pg.rs',
+                'crates/pbps-dialect/src/lib.rs',
+                'crates/pbps-dialect/tests/support/positional_preflight.rs',
+                'crates/pbps-diff/src/identity.rs',
+                'crates/pbps-diff/src/order/compare.rs',
+                'crates/pbps-model/src/module.rs',
+                'crates/pbps-model/src/name.rs',
+                'crates/pbps-mssql/src/estimate.rs',
+                'crates/pbps-mssql/src/introspect.rs',
+                'crates/pbps-mssql/src/lib.rs',
+                'crates/pbps-mssql/src/validate.rs',
+                'crates/pbps-pg/src/estimate.rs',
+                'crates/pbps-pg/src/impact.rs',
+                'crates/pbps-pg/src/lib.rs',
+                'crates/pbps-pg/src/partition_series.rs',
+                'crates/pbps-pg/src/validate.rs',
+                'crates/pbps-pg/tests/live.rs',
+                'crates/pbps-policy/src/evaluate.rs',
+            ]
         )
         for path, (_, why) in holes.items():
             self.assertIn("#2084 step 5", why, path)

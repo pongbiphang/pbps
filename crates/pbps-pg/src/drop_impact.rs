@@ -189,22 +189,37 @@ pub async fn drop_blockers(
         .iter()
         .enumerate()
         .filter_map(|(index, p)| match &p.change {
-            Change::DropTable { name, .. } => Some((index, format!("table {name}"))),
-            Change::DropColumn { column, .. } => Some((index, format!("column {column}"))),
+            Change::DropTable { name, .. } => {
+                Some((index, format!("table {name}", name = name.shown())))
+            }
+            Change::DropColumn { column, .. } => {
+                Some((index, format!("column {column}", column = column.shown())))
+            }
             Change::SetPrimaryKey {
                 table,
                 from: Some(_),
                 ..
-            } => Some((index, format!("primary key on {table}"))),
-            Change::DropUnique { table, name } => {
-                Some((index, format!("unique constraint `{name}` on {table}")))
-            }
-            Change::DropIndex { table, name } => {
-                Some((index, format!("index `{name}` on {table}")))
-            }
+            } => Some((
+                index,
+                format!("primary key on {table}", table = table.shown()),
+            )),
+            Change::DropUnique { table, name } => Some((
+                index,
+                format!(
+                    "unique constraint `{name}` on {table}",
+                    table = table.shown()
+                ),
+            )),
+            Change::DropIndex { table, name } => Some((
+                index,
+                format!("index `{name}` on {table}", table = table.shown()),
+            )),
             Change::AlterColumnNumbering {
                 column, from, to, ..
-            } if gives_up(from, to) => Some((index, format!("numbering source of {column}"))),
+            } if gives_up(from, to) => Some((
+                index,
+                format!("numbering source of {column}", column = column.shown()),
+            )),
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }
             | Change::AttachPartition { .. }
@@ -309,7 +324,8 @@ pub async fn drop_blockers(
             && stored(sources, index, table, None)?.is_some()
         {
             return Err(error(format!(
-                "drop_blockers: key on {table} is absent from the catalog"
+                "drop_blockers: key on {table} is absent from the catalog",
+                table = table.shown()
             ))
             .into());
         }
@@ -382,12 +398,12 @@ fn stored(
         Some(column) => {
             let address = table.column(column);
             Ok(
-                existing(sources.source(&address, at), &address.to_string())?
+                existing(sources.source(&address, at), &address.shown().to_string())?
                     .map(|stored| (stored.table, Some(stored.name))),
             )
         }
         None => Ok(
-            existing(sources.table_source(table, at), &table.to_string())?
+            existing(sources.table_source(table, at), &table.shown().to_string())?
                 .map(|stored| (stored, None)),
         ),
     }
@@ -503,7 +519,8 @@ async fn removal(
                 .map(Some)
                 .ok_or_else(|| {
                     error(format!(
-                        "drop_blockers: table {table} is absent from the catalog"
+                        "drop_blockers: table {table} is absent from the catalog",
+                        table = table.shown()
                     ))
                     .into()
                 })
@@ -518,7 +535,8 @@ async fn removal(
                 .map(Some)
                 .ok_or_else(|| {
                     error(format!(
-                        "drop_blockers: column {column} is absent from the catalog"
+                        "drop_blockers: column {column} is absent from the catalog",
+                        column = column.shown()
                     ))
                     .into()
                 })

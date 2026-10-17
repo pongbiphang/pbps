@@ -58,7 +58,7 @@ pub fn render_partitioned(
     strategy: Option<&Strategy>,
 ) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "table: {}", scalar(&name.to_string()));
+    let _ = writeln!(s, "table: {}", scalar(&name.raw().to_string()));
 
     if let Some(d) = &table.description {
         let _ = writeln!(s, "description: {}", scalar(d.raw()));
@@ -68,7 +68,7 @@ pub fn render_partitioned(
         .iter()
         .find(|i| matches!(i, Intent::RenameTable { to, .. } if to == name))
     {
-        let _ = writeln!(s, "renamed_from: {}", scalar(&from.to_string()));
+        let _ = writeln!(s, "renamed_from: {}", scalar(&from.raw().to_string()));
     }
 
     // Persistent, unlike `renamed_from`: rewriting the file must preserve it
@@ -282,7 +282,7 @@ pub fn render_partitioned(
                 let label = if child.schema == name.schema {
                     child.name.clone()
                 } else {
-                    child.to_string()
+                    child.raw().to_string()
                 };
                 let list = |d: &[pbps_model::BoundDatum]| {
                     d.iter()
@@ -393,7 +393,7 @@ pub fn render_partitioned(
             let _ = writeln!(
                 s,
                 "  versioning:\n    history: {}",
-                scalar(&v.history.to_string())
+                scalar(&v.history.raw().to_string())
             );
             if let Some(r) = &v.retention {
                 let _ = writeln!(s, "    retention: {}", scalar(&r.to_string()));
@@ -476,8 +476,10 @@ pub fn render_module(
     // the file that database came from.
     let (declared, on) = match id {
         ModuleId::Trigger { on, name } => (
-            ObjectName::new(on.schema.clone(), name.clone()).to_string(),
-            Some(on.to_string()),
+            ObjectName::new(on.schema.clone(), name.clone())
+                .raw()
+                .to_string(),
+            Some(on.raw().to_string()),
         ),
         other @ (ModuleId::Named(_) | ModuleId::Routine(_)) => (other.to_string(), None),
     };
@@ -708,7 +710,7 @@ fn render_foreign_keys(s: &mut String, table: &Table, pad: &str, lead: &str) {
             "{pad}    references: {}",
             scalar(&format!(
                 "{}({})",
-                fk.references_table,
+                fk.references_table.raw(),
                 fk.references_columns.join(", ")
             ))
         );
@@ -2010,7 +2012,7 @@ indexes:
             );
             assert_eq!(st.hidden, hidden, "{block}");
             assert_eq!(
-                st.versioning.as_ref().map(|v| v.history.to_string()),
+                st.versioning.as_ref().map(|v| v.history.raw().to_string()),
                 history.map(str::to_owned),
                 "{block}"
             );
@@ -2111,7 +2113,7 @@ indexes:
         };
         let fk = &own("ev_old").foreign_keys["old_w_fk"];
         assert_eq!(fk.columns, ["w"]);
-        assert_eq!(fk.references_table.to_string(), "app.archive");
+        assert_eq!(fk.references_table.raw().to_string(), "app.archive");
         assert_eq!(fk.on_delete, pbps_model::ReferentialAction::Cascade);
         assert!(own("ev_plain").foreign_keys.is_empty());
         assert_eq!(t.table.foreign_keys.keys().collect::<Vec<_>>(), ["ev_u_fk"]);
@@ -2293,7 +2295,7 @@ indexes:
                         ..Default::default()
                     }
                 );
-                (n.to_string(), of.bound)
+                (n.raw().to_string(), of.bound)
             })
             .collect();
         let value = |v: &str| D::Value(v.to_owned());

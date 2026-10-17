@@ -10,20 +10,35 @@ use pbps_diff::{Blocker, RenameSide};
 use pbps_model::change::DeleteCause;
 use pbps_model::escape::Escaped;
 use pbps_model::plan_names::{At, Holder, PlanNames};
-use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass};
+use pbps_model::{Change, ChangeSet, DriftReport, Intent, RiskClass, TableName};
 
 /// One intent in the user's own vocabulary.
 ///
 /// An intent retains its meaning, not where it was supplied (SPEC §6). Describe
 /// the operation without inventing an annotation for a command or prompt answer.
+// Intent and blocker sentences are prose in every format until #2084 step 5
+// (DEC-2084.1); only their embedded command arguments stay raw.
 pub fn intent(i: &Intent) -> String {
     match i {
-        Intent::RenameTable { from, to } => format!("rename table {from} -> {to}"),
+        Intent::RenameTable { from, to } => format!(
+            "rename table {from} -> {to}",
+            from = from.shown(),
+            to = to.shown()
+        ),
         Intent::RenameColumn { table, from, to } => {
-            format!("rename column {table}.{from} -> {table}.{to}")
+            format!(
+                "rename column {table}.{from} -> {table}.{to}",
+                table = table.shown()
+            )
         }
-        Intent::DropTable { table, reason } => format!("drop table {table} (reason: {reason})"),
-        Intent::DropColumn { column, reason } => format!("drop column {column} (reason: {reason})"),
+        Intent::DropTable { table, reason } => format!(
+            "drop table {table} (reason: {reason})",
+            table = table.shown()
+        ),
+        Intent::DropColumn { column, reason } => format!(
+            "drop column {column} (reason: {reason})",
+            column = column.shown()
+        ),
         Intent::RenameRole { from, to } => format!("rename role {from} -> {to}"),
         Intent::DropRole { role, reason } => format!("drop role {role} (reason: {reason})"),
         Intent::MoveRows {
@@ -31,7 +46,8 @@ pub fn intent(i: &Intent) -> String {
             max_rows,
             reason,
         } => format!(
-            "move at most {max_rows} DEFAULT-partition rows into {table} (reason: {reason})"
+            "move at most {max_rows} DEFAULT-partition rows into {table} (reason: {reason})",
+            table = table.shown()
         ),
     }
 }
@@ -101,22 +117,28 @@ fn pair_flag(flag: &str, first: &str, second: &str, second_name: &str) -> String
 
 fn supplied_flag(intent: &Intent) -> Option<String> {
     Some(match intent {
-        Intent::RenameColumn { table, from, to } => {
-            pair_flag("--rename", &format!("{table}.{from}"), to, "new column")
-        }
+        Intent::RenameColumn { table, from, to } => pair_flag(
+            "--rename",
+            &format!("{table}.{from}", table = table.raw()),
+            to,
+            "new column",
+        ),
         Intent::RenameTable { from, to } => pair_flag(
             "--rename-table",
-            &from.to_string(),
-            &to.to_string(),
+            &from.raw().to_string(),
+            &to.raw().to_string(),
             "new table",
         ),
         Intent::RenameRole { from, to } => pair_flag("--rename-role", from, to, "new role"),
         Intent::DropColumn { column, reason } => {
-            pair_flag("--drop", &column.to_string(), reason.as_ref(), "why")
+            pair_flag("--drop", &column.raw().to_string(), reason.as_ref(), "why")
         }
-        Intent::DropTable { table, reason } => {
-            pair_flag("--drop-table", &table.to_string(), reason.as_ref(), "why")
-        }
+        Intent::DropTable { table, reason } => pair_flag(
+            "--drop-table",
+            &table.raw().to_string(),
+            reason.as_ref(),
+            "why",
+        ),
         Intent::DropRole { role, reason } => pair_flag("--drop-role", role, reason.as_ref(), "why"),
         // MoveRows remains a separate command (SPEC §6.5); do not advertise an
         // option the identity batch does not accept.
@@ -183,7 +205,7 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
                 alternatives(
                     "--rename",
                     "--drop",
-                    &format!("{table}.{from}"),
+                    &format!("{table}.{from}", table = table.raw()),
                     appeared.clone(),
                 );
             }
@@ -196,8 +218,8 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
                 alternatives(
                     "--rename-table",
                     "--drop-table",
-                    &from.to_string(),
-                    appeared.iter().map(ToString::to_string).collect(),
+                    &from.raw().to_string(),
+                    appeared.iter().map(|name| name.raw().to_string()).collect(),
                 );
             }
         }
@@ -209,12 +231,15 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
                 alternatives("--rename-role", "--drop-role", from, appeared.clone());
             }
         }
-        Blocker::DropColumnNeedsReason { column } => {
-            fixed.push(pair_flag("--drop", &column.to_string(), "<why>", "why"))
-        }
+        Blocker::DropColumnNeedsReason { column } => fixed.push(pair_flag(
+            "--drop",
+            &column.raw().to_string(),
+            "<why>",
+            "why",
+        )),
         Blocker::DropTableNeedsReason { table } => fixed.push(pair_flag(
             "--drop-table",
-            &table.to_string(),
+            &table.raw().to_string(),
             "<why>",
             "why",
         )),
@@ -225,7 +250,9 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
             // A derived column choice is conditional on its table identity.
             // Putting its flag on the fixed command would silently decide it.
             choices.push(format!(
-                "    only if {from} -> {to} is the table rename you choose:"
+                "    only if {from} -> {to} is the table rename you choose:",
+                from = from.shown(),
+                to = to.shown()
             ));
             let mut conditional = Vec::new();
             batch_flags(blocker, &mut conditional, choices);
@@ -242,6 +269,155 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
 #[cfg(test)]
 mod batch_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_remedy_commands_round_trip_raw_table_and_column_names() {
+        for part in [r"one\backslash", "名前_ünï"] {
+            let table = TableName::new("app", part);
+            for (blocker, expected) in [
+                (
+                    Blocker::DropTableNeedsReason {
+                        table: table.clone(),
+                    },
+                    vec![
+                        "drop-table".into(),
+                        format!("app.{part}"),
+                        "--reason".into(),
+                        "<why>".into(),
+                    ],
+                ),
+                (
+                    Blocker::DropColumnNeedsReason {
+                        column: table.column(part),
+                    },
+                    vec![
+                        "drop".into(),
+                        format!("app.{part}.{part}"),
+                        "--reason".into(),
+                        "<why>".into(),
+                    ],
+                ),
+                (
+                    Blocker::AmbiguousTables {
+                        disappeared: vec![table.clone()],
+                        appeared: vec![TableName::new("app", "new")],
+                    },
+                    vec![
+                        "rename-table".into(),
+                        format!("app.{part}"),
+                        "app.new".into(),
+                    ],
+                ),
+                (
+                    Blocker::AmbiguousColumns {
+                        table: table.clone(),
+                        disappeared: vec!["old".into()],
+                        appeared: vec![part.into()],
+                    },
+                    vec!["rename".into(), format!("app.{part}.old"), part.into()],
+                ),
+            ] {
+                let text = one_blocker(&blocker);
+                let command = text
+                    .lines()
+                    .find_map(|line| line.split_once("pbps ").map(|(_, command)| command))
+                    .unwrap();
+                let script = format!("set -- {command}; printf '%s\\0' \"$@\"");
+                let output = std::process::Command::new("sh")
+                    .args(["-c", &script])
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let args: Vec<&[u8]> = output
+                    .stdout
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                assert_eq!(
+                    args,
+                    expected.iter().map(String::as_bytes).collect::<Vec<_>>(),
+                    "{text:?}"
+                );
+            }
+        }
+        for part in ["a\u{1b}[31mb", "a\rb", "a\u{9b}b"] {
+            let text = one_blocker(&Blocker::DropTableNeedsReason {
+                table: TableName::new("app", part),
+            });
+            assert!(
+                text.contains("pbps drop-table \"<table>\" --reason \"<why>\""),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pasteable_flags_round_trip_raw_names_and_refuse_terminal_controls() {
+        // Parse the actual generated flags with a shell; comparing our own
+        // quote spelling would miss an argument silently rewritten on paste.
+        for part in [r"one\backslash", "名前_ünï"] {
+            let table = TableName::new("app", part);
+            let intent = Intent::RenameTable {
+                from: table.clone(),
+                to: TableName::new("app", "new"),
+            };
+            let flags = supplied_flag(&intent).unwrap();
+            let script = format!("set -- {flags}; printf '%s\\0' \"$@\"");
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let args: Vec<&[u8]> = output
+                .stdout
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .collect();
+            assert_eq!(
+                args,
+                [
+                    b"--rename-table".as_slice(),
+                    format!("app.{part}").as_bytes(),
+                    b"app.new".as_slice()
+                ]
+            );
+            let column = Intent::RenameColumn {
+                table,
+                from: part.into(),
+                to: "next".into(),
+            };
+            let flags = supplied_flag(&column).unwrap();
+            let script = format!("set -- {flags}; printf '%s\\0' \"$@\"");
+            let output = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            let args: Vec<&[u8]> = output
+                .stdout
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .collect();
+            assert_eq!(args[1], format!("app.{part}.{part}").as_bytes());
+        }
+        for part in ["a\u{1b}[31mb", "a\rb", "a\u{9b}b", "a\u{200b}b"] {
+            let table = TableName::new("app", part);
+            let intent = Intent::DropTable {
+                table,
+                reason: "retired".parse().unwrap(),
+            };
+            assert_eq!(
+                supplied_flag(&intent).unwrap(),
+                "--drop-table \"<object name>\" retired"
+            );
+        }
+        assert_eq!(shell_arg("名前_ünï"), Some("\"名前_ünï\"".into()));
+        // The existing cross-shell refusals continue to apply.
+        for part in ["-flag", "trailing\\", r"two\\slashes", "$expand", "a!b"] {
+            assert_eq!(shell_arg(part), None, "{part:?}");
+        }
+    }
 
     #[test]
     fn human_and_json_share_one_complete_batch_without_changing_blocker_ids() {
@@ -378,7 +554,9 @@ fn one_blocker(b: &Blocker) -> String {
     match b {
         Blocker::ProvisionalTableIdentity { from, to, blocker } => format!(
             "  if {from} -> {to} is what you meant (provisional table identity):\n{}",
-            one_blocker(blocker)
+            one_blocker(blocker),
+            from = from.shown(),
+            to = to.shown()
         ),
         Blocker::AmbiguousColumns {
             table,
@@ -388,16 +566,18 @@ fn one_blocker(b: &Blocker) -> String {
             let mut s = format!(
                 "  {table}: {} disappeared, {} is new\n\n",
                 disappeared.join(", "),
-                appeared.join(", ")
+                appeared.join(", "),
+                table = table.shown()
             );
             for from in disappeared {
+                let source = format!("{table}.{from}", table = table.raw());
+                let source_arg = shell_arg(&source).unwrap_or_else(|| placeholder("object name"));
                 for to in appeared {
-                    s.push_str(&format!(
-                        "    if {from} was renamed to {to}:  pbps rename {table}.{from} {to}\n"
-                    ));
+                    let command = pair_flag("pbps rename", &source, to, "new column");
+                    s.push_str(&format!("    if {from} was renamed to {to}:  {command}\n"));
                 }
                 s.push_str(&format!(
-                    "    to drop {from}:                pbps drop {table}.{from} --reason {why}\n"
+                    "    to drop {from}:                pbps drop {source_arg} --reason {why}\n"
                 ));
             }
             s
@@ -408,26 +588,42 @@ fn one_blocker(b: &Blocker) -> String {
         } => {
             let mut s = format!(
                 "  table {} disappeared, {} is new\n\n",
-                join(disappeared),
-                join(appeared)
+                join(disappeared.iter().map(TableName::shown)),
+                join(appeared.iter().map(TableName::shown))
             );
             for from in disappeared {
+                let source_arg =
+                    shell_arg(&from.raw().to_string()).unwrap_or_else(|| placeholder("table"));
                 for to in appeared {
+                    let command = pair_flag(
+                        "pbps rename-table",
+                        &from.raw().to_string(),
+                        &to.raw().to_string(),
+                        "new table",
+                    );
                     s.push_str(&format!(
-                        "    if {from} was renamed to {to}:  pbps rename-table {from} {to}\n"
+                        "    if {from} was renamed to {to}:  {command}\n",
+                        from = from.shown(),
+                        to = to.shown()
                     ));
                 }
                 s.push_str(&format!(
-                    "    to drop {from}:                pbps drop-table {from} --reason {why}\n"
+                    "    to drop {from}:                pbps drop-table {source_arg} --reason {why}\n",
+                    from = from.shown()
                 ));
             }
             s
         }
         Blocker::DropColumnNeedsReason { column } => format!(
-            "  {column} disappeared from the declarations, but a drop must record why (an audit asks for it)\n\n    pbps drop {column} --reason {why}\n"
+            "  {column} disappeared from the declarations, but a drop must record why (an audit asks for it)\n\n    pbps drop {argument} --reason {why}\n",
+            column = column.shown(),
+            argument =
+                shell_arg(&column.raw().to_string()).unwrap_or_else(|| placeholder("column"))
         ),
         Blocker::DropTableNeedsReason { table } => format!(
-            "  table {table} disappeared from the declarations, but a drop must record why\n\n    pbps drop-table {table} --reason {why}\n"
+            "  table {table} disappeared from the declarations, but a drop must record why\n\n    pbps drop-table {argument} --reason {why}\n",
+            table = table.shown(),
+            argument = shell_arg(&table.raw().to_string()).unwrap_or_else(|| placeholder("table"))
         ),
         Blocker::AmbiguousRoles {
             disappeared,
@@ -439,20 +635,21 @@ fn one_blocker(b: &Blocker) -> String {
                 join(appeared)
             );
             for from in disappeared {
+                let source_arg = shell_arg(from).unwrap_or_else(|| placeholder("role"));
                 for to in appeared {
-                    s.push_str(&format!(
-                        "    if {from} was renamed to {to}:  pbps rename-role {from} {to}\n"
-                    ));
+                    let command = pair_flag("pbps rename-role", from, to, "new role");
+                    s.push_str(&format!("    if {from} was renamed to {to}:  {command}\n"));
                 }
                 s.push_str(&format!(
-                    "    to drop {from}:                pbps drop-role {from} --reason {why}\n"
+                    "    to drop {from}:                pbps drop-role {source_arg} --reason {why}\n"
                 ));
             }
             s
         }
         Blocker::DropRoleNeedsReason { role } => format!(
             "  role {role} disappeared from the declarations, but a drop must record why — \
-             its members lose whatever it granted\n\n    pbps drop-role {role} --reason {why}\n"
+             its members lose whatever it granted\n\n    pbps drop-role {argument} --reason {why}\n",
+            argument = shell_arg(role).unwrap_or_else(|| placeholder("role"))
         ),
         Blocker::UnusedIntent { intent: i } => {
             format!(
@@ -519,7 +716,10 @@ fn one_blocker(b: &Blocker) -> String {
         // when there is a containing table worth naming (a column, or a
         // trigger's own table).
         Blocker::UnrepresentableName { what, part, table } => {
-            let prefix = table.as_ref().map(|t| format!("{t}: ")).unwrap_or_default();
+            let prefix = table
+                .as_ref()
+                .map(|t| format!("{t}: ", t = t.shown()))
+                .unwrap_or_default();
             format!(
                 "  {prefix}{what} `{part}` contains a `.`, which pbps uses to separate schema, \
                  table and column; it cannot mint an identity for this {what}.\n\n    rename \
@@ -529,14 +729,15 @@ fn one_blocker(b: &Blocker) -> String {
         Blocker::MoveNotBesideDefault { table } => format!(
             "  {table} is not a range or list partition whose parent declares a DEFAULT \
              partition, so no rows can move into it\n\n    declare {table} as a range or list \
-             partition beside the DEFAULT, or drop the `move-rows` request\n"
+             partition beside the DEFAULT, or drop the `move-rows` request\n",
+            table = table.shown()
         ),
     }
 }
 
-fn join<T: std::fmt::Display>(v: &[T]) -> String {
-    v.iter()
-        .map(ToString::to_string)
+fn join(v: impl IntoIterator<Item = impl std::fmt::Display>) -> String {
+    v.into_iter()
+        .map(|value| value.to_string())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -816,7 +1017,7 @@ pub fn drift(r: &DriftReport) -> String {
         out.push_str(&format!(
             "Unmanaged:   {} table(s) left alone: {}\n",
             r.unmanaged.len(),
-            join(&r.unmanaged)
+            join(r.unmanaged.iter().map(TableName::shown))
         ));
     }
 
@@ -907,6 +1108,8 @@ pub fn rehearsal(r: &crate::dev::Rehearsal) -> String {
 }
 
 pub fn describe(c: &Change) -> String {
+    // Shared JSON prose stays raw until #2084 step 5 (DEC-2084.1): changes() and the
+    // approval renderer escape the complete description once.
     match c {
         // A partition has no columns of its own to count; what it is, is its
         // parent and the rows it takes (#1170).
@@ -921,7 +1124,8 @@ pub fn describe(c: &Change) -> String {
                 pbps_model::PartitionBound::Default => {
                     format!(
                         "+ create table {name}, the default partition of {}",
-                        of.parent
+                        of.parent.raw(),
+                        name = name.raw()
                     )
                 }
                 bound @ (pbps_model::PartitionBound::Range { .. }
@@ -960,7 +1164,8 @@ pub fn describe(c: &Change) -> String {
                     };
                     let made = format!(
                         "+ create table {name}, a partition of {} for rows {rows}",
-                        of.parent
+                        of.parent.raw(),
+                        name = name.raw()
                     );
                     // The rows it takes from the DEFAULT are the change's to
                     // say, since they leave that partition (#1547), and so
@@ -968,23 +1173,29 @@ pub fn describe(c: &Change) -> String {
                     match (beside_default, moves_at_most) {
                         (Some(default), Some(most)) => format!(
                             "{made}, moving those rows out of the default partition {default}, \
-                             at most {most} as allowed"
+                             at most {most} as allowed",
+                            default = default.raw()
                         ),
                         (Some(default), None) => format!(
                             "{made}, moving those rows out of the default partition {default}, \
-                             none allowed: the apply refuses any it holds"
+                             none allowed: the apply refuses any it holds",
+                            default = default.raw()
                         ),
                         (None, _) => made,
                     }
                 }
             },
-            None => format!("+ create table {name} ({} columns)", table.columns.len()),
+            None => format!(
+                "+ create table {name} ({} columns)",
+                table.columns.len(),
+                name = name.raw()
+            ),
         },
         Change::DropTable {
             name,
             detach_from: None,
             ..
-        } => format!("- drop table {name}"),
+        } => format!("- drop table {name}", name = name.raw()),
         Change::DetachPartition {
             table,
             parent,
@@ -995,7 +1206,9 @@ pub fn describe(c: &Change) -> String {
             names
                 .iter()
                 .filter(|n| n.name.as_ref() != Some(&n.parent))
-                .count()
+                .count(),
+            table = table.raw(),
+            parent = parent.raw()
         ),
         Change::AttachPartition {
             table,
@@ -1008,7 +1221,11 @@ pub fn describe(c: &Change) -> String {
             } else {
                 "a partition"
             };
-            format!("~ attach table {table} to {parent} as {partition}, keeping its rows")
+            format!(
+                "~ attach table {table} to {parent} as {partition}, keeping its rows",
+                table = table.raw(),
+                parent = parent.raw()
+            )
         }
         // Said, because the detach is a statement of its own and locks the
         // parent (#1171).
@@ -1016,8 +1233,16 @@ pub fn describe(c: &Change) -> String {
             name,
             detach_from: Some(parent),
             ..
-        } => format!("- drop table {name}, a partition of {parent}, detached from it first"),
-        Change::RenameTable { from, to, .. } => format!("~ rename table {from} -> {to}"),
+        } => format!(
+            "- drop table {name}, a partition of {parent}, detached from it first",
+            name = name.raw(),
+            parent = parent.raw()
+        ),
+        Change::RenameTable { from, to, .. } => format!(
+            "~ rename table {from} -> {to}",
+            from = from.raw(),
+            to = to.raw()
+        ),
         Change::AddColumn { name, column, .. } => {
             format!("+ add column {name} {}", column.ty)
         }
@@ -1064,7 +1289,7 @@ pub fn describe(c: &Change) -> String {
             // the report's, and the report escapes each line whole when it
             // prints it (`Escaped(&describe(..))`, #2035). Showing the reason
             // here too would escape it twice and change the JSON. The interim
-            // cover goes with #2084 step 5.
+            // cover goes with #2084 step 5 (DEC-2084.1).
             Some(r) => format!("~ {} marked deprecated: {}", column.name, r.raw()),
             None => format!("~ {} no longer deprecated", column.name),
         },
@@ -1227,6 +1452,13 @@ fn permissions_list(p: &std::collections::BTreeSet<pbps_model::Permission>) -> S
 /// nothing can execute it. A command that cannot be pasted blindly is a much
 /// smaller problem than one that redirects or runs something when it is.
 pub fn shell_arg(value: &str) -> Option<String> {
+    // Preserve a single backslash inside shell quotes, but refuse every other
+    // character Escaped rewrites: an inert display spelling is a different
+    // argument, and emitting the original control character is not safe.
+    let without_backslashes = value.replace('\\', "");
+    if Escaped(&without_backslashes).to_string() != without_backslashes {
+        return None;
+    }
     // `~` is safe away from the front: it means home-directory expansion as the
     // first character of a word and nothing at all elsewhere, and every Windows
     // short path is full of it (`C:\Users\RUNNER~1\...`).

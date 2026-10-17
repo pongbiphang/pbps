@@ -1290,6 +1290,8 @@ impl Change {
     // later is handled there, not here.
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn subject(&self) -> String {
+        // This is a grouping/policy key and shared JSON text. Reports escape
+        // it when rendering; #2084 step 5 (DEC-2084.1) removes that interim boundary.
         match self {
             Change::CreateRole { name, .. }
             | Change::DropRole { name, .. }
@@ -1306,7 +1308,10 @@ impl Change {
             // for both would group two changes as one.
             other => match other.module_id() {
                 Some(id) => id.to_string(),
-                None => other.table().map(ToString::to_string).unwrap_or_default(),
+                None => other
+                    .table()
+                    .map(|name| name.raw().to_string())
+                    .unwrap_or_default(),
             },
         }
     }
@@ -2874,6 +2879,17 @@ impl ChangeSet {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_table_subject_matches_the_raw_policy_and_grouping_key() {
+        let part = "a\nb\\c\u{200b}";
+        let change = super::Change::DropTable {
+            uid: "t_aaaaaa".parse().unwrap(),
+            name: crate::TableName::new("app", part),
+            detach_from: None,
+        };
+        assert_eq!(change.subject(), format!("app.{part}"));
+        assert_ne!(change.subject(), r"app.a\nb\c\u{200b}");
+    }
 
     /// A part the plan creates again takes its parameters in its `CREATE`,
     /// so a separate change to them is dropped; one on a part left standing
@@ -3312,8 +3328,14 @@ mod tests {
 
     #[test]
     fn every_change_reports_its_table() {
-        assert_eq!(drop_column().table().unwrap().to_string(), "dbo.customer");
-        assert_eq!(add_column().table().unwrap().to_string(), "dbo.customer");
+        assert_eq!(
+            drop_column().table().unwrap().raw().to_string(),
+            "dbo.customer"
+        );
+        assert_eq!(
+            add_column().table().unwrap().raw().to_string(),
+            "dbo.customer"
+        );
         assert_eq!(drop_column().subject(), "dbo.customer");
         // A role is a principal, not an object: no table, but a subject.
         let grant = Change::Grant {
@@ -3410,7 +3432,7 @@ mod tests {
             c.module_id().map(ToString::to_string).as_deref(),
             Some("dbo.active_customer")
         );
-        assert_eq!(c.object().unwrap().to_string(), "dbo.active_customer");
+        assert_eq!(c.object().unwrap().raw().to_string(), "dbo.active_customer");
         assert_eq!(c.subject(), "dbo.active_customer");
         assert!(add_column().module_id().is_none());
 
@@ -3420,13 +3442,13 @@ mod tests {
             id: "app.orders.audit".parse().unwrap(),
             kind: crate::module::ModuleKind::Trigger,
         };
-        assert_eq!(trigger.object().unwrap().to_string(), "app.audit");
+        assert_eq!(trigger.object().unwrap().raw().to_string(), "app.audit");
         assert_eq!(trigger.subject(), "app.orders.audit");
         let routine = Change::DropModule {
             id: "app.f(integer,text)".parse().unwrap(),
             kind: crate::module::ModuleKind::Function,
         };
-        assert_eq!(routine.object().unwrap().to_string(), "app.f");
+        assert_eq!(routine.object().unwrap().raw().to_string(), "app.f");
         assert_eq!(routine.subject(), "app.f(integer,text)");
     }
 

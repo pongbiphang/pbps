@@ -394,11 +394,11 @@ mod tests {
         cs.changes
             .iter()
             .map(|p| match &p.change {
-                Change::CreateTable { name, .. } => format!("table {name}"),
+                Change::CreateTable { name, .. } => format!("table {name}", name = name.shown()),
                 Change::CreateModule { id, .. } => format!("create {id}"),
                 Change::DropModule { id, .. } => format!("drop {id}"),
                 Change::AlterColumnDefault { column, .. } => {
-                    format!("default {}.{}", column.table, column.name)
+                    format!("default {}.{}", column.table.shown(), column.name)
                 }
                 Change::DropRole { name, .. } => format!("drop role {name}"),
                 other => format!("{other:?}"),

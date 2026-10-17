@@ -429,7 +429,7 @@ pub(super) fn run(connection: &str, driver: Driver, loss: Loss, case: Case) {
                 .ids
                 .tables
                 .values()
-                .any(|t| t.to_string() == "moved.t")
+                .any(|t| t.raw().to_string() == "moved.t")
         );
         e.rows("moved.t", "before");
         assert_eq!(e.entries("apply"), 0);

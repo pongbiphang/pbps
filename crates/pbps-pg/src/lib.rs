@@ -1,3 +1,6 @@
+// Names in whole-escaped DialectError fields and shared probe text stay raw
+// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
+
 //! PostgreSQL: the dialect, as far as it is built.
 //!
 //! The counterpart of `pbps-mssql`, and the crate SPEC §11.1's map has been
@@ -1239,7 +1242,8 @@ impl Dialect for Postgres {
                      quoting does not make it literal. The table would be created and then \
                      every unqualified name in its checks, filters and defaults would resolve \
                      through whatever schema the deploying role owns. Declare it under a name \
-                     the path can carry."
+                     the path can carry.",
+                    name = name.raw()
                 ),
             });
         }
@@ -1254,7 +1258,8 @@ impl Dialect for Postgres {
                      `pg_temp` is worse than invisible, because it is this engine's alias for \
                      the session's temporary schema: measured, `CREATE TABLE \"pg_temp\".\"t\"` \
                      leaves a `pg_temp_58.t` that disappears with the connection. Declare the \
-                     table in a schema of the project's own."
+                     table in a schema of the project's own.",
+                    name = name.raw()
                 ),
             });
         }
@@ -1267,7 +1272,8 @@ impl Dialect for Postgres {
                     "table `{name}` is one of the ledger tables this tool owns (SPEC section 8.1). \
                      Only those names in schema `{}` are reserved; the same table name in \
                      another project schema is read back normally.",
-                    crate::state::LEDGER_SCHEMA
+                    crate::state::LEDGER_SCHEMA,
+                    name = name.raw()
                 ),
             });
         }
@@ -1538,7 +1544,8 @@ impl Dialect for Postgres {
                 name: generated_name(&name.name, None, "pkey"),
                 descriptor: format!(
                     "the index {} generates for `{name}`'s unnamed primary key",
-                    types::DIALECT
+                    types::DIALECT,
+                    name = name.shown()
                 ),
                 remedy: "Name the primary key, or rename the other object.",
                 // `ChooseRelationName(..., isconstraint = true)` (#1112).
@@ -1563,7 +1570,8 @@ impl Dialect for Postgres {
                     name: generated_name(&name.name, Some(column), "seq"),
                     descriptor: format!(
                         "the sequence {} generates for identity column `{name}.{column}`",
-                        types::DIALECT
+                        types::DIALECT,
+                        name = name.shown()
                     ),
                     remedy: "Rename the other object.",
                     yields_to_constraints: false,
@@ -1585,7 +1593,10 @@ impl Dialect for Postgres {
                 };
                 by_name.push(pbps_dialect::ImplicitRelation {
                     name: sequence.clone(),
-                    descriptor: format!("the sequence of `serial` column `{name}.{column}`"),
+                    descriptor: format!(
+                        "the sequence of `serial` column `{name}.{column}`",
+                        name = name.shown()
+                    ),
                     remedy: "Rename the other object, or the sequence's `sequence: {name: ...}`.",
                     yields_to_constraints: false,
                 });
@@ -4020,7 +4031,9 @@ mod tests {
                         Some(
                             renames
                                 .iter()
-                                .map(|(from, to)| format!("{from} -> {to}"))
+                                .map(|(from, to)| {
+                                    format!("{from} -> {to}", from = from.shown(), to = to.shown())
+                                })
                                 .collect(),
                         )
                     } else {

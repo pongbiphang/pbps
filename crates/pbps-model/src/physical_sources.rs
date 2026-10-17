@@ -138,7 +138,8 @@ impl<'p> PhysicalSources<'p> {
                 .is_some_and(|before| before != &uid)
             {
                 return Err(SourceError(format!(
-                    "baseline identity for {column} disagrees with the plan"
+                    "baseline identity for {column} disagrees with the plan",
+                    column = column.shown()
                 )));
             }
             build.view.managed.put(origin, 0, Some(uid.clone()));
@@ -152,7 +153,8 @@ impl<'p> PhysicalSources<'p> {
                 .is_some_and(|before| before != &owner)
             {
                 return Err(SourceError(format!(
-                    "baseline identity for {name} disagrees with the plan"
+                    "baseline identity for {name} disagrees with the plan",
+                    name = name.shown()
                 )));
             }
             let shape = if let Some(partition) = &table.partition_of {
@@ -287,7 +289,8 @@ impl Build<'_, '_> {
         match self.view.names.holder(name, at) {
             Holder::Tracked(uid) => Ok(uid.clone()),
             Holder::Unmanaged | Holder::Vacant => Err(SourceError(format!(
-                "no managed table holds {name} at {at:?}"
+                "no managed table holds {name} at {at:?}",
+                name = name.shown()
             ))),
         }
     }

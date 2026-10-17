@@ -1,3 +1,6 @@
+// Findings are shared JSON and report prose. Name operands stay raw until
+// #2084 step 5 (DEC-2084.1) removes the report's whole-message escape; subjects stay raw keys.
+
 //! Running the catalogue: the declaration rules over a [`Schema`], the plan
 //! rules over a [`ChangeSet`] (ADR-0008 decisions 1 and 6).
 //!
@@ -102,7 +105,7 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
             continue; // `check` has already reported it.
         };
         for (name, table) in &schema.tables {
-            let subject = name.to_string();
+            let subject = name.raw().to_string();
             if !ctx.wants(&subject) {
                 continue;
             }
@@ -146,7 +149,10 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                 if !re.is_match(&n) {
                     out.extend(live.finding(
                         Some(&subject),
-                        format!("{name}: {kind} `{n}` does not match `{pattern}`"),
+                        format!(
+                            "{name}: {kind} `{n}` does not match `{pattern}`",
+                            name = name.raw()
+                        ),
                     ));
                 }
             }
@@ -156,7 +162,7 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
     if let Some(live) = Live::of(policies, rules::DATA_MAX_ROWS, ctx) {
         let max = live.config.rows.unwrap_or(ctx.max_rows);
         for (name, table) in &schema.tables {
-            let subject = name.to_string();
+            let subject = name.raw().to_string();
             if !ctx.wants(&subject) {
                 continue;
             }
@@ -168,7 +174,8 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                     format!(
                         "{name}: {} declared rows is above {max} — this does not look like \
                          reference data, and every plan compares it row by row",
-                        data.rows.len()
+                        data.rows.len(),
+                        name = name.raw()
                     ),
                 ));
             }
@@ -177,7 +184,7 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
 
     if let Some(live) = Live::of(policies, rules::COLUMN_NO_DEPRECATED_TYPE, ctx) {
         for (name, table) in &schema.tables {
-            let subject = name.to_string();
+            let subject = name.raw().to_string();
             if !ctx.wants(&subject) {
                 continue;
             }
@@ -189,7 +196,7 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                 {
                     out.extend(live.finding(
                         Some(&subject),
-                        format!("{name}.{column}: `{}` {advice}", spec.ty),
+                        format!("{name}.{column}: `{}` {advice}", spec.ty, name = name.raw()),
                     ));
                 }
             }
@@ -378,14 +385,15 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
         }
         for (id, (at, table)) in contracts {
             if adds.contains_key(&id) {
-                let subject = table.to_string();
+                let subject = table.raw().to_string();
                 out.extend(
                     live.finding(
                         Some(&subject),
                         format!(
                             "{table}: this revision both adds and drops or narrows a column; \
                              that usually wants expand/contract staging (SPEC §13.3) — add \
-                             first, backfill, then contract in a later revision"
+                             first, backfill, then contract in a later revision",
+                            table = table.raw()
                         ),
                     )
                     .map(|f| (at, f)),
@@ -401,7 +409,7 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
             } = &p.change
                 && p.risks.contains(&RiskClass::Narrowing)
             {
-                let subject = column.table.to_string();
+                let subject = column.table.raw().to_string();
                 // An array's element change has no probe: it is supported only
                 // where every element keeps its value, and refused when the
                 // plan is written against a database otherwise (#1167).
@@ -409,13 +417,15 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                     format!(
                         "{column}: {from} -> {to} narrows or converts an array's elements, \
                          which pbps does not do: the plan is refused when it is computed \
-                         against a database"
+                         against a database",
+                        column = column.raw()
                     )
                 } else {
                     format!(
                         "{column}: {from} -> {to} depends on what is already stored; the \
                          pre-flight probe counts the rows that would not fit before the \
-                         first statement runs"
+                         first statement runs",
+                        column = column.raw()
                     )
                 };
                 out.extend(live.finding(Some(&subject), message).map(|f| (i, f)));
@@ -548,6 +558,83 @@ pub fn parse_window(s: &str) -> Result<Window, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declaration_policy_subjects_match_raw_changed_subject_keys() {
+        let part = "a\nb\\c\u{200b}";
+        let name = pbps_model::TableName::new("app", part);
+        let mut schema = schema();
+        let mut table = schema.tables.pop_first().unwrap().1;
+        table.data = Some(pbps_model::TableData {
+            mode: pbps_model::DataMode::Ensure,
+            rows: [(pbps_model::RowKey::from("1"), Default::default())].into(),
+        });
+        schema.tables.insert(name, table);
+        let mut context = ctx();
+        context.only = Some([format!("app.{part}")].into());
+        for config in [
+            Policies::default(),
+            policies(r#"{"rules":{"naming.table":{"pattern":"never"}}}"#),
+            policies(r#"{"rules":{"data.max-rows":{"rows":0}}}"#),
+        ] {
+            let findings = declarations(&schema, &config, &context);
+            assert!(!findings.is_empty(), "{findings:?}");
+            assert!(
+                findings
+                    .iter()
+                    .all(|f| f.subject.as_deref() == Some(format!("app.{part}").as_str())),
+                "{findings:?}"
+            );
+        }
+        context.only = Some([r"app.a\nb\c\u{200b}".into()].into());
+        assert!(declarations(&schema, &Policies::default(), &context).is_empty());
+    }
+
+    #[test]
+    fn plan_policy_subjects_match_raw_changed_subject_keys() {
+        let part = "a\nb\\c\u{200b}";
+        let name = pbps_model::TableName::new("app", part);
+        let narrow = PlannedChange::new(Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: name.column(part),
+            from: "bigint".parse().unwrap(),
+            to: "int".parse().unwrap(),
+            from_nullable: true,
+            to_nullable: true,
+            through_external_partitions: false,
+            from_collation: None,
+            to_collation: None,
+        })
+        .with_risk(RiskClass::Narrowing);
+        let add = PlannedChange::new(Change::AddColumn {
+            uid: "c_bbbbbb".parse().unwrap(),
+            table: name,
+            name: "new".into(),
+            column: Box::new(Column::new("int".parse().unwrap())),
+        });
+        let changes = cs(vec![narrow, add]);
+        let mut context = ctx();
+        context.only = Some([format!("app.{part}")].into());
+        let findings = plan(&changes, &Policies::default(), &context);
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(
+            findings
+                .iter()
+                .all(|(_, f)| f.subject.as_deref() == Some(format!("app.{part}").as_str()))
+        );
+        let suppressed = |on: &str| {
+            serde_json::from_value(serde_json::json!({"suppress": [
+                {"rule": "change.expand-contract", "on": on, "reason": "test"},
+                {"rule": "change.narrowing-on-data", "on": on, "reason": "test"}
+            ]}))
+            .unwrap()
+        };
+        assert_eq!(
+            plan(&changes, &suppressed(r"app.a\nb\c\u{200b}"), &context).len(),
+            2
+        );
+        assert!(plan(&changes, &suppressed(&format!("app.{part}")), &context).is_empty());
+    }
+
     use super::*;
     use pbps_model::{Column, ColumnType, PlannedChange, Table};
 

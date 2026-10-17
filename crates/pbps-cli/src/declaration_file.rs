@@ -160,7 +160,8 @@ pub fn path(
         // the encoding must fail closed instead of reopening path traversal.
         bail!(
             "generated declaration path for `{name}` escaped `{}`",
-            directory.display()
+            directory.display(),
+            name = name.shown()
         );
     }
     Ok(path)
@@ -179,7 +180,10 @@ pub fn paths_of(
         if table.partition_of.is_some() {
             continue;
         }
-        out.push((name.to_string(), path(directory, &name.clone(), None)?));
+        out.push((
+            name.shown().to_string(),
+            path(directory, &name.clone(), None)?,
+        ));
     }
     for (id, module) in &schema.modules {
         out.push((

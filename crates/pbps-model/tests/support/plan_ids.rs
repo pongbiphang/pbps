@@ -7,6 +7,24 @@ use std::collections::{BTreeMap, BTreeSet};
 
 type Event<A> = (usize, Uid, Option<A>, Option<A>);
 
+#[test]
+fn baseline_fixture_table_identities_use_raw_name_seeds() {
+    let part = "a\nb\\c\u{200b}";
+    let name = TableName::new("app", part);
+    let mut before = Schema::default();
+    before.tables.insert(name.clone(), Default::default());
+    let actual = ids(&ChangeSet::default(), &before);
+    assert_eq!(
+        actual.table_uid(&name),
+        Some(&Uid::derived(UidKind::Table, &format!("app.{part}"), 0))
+    );
+    assert!(
+        actual
+            .table_uid(&TableName::new("app", r"a\nb\c\u{200b}"))
+            .is_none()
+    );
+}
+
 // This test-data builder only supplies identities; unrelated changes need no
 // fixture action. PlanNames still validates every explicit source and result.
 #[allow(clippy::wildcard_enum_match_arm)]
@@ -103,7 +121,7 @@ pub(crate) fn ids(changes: &ChangeSet, before: &Schema) -> IdsFile {
     ) {
         if !mentioned.contains(name) {
             start
-                .entry(Uid::derived(UidKind::Table, &name.to_string(), 0))
+                .entry(Uid::derived(UidKind::Table, &name.raw().to_string(), 0))
                 .or_insert_with(|| name.clone());
         }
     }

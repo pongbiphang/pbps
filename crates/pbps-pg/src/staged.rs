@@ -29,7 +29,8 @@ pub async fn execute(conn: &mut Conn, statement: &Statement) -> Result<(), DbErr
                 "Removing the temporary CHECK `{}` on `{}` failed; it may remain `NOT VALID`, \
                  which every read of the table refuses. `pbps baseline --reason ...` removes it \
                  by name before it records; the original error follows.",
-                check.name, check.table
+                check.name,
+                check.table.shown()
             ),
         };
         return Err(error.context(outcome));
@@ -51,7 +52,8 @@ pub async fn execute(conn: &mut Conn, statement: &Statement) -> Result<(), DbErr
     let row = rows.first().ok_or_else(|| {
         DbError::Refused(format!(
             "cannot prepare index build `{}`: table `{}` is absent",
-            build.name, build.table
+            build.name,
+            build.table.shown()
         ))
     })?;
     let table_oid = row
@@ -138,14 +140,16 @@ async fn remove_unvalidated(conn: &mut Conn, check: &ScanCheck) -> Result<String
     let Some(row) = rows.first() else {
         return Ok(format!(
             "The temporary CHECK `{}` is not on `{}`; nothing was removed.",
-            check.name, check.table
+            check.name,
+            check.table.shown()
         ));
     };
     if row.try_get::<&str>("kind")? != Some("c") || row.try_get::<bool>("validated")? != Some(false)
     {
         return Ok(format!(
             "`{}` on `{}` is not a `NOT VALID` CHECK, so it was left as it is.",
-            check.name, check.table
+            check.name,
+            check.table.shown()
         ));
     }
     let sql =
@@ -154,7 +158,8 @@ async fn remove_unvalidated(conn: &mut Conn, check: &ScanCheck) -> Result<String
     Ok(format!(
         "The temporary CHECK `{}` on `{}` was removed; the database is as the last \
          checkpoint recorded it.",
-        check.name, check.table
+        check.name,
+        check.table.shown()
     ))
 }
 

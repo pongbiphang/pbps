@@ -285,11 +285,11 @@ async fn rename_dependencies_execute_with_their_statement_time_names() {
                 Change::DropUnique { .. }
             ));
             assert!(
-                matches!(&changes.changes[2].change, Change::DropForeignKey { table, .. } if table.to_string() == "app.target")
+                matches!(&changes.changes[2].change, Change::DropForeignKey { table, .. } if table.raw().to_string() == "app.target")
             );
         } else if case == "fk_dependent" {
             assert!(
-                matches!(&changes.changes[0].change, Change::DropForeignKey { table, .. } if table.to_string() == "app.old")
+                matches!(&changes.changes[0].change, Change::DropForeignKey { table, .. } if table.raw().to_string() == "app.old")
             );
         } else if case == "index_cross" {
             // The freeing drop precedes the move, and so, since #969's review,
@@ -312,10 +312,10 @@ async fn rename_dependencies_execute_with_their_statement_time_names() {
             );
         } else if case.starts_with("owner_") {
             assert!(
-                matches!(&changes.changes[0].change, Change::RenameTable { to, .. } if to.to_string() == "app.owner_new")
+                matches!(&changes.changes[0].change, Change::RenameTable { to, .. } if to.raw().to_string() == "app.owner_new")
             );
             assert_eq!(
-                changes.changes[1].change.table().unwrap().to_string(),
+                changes.changes[1].change.table().unwrap().raw().to_string(),
                 "app.owner_new"
             );
         }
