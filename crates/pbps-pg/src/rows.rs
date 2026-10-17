@@ -690,8 +690,14 @@ pub(crate) fn unwrapped(default: &str) -> &str {
 /// the type the whole expression has, which is what the engine coerces to
 /// the column's (DECISIONS 361). `None` where nothing was cast.
 pub(crate) fn unwrapped_with_type(default: &str) -> (&str, Option<String>) {
+    let (core, casts) = unwrapped_with_casts(default);
+    (core, casts.into_iter().next())
+}
+
+// An inner domain coercion survives an outer cast back to the column's type.
+pub(crate) fn unwrapped_with_casts(default: &str) -> (&str, Vec<String>) {
     let mut s = default.trim();
-    let mut outermost = None;
+    let mut casts = Vec::new();
     loop {
         let before = s;
         s = crate::emit::without_trailing_trivia(crate::emit::after_the_gap(s).0);
@@ -699,15 +705,15 @@ pub(crate) fn unwrapped_with_type(default: &str) -> (&str, Option<String>) {
             s = s[1..s.len() - 1].trim();
         }
         if let Some((rest, ty)) = without_a_cast_typed(s) {
-            outermost.get_or_insert(ty);
+            casts.push(ty);
             s = rest;
         }
         if let Some((rest, ty)) = without_a_cast_call_typed(s) {
-            outermost.get_or_insert(ty);
+            casts.push(ty);
             s = rest;
         }
         if s == before {
-            return (s, outermost);
+            return (s, casts);
         }
     }
 }
