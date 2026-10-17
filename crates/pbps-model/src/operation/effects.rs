@@ -840,10 +840,18 @@ impl Cx<'_> {
                     }
                 }
                 self.row_meets_constraints(&owner, table, &written);
-                // A row's payload leaves its key column to `key`.
+                // A row's payload leaves its key column to `key`, and a
+                // column it omits takes its default: a literal one names the
+                // value as surely as a cell does.
                 let key_value = Value::Text(key.0.clone());
+                let literals: Vec<(&str, Value)> = defaults
+                    .iter()
+                    .filter(|(c, _)| !row.columns().any(|(r, _)| r == *c))
+                    .filter_map(|(c, expression)| Some((c.as_str(), literal_value(expression)?)))
+                    .collect();
                 let mut cells: Vec<(&str, &Value)> =
                     row.columns().map(|(c, v)| (c.as_str(), v)).collect();
+                cells.extend(literals.iter().map(|(c, v)| (*c, v)));
                 cells.push((key_column.as_str(), &key_value));
                 self.row_references(&owner, &cells, true);
                 self.row_aliases(&owner, &cells, None, false);
@@ -1783,7 +1791,8 @@ impl Cx<'_> {
         changed: Option<&[&str]>,
         ends: bool,
     ) {
-        let (Some((base_name, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner))
+        let (Some((base_name, was)), Some((will_name, will))) =
+            (self.base_of(owner), self.final_of(owner))
         else {
             return;
         };
@@ -1805,7 +1814,9 @@ impl Cx<'_> {
                 base_name,
             )
             .into_owned();
-        let table = if ends { was } else { will };
+        // A key that stands is the same on both sides, and a payload spells
+        // its columns by the names the plan ends with, an old value too.
+        let table = will;
         let mut keys: Vec<Vec<String>> = Vec::new();
         if let Some(pk) = &table.primary_key
             && pk.columns.len() > 1
@@ -1855,6 +1866,17 @@ impl Cx<'_> {
                         .collect::<Option<Vec<_>>>()
                 }),
         );
+        // The engine may rebuild a key around a retype of one of its columns
+        // (SQL Server drops and adds it), and it is absent while rows move.
+        let retyped = |column: &str| {
+            self.final_column(&will_name.column(column))
+                .and_then(|key| self.names_of(&key))
+                .is_some_and(|(was_name, now_name)| {
+                    was.columns.get(&was_name).map(|c| &c.ty)
+                        != will.columns.get(&now_name).map(|c| &c.ty)
+                })
+        };
+        keys.retain(|columns| !columns.iter().any(|c| retyped(c)));
         let mut made = Vec::new();
         for mut columns in keys {
             columns.sort();
@@ -1899,6 +1921,18 @@ impl Cx<'_> {
     /// The rows the baseline's constraints held: nothing here. Deleting a
     /// row is blocked by a child row only; that is `row_references`' edge.
     fn row_blockers_gone(&mut self, _owner: &Recorded) {}
+}
+
+/// The value a default expression spells when it is a plain literal: an
+/// integer, or a quoted string with no quote inside. Any other expression
+/// names no value before it runs.
+fn literal_value(expression: &str) -> Option<Value> {
+    let text = expression.trim();
+    if let Ok(i) = text.parse::<i64>() {
+        return Some(Value::Int(i));
+    }
+    let inner = text.strip_prefix('\'')?.strip_suffix('\'')?;
+    (!inner.contains('\'')).then(|| Value::Text(inner.to_owned()))
 }
 
 /// A value as the row keys spell it; NULL names nothing.
