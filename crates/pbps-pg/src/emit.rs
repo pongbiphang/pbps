@@ -1,3 +1,6 @@
+// Names in whole-escaped DialectError fields and shared probe text stay raw
+// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
+
 //! What one change looks like on PostgreSQL.
 //!
 //! The counterpart of `pbps-mssql/src/emit.rs`'s structural half, and the only
@@ -901,7 +904,8 @@ fn numbering(
     for source in [from, to] {
         if let ValueSource::Generated(_) = source {
             return Err(invalid(format!(
-                "{column}: a generated column has no numbering source to change"
+                "{column}: a generated column has no numbering source to change",
+                column = column.raw()
             )));
         }
     }
@@ -921,7 +925,8 @@ fn numbering(
          IF pbps.pbps_seq IS NULL THEN\n    {}\nEND IF;",
         refuse(&format!(
             "{column} is not numbered by a sequence it owns, as this plan expected; nothing \
-             was applied"
+             was applied",
+            column = column.raw()
         ))
     );
     let block = |body: &[String], variables: &[(&str, &str)]| {
@@ -2691,7 +2696,7 @@ fn the_body_declares_the_identity(
              engine the emitter writes `CREATE FUNCTION {}` and the declaration writes everything \
              after the name, so the list is the body's -- and **measured**, the engine requires \
              one: `CREATE FUNCTION f RETURNS int ...` is a syntax error",
-            id.object_name()
+            id.object_name().raw()
         ))];
     };
     let carried: Vec<&str> = parameters(list)
@@ -2812,14 +2817,16 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                          declaration holds -- `CREATE TRIGGER {} AFTER INSERT ON {on} ...` -- so a \
                          definition naming another table creates the trigger there, under this \
                          key, and the next plan cannot find it",
-                        id.name()
+                        id.name(),
+                        on = on.raw()
                     ))),
                     None => found.push(invalid(format!(
                         "trigger `{id}` has a definition this dialect cannot find an `ON \
                          <table>` in. That clause is what decides which table the trigger is \
                          created on, and it has to be the `{on}` this identity names -- so a \
                          definition whose target cannot be read is refused rather than created \
-                         somewhere this key does not point"
+                         somewhere this key does not point",
+                        on = on.raw()
                     ))),
                 }
             }
@@ -2979,7 +2986,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             column,
             collation: Some(collation),
             ..
-        } => Err(no_column_collation(&column.to_string(), collation)),
+        } => Err(no_column_collation(&column.raw().to_string(), collation)),
 
         Change::AlterColumnType {
             column,
@@ -3227,7 +3234,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             dialect: crate::types::DIALECT,
             message: format!(
                 "{} is a computed column, which this model holds for SQL Server only",
-                table.column(name)
+                table.column(name).raw()
             ),
         }),
         Change::AlterColumnExpression { column, to, .. } => one(
@@ -3751,7 +3758,8 @@ fn no_column_collation(column: &str, collation: &pbps_model::Collation) -> Diale
 fn no_clustered_layout(table: &TableName) -> DialectError {
     invalid(format!(
         "`{table}`: a clustered or nonclustered layout is SQL Server's; PostgreSQL has no \
-         clustered index to create"
+         clustered index to create",
+        table = table.raw()
     ))
 }
 
@@ -3789,14 +3797,19 @@ pub(crate) fn moving_beyond_its_intent(
              partition beside it, and no move of them was allowed, which may be seen by \
              whatever reads the database's changes; nothing was moved. Allow it with \
              `pbps move-rows {partition} --max-rows <N> --reason <why>` and plan again, or \
-             move them by hand, in one transaction: {by_hand}"
+             move them by hand, in one transaction: {by_hand}",
+            default = default.raw(),
+            partition = partition.raw(),
+            parent = parent.raw()
         ),
         Some(most) => format!(
             "rows of {default} are {inside} {partition}, more than the {most} its \
              allowed move may take; nothing was moved. Move them by hand: create the table and \
              move the rows a batch at a time, then run the last batch and the attach in one \
              transaction with the DEFAULT locked, as in: {by_hand} Or allow more with \
-             `pbps move-rows {partition} --max-rows <N> --reason <why>` and plan again."
+             `pbps move-rows {partition} --max-rows <N> --reason <why>` and plan again.",
+            default = default.raw(),
+            partition = partition.raw()
         ),
     })
 }
@@ -4220,11 +4233,14 @@ fn beside_its_default(
             "a publication publishes inserts into every table, or every table of {}, so the rows \
              moved into {name} before it is attached would reach subscribers as rows of a table \
              they do not have; nothing was moved",
-            name.schema
+            name.schema,
+            name = name.raw()
         )),
         published = refuse(format!(
             "a publication publishes deletes from {default}, so moving its rows of the range of \
-             {name} would send subscribers their delete and not their insert; nothing was moved"
+             {name} would send subscribers their delete and not their insert; nothing was moved",
+            default = default.raw(),
+            name = name.raw()
         )),
         reaches =
             crate::preflight::delete_reaches(&format!("{}::pg_catalog.regclass", literal(&d))),
@@ -4245,20 +4261,28 @@ fn beside_its_default(
         )),
         statement = refuse(format!(
             "a statement trigger or rule on {default} fires on the delete that moves its rows of \
-             the range of {name} into it; nothing was moved"
+             the range of {name} into it; nothing was moved",
+            default = default.raw(),
+            name = name.raw()
         )),
         row = refuse(format!(
             "a row trigger on {default} fires on the delete that would move its rows of the range \
-             of {name} into it; nothing was moved"
+             of {name} into it; nothing was moved",
+            default = default.raw(),
+            name = name.raw()
         )),
         hidden = refuse(format!(
             "a table with a foreign key whose action a delete from {default} fires is under \
              row-level security, so the rows referencing the rows the move would take into \
-             {name} cannot all be counted; nothing was moved"
+             {name} cannot all be counted; nothing was moved",
+            default = default.raw(),
+            name = name.raw()
         )),
         referenced = refuse(format!(
             "rows reference rows of {default} the move would take into {name}, and the delete \
-             would fire the action of their foreign key; nothing was moved"
+             would fire the action of their foreign key; nothing was moved",
+            default = default.raw(),
+            name = name.raw()
         )),
         // The rows it counts and locks are the rows it would move: none
         // without a move a human allowed, at most its bound with one
@@ -4285,7 +4309,9 @@ fn beside_its_default(
         recomputed = refuse(format!(
             "moving its rows of the range of {name} out of {default} would change the value of a \
              generated column, which the new partition computes otherwise (as one of its \
-             tableoid does); nothing was moved"
+             tableoid does); nothing was moved",
+            name = name.raw(),
+            default = default.raw()
         )),
     );
     let tag = dollar_tag(&body);
@@ -4391,7 +4417,10 @@ fn create_table(
         return Ok(out);
     }
     if table.columns.is_empty() {
-        return Err(invalid(format!("table `{name}` has no columns")));
+        return Err(invalid(format!(
+            "table `{name}` has no columns",
+            name = name.raw()
+        )));
     }
     if table.clustered.is_some() {
         return Err(no_clustered_layout(name));
@@ -4974,7 +5003,8 @@ fn wrote_the_row(
             "{table} row `{key}` is not what this plan wrote once the statement had run -- a \
              trigger on the table, another writer inside it, or a value the engine stores \
              differently from the way it is declared. Nothing was applied; `pbps plan --db` \
-             says which."
+             says which.",
+            table = table.raw()
         ))
     ))
 }
@@ -5028,7 +5058,8 @@ fn gone_row(
         key_equals(key_column, key, key_type)?,
         refuse(&format!(
             "{table} row `{key}` is back after this plan deleted it -- a trigger on the table, \
-             or another writer inside it. Nothing was applied."
+             or another writer inside it. Nothing was applied.",
+            table = table.raw()
         ))
     ))
 }
@@ -5043,7 +5074,8 @@ fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
         "GET DIAGNOSTICS pbps.pbps_rows = ROW_COUNT;\nIF pbps.pbps_rows <> 1 THEN\n    {}\nEND IF;",
         refuse(&format!(
             "{table} row `{key}` is not as the plan recorded it: changed or deleted since the \
-             plan was made. Plan again."
+             plan was made. Plan again.",
+            table = table.raw()
         ))
     )
 }
@@ -5076,7 +5108,8 @@ fn insert_row(
              writes a pinned key with `OVERRIDING SYSTEM VALUE` and leaves the sequence behind: \
              the apply succeeds, the plan verifies clean, and the next insert from anywhere else \
              fails on the primary key (ADR-0013 section 2). Declare the rows by a natural key, or place \
-             them outside pbps and adopt them with `pbps baseline`."
+             them outside pbps and adopt them with `pbps baseline`.",
+            table = table.raw()
         )));
     }
     let mut columns = vec![quote(key_column)?];
@@ -5188,7 +5221,8 @@ fn update_row(
     // writing `UPDATE t SET WHERE ...` keeps that guarantee checkable.
     if sets.is_empty() {
         return Err(invalid(format!(
-            "{table}: a row update with no changed column"
+            "{table}: a row update with no changed column",
+            table = table.raw()
         )));
     }
     let mut sql = format!(

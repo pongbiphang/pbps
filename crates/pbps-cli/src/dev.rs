@@ -415,10 +415,12 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
                 match stored {
                     Some(stored) => spelling.push(format!(
                         "check {name} on {table}: declared `{}`, the engine stores `{stored}`",
-                        constraint.expression
+                        constraint.expression,
+                        table = table.shown()
                     )),
                     None => structural.push(format!(
-                        "check {name} on {table} is declared but the plan did not create it"
+                        "check {name} on {table} is declared but the plan did not create it",
+                        table = table.shown()
                     )),
                 }
             }
@@ -436,7 +438,8 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
                         | pbps_model::ValueSource::Sequence(_)
                         | pbps_model::ValueSource::Generated(_) => None,
                     })
-                    .unwrap_or("(none)")
+                    .unwrap_or("(none)"),
+                column = column.shown()
             )),
             // A module whose stored body still differs is not layout: the
             // difference already survived `Dialect::normalize_definition`, and
@@ -475,7 +478,8 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
             {
                 for (column, (from, to)) in columns {
                     spelling.push(format!(
-                        "row {key} of {table}, column {column}: declared {to}, the engine stores {from}"
+                        "row {key} of {table}, column {column}: declared {to}, the engine stores {from}",
+                        table = table.shown(),
                     ));
                 }
             }

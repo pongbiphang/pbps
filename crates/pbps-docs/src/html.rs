@@ -121,7 +121,7 @@ fn modules_section(s: &mut String, modules: &BTreeMap<ModuleId, Module>) {
         );
         let on = name
             .attached_to()
-            .map(|t| format!(" on {}", esc(&t.to_string())))
+            .map(|t| format!(" on {}", esc(&t.raw().to_string())))
             .unwrap_or_default();
         let _ = writeln!(s, "<p class=\"muted\">{}{on}</p>", m.kind);
         if let Some(d) = &m.description {
@@ -165,8 +165,8 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
     let _ = writeln!(
         s,
         "<h3 id=\"{}\">{}</h3>",
-        esc(&name.to_string()),
-        code(&name.to_string())
+        esc(&name.raw().to_string()),
+        code(&name.raw().to_string())
     );
     if let Some(d) = &table.description {
         let _ = writeln!(s, "<p>{}</p>", esc(d.raw()));
@@ -229,7 +229,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             "<strong>Foreign key</strong> {}: {} &rarr; {} ({})",
             code(n),
             columns(&fk.columns),
-            code(&fk.references_table.to_string()),
+            code(&fk.references_table.raw().to_string()),
             columns(&fk.references_columns)
         ));
     }
@@ -273,7 +273,10 @@ fn deprecated_section(s: &mut String, schema: &Schema) {
     for (name, table) in &schema.tables {
         for (col_name, c) in &table.columns {
             if let Some(reason) = &c.deprecated {
-                rows.push((format!("{name}.{col_name}"), reason.clone()));
+                rows.push((
+                    format!("{name}.{col_name}", name = name.raw()),
+                    reason.clone(),
+                ));
             }
         }
     }

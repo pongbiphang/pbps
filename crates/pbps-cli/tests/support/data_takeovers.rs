@@ -99,7 +99,7 @@ fn assert_takeover(saved: &SavedPlan, table: &str, mode: DataMode) {
         .iter()
         .filter_map(|planned| {
             if let Change::SetDataMode { table, from, to } = &planned.change {
-                Some((table.to_string(), *from, *to))
+                Some((table.raw().to_string(), *from, *to))
             } else {
                 None
             }
@@ -278,7 +278,7 @@ fn assert_keys(saved: &SavedPlan, table: &str, from: &[&str], to: &[&str]) {
         .iter()
         .filter_map(|p| {
             if let Change::SetEnsureKeys { table, from, to } = &p.change {
-                Some((table.to_string(), from.clone(), to.clone()))
+                Some((table.raw().to_string(), from.clone(), to.clone()))
             } else {
                 None
             }

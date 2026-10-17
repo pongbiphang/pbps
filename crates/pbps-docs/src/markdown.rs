@@ -64,7 +64,7 @@ fn modules_section(s: &mut String, modules: &BTreeMap<ModuleId, Module>) {
         let _ = writeln!(s, "\n### `{name}`\n");
         let on = name
             .attached_to()
-            .map(|t| format!(" on `{t}`"))
+            .map(|t| format!(" on `{t}`", t = t.raw()))
             .unwrap_or_default();
         let _ = writeln!(s, "*{}{on}*\n", m.kind);
         if let Some(d) = &m.description {
@@ -99,7 +99,7 @@ fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
 }
 
 fn one_table(s: &mut String, name: &TableName, table: &Table) {
-    let _ = writeln!(s, "\n### `{name}`\n");
+    let _ = writeln!(s, "\n### `{name}`\n", name = name.raw());
     if let Some(d) = &table.description {
         let _ = writeln!(s, "{}\n", d.raw());
     }
@@ -155,7 +155,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             s,
             "- **Foreign key** `{n}`: {} → `{}` ({})",
             columns(&fk.columns),
-            fk.references_table,
+            fk.references_table.raw(),
             columns(&fk.references_columns)
         );
     }
@@ -220,7 +220,10 @@ fn deprecated_section(s: &mut String, schema: &Schema) {
     for (name, table) in &schema.tables {
         for (col_name, c) in &table.columns {
             if let Some(reason) = &c.deprecated {
-                rows.push((format!("{name}.{col_name}"), reason.clone()));
+                rows.push((
+                    format!("{name}.{col_name}", name = name.raw()),
+                    reason.clone(),
+                ));
             }
         }
     }

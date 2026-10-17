@@ -1,3 +1,6 @@
+// Estimate descriptions are shared cost JSON; keep operands raw until #2084 step 5 (DEC-2084.1).
+// The cost text renderer escapes the complete description once.
+
 //! Measured offline ALTER COLUMN costs, never correctness risk or approval.
 //!
 //! SQL Server updates rows in place: unchanged allocation IDs do not prove a
@@ -356,7 +359,8 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 Estimate {
                     about: format!(
                         "changing {column} to {to} {}",
-                        if to_nullable { "NULL" } else { "NOT NULL" }
+                        if to_nullable { "NULL" } else { "NOT NULL" },
+                        column = column.raw()
                     ),
                     table: column.table.clone(),
                     rewrite,

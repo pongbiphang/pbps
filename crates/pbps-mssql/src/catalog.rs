@@ -1021,8 +1021,8 @@ pub async fn prove_referrers_visible(
             let object =
                 TableName::new(get::<&str>(row, "to_schema")?, get::<&str>(row, "to_name")?);
             Ok(match opt::<&str>(row, "to_column")? {
-                Some(column) => format!("`{object}.{column}`"),
-                None => format!("`{object}`"),
+                Some(column) => format!("`{object}.{column}`", object = object.shown()),
+                None => format!("`{object}`", object = object.shown()),
             })
         })
         .collect::<Result<_, DbError>>()?;

@@ -97,15 +97,15 @@ fn saved_rename_dependencies_apply_and_record_only_surviving_objects() {
         // The saved typed order and address are the ones approved and replayed.
         if case == "fk_dependent" {
             assert!(
-                matches!(&saved.changes.changes[0].change, Change::DropForeignKey { table, .. } if table.to_string() == "app.old")
+                matches!(&saved.changes.changes[0].change, Change::DropForeignKey { table, .. } if table.raw().to_string() == "app.old")
             );
         } else if case.starts_with("index_") {
             assert!(
-                matches!(&saved.changes.changes[0].change, Change::DropIndex { table, .. } if table.to_string() == "app.old")
+                matches!(&saved.changes.changes[0].change, Change::DropIndex { table, .. } if table.raw().to_string() == "app.old")
             );
         } else if case.starts_with("owner_") {
             assert!(
-                matches!(&saved.changes.changes[0].change, Change::RenameTable { to, .. } if to.to_string() == "app.owner_new")
+                matches!(&saved.changes.changes[0].change, Change::RenameTable { to, .. } if to.raw().to_string() == "app.owner_new")
             );
         }
         let denied = approved_apply(&d, connection, &artifact, &[]);

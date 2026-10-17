@@ -1313,7 +1313,7 @@ async fn read_clones(
         }
         carries.extend(own.into_iter().map(|c| Carried {
             what: c.what,
-            detail: format!("on its clone on `{on}`: {}", c.detail),
+            detail: format!("on its clone on `{on}`: {}", c.detail, on = on.shown()),
         }));
     }
     Ok(())

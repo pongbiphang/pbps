@@ -969,7 +969,7 @@ fn weave(
                     } = &p.change
                         && parent == table
                     {
-                        Some(t.to_string())
+                        Some(t.shown().to_string())
                     } else {
                         None
                     }
@@ -980,7 +980,8 @@ fn weave(
                     "`{root}` is rebuilt while this plan detaches {} from {table}, whose {} \
                      calls it; rebuild it and detach in separate plans",
                     moving.join(", "),
-                    d.described
+                    d.described,
+                    table = table.shown()
                 ));
             }
         }
@@ -1794,7 +1795,7 @@ fn before_its_partitions_indexes(
             // `k` is a parent's `AddIndex`, as every adoption's first end is.
             let named = |i: usize| {
                 if let Change::AddIndex { table, name, .. } = &cs.changes[i].change {
-                    (name.clone(), table.to_string())
+                    (name.clone(), table.shown().to_string())
                 } else {
                     (cs.changes[i].change.subject(), String::new())
                 }
@@ -1976,7 +1977,12 @@ fn after_their_parents_defaults(
                     .iter()
                     .find_map(|ids| ids.table_uid(&partition))
                     .cloned()
-                    .ok_or_else(|| format!("no identity names the partition `{partition}`"))?;
+                    .ok_or_else(|| {
+                        format!(
+                            "no identity names the partition `{partition}`",
+                            partition = partition.shown()
+                        )
+                    })?;
                 let fallback = parent_default(declared, &partition, &column.name);
                 cs.changes.insert(
                     i + 1,
@@ -2500,7 +2506,10 @@ pub(crate) fn names_a_later_relation(
                         searched.push(relation.schema.clone());
                     }
                     found.push(LaterName {
-                        what: format!("{whose} names {relation}, which the plan creates after it"),
+                        what: format!(
+                            "{whose} names {relation}, which the plan creates after it",
+                            relation = relation.shown()
+                        ),
                         searched,
                         name,
                     });
@@ -3201,7 +3210,7 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
     let column = |table: &TableName, name: &str, c: &pbps_model::Column| {
         column_expression(c).map(|e| {
             (
-                format!("{}'s default or expression", table.column(name)),
+                format!("{}'s default or expression", table.column(name).shown()),
                 e.to_owned(),
             )
         })
@@ -3223,7 +3232,7 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
                 .filter_map(|(n, own)| {
                     own.default
                         .clone()
-                        .map(|d| (format!("{}'s own default", name.column(n)), d))
+                        .map(|d| (format!("{}'s own default", name.column(n).shown()), d))
                 })
                 .map(at(AT_CREATE)),
         );
@@ -3231,7 +3240,12 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
             table
                 .checks
                 .iter()
-                .map(|(n, c)| (format!("check {n} on {name}"), c.expression.clone()))
+                .map(|(n, c)| {
+                    (
+                        format!("check {n} on {name}", name = name.shown()),
+                        c.expression.clone(),
+                    )
+                })
                 .map(at(CHECKS)),
         );
         // Counted over every index, so `k` matches `relations_brought`.
@@ -3244,7 +3258,7 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
                 .map(|(k, (n, ix))| {
                     (
                         index_step(k),
-                        format!("index {n} on {name}"),
+                        format!("index {n} on {name}", name = name.shown()),
                         index_text(ix),
                     )
                 }),
@@ -3262,7 +3276,10 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
             column,
             to: Some(to),
             ..
-        } => vec![(format!("{column}'s default"), to.clone())],
+        } => vec![(
+            format!("{column}'s default", column = column.shown()),
+            to.clone(),
+        )],
         Change::SetPartitionDefault {
             table,
             column,
@@ -3272,23 +3289,34 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
         } => to
             .as_ref()
             .or(fallback.as_ref())
-            .map(|text| (format!("{}'s default", table.column(column)), text.clone()))
+            .map(|text| {
+                (
+                    format!("{}'s default", table.column(column).shown()),
+                    text.clone(),
+                )
+            })
             .into_iter()
             .collect(),
         Change::AlterColumnExpression { column, to, .. } => {
-            vec![(format!("{column}'s generation expression"), to.clone())]
+            vec![(
+                format!("{column}'s generation expression", column = column.shown()),
+                to.clone(),
+            )]
         }
         Change::AddCheck {
             table,
             name,
             constraint,
         } => vec![(
-            format!("check {name} on {table}"),
+            format!("check {name} on {table}", table = table.shown()),
             constraint.expression.clone(),
         )],
         Change::AddIndex {
             table, name, index, ..
-        } => vec![(format!("index {name} on {table}"), index_text(index))],
+        } => vec![(
+            format!("index {name} on {table}", table = table.shown()),
+            index_text(index),
+        )],
         Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
             vec![(format!("{id}"), module.definition.clone())]
         }
@@ -3515,7 +3543,9 @@ fn after_their_functions(
             "{name} is made beside the DEFAULT partition {default} and takes its rows, but an \
              index or check of its own names a column this plan adds after a function the \
              column calls, so the move would have to wait for that function and let past it \
-             what must follow the move. Add the column in one plan and the partition in the next."
+             what must follow the move. Add the column in one plan and the partition in the next.",
+            name = name.shown(),
+            default = default.shown()
         ));
     }
     let mut preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
@@ -3575,7 +3605,7 @@ fn cycle(
             .into();
     };
     let column = match &cs.changes[at].change {
-        Change::AddColumn { table, name, .. } => format!("{table}.{name}"),
+        Change::AddColumn { table, name, .. } => format!("{table}.{name}", table = table.shown()),
         Change::CreateTable { name, table, .. } => table
             .columns
             .iter()
@@ -3587,8 +3617,8 @@ fn cycle(
                 | ValueSource::Sequence(_) => false,
             })
             .map_or_else(
-                || name.to_string(),
-                |(column, _)| format!("{name}.{column}"),
+                || name.shown().to_string(),
+                |(column, _)| format!("{name}.{column}", name = name.shown()),
             ),
         other => format!("{other:?}"),
     };
@@ -3599,9 +3629,10 @@ fn cycle(
             !done[i] && start + i != at && needs(window[i], window[at - start], deps, partitions)
         })
         .filter_map(|i| match window[i] {
-            Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => {
-                Some(format!("a row this plan writes into `{table}`"))
-            }
+            Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } => Some(format!(
+                "a row this plan writes into `{table}`",
+                table = table.shown()
+            )),
             _ => module(start + i),
         })
         .collect();
@@ -3712,7 +3743,7 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Parti
 /// as `may_call` reads a function's (DEC-1364.1).
 fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
     let named = |text: &str| pbps_pg::generated::may_call(text, &made.name);
-    let typed = |base: &str| base == made.name || base == made.to_string();
+    let typed = |base: &str| base == made.name || base == made.raw().to_string();
     table.columns.values().any(|column| {
         typed(&column.ty.base)
             || match &column.value_source {
@@ -3927,6 +3958,21 @@ mod physical_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_raw_qualified_row_type_matches_its_new_table_name() {
+        let part = "a\nb\\c\u{200b}";
+        let name = pbps_model::TableName::new("app", part);
+        let mut table = pbps_model::Table::default();
+        table.columns.insert(
+            "value".into(),
+            pbps_model::Column::new(pbps_model::ColumnType::simple(format!("app.{part}"))),
+        );
+        assert!(super::names_new_table(&table, &name));
+        // A literal escape is a different type name from the raw character.
+        table.columns["value"].ty = pbps_model::ColumnType::simple(r"app.a\nb\c\u{200b}");
+        assert!(!super::names_new_table(&table, &name));
+    }
+
     use super::fixture::{unaccounted, weave};
     use super::*;
     use pbps_model::{CheckConstraint, Column, Module, Table, TableName, Uid, UidKind};
@@ -4827,7 +4873,7 @@ mod tests {
         let created =
             |name: &str| at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id(name)));
         let table_at = |name: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
         };
         let order = names(&cs);
         assert!(created("app.f(integer)") < table_at("app.n"), "{order:?}");
@@ -4897,7 +4943,7 @@ mod tests {
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
         };
         let function =
             at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
@@ -4997,7 +5043,7 @@ mod tests {
         let function =
             at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
         let create = |n: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name, .. } if name.to_string() == n))
+            at(&|c| matches!(c, Change::CreateTable { name, .. } if name.raw().to_string() == n))
         };
         let set = at(&|c| matches!(c, Change::SetPartitionDefault { .. }));
         assert_eq!(create("app.ev_1"), 0, "{order:?}");
@@ -5013,7 +5059,12 @@ mod tests {
             unreachable!()
         };
         assert_eq!(
-            (table.to_string(), column.as_str(), from, to.as_deref()),
+            (
+                table.raw().to_string(),
+                column.as_str(),
+                from,
+                to.as_deref()
+            ),
             ("app.ev_1".to_owned(), "v", &None, Some("app.f(1)")),
         );
         // The create no longer carries the default it hands over; a default
@@ -5222,7 +5273,7 @@ mod tests {
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
         };
         let function =
             at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f(integer)")));
@@ -5366,7 +5417,7 @@ mod tests {
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
         };
         let function =
             at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id("app.f()")));
@@ -5377,7 +5428,7 @@ mod tests {
         assert!(added < table_at("app.ev_ix"), "{order:?}");
         let default_at = |table: &str| {
             at(
-                &|c| matches!(c, Change::SetPartitionDefault { table: t, .. } if t.to_string() == table),
+                &|c| matches!(c, Change::SetPartitionDefault { table: t, .. } if t.raw().to_string() == table),
             )
         };
         assert!(added < default_at("app.ev_1"), "{order:?}");
@@ -5386,7 +5437,7 @@ mod tests {
             "{order:?}"
         );
         let index_at = |table: &str| {
-            at(&|c| matches!(c, Change::AddIndex { table: t, .. } if t.to_string() == table))
+            at(&|c| matches!(c, Change::AddIndex { table: t, .. } if t.raw().to_string() == table))
         };
         assert!(added < index_at("app.ev_3"), "{order:?}");
         // Negative: an index of a table that is no partition of the parent.
@@ -5484,7 +5535,7 @@ mod tests {
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
-            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.to_string() == name))
+            at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
         };
         let created = at(&|c| matches!(c, Change::CreateModule { .. }));
         let order = names(&cs);
@@ -5517,7 +5568,7 @@ mod tests {
             cs.changes
                 .iter()
                 .position(|p| {
-                    matches!(&p.change, Change::CreateTable { name: n, .. } if n.to_string() == name)
+                    matches!(&p.change, Change::CreateTable { name: n, .. } if n.raw().to_string() == name)
                         || matches!(&p.change, Change::CreateModule { id, .. } if id.to_string() == name)
                 })
                 .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
@@ -5551,7 +5602,7 @@ mod tests {
             cs.changes
                 .iter()
                 .position(|p| {
-                    matches!(&p.change, Change::CreateTable { name: n, .. } if n.to_string() == name)
+                    matches!(&p.change, Change::CreateTable { name: n, .. } if n.raw().to_string() == name)
                         || matches!(&p.change, Change::CreateModule { id, .. } if id.to_string() == name)
                 })
                 .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
@@ -6114,9 +6165,9 @@ mod tests {
             .iter()
             .filter_map(|p| {
                 if let Change::DropCheck { table, name } = &p.change {
-                    Some(format!("drop {table} {name}"))
+                    Some(format!("drop {table} {name}", table = table.shown()))
                 } else if let Change::AddCheck { table, name, .. } = &p.change {
-                    Some(format!("add {table} {name}"))
+                    Some(format!("add {table} {name}", table = table.shown()))
                 } else if let Change::AttachPartition { .. } = &p.change {
                     Some("attach".to_owned())
                 } else if let Change::AlterModule { .. } = &p.change {
@@ -6753,7 +6804,10 @@ mod tests {
             ColumnRef::new(ev.clone(), "n"),
         );
         let default_on = |table: &TableName| Dependent {
-            described: format!("default value for column n of table {table}"),
+            described: format!(
+                "default value for column n of table {table}",
+                table = table.shown()
+            ),
             holds: Holds::TablePart {
                 table: table.clone(),
                 part: Part::Default("n".into()),
@@ -7082,8 +7136,10 @@ mod tests {
         for (name, own) in [("t_1", None), ("t_2", Some("app.f(2)")), ("t_3", Some("5"))] {
             let name = TableName::new("app", name);
             s.tables.insert(name.clone(), partition(own));
-            ids.tables
-                .insert(Uid::derived(UidKind::Table, &name.to_string(), 0), name);
+            ids.tables.insert(
+                Uid::derived(UidKind::Table, &name.raw().to_string(), 0),
+                name,
+            );
         }
         let default_on = |table: &str| Dependent {
             described: format!("default value for column n of table app.{table}"),
@@ -7214,9 +7270,9 @@ mod tests {
             .iter()
             .filter_map(|p| match &p.change {
                 Change::DropCheck { table, .. } | Change::AddCheck { table, .. } => {
-                    Some(table.to_string())
+                    Some(table.raw().to_string())
                 }
-                Change::AlterColumnDefault { column, .. } => Some(column.to_string()),
+                Change::AlterColumnDefault { column, .. } => Some(column.raw().to_string()),
                 _ => None,
             })
             .collect();
@@ -7446,7 +7502,7 @@ mod tests {
         weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
         match &cs.changes[0].change {
             Change::DropCheck { table, name } => {
-                assert_eq!(table.to_string(), "app.t");
+                assert_eq!(table.raw().to_string(), "app.t");
                 assert_eq!(name, "ck");
             }
             other => panic!("expected the moved removal first, got {other:?}"),
@@ -8470,7 +8526,7 @@ mod tests {
             }
         };
         let rename = |from: TableName, to: TableName| Change::RenameTable {
-            uid: Uid::derived(UidKind::Table, &from.to_string(), 0),
+            uid: Uid::derived(UidKind::Table, &from.raw().to_string(), 0),
             from,
             to,
             defaults: Vec::new(),

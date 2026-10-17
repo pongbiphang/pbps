@@ -1,3 +1,5 @@
+// Shared check descriptions and recorded removal notes remain raw until #2084 step 5 (DEC-2084.1); text output escapes them.
+
 //! The connected seam: one function per question a command asks a database,
 //! answered by whichever engine the connection is to.
 //!
@@ -103,7 +105,8 @@ pub async fn operational_cost(
                 changes.push(ChangeCost::Available {
                     change_index,
                     about: e.about,
-                    table: e.table.to_string(),
+                    // Raw JSON field; #2084 step 5 (DEC-2084.1) owns its presentation boundary.
+                    table: e.table.raw().to_string(),
                     rewrite: e.rewrite.into(),
                     reads: e.reads.into(),
                     lock: e.lock.to_owned(),
@@ -150,12 +153,17 @@ pub async fn operational_cost(
                 changes.push(ChangeCost::Available {
                     change_index,
                     about: e.about,
-                    table: e.table.to_string(),
+                    // Raw JSON field; #2084 step 5 (DEC-2084.1) owns its presentation boundary.
+                    table: e.table.raw().to_string(),
                     rewrite: e.rewrite.into(),
                     reads: e.reads.into(),
                     lock: e.lock.to_string(),
                     blocks: e.lock.blocks().to_owned(),
-                    also_locks: e.also_locks.iter().map(ToString::to_string).collect(),
+                    also_locks: e
+                        .also_locks
+                        .iter()
+                        .map(|name| name.raw().to_string())
+                        .collect(),
                     rows: match e.rows {
                         Some(pg::Rows::Estimated(count)) => Rows::Estimated { count },
                         Some(pg::Rows::NeverAnalyzed) => Rows::NeverAnalyzed,
@@ -210,9 +218,10 @@ pub async fn remove_scan_checks(
         .map(|check| {
             let said = format!(
                 "the staged attach's temporary CHECK `{}` on `{}`",
-                check.name, check.table
+                check.name,
+                check.table.raw()
             );
-            println!("Removed {said}.");
+            println!("Removed {}.", pbps_model::escape::Escaped(&said));
             said
         })
         .collect())
@@ -1199,7 +1208,10 @@ pub async fn prove_tables_absent(conn: &mut Conn, missing: &[TableName]) -> anyh
 /// intact to be redacted, and a failed bootstrap records this (DECISIONS 455,
 /// #1605 review).
 fn absence_unproven(missing: &[TableName], error: DbError) -> anyhow::Error {
-    let names: Vec<String> = missing.iter().map(ToString::to_string).collect();
+    let names: Vec<String> = missing
+        .iter()
+        .map(|name| name.shown().to_string())
+        .collect();
     anyhow::Error::new(error).context(format!(
         "cannot record {} as missing; record the state with a login that can see those \
          schemas, so a table hidden from this one is not taken for one that is gone",
@@ -1926,7 +1938,9 @@ pub(crate) fn order_after_releases(
                     "{column} is dropped in this plan, and {what} {c} may read it: once {c} \
                      reads it, the drop is refused, and before that the expression names a \
                      column that is gone. Change that expression in a plan of its own first, or \
-                     write it without {column}."
+                     write it without {column}.",
+                    column = column.shown(),
+                    c = c.shown()
                 ));
             }
         }
@@ -1980,7 +1994,7 @@ pub(crate) fn order_after_releases(
                     let column = changed_column(&names, &changes.changes[first].change)
                         .map_or_else(
                             || changes.changes[first].change.subject(),
-                            |c| c.2.to_string(),
+                            |c| c.2.shown().to_string(),
                         );
                     let waiting: Vec<String> = waiting
                         .iter()
@@ -2073,7 +2087,8 @@ fn keep_ahead(
                  follows `{}`: the column is NOT NULL with no default, so that row, which \
                  does not write it, is refused while the column stands. Apply the \
                  expression change in a plan of its own first, then this one.",
-                insert.subject()
+                insert.subject(),
+                column = column.shown(),
             ),
         );
     }
@@ -2092,7 +2107,8 @@ fn keep_ahead(
                 "{column} is released from its generated column by an expression change in \
                  this plan, and `{}` takes its name before that change runs. Apply the \
                  expression change in a plan of its own first, then this one.",
-                taker.subject()
+                taker.subject(),
+                column = column.shown()
             ),
         );
     }
@@ -2113,7 +2129,8 @@ fn keep_ahead(
                 "{column} is retyped after the expression change that releases it, which \
                  follows `{}`: that change may need the new type. Apply the expression \
                  change in a plan of its own first, then this one.",
-                past.subject()
+                past.subject(),
+                column = column.shown()
             ),
         );
     }
@@ -2210,7 +2227,9 @@ fn unreleased(
                  from it: the engine refuses to retype such a column and drops it only with \
                  CASCADE. Drop the generated column in the same plan, or change its expression \
                  to one that does not name `{}`.",
-                d.generated, column.name
+                d.generated,
+                column.name,
+                column = column.shown()
             ));
         }
     }
@@ -2243,7 +2262,11 @@ pub async fn logical_slots(conn: &mut Conn, changes: &ChangeSet) -> anyhow::Resu
                 ..
             } = &p.change
             {
-                Some(format!("{default} into {name}"))
+                Some(format!(
+                    "{default} into {name}",
+                    default = default.raw(),
+                    name = name.raw()
+                ))
             } else {
                 None
             }
@@ -2333,7 +2356,8 @@ pub async fn generation_support(
         for column in &expressions {
             problems.push(format!(
                 "{column}: changing a generated column's expression needs PostgreSQL 17 or \
-                 later (`SET EXPRESSION`), and this server is {version}"
+                 later (`SET EXPRESSION`), and this server is {version}",
+                column = column.shown()
             ));
         }
     }

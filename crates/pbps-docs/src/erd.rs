@@ -39,7 +39,7 @@ fn entity(name: &TableName) -> String {
 /// must not activate its global `style`/`classDef` preprocessing (DEC-1799.1).
 fn alias(name: &TableName) -> String {
     let mut label = String::new();
-    for c in name.to_string().chars() {
+    for c in name.raw().to_string().chars() {
         if c.is_control()
             || matches!(
                 c,

@@ -1,3 +1,6 @@
+// Names in whole-escaped DialectError fields and shared probe text stay raw
+// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
+
 //! What SQL Server will refuse, checked before anything is generated.
 //!
 //! These are the errors worth catching in `pbps validate`, where the user sees
@@ -90,7 +93,7 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                 errs.push(invalid(format!(
                     "role `{name}`: `{r}` names an argument list; SQL Server identifies a routine \
                      by name alone, so grant on `{}` instead",
-                    r.name
+                    r.name.raw()
                 )));
                 vec![&r.name.schema, &r.name.name]
             }
@@ -127,7 +130,8 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
         let Some(applicable) = kind.permissions() else {
             errs.push(invalid(format!(
                 "grants on `{object}`, a trigger, which takes no permission at all: the engine \
-                 has none on triggers — grant on the table it fires on instead"
+                 has none on triggers — grant on the table it fires on instead",
+                object = object.raw()
             )));
             continue;
         };
@@ -143,7 +147,8 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                         .iter()
                         .map(|p| p.as_str())
                         .collect::<Vec<_>>()
-                        .join(", ")
+                        .join(", "),
+                    object = object.raw()
                 )));
             }
         }
@@ -386,7 +391,8 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
              name alone",
             module.kind,
             spelled.join(","),
-            module.kind
+            module.kind,
+            name = name.raw()
         )));
     }
 
@@ -394,7 +400,8 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
     if body.is_empty() {
         errs.push(invalid(format!(
             "{} `{name}` has an empty definition",
-            module.kind
+            module.kind,
+            name = name.raw()
         )));
     }
 
@@ -413,7 +420,8 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
         errs.push(invalid(format!(
             "{} `{name}` contains a `GO` batch separator; a module is one batch, and `GO` is a \
              client instruction rather than something the server understands",
-            module.kind
+            module.kind,
+            name = name.raw()
         )));
     }
 
@@ -432,7 +440,8 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
         errs.push(invalid(format!(
             "{} `{name}` is declared WITH ENCRYPTION, whose definition cannot be read back; \
              pbps cannot manage it (ADR-0002)",
-            module.kind
+            module.kind,
+            name = name.raw()
         )));
     }
 
@@ -445,10 +454,13 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
             }
         }
         (ModuleKind::Trigger, _) => errs.push(invalid(format!(
-            "trigger `{name}` does not say which table it is on (`on:`)"
+            "trigger `{name}` does not say which table it is on (`on:`)",
+            name = name.raw()
         ))),
         (kind, ModuleId::Trigger { on, .. }) => errs.push(invalid(format!(
-            "`{name}` is a {kind} and cannot be `on: {on}`; only a trigger names a table"
+            "`{name}` is a {kind} and cannot be `on: {on}`; only a trigger names a table",
+            name = name.raw(),
+            on = on.raw()
         ))),
         (_, ModuleId::Named(_) | ModuleId::Routine(_)) => {}
     }
@@ -1086,7 +1098,8 @@ fn system_time(
         }
         if &v.history == name {
             errs.push(invalid(format!(
-                "`system_time` names `{name}` itself as its history table; name another table"
+                "`system_time` names `{name}` itself as its history table; name another table",
+                name = name.raw()
             )));
         }
         // Its index is `ix_` and the name, which the engine cuts at 127
@@ -1098,7 +1111,7 @@ fn system_time(
                 "history table `{}` has a name longer than 124 characters (UTF-16 units, as \
                  SQL Server counts them), which leaves its index, `ix_` and the name, no room in \
                  SQL Server's 128; name it shorter",
-                v.history
+                v.history.raw()
             )));
         }
         // The engine keeps history for at most 1000 years, in any unit

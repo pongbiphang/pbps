@@ -167,7 +167,8 @@ impl Created<'_> {
             for extra in now.difference(&was) {
                 moved.push(format!(
                     "{now_name} {kind} `{extra}` is there, and this plan declares no such \
-                     {kind}"
+                     {kind}",
+                    now_name = now_name.shown()
                 ));
             }
             // Only once every statement has run: a foreign key is split
@@ -177,7 +178,8 @@ impl Created<'_> {
                 for missing in was.difference(&now) {
                     moved.push(format!(
                         "{now_name} {kind} `{missing}` is not there, and this plan's \
-                         `CREATE TABLE` declares it"
+                         `CREATE TABLE` declares it",
+                        now_name = now_name.shown()
                     ));
                 }
             }
@@ -237,7 +239,8 @@ impl Created<'_> {
             if !as_declared {
                 moved.push(format!(
                     "{now_name} column `{n}` is not the one this plan's `CREATE TABLE` \
-                     declares"
+                     declares",
+                    now_name = now_name.shown()
                 ));
             }
         }
@@ -268,7 +271,8 @@ impl Created<'_> {
             && place(declared.partition_of.as_ref()) != place(now.partition_of.as_ref())
         {
             moved.push(format!(
-                "{now_name} is not attached to the parent and range this plan declares"
+                "{now_name} is not attached to the parent and range this plan declares",
+                now_name = now_name.shown()
             ));
         }
         // With the defaults this plan sets after the `CREATE`, as a
@@ -278,7 +282,8 @@ impl Created<'_> {
         if settled.whole() && finished != own(now.partition_of.as_ref()) {
             moved.push(format!(
                 "{now_name}'s own column defaults or NOT NULLs are not the ones this plan's \
-                 `CREATE TABLE` declares"
+                 `CREATE TABLE` declares",
+                now_name = now_name.shown()
             ));
         }
         // A computed column is held to its persistence, and to NOT NULL
@@ -290,7 +295,8 @@ impl Created<'_> {
             {
                 moved.push(format!(
                     "{now_name} computed column `{n}` is not the one this plan's `CREATE \
-                     TABLE` declares"
+                     TABLE` declares",
+                    now_name = now_name.shown()
                 ));
             }
         }
@@ -305,7 +311,8 @@ impl Created<'_> {
             {
                 moved.push(format!(
                     "{now_name} unique `{n}` is not the one this plan's `CREATE TABLE` \
-                     declares"
+                     declares",
+                    now_name = now_name.shown()
                 ));
             }
         }
@@ -319,7 +326,8 @@ impl Created<'_> {
                 && was != now
             {
                 moved.push(format!(
-                    "{now_name} foreign key `{n}` is not the one this plan adds"
+                    "{now_name} foreign key `{n}` is not the one this plan adds",
+                    now_name = now_name.shown()
                 ));
             }
         }
@@ -329,7 +337,8 @@ impl Created<'_> {
             {
                 moved.push(format!(
                     "{now_name} index `{n}` is not the one this plan's `CREATE TABLE` \
-                     declares"
+                     declares",
+                    now_name = now_name.shown()
                 ));
             }
         }
@@ -337,12 +346,14 @@ impl Created<'_> {
             && !primary_key_as_declared(was, now)
         {
             moved.push(format!(
-                "{now_name} primary key is not the one this plan's `CREATE TABLE` declares"
+                "{now_name} primary key is not the one this plan's `CREATE TABLE` declares",
+                now_name = now_name.shown()
             ));
         }
         if self.finished.primary_key.is_none() && now.primary_key.is_some() {
             moved.push(format!(
-                "{now_name} has a primary key, and this plan declares none"
+                "{now_name} has a primary key, and this plan declares none",
+                now_name = now_name.shown()
             ));
         }
         // Which index holds the rows (#1178). A staged checkpoint can land
@@ -352,7 +363,8 @@ impl Created<'_> {
         // is held once the object it names is there.
         if !super::parts::created_layout(&self.finished, now, settled.whole()) {
             moved.push(format!(
-                "{now_name} is not clustered the way this plan's `CREATE TABLE` declares"
+                "{now_name} is not clustered the way this plan's `CREATE TABLE` declares",
+                now_name = now_name.shown()
             ));
         }
         // The replica identity is the `CREATE`'s last statement (#1444):
@@ -366,7 +378,8 @@ impl Created<'_> {
         {
             moved.push(format!(
                 "{now_name} replica identity is not the one this plan's `CREATE TABLE` \
-                 declares"
+                 declares",
+                now_name = now_name.shown()
             ));
         }
         // In the `CREATE` itself, so held from the first read that finds
@@ -378,7 +391,8 @@ impl Created<'_> {
                     "unlogged"
                 } else {
                     "logged"
-                }
+                },
+                now_name = now_name.shown()
             ));
         }
         // In the `CREATE` itself, period and versioning, so held from the
@@ -387,7 +401,8 @@ impl Created<'_> {
         if &declared.system_time != now.system_time {
             moved.push(format!(
                 "{now_name} period or system versioning is not what this plan's `CREATE \
-                 TABLE` declares"
+                 TABLE` declares",
+                now_name = now_name.shown()
             ));
         }
         // In the `CREATE` itself (`WITH`), so held from the first read
@@ -395,12 +410,14 @@ impl Created<'_> {
         if &declared.storage_parameters != now.storage_parameters {
             moved.push(format!(
                 "{now_name} storage parameters are not the ones this plan's `CREATE TABLE` \
-                 declares"
+                 declares",
+                now_name = now_name.shown()
             ));
         }
         if settled.whole() && self.finished.primary_key.is_some() && now.primary_key.is_none() {
             moved.push(format!(
-                "{now_name} has no primary key, and this plan's `CREATE TABLE` declares one"
+                "{now_name} has no primary key, and this plan's `CREATE TABLE` declares one",
+                now_name = now_name.shown()
             ));
         }
     }

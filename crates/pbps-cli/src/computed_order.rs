@@ -211,7 +211,7 @@ pub(crate) fn order_by_edges(
                          and SQL Server refuses that while the computed column stands. Drop the \
                          computed column, or change its expression, in a plan of its own first, \
                          then this one.",
-                        e.from
+                        e.from.shown()
                     ));
                 }
             }
@@ -234,7 +234,8 @@ pub(crate) fn order_by_edges(
                         "computed column {}.{computed} calls `{function}`, which this plan {what}, \
                          and SQL Server refuses that while the column calls it. Apply the \
                          function change and the computed column change in separate plans.",
-                        e.from
+                        e.from.shown(),
+                        function = function.shown()
                     ));
                 }
             }
@@ -252,7 +253,9 @@ pub(crate) fn order_by_edges(
                         "computed column {table}.{name} is dropped by this plan, and the \
                          schema-bound {} reads it. Drop {}, or recreate it without \
                          SCHEMABINDING, in a plan of its own first, then this one.",
-                        e.from, e.from
+                        e.from.shown(),
+                        e.from.shown(),
+                        table = table.shown()
                     ));
                 }
             }
@@ -433,7 +436,9 @@ pub(crate) fn refuse_added_calls(
                     refused.push(format!(
                         "computed column {table}.{column} calls `{function}` as `{schema}.{name}` \
                          under the database's collation, and this plan {what} it. Apply the \
-                         function change and the computed column change in separate plans."
+                         function change and the computed column change in separate plans.",
+                        table = table.shown(),
+                        function = function.shown()
                     ));
                 }
             }

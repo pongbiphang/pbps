@@ -29,55 +29,58 @@ fn conflicting_default_and_identity_do_not_invent_an_omitted_value_error() {
 
 #[test]
 fn source_only_changes_remain_visible_to_since_policy_filtering() {
-    let p = Project::new();
-    p.write("pbps.yml", "dialect: mssql\npolicies:\n  rules:\n    naming.table: {severity: error, pattern: '[a-z_]+'}\n");
-    let ordinary = "table: dbo.OldTable\ncolumns:\n  id: {type: int, nullable: false}\n";
-    p.write("schema/a.yml", ordinary);
-    p.run(&["plan"], 0);
-    for args in [
-        vec!["add", "."],
-        vec![
-            "-c",
-            "user.name=Fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "-qm",
-            "baseline",
-        ],
-    ] {
-        let result = std::process::Command::new("git")
-            .args(args)
-            .current_dir(&p.0)
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
+    for name in ["dbo.OldTable", "dbo.a\nb\\c\u{200b}"] {
+        let p = Project::new();
+        p.write("pbps.yml", "dialect: mssql\npolicies:\n  rules:\n    naming.table: {severity: error, pattern: '[a-z_]+'}\n");
+        let ordinary = "table: dbo.OldTable\ncolumns:\n  id: {type: int, nullable: false}\n"
+            .replace("dbo.OldTable", &serde_json::to_string(name).unwrap());
+        p.write("schema/a.yml", &ordinary);
+        p.run(&["plan"], 0);
+        for args in [
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "baseline",
+            ],
+        ] {
+            let result = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&p.0)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+        p.run(&["validate", "--since", "HEAD", "--format", "json"], 0);
+        p.write(
+            "schema/a.yml",
+            &ordinary.replace(
+                "nullable: false",
+                "nullable: false, default: '7', identity: [1, 1]",
+            ),
         );
+        let capture = p.run(&["validate", "--since", "HEAD", "--format", "json"], 2);
+        let json: serde_json::Value = serde_json::from_str(&capture.stdout).unwrap();
+        assert!(
+            json["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["id"] == "naming.table"),
+            "{json}"
+        );
+        // An unchanged ordinary table still receives gradual-adoption filtering.
+        p.write("schema/a.yml", &ordinary);
+        p.run(&["validate", "--since", "HEAD", "--format", "json"], 0);
     }
-    p.run(&["validate", "--since", "HEAD", "--format", "json"], 0);
-    p.write(
-        "schema/a.yml",
-        &ordinary.replace(
-            "nullable: false",
-            "nullable: false, default: '7', identity: [1, 1]",
-        ),
-    );
-    let capture = p.run(&["validate", "--since", "HEAD", "--format", "json"], 2);
-    let json: serde_json::Value = serde_json::from_str(&capture.stdout).unwrap();
-    assert!(
-        json["findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|f| f["id"] == "naming.table"),
-        "{json}"
-    );
-    // An unchanged ordinary table still receives gradual-adoption filtering.
-    p.write("schema/a.yml", ordinary);
-    p.run(&["validate", "--since", "HEAD", "--format", "json"], 0);
 }
 
 fn sources(mask: u8) -> String {

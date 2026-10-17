@@ -429,7 +429,7 @@ impl Owners for PlanOwners<'_> {
             ids.table_uid(name)
                 .cloned()
                 .ok_or_else(|| OwnerError::Unmanaged {
-                    name: name.to_string(),
+                    name: name.shown().to_string(),
                     spelling,
                 })
         };
@@ -438,7 +438,11 @@ impl Owners for PlanOwners<'_> {
             Spelling::Final => recorded(&self.desired),
             Spelling::At(_) => {
                 let at = self.inside(spelling)?;
-                held(self.names.holder(name, at), name.to_string(), spelling)
+                held(
+                    self.names.holder(name, at),
+                    name.shown().to_string(),
+                    spelling,
+                )
             }
         }
     }
@@ -448,7 +452,7 @@ impl Owners for PlanOwners<'_> {
             ids.column_uid(column)
                 .cloned()
                 .ok_or_else(|| OwnerError::Unmanaged {
-                    name: column.to_string(),
+                    name: column.shown().to_string(),
                     spelling,
                 })
         };
@@ -459,7 +463,7 @@ impl Owners for PlanOwners<'_> {
                 let at = self.inside(spelling)?;
                 held(
                     self.names.column_holder(column, at),
-                    column.to_string(),
+                    column.shown().to_string(),
                     spelling,
                 )
             }

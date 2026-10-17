@@ -122,8 +122,9 @@ impl Schema {
                             "{name}: foreign key `{fk_name}` joins `{local}` ({}) to {}.`{referenced}` \
                              ({}); both sides of a foreign key must declare the same collation",
                             say(&l.collation),
-                            fk.references_table,
-                            say(&r.collation)
+                            fk.references_table.shown(),
+                            say(&r.collation),
+                            name = name.shown(),
                         ));
                     }
                 }

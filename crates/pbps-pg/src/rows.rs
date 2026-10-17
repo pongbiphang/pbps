@@ -1695,7 +1695,7 @@ pub(crate) fn data_problems(
              deployment succeeds and the application breaks afterwards. There is nothing pbps \
              can safely do to the sequence (ADR-0013 section 2). Declare the rows by a natural \
              key, or place them outside pbps and adopt them with `pbps baseline`.",
-            crate::emit::owned_sequence(name, key, sequence)
+            crate::emit::owned_sequence(name, key, sequence).raw()
         )));
     }
 
@@ -1829,6 +1829,7 @@ fn not_a_bytea(text: &str) -> Option<&'static str> {
 /// A note rather than silence, because a command that reports clean about a
 /// question it never asked is the shape this project's own rule is about:
 /// absent, empty and unreadable are three different answers (DECISIONS 327).
+// Shared finding JSON stays raw until #2084 step 5 (DEC-2084.1); text escapes it once.
 pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
     let mut out = Vec::new();
     for (name, table) in &schema.tables {
@@ -1854,7 +1855,8 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
                  nondeterministic collation makes `New` and `new` one key and the second insert \
                  fails on the primary key. `pbps plan --db` asks the engine; this run did not \
                  (ADR-0013 section 5).",
-                data.rows.len()
+                data.rows.len(),
+                name = name.raw(),
             ));
         }
         let Some(column) = table.columns.get(&key) else {
@@ -1887,7 +1889,8 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
             "`{name}`: this run did not check whether each declared row key converts to \
              `{ty}`, the type of `{key}`, and reads back with the same spelling. Even one \
              key can be refused or respelled by the engine. `pbps plan --db` checks the \
-             key conversion and spelling against the live column."
+             key conversion and spelling against the live column.",
+            name = name.raw()
         ));
     }
     out
@@ -3101,12 +3104,12 @@ mod tests {
         let queries = list_collision_queries(&schema).unwrap();
         assert_eq!(queries.len(), 1, "{queries:#?}");
         let (parent, q) = &queries[0];
-        assert_eq!(parent.to_string(), "app.l");
+        assert_eq!(parent.raw().to_string(), "app.l");
         assert_eq!(q.ty, "numeric");
         let entries: Vec<(String, &str)> = q
             .entries
             .iter()
-            .map(|(t, v)| (t.to_string(), v.as_str()))
+            .map(|(t, v)| (t.raw().to_string(), v.as_str()))
             .collect();
         assert_eq!(
             entries,

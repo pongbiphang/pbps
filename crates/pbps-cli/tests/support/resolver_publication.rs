@@ -158,7 +158,7 @@ pub fn published(server: &str) {
         .iter()
         .filter_map(|p| {
             if let pbps_model::Change::SetEnsureKeys { table, from, to } = &p.change {
-                Some((table.to_string(), from.clone(), to.clone()))
+                Some((table.raw().to_string(), from.clone(), to.clone()))
             } else {
                 None
             }

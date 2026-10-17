@@ -207,13 +207,15 @@ fn surface_verdict(resolution: &SurfaceResolution) -> SurfaceVerdict {
 }
 
 fn surface(surface: &Surface) -> String {
+    // This becomes Text and JSON; rendering escapes it once. Keep the input
+    // raw until #2084 step 5 (DEC-2084.1) removes the shared-sentence boundary.
     match surface {
         Surface::Namespace(name) => format!("schema {name}"),
-        Surface::Table(table) => format!("table {table}"),
-        Surface::Column(column) => format!("column {column}"),
-        Surface::Default(column) => format!("default {column}"),
-        Surface::Check { table, name } => format!("check {table}.{name}"),
-        Surface::Index { table, name } => format!("index {table}.{name}"),
+        Surface::Table(table) => format!("table {table}", table = table.raw()),
+        Surface::Column(column) => format!("column {column}", column = column.raw()),
+        Surface::Default(column) => format!("default {column}", column = column.raw()),
+        Surface::Check { table, name } => format!("check {table}.{name}", table = table.raw()),
+        Surface::Index { table, name } => format!("index {table}.{name}", table = table.raw()),
         Surface::Module(module) => format!("module {module}"),
     }
 }
@@ -346,6 +348,55 @@ pub fn render(detail: &ResolverDetail, changes: &pbps_model::ChangeSet) -> Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn surface_descriptions_keep_raw_json_and_are_shown_once() {
+        let part = "a\nb\\c\u{200b}";
+        let shown = r"a\nb\\c\u{200b}";
+        let table = pbps_model::TableName::new("app", part);
+        for (subject, expected, escaped) in [
+            (
+                Surface::Table(table.clone()),
+                format!("table app.{part}"),
+                format!("table app.{shown}"),
+            ),
+            (
+                Surface::Column(table.column(part)),
+                format!("column app.{part}.{part}"),
+                format!("column app.{shown}.{shown}"),
+            ),
+            (
+                Surface::Default(table.column(part)),
+                format!("default app.{part}.{part}"),
+                format!("default app.{shown}.{shown}"),
+            ),
+            (
+                Surface::Check {
+                    table: table.clone(),
+                    name: part.into(),
+                },
+                format!("check app.{part}.{part}"),
+                format!("check app.{shown}.{shown}"),
+            ),
+            (
+                Surface::Index {
+                    table: table.clone(),
+                    name: part.into(),
+                },
+                format!("index app.{part}.{part}"),
+                format!("index app.{shown}.{shown}"),
+            ),
+        ] {
+            let raw = Text::new(surface(&subject));
+            assert_eq!(raw.raw(), expected);
+            assert_eq!(raw.shown().to_string(), escaped);
+        }
+        let ordinary = Surface::Table(pbps_model::TableName::new("app", "名前"));
+        assert_eq!(
+            Text::new(surface(&ordinary)).shown().to_string(),
+            "table app.名前"
+        );
+    }
+
     use super::*;
 
     fn detail(scratch: &'static str, image: Option<&str>, writes: &'static str) -> ResolverDetail {

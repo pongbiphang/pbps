@@ -1,3 +1,5 @@
+// Shared catalog, check and unmanaged inventories stay raw for JSON until #2084 step 5 (DEC-2084.1); text boundaries escape them.
+
 //! The commands that need a database: recording state, adopting a database, and
 //! building one from the declarations (SPEC §8, §9.2).
 //!
@@ -249,22 +251,28 @@ fn refuse_occupied_names(
     use pbps_model::Change;
     let relation = |name: &TableName| -> Option<String> {
         if scoped.unmanaged.contains(name) && !unmanaged_relations.contains(name) {
-            return Some(format!("table `{name}`"));
+            return Some(format!("table `{name}`", name = name.shown()));
         }
         // Only a relation shares this namespace: an unreadable aggregate
         // `app.x(integer)` or a trigger named `x` coexists with a table
         // `app.x`, and refusing it would refuse a plan the engine takes.
         let a_relation = |t: &pbps_db::catalog::LimitationTarget| matches!(t, pbps_db::catalog::LimitationTarget::Relation(n) if n == name);
         if let Some((_, why)) = unreadable.iter().find(|(t, _)| a_relation(t)) {
-            return Some(format!("`{name}`, which pbps cannot read ({why})"));
+            return Some(format!(
+                "`{name}`, which pbps cannot read ({why})",
+                name = name.shown()
+            ));
         }
         if unmanaged_relations.contains(name) {
-            return Some(format!("`{name}`, a relation pbps cannot read"));
+            return Some(format!(
+                "`{name}`, a relation pbps cannot read",
+                name = name.shown()
+            ));
         }
         scoped
             .unmanaged_modules
             .contains(&ModuleId::Named(name.clone()))
-            .then(|| format!("view `{name}`"))
+            .then(|| format!("view `{name}`", name = name.shown()))
     };
     let dropped: BTreeSet<&ModuleId> = cs
         .changes
@@ -277,7 +285,10 @@ fn refuse_occupied_names(
     let mut taken: Vec<String> = Vec::new();
     for p in &cs.changes {
         let (declared, occupant) = match &p.change {
-            Change::CreateTable { name, .. } => (format!("table `{name}`"), relation(name)),
+            Change::CreateTable { name, .. } => (
+                format!("table `{name}`", name = name.shown()),
+                relation(name),
+            ),
             Change::CreateModule { id, module } if !dropped.contains(id) => {
                 let occupant = match id {
                     ModuleId::Named(name) => relation(name),
@@ -298,7 +309,8 @@ fn refuse_occupied_names(
     for name in created_index_names(cs) {
         if let Some(occupant) = relation(&name) {
             taken.push(format!(
-                "index `{name}`: the database already has {occupant}"
+                "index `{name}`: the database already has {occupant}",
+                name = name.shown()
             ));
         }
     }
@@ -574,7 +586,12 @@ fn name_clashes(
     let mut present = Occupant::all(occupants);
     let mut held: Vec<(TableName, String)> = relations
         .iter()
-        .map(|(name, kind)| (name.clone(), format!("{kind} `{name}` already is")))
+        .map(|(name, kind)| {
+            (
+                name.clone(),
+                format!("{kind} `{name}` already is", name = name.shown()),
+            )
+        })
         .collect();
     let mut created: BTreeSet<TableName> = BTreeSet::new();
     let mut taken: Vec<(Option<usize>, String)> = Vec::new();
@@ -610,9 +627,12 @@ fn name_clashes(
                     Some((_, q)) => Some(match &q.carried {
                         Some((f, t)) => format!(
                             "{} `{}`, which the rename of `{f}` to `{t}` moves there first",
-                            q.found.kind, q.found.name
+                            q.found.kind,
+                            q.found.name.shown(),
+                            f = f.shown(),
+                            t = t.shown()
                         ),
-                        None => format!("{} `{}` already is", q.found.kind, q.name),
+                        None => format!("{} `{}` already is", q.found.kind, q.name.shown()),
                     }),
                     None => held
                         .iter()
@@ -625,7 +645,11 @@ fn name_clashes(
                         format!(
                             "`{}`: this plan moves {} `{}` on `{from}` there, with the rename of \
                              `{from}` to `{to}`, where {there}",
-                            o.name, o.found.kind, o.found.name
+                            o.name.shown(),
+                            o.found.kind,
+                            o.found.name.shown(),
+                            from = from.shown(),
+                            to = to.shown()
                         ),
                     ));
                 }
@@ -642,9 +666,12 @@ fn name_clashes(
                     .map(|q| match &q.carried {
                         Some((f, t)) => format!(
                             "{} `{}`, which the rename of `{f}` to `{t}` moves there first",
-                            q.found.kind, q.found.name
+                            q.found.kind,
+                            q.found.name.shown(),
+                            f = f.shown(),
+                            t = t.shown()
                         ),
-                        None => format!("{} `{}` already is", q.found.kind, q.name),
+                        None => format!("{} `{}` already is", q.found.kind, q.name.shown()),
                     })
                     .or_else(|| {
                         held.iter()
@@ -661,7 +688,10 @@ fn name_clashes(
                         Some(at),
                         format!(
                             "`{name}`: this plan renames `{from}` to `{to}`, which takes \
-                             `{name}`{how}, where {there}"
+                             `{name}`{how}, where {there}",
+                            name = name.shown(),
+                            from = from.shown(),
+                            to = to.shown()
                         ),
                     ));
                 }
@@ -669,7 +699,11 @@ fn name_clashes(
             // The table itself holds its new name from here on.
             held.push((
                 to.clone(),
-                format!("table `{to}`, which the rename of `{from}` to `{to}` moves there first"),
+                format!(
+                    "table `{to}`, which the rename of `{from}` to `{to}` moves there first",
+                    to = to.shown(),
+                    from = from.shown()
+                ),
             ));
         }
         for name in relation_names_created(&p.change) {
@@ -849,12 +883,23 @@ impl<'a> Occupant<'a> {
         match (&self.carried, &self.found.owner) {
             (Some((from, to)), _) => format!(
                 "`{name}`: this plan moves {kind} `{found}` on `{from}` there first, with the \
-                 rename of `{from}` to `{to}`"
+                 rename of `{from}` to `{to}`",
+                name = name.shown(),
+                found = found.shown(),
+                from = from.shown(),
+                to = to.shown()
             ),
             (None, Some(owner)) => {
-                format!("`{name}`: the database already has {kind} `{name}` on `{owner}`")
+                format!(
+                    "`{name}`: the database already has {kind} `{name}` on `{owner}`",
+                    name = name.shown(),
+                    owner = owner.shown()
+                )
             }
-            (None, None) => format!("`{name}`: the database already has {kind} `{name}`"),
+            (None, None) => format!(
+                "`{name}`: the database already has {kind} `{name}`",
+                name = name.shown()
+            ),
         }
     }
 }
@@ -1010,7 +1055,7 @@ pub(crate) fn refuse_permanent_referencers(
             let through = if r.table == r.root_table {
                 String::new()
             } else {
-                format!(" (on its partition {} as `{}`)", r.table, r.key)
+                format!(" (on its partition {} as `{}`)", r.table.shown(), r.key)
             };
             lines.push(format!(
                 "{partition} would be {} unlogged under {parent}, which {}'s foreign key \
@@ -1021,9 +1066,11 @@ pub(crate) fn refuse_permanent_referencers(
                 } else {
                     "created"
                 },
-                r.root_table,
+                r.root_table.shown(),
                 r.root_key,
-                r.table
+                r.table.shown(),
+                partition = partition.shown(),
+                parent = parent.shown()
             ));
         }
     }
@@ -1529,13 +1576,24 @@ impl<'f> Walk<'f> {
     fn refuse(&mut self, step: usize, name: &TableName, at: usize) {
         let h = &self.held[at];
         let what = match &h.parent {
-            Some(parent) => format!("{} `{}` on `{parent}`", h.kind, h.name),
-            None => format!("{} `{}`", h.kind, h.name),
+            Some(parent) => format!(
+                "{} `{}` on `{parent}`",
+                h.kind,
+                h.name.shown(),
+                parent = parent.shown()
+            ),
+            None => format!("{} `{}`", h.kind, h.name.shown()),
         };
         let line = if h.planned {
-            format!("`{name}`: this plan puts {what} there first")
+            format!(
+                "`{name}`: this plan puts {what} there first",
+                name = name.shown()
+            )
         } else {
-            format!("`{name}`: the database already has {what}")
+            format!(
+                "`{name}`: the database already has {what}",
+                name = name.shown()
+            )
         };
         self.taken.push(Taken {
             step,
@@ -2465,7 +2523,10 @@ async fn refuse_taken_history_names(
             format!(
                 "{table} names {history} as its history table, and the database already has {} \
                  `{}`",
-                o.kind, o.name
+                o.kind,
+                o.name.shown(),
+                table = table.shown(),
+                history = history.shown()
             )
         })
         .collect();
@@ -2744,20 +2805,30 @@ pub(crate) async fn refuse_misspelt(
             .map(|m| match (&m.column, &m.canonical) {
                 (None, None) => format!(
                     "{} row key `{}` cannot be read as {} by the engine",
-                    m.table, m.key, m.ty
+                    m.table.shown(),
+                    m.key,
+                    m.ty
                 ),
                 (None, Some(canonical)) => format!(
                     "{} row key `{}` is read back by the engine as {:?}; write it that way",
-                    m.table, m.key, canonical
+                    m.table.shown(),
+                    m.key,
+                    canonical
                 ),
                 (Some(c), None) => format!(
                     "{} row `{}`: `{c}` = {:?} cannot be read as {} by the engine",
-                    m.table, m.key, m.declared, m.ty
+                    m.table.shown(),
+                    m.key,
+                    m.declared,
+                    m.ty
                 ),
                 (Some(c), Some(canonical)) => format!(
                     "{} row `{}`: `{c}` is written {:?}, and the engine reads it back as {:?}; \
                  write it that way",
-                    m.table, m.key, m.declared, canonical
+                    m.table.shown(),
+                    m.key,
+                    m.declared,
+                    canonical
                 ),
             }),
     );
@@ -2766,12 +2837,17 @@ pub(crate) async fn refuse_misspelt(
     lines.extend(found.bounds.iter().map(|b| match &b.canonical {
         None => format!(
             "partition {} bound on `{}`: {:?} cannot be read as {} by the engine",
-            b.partition, b.column, b.declared, b.ty
+            b.partition.shown(),
+            b.column,
+            b.declared,
+            b.ty
         ),
         Some(canonical) => format!(
             "partition {} bound on `{}` is written {:?}, and the engine reads it back as \
              {canonical:?}; write it that way",
-            b.partition, b.column, b.declared
+            b.partition.shown(),
+            b.column,
+            b.declared
         ),
     }));
     // A partition's own default stored as its parent's reads back as none of
@@ -2780,7 +2856,10 @@ pub(crate) async fn refuse_misspelt(
         format!(
             "partition {} column `{}`: its own default {:?} is stored as {:?}, which is its \
              parent's; drop the partition's own default, it is the parent's",
-            d.partition, d.column, d.declared, d.stored
+            d.partition.shown(),
+            d.column,
+            d.declared,
+            d.stored
         )
     }));
     let mut sections = Vec::new();
@@ -2804,7 +2883,11 @@ pub(crate) async fn refuse_misspelt(
             .map(|c| {
                 format!(
                     "`{}` takes {:?} and `{}` takes {:?} of `{}`",
-                    c.first.0, c.first.1, c.second.0, c.second.1, c.parent
+                    c.first.0.shown(),
+                    c.first.1,
+                    c.second.0.shown(),
+                    c.second.1,
+                    c.parent.shown()
                 )
             })
             .collect();
@@ -2928,16 +3011,21 @@ fn ambiguous_line(a: &pbps_db::catalog::Ambiguous) -> String {
             table,
             key,
             column: None,
-        } => format!("{table} row key `{key}`"),
+        } => format!("{table} row key `{key}`", table = table.shown()),
         LiteralAt::Cell {
             table,
             key,
             column: Some(c),
-        } => format!("{table} row `{key}`: `{c}`"),
+        } => format!("{table} row `{key}`: `{c}`", table = table.shown()),
         LiteralAt::Bound { partition, column } => {
-            format!("partition {partition} bound on `{column}`")
+            format!(
+                "partition {partition} bound on `{column}`",
+                partition = partition.shown()
+            )
         }
-        LiteralAt::Default { table, column } => format!("{table} column `{column}` default"),
+        LiteralAt::Default { table, column } => {
+            format!("{table} column `{column}` default", table = table.shown())
+        }
     };
     match &a.pinned {
         None => format!(
@@ -2980,7 +3068,7 @@ fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
     // reported as drift by the `verify` immediately after.
     for name in schema.tables.keys() {
         out.entry(name.schema.clone())
-            .or_insert_with(|| format!("the schema of `{name}`"));
+            .or_insert_with(|| format!("the schema of `{name}`", name = name.shown()));
     }
     for id in schema.modules.keys() {
         out.entry(id.schema().to_owned())
@@ -2994,8 +3082,12 @@ fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
             .as_ref()
             .and_then(|st| st.versioning.as_ref())
         {
-            out.entry(v.history.schema.clone())
-                .or_insert_with(|| format!("the schema of `{name}`'s history table"));
+            out.entry(v.history.schema.clone()).or_insert_with(|| {
+                format!(
+                    "the schema of `{name}`'s history table",
+                    name = name.shown()
+                )
+            });
         }
     }
     out
@@ -3108,7 +3200,7 @@ fn key_type_changes_over_aliases(
                 "{}: this plan changes the type of its key column `{}` ({from} -> {to}), and \
                  these declared keys are spelled differently from the way the engine spells \
                  them: {}",
-                column.table,
+                column.table.shown(),
                 column.name,
                 aliased.join(", ")
             ));
@@ -3214,6 +3306,8 @@ pub(crate) fn managed_limitations(
     modules: &std::collections::BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
 ) -> Vec<String> {
+    // Catalog refusal/detail prose already contains shown names beside rendered
+    // errors; preserve that single pass until #2084 step 5 (DEC-2084.1).
     let mut managed_tables: std::collections::BTreeSet<_> = ids.tables.values().collect();
     // A partition of a managed parent whose partitions are external (#1533)
     // is held only as its parent makes it: what the catalog read could not
@@ -3245,7 +3339,9 @@ pub(crate) fn managed_limitations(
                 .map(|m| {
                     format!(
                         "{} {} is in the managed set, but {}",
-                        m.kind, m.target, m.why
+                        m.kind,
+                        pbps_model::escape::Escaped(&m.target.to_string()),
+                        m.why
                     )
                 }),
         )
@@ -3513,7 +3609,12 @@ pub(crate) fn unreadable_modules(
         .map(|module| {
             (
                 module.target.clone(),
-                format!("{} {} ({})", module.kind, module.target, module.why),
+                format!(
+                    "{} {} ({})",
+                    module.kind,
+                    pbps_model::escape::Escaped(&module.target.to_string()),
+                    module.why
+                ),
             )
         })
         .collect()
@@ -3528,17 +3629,30 @@ pub(crate) fn unmanaged_objects(
     ids: &IdsFile,
     managed_modules: &std::collections::BTreeSet<ModuleId>,
 ) -> Vec<String> {
+    // Operator-facing labels only: the machine inventory remains typed and raw
+    // in Scoped/DriftReport.unmanaged. Show its names before combining them with
+    // unreadable-module prose until #2084 step 5 (DEC-2084.1).
     let managed_tables = ids.tables.values().collect();
     scoped
         .unmanaged
         .iter()
-        .map(ToString::to_string)
-        .chain(scoped.unmanaged_modules.iter().map(ToString::to_string))
+        .map(|name| name.shown().to_string())
+        .chain(
+            scoped
+                .unmanaged_modules
+                .iter()
+                .map(|id| pbps_model::escape::Escaped(&id.to_string()).to_string()),
+        )
         // A role is a principal rather than an object, so it has no
         // `TableName` to be listed under and needs its own spelling — but the
         // policy is about everything in the database this project does not
         // declare, and an undeclared role is one of those (ADR-0005).
-        .chain(scoped.unmanaged_roles.iter().map(|r| format!("role {r}")))
+        .chain(
+            scoped
+                .unmanaged_roles
+                .iter()
+                .map(|r| format!("role {}", pbps_model::escape::Escaped(r))),
+        )
         // Unreadable modules are absent from `scoped.schema`, but they are
         // still catalog objects. If their target is outside the supplied managed
         // set, the unmanaged policy applies exactly as it does to a readable
@@ -3572,19 +3686,22 @@ fn apply_unmanaged_policy(names: &[String], policy: pbps_config::Unmanaged) -> a
     if names.is_empty() {
         return Ok(());
     }
+    // Labels already contain shown names beside rendered refusal prose.
+    // Preserve that single pass until #2084 step 5 (DEC-2084.1).
+    let names_shown = names.join(", ");
     match policy {
         pbps_config::Unmanaged::Ignore => {}
         pbps_config::Unmanaged::Warn => eprintln!(
             "warning: {} object(s) in this database are not declared and are left alone: {}",
             names.len(),
-            names.join(", ")
+            names_shown
         ),
         pbps_config::Unmanaged::Error => {
             return Err(UnmanagedPolicy(format!(
                 "`unmanaged: error` in pbps.yml, and {} object(s) here are not declared: {}.\n\
                  Declare them (`pbps pull` reverse-generates them) or relax the setting.",
                 names.len(),
-                names.join(", ")
+                names_shown
             ))
             .into());
         }
@@ -3597,7 +3714,11 @@ fn apply_unmanaged_policy(names: &[String], policy: pbps_config::Unmanaged) -> a
 /// that describes a different database.
 fn report_missing(scoped: &pbps_diff::Scoped) {
     if !scoped.missing.is_empty() {
-        let names: Vec<String> = scoped.missing.iter().map(ToString::to_string).collect();
+        let names: Vec<String> = scoped
+            .missing
+            .iter()
+            .map(|name| name.shown().to_string())
+            .collect();
         eprintln!(
             "warning: the identity file names {} table(s) this database does not have: {}",
             names.len(),
@@ -3964,6 +4085,7 @@ fn refuse_pinned_movement(
             undo_before.apply(was, name) == undo_after.apply(now, name)
         },
         &mut moved,
+        |n| n.shown().to_string(),
     );
     guard::implied(&implied, after, &mut moved);
     // Every touched table, under the name it ends with — including the ones
@@ -4186,10 +4308,12 @@ fn refuse_pinned_movement(
                     if held(after_row, touched_columns) == held(row, touched_columns) => {}
                 Some(_) => moved.push(format!(
                     "{now_name} row `{key}` is not what the plan was approved over, \
-                     and no change of this plan writes it"
+                     and no change of this plan writes it",
+                    now_name = now_name.shown()
                 )),
                 None => moved.push(format!(
-                    "{now_name} row `{key}` is gone, and no change of this plan deletes it"
+                    "{now_name} row `{key}` is gone, and no change of this plan deletes it",
+                    now_name = now_name.shown()
                 )),
             }
         }
@@ -4198,7 +4322,8 @@ fn refuse_pinned_movement(
                 continue;
             }
             moved.push(format!(
-                "{now_name} row `{key}` is there, and no change of this plan inserts it"
+                "{now_name} row `{key}` is there, and no change of this plan inserts it",
+                now_name = now_name.shown()
             ));
         }
     }
@@ -4209,6 +4334,7 @@ fn refuse_pinned_movement(
         |id: &pbps_model::ModuleId| touched_modules.contains(id),
         |_: &pbps_model::ModuleId, was: &pbps_model::Module, now: &pbps_model::Module| was == now,
         &mut moved,
+        ToString::to_string,
     );
     // A module the plan names is held to the definition the plan wrote, not
     // exempted. `CREATE OR ALTER` reports success and says nothing about what
@@ -4280,7 +4406,8 @@ fn refuse_pinned_movement(
                             (pbps_model::CellAfter::Spelled(wrote), Some(now)) if now != wrote => {
                                 moved.push(format!(
                                     "{table} row `{key}` does not hold in `{column}` what this \
-                                     plan wrote"
+                                     plan wrote",
+                                    table = table.shown()
                                 ));
                             }
                             (pbps_model::CellAfter::Spelled(_), _) => {}
@@ -4302,7 +4429,8 @@ fn refuse_pinned_movement(
                             {
                                 moved.push(format!(
                                     "{table} row `{key}` holds a value in `{column}`, and this \
-                                     plan leaves it at its default"
+                                     plan leaves it at its default",
+                                    table = table.shown()
                                 ));
                             }
                             (pbps_model::CellAfter::AtDefault, _) => {}
@@ -4310,10 +4438,12 @@ fn refuse_pinned_movement(
                     }
                 }
                 (pbps_model::RowAfter::Holding(_), None) => moved.push(format!(
-                    "{table} row `{key}` is not there, and this plan writes it"
+                    "{table} row `{key}` is not there, and this plan writes it",
+                    table = table.shown()
                 )),
                 (pbps_model::RowAfter::Gone, Some(_)) => moved.push(format!(
-                    "{table} row `{key}` is still there, and this plan deletes it"
+                    "{table} row `{key}` is still there, and this plan deletes it",
+                    table = table.shown()
                 )),
                 (pbps_model::RowAfter::Gone, None) => {}
             }
@@ -4402,6 +4532,7 @@ fn refuse_pinned_movement(
         named_role,
         |_: &String, was: &pbps_model::Role, now: &pbps_model::Role| was == now,
         &mut moved,
+        Clone::clone,
     );
     // And the same for a role the plan does name: exempt down to the
     // permissions it moves, and no further. A plan that adds one grant is not
@@ -4584,20 +4715,22 @@ fn compare<K, V>(
     // spellings have to be accepted. Modules and roles pass `==`.
     unchanged: impl Fn(&K, &V, &V) -> bool,
     moved: &mut Vec<String>,
+    shown: impl Fn(&K) -> String,
 ) where
-    K: Ord + std::fmt::Display,
+    K: Ord,
 {
     for (name, was) in before {
         if touched(name) {
             continue;
         }
+        let display = shown(name);
         match after.get(name) {
             Some(now) if unchanged(name, was, now) => {}
             Some(_) => moved.push(format!(
-                "{kind}{name} is not what the plan was approved over"
+                "{kind}{display} is not what the plan was approved over"
             )),
             None => moved.push(format!(
-                "{kind}{name} is gone, and no change of this plan drops it"
+                "{kind}{display} is gone, and no change of this plan drops it"
             )),
         }
     }
@@ -4605,8 +4738,9 @@ fn compare<K, V>(
         if touched(name) || before.contains_key(name) {
             continue;
         }
+        let display = shown(name);
         moved.push(format!(
-            "{kind}{name} is there, and no change of this plan creates it"
+            "{kind}{display} is there, and no change of this plan creates it"
         ));
     }
 }
@@ -5152,7 +5286,7 @@ pub fn cmd_bootstrap(
         .tables
         .keys()
         .filter(|t| ids.table_uid(t).is_none())
-        .map(ToString::to_string)
+        .map(|name| name.shown().to_string())
         .chain(
             loaded
                 .schema
@@ -5448,7 +5582,7 @@ pub fn cmd_bootstrap(
                     .schema
                     .tables
                     .keys()
-                    .map(ToString::to_string)
+                    .map(|name| name.shown().to_string())
                     .chain(
                         existing
                             .scoped
@@ -5770,7 +5904,7 @@ pub fn cmd_plan_db(
         // read-only command stays in its one JSON report (SPEC §9.8; #1660).
         for w in unasked {
             if !json {
-                eprintln!("warning: {w}");
+                eprintln!("warning: {}", pbps_model::escape::Escaped(&w));
             }
             findings.push(crate::output::Finding::warning(
                 "plan.partition-default-unasked",
@@ -5922,14 +6056,16 @@ pub fn cmd_plan_db(
                     "Reference data: the declarations take over the rows of {name} ({}); it holds \
                      {} row(s) now.",
                     scope.mode,
-                    observed.rows.len()
+                    observed.rows.len(),
+                    name = name.raw()
                 ),
                 None => format!(
-                    "Reference data: {name} does not exist yet; its declared rows go in with it."
+                    "Reference data: {name} does not exist yet; its declared rows go in with it.",
+                    name = name.raw()
                 ),
             };
             if !json {
-                println!("{message}");
+                println!("{}", pbps_model::escape::Escaped(&message));
             }
             findings.push(crate::output::Finding::note("data.adoption", message));
         }
@@ -6651,7 +6787,11 @@ pub fn cmd_plan_db(
         }
         print!("{}", crate::report::plan(&cs, &names));
         for check in &data.connected_checks {
-            println!("{}: {}", check.name, check.message);
+            println!(
+                "{}: {}",
+                check.name,
+                pbps_model::escape::Escaped(&check.message)
+            );
         }
         if let Some(cost) = &data.cost {
             print!("{}", crate::cost::render(cost));
@@ -8195,7 +8335,10 @@ async fn refuse_recreated_tables(
         .await?
         .first()
     {
-        anyhow::bail!("{name} is still there, and this plan removes it");
+        anyhow::bail!(
+            "{name} is still there, and this plan removes it",
+            name = name.shown()
+        );
     }
     Ok(())
 }
@@ -8950,12 +9093,135 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
         .iter()
         .filter(|p| matches!(p.change, pbps_model::Change::DropModule { .. }))
         .filter_map(|p| p.change.module_id())
-        .map(|id| id.object_name().to_string())
+        .map(|id| id.object_name().raw().to_string())
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inventory_prose_shows_names_once_beside_rendered_module_errors() {
+        use pbps_db::catalog::{LimitationTarget, Pulled, UnmanagedModule};
+        for (part, shown) in [
+            (
+                "a\nb\r\u{1b}[31m\\c\u{200b}",
+                r"a\nb\r\u{1b}[31m\\c\u{200b}",
+            ),
+            ("名前_ünï", "名前_ünï"),
+        ] {
+            let name = TableName::new("app", part);
+            let id = ModuleId::Named(name.clone());
+            let why = pbps_dialect::DialectError::Invalid {
+                dialect: "test",
+                message: format!("module `app.{part}` is invalid"),
+            }
+            .to_string();
+            let pulled = Pulled {
+                unmanaged_modules: vec![UnmanagedModule {
+                    kind: "view",
+                    target: LimitationTarget::module(id.clone()),
+                    why: why.clone(),
+                }],
+                ..Default::default()
+            };
+            let unreadable = unreadable_modules(&pulled.unmanaged_modules);
+            let expected = format!("view app.{shown} ({why})");
+            assert_eq!(unreadable[0].1, expected);
+            let empty = IdsFile::default();
+            let scoped = pbps_diff::scope(
+                &pulled.schema,
+                &empty,
+                &BTreeSet::new(),
+                &Default::default(),
+            );
+            let labels = unmanaged_objects(&scoped, &unreadable, &empty, &BTreeSet::new());
+            assert_eq!(labels, std::slice::from_ref(&expected));
+            let refusal =
+                apply_unmanaged_policy(&labels, pbps_config::Unmanaged::Error).unwrap_err();
+            let expected_refusal = format!(
+                "`unmanaged: error` in pbps.yml, and 1 object(s) here are not declared: {expected}.\nDeclare them (`pbps pull` reverse-generates them) or relax the setting."
+            );
+            assert_eq!(refusal.to_string(), expected_refusal);
+            let report = crate::output::Report::new(
+                "verify",
+                vec![crate::output::Finding::error(
+                    "state.unmanaged-refused",
+                    refusal.to_string(),
+                )],
+                Some(serde_json::json!({"name": name})),
+            );
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(json["findings"][0]["message"], expected_refusal);
+            assert_eq!(json["data"]["name"], format!("app.{part}"));
+            assert_eq!(
+                crate::output::human(&report.findings),
+                format!("  error: {expected_refusal}\n")
+            );
+
+            let modules = [id].into_iter().collect();
+            let managed = managed_limitations(&pulled, &empty, &modules, &BTreeSet::new());
+            let expected_managed = format!("view app.{shown} is in the managed set, but {why}");
+            assert_eq!(managed, std::slice::from_ref(&expected_managed));
+            assert_eq!(
+                refuse_managed_limitations(&managed)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "1 fact(s) inside the managed set cannot be represented:\n  {expected_managed}\nRefusing to compare, plan from, or record a partial schema."
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_prose_copies_keep_one_fact_without_merging_other_facts() {
+        use pbps_db::catalog::{Limitation, LimitationTarget, Pulled, UnmanagedModule};
+        let part = "a\nb\\c\u{200b}";
+        let id = ModuleId::Named(TableName::new("app", part));
+        let target = LimitationTarget::module(id.clone());
+        let detail = r"app.a\nb\\c\u{200b} cannot be represented".to_owned();
+        let mut pulled = Pulled {
+            limitations: vec![Limitation {
+                target: target.clone(),
+                detail: detail.clone(),
+            }],
+            unmanaged_modules: vec![UnmanagedModule {
+                kind: "view",
+                target,
+                why: detail.clone(),
+            }],
+            ..Default::default()
+        };
+        let modules = [id].into_iter().collect();
+        let facts = managed_limitations(&pulled, &IdsFile::default(), &modules, &BTreeSet::new());
+        assert_eq!(facts, [r"app.a\nb\\c\u{200b} cannot be represented"]);
+        assert_eq!(pulled.limitations[0].detail, detail);
+        pulled.unmanaged_modules[0].why = "another unsupported property".into();
+        assert_eq!(
+            managed_limitations(&pulled, &IdsFile::default(), &modules, &BTreeSet::new()).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn dropped_referrer_name_keys_keep_raw_qualified_names() {
+        let part = "a\nb\\c\u{200b}";
+        let table = pbps_model::TableName::new("app", part);
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(
+                pbps_model::Change::DropModule {
+                    id: pbps_model::ModuleId::Named(table),
+                    kind: pbps_model::ModuleKind::View,
+                },
+            )],
+        };
+        assert_eq!(
+            super::dropped_referrer_names(&changes),
+            [format!("app.{part}")].into()
+        );
+        assert!(!super::dropped_referrer_names(&changes).contains(r"app.a\nb\c\u{200b}"));
+    }
+
     /// The refusal prints the SQL of the statements that cannot run in a
     /// transaction, and the SQL carries the plan's names: a quoted identifier
     /// may hold a line break or a terminal sequence, which the refusal shows
@@ -9260,7 +9526,7 @@ mod tests {
         let blocking = |changes: Vec<PlannedChange>| {
             blocking_history_occupants(&ChangeSet { changes }, &held)
                 .into_iter()
-                .map(|(t, h, _)| (t.to_string(), h.to_string()))
+                .map(|(t, h, _)| (t.raw().to_string(), h.raw().to_string()))
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -9596,7 +9862,10 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            e.contains(&format!("this plan puts default constraint `{fallback}`")),
+            e.contains(&format!(
+                "this plan puts default constraint `{fallback}`",
+                fallback = fallback.shown()
+            )),
             "{e}"
         );
         refuse_occupied_objects(
@@ -10991,7 +11260,11 @@ mod tests {
         };
         let rename = |from: &TableName, to: &TableName| {
             PlannedChange::new(Change::RenameTable {
-                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.to_string(), 0),
+                uid: pbps_model::Uid::derived(
+                    pbps_model::UidKind::Table,
+                    &from.raw().to_string(),
+                    0,
+                ),
                 from: from.clone(),
                 to: to.clone(),
                 defaults: Vec::new(),
@@ -11057,7 +11330,11 @@ mod tests {
         use pbps_pg::catalog::NameOccupant;
         let rename = |from: &TableName, to: &TableName| {
             PlannedChange::new(Change::RenameTable {
-                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.to_string(), 0),
+                uid: pbps_model::Uid::derived(
+                    pbps_model::UidKind::Table,
+                    &from.raw().to_string(),
+                    0,
+                ),
                 from: from.clone(),
                 to: to.clone(),
                 defaults: Vec::new(),
@@ -11130,7 +11407,11 @@ mod tests {
         use pbps_pg::catalog::NameOccupant;
         let rename = |from: &TableName, to: TableName| {
             PlannedChange::new(Change::RenameTable {
-                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.to_string(), 0),
+                uid: pbps_model::Uid::derived(
+                    pbps_model::UidKind::Table,
+                    &from.raw().to_string(),
+                    0,
+                ),
                 from: from.clone(),
                 to,
                 defaults: Vec::new(),
@@ -11246,7 +11527,8 @@ mod tests {
             }
         }
         for other in others {
-            let uid = pbps_model::Uid::derived(pbps_model::UidKind::Table, &other.to_string(), 0);
+            let uid =
+                pbps_model::Uid::derived(pbps_model::UidKind::Table, &other.raw().to_string(), 0);
             put(uid, other, other);
         }
         sides
@@ -11304,7 +11586,11 @@ mod tests {
         let t = TableName::new;
         let rename = |from: TableName, to: TableName| {
             PlannedChange::new(Change::RenameTable {
-                uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, &from.to_string(), 0),
+                uid: pbps_model::Uid::derived(
+                    pbps_model::UidKind::Table,
+                    &from.raw().to_string(),
+                    0,
+                ),
                 from,
                 to,
                 defaults: Vec::new(),
@@ -18154,7 +18440,11 @@ mod tests {
             .insert("dbo.new".parse().unwrap(), pbps_model::Table::default());
 
         let live = tables_under(&declared, &final_ids, &live_ids);
-        let names: Vec<String> = live.tables.keys().map(ToString::to_string).collect();
+        let names: Vec<String> = live
+            .tables
+            .keys()
+            .map(|name| name.raw().to_string())
+            .collect();
         assert_eq!(names, ["dbo.new", "dbo.t"]);
         assert!(
             live.tables[&"dbo.t".parse::<TableName>().unwrap()]
@@ -18534,7 +18824,7 @@ mod tests {
         data.insert("app.later".parse().unwrap(), scope.clone());
 
         let now = scopes_under(&data, &final_ids, &live_ids);
-        let names: Vec<String> = now.keys().map(ToString::to_string).collect();
+        let names: Vec<String> = now.keys().map(|name| name.raw().to_string()).collect();
         assert_eq!(names, ["app.later", "app.old_customer"]);
         assert_eq!(
             now[&"app.old_customer".parse::<TableName>().unwrap()],

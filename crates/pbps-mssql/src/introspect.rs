@@ -1,3 +1,6 @@
+// Catalog refusal/detail sentences are prose beside rendered type errors.
+// Show names once until #2084 step 5 (DEC-2084.1); typed targets stay raw.
+
 //! Reading a live database back into the model — the heart of `pbps pull`.
 //!
 //! # Shape
@@ -224,7 +227,8 @@ fn versioning(
     let layout = |what: &str| {
         Err(format!(
             "its history table {name} {what}, and pbps holds only the layout SQL Server builds \
-             for a new history table"
+             for a new history table",
+            name = name.shown()
         ))
     };
     let mirrors = history_cols.len() == cols.len()
@@ -1075,7 +1079,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 &mut limitations,
                 Some(&name),
                 format!(
-                    "{name}: {what}, which pbps cannot express; the table, its history table and its ledger view were left out of the declarations"
+                    "{name}: {what}, which pbps cannot express; the table, its history table and its ledger view were left out of the declarations",
+                    name = name.shown()
                 ),
             );
             continue;
@@ -1094,7 +1099,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             let why = match current {
                 Some(c) => format!(
                     "the history table of {}, which was left out; it was left out with it",
-                    TableName::new(c.schema.clone(), c.name.clone())
+                    TableName::new(c.schema.clone(), c.name.clone()).shown()
                 ),
                 None => "a history table whose system-versioned table cannot be read; it was \
                          left out of the declarations"
@@ -1104,7 +1109,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 &mut warnings,
                 &mut limitations,
                 Some(&name),
-                format!("{name}: {why}"),
+                format!("{name}: {why}", name = name.shown()),
             );
             continue;
         }
@@ -1120,7 +1125,10 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     &mut warnings,
                     &mut limitations,
                     Some(&name),
-                    format!("{name}: {why}; the table was left out of the declarations"),
+                    format!(
+                        "{name}: {why}; the table was left out of the declarations",
+                        name = name.shown()
+                    ),
                 );
                 continue;
             }
@@ -1132,7 +1140,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                         "{name}: SQL Server named its history table {}; the declaration names \
                          it explicitly, so a table created from it keeps this name instead of \
                          another the engine would choose",
-                        v.history
+                        v.history.raw(),
+                        name = name.raw()
                     ));
                 }
                 table.system_time = Some(st.clone());
@@ -1144,7 +1153,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     let name_of = |id: i32, names: &BTreeMap<i32, TableName>| {
         names
             .get(&id)
-            .map(ToString::to_string)
+            .map(|name| name.shown().to_string())
             .unwrap_or_else(|| format!("object {id}"))
     };
 
@@ -1734,7 +1743,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     names.get(&f.object_id),
                     format!(
                         "{table_name}: foreign key `{}` references {kind} `{key}` of {referenced}, which was left out of the declarations; the foreign key was left out too",
-                        f.constraint_name
+                        f.constraint_name,
+                        referenced = referenced.shown()
                     ),
                 );
             }
@@ -1749,7 +1759,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     names.get(&f.object_id),
                     format!(
                         "{table_name}: foreign key `{}` references {kind} {referenced}, which is outside the declarations; the foreign key was left out too",
-                        f.constraint_name
+                        f.constraint_name,
+                        referenced = referenced.shown()
                     ),
                 );
             }
@@ -2271,6 +2282,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn limitation_prose_shows_the_table_once_beside_an_escaped_type_error() {
+        for (part, shown) in [
+            (
+                "a\nb\r\u{1b}[31m\\c\u{200b}",
+                r"a\nb\r\u{1b}[31m\\c\u{200b}",
+            ),
+            ("名前_ünï", "名前_ünï"),
+        ] {
+            let raw = RawCatalog {
+                tables: vec![raw_table(1, "app", part)],
+                columns: vec![raw_column(1, "id", "bad\\type\u{200b}")],
+                ..Default::default()
+            };
+            let pulled = assemble(&raw);
+            let name = TableName::new("app", part);
+            let expected = format!(
+                "app.{shown}.id: mssql has no type `bad\\\\type\\u{{200b}}`; it was left out of the declarations"
+            );
+            assert_eq!(pulled.limitations[0].detail, expected);
+            assert_eq!(pulled.warnings[0], expected);
+            assert_eq!(pulled.limitations[0].target.object_name(), name);
+            assert_eq!(serde_json::to_value(name).unwrap(), format!("app.{part}"));
+        }
+    }
+
     /// A versioned pair as the engine builds one (#1176, measured on 17.0):
     /// `dbo.t` with its period `vf`/`vt`, and `hist.t_history` mirroring its
     /// columns under one clustered index `ix_t_history` on `(vt, vf)`, PAGE.
@@ -2333,7 +2370,7 @@ mod tests {
                 .schema
                 .tables
                 .keys()
-                .map(ToString::to_string)
+                .map(|name| name.raw().to_string())
                 .collect::<Vec<_>>(),
             ["dbo.t"]
         );
@@ -4472,7 +4509,9 @@ mod module_tests {
         let id: pbps_model::ModuleId = "dbo.customer.trg_audit".parse().unwrap();
         let m = &p.schema.modules[&id];
         assert_eq!(
-            id.attached_to().map(ToString::to_string).as_deref(),
+            id.attached_to()
+                .map(|name| name.raw().to_string())
+                .as_deref(),
             Some("dbo.customer")
         );
         assert_eq!(m.definition, "AFTER INSERT AS SELECT 1;");

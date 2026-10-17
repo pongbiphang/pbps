@@ -287,7 +287,7 @@ pub async fn outcome<E: Engine>(
     let columns = catalog
         .tables
         .iter()
-        .map(|(name, t)| (name.to_string(), t.columns.keys().cloned().collect()))
+        .map(|(name, t)| (name.raw().to_string(), t.columns.keys().cloned().collect()))
         .collect();
     // The next plan is about what the declarations converge on. A module's
     // text is the engine's own respelling once read back, which `plan --db`
@@ -325,7 +325,7 @@ pub async fn outcome<E: Engine>(
     let mut rows = Vec::new();
     for table in seeded {
         let dump = engine.texts(db, &engine.rows_sql(table)).await?;
-        rows.push((table.to_string(), dump.join("\n")));
+        rows.push((table.raw().to_string(), dump.join("\n")));
     }
     Ok(Outcome {
         catalog,

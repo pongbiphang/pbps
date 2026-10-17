@@ -14683,7 +14683,9 @@ fn adopt_constraint_trigger_modules(connection: &str, d: &Demo) {
             .collect::<String>();
         let kind = module.kind.as_str();
         let identity = match &id {
-            pbps_model::ModuleId::Trigger { on, name } => format!("{}.{name}\non: {on}", on.schema),
+            pbps_model::ModuleId::Trigger { on, name } => {
+                format!("{}.{name}\non: {on}", on.schema, on = on.raw())
+            }
             pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Routine(_) => id.to_string(),
         };
         std::fs::write(
@@ -15543,7 +15545,7 @@ fn a_dropped_view_is_not_reported_as_carried_by_a_column_rename() {
                 pbps_model::Change::DropModule {
                     kind: pbps_model::ModuleKind::View,
                     id: pbps_model::ModuleId::Named(n),
-                } if n.to_string() == "app.v"
+                } if n.raw().to_string() == "app.v"
             )),
             "{kinds:#?}"
         );

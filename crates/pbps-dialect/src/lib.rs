@@ -490,53 +490,87 @@ pub struct Unchecked {
 }
 
 impl Unchecked {
+    // These labels are also JSON. Keep name operands raw until #2084 step 5 (DEC-2084.1);
+    // the explain renderer escapes each complete check/reason once.
     pub fn for_change(change: &Change, reason: impl Into<String>) -> Self {
         let description = match change {
-            Change::AddCheck { table, name, .. } => format!("new check {name} on {table}"),
+            Change::AddCheck { table, name, .. } => {
+                format!("new check {name} on {table}", table = table.raw())
+            }
             Change::AddUnique { table, name, .. } => {
-                format!("new unique constraint {name} on {table}")
+                format!(
+                    "new unique constraint {name} on {table}",
+                    table = table.raw()
+                )
             }
             Change::AddForeignKey { table, name, .. } => {
-                format!("new foreign key {name} on {table}")
+                format!("new foreign key {name} on {table}", table = table.raw())
             }
-            Change::AddIndex { table, name, .. } => format!("new unique index {name} on {table}"),
+            Change::AddIndex { table, name, .. } => {
+                format!("new unique index {name} on {table}", table = table.raw())
+            }
             Change::SetPrimaryKey { table, to, .. } => format!(
                 "new primary key {} on {table}",
                 to.as_ref()
                     .and_then(|key| key.name.as_deref())
-                    .unwrap_or("(unnamed)")
+                    .unwrap_or("(unnamed)"),
+                table = table.raw()
             ),
             Change::AddColumn { table, name, .. } => {
-                format!("new NOT NULL column {}", table.column(name))
+                format!("new NOT NULL column {}", table.column(name).raw())
             }
-            Change::SetReplicaIdentity { table, .. } => format!("replica identity of {table}"),
+            Change::SetReplicaIdentity { table, .. } => {
+                format!("replica identity of {table}", table = table.raw())
+            }
             Change::SetStorageParameters { table, .. } => {
-                format!("storage parameters of {table}")
+                format!("storage parameters of {table}", table = table.raw())
             }
-            Change::SetTablePersistence { table, .. } => format!("persistence of {table}"),
+            Change::SetTablePersistence { table, .. } => {
+                format!("persistence of {table}", table = table.raw())
+            }
             Change::SetIndexStorageParameters { table, .. } => {
-                format!("index storage parameters on {table}")
+                format!("index storage parameters on {table}", table = table.raw())
             }
-            Change::AlterColumnNullability { column, .. } => format!("NOT NULL column {column}"),
+            Change::AlterColumnNullability { column, .. } => {
+                format!("NOT NULL column {column}", column = column.raw())
+            }
             Change::SetPartitionNotNull { table, column, .. } => {
-                format!("NOT NULL column {} on the partition", table.column(column))
+                format!(
+                    "NOT NULL column {} on the partition",
+                    table.column(column).raw()
+                )
             }
             Change::AddComputedColumn { table, name, .. } => {
-                format!("new computed column {}", table.column(name))
+                format!("new computed column {}", table.column(name).raw())
             }
-            Change::AlterColumnType { column, .. } => format!("type conversion of {column}"),
+            Change::AlterColumnType { column, .. } => {
+                format!("type conversion of {column}", column = column.raw())
+            }
             Change::AlterColumnExpression { column, .. } => {
-                format!("recomputed generated column {column}")
+                format!(
+                    "recomputed generated column {column}",
+                    column = column.raw()
+                )
             }
             Change::AlterColumnNumbering { column, .. } => {
-                format!("numbering source of {column}")
+                format!("numbering source of {column}", column = column.raw())
             }
-            Change::DeleteRow { table, key, .. } => format!("references to row {key} in {table}"),
+            Change::DeleteRow { table, key, .. } => {
+                format!("references to row {key} in {table}", table = table.raw())
+            }
             Change::DetachPartition { table, parent, .. } => {
-                format!("references to the partition {table}, detached from {parent}")
+                format!(
+                    "references to the partition {table}, detached from {parent}",
+                    table = table.raw(),
+                    parent = parent.raw()
+                )
             }
             Change::AttachPartition { table, parent, .. } => {
-                format!("rows of {table} outside the range it takes under {parent}")
+                format!(
+                    "rows of {table} outside the range it takes under {parent}",
+                    table = table.raw(),
+                    parent = parent.raw()
+                )
             }
             Change::CreateTable { .. }
             | Change::DropTable { .. }
@@ -3110,7 +3144,8 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
                 problems.push(format!(
                     "`{first}` and `{id}` are both declared as `{name}`; {} keeps them in one \
                      namespace per schema, so it can hold only one of them",
-                    dialect.name()
+                    dialect.name(),
+                    name = name.shown()
                 ));
             }
             if schema.tables.contains_key(&name) {
@@ -3119,7 +3154,8 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
                      in one namespace per schema",
                     module.kind,
                     dialect.name(),
-                    module.kind
+                    module.kind,
+                    name = name.shown()
                 ));
             }
         }
@@ -3130,7 +3166,7 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
                      name it `{}` instead",
                     dialect.name(),
                     module.kind,
-                    id.object_name()
+                    id.object_name().shown()
                 ));
             }
             // The mirror image. Where the kind overloads, the engine identifies
@@ -3176,7 +3212,8 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
         {
             problems.push(format!(
                 "`{name}` is partitioned by LIST over {} columns, and a LIST key is one column",
-                by.columns.len()
+                by.columns.len(),
+                name = name.shown()
             ));
         }
         // The engine's PARTITION_MAX_KEYS, fixed when it is built: measured
@@ -3188,7 +3225,8 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
             problems.push(format!(
                 "`{name}` is partitioned over {} columns, and PostgreSQL partitions over at \
                  most {PARTITION_MAX_KEYS}",
-                by.columns.len()
+                by.columns.len(),
+                name = name.shown()
             ));
         }
     }
@@ -3199,14 +3237,16 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
         let Some(parent) = schema.tables.get(&of.parent) else {
             problems.push(format!(
                 "`{child}` is a partition of `{}`, which is not declared",
-                of.parent
+                of.parent.shown(),
+                child = child.shown()
             ));
             continue;
         };
         let Some(by) = &parent.partition_by else {
             problems.push(format!(
                 "`{child}` is a partition of `{}`, which declares no `partition_by`",
-                of.parent
+                of.parent.shown(),
+                child = child.shown()
             ));
             continue;
         };
@@ -3214,7 +3254,7 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
             problems.push(format!(
                 "`{}` is both partitioned and a partition, and pbps does not hold nested \
                  partitioning",
-                of.parent
+                of.parent.shown()
             ));
         }
         if let Some(strategy) = of.bound.strategy()
@@ -3223,8 +3263,9 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
             problems.push(format!(
                 "`{child}` is bounded as a {} partition, and `{}` is partitioned by {}",
                 strategy.keyword(),
-                of.parent,
-                by.strategy.keyword()
+                of.parent.shown(),
+                by.strategy.keyword(),
+                child = child.shown()
             ));
             continue;
         }
@@ -3235,7 +3276,8 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
                 problems.push(format!(
                     "`{child}` is the default partition of `{}`, which is partitioned by HASH \
                      and takes none",
-                    of.parent
+                    of.parent.shown(),
+                    child = child.shown()
                 ));
             }
             pbps_model::PartitionBound::Default => {
@@ -3243,7 +3285,9 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
                     problems.push(format!(
                         "`{first}` and `{child}` are both the default partition of `{}`, which \
                          takes one",
-                        of.parent
+                        of.parent.shown(),
+                        first = first.shown(),
+                        child = child.shown()
                     ));
                 }
             }
@@ -3256,13 +3300,17 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
                          end",
                         from.len(),
                         to.len(),
-                        of.parent
+                        of.parent.shown(),
+                        child = child.shown()
                     ));
                 }
             }
             pbps_model::PartitionBound::List { values } => {
                 if values.is_empty() {
-                    problems.push(format!("`{child}` is a LIST partition of no values"));
+                    problems.push(format!(
+                        "`{child}` is a LIST partition of no values",
+                        child = child.shown()
+                    ));
                 }
                 for value in values {
                     if let Some(first) = listed.insert((&of.parent, value), child)
@@ -3275,7 +3323,9 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
                         problems.push(format!(
                             "`{first}` and `{child}` both take {value} of `{}`, which routes a \
                              value to one partition",
-                            of.parent
+                            of.parent.shown(),
+                            first = first.shown(),
+                            child = child.shown()
                         ));
                     }
                 }
@@ -3284,7 +3334,8 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
                 if *modulus == 0 || remainder >= modulus {
                     problems.push(format!(
                         "`{child}` takes remainder {remainder} of modulus {modulus}: a modulus \
-                         is at least 1, and a remainder below it"
+                         is at least 1, and a remainder below it",
+                        child = child.shown()
                     ));
                     continue;
                 }
@@ -3296,7 +3347,8 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
                     problems.push(format!(
                         "`{child}` takes modulus {modulus}, and PostgreSQL takes a modulus up \
                          to {}",
-                        i32::MAX
+                        i32::MAX,
+                        child = child.shown()
                     ));
                     continue;
                 }
@@ -3319,7 +3371,9 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
             problems.push(format!(
                 "`{parent}`'s hash partitions have moduli {} and {}: each modulus must be a \
                  factor of the next larger one",
-                pair[0], pair[1]
+                pair[0],
+                pair[1],
+                parent = parent.shown()
             ));
             continue;
         }
@@ -3334,7 +3388,13 @@ pub fn check_partitions(schema: &Schema) -> Vec<String> {
                     problems.push(format!(
                         "`{a}` and `{b}` both take rows of `{parent}`: remainder {} of modulus \
                          {} lies within remainder {} of modulus {}",
-                        large.1, large.0, small.1, small.0
+                        large.1,
+                        large.0,
+                        small.1,
+                        small.0,
+                        a = a.shown(),
+                        b = b.shown(),
+                        parent = parent.shown()
                     ));
                 }
             }
@@ -3378,7 +3438,10 @@ pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String
             for name in named {
                 held.insert(
                     TableName::new(table_name.schema.clone(), name),
-                    format!("a constraint of `{table_name}`"),
+                    format!(
+                        "a constraint of `{table_name}`",
+                        table_name = table_name.shown()
+                    ),
                 );
             }
         }
@@ -3397,13 +3460,18 @@ pub fn check_history_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String
                 "`{table}` names `{history}` as its history table, which is also declared as \
                  {what}; {} keeps them in one namespace per schema, and the history is created \
                  with `{table}`, so name it something else",
-                dialect.name()
+                dialect.name(),
+                table = table.shown(),
+                history = history.shown()
             ));
         }
         if let Some(first) = histories.insert(history, table) {
             problems.push(format!(
                 "`{first}` and `{table}` both name `{history}` as their history table; each \
-                 system-versioned table needs its own"
+                 system-versioned table needs its own",
+                first = first.shown(),
+                table = table.shown(),
+                history = history.shown()
             ));
         }
     }
@@ -3457,13 +3525,19 @@ pub fn history_references_under(
             let declared = if referenced == *history {
                 String::new()
             } else {
-                format!(" (declared as `{history}`, one name under the database's collation)")
+                format!(
+                    " (declared as `{history}`, one name under the database's collation)",
+                    history = history.shown()
+                )
             };
             problems.push(format!(
                 "foreign key `{fk_name}` on `{table_name}` references `{referenced}`, the \
                  history table of `{versioned}`{declared}; a history table has no key a \
                  foreign key can reference, and {} refuses one there",
-                dialect.name()
+                dialect.name(),
+                table_name = table_name.shown(),
+                referenced = referenced.shown(),
+                versioned = versioned.shown()
             ));
         }
     }
@@ -3497,7 +3571,8 @@ pub fn check_system_time_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec
             problems.push(format!(
                 "trigger `{name}` on `{on}` is INSTEAD OF, which {} refuses on a \
                  system-versioned table; make it AFTER, or leave `versioning` out",
-                dialect.name()
+                dialect.name(),
+                on = on.shown()
             ));
         }
     }
@@ -3533,7 +3608,8 @@ pub fn check_partition_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec<S
                     "trigger `{trigger}` on `{name}` is named as its parent's row trigger \
                      `{id}`, which {} clones onto every partition under that name; name it \
                      otherwise",
-                    dialect.name()
+                    dialect.name(),
+                    name = name.shown()
                 ));
             }
             if dialect.declares_a_constraint(module) {
@@ -3546,7 +3622,8 @@ pub fn check_partition_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec<S
                             "{kind} `{trigger}` on `{name}` is named as its parent's \
                              constraint trigger `{id}`, whose clone on every partition is a \
                              constraint under that name on {}; name it otherwise",
-                            dialect.name()
+                            dialect.name(),
+                            name = name.shown()
                         ));
                     }
                 }
@@ -3639,7 +3716,10 @@ pub fn check_index_names_with_sources(
     let mut problems = Vec::new();
     let mut claimed: BTreeMap<ObjectName, Claim<'_>> = BTreeMap::new();
     for name in schema.tables.keys() {
-        claimed.insert(name.clone(), unclaimed(format!("table `{name}`")));
+        claimed.insert(
+            name.clone(),
+            unclaimed(format!("table `{name}`", name = name.shown())),
+        );
     }
     for (id, module) in &schema.modules {
         if dialect.shares_namespace_with_tables(module.kind) {
@@ -3654,14 +3734,20 @@ pub fn check_index_names_with_sources(
         for index_name in table.indexes.keys() {
             declared.push((
                 index_name.as_str(),
-                unclaimed(format!("index `{table_name}.{index_name}`")),
+                unclaimed(format!(
+                    "index `{table_name}.{index_name}`",
+                    table_name = table_name.shown()
+                )),
             ));
         }
         if let Some(pk_name) = table.primary_key.as_ref().and_then(|pk| pk.name.as_deref()) {
             declared.push((
                 pk_name,
                 Claim {
-                    descriptor: format!("primary key `{table_name}.{pk_name}`"),
+                    descriptor: format!(
+                        "primary key `{table_name}.{pk_name}`",
+                        table_name = table_name.shown()
+                    ),
                     key_of: Some(table_name),
                 },
             ));
@@ -3670,7 +3756,10 @@ pub fn check_index_names_with_sources(
             declared.push((
                 unique_name.as_str(),
                 Claim {
-                    descriptor: format!("unique constraint `{table_name}.{unique_name}`"),
+                    descriptor: format!(
+                        "unique constraint `{table_name}.{unique_name}`",
+                        table_name = table_name.shown()
+                    ),
                     key_of: Some(table_name),
                 },
             ));
@@ -3691,7 +3780,8 @@ pub fn check_index_names_with_sources(
                      views and indexes in one namespace per schema, so it can hold only one of \
                      them",
                     existing.descriptor,
-                    dialect.name()
+                    dialect.name(),
+                    claim_name = claim_name.shown()
                 ));
             }
         }
@@ -3725,7 +3815,8 @@ pub fn check_index_names_with_sources(
                     existing.descriptor,
                     relation.descriptor,
                     dialect.name(),
-                    relation.remedy
+                    relation.remedy,
+                    claim_name = claim_name.shown()
                 ));
             }
             claimants.push(Claimant {
@@ -3804,7 +3895,8 @@ pub fn check_index_names_with_sources(
                  the order they are created in. {}",
                 existing.descriptor,
                 dialect.name(),
-                remedy
+                remedy,
+                claim_name = claim_name.shown()
             ));
         }
     }
@@ -3993,7 +4085,7 @@ pub fn check_constraint_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<Str
         claimed.insert(
             name.clone(),
             Claim {
-                descriptor: format!("table `{name}`"),
+                descriptor: format!("table `{name}`", name = name.shown()),
                 constraint_of: None,
             },
         );
@@ -4037,7 +4129,10 @@ pub fn check_constraint_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<Str
             );
         for (name, kind) in named {
             let claim_name = ObjectName::new(table_name.schema.clone(), name);
-            let descriptor = format!("{kind} `{table_name}.{name}`");
+            let descriptor = format!(
+                "{kind} `{table_name}.{name}`",
+                table_name = table_name.shown()
+            );
             let claim = Claim {
                 descriptor: descriptor.clone(),
                 constraint_of: Some(table_name),
@@ -4051,7 +4146,8 @@ pub fn check_constraint_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<Str
                      routines, triggers and constraints in one namespace per schema, so it can \
                      hold only one of them",
                     existing.descriptor,
-                    dialect.name()
+                    dialect.name(),
+                    claim_name = claim_name.shown()
                 ));
             }
         }
@@ -5178,7 +5274,7 @@ mod tests {
         let variant = with("hist.A_History");
         assert!(check_history_references(&variant, &MinimalDialect).is_empty());
         let folded = |a: &TableName, b: &TableName| {
-            a.to_string().to_lowercase() == b.to_string().to_lowercase()
+            a.raw().to_string().to_lowercase() == b.raw().to_string().to_lowercase()
         };
         let problems = history_references_under(&variant, &MinimalDialect, folded);
         assert!(

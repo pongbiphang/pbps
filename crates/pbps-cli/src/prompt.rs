@@ -114,14 +114,18 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
                 .flat_map(|from| appeared.iter().map(move |to| (from, to)))
                 .collect();
             pairs.sort_by(|a, b| {
-                similarity(&a.0.to_string(), &a.1.to_string())
-                    .total_cmp(&similarity(&b.0.to_string(), &b.1.to_string()))
+                similarity(&a.0.raw().to_string(), &a.1.raw().to_string())
+                    .total_cmp(&similarity(&b.0.raw().to_string(), &b.1.raw().to_string()))
                     .reverse()
                     .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
             });
             for (from, to) in pairs {
                 out.push(Choice {
-                    label: format!("table {from} was renamed to {to}"),
+                    label: format!(
+                        "table {from} was renamed to {to}",
+                        from = from.shown(),
+                        to = to.shown()
+                    ),
                     kind: ChoiceKind::Rename(Intent::RenameTable {
                         from: from.clone(),
                         to: to.clone(),
@@ -130,17 +134,26 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
             }
             for from in disappeared {
                 out.push(Choice {
-                    label: format!("table {from} was dropped (you will be asked why)"),
+                    label: format!(
+                        "table {from} was dropped (you will be asked why)",
+                        from = from.shown()
+                    ),
                     kind: ChoiceKind::DropTable(from.clone()),
                 });
             }
         }
         Blocker::DropColumnNeedsReason { column } => out.push(Choice {
-            label: format!("{column} was dropped (you will be asked why)"),
+            label: format!(
+                "{column} was dropped (you will be asked why)",
+                column = column.shown()
+            ),
             kind: ChoiceKind::DropColumn(column.clone()),
         }),
         Blocker::DropTableNeedsReason { table } => out.push(Choice {
-            label: format!("table {table} was dropped (you will be asked why)"),
+            label: format!(
+                "table {table} was dropped (you will be asked why)",
+                table = table.shown()
+            ),
             kind: ChoiceKind::DropTable(table.clone()),
         }),
         Blocker::AmbiguousRoles {
@@ -278,11 +291,11 @@ pub fn ask_from<R: std::io::BufRead>(blockers: &[Blocker], reader: R) -> Option<
             ChoiceKind::Rename(i) => i.clone(),
             ChoiceKind::DropColumn(column) => Intent::DropColumn {
                 column: column.clone(),
-                reason: reason(&mut lines, &column.to_string())?,
+                reason: reason(&mut lines, &column.shown().to_string())?,
             },
             ChoiceKind::DropTable(table) => Intent::DropTable {
                 table: table.clone(),
-                reason: reason(&mut lines, &table.to_string())?,
+                reason: reason(&mut lines, &table.shown().to_string())?,
             },
             ChoiceKind::DropRole(role) => Intent::DropRole {
                 role: role.clone(),
@@ -313,7 +326,9 @@ fn question(b: &Blocker) -> String {
     match b {
         Blocker::ProvisionalTableIdentity { from, to, blocker } => format!(
             "if {from} -> {to} is what you meant (provisional table identity): {}",
-            question(blocker)
+            question(blocker),
+            from = from.shown(),
+            to = to.shown()
         ),
         Blocker::AmbiguousColumns {
             table,
@@ -322,21 +337,28 @@ fn question(b: &Blocker) -> String {
         } => format!(
             "{table}: {} disappeared, {} is new",
             disappeared.join(", "),
-            appeared.join(", ")
+            appeared.join(", "),
+            table = table.shown()
         ),
         Blocker::AmbiguousTables {
             disappeared,
             appeared,
         } => format!(
             "table {} disappeared, {} is new",
-            list(disappeared),
-            list(appeared)
+            list(disappeared.iter().map(TableName::shown)),
+            list(appeared.iter().map(TableName::shown))
         ),
         Blocker::DropColumnNeedsReason { column } => {
-            format!("{column} disappeared from the declarations")
+            format!(
+                "{column} disappeared from the declarations",
+                column = column.shown()
+            )
         }
         Blocker::DropTableNeedsReason { table } => {
-            format!("table {table} disappeared from the declarations")
+            format!(
+                "table {table} disappeared from the declarations",
+                table = table.shown()
+            )
         }
         Blocker::AmbiguousRoles {
             disappeared,
@@ -360,24 +382,52 @@ fn question(b: &Blocker) -> String {
         // choices before ever calling this), but the match still has to
         // cover it.
         Blocker::UnrepresentableName { what, part, table } => {
-            let prefix = table.as_ref().map(|t| format!("{t}: ")).unwrap_or_default();
+            let prefix = table
+                .as_ref()
+                .map(|t| format!("{t}: ", t = t.shown()))
+                .unwrap_or_default();
             format!("{prefix}{what} `{part}` contains a `.`")
         }
         Blocker::MoveNotBesideDefault { table } => {
-            format!("{table} is not a range or list partition beside a DEFAULT")
+            format!(
+                "{table} is not a range or list partition beside a DEFAULT",
+                table = table.shown()
+            )
         }
     }
 }
 
-fn list<T: std::fmt::Display>(v: &[T]) -> String {
-    v.iter()
-        .map(ToString::to_string)
+fn list(v: impl IntoIterator<Item = impl std::fmt::Display>) -> String {
+    v.into_iter()
+        .map(|value| value.to_string())
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn table_rename_similarity_uses_raw_names_while_labels_are_shown() {
+        let from = TableName::new("app", "a\nb\\c\u{200b}");
+        let closer = TableName::new("app", "a\nb\\c");
+        let farther = TableName::new("app", "\n\\c\u{200b}");
+        let offered = choices(&Blocker::AmbiguousTables {
+            disappeared: vec![from.clone()],
+            appeared: vec![farther, closer.clone()],
+        });
+        // Removing one invisible character is closer than removing two letters;
+        // ranking the escaped spelling would give the long escape extra weight.
+        assert_eq!(
+            offered[0].kind,
+            ChoiceKind::Rename(Intent::RenameTable { from, to: closer })
+        );
+        assert_eq!(
+            offered[0].label,
+            r"table app.a\nb\\c\u{200b} was renamed to app.a\nb\\c"
+        );
+        assert_eq!(offered.len(), 3);
+    }
+
     use super::*;
 
     fn answers(script: &str) -> std::io::Cursor<Vec<u8>> {

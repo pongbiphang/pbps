@@ -1,3 +1,6 @@
+// Diagnosis reasons are prose in every format until #2084 step 5
+// (DEC-2084.1): shown names sit beside already escaped database errors.
+
 //! Is a partitioned table's series running out, and are its rows landing in
 //! the DEFAULT partition (#1789, DEC-1789.2)?
 //!
@@ -299,7 +302,9 @@ async fn lookup(conn: &mut Conn, physical: &ObjectName) -> Result<Lookup, Failur
                 _ => {
                     return Err(Failure::said(format!(
                         "partition {name} of {physical} has the bound `{text}`, which does not \
-                         have one value at each end, as the key has one column"
+                         have one value at each end, as the key has one column",
+                        name = name.shown(),
+                        physical = physical.shown()
                     )));
                 }
             },
@@ -308,13 +313,17 @@ async fn lookup(conn: &mut Conn, physical: &ObjectName) -> Result<Lookup, Failur
             Some(PartitionBound::List { .. } | PartitionBound::Hash { .. }) => {
                 return Err(Failure::said(format!(
                     "partition {name} of {physical} has the bound `{text}`: the runway is read \
-                     from RANGE partitions only"
+                     from RANGE partitions only",
+                    name = name.shown(),
+                    physical = physical.shown()
                 )));
             }
             None => {
                 return Err(Failure::said(format!(
                     "partition {name} of {physical} has the bound `{text}`, which this reader \
-                     does not know"
+                     does not know",
+                    name = name.shown(),
+                    physical = physical.shown()
                 )));
             }
         }
@@ -428,7 +437,8 @@ async fn runway_in(
             runway::range(found.key, &catalogued.from, &catalogued.to).map_err(|why| {
                 Failure::said(format!(
                     "partition {} of {physical}: {why}",
-                    catalogued.name
+                    catalogued.name.shown(),
+                    physical = physical.shown()
                 ))
             })?,
         );

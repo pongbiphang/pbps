@@ -297,7 +297,7 @@ async fn connected_estimates_keep_storage_and_identity_uncertainty_visible() {
     let mut e = fixture_planned_estimates(&renamed).pop().unwrap().1;
     estimate::against(&mut db.conn, &mut e).await.unwrap();
     assert_eq!(
-        (e.table.to_string(), e.rewrite, e.rows),
+        (e.table.raw().to_string(), e.rewrite, e.rows),
         ("dbo.renamed".into(), Rewrite::No, Some(3))
     );
 

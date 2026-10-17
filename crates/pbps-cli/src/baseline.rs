@@ -409,12 +409,12 @@ pub fn changed_subjects(
     let mut out = std::collections::BTreeSet::new();
     for (uid, name) in before.tables.iter().chain(&now.tables) {
         if before.tables.get(uid) != now.tables.get(uid) {
-            out.insert(name.to_string());
+            out.insert(name.raw().to_string());
         }
     }
     for (uid, column) in before.columns.iter().chain(&now.columns) {
         if before.columns.get(uid) != now.columns.get(uid) {
-            out.insert(column.table.to_string());
+            out.insert(column.table.raw().to_string());
         }
     }
     for (uid, role) in before.roles.iter().chain(&now.roles) {
@@ -434,7 +434,7 @@ pub fn changed_subjects(
             .and_then(|uid| before.tables.get(uid))
             .and_then(|old_name| before_schema.tables.get(old_name));
         if was != Some(table) {
-            out.insert(name.to_string());
+            out.insert(name.raw().to_string());
         }
     }
     for (name, role) in &now_schema.roles {
@@ -584,6 +584,38 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn changed_subject_keys_keep_raw_table_and_column_ownership_names() {
+        use super::*;
+        let part = "a\nb\\c\u{200b}";
+        let name = pbps_model::TableName::new("app", part);
+        let mut ids = IdsFile::default();
+        ids.tables.insert("t_aaaaaa".parse().unwrap(), name.clone());
+        assert_eq!(
+            changed_subjects(
+                &IdsFile::default(),
+                &ids,
+                &Default::default(),
+                &Default::default()
+            ),
+            [format!("app.{part}")].into()
+        );
+        let mut columns = ids.clone();
+        columns
+            .columns
+            .insert("c_aaaaaa".parse().unwrap(), name.column(part));
+        assert_eq!(
+            changed_subjects(&ids, &columns, &Default::default(), &Default::default()),
+            [format!("app.{part}")].into()
+        );
+        let mut schema = pbps_model::Schema::default();
+        schema.tables.insert(name, Default::default());
+        assert_eq!(
+            changed_subjects(&ids, &ids, &Default::default(), &schema),
+            [format!("app.{part}")].into()
+        );
+        assert!(changed_subjects(&columns, &columns, &schema, &schema).is_empty());
+    }
 
     /// A path an old revision configured, as git names it. The `..` case is
     /// the one that matters: a project in a subdirectory may keep its

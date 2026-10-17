@@ -146,7 +146,8 @@ pub async fn key_drop_blockers(
             .await?;
         let Some(row) = rows.first() else {
             return Err(DbError::Refused(format!(
-                "key_drop_blockers: {kind} `{name}` on {table} is absent from the readable catalog"
+                "key_drop_blockers: {kind} `{name}` on {table} is absent from the readable catalog",
+                table = table.shown()
             ))
             .into());
         };
@@ -322,12 +323,12 @@ pub async fn key_drop_blockers(
             let child = get::<i32>(&row, "child")?;
             if !removals.iter().any(|&(at, removed, on, whole)| at < index && if whole { on == child } else { removed == oid }) {
                 let child = TableName::new(get::<&str>(&row, "schema_name")?, get::<&str>(&row, "table_name")?);
-                blocking.insert(format!("foreign key `{}` on {child}", get::<&str>(&row, "name")?));
+                blocking.insert(format!("foreign key `{}` on {child}", get::<&str>(&row, "name")?, child = child.shown()));
             }
         }
         reports.push(pbps_db::impact::DropReport {
             change_index: index,
-            target: format!("key `{key_name}` on {table}"),
+            target: format!("key `{key_name}` on {table}", table = table.shown()),
             blocking: blocking.into_iter().collect(),
         });
     }
@@ -353,14 +354,16 @@ pub async fn key_drop_blockers(
             .await?;
         let located = located.first().ok_or_else(|| {
             DbError::Refused(format!(
-                "key_drop_blockers: column `{column}` on {table} could not be located"
+                "key_drop_blockers: column `{column}` on {table} could not be located",
+                table = table.shown()
             ))
         })?;
         let (Some(object), Some(column_id)) =
             (opt::<i32>(located, "obj")?, opt::<i32>(located, "col")?)
         else {
             return Err(DbError::Refused(format!(
-                "key_drop_blockers: column `{column}` on {table} is absent from the readable catalog"
+                "key_drop_blockers: column `{column}` on {table} is absent from the readable catalog",
+                table = table.shown(),
             ))
             .into());
         };
@@ -394,13 +397,14 @@ pub async fn key_drop_blockers(
                 );
                 blocking.insert(format!(
                     "foreign key `{}` on {child}",
-                    get::<&str>(&row, "name")?
+                    get::<&str>(&row, "name")?,
+                    child = child.shown()
                 ));
             }
         }
         reports.push(pbps_db::impact::DropReport {
             change_index: index,
-            target: format!("column `{column}` on {table}"),
+            target: format!("column `{column}` on {table}", table = table.shown()),
             blocking: blocking.into_iter().collect(),
         });
     }
@@ -672,7 +676,7 @@ pub async fn rename_impact_reading(
     read: DependencyRead,
 ) -> Result<ImpactReport, ImpactError> {
     // `OBJECT_ID` *parses* its argument as a name, so it is given the quoted
-    // form and not `TableName`'s `Display`. It splits on periods, so a name
+    // form and not `TableName`'s raw spelling. It splits on periods, so a name
     // holding one makes the bare `schema.name` a three-part name — `dbo`.
     // `cust`.`omer` — which names a different object and resolves to NULL.
     // Every one of these queries then joins against NULL and matches nothing,
@@ -751,7 +755,11 @@ pub async fn rename_impact_reading(
         if mentions(definition.unwrap_or_default(), &column.name) {
             report.advisory.push(Referrer {
                 kind: "computed column".to_owned(),
-                name: format!("{}.{}", column.table, get::<&str>(&row, "column_name")?),
+                name: format!(
+                    "{}.{}",
+                    column.table.shown(),
+                    get::<&str>(&row, "column_name")?
+                ),
                 detail: definition.map(str::to_owned),
                 removed_with: None,
             });

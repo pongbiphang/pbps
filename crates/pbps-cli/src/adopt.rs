@@ -1,3 +1,6 @@
+// Catalog descriptions feed JSON as well as text. Keep operands raw until
+// #2084 step 5 (DEC-2084.1). Warnings are prose beside validation error displays.
+
 //! What an adoption writes, and what it leaves out because `validate` would
 //! refuse it (#902).
 //!
@@ -60,7 +63,8 @@ pub(crate) async fn hand_over_external_partitions(
         if !parent(&pulled.schema, name) {
             anyhow::bail!(
                 "--partitions-external {name}: this database has no partitioned parent by that \
-                 name that pull keeps"
+                 name that pull keeps",
+                name = name.shown()
             );
         }
         external.insert(name.clone(), "named with --partitions-external".to_owned());
@@ -82,7 +86,8 @@ pub(crate) async fn hand_over_external_partitions(
             {
                 pulled.onboarding_notices.push(format!(
                     "table `{template}` was left out: it is pg_partman's template for `{}`",
-                    m.parent
+                    m.parent.raw(),
+                    template = template.raw()
                 ));
             }
             if parent(&pulled.schema, &m.parent) {
@@ -93,7 +98,7 @@ pub(crate) async fn hand_over_external_partitions(
                 pulled.warnings.push(format!(
                     "pg_partman maintains `{}`, which this pull does not keep as a \
                      partitioned parent; its partitions are not declared external",
-                    m.parent
+                    m.parent.shown()
                 ));
             }
         }
@@ -112,7 +117,9 @@ pub(crate) async fn hand_over_external_partitions(
             if !own.is_empty() {
                 refused.push(format!(
                     "  {partition}, a partition of {name}, holds {} of its own",
-                    own.join(", ")
+                    own.join(", "),
+                    partition = partition.shown(),
+                    name = name.shown()
                 ));
             }
             // What the read could not take in is a part of its own the list
@@ -123,7 +130,9 @@ pub(crate) async fn hand_over_external_partitions(
                 {
                     refused.push(format!(
                         "  {partition}, a partition of {name}: {}",
-                        limitation.detail
+                        limitation.detail,
+                        partition = partition.shown(),
+                        name = name.shown()
                     ));
                 }
             }
@@ -142,7 +151,8 @@ pub(crate) async fn hand_over_external_partitions(
         pulled.onboarding_notices.push(format!(
             "table `{name}`: its partitions are external ({why}), so its {} partition(s) are not \
              declared",
-            partitions.len()
+            partitions.len(),
+            name = name.raw()
         ));
     }
     if !refused.is_empty() {
@@ -185,7 +195,8 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
         schema.tables.remove(&name);
         pulled.warnings.push(format!(
             "table `{name}` was left out: `pbps validate` refuses its declaration — {}",
-            why.join("; ")
+            why.join("; "),
+            name = name.shown()
         ));
     }
     // A partition whose own checks or indexes `validate` refuses takes its
@@ -207,7 +218,9 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
             pulled.warnings.push(format!(
                 "table `{parent}` was left out with its partitions: `pbps validate` refuses its \
                  partition `{name}` — {}",
-                why.join("; ")
+                why.join("; "),
+                parent = parent.shown(),
+                name = name.shown()
             ));
         }
     }
@@ -225,7 +238,9 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
     for (name, parent) in orphans {
         schema.tables.remove(&name);
         pulled.warnings.push(format!(
-            "table `{name}` was left out: it is a partition of `{parent}`, which was left out"
+            "table `{name}` was left out: it is a partition of `{parent}`, which was left out",
+            name = name.shown(),
+            parent = parent.shown()
         ));
     }
 
@@ -266,7 +281,10 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
         pulled.unmanaged_modules.push(UnmanagedModule {
             kind: ModuleKind::Trigger.as_str(),
             target: LimitationTarget::module(id),
-            why: format!("its table `{on}` is not among the declarations this adoption wrote"),
+            why: format!(
+                "its table `{on}` is not among the declarations this adoption wrote",
+                on = on.shown()
+            ),
         });
     }
 
@@ -646,6 +664,35 @@ mod tests {
         Box::new(pbps_pg::Postgres::new())
     }
 
+    #[test]
+    fn adoption_prose_keeps_shown_names_beside_escaped_validation_errors() {
+        for (part, shown) in [
+            (
+                "a\nb\r\u{1b}[31m\\c\u{200b}",
+                r"a\nb\r\u{1b}[31m\\c\u{200b}",
+            ),
+            ("名前_ünï", "名前_ünï"),
+        ] {
+            let mut invalid = table("int", Some(Identity::new(1, 0)));
+            let column = invalid.columns.shift_remove("id").unwrap();
+            invalid.columns.insert(part.to_owned(), column);
+            invalid.primary_key.as_mut().unwrap().columns = vec![part.to_owned()];
+            let mut pulled = Pulled::default();
+            pulled
+                .schema
+                .tables
+                .insert(TableName::new("app", part), invalid);
+            leave_out_what_validate_refuses(&mut pulled, &pbps_mssql::Mssql);
+            assert!(pulled.schema.tables.is_empty());
+            assert_eq!(
+                pulled.warnings,
+                [format!(
+                    "table `app.{shown}` was left out: `pbps validate` refuses its declaration — mssql: column `{shown}` has an IDENTITY increment of 0, which never advances"
+                )]
+            );
+        }
+    }
+
     /// The two shapes #504 and #705 found: the reader expresses them, the
     /// validator refuses them. Each is left out and named; its neighbours —
     /// including the exact-span identity the validator accepts — stay.
@@ -678,7 +725,12 @@ mod tests {
 
         leave_out_what_validate_refuses(&mut pulled, pg().as_ref());
 
-        let kept: Vec<String> = pulled.schema.tables.keys().map(|n| n.to_string()).collect();
+        let kept: Vec<String> = pulled
+            .schema
+            .tables
+            .keys()
+            .map(|n| n.raw().to_string())
+            .collect();
         assert_eq!(kept, ["app.down", "app.edge", "app.t"]);
         let warned = pulled.warnings.join("\n");
         assert!(
@@ -724,7 +776,12 @@ mod tests {
 
         leave_out_what_validate_refuses(&mut pulled, pg().as_ref());
 
-        let kept: Vec<String> = pulled.schema.tables.keys().map(|n| n.to_string()).collect();
+        let kept: Vec<String> = pulled
+            .schema
+            .tables
+            .keys()
+            .map(|n| n.raw().to_string())
+            .collect();
         assert_eq!(kept, ["app.kept", "app.kept_rest"]);
         let warned = pulled.warnings.join("\n");
         assert!(
@@ -782,7 +839,12 @@ mod tests {
 
         leave_out_what_validate_refuses(&mut pulled, pg().as_ref());
 
-        let kept: Vec<String> = pulled.schema.tables.keys().map(|n| n.to_string()).collect();
+        let kept: Vec<String> = pulled
+            .schema
+            .tables
+            .keys()
+            .map(|n| n.raw().to_string())
+            .collect();
         assert_eq!(kept, ["app.good", "app.good_1"]);
         let warned = pulled.warnings.join("\n");
         assert!(
