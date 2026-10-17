@@ -1316,3 +1316,64 @@ async fn mssql_a_bound_default_or_rule_is_a_binding_and_its_definition_is_compar
     );
     db.drop().await;
 }
+
+/// A sequence a DEFAULT draws from and the XML schema collection a typed
+/// `xml` column validates against are part of what the capture compares: a
+/// sequence's increment changed, or a schema added to the collection,
+/// differs. A sequence that has only issued values does not.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_sequences_declaration_and_an_xml_collections_schemas_are_compared() {
+    let mut db = TestDb::create("seqxml2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE SEQUENCE app.seq AS int START WITH 1 INCREMENT BY 1;",
+            "CREATE XML SCHEMA COLLECTION app.xs AS N'<xsd:schema xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><xsd:element name=\"a\" type=\"xsd:int\"/></xsd:schema>';",
+            "CREATE TABLE app.t (id int CONSTRAINT df_id DEFAULT NEXT VALUE FOR app.seq, doc xml(app.xs));",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t")]))
+        .await
+        .expect("capture");
+    let seq = object("app", "seq");
+    assert!(bound(&sealed, &object("app", "df_id")).contains(&seq));
+    let differs = |differences: &[pbps_db::resolver::capture::CaptureDifference],
+                   what: &ObjectIdentity| {
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(what) && d.change == InputChange::Properties)
+    };
+
+    run(&mut db.conn, &["INSERT INTO app.t (doc) VALUES (NULL);"]).await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        !differs(&differences, &seq),
+        "a value issued: {differences:?}"
+    );
+
+    run(&mut db.conn, &["ALTER SEQUENCE app.seq INCREMENT BY 10;"]).await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(differs(&differences, &seq), "increment: {differences:?}");
+
+    run(&mut db.conn, &["ALTER SEQUENCE app.seq INCREMENT BY 1;"]).await;
+    run(
+        &mut db.conn,
+        &["ALTER XML SCHEMA COLLECTION app.xs ADD N'<xsd:schema xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:b\"><xsd:element name=\"b\" type=\"xsd:int\"/></xsd:schema>';"],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differs(&differences, &column(&object("app", "t"), "doc")),
+        "collection: {differences:?}"
+    );
+    db.drop().await;
+}

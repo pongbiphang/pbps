@@ -20,6 +20,7 @@ pub(super) const VIEWS: &[&str] = &[
     "objects",
     "sql_modules",
     "synonyms",
+    "sequences",
     "check_constraints",
     "default_constraints",
     "key_constraints",
@@ -93,6 +94,7 @@ pub(super) fn rule(view: &str, column: &str) -> Option<Rule> {
             "objects"
             | "sql_modules"
             | "synonyms"
+            | "sequences"
             | "check_constraints"
             | "default_constraints"
             | "key_constraints"
@@ -100,6 +102,11 @@ pub(super) fn rule(view: &str, column: &str) -> Option<Rule> {
             | "triggers",
             "object_id",
         ) => KEY,
+        // A sequence's declaration is compared; what it has issued so far
+        // moves with every `NEXT VALUE FOR`.
+        ("sequences", "current_value" | "last_used_value" | "is_exhausted") => {
+            Rule::Skip("a status: what the sequence has issued so far")
+        }
         ("types" | "table_types", "user_type_id") => KEY,
         ("columns" | "computed_columns" | "identity_columns", "column_id") => POSITION,
         ("parameters", "parameter_id") => POSITION,

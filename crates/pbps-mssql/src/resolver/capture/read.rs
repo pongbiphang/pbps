@@ -231,8 +231,10 @@ pub(super) struct Catalog {
     pub table_type_objects: BTreeMap<i64, BTreeSet<i64>>,
     /// Filegroups and partition schemes, by `data_space_id`.
     pub data_spaces: BTreeMap<i64, String>,
-    /// XML schema collections, by id: schema and name.
-    pub xml_collections: BTreeMap<i64, (String, String)>,
+    /// XML schema collections, by id: schema, name and the schemas it holds.
+    /// A typed `xml` column validates against those, so `ALTER XML SCHEMA
+    /// COLLECTION ... ADD` changes what it accepts.
+    pub xml_collections: BTreeMap<i64, (String, String, String)>,
     /// Column encryption keys, by id.
     pub encryption_keys: BTreeMap<i64, String>,
     /// Each user-defined table type's structure, by its `user_type_id`.
@@ -490,8 +492,9 @@ const DATA_SPACES: &str = "SELECT CONVERT(nvarchar(20), data_space_id) AS id, \
     CONVERT(nvarchar(128), name) AS name FROM sys.data_spaces;";
 
 const XML_COLLECTIONS: &str = "SELECT CONVERT(nvarchar(20), xml_collection_id) AS id, \
-    CONVERT(nvarchar(128), SCHEMA_NAME(schema_id)) AS [schema], CONVERT(nvarchar(128), name) AS name \
-    FROM sys.xml_schema_collections;";
+    CONVERT(nvarchar(128), SCHEMA_NAME(schema_id)) AS [schema], CONVERT(nvarchar(128), name) AS name, \
+    CONVERT(nvarchar(max), XML_SCHEMA_NAMESPACE(SCHEMA_NAME(schema_id), name)) AS definition \
+    FROM sys.xml_schema_collections WHERE xml_collection_id > 1;";
 
 const ENCRYPTION_KEYS: &str = "SELECT CONVERT(nvarchar(20), column_encryption_key_id) AS id, \
     CONVERT(nvarchar(128), name) AS name FROM sys.column_encryption_keys;";
@@ -896,7 +899,11 @@ pub(super) async fn read(
         let row = Text(&row);
         xml_collections.insert(
             row.number("id")?,
-            (row.required("schema")?, row.required("name")?),
+            (
+                row.required("schema")?,
+                row.required("name")?,
+                row.required("definition")?,
+            ),
         );
     }
     let mut encryption_keys = BTreeMap::new();

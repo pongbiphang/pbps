@@ -17,6 +17,7 @@ const PER_OBJECT: &[&str] = &[
     "objects",
     "sql_modules",
     "synonyms",
+    "sequences",
     "check_constraints",
     "default_constraints",
     "key_constraints",

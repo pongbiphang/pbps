@@ -3693,6 +3693,13 @@ column after another, which is why §8 rejected it for the externals file.
   answers #2150's third ready review. The same review's
   engine-generated-name finding is deferred to #2157, for #2142's
   target-versus-scratch comparison.
+- **A sequence and an XML schema collection are compared too.**
+  `sys.sequences` is one of the views read whole: a sequence a DEFAULT
+  draws from is compared on its declaration. Its `current_value`,
+  `last_used_value` and `is_exhausted` are skipped as status. A typed
+  `xml` column's collection is named together with the schemas it holds
+  (`XML_SCHEMA_NAMESPACE`), so `ALTER XML SCHEMA COLLECTION … ADD` differs.
+  This answers #2150's fourth ready review.
 - **The typed reads stay.** The dependency classification, the closure,
   the candidates and ownership read them (DEC-2141.1). The whole rows are
   what a capture compares.
@@ -3702,7 +3709,8 @@ column the pinned build reports for every view has a rule or may be compared
 as reported), `mssql_a_column_no_rule_names_is_compared` (a unique
 index's filter and a column's `SPARSE`) and
 `mssql_a_table_types_expressions_call_no_user_function` and
-`mssql_a_bound_default_or_rule_is_a_binding_and_its_definition_is_compared`,
+`mssql_a_bound_default_or_rule_is_a_binding_and_its_definition_is_compared`
+and `mssql_a_sequences_declaration_and_an_xml_collections_schemas_are_compared`,
 live; and
 `a_dependency_of_a_table_types_own_objects_refuses`. Each test fails with its part
 of the rule removed. The rebuilt-alike case of
