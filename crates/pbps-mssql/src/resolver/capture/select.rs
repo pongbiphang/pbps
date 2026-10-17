@@ -616,6 +616,29 @@ impl Builder<'_> {
                 .get(&id)
                 .ok_or_else(|| Uncovered::class(class::TYPE, "a type is not in the catalog"))?;
             let me = self.index.type_identity(id)?;
+            // A table type's computed column, DEFAULT or CHECK may not call a
+            // user function on the pinned build (2785, 4105; pinned by
+            // `mssql_a_table_types_expressions_call_no_user_function`), so
+            // its rows name only its own columns. Should a build allow more,
+            // the dependency is refused, never left out of the closure.
+            if let Some(objects) = self.index.catalog.table_type_objects.get(&id)
+                && self
+                    .index
+                    .catalog
+                    .dependencies
+                    .iter()
+                    // Its own columns, which a CHECK or a computed column
+                    // reads, are its own.
+                    .any(|d| {
+                        objects.contains(&d.referencing)
+                            && !d.referenced.is_some_and(|target| objects.contains(&target))
+                    })
+            {
+                return Err(Uncovered::object(
+                    &me,
+                    "a table type's expression names an object, which the capture does not follow",
+                ));
+            }
             // An alias type's base is the system type whose id is its
             // `system_type_id`.
             let base = if found.user_defined && !found.table_type {

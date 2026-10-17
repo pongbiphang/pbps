@@ -225,6 +225,10 @@ pub(super) struct Catalog {
     /// Every row of each view in `columns::VIEWS` that describes something
     /// this database's own objects or types hold, read whole (#2153).
     pub whole: BTreeMap<&'static str, Vec<WholeRow>>,
+    /// Each table type's own table object and the constraint objects on it,
+    /// by the type's `user_type_id`. They are the engine's
+    /// (`is_ms_shipped = 1`), so the ordinary object read never lists them.
+    pub table_type_objects: BTreeMap<i64, BTreeSet<i64>>,
     /// Filegroups and partition schemes, by `data_space_id`.
     pub data_spaces: BTreeMap<i64, String>,
     /// XML schema collections, by id: schema and name.
@@ -477,6 +481,10 @@ fn whole_select(view: &str, columns: &[(String, String)]) -> String {
         .join(", ");
     format!("SELECT {list} FROM sys.{view}{};", whole_filter(view))
 }
+
+const TABLE_TYPE_OBJECTS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) AS type, \
+    CONVERT(nvarchar(20), o.object_id) AS id FROM sys.table_types tt \
+    JOIN sys.objects o ON o.object_id = tt.type_table_object_id OR o.parent_object_id = tt.type_table_object_id;";
 
 const DATA_SPACES: &str = "SELECT CONVERT(nvarchar(20), data_space_id) AS id, \
     CONVERT(nvarchar(128), name) AS name FROM sys.data_spaces;";
@@ -870,6 +878,14 @@ pub(super) async fn read(
         }
         whole.insert(view, read);
     }
+    let mut table_type_objects: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+    for row in rows(conn, TABLE_TYPE_OBJECTS).await? {
+        let row = Text(&row);
+        table_type_objects
+            .entry(row.number("type")?)
+            .or_default()
+            .insert(row.number("id")?);
+    }
     let mut data_spaces = BTreeMap::new();
     for row in rows(conn, DATA_SPACES).await? {
         let row = Text(&row);
@@ -1044,6 +1060,7 @@ pub(super) async fn read(
         unique_indexes,
         foreign_keys,
         whole,
+        table_type_objects,
         data_spaces,
         xml_collections,
         encryption_keys,

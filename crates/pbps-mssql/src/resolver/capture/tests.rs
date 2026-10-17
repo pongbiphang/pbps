@@ -87,6 +87,7 @@ fn catalog() -> Catalog {
         synonyms: BTreeMap::new(),
         triggers: BTreeMap::new(),
         whole: BTreeMap::new(),
+        table_type_objects: BTreeMap::new(),
         data_spaces: BTreeMap::new(),
         xml_collections: BTreeMap::new(),
         encryption_keys: BTreeMap::new(),
@@ -288,6 +289,51 @@ fn every_refusal_names_its_reason() {
         condition(&nameless),
         "a reference names an object the capture cannot identify"
     );
+}
+
+#[test]
+fn a_dependency_of_a_table_types_own_objects_refuses() {
+    use super::read::Type;
+    let mut catalog = catalog();
+    catalog.types.push(Type {
+        id: 400,
+        schema: APP,
+        name: "rows".into(),
+        base: 243,
+        max_length: -1,
+        precision: 0,
+        scale: 0,
+        collation: None,
+        nullable: false,
+        user_defined: true,
+        table_type: true,
+    });
+    catalog.table_types.insert(400, Default::default());
+    // The type's own table object (900) and a constraint on it (901).
+    catalog
+        .table_type_objects
+        .insert(400, BTreeSet::from([900, 901]));
+    let mut row = reference(Some("dbo"), "f", Some(PRICE));
+    row.referencing = 901;
+    catalog.dependencies.push(row);
+    let scope = CaptureScope {
+        retained: BTreeSet::from([super::super::capture::ObjectIdentity {
+            class: class::TYPE.into(),
+            name: vec!["app".into(), "rows".into()],
+            signature: Vec::new(),
+        }]),
+        candidates: BTreeSet::new(),
+    };
+    catalog
+        .types_named
+        .insert(("app".into(), "rows".into()), BTreeSet::from([400]));
+    match select::select(&catalog, &scope) {
+        Ok(_) => panic!("the capture was expected to refuse"),
+        Err(refusal) => assert_eq!(
+            refusal.condition,
+            "a table type's expression names an object, which the capture does not follow"
+        ),
+    }
 }
 
 #[test]

@@ -1203,3 +1203,52 @@ async fn mssql_a_column_no_rule_names_is_compared() {
     );
     db.drop().await;
 }
+
+/// The premise the table-type guard rests on: a table type's computed
+/// column, DEFAULT and CHECK may not call a user function (2785, 4105), so
+/// its own objects bind nothing the capture would have to follow. One with
+/// only built-in expressions is captured. If a build lifts the restriction,
+/// this fails first, and the capture refuses such a type rather than leave
+/// its function out of the closure.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_table_types_expressions_call_no_user_function() {
+    let mut db = TestDb::create("typeexpr2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE FUNCTION dbo.f(@x int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @x END;",
+        ],
+    )
+    .await;
+    for (shape, error) in [
+        ("b AS dbo.f(a)", "2785"),
+        ("c int DEFAULT dbo.f(1)", "4105"),
+        ("CHECK (dbo.f(a) > 0)", "2785"),
+    ] {
+        let refused = db
+            .conn
+            .execute(&format!("CREATE TYPE app.calls AS TABLE (a int, {shape});"))
+            .await
+            .expect_err(shape);
+        assert_eq!(
+            refused.server_error_code().as_deref(),
+            Some(error),
+            "{shape}"
+        );
+    }
+    run(
+        &mut db.conn,
+        &[
+            "CREATE TYPE app.builtin AS TABLE (a int, b AS ABS(a), c int DEFAULT 1, CHECK (a > 0));",
+            "CREATE PROCEDURE app.takes @r app.builtin READONLY AS SELECT * FROM @r;",
+        ],
+    )
+    .await;
+    let captured = capture::capture(&mut db.conn, &objects(&[("app", "takes")]))
+        .await
+        .expect("a table type of built-in expressions is captured");
+    assert!(bound(&captured, &object("app", "takes")).contains(&user_type("app", "builtin")));
+    db.drop().await;
+}

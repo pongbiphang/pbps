@@ -169,6 +169,17 @@ impl<'a> Whole<'a> {
         if let Some(user_type) = self.table_objects.get(&id) {
             return Ok(json!(index.type_identity(*user_type)?));
         }
+        // A constraint on a table type's own table object, such as a column's
+        // DEFAULT, is the engine's and named by it: it stands as its type's,
+        // whose structure holds its definition.
+        if let Some((user_type, _)) = self
+            .catalog
+            .table_type_objects
+            .iter()
+            .find(|(_, objects)| objects.contains(&id))
+        {
+            return Ok(json!({"table_type_constraint": index.type_identity(*user_type)?}));
+        }
         Err(Self::unknown(view))
     }
 

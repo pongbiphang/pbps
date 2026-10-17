@@ -3676,14 +3676,24 @@ column after another, which is why §8 rejected it for the externals file.
     later build adds is compared before anyone names it.
   - **An id column no rule names refuses by name.** Compared raw, it would
     compare one database's numbering.
+- **A table type's own objects bind nothing to follow.** Its computed
+  column, DEFAULT and CHECK may not call a user function on the pinned
+  build (2785, 4105, measured), so its dependency rows name only its own
+  columns. Should a build allow more, the capture refuses that type by name
+  rather than leave the function out of its closure. A constraint on its own
+  table object, such as a column's DEFAULT that `default_object_id` names,
+  stands as its type's, since its name is the engine's and its definition
+  is in the type's structure. This answers #2150's second ready review.
 - **The typed reads stay.** The dependency classification, the closure,
   the candidates and ownership read them (DEC-2141.1). The whole rows are
   what a capture compares.
 
 **Pinned by** `mssql_every_catalog_column_has_a_rule_or_is_compared` (every
 column the pinned build reports for every view has a rule or may be compared
-as reported) and `mssql_a_column_no_rule_names_is_compared` (a unique
-index's filter and a column's `SPARSE`), live. Each test fails with its part
+as reported), `mssql_a_column_no_rule_names_is_compared` (a unique
+index's filter and a column's `SPARSE`) and
+`mssql_a_table_types_expressions_call_no_user_function`, live; and
+`a_dependency_of_a_table_types_own_objects_refuses`. Each test fails with its part
 of the rule removed. The rebuilt-alike case of
 `mssql_an_identitys_seed_and_not_for_replication_are_differences` fails if
 the dates are compared.
