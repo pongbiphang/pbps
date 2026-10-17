@@ -2835,7 +2835,10 @@ fn backfill_of(added: &AddedColumn) -> Option<String> {
                 crate::types::normalize(&added.ty).unwrap_or_else(|_| added.ty.clone())
             ))
         }
-        // A column added with no default arrives at NULL in every stored row.
+        // A scalar reference may be a domain whose own DEFAULT fills the row.
+        // This projection cannot guess or evaluate that value.
+        None if added.ty.type_ref().is_some() && !added.ty.is_array() => None,
+        // Other columns added with no default arrive at NULL in every stored row.
         None => Some("NULL".to_owned()),
     }
 }

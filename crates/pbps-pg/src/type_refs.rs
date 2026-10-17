@@ -272,11 +272,10 @@ pub async fn check_added(
         let own_default = !matches!(column.value_source, pbps_model::ValueSource::None);
         let added =
             crate::input_path::Added::new(&types[0], own_default).array(column.ty.is_array());
-        let added = if null_default(column) {
-            added.null_fill()
-        } else {
-            added
-        };
+        let fills_null = null_default(column)
+            || matches!(&column.value_source, pbps_model::ValueSource::Generated(g)
+                if crate::rows::unwrapped_with_type(&g.expression).0.eq_ignore_ascii_case("null"));
+        let added = if fills_null { added.null_fill() } else { added };
         let trusted: Vec<_> = trusted.iter().cloned().collect();
         let answers = crate::input_path::read(conn, within, &trusted, &[added]).await;
         let answer = answers
