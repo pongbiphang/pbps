@@ -6289,3 +6289,94 @@ attach. Also by `a_table_is_attached_as_the_default_partition_through_the_cli`
 (on 16 and 18), which fails with the engine's own error when the rows probe
 is removed, and by the units `an_ordinary_table_declared_as_a_partition_is_attached`
 and `a_partition_change_under_a_standing_parent_is_probed`.
+
+<a id="dec-1967-1"></a>
+
+**DEC-1967.1. An addition whose text may call a function the plan creates
+waits for the last function create by a `Lexical` edge.** (#1967, S6a of
+#1776)
+
+`after_the_rebuilds` used to cut the additions it moves out of the plan and
+put them back right after the last function create, in the order they had.
+It now draws a `Lexical` edge from that create to each of them, and `settle`
+places them: right after it, in their order, ahead of what followed it. The
+set is unchanged: a check, a default, a partition's default, an index or a
+generation expression whose text names a function the plan creates or
+rebuilds (DEC-1364.1's `may_call`), and what validates a column such a
+generation expression recomputes.
+
+**Why the last create, not the functions each names.** An edge from each
+named function would place an addition right after its own functions, and
+that loses what the old order kept without saying so. Four rounds of review
+on #2125 each found another such loss:
+- a function calling another the plan creates after it, as a mutually
+  recursive pair is, or through a function the plan leaves alone;
+- a check or key, on the table or a partition inheriting the column, ahead
+  of the recomputation it validates;
+- a change resting on another moved addition: a check naming a delayed
+  index, a new table whose default names one, with its rows after it;
+- a default the rows take, which must stay ahead of them.
+
+The barrier keeps them all, because the old pass's order is what kept them.
+A narrower placement is a separate change, with these as its cases.
+
+**Side by side.** Over the full local gate, every plan the pass saw was
+ordered by the old move and by the edges and compared: 1983 plans, 122 of
+them with an addition moved, all byte-identical.
+
+Pinned by `an_addition_naming_a_created_function_follows_the_last_function_create`.
+
+<a id="dec-1967-2"></a>
+
+**DEC-1967.2. A partitioned parent's new index is ordered ahead of a
+partition's index it could adopt by an edge to that index, not by moving the
+parent's.** (#1967, S6a of #1776)
+
+`before_its_partitions_indexes` used to hoist the parent's index, with what
+it rests on, to the first adoptable partition index. It refused when a change
+in between could not be crossed, or when the parent's rested on an adoptable
+index. Now:
+
+- an `Effect` edge goes from the parent's `AddIndex` to each partition index
+  `pbps_diff::schema_diff::adopts` says it could take (DEC-1688.1), and to no
+  other;
+- across the stretch between them, an edge goes from each change to what
+  rests on it (`rests_on`): a literal naming a relation it brings, a foreign
+  key on a key or unique index of the table it references, a replica identity
+  on the index, a change taking a name a drop may free;
+- `settle` sinks the partition's index to right after the parent's, carrying
+  what rests on it.
+
+What the parent's needs already runs before it, so nothing it needs has to
+cross. A change between the two is passed, since the partition's index needs
+nothing it brings unless an edge says so. What the partition's index may
+carry is narrower: a change that could create a table, a column or a module
+(the old `crossable` test) keeps an edge to the parent's index, because
+`rests_on` does not read what rests on such a change in turn, as a function
+calling one carried. Carrying one is therefore a cycle, refused with the old
+text, "it would pass a change to …" (round 5 of review). The other refusal is
+the parent's index resting on an adoptable partition index, also with the
+old text.
+
+**Side by side**, over the full local gate:
+- 3 calls ordered alike (2 moved, 1 unchanged);
+- 3 calls ordered differently: the partition index sank instead of the
+  parent's rising, which is the same pair order with the other changes in
+  the differ's place;
+- 1 call the old pass refused ("it would pass a change to
+  app.f(integer)") is now planned: the function rebuild between them no
+  longer blocks.
+
+Pinned by `a_parents_new_index_goes_ahead_of_the_partition_indexes_it_could_take`,
+which checks:
+- the sink;
+- the foreign key and replica identity carried with a unique index;
+- the negative (a partition index on another column, not adoptable, keeps
+  its place);
+- idempotency;
+- the passed function rebuild;
+- a function resting on the partition's index, with a caller after it,
+  refused;
+- the cycle refusal.
+
+#1998 item 11 (the verifier's effect for this pair) is in #1968's slice, S7a.
