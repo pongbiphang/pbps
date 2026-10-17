@@ -6596,17 +6596,28 @@ where an order is made. Replacing the hand rules showed four orders they
 kept that the effects did not, each now an effect or an edge, and none
 refusing a valid plan:
 
-- **A reader that spells the old name goes before the rename.** `Is` of the
-  base incarnation draws an edge to the renames of its key, by the name it
-  spells (`order::edges`, DEC-1954.4). A retype is no such move, and the
-  old default still goes first by `Absent` alone (DEC-1168.1). The release of
-  a partition's own default is spelled by its parent's column, so it reads
-  that column the same way (DEC-1699.1).
+- **A reader of the base incarnation is ordered against the rename of what it
+  reads by the name it spells**, as `Exists` is (DEC-1998.1 added the edge
+  to `order::edges`). A retype is no such move, and the old default still goes
+  first by `Absent` alone (DEC-1168.1). The release of a partition's own
+  default is spelled by its parent's column, so it reads that column the
+  same way (DEC-1699.1).
 - **A partition's index follows the indexes its parent ends with**, because
   the parent's built after it would take it as its clone (DEC-1688.1). It
   over-approximates by shape, as the hand rule did.
 - **A foreign key the plan drops, over a retyped column or into it, goes
-  before the retype.**
+  before the retype**, found through the column's uid, since the step spells
+  the name the column ends with.
+- **A row update names the columns its guards read**, the cells it leaves
+  alone and its key, so a rename of one goes first. **A row that references
+  its parent through a unique column other than the key, or through several
+  columns, waits for the parent row that holds those values**: a row also
+  goes by each of its unique keys' values (`row_aliases`), which the insert or
+  update creates and the child's reference requires, as the primary key's
+  value does for a single-column reference to it.
+  The update half of #2079 closes with it, so the commutation suites drop
+  their `a_row_updated_beside_a_new_column` gap (DEC-1965.1); the insert half
+  stays open.
 - **The name slots' handovers are edges** (`order::slots::edges`, offline, so
   without the catalog's alike names), sealed `Identity`.
 

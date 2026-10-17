@@ -843,6 +843,7 @@ impl Cx<'_> {
                 let cells: Vec<(&str, &Value)> =
                     row.columns().map(|(c, v)| (c.as_str(), v)).collect();
                 self.row_references(&owner, &cells, true);
+                self.row_aliases(&owner, &cells, None);
                 for (c, v) in &cells {
                     if v.is_null() {
                         self.row_needs_nullable(&owner, table, c);
@@ -858,14 +859,31 @@ impl Cx<'_> {
             }
             Change::UpdateRow {
                 table,
+                key_column,
                 key,
                 columns,
+                unchanged,
                 ..
             } => {
                 let owner = self.table(table)?;
                 self.row_basics(&owner, table, key);
                 let written: Vec<&str> = columns.keys().map(String::as_str).collect();
                 self.row_writes(table, &owner, &written);
+                // The statement holds the row to the cells it leaves alone
+                // and finds it by its key, before and after it runs, so it
+                // names those columns too: a rename of one goes first
+                // (DECISIONS 136).
+                for c in unchanged
+                    .keys()
+                    .map(String::as_str)
+                    .chain([key_column.as_str()])
+                {
+                    if !written.contains(&c)
+                        && let Ok(column) = self.column(&table.column(c))
+                    {
+                        self.exists(ObjectKey::Column(column));
+                    }
+                }
                 self.row_meets_constraints(&owner, table, &written);
                 let mut cells: Vec<(&str, &Value)> = Vec::new();
                 for (c, (from, to)) in columns {
@@ -891,6 +909,14 @@ impl Cx<'_> {
                     let _ = from;
                 }
                 self.row_references(&owner, &cells, true);
+                // The values it holds once it has run: the cells it sets and
+                // those it leaves alone.
+                let mut now = cells.clone();
+                now.extend(unchanged.iter().filter_map(|(c, cell)| match cell {
+                    crate::Cell::Value(v) => Some((c.as_str(), v)),
+                    crate::Cell::Default(_) => None,
+                }));
+                self.row_aliases(&owner, &now, Some(&written));
                 let old: Vec<(&str, &Value)> = columns
                     .iter()
                     .filter_map(|(c, (from, _))| match from {
@@ -1325,7 +1351,7 @@ impl Cx<'_> {
         let name = name.clone();
         let mut gone = Vec::new();
         for (n, fk) in &table.foreign_keys {
-            if fk.columns.iter().any(|c| *c == column) {
+            if fk.columns.contains(&column) {
                 gone.push(Self::part(owner, PartKey::ForeignKey(n.clone())));
             }
         }
@@ -1334,8 +1360,7 @@ impl Cx<'_> {
                 continue;
             };
             for (fk_name, fk) in &other.foreign_keys {
-                if fk.references_table == name && fk.references_columns.iter().any(|c| *c == column)
-                {
+                if fk.references_table == name && fk.references_columns.contains(&column) {
                     gone.push(Self::part(
                         &other_owner,
                         PartKey::ForeignKey(fk_name.clone()),
@@ -1649,52 +1674,163 @@ impl Cx<'_> {
             if was.foreign_keys.get(name) != Some(fk) {
                 continue;
             }
-            let ([column], [referenced]) =
-                (fk.columns.as_slice(), fk.references_columns.as_slice())
-            else {
-                continue;
-            };
-            let Some((_, value)) = cells.iter().find(|(c, _)| c == column) else {
-                continue;
-            };
-            let key = match value {
-                Value::Int(i) => i.to_string(),
-                Value::Text(t) => t.clone(),
-                Value::Bool(b) => b.to_string(),
-                Value::Null => continue,
-            };
             let Some(parent) = self
                 .final_table(&fk.references_table)
                 .or_else(|| self.base_table(&fk.references_table))
             else {
                 continue;
             };
-            // A row is keyed by its primary key: a value of any other
-            // referenced column does not name a row this plan writes.
-            let keyed = self
-                .final_of(&parent)
-                .or_else(|| self.base_of(&parent))
-                .is_some_and(|(_, t)| {
-                    t.primary_key
-                        .as_ref()
-                        .is_some_and(|pk| pk.columns.as_slice() == std::slice::from_ref(referenced))
+            // A row is keyed by its primary key: a reference to exactly that
+            // key, through one column, names the row this plan writes.
+            let keyed = match (fk.columns.as_slice(), fk.references_columns.as_slice()) {
+                ([column], [referenced]) => self
+                    .final_of(&parent)
+                    .or_else(|| self.base_of(&parent))
+                    .is_some_and(|(_, t)| {
+                        t.primary_key.as_ref().is_some_and(|pk| {
+                            pk.columns.as_slice() == std::slice::from_ref(referenced)
+                        })
+                    })
+                    .then_some(column),
+                _ => None,
+            };
+            if let Some(column) = keyed {
+                let Some((_, value)) = cells.iter().find(|(c, _)| c == column) else {
+                    continue;
+                };
+                let key = match value {
+                    Value::Int(i) => i.to_string(),
+                    Value::Text(t) => t.clone(),
+                    Value::Bool(b) => b.to_string(),
+                    Value::Null => continue,
+                };
+                wanted.push(ObjectKey::Row {
+                    table: parent,
+                    key: RowKey(key),
                 });
-            if !keyed {
                 continue;
             }
-            wanted.push(ObjectKey::Row {
-                table: parent,
-                key: RowKey(key),
-            });
+            // Any other reference, to a unique column or through several, is
+            // not a row key: the row that holds those values goes by them
+            // instead (`row_aliases`).
+            let mut pairs: Vec<(&String, Option<String>)> = fk
+                .references_columns
+                .iter()
+                .zip(&fk.columns)
+                .map(|(referenced, column)| {
+                    let value = cells
+                        .iter()
+                        .find(|(c, _)| c == column)
+                        .and_then(|(_, v)| cell_text(v));
+                    (referenced, value)
+                })
+                .collect();
+            pairs.sort();
+            let (columns, values): (Vec<&String>, Vec<Option<String>>) = pairs.into_iter().unzip();
+            if let Some(values) = values.into_iter().collect::<Option<Vec<_>>>() {
+                wanted.push(ObjectKey::Row {
+                    table: parent,
+                    key: alias_key(&columns, &values),
+                });
+            }
         }
         for key in wanted {
             self.exists(key);
         }
     }
 
+    /// The keys a row also goes by: each unique key of its table other than
+    /// a single-column primary key, which names the row itself. A foreign
+    /// key over one of them names the row by those values, so the row that
+    /// holds them creates the name (`cells` says what it holds).
+    fn row_aliases(
+        &mut self,
+        owner: &Recorded,
+        cells: &[(&str, &Value)],
+        changed: Option<&[&str]>,
+    ) {
+        let Some((_, table)) = self.final_of(owner) else {
+            return;
+        };
+        let mut keys: Vec<Vec<String>> = Vec::new();
+        if let Some(pk) = &table.primary_key
+            && pk.columns.len() > 1
+        {
+            keys.push(pk.columns.clone());
+        }
+        keys.extend(table.unique.values().map(|u| u.columns.clone()));
+        keys.extend(
+            table
+                .indexes
+                .values()
+                .filter(|i| i.unique && i.filter.is_none())
+                .filter_map(|i| {
+                    i.columns
+                        .iter()
+                        .map(|c| match &c.key {
+                            IndexKey::Column(k) => Some(k.clone()),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()
+                }),
+        );
+        let mut made = Vec::new();
+        for mut columns in keys {
+            columns.sort();
+            // An update that leaves the key's columns alone makes no new name.
+            if changed.is_some_and(|c| !columns.iter().any(|k| c.contains(&k.as_str()))) {
+                continue;
+            }
+            let values: Option<Vec<String>> = columns
+                .iter()
+                .map(|k| {
+                    cells
+                        .iter()
+                        .find(|(c, _)| c == k)
+                        .and_then(|(_, v)| cell_text(v))
+                })
+                .collect();
+            if let Some(values) = values {
+                let refs: Vec<&String> = columns.iter().collect();
+                made.push(Resource::Object(
+                    ObjectKey::Row {
+                        table: owner.clone(),
+                        key: alias_key(&refs, &values),
+                    },
+                    Incarnation::Final,
+                ));
+            }
+        }
+        for r in made {
+            self.creates(r);
+        }
+    }
+
     /// The rows the baseline's constraints held: nothing here. Deleting a
     /// row is blocked by a child row only; that is `row_references`' edge.
     fn row_blockers_gone(&mut self, _owner: &Recorded) {}
+}
+
+/// A value as the row keys spell it; NULL names nothing.
+fn cell_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Int(i) => Some(i.to_string()),
+        Value::Text(t) => Some(t.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Null => None,
+    }
+}
+
+/// The name a row goes by through a unique key: its columns, sorted, and the
+/// values it holds in them. It cannot be a primary key's text, which holds no
+/// such prefix.
+fn alias_key(columns: &[&String], values: &[String]) -> RowKey {
+    let columns: Vec<&str> = columns.iter().map(|c| c.as_str()).collect();
+    RowKey(format!(
+        "unique({})=({})",
+        columns.join(","),
+        values.join(",")
+    ))
 }
 
 /// Every named part a table holds, as keys' parts.
