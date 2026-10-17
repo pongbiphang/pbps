@@ -8,8 +8,8 @@
 use std::path::Path;
 
 use pbps_mssql::introspect::{
-    IndexKind, ModuleKind, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn,
-    RawKeyColumn, RawModule, RawTable, assemble,
+    IndexKind, ModuleKind, RawCatalog, RawCheck, RawCheckColumn, RawColumn, RawForeignKeyColumn,
+    RawIndexColumn, RawKeyColumn, RawModule, RawTable, assemble,
 };
 
 /// A catalog exercising every construct the model can express.
@@ -107,6 +107,10 @@ fn full_catalog() -> RawCatalog {
             constraint_object_id: 12,
             name: "ck_price".into(),
             definition: "([price]>(0))".into(),
+        }],
+        check_columns: vec![RawCheckColumn {
+            constraint_object_id: 12,
+            column: "price".into(),
         }],
         index_columns: vec![
             RawIndexColumn {

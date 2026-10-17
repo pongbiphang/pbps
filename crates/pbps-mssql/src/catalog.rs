@@ -10,8 +10,8 @@ use pbps_db::{Conn, DbError, FromColumn, Row};
 use pbps_model::{ObservedRows, RowScope, Schema, TableName};
 
 use crate::introspect::{
-    IndexKind, Pulled, RawCatalog, RawCheck, RawColumn, RawForeignKeyColumn, RawIndexColumn,
-    RawKeyColumn, RawModule, RawObjectDependency, RawTable, Securable, assemble,
+    IndexKind, Pulled, RawCatalog, RawCheck, RawCheckColumn, RawColumn, RawForeignKeyColumn,
+    RawIndexColumn, RawKeyColumn, RawModule, RawObjectDependency, RawTable, Securable, assemble,
 };
 
 /// `is_ms_shipped = 0` drops the system tables; the name list drops this tool's
@@ -257,6 +257,26 @@ SELECT cc.parent_object_id AS object_id, cc.object_id AS constraint_object_id,
   FROM sys.check_constraints cc
  WHERE cc.is_ms_shipped = 0
  ORDER BY cc.parent_object_id, cc.name;";
+
+/// The columns of its own table each check names (#1438), so the assembler
+/// can leave out a check over a column it left out instead of declaring one
+/// validation refuses. The engine's resolution rather than a scan of the
+/// definition's text, read the way `MODULE_DEPENDENCIES` reads a module's.
+const CHECK_COLUMNS: &str = "\
+BEGIN TRY
+SELECT DISTINCT cc.object_id AS constraint_object_id, r.referenced_minor_name AS column_name
+  FROM sys.check_constraints cc
+ CROSS APPLY sys.dm_sql_referenced_entities(
+       QUOTENAME(SCHEMA_NAME(cc.schema_id)) + N'.' + QUOTENAME(cc.name), N'OBJECT') r
+ WHERE cc.is_ms_shipped = 0
+   AND r.referenced_id = cc.parent_object_id
+   AND r.referenced_minor_id > 0
+ ORDER BY constraint_object_id, column_name;
+END TRY
+BEGIN CATCH
+    DECLARE @error nvarchar(2048) = ERROR_MESSAGE();
+    RAISERROR(N'%s', 16, 1, @error);
+END CATCH;";
 
 /// PK- and UNIQUE-backing indexes are already covered by `KEY_COLUMNS`;
 /// hypothetical indexes are the tuning wizard's ghosts. Included columns sort
@@ -544,6 +564,13 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             constraint_object_id: get(&row, "constraint_object_id")?,
             name: get::<&str>(&row, "name")?.to_owned(),
             definition: get::<&str>(&row, "definition")?.to_owned(),
+        });
+    }
+
+    for row in conn.query(CHECK_COLUMNS).await? {
+        raw.check_columns.push(RawCheckColumn {
+            constraint_object_id: get(&row, "constraint_object_id")?,
+            column: get::<&str>(&row, "column_name")?.to_owned(),
         });
     }
 

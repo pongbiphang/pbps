@@ -862,6 +862,7 @@
         "darwin"
       ],
       "cases": [
+        "an_object_over_a_left_out_column_is_left_out_with_it",
         "binding619::an_arrival_in_a_modules_own_schema_rebinds_its_one_part_names_and_no_other_arrival_does",
         "binding619::a_modules_one_part_names_resolve_in_its_schema_and_a_statements_in_the_users",
         "binding619::a_procedure_call_in_a_module_resolves_in_sys_then_the_executing_users_schema",

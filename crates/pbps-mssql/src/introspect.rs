@@ -401,6 +401,19 @@ pub struct RawCheck {
     pub definition: String,
 }
 
+/// One column of its own table that a check constraint's stored definition
+/// names, as `sys.dm_sql_referenced_entities` resolved it (#1438).
+///
+/// The engine's answer, not a scan of the definition's spelling: it reads
+/// `[m]` and `m` as the one column and knows which identifier is a column
+/// (measured on 17.0, comment on #1438). A reader that cannot see a check's
+/// definition sees none of its columns either.
+#[derive(Debug, Clone)]
+pub struct RawCheckColumn {
+    pub constraint_object_id: i32,
+    pub column: String,
+}
+
 /// The physical kind of an index, as `sys.indexes.type` reports it.
 ///
 /// The declarations hold rowstore B-tree indexes, clustered or not (the
@@ -609,6 +622,7 @@ pub struct RawCatalog {
     pub key_columns: Vec<RawKeyColumn>,
     pub foreign_key_columns: Vec<RawForeignKeyColumn>,
     pub checks: Vec<RawCheck>,
+    pub check_columns: Vec<RawCheckColumn>,
     pub index_columns: Vec<RawIndexColumn>,
     pub modules: Vec<RawModule>,
     pub object_dependencies: Vec<RawObjectDependency>,
@@ -991,6 +1005,21 @@ fn extend_unavailable_modules<D: std::ops::Deref<Target = RawObjectDependency>>(
     }
 }
 
+/// The left-out columns an object is over, as its limitation names them:
+/// "column `m`", or "columns `a`, `m`".
+fn left_out_columns_phrase(columns: &BTreeSet<&str>) -> String {
+    let list = columns
+        .iter()
+        .map(|c| format!("`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if columns.len() == 1 {
+        format!("column {list}")
+    } else {
+        format!("columns {list}")
+    }
+}
+
 /// Assembles the raw catalog rows into a [`Schema`].
 ///
 /// Rows referring to an object id that is not in `tables` are ignored: the
@@ -1128,11 +1157,23 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         &mut unavailable_object_ids,
     );
 
+    // The columns of each table this loop leaves out, by name. A key, index,
+    // check or foreign key over one cannot be declared either: validation
+    // refuses a declaration that names a column it does not have, so the
+    // object goes with its column, by name, rather than taking the whole
+    // pulled table down with it (#1438).
+    let mut left_out_columns: BTreeMap<i32, BTreeSet<String>> = BTreeMap::new();
     for c in &raw.columns {
         let Some(table) = tables.get_mut(&c.object_id) else {
             continue;
         };
         let table_name = name_of(c.object_id, &names);
+        let mut leave_out = || {
+            left_out_columns
+                .entry(c.object_id)
+                .or_default()
+                .insert(c.name.clone());
+        };
 
         if c.is_computed {
             // A definition the reader may not see is not an ordinary column
@@ -1147,6 +1188,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                         c.name
                     ),
                 );
+                leave_out();
                 continue;
             };
             table.computed.insert(
@@ -1172,6 +1214,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     c.name, c.type_name
                 ),
             );
+            leave_out();
             continue;
         }
         let ty = match column_type(c) {
@@ -1186,6 +1229,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                         c.name
                     ),
                 );
+                leave_out();
                 continue;
             }
         };
@@ -1261,6 +1305,65 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         table.columns.insert(c.name.clone(), column);
     }
 
+    // Each key, index, foreign key and check over a column left out above,
+    // with the columns, keyed as the loops below dedupe their rows: by owning
+    // object and name for the first three, by the constraint's id for a check.
+    let over_left_out = |object_id: i32, column: &str| {
+        left_out_columns
+            .get(&object_id)
+            .is_some_and(|columns| columns.contains(column))
+    };
+    let mut keys_over_left_out: BTreeMap<(i32, String), BTreeSet<&str>> = BTreeMap::new();
+    for k in raw
+        .key_columns
+        .iter()
+        .filter(|k| over_left_out(k.object_id, &k.column))
+    {
+        keys_over_left_out
+            .entry((k.object_id, k.constraint_name.clone()))
+            .or_default()
+            .insert(&k.column);
+    }
+    let mut indexes_over_left_out: BTreeMap<(i32, String), BTreeSet<&str>> = BTreeMap::new();
+    for i in raw
+        .index_columns
+        .iter()
+        .filter(|i| over_left_out(i.object_id, &i.column))
+    {
+        indexes_over_left_out
+            .entry((i.object_id, i.index_name.clone()))
+            .or_default()
+            .insert(&i.column);
+    }
+    let mut foreign_keys_over_left_out: BTreeMap<(i32, String), BTreeSet<&str>> = BTreeMap::new();
+    for f in raw
+        .foreign_key_columns
+        .iter()
+        .filter(|f| over_left_out(f.object_id, &f.column))
+    {
+        foreign_keys_over_left_out
+            .entry((f.object_id, f.constraint_name.clone()))
+            .or_default()
+            .insert(&f.column);
+    }
+    let check_tables: BTreeMap<i32, i32> = raw
+        .checks
+        .iter()
+        .map(|c| (c.constraint_object_id, c.object_id))
+        .collect();
+    let mut checks_over_left_out: BTreeMap<i32, BTreeSet<&str>> = BTreeMap::new();
+    for c in &raw.check_columns {
+        if check_tables
+            .get(&c.constraint_object_id)
+            .is_some_and(|table| over_left_out(*table, &c.column))
+        {
+            checks_over_left_out
+                .entry(c.constraint_object_id)
+                .or_default()
+                .insert(&c.column);
+        }
+    }
+
     // The tables whose clustered index the loops below leave out. A
     // nonclustered primary key on one of them cannot be declared: absent,
     // the table's layout says the key is clustered, and `heap` says there is
@@ -1273,14 +1376,20 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         .filter(|k| {
             !k.is_primary
                 && k.index_type == 1
-                && (k.is_disabled || k.ignore_dup_key || k.rows_partitioned)
+                && (k.is_disabled
+                    || k.ignore_dup_key
+                    || k.rows_partitioned
+                    || keys_over_left_out.contains_key(&(k.object_id, k.constraint_name.clone())))
         })
         .map(|k| (k.object_id, k.constraint_name.clone()))
         .chain(
             raw.index_columns
                 .iter()
                 .filter(|i| {
-                    (i.kind == IndexKind::Clustered && clustered_index_left_out(i))
+                    (i.kind == IndexKind::Clustered
+                        && (clustered_index_left_out(i)
+                            || indexes_over_left_out
+                                .contains_key(&(i.object_id, i.index_name.clone()))))
                         // A clustered columnstore holds the rows too, and is
                         // always left out: declared beside it, a
                         // nonclustered key would read as a heap's (#1209
@@ -1300,6 +1409,27 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let Some(table) = tables.get_mut(&k.object_id) else {
             continue;
         };
+        if let Some(columns) = keys_over_left_out.get(&(k.object_id, k.constraint_name.clone())) {
+            if unsupported_keys.insert((k.object_id, k.constraint_name.clone())) {
+                let kind = if k.is_primary {
+                    "primary key"
+                } else {
+                    "unique constraint"
+                };
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&k.object_id),
+                    format!(
+                        "{}: {kind} `{}` is over {}, which was left out of the declarations; the {kind} was left out too",
+                        name_of(k.object_id, &names),
+                        k.constraint_name,
+                        left_out_columns_phrase(columns),
+                    ),
+                );
+            }
+            continue;
+        }
         if k.is_disabled || k.ignore_dup_key {
             if unsupported_keys.insert((k.object_id, k.constraint_name.clone())) {
                 push_limitation(
@@ -1422,6 +1552,23 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let Some(table) = tables.get_mut(&i.object_id) else {
             continue;
         };
+        if let Some(columns) = indexes_over_left_out.get(&(i.object_id, i.index_name.clone())) {
+            if unmodelled_indexes.insert((i.object_id, i.index_name.clone())) {
+                let kind = if i.is_unique { "unique index" } else { "index" };
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&i.object_id),
+                    format!(
+                        "{}: {kind} `{}` is over {}, which was left out of the declarations; the index was left out too",
+                        name_of(i.object_id, &names),
+                        i.index_name,
+                        left_out_columns_phrase(columns),
+                    ),
+                );
+            }
+            continue;
+        }
         // Ordinary disabled indexes affect access paths only. Unique indexes
         // change which writes survive, so rebuilding them must not silently
         // enable enforcement or replace IGNORE_DUP_KEY with rejection.
@@ -1523,6 +1670,24 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         if !tables.contains_key(&f.object_id) {
             continue;
         }
+        if let Some(columns) =
+            foreign_keys_over_left_out.get(&(f.object_id, f.constraint_name.clone()))
+        {
+            if unsupported_omitted_foreign_keys.insert((f.object_id, f.constraint_name.clone())) {
+                push_limitation(
+                    &mut warnings,
+                    &mut limitations,
+                    names.get(&f.object_id),
+                    format!(
+                        "{}: foreign key `{}` is over {}, which was left out of the declarations; the foreign key was left out too",
+                        name_of(f.object_id, &names),
+                        f.constraint_name,
+                        left_out_columns_phrase(columns),
+                    ),
+                );
+            }
+            continue;
+        }
         // Recreating one of these as an ordinary FK would enable or validate
         // enforcement the source did not promise (decision 460). Keep the
         // omission visible to managed-set drift checks, once per composite FK.
@@ -1609,6 +1774,20 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let Some(table) = tables.get_mut(&c.object_id) else {
             continue;
         };
+        if let Some(columns) = checks_over_left_out.get(&c.constraint_object_id) {
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&c.object_id),
+                format!(
+                    "{}: check constraint `{}` is over {}, which was left out of the declarations; the check constraint was left out too",
+                    name_of(c.object_id, &names),
+                    c.name,
+                    left_out_columns_phrase(columns),
+                ),
+            );
+            continue;
+        }
         if c.is_disabled || c.is_not_trusted || c.is_not_for_replication {
             push_limitation(
                 &mut warnings,
@@ -3415,6 +3594,195 @@ mod tests {
         }
         // One per left-out index and one per foreign key that went with it.
         assert_eq!(pulled.limitations.len(), 4, "{:?}", pulled.limitations);
+    }
+
+    /// #1438: a column the reader leaves out — a computed column whose
+    /// definition it cannot see, a column of an alias type — took nothing
+    /// with it, so a key, index, check or foreign key over it was declared,
+    /// and validation then refused the pulled table ("not a column of this
+    /// table"). Each now goes with its column, by name, and the rest of the
+    /// table stays.
+    #[test]
+    fn an_object_over_a_left_out_column_is_left_out_with_it() {
+        let mut raw = RawCatalog {
+            tables: vec![
+                raw_table(10, "dbo", "t"),
+                raw_table(20, "dbo", "u"),
+                raw_table(30, "dbo", "ch"),
+            ],
+            ..Default::default()
+        };
+        let mut hidden = raw_column(10, "hidden", "int");
+        hidden.is_computed = true;
+        let id = |object_id| {
+            let mut c = raw_column(object_id, "id", "int");
+            c.is_nullable = false;
+            c
+        };
+        let alias = |object_id, name: &str| {
+            let mut c = raw_column(object_id, name, "money_t");
+            c.is_user_defined_type = true;
+            c
+        };
+        raw.columns = vec![
+            id(10),
+            raw_column(10, "a", "int"),
+            hidden,
+            alias(10, "m"),
+            id(20),
+            alias(20, "v"),
+            id(30),
+            raw_column(30, "a", "int"),
+            raw_column(30, "m", "int"),
+        ];
+        raw.key_columns = vec![
+            key(10, "pk_t", true, 1, "id"),
+            // Only the column left out is named; `a` is an ordinary column.
+            key(10, "uq_t_a_m", false, 2, "a"),
+            key(10, "uq_t_a_m", false, 2, "m"),
+            // The rows of u are clustered on a key over a left-out column, so
+            // its nonclustered primary key cannot say how they are laid out.
+            key(20, "uq_u_v", false, 1, "v"),
+            key(20, "pk_u", true, 2, "id"),
+        ];
+        let index = |name: &str, column: &str, is_included| RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
+            object_id: 10,
+            index_name: name.into(),
+            is_unique: false,
+            kind: IndexKind::Nonclustered,
+            filter: None,
+            column: column.into(),
+            is_included,
+            is_descending: false,
+            rows_partitioned: false,
+        };
+        raw.index_columns = vec![
+            index("ix_hidden", "hidden", false),
+            index("ix_a_with_m", "a", false),
+            index("ix_a_with_m", "m", true),
+            index("ix_a", "a", false),
+        ];
+        let check = |constraint_object_id, name: &str| RawCheck {
+            is_disabled: false,
+            is_not_trusted: false,
+            is_not_for_replication: false,
+            object_id: 10,
+            constraint_object_id,
+            name: name.into(),
+            definition: "(1=1)".into(),
+        };
+        raw.checks = vec![check(11, "ck_m"), check(12, "ck_a")];
+        raw.check_columns = vec![
+            RawCheckColumn {
+                constraint_object_id: 11,
+                column: "m".into(),
+            },
+            RawCheckColumn {
+                constraint_object_id: 12,
+                column: "a".into(),
+            },
+        ];
+        let fk = |object_id, name: &str, ref_object_id, ref_table: &str, ref_key: &str| {
+            [("a", "a"), ("m", "m")].map(|(column, ref_column)| RawForeignKeyColumn {
+                object_id,
+                constraint_name: name.into(),
+                ref_schema: "dbo".into(),
+                ref_table: ref_table.into(),
+                ref_object_id,
+                ref_key: Some(ref_key.into()),
+                column: column.into(),
+                ref_column: ref_column.into(),
+                on_delete: 0,
+                on_update: 0,
+                is_disabled: false,
+                is_not_trusted: false,
+                is_not_for_replication: false,
+            })
+        };
+        // One over t's own left-out column, and one from ch into the key of t
+        // that goes with it.
+        raw.foreign_key_columns = [
+            fk(10, "fk_t_ch", 30, "ch", "pk_ch"),
+            fk(30, "fk_ch_t", 10, "t", "uq_t_a_m"),
+        ]
+        .concat();
+
+        let pulled = assemble(&raw);
+
+        let table = |name: &str| &pulled.schema.tables[&TableName::new("dbo", name)];
+        for name in ["t", "u", "ch"] {
+            let errors = crate::validate::table(&TableName::new("dbo", name), table(name));
+            assert!(errors.is_empty(), "{name}: {errors:?}");
+        }
+        let t = table("t");
+        assert_eq!(t.columns.keys().collect::<Vec<_>>(), ["id", "a"]);
+        assert_eq!(t.primary_key.as_ref().unwrap().columns, ["id"]);
+        assert!(t.unique.is_empty(), "{:?}", t.unique);
+        assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_a"]);
+        assert_eq!(t.checks.keys().collect::<Vec<_>>(), ["ck_a"]);
+        assert!(t.foreign_keys.is_empty(), "{:?}", t.foreign_keys);
+        let u = table("u");
+        assert!(u.primary_key.is_none() && u.unique.is_empty(), "{u:?}");
+        assert!(table("ch").foreign_keys.is_empty());
+
+        for (on, detail) in [
+            (
+                "t",
+                "index `ix_hidden` is over column `hidden`, which was left out",
+            ),
+            (
+                "t",
+                "index `ix_a_with_m` is over column `m`, which was left out",
+            ),
+            (
+                "t",
+                "unique constraint `uq_t_a_m` is over column `m`, which was left out",
+            ),
+            (
+                "t",
+                "check constraint `ck_m` is over column `m`, which was left out",
+            ),
+            (
+                "t",
+                "foreign key `fk_t_ch` is over column `m`, which was left out",
+            ),
+            (
+                "u",
+                "unique constraint `uq_u_v` is over column `v`, which was left out",
+            ),
+            (
+                "u",
+                "primary key `pk_u` is nonclustered beside the clustered index `uq_u_v`",
+            ),
+            (
+                "ch",
+                "foreign key `fk_ch_t` references key `uq_t_a_m` of dbo.t",
+            ),
+        ] {
+            assert!(
+                pulled.limitations.iter().any(|l| {
+                    l.target.object_name() == TableName::new("dbo", on) && l.detail.contains(detail)
+                }),
+                "{detail}: {:?}",
+                pulled.limitations
+            );
+        }
+        // Those eight and the three columns themselves; nothing else.
+        assert_eq!(pulled.limitations.len(), 11, "{:?}", pulled.limitations);
+    }
+
+    #[test]
+    fn a_left_out_column_is_named_alone_or_in_a_list() {
+        assert_eq!(
+            left_out_columns_phrase(&BTreeSet::from(["m"])),
+            "column `m`"
+        );
+        assert_eq!(
+            left_out_columns_phrase(&BTreeSet::from(["m", "a"])),
+            "columns `a`, `m`"
+        );
     }
 
     /// #1186 left a key laid out against its kind's default out of the
