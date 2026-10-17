@@ -373,6 +373,35 @@ impl<'a> Whole<'a> {
         Ok(out)
     }
 
+    /// The `default_object_id` and `rule_object_id` a column's or a type's
+    /// row names, each with its column, when nonzero.
+    pub(super) fn bound_by(&self, row: &WholeRow) -> Vec<(&'static str, i64)> {
+        ["default_object_id", "rule_object_id"]
+            .into_iter()
+            .filter_map(|column| {
+                number(row, column)
+                    .filter(|id| *id != 0)
+                    .map(|id| (column, id))
+            })
+            .collect()
+    }
+
+    /// The column row of `(object, column)` in `sys.columns`.
+    pub(super) fn column_row(&self, object: i64, column: i64) -> Option<&'a WholeRow> {
+        self.per_column
+            .get("columns")
+            .and_then(|rows| rows.get(&(object, column)))
+            .copied()
+    }
+
+    /// The row of a type in `sys.types`.
+    pub(super) fn type_row(&self, id: i64) -> Option<&'a WholeRow> {
+        self.types
+            .get("types")
+            .and_then(|rows| rows.get(&id))
+            .copied()
+    }
+
     /// Everything the whole views hold about one column, by view.
     pub(super) fn column(
         &self,

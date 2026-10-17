@@ -3684,6 +3684,15 @@ column after another, which is why §8 rejected it for the externals file.
   table object, such as a column's DEFAULT that `default_object_id` names,
   stands as its type's, since its name is the engine's and its definition
   is in the type's structure. This answers #2150's second ready review.
+- **A bound DEFAULT or RULE is a binding.** A standalone DEFAULT or RULE
+  bound with `sp_bindefault` or `sp_bindrule` is what its column or alias
+  type runs. So a column's or a type's `default_object_id` or
+  `rule_object_id` naming one is a binding, and its object, definition
+  included, joins the closure. The type pass and the object pass alternate
+  until neither finds anything new, since a type can bind a rule. This
+  answers #2150's third ready review. The same review's
+  engine-generated-name finding is deferred to #2157, for #2142's
+  target-versus-scratch comparison.
 - **The typed reads stay.** The dependency classification, the closure,
   the candidates and ownership read them (DEC-2141.1). The whole rows are
   what a capture compares.
@@ -3692,7 +3701,9 @@ column after another, which is why §8 rejected it for the externals file.
 column the pinned build reports for every view has a rule or may be compared
 as reported), `mssql_a_column_no_rule_names_is_compared` (a unique
 index's filter and a column's `SPARSE`) and
-`mssql_a_table_types_expressions_call_no_user_function`, live; and
+`mssql_a_table_types_expressions_call_no_user_function` and
+`mssql_a_bound_default_or_rule_is_a_binding_and_its_definition_is_compared`,
+live; and
 `a_dependency_of_a_table_types_own_objects_refuses`. Each test fails with its part
 of the rule removed. The rebuilt-alike case of
 `mssql_an_identitys_seed_and_not_for_replication_are_differences` fails if

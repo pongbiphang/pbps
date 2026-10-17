@@ -1252,3 +1252,67 @@ async fn mssql_a_table_types_expressions_call_no_user_function() {
     assert!(bound(&captured, &object("app", "takes")).contains(&user_type("app", "builtin")));
     db.drop().await;
 }
+
+/// A standalone DEFAULT or RULE bound with `sp_bindefault` or `sp_bindrule`
+/// is what its column or alias type runs: a binding, and in the closure, so
+/// one rebuilt under the same name with another definition differs.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_bound_default_or_rule_is_a_binding_and_its_definition_is_compared() {
+    let mut db = TestDb::create("bound2141r").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE DEFAULT app.d_zero AS 0;",
+            "CREATE RULE app.r_pos AS @v > 0;",
+            "CREATE RULE app.r_type AS @v < 100;",
+            "CREATE TYPE app.posint FROM int;",
+            "CREATE TABLE app.t (a int, b int);",
+            // Only a parameter uses the type: binding a rule to a type binds
+            // it to the type's columns too, never to a parameter.
+            "CREATE PROCEDURE app.takes @x app.posint AS SELECT @x;",
+            "EXEC sp_bindefault N'app.d_zero', N'app.t.a';",
+            "EXEC sp_bindrule N'app.r_pos', N'app.t.b';",
+            "EXEC sp_bindrule N'app.r_type', N'app.posint';",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t"), ("app", "takes")]))
+        .await
+        .expect("capture");
+    let t = object("app", "t");
+    let (d, r) = (object("app", "d_zero"), object("app", "r_pos"));
+    assert!(bound(&sealed, &column(&t, "a")).contains(&d));
+    assert!(bound(&sealed, &column(&t, "b")).contains(&r));
+    // Bound to the type alone, the rule is found through the type.
+    let only_the_type = object("app", "r_type");
+    assert!(bound(&sealed, &user_type("app", "posint")).contains(&only_the_type));
+    for standalone in [&d, &r, &only_the_type] {
+        assert!(
+            sealed.objects().any(|o| o == standalone),
+            "{standalone:?} is in the closure"
+        );
+    }
+
+    run(
+        &mut db.conn,
+        &[
+            "EXEC sp_unbindefault N'app.t.a';",
+            "DROP DEFAULT app.d_zero;",
+            "CREATE DEFAULT app.d_zero AS 1;",
+            "EXEC sp_bindefault N'app.d_zero', N'app.t.a';",
+        ],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differences
+            .iter()
+            .any(|x| x.object.as_ref() == Some(&d) && x.change == InputChange::Properties),
+        "{differences:?}"
+    );
+    db.drop().await;
+}

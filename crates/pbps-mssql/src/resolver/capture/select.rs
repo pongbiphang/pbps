@@ -219,6 +219,9 @@ struct Builder<'a> {
     pending: VecDeque<i64>,
     seen: BTreeSet<i64>,
     types: BTreeSet<i64>,
+    /// The types already read, kept across passes: a type can bind a
+    /// standalone RULE, whose object joins the next object pass.
+    types_done: BTreeSet<i64>,
     /// The engine's own objects something names: in scope by identity only,
     /// since nothing a plan does can change them.
     engine: BTreeSet<ObjectIdentity>,
@@ -240,6 +243,34 @@ impl Builder<'_> {
             ));
         }
         Ok(())
+    }
+
+    /// The bindings to a standalone DEFAULT or RULE a column's or a type's
+    /// row names (`sp_bindefault`, `sp_bindrule`): its definition is what
+    /// the bound column runs, so the object joins the closure. A DEFAULT
+    /// constraint is no standalone object: it is its table's, and read so.
+    fn standalone(
+        &mut self,
+        row: Option<&super::read::WholeRow>,
+    ) -> Result<BTreeSet<Binding>, Uncovered> {
+        let mut bindings = BTreeSet::new();
+        let Some(row) = row else {
+            return Ok(bindings);
+        };
+        for (column, id) in self.whole.bound_by(row) {
+            let Some(found) = self.index.objects.get(&id).copied() else {
+                continue;
+            };
+            if found.parent.is_none() && matches!(found.kind.as_str(), "D" | "R") {
+                self.enqueue(id);
+                bindings.insert(Binding {
+                    node: "sys.columns".into(),
+                    path: vec![column.into()],
+                    target: self.index.object(found)?,
+                });
+            }
+        }
+        Ok(bindings)
     }
 
     fn type_ref(&mut self, id: i64) -> Result<ObjectIdentity, Uncovered> {
@@ -567,7 +598,8 @@ impl Builder<'_> {
                 ("persisted".to_owned(), json!(column.persisted)),
             ]);
             properties.extend(self.whole.column(id, column.id, &self.index)?);
-            let bindings = column_bindings.remove(&column.id).unwrap_or_default();
+            let mut bindings = column_bindings.remove(&column.id).unwrap_or_default();
+            bindings.extend(self.standalone(self.whole.column_row(id, column.id))?);
             self.insert(
                 column_id,
                 Input {
@@ -605,9 +637,8 @@ impl Builder<'_> {
 
     fn finish_types(&mut self) -> Result<(), Uncovered> {
         let mut pending: VecDeque<i64> = self.types.iter().copied().collect();
-        let mut done = BTreeSet::new();
         while let Some(id) = pending.pop_front() {
-            if !done.insert(id) {
+            if !self.types_done.insert(id) {
                 continue;
             }
             let found = *self
@@ -706,6 +737,7 @@ impl Builder<'_> {
                 ("table_type".to_owned(), json!(found.table_type)),
             ]);
             properties.extend(self.whole.type_rows(id, &self.index)?);
+            bindings.extend(self.standalone(self.whole.type_row(id))?);
             self.insert(
                 me,
                 Input {
@@ -725,6 +757,7 @@ pub(super) fn select(catalog: &Catalog, scope: &CaptureScope) -> Result<Selected
         pending: VecDeque::new(),
         seen: BTreeSet::new(),
         types: BTreeSet::new(),
+        types_done: BTreeSet::new(),
         engine: BTreeSet::new(),
         result: Selected {
             inputs: BTreeMap::new(),
@@ -820,10 +853,17 @@ pub(super) fn select(catalog: &Catalog, scope: &CaptureScope) -> Result<Selected
         };
         builder.result.candidates.insert(candidate.clone(), members);
     }
-    while let Some(id) = builder.pending.pop_front() {
-        builder.object(id)?;
+    // Objects bind types, and a type can bind a standalone RULE: alternate
+    // until neither pass finds anything new.
+    loop {
+        while let Some(id) = builder.pending.pop_front() {
+            builder.object(id)?;
+        }
+        builder.finish_types()?;
+        if builder.pending.is_empty() {
+            break;
+        }
     }
-    builder.finish_types()?;
     for engine in std::mem::take(&mut builder.engine) {
         builder
             .result
