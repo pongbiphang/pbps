@@ -6301,9 +6301,13 @@ function create in the plan, whichever function that was. It now states what
 each addition waits for and lets `settle` place it:
 
 - a `Lexical` edge from each function create its text may call
-  (`may_call`, DEC-1364.1's over-approximation, unchanged);
+  (`may_call`, DEC-1364.1's over-approximation, unchanged), and from each
+  create a call may reach through the bodies of the plan's functions. An
+  addition is evaluated over rows, so it runs what its function calls in
+  turn, and PL/pgSQL creates a mutually recursive pair in either order;
 - an `Effect` edge from a recomputed column's new expression to what
-  validates its values: a `NOT NULL`, and a key or index over it.
+  validates its values: a `NOT NULL`, a key or index over it, and a check or
+  expression index whose text may read it.
 
 What waits for nothing keeps the differ's place, as before.
 
@@ -6328,7 +6332,14 @@ No call changed from accepted to refused or back.
 
 Pinned by `an_addition_runs_right_after_the_functions_its_text_names`: the
 placement, the two negatives (a function created ahead, no function named)
-and idempotency.
+and idempotency. `an_evaluated_addition_waits_for_what_its_call_reaches_and_the_columns_it_reads`
+pins the reach through a recursive pair and the check reading a recomputed
+column, with a negative for each.
+
+Only a check or index reading a recomputed column can land later than the
+old pass put it: one naming no function used to stay ahead of the
+recomputation it validates. Every other edge comes from a function create,
+all of which the old pass put the addition after.
 
 <a id="dec-1967-2"></a>
 

@@ -1871,6 +1871,36 @@ fn after_the_rebuilds(
             _ => None,
         })
         .collect();
+    // An addition evaluated over rows runs the function it calls, and what
+    // that function calls in turn: each create a call may reach through the
+    // bodies of the plan's functions, itself included. PL/pgSQL accepts a
+    // body naming a function not created yet, so mutually recursive creates
+    // run in either order, and the addition waits for all of them (#2125
+    // review).
+    let bodies: Vec<&str> = functions
+        .iter()
+        .map(|(_, at)| match &cs.changes[*at].change {
+            Change::AlterModule { module, .. } | Change::CreateModule { module, .. } => {
+                module.definition.as_str()
+            }
+            _ => "",
+        })
+        .collect();
+    let reach: Vec<BTreeSet<usize>> = (0..functions.len())
+        .map(|from| {
+            let mut seen = BTreeSet::from([from]);
+            let mut stack = vec![from];
+            while let Some(k) = stack.pop() {
+                for (j, (name, _)) in functions.iter().enumerate() {
+                    if !seen.contains(&j) && pbps_pg::generated::may_call(bodies[k], name) {
+                        seen.insert(j);
+                        stack.push(j);
+                    }
+                }
+            }
+            seen
+        })
+        .collect();
     let mut schedule = Schedule::new(cs.changes.len());
     for (i, p) in cs.changes[..last].iter().enumerate() {
         let (text, columns): (Option<String>, Vec<ColumnRef>) = match &p.change {
@@ -1943,15 +1973,32 @@ fn after_the_rebuilds(
             ),
             _ => (None, Vec::new()),
         };
-        if let Some(text) = text {
-            for (name, created) in &functions {
-                if pbps_pg::generated::may_call(&text, name) {
-                    schedule.edge(*created, i, Source::Lexical, OrderReason::Structural);
+        // A check's and an expression index's text is evaluated over the
+        // table's rows, so a recomputed column it may read is validated by it
+        // as much as by a key over it (#2125 review).
+        let evaluated = match &p.change {
+            Change::AddCheck { table, .. } | Change::AddIndex { table, .. } => Some(table),
+            _ => None,
+        };
+        if let Some(text) = &text {
+            for (k, (name, _)) in functions.iter().enumerate() {
+                if pbps_pg::generated::may_call(text, name) {
+                    for &callee in &reach[k] {
+                        schedule.edge(
+                            functions[callee].1,
+                            i,
+                            Source::Lexical,
+                            OrderReason::Structural,
+                        );
+                    }
                 }
             }
         }
         for (column, at) in &expressions {
-            if *at != i && columns.contains(column) {
+            let reads = evaluated.zip(text.as_deref()).is_some_and(|(table, text)| {
+                column.table == *table && pbps_pg::generated::may_read(text, &column.name)
+            });
+            if *at != i && (columns.contains(column) || reads) {
                 schedule.edge(*at, i, Source::Effect, OrderReason::Structural);
             }
         }
@@ -6063,6 +6110,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!((again, &cs), (0, &settled));
+    }
+
+    /// #2125 review: an addition evaluated over rows waits for every function
+    /// its call may reach through the plan's function bodies, a mutually
+    /// recursive pair included, and for the recomputation of a generated
+    /// column its text may read. Negatives: a function the called one does
+    /// not name, and a check reading another column, are not waited for.
+    #[test]
+    fn an_evaluated_addition_waits_for_what_its_call_reaches_and_the_columns_it_reads() {
+        let order = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .map(|p| {
+                    if let Change::AddCheck { name, .. } = &p.change {
+                        name.clone()
+                    } else {
+                        p.change.subject()
+                    }
+                })
+                .collect()
+        };
+        let run = |changes: Vec<Change>| {
+            let mut cs = plan(changes);
+            after_the_rebuilds(
+                &mut cs,
+                &BTreeSet::new(),
+                &ModuleDeps::new(),
+                &Schema::default(),
+            )
+            .unwrap();
+            order(&cs)
+        };
+        // `f` calls `g` and `g` calls `f`: created in name order, the check
+        // calling only `f` follows both.
+        assert_eq!(
+            run(vec![
+                routine("app.f()", "SELECT app.g()"),
+                check_of("calls_f", "app.f() > 0"),
+                routine("app.g()", "SELECT app.f()"),
+                routine("app.h()", "SELECT 3"),
+            ]),
+            ["app.f()", "app.g()", "calls_f", "app.h()"]
+        );
+        // Negative: `f` names no other function, so `g` is not waited for.
+        assert_eq!(
+            run(vec![
+                routine("app.f()", "SELECT 1"),
+                check_of("calls_f", "app.f() > 0"),
+                routine("app.g()", "SELECT app.f()"),
+            ]),
+            ["app.f()", "calls_f", "app.g()"]
+        );
+        // A generated column recomputed by `g`, read by a check that calls
+        // only `f`, created ahead of `g`: the check follows the recomputation.
+        let recompute = Change::AlterColumnExpression {
+            uid: "c_d4e5f6".parse().unwrap(),
+            column: TableName::new("app", "t").column("c"),
+            from: "id".into(),
+            to: "app.g(id)".into(),
+        };
+        assert_eq!(
+            run(vec![
+                recompute.clone(),
+                routine("app.f()", "SELECT 1"),
+                check_of("reads_c", "c >= app.f()"),
+                check_of("reads_d", "d >= app.f()"),
+                routine("app.g()", "SELECT 2"),
+            ]),
+            ["app.f()", "reads_d", "app.g()", "app.t", "reads_c"]
+        );
     }
 
     /// A parent's new index goes ahead of every partition index it could take
