@@ -937,12 +937,23 @@ impl Cx<'_> {
                 });
             }
             Change::DeleteRow {
-                table, key, row, ..
+                table,
+                key_column,
+                key,
+                row,
+                ..
             } => {
                 let owner = self.table(table)?;
                 self.row_basics(&owner, table, key);
                 let written: Vec<&str> = row.keys().map(String::as_str).collect();
                 self.row_writes(table, &owner, &written);
+                // The statement finds the row by its key, which a payload
+                // leaves out, so a rename of that column goes first.
+                if !written.contains(&key_column.as_str())
+                    && let Ok(column) = self.column(&table.column(key_column))
+                {
+                    self.exists(ObjectKey::Column(column));
+                }
                 self.row_parents(&owner, false, true);
                 self.row_cycle(&owner);
                 self.row_inbound_keys_gone(&owner);
@@ -1170,7 +1181,13 @@ impl Cx<'_> {
         else {
             return;
         };
-        let (Some(was), Some(will)) = (was.columns.get(column), will.columns.get(column)) else {
+        // The column under each side's own name: the parent may rename it, and
+        // the step spells the name it ends with.
+        let (was_name, will_name) = self
+            .names_of(&key)
+            .unwrap_or_else(|| (column.to_owned(), column.to_owned()));
+        let (Some(was), Some(will)) = (was.columns.get(&was_name), will.columns.get(&will_name))
+        else {
             return;
         };
         match attribute {

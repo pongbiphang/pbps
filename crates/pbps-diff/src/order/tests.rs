@@ -3999,3 +3999,136 @@ fn a_parent_row_is_deleted_after_a_foreign_key_the_plan_rebuilds() {
             .any(|v| matches!(v, Violation::Edge { .. }))
     );
 }
+
+/// The statement finds the row it deletes by its key column, which the row's
+/// payload leaves out, so a rename of that column goes first (review of #2120).
+#[test]
+fn a_row_delete_waits_for_the_rename_of_its_key_column() {
+    let none = ModuleDeps::new();
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table_with(&["a", "n"]));
+    after.tables.insert(t("t"), table_with(&["k", "n"]));
+    let moved = uid(UidKind::Column, "t.a");
+    let named = |column: &str| {
+        let mut ids = Plan::ids(&["t"], &[("t", "n")]);
+        ids.columns.insert(moved.clone(), t("t").column(column));
+        ids
+    };
+    let plan = Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("t"),
+                from: "a".into(),
+                to: "k".into(),
+                table_was: None,
+            }),
+            p(Change::DeleteRow {
+                table: t("t"),
+                key_column: "k".into(),
+                key: RowKey::from("1"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                row: [("n".to_owned(), pbps_model::Cell::Value(Value::Int(5)))]
+                    .into_iter()
+                    .collect(),
+                dropped: Default::default(),
+                types: Default::default(),
+                after_types: Default::default(),
+                key_type: None,
+            }),
+        ],
+        before,
+        after,
+        before_ids: named("a"),
+        after_ids: named("k"),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+}
+
+/// A partition's own default follows its parent's, also when the parent's
+/// column is renamed in the plan: the parent is read under each side's own
+/// name for the column (review of #2120).
+#[test]
+fn a_partitions_default_follows_its_parents_default_through_a_column_rename() {
+    use pbps_model::{PartitionBound, PartitionColumn, PartitionOf, ValueSource};
+    let with_default = |name: &str, default: &str| {
+        let mut table = table_with(&["id"]);
+        let mut column = Column::new(int());
+        column.value_source = ValueSource::Default(default.into());
+        table.columns.insert(name.into(), column);
+        table
+    };
+    let mut before = Schema::default();
+    before.tables.insert(t("par"), with_default("a", "1"));
+    before.tables.insert(t("pt"), table_with(&["id"]));
+    let mut member = table_with(&[]);
+    member.partition_of = Some(PartitionOf {
+        parent: t("par"),
+        bound: PartitionBound::Default,
+        columns: [(
+            "b".to_owned(),
+            PartitionColumn {
+                default: Some("5".into()),
+                not_null: false,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let mut after = Schema::default();
+    after.tables.insert(t("par"), with_default("b", "2"));
+    after.tables.insert(t("pt"), member);
+    let moved = uid(UidKind::Column, "par.a");
+    let named = |column: &str| {
+        let mut ids = Plan::ids(&["par", "pt"], &[("par", "id")]);
+        ids.columns.insert(moved.clone(), t("par").column(column));
+        ids
+    };
+    let plan = Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("par"),
+                from: "a".into(),
+                to: "b".into(),
+                table_was: None,
+            }),
+            p(Change::AlterColumnDefault {
+                uid: moved.clone(),
+                column: t("par").column("b"),
+                from: Some("1".into()),
+                to: Some("2".into()),
+            }),
+            p(Change::SetPartitionDefault {
+                uid: uid(UidKind::Table, "pt"),
+                table: t("pt"),
+                parent: t("par"),
+                column: "b".into(),
+                from: None,
+                to: Some("5".into()),
+                fallback: None,
+            }),
+        ],
+        before,
+        after,
+        before_ids: named("a"),
+        after_ids: named("b"),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 2, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+}
