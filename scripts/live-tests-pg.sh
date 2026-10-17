@@ -129,7 +129,7 @@ cargo test -p pbps-cli --bin pbps -- --ignored --test-threads=1 "$@"
 # their images, already here.
 PBPS_TEST_PG_SCRATCH_IMAGE=${PBPS_TEST_PG_SCRATCH_IMAGE:-$IMAGE} \
 PBPS_TEST_PG_OLD_SCRATCH_IMAGE=${PBPS_TEST_PG_OLD_SCRATCH_IMAGE:-$OLD_IMAGE} \
-cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::scratch::live_tests "$@"
+cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::scratch::live_tests "$@"
 # The CLI end to end on this engine, serially: each test creates and drops a
 # database of its own, and two of those racing is a race the engine can lose.
 cargo test -p pbps-cli --test flow_pg -- --ignored --test-threads=1 "$@"

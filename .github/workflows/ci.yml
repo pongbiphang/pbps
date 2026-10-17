@@ -563,7 +563,7 @@ jobs:
       # and the runner's own Docker for a Docker scratch (#1674). The filter
       # must not end in `:`, which YAML reads as a mapping and rejects the
       # whole file.
-      - run: cargo test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::scratch::live_tests
+      - run: cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 resolver::server::scratch::live_tests
         if: matrix.suite == 'dialect'
       # Private capture internals have live snapshot/rendering regressions.
       # Split by module: the binding half rides with the short suites above.
