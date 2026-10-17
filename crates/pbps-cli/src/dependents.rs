@@ -72,6 +72,8 @@ fn boundary(changes: &[PlannedChange], i: usize) -> At {
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
+use pbps_diff::order::{Schedule, Source};
+use pbps_model::resolver::OrderReason;
 use pbps_model::{
     Change, ChangeSet, ColumnRef, IdsFile, ModuleDeps, ModuleId, ModuleKind, Partitions,
     PlannedChange, Schema, TableName,
@@ -1481,20 +1483,18 @@ fn split_new_tables(
 /// planned on the parent, and its partitions' own defaults set again after it
 /// by the differ, `DROP DEFAULT` included (DEC-1687.1).
 /// A parent's new index ahead of every partition index it could take as its
-/// clone, wherever the passes before left them (DEC-1688.1, #1745 review).
-/// The differ ranks the parent's first and the weave restores it first, but
-/// a partition's own index that calls a rebuilt function can still come
-/// ahead of the parent's restoration.
+/// clone, wherever the passes before left them (DEC-1688.1, #1745 review,
+/// DEC-1967.2). The differ ranks the parent's first and the weave restores it
+/// first, but a partition's own index that calls a rebuilt function can still
+/// come ahead of the parent's restoration.
 ///
-/// The parent's moves, not the partition's: what rests on a partition's
-/// index (a foreign key on a unique one, another index naming it in a
-/// literal) stays where the passes put it, after it. It moves with what it
-/// rests on between them, and what that rests on in turn
-/// ([`rests_on`]), in their order, so each still follows what it needs.
-/// One of those being a partition index it could take is a cycle no order
-/// satisfies, refused by name, as is a change between them that could
-/// create a table, a column or a module: those are what the differ ranks
-/// ahead, and crossing them is what this pass would have to prove safe.
+/// An edge from the parent's index to each partition index it could adopt
+/// (`adopts`), and none to one it could not, which `settle` orders: the
+/// partition's index sinks to right after the parent's. What rests on it
+/// between them sinks with it, by the same edges [`rests_on`] reads: a
+/// foreign key on a unique one, a literal naming it, a replica identity on
+/// it. What the parent's index needs runs before it already. A partition's
+/// index the parent's rests on is a cycle no order satisfies, refused by name.
 fn before_its_partitions_indexes(
     cs: &mut ChangeSet,
     declared: &Schema,
@@ -1514,115 +1514,93 @@ fn before_its_partitions_indexes(
             .is_some_and(|of| of.parent == *parent)
             && pbps_diff::schema_diff::adopts(index, own)
     };
-    // Changes the moved ones may cross: none creates a table, a column or a
-    // module.
-    let crossable = |c: &Change| {
-        matches!(
-            c,
-            Change::AddIndex { .. }
-                | Change::DropIndex { .. }
-                | Change::SetIndexStorageParameters { .. }
-                | Change::AddUnique { .. }
-                | Change::DropUnique { .. }
-                | Change::SetPrimaryKey { .. }
-                | Change::AddCheck { .. }
-                | Change::DropCheck { .. }
-                | Change::AddForeignKey { .. }
-                | Change::DropForeignKey { .. }
-                | Change::SetReplicaIdentity { .. }
-                | Change::Grant { .. }
-                | Change::Revoke { .. }
-                | Change::PublicExecution { .. }
-        )
-    };
-    let refused = |name: &str, parent: &TableName, why: String| {
-        format!(
-            "the index `{name}` on {parent} is built after a partition's own index it could \
-             take as its clone, and cannot be moved ahead of it: {why}; make the partition's \
-             index and this change in separate plans"
-        )
-    };
-    // Each move leaves a parent's index ahead of every partition index it
-    // could take; one that puts another's back behind would cycle, which
-    // the bound turns into a refusal rather than a hang.
-    for _ in 0..=cs.changes.len() {
-        let mut found = None;
-        for k in 0..cs.changes.len() {
-            let Change::AddIndex {
-                table: parent,
-                index,
-                name,
-                ..
-            } = &cs.changes[k].change
-            else {
-                continue;
-            };
-            if let Some(first) = cs.changes[..k]
-                .iter()
-                .position(|p| adoptable_by(parent, index, &p.change))
-            {
-                found = Some((first, k, parent.clone(), (**index).clone(), name.clone()));
-                break;
-            }
-        }
-        let Some((first, k, parent, index, name)) = found else {
-            return Ok(());
+    let mut schedule = Schedule::new(cs.changes.len());
+    // The stretch a partition's index may sink through: from the first one
+    // ahead of a parent's that could take it, to the last such parent's.
+    let mut stretch: Option<(usize, usize)> = None;
+    let mut adoptions: Vec<(usize, usize)> = Vec::new();
+    for (k, p) in cs.changes.iter().enumerate() {
+        let Change::AddIndex {
+            table: parent,
+            index,
+            ..
+        } = &p.change
+        else {
+            continue;
         };
-        if let Some(blocking) = cs.changes[first..k].iter().find(|p| !crossable(&p.change)) {
-            return Err(refused(
-                &name,
-                &parent,
-                format!("it would pass a change to {}", blocking.change.subject()),
-            ));
-        }
-        // The parent's index and, between them, what it rests on, closed.
-        let mut moving = BTreeSet::from([k]);
-        let mut pending = vec![k];
-        while let Some(m) = pending.pop() {
-            for j in first..m {
-                if !moving.contains(&j)
-                    && rests_on(&cs.changes[m].change, &cs.changes[j].change, dialect)
-                {
-                    moving.insert(j);
-                    pending.push(j);
+        for (j, q) in cs.changes.iter().enumerate() {
+            if adoptable_by(parent, index, &q.change) {
+                schedule.edge(k, j, Source::Effect, OrderReason::Structural);
+                adoptions.push((k, j));
+                if j < k {
+                    stretch = Some(stretch.map_or((j, k), |(lo, hi)| (lo.min(j), hi.max(k))));
                 }
             }
         }
-        if let Some(&j) = moving
-            .iter()
-            .find(|&&j| adoptable_by(&parent, &index, &cs.changes[j].change))
-        {
-            return Err(refused(
-                &name,
-                &parent,
-                format!(
-                    "it rests on {}, which it could take",
-                    cs.changes[j].change.subject()
-                ),
-            ));
-        }
-        let mut taken: Vec<PlannedChange> = Vec::new();
-        for &j in moving.iter().rev() {
-            taken.push(cs.changes.remove(j));
-        }
-        taken.reverse();
-        cs.changes.splice(first..first, taken);
     }
-    Err(
-        "the partitioned parents' new indexes and their partitions' admit no order in \
-         which each parent's is built ahead of the partition indexes it could take; make them \
-         in separate plans"
-            .to_owned(),
-    )
+    let Some((lo, hi)) = stretch else {
+        return Ok(());
+    };
+    for later in lo..=hi {
+        for earlier in lo..later {
+            if rests_on(
+                &cs.changes[later].change,
+                &cs.changes[earlier].change,
+                dialect,
+            ) {
+                schedule.edge(earlier, later, Source::Effect, OrderReason::Structural);
+            }
+        }
+    }
+    let settled = match schedule.settle(cs.clone()) {
+        Ok(settled) => settled,
+        Err(pbps_diff::order::Refusal::Cycle { members, .. }) => {
+            // The parent's index rests on a partition's it could take.
+            // `k` is a parent's `AddIndex`, as every adoption's first end is.
+            let named = |i: usize| {
+                if let Change::AddIndex { table, name, .. } = &cs.changes[i].change {
+                    (name.clone(), table.to_string())
+                } else {
+                    (cs.changes[i].change.subject(), String::new())
+                }
+            };
+            return Err(adoptions
+                .iter()
+                .find(|(k, j)| members.contains(k) && members.contains(j))
+                .map_or_else(
+                    || {
+                        "the partitioned parents' new indexes and their partitions' admit no \
+                         order in which each parent's is built ahead of the partition indexes \
+                         it could take; make them in separate plans"
+                            .to_owned()
+                    },
+                    |&(k, j)| {
+                        let (name, parent) = named(k);
+                        format!(
+                            "the index `{name}` on {parent} is built after a partition's own \
+                             index it could take as its clone, and cannot be moved ahead of \
+                             it: it rests on {}, which it could take; make the partition's \
+                             index and this change in separate plans",
+                            cs.changes[j].change.subject()
+                        )
+                    },
+                ));
+        }
+        Err(refusal) => return Err(refusal.describe(cs)),
+    };
+    *cs = settled.changes;
+    Ok(())
 }
 
 /// Whether `later` must stay after `earlier`, among the changes
 /// [`before_its_partitions_indexes`] may move: a literal in its text that
 /// may name a relation `earlier` brings ([`relation_literal`]), a foreign
 /// key on a key or unique index `earlier` adds to the table it references,
-/// or a drop on its own table that may free the name it takes. Read wide,
-/// not exact: a dependency imagined moves a change that could have stayed,
-/// one missed breaks the plan.
+/// a replica identity on an index `earlier` adds, or a change on its own
+/// table taking a name a drop there may free. Read wide, not exact: a
+/// dependency imagined moves a change that could have stayed, one missed
+/// breaks the plan. These are the edges a partition's index that sinks
+/// carries what rests on it with (DEC-1967.2).
 fn rests_on(later: &Change, earlier: &Change, dialect: &dyn Dialect) -> bool {
     let brought = relations_brought(earlier);
     if !brought.is_empty() {
@@ -1646,6 +1624,19 @@ fn rests_on(later: &Change, earlier: &Change, dialect: &dyn Dialect) -> bool {
         | Change::SetPrimaryKey { table, .. }
         | Change::AddIndex { table, .. } = earlier
         && *table == constraint.references_table
+    {
+        return true;
+    }
+    if let Change::SetReplicaIdentity {
+        table,
+        to: Some(pbps_model::ReplicaIdentity::Index(index)),
+        ..
+    } = later
+        && let Change::AddIndex {
+            table: on, name, ..
+        } = earlier
+        && on == table
+        && name == index
     {
         return true;
     }
@@ -1822,8 +1813,9 @@ fn settle_public_execution(cs: &mut ChangeSet, decisions: Vec<PlannedChange>) {
 /// `creation_order_with` reads a module's definition (DECISIONS 315): every
 /// name the text could call, by the engine's lexer, is taken as a call
 /// ([`calls_one_of`]). An addition whose text names a function the plan
-/// creates or rebuilds goes after the last function the plan creates, in the
-/// order it had. That is a check, an index with a filter or an expression key
+/// creates or rebuilds waits for each such create by a `Lexical` edge, and
+/// `settle` runs it right after the last of them, in the order it had
+/// (DEC-1967.1). That is a check, an index with a filter or an expression key
 /// (an index's other columns are names), a default being set, and a changed
 /// generation expression. An addition whose text names none stays where the
 /// differ put it. A unique index with no expression stays too, since a
@@ -1864,86 +1856,111 @@ fn after_the_rebuilds(
             _ => None,
         })
         .collect();
-    let moves: Vec<bool> = cs.changes[..last]
+    // What each addition waits for (#1967, DEC-1967.1): every function create
+    // its text may call, a `Lexical` edge, and the new expression of a
+    // recomputed column it validates, an `Effect` edge. `settle` holds it
+    // right after the last of them; what waits for nothing keeps the
+    // differ's place.
+    let expressions: Vec<(&ColumnRef, usize)> = cs.changes[..last]
         .iter()
-        .map(|p| match &p.change {
-            Change::AddCheck { constraint, .. } => calls(&constraint.expression),
+        .enumerate()
+        .filter_map(|(i, p)| match &p.change {
+            Change::AlterColumnExpression { column, .. } if recomputed.contains(column) => {
+                Some((column, i))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut schedule = Schedule::new(cs.changes.len());
+    for (i, p) in cs.changes[..last].iter().enumerate() {
+        let (text, columns): (Option<String>, Vec<ColumnRef>) = match &p.change {
+            Change::AddCheck { constraint, .. } => {
+                (Some(constraint.expression.clone()), Vec::new())
+            }
             Change::AlterColumnDefault {
                 column,
                 to: Some(to),
                 ..
-            } => !taken.contains(column) && calls(to),
+            } if !taken.contains(column) => (Some(to.clone()), Vec::new()),
             // A partition's, its own or its parent's taken back (#1588). A
             // row written through its parent takes the parent's default, not
             // the partition's (DEC-1578.1), so none is taken ahead of it.
-            Change::SetPartitionDefault { to, fallback, .. } => to
-                .as_ref()
-                .or(fallback.as_ref())
-                .is_some_and(|text| calls(text)),
+            Change::SetPartitionDefault { to, fallback, .. } => {
+                (to.as_ref().or(fallback.as_ref()).cloned(), Vec::new())
+            }
             // A generation expression binds the functions it calls exactly
             // as a default does (DEC-1168.1). No row writes a generated
-            // column, so none is taken ahead of it.
-            // One that releases a generated column from a module the plan
-            // drops stays ahead of that drop, which `weave` put after it.
-            Change::AlterColumnExpression { column, .. } => recomputed.contains(column),
+            // column, so none is taken ahead of it. One that releases a
+            // generated column from a module the plan drops stays ahead of
+            // that drop, which `weave` put after it.
+            Change::AlterColumnExpression { column, to, .. } if recomputed.contains(column) => {
+                (Some(to.clone()), Vec::new())
+            }
             // What validates a recomputed column's values stays behind its new
-            // expression, which the order kept among the moved preserves: a
-            // `NOT NULL`, and a key over it on either side of a foreign key.
-            // Left here, it would judge the values the old expression stored.
+            // expression: a `NOT NULL`, and a key over it on either side of a
+            // foreign key. Ahead of it, it would judge the values the old
+            // expression stored.
             Change::AlterColumnNullability {
                 column,
                 to_nullable: false,
                 ..
-            } => recomputed.contains(column),
-            Change::AddIndex { table, index, .. } => {
-                (index.holds_expression() && calls(&index_text(index)))
-                    || index.column_keys().is_some_and(|keys| {
-                        keys.iter().any(|k| recomputed.contains(&table.column(k)))
-                    })
-            }
+            } => (None, vec![column.clone()]),
+            Change::AddIndex { table, index, .. } => (
+                index.holds_expression().then(|| index_text(index)),
+                index
+                    .column_keys()
+                    .into_iter()
+                    .flatten()
+                    .map(|k| table.column(k))
+                    .collect(),
+            ),
             Change::AddUnique {
                 table, constraint, ..
-            } => constraint
-                .columns
-                .iter()
-                .any(|c| recomputed.contains(&table.column(c))),
+            } => (
+                None,
+                constraint.columns.iter().map(|c| table.column(c)).collect(),
+            ),
             Change::SetPrimaryKey {
                 table,
                 to: Some(pk),
                 ..
-            } => pk
-                .columns
-                .iter()
-                .any(|c| recomputed.contains(&table.column(c))),
+            } => (None, pk.columns.iter().map(|c| table.column(c)).collect()),
             Change::AddForeignKey {
                 table, constraint, ..
-            } => {
+            } => (
+                None,
                 constraint
                     .columns
                     .iter()
-                    .any(|c| recomputed.contains(&table.column(c)))
-                    || constraint
-                        .references_columns
-                        .iter()
-                        .any(|c| recomputed.contains(&constraint.references_table.column(c)))
+                    .map(|c| table.column(c))
+                    .chain(
+                        constraint
+                            .references_columns
+                            .iter()
+                            .map(|c| constraint.references_table.column(c)),
+                    )
+                    .collect(),
+            ),
+            _ => (None, Vec::new()),
+        };
+        if let Some(text) = text {
+            for (name, created) in &functions {
+                if pbps_pg::generated::may_call(&text, name) {
+                    schedule.edge(*created, i, Source::Lexical, OrderReason::Structural);
+                }
             }
-            _ => false,
-        })
-        .collect();
-    let mut moved = Vec::new();
-    let mut kept = Vec::new();
-    let tail = cs.changes.split_off(last + 1);
-    for (i, p) in cs.changes.drain(..).enumerate() {
-        if moves.get(i).copied().unwrap_or(false) {
-            moved.push(p);
-        } else {
-            kept.push(p);
+        }
+        for (column, at) in &expressions {
+            if *at != i && columns.contains(column) {
+                schedule.edge(*at, i, Source::Effect, OrderReason::Structural);
+            }
         }
     }
-    let count = moved.len();
-    kept.extend(moved);
-    kept.extend(tail);
-    cs.changes = kept;
+    let settled = schedule
+        .settle(std::mem::take(cs))
+        .map_err(|refusal| refusal.to_string())?;
+    let count = pbps_diff::order::schedule::moved(&settled.sequence);
+    *cs = settled.changes;
     Ok(count + after_their_functions(cs, deps, &Partitions::of(declared))?)
 }
 
@@ -5996,11 +6013,64 @@ mod tests {
         }
     }
 
+    /// #1967: an addition waits for each function its text may call, by a
+    /// `Lexical` edge, and runs right after the last of them, no longer after
+    /// every function the plan creates (DEC-1967.1). Negatives: one naming a
+    /// function created ahead of it keeps its place, and so does one naming
+    /// none. Settled again, nothing moves.
+    #[test]
+    fn an_addition_runs_right_after_the_functions_its_text_names() {
+        let mut cs = plan(vec![
+            routine("app.g()", "SELECT 2"),
+            check_of("calls_g", "app.g() > 0"),
+            check_of("calls_f", "app.f(id) >= 0"),
+            check_of("plain", "id > 0"),
+            routine("app.f()", "SELECT 1"),
+            routine("app.h()", "SELECT 3"),
+        ]);
+        let order = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .map(|p| {
+                    if let Change::AddCheck { name, .. } = &p.change {
+                        name.clone()
+                    } else {
+                        p.change.subject()
+                    }
+                })
+                .collect()
+        };
+        let moved = after_the_rebuilds(
+            &mut cs,
+            &BTreeSet::new(),
+            &ModuleDeps::new(),
+            &Schema::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            order(&cs),
+            [
+                "app.g()", "calls_g", "plain", "app.f()", "calls_f", "app.h()"
+            ]
+        );
+        assert_eq!(moved, 1);
+        let settled = cs.clone();
+        let again = after_the_rebuilds(
+            &mut cs,
+            &BTreeSet::new(),
+            &ModuleDeps::new(),
+            &Schema::default(),
+        )
+        .unwrap();
+        assert_eq!((again, &cs), (0, &settled));
+    }
+
     /// A parent's new index goes ahead of every partition index it could take
-    /// as its clone, wherever the passes before left them (#1745 review).
-    /// The partitions' indexes and what rests on them keep their order: an
-    /// index naming another, a foreign key on a unique one. A change that
-    /// could create what the parent's needs is not crossed: refused by name.
+    /// as its clone, wherever the passes before left them (#1745 review): the
+    /// partition's index sinks to right after it (DEC-1967.2), with what rests
+    /// on it between them, a foreign key on a unique one or a replica
+    /// identity on it. A partition index the parent's could not take is not
+    /// ordered after it.
     #[test]
     fn a_parents_new_index_goes_ahead_of_the_partition_indexes_it_could_take() {
         let (mut s, _) = declared();
@@ -6064,7 +6134,52 @@ mod tests {
             add(&ev, "ev_k", "k", false),
         ]);
         before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).unwrap();
-        assert_eq!(names(&cs), ["ev_k", "own_k", "own_sibling", "z"]);
+        assert_eq!(names(&cs), ["own_sibling", "z", "ev_k", "own_k"]);
+        // Settled again, nothing moves.
+        let settled = cs.clone();
+        before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(cs, settled);
+        // What rests on an adoptable unique one sinks with it: a foreign key
+        // on it, and a replica identity on it.
+        let fk_on = |references: &TableName| Change::AddForeignKey {
+            table: other.clone(),
+            name: "zz_fk".into(),
+            constraint: Box::new(pbps_model::ForeignKey {
+                columns: vec!["k".into()],
+                references_table: references.clone(),
+                references_columns: vec!["k".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            }),
+        };
+        let identity = Change::SetReplicaIdentity {
+            uid: Uid::derived(UidKind::Table, "app.ev_1", 0),
+            table: ev_1.clone(),
+            to: Some(pbps_model::ReplicaIdentity::Index("own_u".into())),
+        };
+        let mut cs = plan(vec![
+            add(&ev_1, "own_u", "k", true),
+            fk_on(&ev_1),
+            identity,
+            add(&other, "z", "k", false),
+            add(&ev, "ev_u", "k", true),
+        ]);
+        before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(
+            names(&cs),
+            ["z", "ev_u", "own_u", "app.zz", "app.ev_1"],
+            "{:?}",
+            cs.changes
+        );
+        // Negative: one the parent's could not take, on another column, keeps
+        // its place.
+        let mut cs = plan(vec![
+            add(&ev_1, "own_m", "m", false),
+            add(&ev, "ev_k", "k", false),
+        ]);
+        let before = cs.clone();
+        before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(cs, before);
         // Negative: a unique one the parent's could not take, and the foreign
         // key on it, stay as they are.
         let fk = Change::AddForeignKey {
@@ -6094,15 +6209,16 @@ mod tests {
         let before = cs.clone();
         before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).unwrap();
         assert_eq!(cs, before);
-        // A module between them is not crossed.
+        // A module between them is passed: the partition's index needs
+        // nothing it brings, and what it needs ran before it already.
         let mut cs = plan(vec![
             add(&ev_1, "own_k", "k", false),
             alter(&s, "app.f(integer)"),
             add(&ev, "ev_k", "k", false),
         ]);
-        let why = before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).expect_err("refused");
-        assert!(why.contains("index `ev_k` on app.ev"), "{why}");
-        // What the parent's rests on between them moves with it, in its
+        before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).unwrap();
+        assert_eq!(names(&cs)[1..], ["ev_k", "own_k"], "{:?}", cs.changes);
+        // What the parent's rests on between them stays ahead of it, in its
         // order: the drop that frees its name, and an index its predicate
         // names, with the drop that one's name needs (#1745 review).
         let filtered = |name: &str, filter: &str| {
@@ -6133,7 +6249,7 @@ mod tests {
         before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).unwrap();
         assert_eq!(
             names(&cs),
-            ["app.zz", "named", "app.ev", "ev_k", "own_k", "z"],
+            ["app.zz", "z", "named", "app.ev", "ev_k", "own_k"],
             "{:?}",
             cs.changes
         );

@@ -6289,3 +6289,91 @@ attach. Also by `a_table_is_attached_as_the_default_partition_through_the_cli`
 (on 16 and 18), which fails with the engine's own error when the rows probe
 is removed, and by the units `an_ordinary_table_declared_as_a_partition_is_attached`
 and `a_partition_change_under_a_standing_parent_is_probed`.
+
+<a id="dec-1967-1"></a>
+
+**DEC-1967.1. An addition whose text may call a function the plan creates
+waits for each such create by a `Lexical` edge, and runs right after the
+last of them.** (#1967, S6a of #1776)
+
+`after_the_rebuilds` used to move every such addition to just after the last
+function create in the plan, whichever function that was. It now states what
+each addition waits for and lets `settle` place it:
+
+- a `Lexical` edge from each function create its text may call
+  (`may_call`, DEC-1364.1's over-approximation, unchanged);
+- an `Effect` edge from a recomputed column's new expression to what
+  validates its values: a `NOT NULL`, and a key or index over it.
+
+What waits for nothing keeps the differ's place, as before.
+
+**What changes.** An addition naming only an early function now runs right
+after that function, not after functions it never names. A function created
+later that reads the relation the addition brings (a literal in its body) no
+longer finds it missing. `bootstrap` used to refuse such a plan as "names a
+relation this plan creates later"; the engine builds it
+(`a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused`, whose
+remedy now keeps the reading functions in the first plan).
+
+**Side by side.** The old pass ran beside the new one over the full local
+gate:
+- 68 calls moved the same way, and 9 were refused alike, with the same text;
+- 50 calls (13 distinct plans) differ, each only by an addition landing
+  right after the last function its text names instead of after the last
+  function create;
+- 2 calls moved on the old side and not the new: the addition already
+  followed its function. One of them is a re-run of a settled plan, which
+  the old pass moved again.
+No call changed from accepted to refused or back.
+
+Pinned by `an_addition_runs_right_after_the_functions_its_text_names`: the
+placement, the two negatives (a function created ahead, no function named)
+and idempotency.
+
+<a id="dec-1967-2"></a>
+
+**DEC-1967.2. A partitioned parent's new index is ordered ahead of a
+partition's index it could adopt by an edge to that index, not by moving the
+parent's.** (#1967, S6a of #1776)
+
+`before_its_partitions_indexes` used to hoist the parent's index, with what
+it rests on, to the first adoptable partition index. It refused when a change
+in between could not be crossed, or when the parent's rested on an adoptable
+index. Now:
+
+- an `Effect` edge goes from the parent's `AddIndex` to each partition index
+  `pbps_diff::schema_diff::adopts` says it could take (DEC-1688.1), and to no
+  other;
+- across the stretch between them, an edge goes from each change to what
+  rests on it (`rests_on`): a literal naming a relation it brings, a foreign
+  key on a key or unique index of the table it references, a replica identity
+  on the index, a change taking a name a drop may free;
+- `settle` sinks the partition's index to right after the parent's, carrying
+  what rests on it.
+
+What the parent's needs already runs before it, so nothing it needs has to
+cross. `crossable` is gone: a change between the two is passed, since the
+partition's index needs nothing it brings unless an edge says so. The
+remaining refusal is the cycle, the parent's index resting on an adoptable
+partition index, with the old text naming it.
+
+**Side by side**, over the full local gate:
+- 3 calls ordered alike (2 moved, 1 unchanged);
+- 3 calls ordered differently: the partition index sank instead of the
+  parent's rising, which is the same pair order with the other changes in
+  the differ's place;
+- 1 call the old pass refused ("it would pass a change to
+  app.f(integer)") is now planned: the function rebuild between them no
+  longer blocks.
+
+Pinned by `a_parents_new_index_goes_ahead_of_the_partition_indexes_it_could_take`,
+which checks:
+- the sink;
+- the foreign key and replica identity carried with a unique index;
+- the negative (a partition index on another column, not adoptable, keeps
+  its place);
+- idempotency;
+- the passed function rebuild;
+- the cycle refusal.
+
+#1998 item 11 (the verifier's effect for this pair) is in #1968's slice, S7a.

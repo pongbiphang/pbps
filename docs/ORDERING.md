@@ -137,15 +137,19 @@ Then, in this order:
   - `split_moving_defaults` sets a create's own default after the last
     function its text may call, where the create moves rows out of a DEFAULT
     partition (DEC-1547.1).
-  - `after_the_rebuilds` moves the expression-bearing additions whose text
-    names a function the plan creates after the last function create, and
-    places a new column whose expression names one after that create, with
-    what may read the column after it (DEC-942.1, DEC-1364.1).
+  - `after_the_rebuilds` settles the expression-bearing additions over
+    `Lexical` edges from each function create their text may call, so each
+    runs right after the last of those, and keeps what validates a
+    recomputed column after its new expression; it places a new column whose
+    expression names one after that create, with what may read the column
+    after it (DEC-942.1, DEC-1364.1, DEC-1967.1).
   - `after_their_parents_defaults` then sets each partition's own default
     again after a parent's default the plan sets, which reaches every
     partition (DEC-1581.1).
-  - `before_its_partitions_indexes` moves a partitioned parent's new index
-    ahead of the partition indexes it could take (DEC-1688.1).
+  - `before_its_partitions_indexes` settles an edge from a partitioned
+    parent's new index to each partition index it could take, so that index
+    sinks to right after the parent's, with what rests on it (DEC-1688.1,
+    DEC-1967.2).
 - **On SQL Server**, a retype or recollation drops and re-adds the keys,
   indexes and checks over the column, through `retype_dependents` and
   `recollate_dependents` (#1175, DECISIONS 515). `CREATE OR ALTER` means a
@@ -362,7 +366,7 @@ and the expression-bearing changes that need a function.
 | `AlterColumnDefault`, `AlterColumnNullability`, or an `AlterColumnType` changing nullability, of a parent → its partitions' `SetPartitionDefault` and `SetPartitionNotNull` on that column | fixed | (9, 4) after the parent's class 9, and a structural edge in the resolver's graph (#1610); the parent's change recurses over the partition's own (DEC-1687.1) | ✓ DEC-1687.1 |
 | A parent's column change (`AddColumn`, `DropColumn`, `RenameColumn`, `AlterColumn*`) → `CreateTable` of a partition under it | fixed | (9, 5) after them: the partition is created with its own entries on the parent's columns as they end (DEC-1687.1) | ✓ DEC-1687.1 |
 | `AttachPartition` → the partition's own `SetPartitionDefault`, `SetPartitionNotNull`, `SetTablePersistence`, `SetStorageParameters`, `AddIndex` and `AddCheck` | fixed | class 7 before 9, 10 and 13; each acts on the partition alone once attached. After an attach at (11, 1), its own alterations of classes 9 and 10 move to (11, 2) | ✓ DEC-1545.1 |
-| A partitioned parent's `AddIndex` → a partition's own `AddIndex` | fixed | (13, 0) before the rest of class 13, a structural edge in the resolver's graph, first among the indexes the dependents' weave restores around a rebuilt function, and `before_its_partitions_indexes`, the last reordering of `plan --db`, which moves the parent's ahead of a partition index the passes left before it, or refuses by name: the parent's index built after a partition's own of its shape takes it as its clone (DEC-1688.1) | ✓ DEC-1688.1 |
+| A partitioned parent's `AddIndex` → a partition's own `AddIndex` | fixed | (13, 0) before the rest of class 13, a structural edge in the resolver's graph, first among the indexes the dependents' weave restores around a rebuilt function, and `before_its_partitions_indexes`, the last reordering of `plan --db`, which settles an edge from the parent's index to each partition index it could adopt, so a partition index the passes left before it sinks to right after it, with what rests on it, or refuses a cycle by name: the parent's index built after a partition's own of its shape takes it as its clone (DEC-1688.1) | ✓ DEC-1688.1, DEC-1967.2 |
 | `AddColumn` → rows, constraints, modules naming it | fixed | class 8 before 11, 13, 14 | ✓ |
 | `AddColumn` (input) → generated `AddColumn` reading it | fixed | (9, 2) after class 8 | ✓ DEC-1168.1 |
 | `AlterColumnType` of an existing input → generated `AddColumn` reading it | fixed | (9, 2) after the in-place alterations: a standing generated reader blocks the retype | ✓ DEC-1168.1 |
@@ -381,7 +385,7 @@ and the expression-bearing changes that need a function.
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
 | Row writes → `SetDataMode` / `SetEnsureKeys` of their table | fixed | class 11 and 12 before 17 | ✓ |
 | Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315) | ✓ |
-| Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: after the last function create, when its text names the function | ✓ DEC-942.1, DEC-1364.1 |
+| Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: a `Lexical` edge from each function create its text names, settled | ✓ DEC-942.1, DEC-1364.1, DEC-1967.1 |
 | Function created or rebuilt → `AlterColumnExpression` calling it | content, over-approximated | `after_the_rebuilds`, when its text names the function | ✓ DEC-1168.1, DEC-1364.1 |
 | Function created or rebuilt → `AddColumn` whose default or generation expression calls it | content, over-approximated | `after_their_functions`: after the create its text names, and what may read the column, or a partition holding it, after it; a cycle is refused by name | ✓ DEC-1364.1 |
 | `AddColumn` → a module created that reads it | content, over-approximated | class 8 before 14; reordered after a column that moves, when it names the column or its table | ✓ DEC-1364.1 |
@@ -485,8 +489,8 @@ is conservative, so it can never be wrong in the dangerous direction.
   315).
 - `after_the_rebuilds` reads a check's, an index's, a default's and a
   generation expression's text for the functions the plan creates or rebuilds
-  (DEC-1364.1). Only an addition whose text names one moves after the last
-  create; the rest keep the differ's place. A new column whose expression
+  (DEC-1364.1). Only an addition whose text names one moves, right after the
+  last create it names (DEC-1967.1); the rest keep the differ's place. A new column whose expression
   names one follows that create, and what may read the column follows the
   column: a module naming it, or naming its table. Where the
   function itself may read the column, or a row the plan writes needs it,

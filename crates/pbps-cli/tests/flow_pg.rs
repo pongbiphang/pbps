@@ -23034,9 +23034,7 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
     let z = d.dir.join("schema/app.z.yml");
     let declared = std::fs::read_to_string(&z).unwrap();
     let reader = d.dir.join("schema/app.reader%28%29.function.yml");
-    let reads = std::fs::read_to_string(&reader).unwrap();
     let across = d.dir.join("schema/other.across%28%29.function.yml");
-    let reads_across = std::fs::read_to_string(&across).unwrap();
 
     let sql = d.dir.join("boot.sql");
     for args in [
@@ -23045,11 +23043,14 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
     ] {
         let o = d.run(&args);
         assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
+        // The index waits only for `app.abs()`, the one function its text
+        // names (DEC-1967.1), so the functions that read it are created after
+        // it and are not named: the engine below builds them.
         assert!(
             stderr(&o).contains("names a relation this plan creates later")
                 && stderr(&o).contains("app.z.r's default or expression names app.ix_a")
-                && stderr(&o).contains("app.reader() names app.ix_a")
-                && stderr(&o).contains("other.across() names app.ix_a"),
+                && !stderr(&o).contains("app.reader()")
+                && !stderr(&o).contains("other.across()"),
             "{args:?}: {}",
             stderr(&o)
         );
@@ -23064,16 +23065,21 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
         "nothing was built"
     );
 
-    // The remedy: the expressions in a second plan, once the index stands.
+    // The remedy: the default in a second plan, once the index stands. The
+    // functions reading the index stay in the first.
     std::fs::write(&z, "table: app.z\ncolumns:\n  r: {type: text}\n").unwrap();
-    std::fs::remove_file(&reader).unwrap();
-    std::fs::remove_file(&across).unwrap();
     d.commit();
     on_server(&tgt, "CREATE SCHEMA app; CREATE SCHEMA other");
     succeeds(d.run(&["bootstrap", "--db", &tgt]));
+    assert_eq!(
+        scalar(
+            &tgt,
+            "SELECT count(*) FROM pg_proc WHERE proname IN ('reader', 'across')"
+        ),
+        2,
+        "the functions reading the index were built"
+    );
     std::fs::write(&z, &declared).unwrap();
-    std::fs::write(&reader, &reads).unwrap();
-    std::fs::write(&across, &reads_across).unwrap();
     d.commit();
     let plan = d.dir.join("second.json");
     succeeds(d.run(&["plan", "--db", &tgt, "--out", plan.to_str().unwrap()]));
