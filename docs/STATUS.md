@@ -262,7 +262,8 @@ Docker entry on a container pbps starts from the entry's image and removes
 after the run (#1674, DEC-1674.1). Either kind's `externals` stages external
 objects, compared with the target (#1673, DEC-1673.1), and may be allowed to
 write outside the scratch database; `pbps resolver externals` drafts that file
-from the target for review (#1778, DEC-1778.1). Before any scratch write the resolver
+from the target for review (#1778, DEC-1778.1), and every run fills what the
+file lacks from the target (DEC-1778.2). Before any scratch write the resolver
 proves its scratch is not the target and, on the target's cluster, that its
 account is confined; then it runs the shared compatibility qualification. Its
 plan is published after the ordinary connected checks and a fresh recheck of
@@ -271,10 +272,10 @@ sealed in its evidence (#1516, DEC-1516.1). `explain` shows that evidence
 from the plan alone, in human and JSON output: the entry that ran, its
 scratch kind and layout, the qualification, each surface's verdict, the
 order and the prerequisites. SQL Server resolution, `--staged` and a
-retained external object the externals file does not stage refuse by name (#1517,
-DEC-1517.1). PostgreSQL planning and transactional apply are delivered
+retained external object neither the externals file nor fill stages refuse by name
+(#1517, DEC-1517.1). PostgreSQL planning and transactional apply are delivered
 (#616). [Delivery tracking](RESOLVER-DELIVERY.md) has the remaining order:
-the rest of #1778, then SQL Server's #620 and #621, implementing
+SQL Server's #620 and #621, implementing
 [the measured SQL Server design](RESOLVER-MSSQL.md) of #619.
 
 Delivery is split into three stages:

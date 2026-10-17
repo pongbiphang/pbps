@@ -31,9 +31,10 @@ use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, ScratchSource};
 use pbps_pg::resolver::capture::{StageError, Staged};
-use pbps_pg::resolver::externals;
+use pbps_pg::resolver::reconstruct::Part;
 use pbps_pg::resolver::scratch::{self as sql, Placement};
 use pbps_pg::resolver::standard::{self, Standard};
+use pbps_pg::resolver::{draft, externals};
 use std::collections::BTreeSet;
 
 /// One run of the resolver for a connected plan. `scratch`
@@ -409,8 +410,12 @@ struct Prepared {
     map: scope::Principals,
     /// Authorization keys the reproduction did not reproduce.
     differences: Vec<String>,
-    /// What the externals file created (#1673).
+    /// What the externals file and the fill ahead of the managed objects
+    /// created (#1673, #1778).
     created: externals::Created,
+    /// What fill sends once the managed tables exist, what it filled, and
+    /// what it could not (#1778).
+    staging: draft::Staging,
     /// The role a run-owned layout gives USAGE on a schema the externals file
     /// created; `None` where the scratch account compiles as itself.
     grantee: Option<String>,
@@ -455,12 +460,31 @@ impl Run<'_> {
             )));
         }
         let opening_catalog = target_catalog.clone();
+        // What the externals file lacks is filled from the target (#1778,
+        // DEC-1778.2); which of it the file holds is known once it has run.
+        let fill = draft::fill(target, binding.desired, binding.base)
+            .await
+            .map_err(|error| match error {
+                draft::Error::Declaration(reason) => Error::Binding(reason),
+                error @ (draft::Error::AbsentSchema(_) | draft::Error::Read { .. }) => {
+                    Error::Read(format!("the externals to fill: {error}"))
+                }
+            })?;
         let mut prepared = match provisioning {
             Provisioning::RunOwned => {
-                self.run_owned(admin, &target_catalog, &authorization, &scope_schemas)
+                self.run_owned(
+                    admin,
+                    &target_catalog,
+                    &authorization,
+                    &scope_schemas,
+                    &fill,
+                )
+                .await?
+            }
+            Provisioning::Supplied => {
+                self.supplied(admin, &authorization, &scope_schemas, &fill)
                     .await?
             }
-            Provisioning::Supplied => self.supplied(admin, &authorization, &scope_schemas).await?,
         };
         // The expected visibility is the deployer's after the plan's own
         // grants.
@@ -514,19 +538,24 @@ impl Run<'_> {
         let mut any = self.routine_oids(target, binding.base).await?;
         any.extend(kept.iter().copied());
         let routines = externals::ManagedRoutines { desired: kept, any };
+        // A chain through a filled object is lifted: fill created it once
+        // the managed tables existed.
+        let links: Vec<_> = links
+            .into_iter()
+            .filter(|link| !prepared.staging.filled.contains(&link.middle.described))
+            .collect();
         let chains = externals::chains(&links, &desired_managed, &base_managed, &routines);
-        let staged = match self.externals {
-            Some(_) => {
-                self.stage(
-                    provisioning,
-                    &mut prepared,
-                    admin,
-                    target,
-                    &[&base_managed, &desired_managed],
-                )
-                .await?
-            }
-            None => Staged::default(),
+        let mut staged = if self.externals.is_some() || !prepared.staging.filled.is_empty() {
+            self.stage(
+                provisioning,
+                &mut prepared,
+                admin,
+                target,
+                &[&base_managed, &desired_managed],
+            )
+            .await?
+        } else {
+            Staged::default()
         };
         #[cfg(test)]
         if let Ok(Some(sql)) = AFTER_STAGING.try_with(Clone::clone) {
@@ -538,25 +567,84 @@ impl Run<'_> {
         let extras = &request.write_path_extras;
         let mut reconstruction =
             engine::reconstruction(driver, extras, binding.bootstrap).map_err(Error::Binding)?;
+        // The target's zone, read before the scratch is compiled in it.
+        let zone = target.session_zone().cloned();
+        let unfillable = prepared.staging.unfillable.clone();
+        let failed = |error: Error, staged: &Staged| {
+            let error = through_shape_view(error, staged);
+            if let Error::Binding(reason) = &error
+                && !(chains.is_empty() && unfillable.is_empty())
+            {
+                return Error::Externals(
+                    chains
+                        .iter()
+                        .chain(&unfillable)
+                        .cloned()
+                        .chain([reason.clone()])
+                        .collect(),
+                );
+            }
+            error
+        };
+        let whole = prepared.staging.chained.is_empty();
+        let first = if whole { Part::Whole } else { Part::Tables };
         let compile = match prepared.compile.as_mut() {
             Some(compile) => compile,
             None => &mut *admin,
         };
-        // The target's zone, read before the scratch is compiled in it.
-        let zone = target.session_zone().cloned();
-        engine::compile(&mut reconstruction, extras, driver, zone.as_ref(), compile)
+        engine::compile(
+            &mut reconstruction,
+            extras,
+            driver,
+            zone.as_ref(),
+            compile,
+            first,
+        )
+        .await
+        .map_err(|error| failed(error, &staged))?;
+        if !whole {
+            // Its shapes name the managed tables just committed, so it runs
+            // now, as the setup role, before anything else compiles
+            // (DEC-1778.2).
+            let setup = match prepared.capture.as_mut() {
+                Some(owner) => owner,
+                None => &mut *admin,
+            };
+            let before = inventory(setup).await?;
+            run_fill(setup, &prepared.staging.chained).await?;
+            let chained = externals::created(&before, &inventory(setup).await?);
+            let compile = match prepared.compile.as_mut() {
+                Some(compile) => compile,
+                None => &mut *admin,
+            };
+            engine::compile(
+                &mut reconstruction,
+                extras,
+                driver,
+                zone.as_ref(),
+                compile,
+                Part::AfterTables,
+            )
             .await
-            .map_err(|error| {
-                let error = through_shape_view(error, &staged);
-                if let Error::Binding(reason) = &error
-                    && !chains.is_empty()
-                {
-                    return Error::Externals(
-                        chains.iter().cloned().chain([reason.clone()]).collect(),
-                    );
-                }
-                error
-            })?;
+            .map_err(|error| failed(error, &staged))?;
+            let capture = match (prepared.capture.as_mut(), prepared.compile.as_mut()) {
+                (Some(capture), _) | (None, Some(capture)) => capture,
+                (None, None) => &mut *admin,
+            };
+            staged.extend(
+                pbps_pg::resolver::capture::compare_staged(
+                    capture,
+                    target,
+                    &chained,
+                    &[&base_managed, &desired_managed],
+                )
+                .await
+                .map_err(|error| match error {
+                    StageError::Capture(error) => engine::catalog_read_failed(error),
+                    StageError::Refused(findings) => Error::Externals(findings),
+                })?,
+            );
+        }
         let dropped = engine::dropped_signatures(extras, base_managed.dropped_by(&desired_managed))
             .map_err(Error::Binding)?;
         let signatures: BTreeSet<_> = dropped.iter().filter_map(|(_, s)| s.clone()).collect();
@@ -706,6 +794,7 @@ impl Run<'_> {
         target_catalog: &CatalogFacts,
         authorization: &scope::Authorization,
         scope_schemas: &[String],
+        fill: &draft::Fill,
     ) -> Result<Prepared, Error> {
         let driver = self.driver;
         let request = self.request;
@@ -764,23 +853,27 @@ impl Run<'_> {
         .map_err(db("the deployer's reproduced authorization"))?;
         // After the reproduction, which drops and recreates each in-scope
         // schema, and before any managed object (DEC-1673.1). Its own
-        // session, so its `SET`s reach nothing after it.
-        let created = match self.externals {
-            Some(statements) => {
-                let before = inventory(&mut owner).await?;
-                let mut setup = Conn::connect_with(driver, self.scratch, names.database(), None)
-                    .await
-                    .map_err(db("the externals file's session"))?;
-                setup
-                    .execute("SET ROLE NONE")
-                    .await
-                    .map_err(db("the externals file session's role"))?;
-                run_externals(&mut setup, statements, self.provenance.outside_writes).await?;
-                drop(setup);
-                externals::created(&before, &inventory(&mut owner).await?)
-            }
-            None => externals::Created::default(),
-        };
+        // session, so its `SET`s reach nothing after it. Then what fill
+        // stages ahead of the managed objects, in the same session
+        // (DEC-1778.2).
+        let before = inventory(&mut owner).await?;
+        let mut setup = Conn::connect_with(driver, self.scratch, names.database(), None)
+            .await
+            .map_err(db("the externals file's session"))?;
+        setup
+            .execute("SET ROLE NONE")
+            .await
+            .map_err(db("the externals file session's role"))?;
+        if let Some(statements) = self.externals {
+            run_externals(&mut setup, statements, self.provenance.outside_writes).await?;
+        }
+        let staging = fill.staging(&identities(&externals::created(
+            &before,
+            &inventory(&mut owner).await?,
+        )));
+        run_fill(&mut setup, &staging.ahead).await?;
+        drop(setup);
+        let created = externals::created(&before, &inventory(&mut owner).await?);
         // Opened after the reproduction, so the login defaults it stored
         // load into this session as they load on the target's.
         let mut session = Conn::connect_with(
@@ -825,6 +918,7 @@ impl Run<'_> {
             map,
             differences,
             created,
+            staging,
             grantee,
         })
     }
@@ -837,6 +931,7 @@ impl Run<'_> {
         admin: &mut Conn,
         authorization: &scope::Authorization,
         scope_schemas: &[String],
+        fill: &draft::Fill,
     ) -> Result<Prepared, Error> {
         let driver = self.driver;
         let request = self.request;
@@ -896,29 +991,34 @@ impl Run<'_> {
         // any usage, on the checked connection like every write here
         // (DEC-1673.1). `DISCARD ALL` then keeps its `SET`s from the
         // compile that follows on this same session.
-        let created = match self.externals {
-            Some(statements) => {
-                let before = inventory(admin).await?;
-                run_externals(admin, statements, self.provenance.outside_writes).await?;
-                admin
-                    .execute("SET ROLE NONE")
+        let before = inventory(admin).await?;
+        if let Some(statements) = self.externals {
+            run_externals(admin, statements, self.provenance.outside_writes).await?;
+            admin
+                .execute("SET ROLE NONE")
+                .await
+                .map_err(db("the scratch session's role"))?;
+            // An allowed externals file may change the login's own defaults
+            // (#1674). Those are kept, so the release compares the
+            // compile's changes with what the externals file left.
+            if self.provenance.outside_writes == OutsideWrites::Allowed
+                && let Created::Supplied { defaults, .. } = &mut self.created
+            {
+                *defaults = sql::login_defaults(admin)
                     .await
-                    .map_err(db("the scratch session's role"))?;
-                // An allowed externals file may change the login's own defaults
-                // (#1674). Those are kept, so the release compares the
-                // compile's changes with what the externals file left.
-                if self.provenance.outside_writes == OutsideWrites::Allowed
-                    && let Created::Supplied { defaults, .. } = &mut self.created
-                {
-                    *defaults = sql::login_defaults(admin)
-                        .await
-                        .map_err(db("the scratch account's own defaults"))?;
-                }
-                pinned(admin, self.backend).await?;
-                externals::created(&before, &inventory(admin).await?)
+                    .map_err(db("the scratch account's own defaults"))?;
             }
-            None => externals::Created::default(),
-        };
+            pinned(admin, self.backend).await?;
+        }
+        // What fill stages ahead of the managed objects, on the same checked
+        // connection (DEC-1778.2).
+        let staging = fill.staging(&identities(&externals::created(
+            &before,
+            &inventory(admin).await?,
+        )));
+        run_fill(admin, &staging.ahead).await?;
+        pinned(admin, self.backend).await?;
+        let created = externals::created(&before, &inventory(admin).await?);
         let unusable = authorization
             .unusable_schemas(&request.planned)
             .into_iter()
@@ -955,6 +1055,7 @@ impl Run<'_> {
             map,
             differences: Vec::new(),
             created,
+            staging,
             grantee: None,
         })
     }
@@ -1370,6 +1471,55 @@ fn through_shape_view(error: Error, staged: &Staged) -> Error {
     }
 }
 
+/// What `created` holds, by catalog and description, as fill tells the
+/// externals file's objects from its own.
+fn identities(created: &externals::Created) -> BTreeSet<(String, String)> {
+    created
+        .roots
+        .iter()
+        .chain(&created.members)
+        .map(|object| (object.catalog.clone(), object.described.clone()))
+        .collect()
+}
+
+/// Sends fill's statements on `session` in one transaction, under the empty
+/// path every pbps session pins (#1778). pbps renders them, from the
+/// target's catalog, so a refusal is the target's shape not reproducing
+/// here, and is named as fill's.
+async fn run_fill(session: &mut Conn, sql: &str) -> Result<(), Error> {
+    if sql.is_empty() {
+        return Ok(());
+    }
+    let read =
+        |what: &'static str| move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"));
+    session
+        .execute("BEGIN")
+        .await
+        .map_err(read("the fill's transaction"))?;
+    let outcome = async {
+        session
+            .execute("SELECT pg_catalog.set_config('search_path', '', true)")
+            .await
+            .map_err(read("the fill session's path"))?;
+        externals::run(session, sql).await.map_err(|failed| {
+            Error::Externals(vec![format!(
+                "filling what the externals file lacks from the target failed: the engine \
+                 refused it: {}; write the object it names in the externals file",
+                failed.error
+            )])
+        })
+    }
+    .await;
+    if let Err(error) = outcome {
+        let _ = session.execute("ROLLBACK").await;
+        return Err(error);
+    }
+    session
+        .execute("COMMIT")
+        .await
+        .map_err(read("the fill's transaction"))
+}
+
 /// Every object in the scratch database initdb did not create.
 async fn inventory(conn: &mut Conn) -> Result<externals::Inventory, Error> {
     externals::inventory(conn)
@@ -1424,7 +1574,8 @@ async fn run_externals(
                 finding.push_str(
                     "; the externals file runs before any managed object, so a statement that names \
                      one fails: write such an object as a shape view (a view of typed NULLs \
-                     that returns no row), or leave it out of the externals file",
+                     that returns no row), or leave it out of the externals file, and fill \
+                     stages it once the managed tables exist",
                 );
             }
             return Err(Error::Externals(vec![finding]));

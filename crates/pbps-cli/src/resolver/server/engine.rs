@@ -59,24 +59,26 @@ pub(super) fn reconstruction(
     }
 }
 
-/// Compiles the reconstruction as whatever role the session is, over the
-/// run's ordinary connection.
+/// Compiles `part` of the reconstruction as whatever role the session is,
+/// over the run's ordinary connection.
 pub(crate) async fn compile(
     reconstruction: &mut Reconstruction,
     extras: &[String],
     driver: Driver,
     zone: Option<&pbps_model::SessionZone>,
     connection: &mut impl pbps_db::transport::ExecuteConnection,
+    part: pbps_pg::resolver::reconstruct::Part,
 ) -> Result<(), Error> {
     match (driver, zone) {
         (Driver::Postgres, None) => Err(Error::Scope(
             "the target reported no session time zone to compile in".into(),
         )),
         (Driver::Postgres, Some(zone)) => reconstruction
-            .compile(
+            .compile_part(
                 &pbps_pg::Postgres::with_write_path_extras(extras.to_vec()),
                 zone,
                 connection,
+                part,
             )
             .await
             .map_err(compile_failed),

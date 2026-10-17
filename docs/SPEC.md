@@ -2033,7 +2033,7 @@ scratch compile (#1616).
     with the engine's error, which names what failed; when what it names is
     managed, the remedy is a shape view or leaving the object out. The
     draft command writes shape views and orders by the target's
-    `pg_depend`, as the planned fill will.
+    `pg_depend`, as fill does.
 - **Everything it leaves behind must be accounted for.**
   - Each object it creates is compared with the target before any binding
     question is answered. A mismatch, an object the target does not have,
@@ -2124,7 +2124,8 @@ scratch compile (#1616).
   that is sealed: the comparison and that capture are two reads of the
   target, and a shape that changed between them refuses, naming what
   changed (#1755).
-- **A chain through the boundary refuses.** In such a chain, a managed object
+- **A chain through the boundary refuses**, unless fill stages the middle
+  object (below). In such a chain, a managed object
   binds to an external one whose compared *shape* names a managed object:
   a column, attribute or argument of a managed type, a managed parent
   relation, or a cast over a managed type.
@@ -2182,12 +2183,38 @@ review (#1778, DEC-1778.1).**
   entry names or a file the project reads. The file it drafts is compared
   with the target like any other, whoever edited it.
 
-A later step is planned: filling, at plan time, the shapes an externals file
-lacks, by the same rules; the externals file wins on overlap. pbps generates
-each object itself, so it can order them one by one from the target's
-recorded dependencies (`pg_depend`), between managed objects, without
-parsing SQL. That lifts the chain refusal for filled objects. Under #1776
-that order is `Catalog` edges `settle` consumes, so fill waits for #1956.
+**Fill stages, at plan time, the shapes the externals file lacks (#1778,
+DEC-1778.2).**
+- **What it stages.** It reads what the draft reads, without `--schema`, from
+  the target as the run starts. It stages every object the managed objects
+  reach that the externals file did not create. The externals file wins on
+  overlap, matched by catalog and `pg_describe_object` description, so a
+  file's copy that differs from the target still refuses.
+- **How it stages them.** The SQL is the draft's, sent by pbps. It runs in
+  the session that ran the externals file, in a transaction of its own,
+  after it and before any managed object. What it creates joins what the
+  file created: it is compared with the target, sealed, and rechecked.
+- **It lifts a chain through what it writes.** A shape that names a managed
+  table's row type cannot exist before that table does, so the compile then
+  runs in two parts:
+  - the deployer's session creates and commits the managed tables;
+  - the setup session creates the chained shapes, in `pg_depend` order;
+  - the deployer's session compiles everything else.
+
+  The chained shapes are compared with the target after the compile, before
+  any binding question is answered.
+- **What it does not stage**, it names when the compile fails for want of it:
+  - a routine (pbps sends no routine source);
+  - what the draft lists for writing by hand;
+  - a foreign table;
+  - an object whose shape names one of these.
+
+  The remedy is the externals file, or no resolver.
+- **Its order is scratch's, never the plan's.** Scratch is built by the
+  reconstruction, not by `settle`, and a filled object exists on the target
+  already, so it is never a change of the plan. Fill adds no ordering edge to
+  the plan (#1776).
+- **It always runs.** An entry with no externals file is filled whole.
 
 Resolved dependencies also become cross-kind ordering edges in the final typed
 plan: remove dependents before their old inputs, and establish desired inputs

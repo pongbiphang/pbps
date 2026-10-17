@@ -83,6 +83,27 @@ enum Phase {
     Expressions,
 }
 
+/// Which steps one compile runs: all of them, or the tables and then the
+/// rest. A fill's chained shapes name a managed table's row type, so they
+/// are created between the two, outside the deployer's transaction
+/// (#1778, DEC-1778.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    Whole,
+    Tables,
+    AfterTables,
+}
+
+impl Part {
+    fn holds(self, phase: Phase) -> bool {
+        match self {
+            Self::Whole => true,
+            Self::Tables => phase == Phase::Tables,
+            Self::AfterTables => phase != Phase::Tables,
+        }
+    }
+}
+
 /// What kind of object a step makes nameable, and so which bindings it
 /// could have taken over had it existed earlier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -513,6 +534,18 @@ impl Reconstruction {
         zone: &pbps_model::SessionZone,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
     ) -> Result<(), ReconstructError> {
+        self.compile_part(dialect, zone, conn, Part::Whole).await
+    }
+
+    /// [`Self::compile`] for `part` of the steps only, in a transaction of
+    /// its own.
+    pub async fn compile_part(
+        &mut self,
+        dialect: &crate::Postgres,
+        zone: &pbps_model::SessionZone,
+        conn: &mut impl pbps_db::transport::ExecuteConnection,
+        part: Part,
+    ) -> Result<(), ReconstructError> {
         let framing = dialect.transaction_framing(zone);
         conn.execute(&framing.begin).await.map_err(|e| {
             // `invalid_parameter_value`, measured on 18.6 for an unknown
@@ -531,7 +564,7 @@ impl Reconstruction {
                 ReconstructError::Transaction("begin")
             }
         })?;
-        let outcome = self.compile_steps(conn).await;
+        let outcome = self.compile_steps(conn, part).await;
         if outcome.is_err() {
             let _ = conn.execute(&framing.rollback).await;
             return outcome;
@@ -544,8 +577,9 @@ impl Reconstruction {
     async fn compile_steps(
         &mut self,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
+        part: Part,
     ) -> Result<(), ReconstructError> {
-        for step in &mut self.steps {
+        for step in self.steps.iter_mut().filter(|step| part.holds(step.phase)) {
             let failed = |reason: String| ReconstructError::Compile {
                 declaration: step.declaration.clone(),
                 reason,

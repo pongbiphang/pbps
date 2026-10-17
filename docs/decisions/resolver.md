@@ -2828,8 +2828,7 @@ maintainer's (2026-10-15).
 - The reader is new code in `pbps-pg`: the plan model and emitter hold no
   types, domains, enums, extensions or shape views.
 
-Fill, the second step, waits for #1956: its order is `Catalog` edges
-`settle` consumes under #1776, not a new pass.
+Fill, the second step, is DEC-1778.2.
 
 **Pinned by** `resolver_stages_an_externals_file_drafted_from_the_target_unchanged`
 and `resolver_draft_lists_a_routine_and_a_chain_and_writes_neither` (live,
@@ -3378,3 +3377,53 @@ makes the change, which moves the rule identifier (DEC-2012.1).
 `a_persisted_column_needs_its_functions_owner_to_be_the_tables`
 and `synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed`
 (the three-part name).
+
+<a id="dec-1778-2"></a>
+
+**DEC-1778.2. Fill stages what the externals file lacks, in scratch's
+order, and splits the compile around the managed tables for a chain it
+lifts (#1778).** The maintainer chose this on 2026-10-17. It corrects the
+2026-10-14 plan that fill would order its objects as `Catalog` edges for
+`settle`.
+
+**Why not `settle`.** `settle` orders the sealed plan, and refuses a node
+that is no change of it (`Refusal::Outside`, `Refusal::Mismatch`). A
+filled object exists on the target already, so it never enters the plan.
+Scratch is built by the reconstruction instead: the plan from an empty
+schema, sorted into tables, keys, modules and expressions. Fill is placed
+in that order, so the plan's ordering gains no edge and no pass (#1776).
+
+**What was decided.**
+- **What it stages.** Fill reads what the draft reads without `--schema`, at
+  plan time and from the target. It runs the draft's SQL for every object
+  the externals file did not create. It runs after that file, in its session
+  and in a transaction of its own, before any managed object.
+- **The externals file wins on overlap.** Objects are matched by catalog and
+  by `pg_describe_object` under the empty path, which names an object alike
+  on both databases. A file's copy that differs from the target therefore
+  still refuses: fill never replaces it.
+- **What it creates is compared, sealed and rechecked** like what the file
+  created. The evidence gains no field.
+- **A chain is lifted for what fill writes.** A shape that names a managed
+  table's row type is created between two parts of the compile:
+  - the deployer's session commits the tables;
+  - the setup session creates the shape, as the externals file's owner
+    would;
+  - the deployer's session compiles the rest.
+
+  Those shapes are compared after the compile. A chain through a routine,
+  through what the draft lists for writing by hand, or through a foreign
+  table still refuses. When the compile fails, each object fill could not
+  stage is named, with the externals file as the remedy.
+- **It always runs.** An entry without an externals file is filled whole.
+
+**Pinned by** `resolver_lifts_a_chain_through_an_object_fill_stages`
+(run-owned, and supplied on 16 and 18),
+`resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it`,
+`resolver_fills_the_external_objects_no_externals_file_stages`,
+`resolver_refuses_a_routine_fill_cannot_stage_naming_it` and
+`resolver_compiles_a_managed_view_over_an_externals_table` (the file's
+copy is not filled over), live; and the `resolver::draft` unit tests
+`fill_stages_what_the_externals_file_lacks_and_leaves_what_it_holds`,
+`a_shape_naming_a_managed_row_type_is_filled_once_the_managed_tables_exist`
+and `what_fill_cannot_stage_is_named_with_what_names_it`.

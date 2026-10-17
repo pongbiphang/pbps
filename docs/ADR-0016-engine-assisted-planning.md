@@ -754,9 +754,10 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
     requirements designed above no longer apply (#617 is closed).
   - Two later steps reuse the same comparison: a reviewed externals draft from
     the target, delivered as `pbps resolver externals` (#1778,
-    DEC-1778.1), then automatic fill of missing shapes. Fill orders each
-    generated object from the target's `pg_depend`, between managed
-    objects, which lifts the chain refusal for what it fills.
+    DEC-1778.1), then automatic fill of missing shapes (DEC-1778.2). Fill
+    orders each generated object from the target's `pg_depend`, between
+    managed objects in scratch's order, which lifts the chain refusal for
+    what it fills.
 - **Reading this record.** Wherever the decisions above describe
   containment, process or socket observation, executable identity, verified
   channels or retained external source, they describe the measured profiles,
@@ -787,7 +788,10 @@ carries the normative text, and DEC-1528.1 and DEC-1636.1 the reasons.
     qualification)
   - `resolver_refuses_an_externals_file_object_left_uncompared`
   - `resolver_compares_an_external_table_without_its_foreign_keys_and_triggers`
-  - `resolver_refuses_a_chain_through_an_external_object_naming_it`
+  - `resolver_lifts_a_chain_through_an_object_fill_stages` and
+    `resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it`
+  - `resolver_fills_the_external_objects_no_externals_file_stages` and
+    `resolver_refuses_a_routine_fill_cannot_stage_naming_it`
   - `resolver_compiles_a_managed_view_over_an_external_view_staged_as_a_shape_view`
   - `resolver_refuses_an_external_view_staged_as_a_table` (the computed-field
     `xmin(ext.v)` case binds differently on a table)

@@ -523,3 +523,125 @@ fn a_table_with_an_invalid_unique_index_is_listed_for_writing_by_hand() {
         draft.sql
     );
 }
+
+impl Target {
+    fn fill(&self) -> Fill {
+        survey_fill(&self.facts, &|key| self.managed.contains(key))
+    }
+}
+
+fn file_created(objects: &[(&str, &str)]) -> BTreeSet<(String, String)> {
+    objects
+        .iter()
+        .map(|(catalog, described)| ((*catalog).to_owned(), (*described).to_owned()))
+        .collect()
+}
+
+#[test]
+fn fill_stages_what_the_externals_file_lacks_and_leaves_what_it_holds() {
+    let (target, _, _, _) = reading_a_view();
+    let fill = target.fill();
+    let staging = fill.staging(&BTreeSet::new());
+    assert_eq!(
+        staging.ahead,
+        "CREATE SCHEMA IF NOT EXISTS ext;\n\
+         CREATE VIEW ext.v AS SELECT NULL::integer AS id WHERE false;\n"
+    );
+    assert_eq!(staging.chained, "");
+    assert_eq!(staging.filled, BTreeSet::from(["view ext.v".to_owned()]));
+    assert!(staging.unfillable.is_empty(), "{:?}", staging.unfillable);
+    // Negative: what the externals file created is the file's, never filled
+    // over it.
+    let held = fill.staging(&file_created(&[("pg_class", "view ext.v")]));
+    assert_eq!(held, Staging::default());
+}
+
+/// `ext.c (m app.m)`, a table whose column is the managed table `app.m`'s
+/// row type, read by the managed view `app.a`.
+fn naming_a_managed_row_type() -> Target {
+    let mut target = Target::default();
+    let managed = target.relation(20200, 'r', "app", "m", &[("id", "integer")]);
+    target.managed(&managed);
+    let chained = target.relation(20210, 'r', "ext", "c", &[("m", "app.m")]);
+    target.depend(&chained, &key("pg_type", 20201), 'n', true);
+    let reader = target.relation(20220, 'v', "app", "a", &[("m", "app.m")]);
+    target.depend(&reader, &chained, 'n', false);
+    target.managed(&reader);
+    target
+}
+
+#[test]
+fn a_shape_naming_a_managed_row_type_is_filled_once_the_managed_tables_exist() {
+    let target = naming_a_managed_row_type();
+    let fill = target.fill();
+    let staging = fill.staging(&BTreeSet::new());
+    assert_eq!(staging.ahead, "CREATE SCHEMA IF NOT EXISTS ext;\n");
+    assert!(
+        staging
+            .chained
+            .starts_with("CREATE TABLE ext.c (\n    m app.m"),
+        "{}",
+        staging.chained
+    );
+    assert_eq!(staging.filled, BTreeSet::from(["table ext.c".to_owned()]));
+    // The draft still lists it: a file written before the managed objects
+    // cannot stage it.
+    assert!(
+        target
+            .draft(&[])
+            .listed
+            .iter()
+            .any(|line| line.contains("ext.c cannot be staged")),
+        "{:?}",
+        target.draft(&[]).listed
+    );
+    // Negative: the externals file's own copy is not filled over, so nothing
+    // is created between the compile's two parts.
+    let held = fill.staging(&file_created(&[("pg_class", "table ext.c")]));
+    assert_eq!(held.chained, "");
+    assert!(held.filled.is_empty(), "{:?}", held.filled);
+}
+
+#[test]
+fn what_fill_cannot_stage_is_named_with_what_names_it() {
+    let mut target = Target::default();
+    let range = target.object("pg_type", 20300, "ext", "type ext.r");
+    target.facts.types.insert(
+        20300,
+        Type {
+            kind: 'r',
+            qualified: "ext.r".into(),
+            ..Type::default()
+        },
+    );
+    let table = target.relation(20310, 'r', "ext", "t", &[("span", "ext.r")]);
+    target.depend(&table, &range, 'n', true);
+    let routine = target.object("pg_proc", 20320, "ext", "function ext.f(integer)");
+    let reader = target.relation(20330, 'v', "app", "a", &[("span", "ext.r")]);
+    target.depend(&reader, &table, 'n', false);
+    target.depend(&reader, &routine, 'n', false);
+    target.managed(&reader);
+    let fill = target.fill();
+    let staging = fill.staging(&BTreeSet::new());
+    assert_eq!(staging.ahead, "");
+    assert!(staging.filled.is_empty(), "{:?}", staging.filled);
+    let unfillable = staging.unfillable.join("\n");
+    for expected in [
+        "function ext.f(integer) cannot be filled: pbps sends no routine source to scratch; \
+         write it in the externals file",
+        "type ext.r cannot be filled: pbps writes no range type",
+        "table ext.t cannot be filled: its shape names type ext.r, which cannot be filled either",
+    ] {
+        assert!(unfillable.contains(expected), "{unfillable}");
+    }
+    // Negative: once the externals file holds the range type, the table
+    // that names it is filled.
+    let held = fill.staging(&file_created(&[("pg_type", "type ext.r")]));
+    assert!(
+        held.ahead.contains("CREATE TABLE ext.t (\n    span ext.r"),
+        "{}",
+        held.ahead
+    );
+    assert_eq!(held.filled, BTreeSet::from(["table ext.t".to_owned()]));
+    assert_eq!(held.unfillable.len(), 1, "{:?}", held.unfillable);
+}

@@ -55,6 +55,14 @@ impl Staged {
         self.compared.contains(object)
     }
 
+    /// `other`'s objects too: a fill's chained shapes are compared after the
+    /// compile, apart from what was staged before it (#1778).
+    pub fn extend(&mut self, other: Staged) {
+        self.compared.extend(other.compared);
+        self.accepted.extend(other.accepted);
+        self.described.extend(other.described);
+    }
+
     /// What changed on the target, among the shapes the comparison
     /// accepted, by the time of `current`, the capture the plan seals. The
     /// comparison and that capture are two reads; a writer between them
