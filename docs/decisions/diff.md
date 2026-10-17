@@ -6348,10 +6348,15 @@ index. Now:
   what rests on it.
 
 What the parent's needs already runs before it, so nothing it needs has to
-cross. `crossable` is gone: a change between the two is passed, since the
-partition's index needs nothing it brings unless an edge says so. The
-remaining refusal is the cycle, the parent's index resting on an adoptable
-partition index, with the old text naming it.
+cross. A change between the two is passed, since the partition's index needs
+nothing it brings unless an edge says so. What the partition's index may
+carry is narrower: a change that could create a table, a column or a module
+(the old `crossable` test) keeps an edge to the parent's index, because
+`rests_on` does not read what rests on such a change in turn, as a function
+calling one carried. Carrying one is therefore a cycle, refused with the old
+text, "it would pass a change to …" (round 5 of review). The other refusal is
+the parent's index resting on an adoptable partition index, also with the
+old text.
 
 **Side by side**, over the full local gate:
 - 3 calls ordered alike (2 moved, 1 unchanged);
@@ -6370,6 +6375,8 @@ which checks:
   its place);
 - idempotency;
 - the passed function rebuild;
+- a function resting on the partition's index, with a caller after it,
+  refused;
 - the cycle refusal.
 
 #1998 item 11 (the verifier's effect for this pair) is in #1968's slice, S7a.

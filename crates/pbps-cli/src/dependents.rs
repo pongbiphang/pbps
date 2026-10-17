@@ -1494,7 +1494,9 @@ fn split_new_tables(
 /// between them sinks with it, by the same edges [`rests_on`] reads: a
 /// foreign key on a unique one, a literal naming it, a replica identity on
 /// it. What the parent's index needs runs before it already. A partition's
-/// index the parent's rests on is a cycle no order satisfies, refused by name.
+/// index the parent's rests on is a cycle no order satisfies, refused by name,
+/// as is one that would carry a change that could create a table, a column
+/// or a module: what rests on that is not read.
 fn before_its_partitions_indexes(
     cs: &mut ChangeSet,
     declared: &Schema,
@@ -1513,6 +1515,27 @@ fn before_its_partitions_indexes(
             .and_then(|t| t.partition_of.as_ref())
             .is_some_and(|of| of.parent == *parent)
             && pbps_diff::schema_diff::adopts(index, own)
+    };
+    // Changes a partition's index may carry past the parent's: none creates
+    // a table, a column or a module.
+    let crossable = |c: &Change| {
+        matches!(
+            c,
+            Change::AddIndex { .. }
+                | Change::DropIndex { .. }
+                | Change::SetIndexStorageParameters { .. }
+                | Change::AddUnique { .. }
+                | Change::DropUnique { .. }
+                | Change::SetPrimaryKey { .. }
+                | Change::AddCheck { .. }
+                | Change::DropCheck { .. }
+                | Change::AddForeignKey { .. }
+                | Change::DropForeignKey { .. }
+                | Change::SetReplicaIdentity { .. }
+                | Change::Grant { .. }
+                | Change::Revoke { .. }
+                | Change::PublicExecution { .. }
+        )
     };
     let mut schedule = Schedule::new(cs.changes.len());
     // The stretch a partition's index may sink through: from the first one
@@ -1552,10 +1575,23 @@ fn before_its_partitions_indexes(
             }
         }
     }
+    // A change that could create a table, a column or a module is not
+    // carried: `rests_on` does not read what rests on it in turn, as a caller
+    // on its callee or an index on its table. An edge keeps it ahead of the
+    // parent's index, so carrying it is a cycle, refused as the hoist refused
+    // passing it.
+    let mut held: Vec<(usize, usize)> = Vec::new();
+    for &(k, j) in adoptions.iter().filter(|(k, j)| j < k) {
+        for c in j + 1..k {
+            if !crossable(&cs.changes[c].change) {
+                schedule.edge(c, k, Source::Effect, OrderReason::Structural);
+                held.push((k, c));
+            }
+        }
+    }
     let settled = match schedule.settle(cs.clone()) {
         Ok(settled) => settled,
         Err(pbps_diff::order::Refusal::Cycle { members, .. }) => {
-            // The parent's index rests on a partition's it could take.
             // `k` is a parent's `AddIndex`, as every adoption's first end is.
             let named = |i: usize| {
                 if let Change::AddIndex { table, name, .. } = &cs.changes[i].change {
@@ -1564,6 +1600,28 @@ fn before_its_partitions_indexes(
                     (cs.changes[i].change.subject(), String::new())
                 }
             };
+            let refused = |k: usize, why: String| {
+                let (name, parent) = named(k);
+                format!(
+                    "the index `{name}` on {parent} is built after a partition's own index it \
+                     could take as its clone, and cannot be moved ahead of it: {why}; make the \
+                     partition's index and this change in separate plans"
+                )
+            };
+            // A partition's index carrying a change it may not.
+            if let Some(&(k, c)) = held
+                .iter()
+                .find(|(k, c)| members.contains(k) && members.contains(c))
+            {
+                return Err(refused(
+                    k,
+                    format!(
+                        "it would pass a change to {}",
+                        cs.changes[c].change.subject()
+                    ),
+                ));
+            }
+            // The parent's index rests on a partition's it could take.
             return Err(adoptions
                 .iter()
                 .find(|(k, j)| members.contains(k) && members.contains(j))
@@ -1575,13 +1633,12 @@ fn before_its_partitions_indexes(
                             .to_owned()
                     },
                     |&(k, j)| {
-                        let (name, parent) = named(k);
-                        format!(
-                            "the index `{name}` on {parent} is built after a partition's own \
-                             index it could take as its clone, and cannot be moved ahead of \
-                             it: it rests on {}, which it could take; make the partition's \
-                             index and this change in separate plans",
-                            cs.changes[j].change.subject()
+                        refused(
+                            k,
+                            format!(
+                                "it rests on {}, which it could take",
+                                cs.changes[j].change.subject()
+                            ),
                         )
                     },
                 ));
@@ -6196,6 +6253,24 @@ mod tests {
         ]);
         before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).unwrap();
         assert_eq!(names(&cs)[1..], ["ev_k", "own_k"], "{:?}", cs.changes);
+        // Negative: a module that rests on the partition's index is not
+        // carried, since what calls it would not follow: refused, as the
+        // hoist refused passing it.
+        let function = |name: &str, body: &str| Change::CreateModule {
+            id: id(name),
+            module: Box::new(module(
+                ModuleKind::Function,
+                &format!("() RETURNS integer LANGUAGE sql BEGIN ATOMIC {body}; END"),
+            )),
+        };
+        let mut cs = plan(vec![
+            add(&ev_1, "own_k", "k", false),
+            function("app.a()", "SELECT 'app.own_k'::regclass::oid::integer"),
+            function("app.b()", "SELECT app.a()"),
+            add(&ev, "ev_k", "k", false),
+        ]);
+        let why = before_its_partitions_indexes(&mut cs, &s, pg().as_ref()).expect_err("refused");
+        assert!(why.contains("would pass a change to app.a()"), "{why}");
         // What the parent's rests on between them stays ahead of it, in its
         // order: the drop that frees its name, and an index its predicate
         // names, with the drop that one's name needs (#1745 review).
