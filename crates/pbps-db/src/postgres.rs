@@ -67,6 +67,66 @@ async fn fresh_zone(client: &tokio_postgres::Client) -> Result<SessionZone, DbEr
     })
 }
 
+/// The oldest PostgreSQL release pbps supports, as `server_version_num`
+/// spells it: the lowest release CI qualifies (DEC-2151.1). Lowering it takes
+/// that release's CI cell first (#2152).
+pub(crate) const MINIMUM_SERVER_VERSION_NUM: i32 = 160_000;
+
+/// [`MINIMUM_SERVER_VERSION_NUM`] as an operator would name it.
+const MINIMUM_SERVER_VERSION: &str = "16";
+
+/// A `server_version_num` as the release it is: `100021` is 10.21, and before
+/// 10 the number had three parts, so `90624` is 9.6.24.
+fn version_name(num: i32) -> String {
+    if num >= 100_000 {
+        format!("{}.{}", num / 10_000, num % 10_000)
+    } else {
+        format!("{}.{}.{}", num / 10_000, num / 100 % 100, num % 100)
+    }
+}
+
+/// Refuses a release older than [`MINIMUM_SERVER_VERSION_NUM`] by name
+/// (DEC-2151.1). `SHOW` for the reason [`fresh_zone`] gives, before anything
+/// else is asked of the session.
+async fn require_supported_server(client: &tokio_postgres::Client) -> Result<(), DbError> {
+    let rows = client.simple_query("SHOW server_version_num").await?;
+    let answer = rows.iter().find_map(|m| {
+        if let tokio_postgres::SimpleQueryMessage::Row(row) = m {
+            Some(row.get(0))
+        } else {
+            None
+        }
+    });
+    supported(version_num(answer)?)
+}
+
+/// The number `SHOW server_version_num` answered. Absent and unreadable are
+/// errors, never a release that passes.
+fn version_num(answer: Option<Option<&str>>) -> Result<i32, DbError> {
+    let Some(Some(text)) = answer else {
+        return Err(DbError::BadRow(
+            "`SHOW server_version_num` returned no value".to_owned(),
+        ));
+    };
+    text.parse().map_err(|_| {
+        DbError::BadRow(
+            "`SHOW server_version_num` answered something that is not a number".to_owned(),
+        )
+    })
+}
+
+/// [`require_supported_server`]'s judgement on the number it read.
+fn supported(num: i32) -> Result<(), DbError> {
+    if num < MINIMUM_SERVER_VERSION_NUM {
+        return Err(DbError::UnsupportedServer {
+            engine: "PostgreSQL",
+            found: version_name(num),
+            minimum: MINIMUM_SERVER_VERSION,
+        });
+    }
+    Ok(())
+}
+
 impl From<tokio_postgres::Error> for DbError {
     /// The driver's error, flattened to text and a SQLSTATE.
     ///
@@ -317,6 +377,7 @@ impl Conn {
             let (client, connection) = config.connect_raw(tcp, tokio_postgres::NoTls).await?;
             (client, hold(connection))
         };
+        require_supported_server(&client).await?;
         let zone = fresh_zone(&client).await?;
         let mut conn = Self {
             client,
@@ -1045,6 +1106,45 @@ impl Row {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_release_older_than_the_minimum_is_refused_by_name() {
+        for num in [160_000, 160_013, 180_006] {
+            assert!(supported(num).is_ok(), "{num}");
+        }
+        for (num, name) in [(150_010, "15.10"), (100_021, "10.21"), (90_624, "9.6.24")] {
+            let error = supported(num).unwrap_err();
+            assert!(
+                matches!(&error, DbError::UnsupportedServer { found, .. } if found == name),
+                "{num}: {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("PostgreSQL {name} is not supported; pbps needs PostgreSQL 16 or later")
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_server_version_is_an_error_not_a_pass() {
+        assert_eq!(version_num(Some(Some("180006"))).unwrap(), 180_006);
+        for answer in [None, Some(None), Some(Some("")), Some(Some("18.6"))] {
+            assert!(
+                matches!(version_num(answer), Err(DbError::BadRow(_))),
+                "{answer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_version_number_is_named_as_its_release() {
+        assert_eq!(version_name(180_006), "18.6");
+        assert_eq!(version_name(160_000), "16.0");
+        assert_eq!(version_name(100_021), "10.21");
+        // Before 10 the number had three parts.
+        assert_eq!(version_name(90_624), "9.6.24");
+        assert_eq!(version_name(90_500), "9.5.0");
+    }
 
     fn endpoint_of(connection: &str) -> Result<(String, u16), DbError> {
         endpoint(&config_of(connection))
