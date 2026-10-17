@@ -16,7 +16,8 @@
 //!   (DEC-1958.1), exhausted only by a rule that does not converge.
 //!
 //! A rewrite that adds nothing ends the loop with a refusal naming what is
-//! left; a plan with nothing unmet ends it as a success. The added steps
+//! left; a plan with nothing unmet ends it as a success, once the final
+//! order over [`Expansion::order`]'s edges still leaves nothing unmet. The added steps
 //! carry their [`Provenance`] for the plan output, never sealed (DEC-1958.3).
 //!
 //! An expansion's return type has no whole step: it cannot turn a rename into
@@ -192,6 +193,18 @@ pub fn expand<E: Expansion>(
     let order = expansion.order(&state.changes)?;
     let n = state.changes.len();
     state.settle(&order, n)?;
+    // The final order may move a step past one that met an obligation by its
+    // position; a plan returned as expanded meets every one in the order it
+    // is returned in.
+    let left = expansion.unmet(&state.changes)?;
+    if !left.is_empty() {
+        return Err(format!(
+            "{}: the final order leaves {} unmet: {}",
+            expansion.rule(),
+            left.len(),
+            list(&left)
+        ));
+    }
     Ok(Expanded {
         changes: ChangeSet {
             changes: state.changes,

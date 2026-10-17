@@ -19,6 +19,9 @@ enum Mode {
 
 struct Toy(Mode);
 
+/// The toy rule, whose final order puts each create ahead of every drop.
+struct Undoes;
+
 fn create(name: &str) -> PlannedChange {
     PlannedChange::new(Change::CreateRole {
         uid: "r_aaaaaa".parse().unwrap(),
@@ -247,4 +250,49 @@ impl Expansion for SplitsItsOwn {
 fn only_a_whole_step_can_be_split() {
     let err = expand(plan(&["a"]), &SplitsItsOwn, FACTOR).unwrap_err();
     assert_eq!(err, "own: only a whole step splits, not step 0");
+}
+
+impl Expansion for Undoes {
+    type Obligation = String;
+
+    fn rule(&self) -> &'static str {
+        "undoes"
+    }
+
+    fn unmet(&self, plan: &[PlannedChange]) -> Result<Vec<String>, String> {
+        Toy(Mode::Meets).unmet(plan)
+    }
+
+    fn expand(&self, plan: &[PlannedChange], obligation: &String) -> Result<Rewrite, String> {
+        Toy(Mode::Meets).expand(plan, obligation)
+    }
+
+    fn order(&self, plan: &[PlannedChange]) -> Result<Vec<Order>, String> {
+        let creates = plan
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| name(p).is_some_and(|n| n.1));
+        let drops: Vec<usize> = plan
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| name(p).is_some_and(|n| !n.1))
+            .map(|(i, _)| i)
+            .collect();
+        Ok(creates
+            .flat_map(|(c, _)| {
+                drops.iter().map(move |&d| Order {
+                    before: Step::Plan(c),
+                    after: Step::Plan(d),
+                    source: Source::Catalog,
+                    reason: OrderReason::Structural,
+                })
+            })
+            .collect())
+    }
+}
+
+#[test]
+fn a_final_order_that_unmeets_an_obligation_is_refused() {
+    let err = expand(plan(&["a"]), &Undoes, FACTOR).unwrap_err();
+    assert_eq!(err, "undoes: the final order leaves 1 unmet: a");
 }
