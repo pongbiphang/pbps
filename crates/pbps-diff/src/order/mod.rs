@@ -15,13 +15,12 @@
 //! - [`commute`]: a pair the facts call independent, and a second order that
 //!   swaps it, for the live suites that check the facts against an engine.
 //!
-//! The effects order nothing in a release build: `settle` orders there only
-//! over the edges its callers state (the resolver's graph, the generated- and
-//! computed-column releases), DEC-1956.3.
+//! The effects order nothing in a release build but the resolver's plan:
+//! `settle` orders there only over the edges its callers state (the generated-
+//! and computed-column releases) and the resolver's, which are the effects, the
+//! name slots and its evidence (DEC-1956.3, DEC-1968.2).
 
 pub mod commute;
-#[cfg(any(test, debug_assertions))]
-pub(crate) mod compare;
 pub mod edges;
 pub mod schedule;
 pub mod shadow;

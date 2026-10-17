@@ -209,8 +209,12 @@ fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
     };
     // Rebuilt around the rows: 1 -> 2 is written before 2 exists, and fine.
     assert_eq!(verdict(true), []);
-    // Negative: a key that stands throughout wants its parent row first.
-    assert!(!verdict(false).is_empty());
+    // A table that references itself is a cycle of one: its rows keep the
+    // order given, as the differ leaves them, whether the key stands or not
+    // (DEC-1968.2). A key that stands between two tables wants the parent's
+    // rows first: `rows_wait_only_for_a_key_that_stands_when_they_are_written`
+    // in `pbps-diff`.
+    assert_eq!(verdict(false), []);
 }
 
 #[test]

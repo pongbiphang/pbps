@@ -1,5 +1,5 @@
 use super::*;
-use pbps_model::resolver::OrderReason;
+use pbps_model::resolver::OrderEdge;
 use pbps_model::{Change, PlannedChange};
 
 fn example() -> ChangeSet {
@@ -68,6 +68,194 @@ fn cycles_and_edges_outside_the_change_set_refuse_before_output() {
         ),
         Err(Error::Edge)
     ));
+}
+
+/// DEC-1968.1: an edge only the evidence states is an obligation like any
+/// other. A cycle through one is refused by name, whichever source closes it.
+#[test]
+fn a_cycle_through_an_execution_or_binding_edge_is_refused_by_name_not_dropped() {
+    let edge = |before, after, reason| OrderEdge {
+        before,
+        after,
+        reason,
+    };
+    for edges in [
+        // Execution alone.
+        vec![
+            edge(0, 1, OrderReason::Authorization),
+            edge(1, 0, OrderReason::Authorization),
+        ],
+        // Execution closed by a binding.
+        vec![
+            edge(0, 1, OrderReason::Authorization),
+            edge(1, 2, OrderReason::Binding),
+            edge(2, 0, OrderReason::Binding),
+        ],
+    ] {
+        match order(example(), edges.iter().cloned().collect()) {
+            Err(Error::Cycle(text)) => {
+                assert!(text.contains("role a") && text.contains("role b"), "{text}");
+                assert!(text.contains("authorization"), "{text}");
+            }
+            other => panic!("{edges:?}: {:?}", other.map(|o| o.changes)),
+        }
+    }
+    // Negative: the same edges without the closing one order.
+    assert!(
+        order(
+            example(),
+            BTreeSet::from([edge(0, 1, OrderReason::Authorization)])
+        )
+        .is_ok()
+    );
+}
+
+/// The evidence orders what the effects leave free (DEC-1968.2): a view
+/// reads a table, which no effect says, and the plan arrives with the view
+/// first. Guard: without the binding edge the view stays first.
+#[test]
+fn a_binding_edge_is_respected_where_the_effects_allow_the_other_order() {
+    use pbps_model::{Hints, IdsFile, Module, ModuleKind, Schema};
+    let base = Schema::default();
+    let old_ids = IdsFile::default();
+    let mut desired = Schema::default();
+    let table: pbps_model::TableName = "app.t".parse().unwrap();
+    desired
+        .tables
+        .insert(table.clone(), pbps_model::Table::default());
+    let view: pbps_model::ModuleId = "app.v".parse().unwrap();
+    desired.modules.insert(
+        view.clone(),
+        Module {
+            kind: ModuleKind::View,
+            description: None,
+            definition: "SELECT 1 AS id".into(),
+        },
+    );
+    let wanted_ids = ids(&desired, &old_ids);
+    let (base_side, desired_side) = (
+        crate::Side {
+            schema: &base,
+            ids: &old_ids,
+        },
+        crate::Side {
+            schema: &desired,
+            ids: &wanted_ids,
+        },
+    );
+    let observations = [observation(
+        Surface::Module(view.clone()),
+        BTreeSet::from([Surface::Table(table.clone())]),
+    )];
+    let steps = |ordered: &Ordered| {
+        ordered
+            .changes
+            .changes
+            .iter()
+            .map(|p| p.change.subject())
+            .collect::<Vec<_>>()
+    };
+    let ordered = plan(
+        base_side,
+        desired_side,
+        &Hints::default(),
+        &observations,
+        &pbps_dialect::MinimalDialect,
+    )
+    .unwrap();
+    assert_eq!(steps(&ordered), ["app.t", "app.v"]);
+    let binding: Vec<_> = ordered
+        .proof
+        .edges()
+        .iter()
+        .filter(|e| e.reason == OrderReason::Binding)
+        .collect();
+    assert_eq!(binding.len(), 1, "{:?}", ordered.proof.edges());
+    // The view first, as the arrival order in a hand-built plan, and the
+    // table after it: the evidence alone moves them.
+    let wrong = ChangeSet {
+        changes: vec![
+            ordered.changes.changes[1].clone(),
+            ordered.changes.changes[0].clone(),
+        ],
+    };
+    let with = order_logical(
+        wrong.clone(),
+        &observations,
+        &Default::default(),
+        base_side,
+        desired_side,
+        &pbps_dialect::MinimalDialect,
+    )
+    .unwrap();
+    assert_eq!(steps(&with), ["app.t", "app.v"]);
+    let without = order_logical(
+        wrong,
+        &[],
+        &Default::default(),
+        base_side,
+        desired_side,
+        &pbps_dialect::MinimalDialect,
+    )
+    .unwrap();
+    assert_eq!(steps(&without), ["app.v", "app.t"]);
+}
+
+/// A resolver plan with a cycle through its own edges is refused by name: a
+/// declared dependency of a view on another, and the evidence binding the
+/// other to the view.
+#[test]
+fn a_resolver_plan_with_a_cycle_through_the_evidence_is_refused_by_name() {
+    use pbps_model::{Hints, IdsFile, Module, ModuleKind, Schema};
+    let base = Schema::default();
+    let old_ids = IdsFile::default();
+    let mut desired = Schema::default();
+    for name in ["app.va", "app.vz"] {
+        desired.modules.insert(
+            name.parse().unwrap(),
+            Module {
+                kind: ModuleKind::View,
+                description: None,
+                definition: "SELECT 1 AS id".into(),
+            },
+        );
+    }
+    let wanted_ids = ids(&desired, &old_ids);
+    let mut hints = Hints::default();
+    hints.module_deps.insert(
+        "app.va".parse().unwrap(),
+        BTreeSet::from(["app.vz".parse().unwrap()]),
+    );
+    let observations = [
+        observation(Surface::Module("app.va".parse().unwrap()), BTreeSet::new()),
+        // `app.vz` is bound to `app.va`, which `app.va` is declared to follow.
+        observation(
+            Surface::Module("app.vz".parse().unwrap()),
+            BTreeSet::from([Surface::Module("app.va".parse().unwrap())]),
+        ),
+    ];
+    match plan(
+        crate::Side {
+            schema: &base,
+            ids: &old_ids,
+        },
+        crate::Side {
+            schema: &desired,
+            ids: &wanted_ids,
+        },
+        &hints,
+        &observations,
+        &pbps_dialect::MinimalDialect,
+    ) {
+        Err(Error::Cycle(text)) => {
+            assert!(text.contains("app.va") && text.contains("app.vz"), "{text}");
+            assert!(
+                text.contains("binding") && text.contains("structural"),
+                "{text}"
+            );
+        }
+        other => panic!("{:?}", other.map(|o| o.changes)),
+    }
 }
 
 fn identity(name: &str) -> pbps_model::resolver::ObjectIdentity {
@@ -285,20 +473,11 @@ fn explicit_module_dependencies_and_ordinary_orders_survive_resolution() {
     .unwrap();
     assert_eq!(before, after);
     assert_eq!(ordered.changes, before);
-    hints.module_deps.insert(
-        "app.vz".parse().unwrap(),
-        BTreeSet::from(["app.va".parse().unwrap()]),
-    );
-    assert!(
-        plan(
-            base_side,
-            desired_side,
-            &hints,
-            &observations,
-            &pbps_dialect::MinimalDialect
-        )
-        .is_err()
-    );
+    // A cycle of annotations alone is no longer refused here: `settle` keeps
+    // the order given and the replay names the broken annotation (DEC-1956.3,
+    // #2083). A test build's observer refuses that order, so the cycle is
+    // pinned in `schedule_tests`, and the cycle the resolver still refuses, one
+    // through its own edges, below.
 }
 
 #[test]
@@ -401,8 +580,8 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
     let mut current = observed.desired.clone().unwrap();
     current.managed_inputs = BTreeSet::from([Surface::Table(old)]);
     observed.current = Some(current);
-    let edges = graph::constraints_of_logical(
-        &changes,
+    let ordered = order_logical(
+        changes,
         &[observed],
         &Default::default(),
         crate::Side {
@@ -413,8 +592,9 @@ fn a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency() {
             schema: &desired,
             ids: &after_ids,
         },
-    );
-    let ordered = order(changes, edges).unwrap();
+        &pbps_dialect::MinimalDialect,
+    )
+    .unwrap();
     let steps = &ordered.changes.changes;
     let drop = steps
         .iter()
@@ -1219,6 +1399,69 @@ mod generated_surface_coverage {
         .unwrap()
     }
 
+    /// A check whose binding changes with an unchanged text is torn down and put
+    /// back around the rows the plan writes (review of #2120): an update that
+    /// the old binding refuses meets neither (a new overload, a row update).
+    #[test]
+    fn a_rebound_check_is_torn_down_before_the_row_the_plan_updates() {
+        use pbps_model::{DataMode, PrimaryKey, Row, RowKey, TableData, Value};
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let table = |n: i64| {
+            let mut table = Table::default();
+            table
+                .columns
+                .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+            table
+                .columns
+                .insert("n".into(), Column::new("int".parse().unwrap()));
+            table.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            table.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: "n > app.f(1)".into(),
+                },
+            );
+            table.data = Some(TableData {
+                mode: DataMode::Exact,
+                rows: [(
+                    RowKey::from("1"),
+                    [("n".to_owned(), Value::Int(n))]
+                        .into_iter()
+                        .collect::<Row>(),
+                )]
+                .into_iter()
+                .collect(),
+            });
+            table
+        };
+        let mut base = Schema::default();
+        base.tables.insert(t.clone(), table(11));
+        let mut desired = Schema::default();
+        desired.tables.insert(t.clone(), table(1));
+        let observation = SurfaceResolution {
+            surface: Surface::Check {
+                table: t.clone(),
+                name: "ck".into(),
+            },
+            current: Some(bound("pg_constraint", "app.t.ck", &[], "f_old")),
+            desired: Some(bound("pg_constraint", "app.t.ck", &[], "f_new")),
+        };
+        let ordered = sided(&base, &desired, &[observation]);
+        let drop = at(&ordered, &|c| matches!(c, Change::DropCheck { .. }));
+        let update = at(&ordered, &|c| matches!(c, Change::UpdateRow { .. }));
+        let add = at(&ordered, &|c| matches!(c, Change::AddCheck { .. }));
+        assert!(
+            drop < update && update < add,
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
     fn at(ordered: &Ordered, f: &dyn Fn(&Change) -> bool) -> usize {
         ordered
             .changes
@@ -1949,8 +2192,8 @@ mod generated_surface_coverage {
                 rename(&a, &b),
             ],
         };
-        let edges = graph::constraints_of_logical(
-            &changes,
+        let ordered = order_logical(
+            changes,
             &[],
             &Default::default(),
             crate::Side {
@@ -1961,15 +2204,17 @@ mod generated_surface_coverage {
                 schema: &desired,
                 ids: &after_ids,
             },
-        );
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap();
+        let edges = ordered.proof.edges();
         let between = |before, after| edges.iter().any(|e| e.before == before && e.after == after);
         assert!(
             between(0, 1),
             "the drop goes before its table's rename: {edges:?}"
         );
         // Negative: it does not wait for the other table's rename into app.b.
-        assert!(!between(2, 0), "{edges:?}");
-        let ordered = order(changes, edges).unwrap();
+        assert!(!between(2, 0) && !between(0, 2), "{edges:?}");
         assert!(matches!(
             ordered.changes.changes[0].change,
             Change::DropCheck { .. }
@@ -2161,10 +2406,15 @@ mod generated_surface_coverage {
             &before_ids,
             &after_ids,
         );
-        let edges = graph::constraints(
-            &steps,
+        let operations = Operations::expanded(
             logical.changes.len(),
+            origins.iter().cloned().zip(steps.changes.iter().cloned()),
+            pbps_model::operation::ModuleEdits::InPlace,
+        );
+        let schedule = scheduled(
+            &steps,
             &origins,
+            &operations,
             &owners,
             &[],
             &Default::default(),
@@ -2176,7 +2426,9 @@ mod generated_surface_coverage {
                 schema: &desired,
                 ids: &after_ids,
             },
+            &pbps_dialect::MinimalDialect,
         );
+        let edges = schedule.constraints();
         let between = |before, after| edges.iter().any(|e| e.before == before && e.after == after);
         assert!(between(1, 2), "after the rename into app.b: {edges:?}");
         // Negative: the old app.b's rename away is not its table's.
@@ -2639,6 +2891,51 @@ mod generated_surface_coverage {
             folded.changes.changes
         );
         folded.proof.validate(&folded.changes).unwrap();
+
+        // Both at once (review of #2120): the old `a` loses its default under
+        // its final name `b` while the old `b` rebinds. The appended teardown,
+        // spelled `b`, holds `b` to `c` back, and with it `a` to `b`; the
+        // removal spelled `b` follows that last rename, not the teardown's
+        // position.
+        let both = plan(
+            "teardown and final-spelled removal",
+            "b",
+            &schema(&[("a", Some("1")), ("b", Some("1"))]),
+            &schema(&[("b", None), ("c", Some("1"))]),
+            &[
+                SurfaceResolution {
+                    surface: Surface::Default(t.column("a")),
+                    current: attrdef("int4in"),
+                    desired: None,
+                },
+                SurfaceResolution {
+                    surface: Surface::Default(t.column("b")),
+                    current: attrdef("f"),
+                    desired: None,
+                },
+                SurfaceResolution {
+                    surface: Surface::Default(t.column("c")),
+                    current: None,
+                    desired: attrdef("f_exact"),
+                },
+            ],
+        );
+        let mut removals: Vec<usize> = both
+            .changes
+            .changes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| removal(&p.change))
+            .map(|(i, _)| i)
+            .collect();
+        removals.sort_unstable();
+        let (away, into) = (position(&both, &rename("b")), position(&both, &rename("a")));
+        assert!(
+            matches!(removals[..], [teardown, spelled] if teardown < away && away < into && into < spelled),
+            "{:?}",
+            both.changes.changes
+        );
+        both.proof.validate(&both.changes).unwrap();
 
         // A drop frees the name instead: the old `b` is dropped, `a` takes
         // its name and loses its default. The drop goes first, as the
@@ -4058,24 +4355,56 @@ fn a_parents_new_index_precedes_its_partitions_own_under_the_resolver() {
             add(&parent, "ev_n"),
         ],
     };
-    let ids = pbps_model::IdsFile::default();
-    let side = crate::Side {
-        schema: &desired,
-        ids: &ids,
+    // The tables stand and the plan adds the three indexes.
+    let base = desired.clone();
+    for (table, name) in [(&parent, "ev_n"), (&partition, "own"), (&other, "z_n")] {
+        desired
+            .tables
+            .get_mut(table)
+            .unwrap()
+            .indexes
+            .insert(name.into(), index.clone());
+    }
+    let ids = ids(&desired, &pbps_model::IdsFile::default());
+    let ordered = order_logical(
+        changes,
+        &[],
+        &Default::default(),
+        crate::Side {
+            schema: &base,
+            ids: &ids,
+        },
+        crate::Side {
+            schema: &desired,
+            ids: &ids,
+        },
+        &pbps_dialect::MinimalDialect,
+    )
+    .unwrap();
+    let edges = ordered.proof.edges();
+    // The parent's index is ordered before the partition's own by an edge,
+    // not by where the differ put it (DEC-1688.1).
+    let at = |table: &TableName| {
+        ordered
+            .changes
+            .changes
+            .iter()
+            .position(|p| p.change.table() == Some(table))
+            .unwrap()
     };
-    let edges = graph::constraints_of_logical(&changes, &[], &Default::default(), side, side);
     assert!(
         edges
             .iter()
-            .any(|e| e.before == 2 && e.after == 0 && e.reason == OrderReason::Structural),
+            .any(|e| e.before == at(&parent) && e.after == at(&partition)),
         "{edges:?}"
     );
     // Negative: nothing ties the unrelated table's index to either.
     assert!(
-        !edges.iter().any(|e| e.before == 1 || e.after == 1),
+        !edges
+            .iter()
+            .any(|e| e.before == at(&other) || e.after == at(&other)),
         "{edges:?}"
     );
-    let ordered = order(changes, edges).unwrap();
     let tables: Vec<&TableName> = ordered
         .changes
         .changes
@@ -4527,4 +4856,101 @@ mod operations {
             other => panic!("replayed: {other:?}"),
         }
     }
+}
+
+/// Two reference tables that reference each other, rows in both: the differ
+/// plans them in name order and does not refuse the cycle
+/// (`data::supply_order`), and the resolver, which settles the same plan, does
+/// not refuse it either and keeps the differ's order (DEC-1968.2).
+#[test]
+fn two_reference_tables_referencing_each_other_plan_and_settle_in_the_differs_order() {
+    use pbps_model::{
+        Column, DataMode, ForeignKey, Hints, IdsFile, PrimaryKey, Row, RowKey, Schema, Table,
+        TableData, Value,
+    };
+    let reference = |to: &str, column: &str| ForeignKey {
+        columns: vec![column.into()],
+        references_table: to.parse().unwrap(),
+        references_columns: vec!["id".into()],
+        on_delete: Default::default(),
+        on_update: Default::default(),
+    };
+    let table = |other: &str, column: &str, name: &str| {
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+        table
+            .columns
+            .insert(column.into(), Column::new("int".parse().unwrap()));
+        table.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["id".into()],
+            storage_parameters: Default::default(),
+        });
+        table
+            .foreign_keys
+            .insert(format!("fk_{name}"), reference(other, column));
+        table.data = Some(TableData {
+            mode: DataMode::Exact,
+            rows: [(
+                RowKey::from("1"),
+                [(column.to_owned(), Value::Int(1))]
+                    .into_iter()
+                    .collect::<Row>(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        table
+    };
+    let mut desired = Schema::default();
+    desired
+        .tables
+        .insert("app.a".parse().unwrap(), table("app.b", "b_id", "a"));
+    desired
+        .tables
+        .insert("app.b".parse().unwrap(), table("app.a", "a_id", "b"));
+    // The tables and their keys stand; the plan inserts the rows.
+    let mut base = desired.clone();
+    for table in base.tables.values_mut() {
+        table.data = None;
+    }
+    let wanted_ids = ids(&desired, &IdsFile::default());
+    let (base_side, desired_side) = (
+        crate::Side {
+            schema: &base,
+            ids: &wanted_ids,
+        },
+        crate::Side {
+            schema: &desired,
+            ids: &wanted_ids,
+        },
+    );
+    let differ = crate::diff(
+        base_side,
+        desired_side,
+        &pbps_dialect::MinimalDialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    assert!(
+        differ
+            .changes
+            .iter()
+            .filter(|p| matches!(p.change, Change::InsertRow { .. }))
+            .count()
+            == 2,
+        "{differ:?}"
+    );
+    let ordered = plan(
+        base_side,
+        desired_side,
+        &Hints::default(),
+        &[],
+        &pbps_dialect::MinimalDialect,
+    )
+    .unwrap_or_else(|error| panic!("a cycle of reference tables is refused: {error:?}"));
+    assert_eq!(ordered.changes, differ);
+    ordered.proof.validate(&ordered.changes).unwrap();
 }

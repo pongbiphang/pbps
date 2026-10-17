@@ -5678,6 +5678,9 @@ The resolver keeps its own edges and their reasons until #1968 (S7a). Its
 proof is unchanged: every resolver test that pins `OrderingProof` edges and
 reasons passes as it did. An ordinary plan's proof is still not sealed.
 
+*Amended by [DEC-1968.2](#dec-1968-2): the resolver is settled over the effects
+now, and its proof holds their edges.*
+
 Pinned by `each_edge_maps_to_one_sealed_reason_by_the_effect_behind_it`.
 
 <a id="dec-1956-2"></a>
@@ -6380,3 +6383,123 @@ which checks:
 - the cycle refusal.
 
 #1998 item 11 (the verifier's effect for this pair) is in #1968's slice, S7a.
+
+<a id="dec-1968-1"></a>
+
+**DEC-1968.1. The grants a resolver's binding steps need are evidence the
+resolver states, as a source of their own, `Execution`; no effect derives
+them.** (#1968, S7a of #1776)
+
+A restored grant on a schema goes before the steps that make an observed
+surface and before the rows. A grant on a routine, or `PUBLIC`'s execution of
+it, goes before the rows and the expressions that call it. The principal
+that runs a statement has to hold the privilege when it runs, and no effect
+of any step says so: the grant creates nothing the step requires. So
+`resolver::graph` keeps these edges, read from the observations, beside the
+bindings. They are `Source::Execution`, sealed as `Authorization`
+(DEC-1956.1).
+
+Like a `Binding` edge, the verifier cannot re-derive them: its replay
+reads effects. `settle` takes them as obligations of their own source, so a
+cycle through one is refused by name, never dropped
+(`a_cycle_through_an_execution_or_binding_edge_is_refused_by_name_not_dropped`).
+A resolver for another engine must supply them with its bindings; S7's
+(#1959) new-engine contract lists them.
+
+<a id="dec-1968-2"></a>
+
+**DEC-1968.2. The resolver orders its plan through `settle` over the effects
+an ordinary plan is checked against, the name slots' handovers, the
+`depends_on:` annotations and its evidence. The rules `resolver::graph`
+derived by hand are gone.** (#1968)
+
+`graph::constraints` states only the bindings and the executions of
+DEC-1968.1. The effects are read in every build here, as DEC-1956.3 allows
+where an order is made. Replacing the hand rules showed orders they kept
+that the effects did not, each now an effect or an edge, and none refusing
+a valid plan:
+
+- **A reader of the base incarnation is ordered against the rename of what it
+  reads by the name it spells**, as `Exists` is (DEC-1998.1 added the edge
+  to `order::edges`). A retype is no such move, and the old default still goes
+  first by `Absent` alone (DEC-1168.1). The release of a partition's own
+  default is spelled by its parent's column, so it reads that column the
+  same way (DEC-1699.1).
+- **A partition's index follows the indexes its parent ends with**, because
+  the parent's built after it would take it as its clone (DEC-1688.1). It
+  over-approximates by shape, as the hand rule did.
+- **A foreign key the plan drops, over a retyped column or into it, goes
+  before the retype**, found through the column's uid, since the step spells
+  the name the column ends with.
+- **A row update names the columns its guards read**, the cells it leaves
+  alone and its key, so a rename of one goes first. The update half of
+  #2079 closes with it, so the commutation suites drop their
+  `a_row_updated_beside_a_new_column` gap (DEC-1965.1); the insert half
+  stays open.
+- **Rows are ordered by the foreign keys between their tables, and no value
+  is read.** An insert or update makes the written side of its table's rows
+  (`ObjectKey::Rows`) and a delete ends the held side. A child's insert or
+  update requires the parent's written side, and a child's delete or update
+  requires the parent's held side, so a parent's rows come first and a
+  child's rows leave first. A delete also waits for a foreign key into its
+  table that the plan drops or replaces, and a row written waits for
+  whatever the plan takes away from its table, a check, key or index, by the
+  name and whatever its text: a check the resolver rebinds is torn down and
+  put back around the rows (`RowSide::Released`, a key per part, so two drops
+  are not ordered by it). A foreign key counts if it
+  stands throughout, compared through the plan's renames as the differ
+  compares. The first design named
+  the row a reference needs by its key, unique-key or default value; each
+  value the effects could not read (a literal default of some type, a
+  payload's key column, a tuple, a renamed or retyped key) was an order the
+  hand graph kept and the effects lost, and they were found one review
+  round at a time (#2140). Two tables in one cycle of foreign keys, a table
+  and itself included, draw no edge from the keys: the differ plans their
+  rows in name order and does not refuse the cycle (`data::supply_order`), so
+  the resolver must not either. Their rows keep the order given, as writes of
+  one resource that all of them share, which the effect graph orders by the
+  operations' ids. The two sides
+  are two keys because a key both made and ended would put the first
+  ending before every making.
+
+**Differences from the hand graph**, measured side by side over the unit
+suites and both engines' live suites, before the rows were ordered table
+against table (no plan of either was unowned):
+
+- **Order.** In 56 of the 118 plans the live suites made, one mechanism: a rebuild's
+  `DropCheck` and `AddCheck` of one name, its `DropIndex` and its default
+  pair each leave the same-table bracket (every removal first, every
+  installation last). The check is added right after its drop, and a column
+  added in the same plan keeps its place. These are different objects with no
+  effect between them, so both orders apply. Their scripts and checksums
+  change. `resolver_publishes_its_rechecked_plan_in_the_exact_order` pins the
+  new order. A column's deprecation is no longer between the two halves of its
+  default's change (#1954): it emits no SQL.
+- **Proof.** The edges are the effects' direct ones, not the closure the hand
+  rules drew. The edges that went either order a pair whose effects do not
+  meet (two rows, two deprecations, objects that share a table) or are implied
+  by those that remain. `Restoration` is no longer produced, as DEC-1956.1's
+  mapping has no effect for it: a rebuilt object's drop and creation are
+  `Identity`. The reasons the tests pin are unchanged.
+- **An annotation-only cycle** plans in the order given, as DEC-1956.3
+  decided (#2083); the resolver refused it before. A cycle through a binding
+  or an execution is still refused by name.
+
+A step whose names the models cannot own has no effects and keeps its place
+among the others (`Shadowed::unowned`). None of the measured plans had one.
+The hand graph ordered it by the names it shared.
+
+Pinned by `a_binding_edge_is_respected_where_the_effects_allow_the_other_order`,
+`a_resolver_plan_with_a_cycle_through_the_evidence_is_refused_by_name`,
+`a_base_spelled_reader_precedes_the_rename_of_what_it_names_and_not_a_retype`,
+`a_default_removal_in_a_column_rename_chain_reads_its_column_uid`,
+`a_child_row_waits_for_the_parent_rows_whatever_its_reference_names`,
+`the_rows_of_two_tables_referencing_each_other_keep_the_order_given`,
+`two_reference_tables_referencing_each_other_plan_and_settle_in_the_differs_order`,
+`a_parents_new_index_precedes_its_partitions_own_under_the_resolver`,
+`a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency` and
+`an_appended_teardown_belongs_to_its_base_table_in_a_rename_chain`.
+
+*Amends [DEC-1956.1](#dec-1956-1) and [DEC-1954.7](#dec-1954-7): the resolver
+no longer keeps its own edges and reasons, and the comparison with the hand
+graph is retired with it.*

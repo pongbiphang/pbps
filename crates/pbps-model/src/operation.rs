@@ -310,12 +310,34 @@ pub enum ObjectKey {
         table: Recorded,
         key: RowKey,
     },
+    /// The rows of a table, as the tables that reference it see them: the
+    /// written side is made by every insert and update, the held side ended by
+    /// every delete. Two keys, so that no key is both made and ended, which
+    /// would put the first ending before every making. A child's rows wait
+    /// for the parent's written side and leave before its held side, and no
+    /// value is read (DEC-1968.2).
+    Rows {
+        table: Recorded,
+        side: RowSide,
+    },
     /// A grantee's permissions on one target, by the names the change
     /// carries: roles and targets of grants are spelled where the grant runs.
     Grant {
         grantee: Grantee,
         target: GrantTarget,
     },
+}
+
+/// Which side of a table's rows a [`ObjectKey::Rows`] is.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RowSide {
+    Written,
+    Held,
+    /// Made by the drop of one check, key or index of the table: what the
+    /// plan takes away is gone before a row is written, whether or not its
+    /// text changed (a rebound check is torn down and put back). One key per
+    /// part, so that two drops are not ordered by it.
+    Released(PartKey),
 }
 
 /// Which instance of an object: the baseline's or the plan's.
