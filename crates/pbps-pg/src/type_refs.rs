@@ -132,10 +132,20 @@ pub async fn seal(
     let types = read(conn, Within::OwnTransaction, &references).await?;
     for schema in schemas {
         for (table, definition) in &schema.tables {
-            let check_default = |column: &str, ty: &ColumnType, is_null: bool| {
+            let check_default = |column: &str, ty: &ColumnType, expr: Option<&str>| {
                 let Some(reference) = ty.type_ref() else {
                     return Ok(());
                 };
+                let is_null = expr.is_some_and(|expr| {
+                    let (core, casts) = crate::rows::unwrapped_with_casts(expr);
+                    core.eq_ignore_ascii_case("null")
+                        && casts.iter().all(|cast| {
+                            cast.parse::<ColumnType>()
+                                .ok()
+                                .and_then(|t| crate::types::normalize(&t).ok())
+                                .is_some_and(|cast| cast == *ty)
+                        })
+                });
                 if is_null
                     && (ty.is_array()
                         || types.iter().any(|ty| {
@@ -149,7 +159,9 @@ pub async fn seal(
                 Ok(())
             };
             for (column, spec) in &definition.columns {
-                check_default(column, &spec.ty, null_default(spec))?;
+                if let pbps_model::ValueSource::Default(expr) = &spec.value_source {
+                    check_default(column, &spec.ty, Some(expr))?;
+                }
             }
             // Partitions declare only overrides; their column types live on the parent.
             if let Some(part) = &definition.partition_of
@@ -157,15 +169,7 @@ pub async fn seal(
             {
                 for (column, own) in &part.columns {
                     if let Some(spec) = parent.columns.get(column) {
-                        check_default(
-                            column,
-                            &spec.ty,
-                            own.default.as_deref().is_some_and(|expr| {
-                                crate::rows::unwrapped_with_type(expr)
-                                    .0
-                                    .eq_ignore_ascii_case("null")
-                            }),
-                        )?;
+                        check_default(column, &spec.ty, own.default.as_deref())?;
                     }
                 }
             }

@@ -726,3 +726,95 @@ fn routine_overloads_and_relations_have_distinct_dependency_identities() {
         }
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn domain_coercions_keep_null_defaults_on_enum_columns_and_partition_overrides() {
+    let setup = "CREATE SCHEMA app; CREATE TYPE app.mood AS ENUM ('ok');
+        CREATE DOMAIN app.checked_mood AS app.mood CHECK (VALUE IS NULL OR VALUE = 'ok')";
+    let retained = [
+        "NULL::app.checked_mood",
+        "(NULL::app.checked_mood)::app.mood",
+        "CAST(CAST(NULL AS app.checked_mood) AS app.mood)",
+    ];
+    let erased = [
+        "NULL",
+        "NULL::app.mood::app.mood",
+        "CAST(CAST(NULL AS app.mood) AS app.mood)",
+    ];
+    // Measure both majors before asking pbps to admit the declaration.
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "refs_cast_measure");
+        let db = own.connection();
+        on_server(db, setup);
+        on_server(
+            db,
+            "CREATE TABLE app.measure (id integer, mood app.mood) PARTITION BY RANGE (id);
+             CREATE TABLE app.low PARTITION OF app.measure FOR VALUES FROM (0) TO (10)",
+        );
+        for (expressions, count) in [(&retained[..], 2), (&erased[..], 0)] {
+            for expr in expressions {
+                on_server(
+                    db,
+                    &format!(
+                        "ALTER TABLE app.measure ALTER COLUMN mood SET DEFAULT {expr};
+                    ALTER TABLE app.low ALTER COLUMN mood SET DEFAULT {expr}"
+                    ),
+                );
+                assert_eq!(scalar(db, "SELECT count(*)::bigint FROM pg_catalog.pg_attrdef d
+                    JOIN pg_catalog.pg_attribute a ON a.attrelid=d.adrelid AND a.attnum=d.adnum
+                    WHERE d.adrelid IN ('app.measure'::regclass, 'app.low'::regclass) AND a.attname='mood'"), count,
+                    "{expr} on {server}");
+            }
+        }
+    }
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "refs_cast_default");
+        let db = own.connection();
+        on_server(db, setup);
+        let d = Demo::new("refs-cast-default");
+        let table = |parent: &str, partition: &str| {
+            format!(
+                "{}partition_by: [id]\npartitions:\n  low:\n    from: ['0']\n    to: ['10']\n    columns:\n      override_mood: {{default: '{partition}'}}\n",
+                declarations(&format!(
+                    "  mood: {{type: app.mood, default: '{parent}'}}\n  override_mood: {{type: app.mood, default: \"'ok'::app.mood\"}}\n"
+                ))
+            )
+        };
+        d.table(&table(retained[0], retained[0]));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        for (index, expr) in retained.into_iter().enumerate() {
+            if index > 0 {
+                d.table(&table(expr, expr));
+                succeeds(d.run(&["plan"]));
+                d.commit();
+            }
+            let path = plan(&d, db);
+            succeeds(apply_plan(&d, db, &path, false));
+            succeeds(d.run(&["verify", "--db", db]));
+            let next: pbps_model::SavedPlan =
+                serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
+            assert!(next.changes.is_empty(), "{expr}: {:?}", next.changes);
+        }
+        for expr in erased {
+            for (parent, partition, name) in [
+                (expr, retained[0], "app.t.mood"),
+                (retained[0], expr, "app.low.override_mood"),
+            ] {
+                d.table(&table(parent, partition));
+                succeeds(d.run(&["plan"]));
+                d.commit();
+                let out = d.run(&["plan", "--db", db]);
+                assert_ne!(code(&out), 0, "{expr} at {name} on {server}");
+                assert!(
+                    stderr(&out).contains(name)
+                        && stderr(&out).contains("NULL default the engine does not keep"),
+                    "{}",
+                    stderr(&out)
+                );
+            }
+        }
+    }
+}
