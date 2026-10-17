@@ -22994,16 +22994,14 @@ fn an_offline_plan_names_the_catalog_fact_it_could_not_read_in_json_too() {
 /// A bootstrap whose reordering moves a relation after an expression naming
 /// it in a literal is refused by name before any script or DDL, as `plan
 /// --db` refuses it (DEC-1576.1, #1599 review): an expression index on
-/// `abs(k)` beside a declared `app.abs()` follows the function, and
-/// `app.a_reader()`, created ahead of it, reads `'app.ix_a'::regclass` in its
-/// body and would otherwise roll the bootstrap back. What the reordering can
-/// carry with the index is not named (DEC-1967.1): a default reading it rests
-/// on it and follows it, and functions created after `app.abs()`, also from
-/// another schema through their own `search_path`, find it there; the engine
-/// builds them. The database stays empty, and the refusal's two-plan remedy
-/// deploys it. An unqualified name, which only the target can settle, is
-/// refused before `--sql` writes a script beside `--db`. Negative: without
-/// the literals the same declarations bootstrap.
+/// `abs(k)` beside a declared `app.abs()` follows the function, and a
+/// default reading `'app.ix_a'::regclass` would otherwise roll the bootstrap
+/// back. So would a function whose body reads it, through its own
+/// `search_path` from another schema too. The database stays empty,
+/// and the refusal's two-plan remedy deploys it. An unqualified name, which
+/// only the target can settle, is refused before `--sql` writes a script
+/// beside `--db`. Negative: without the literals the same declarations
+/// bootstrap.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
@@ -23023,8 +23021,6 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
          CREATE TABLE app.a (k integer); \
          CREATE INDEX ix_a ON app.a (abs(k)); \
          CREATE TABLE app.z (r text DEFAULT ('app.ix_a'::regclass)::text); \
-         CREATE FUNCTION app.a_reader() RETURNS integer LANGUAGE sql \
-             RETURN ('app.ix_a'::regclass)::oid::integer; \
          CREATE FUNCTION app.reader() RETURNS integer LANGUAGE sql \
              RETURN ('app.ix_a'::regclass)::oid::integer; \
          CREATE SCHEMA other; \
@@ -23036,10 +23032,11 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
     succeeds(d.run(&["pull", "--db", &src]));
     d.commit();
     let z = d.dir.join("schema/app.z.yml");
-    let early = d.dir.join("schema/app.a_reader%28%29.function.yml");
-    let reads = std::fs::read_to_string(&early).unwrap();
+    let declared = std::fs::read_to_string(&z).unwrap();
     let reader = d.dir.join("schema/app.reader%28%29.function.yml");
+    let reads = std::fs::read_to_string(&reader).unwrap();
     let across = d.dir.join("schema/other.across%28%29.function.yml");
+    let reads_across = std::fs::read_to_string(&across).unwrap();
 
     let sql = d.dir.join("boot.sql");
     for args in [
@@ -23050,10 +23047,9 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
         assert_ne!(code(&o), 0, "{args:?}: {}", stdout(&o));
         assert!(
             stderr(&o).contains("names a relation this plan creates later")
-                && stderr(&o).contains("app.a_reader() names app.ix_a")
-                && !stderr(&o).contains("app.z.r")
-                && !stderr(&o).contains("app.reader()")
-                && !stderr(&o).contains("other.across()"),
+                && stderr(&o).contains("app.z.r's default or expression names app.ix_a")
+                && stderr(&o).contains("app.reader() names app.ix_a")
+                && stderr(&o).contains("other.across() names app.ix_a"),
             "{args:?}: {}",
             stderr(&o)
         );
@@ -23068,29 +23064,16 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
         "nothing was built"
     );
 
-    // The remedy: the early reader in a second plan, once the index stands.
-    // The default and the later readers stay in the first, and are built.
-    std::fs::remove_file(&early).unwrap();
+    // The remedy: the expressions in a second plan, once the index stands.
+    std::fs::write(&z, "table: app.z\ncolumns:\n  r: {type: text}\n").unwrap();
+    std::fs::remove_file(&reader).unwrap();
+    std::fs::remove_file(&across).unwrap();
     d.commit();
     on_server(&tgt, "CREATE SCHEMA app; CREATE SCHEMA other");
     succeeds(d.run(&["bootstrap", "--db", &tgt]));
-    assert_eq!(
-        scalar(
-            &tgt,
-            "SELECT count(*) FROM pg_proc WHERE proname IN ('reader', 'across')"
-        ),
-        2,
-        "the functions reading the index were built"
-    );
-    assert_eq!(
-        scalar(
-            &tgt,
-            "SELECT count(*) FROM pg_attrdef WHERE adrelid = 'app.z'::regclass"
-        ),
-        1,
-        "the default reading the index was built"
-    );
-    std::fs::write(&early, &reads).unwrap();
+    std::fs::write(&z, &declared).unwrap();
+    std::fs::write(&reader, &reads).unwrap();
+    std::fs::write(&across, &reads_across).unwrap();
     d.commit();
     let plan = d.dir.join("second.json");
     succeeds(d.run(&["plan", "--db", &tgt, "--out", plan.to_str().unwrap()]));
@@ -23103,8 +23086,8 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
     std::fs::remove_file(&reader).unwrap();
     std::fs::remove_file(&across).unwrap();
     std::fs::write(
-        &early,
-        reads.replace("'app.ix_a'::regclass", "'ix_a'::regclass"),
+        &z,
+        declared.replace("'app.ix_a'::regclass", "'ix_a'::regclass"),
     )
     .unwrap();
     d.commit();
@@ -23114,7 +23097,7 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
     let o = d.run(&["bootstrap", "--sql", script.to_str().unwrap(), "--db", &b]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(
-        stderr(&o).contains("app.a_reader() names app.ix_a"),
+        stderr(&o).contains("app.z.r's default or expression names app.ix_a"),
         "{}",
         stderr(&o)
     );
@@ -23122,7 +23105,6 @@ fn a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused() {
 
     // Negative: no literal, nothing refused.
     let p = plain.connection().to_owned();
-    std::fs::remove_file(&early).unwrap();
     std::fs::write(
         &z,
         "table: app.z\ncolumns:\n  r: {type: text, default: \"'x'\"}\n",

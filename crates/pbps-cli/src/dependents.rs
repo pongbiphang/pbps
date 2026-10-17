@@ -1813,9 +1813,9 @@ fn settle_public_execution(cs: &mut ChangeSet, decisions: Vec<PlannedChange>) {
 /// `creation_order_with` reads a module's definition (DECISIONS 315): every
 /// name the text could call, by the engine's lexer, is taken as a call
 /// ([`calls_one_of`]). An addition whose text names a function the plan
-/// creates or rebuilds waits for each such create by a `Lexical` edge, and
-/// `settle` runs it right after the last of them, in the order it had
-/// (DEC-1967.1). That is a check, an index with a filter or an expression key
+/// creates or rebuilds waits for the last function the plan creates by a
+/// `Lexical` edge, and `settle` runs it right after that create, in the order
+/// it had (DEC-1967.1). That is a check, an index with a filter or an expression key
 /// (an index's other columns are names), a default being set, and a changed
 /// generation expression. An addition whose text names none stays where the
 /// differ put it. A unique index with no expression stays too, since a
@@ -1838,7 +1838,6 @@ fn after_the_rebuilds(
     released: &BTreeSet<ColumnRef>,
     deps: &ModuleDeps,
     declared: &pbps_model::Schema,
-    dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let Some(last) = last_function_create(cs) else {
         return Ok(0);
@@ -1857,218 +1856,88 @@ fn after_the_rebuilds(
             _ => None,
         })
         .collect();
-    // What each addition waits for (#1967, DEC-1967.1): every function create
-    // its text may call, a `Lexical` edge, and the new expression of a
-    // recomputed column it validates, an `Effect` edge. `settle` holds it
-    // right after the last of them; what waits for nothing keeps the
-    // differ's place.
-    // Keyed by the column each is, its parent's for a partition's: a
-    // partition's check or key over an inherited column validates the
-    // parent's recomputation as much as the parent's own (#2125 review).
-    let partitions = Partitions::of(declared);
-    let expressions: Vec<(ColumnRef, usize)> = cs.changes[..last]
+    let moves: Vec<bool> = cs.changes[..last]
         .iter()
-        .enumerate()
-        .filter_map(|(i, p)| match &p.change {
-            Change::AlterColumnExpression { column, .. } if recomputed.contains(column) => {
-                Some((partitions.column(column), i))
-            }
-            _ => None,
-        })
-        .collect();
-    // An addition evaluated over rows runs the function it calls, and what
-    // that function calls in turn: each create a call may reach through the
-    // bodies of the plan's functions, itself included. PL/pgSQL accepts a
-    // body naming a function not created yet, so mutually recursive creates
-    // run in either order, and the addition waits for all of them (#2125
-    // review).
-    let bodies: Vec<&str> = functions
-        .iter()
-        .map(|(_, at)| match &cs.changes[*at].change {
-            Change::AlterModule { module, .. } | Change::CreateModule { module, .. } => {
-                module.definition.as_str()
-            }
-            _ => "",
-        })
-        .collect();
-    // Each body is read once for the functions it may call, and only for a
-    // function some addition reaches: a plan of routines alone reads none
-    // (#2125 review).
-    // A call spells the name, folded or quoted, so a body that does not hold
-    // it case-blind is not lexed for it. A name holding a quote may be spelled
-    // with it doubled, and a body with an escape (`U&`, a backslash) may spell
-    // any name in code points: both are always lexed.
-    let folded: Vec<String> = bodies.iter().map(|b| b.to_lowercase()).collect();
-    let escaped: Vec<bool> = folded
-        .iter()
-        .map(|b| b.contains("u&") || b.contains('\\'))
-        .collect();
-    let names: Vec<String> = functions.iter().map(|(n, _)| n.to_lowercase()).collect();
-    let mut callees: Vec<Option<Vec<usize>>> = vec![None; functions.len()];
-    let mut reach = |from: usize| -> BTreeSet<usize> {
-        let mut seen = BTreeSet::from([from]);
-        let mut stack = vec![from];
-        while let Some(k) = stack.pop() {
-            let next = callees[k].get_or_insert_with(|| {
-                (0..functions.len())
-                    .filter(|&j| {
-                        j != k
-                            && (escaped[k]
-                                || names[j].contains('"')
-                                || folded[k].contains(&names[j]))
-                            && pbps_pg::generated::may_call(bodies[k], &functions[j].0)
-                    })
-                    .collect()
-            });
-            for &j in next.iter() {
-                if seen.insert(j) {
-                    stack.push(j);
-                }
-            }
-        }
-        seen
-    };
-    let mut schedule = Schedule::new(cs.changes.len());
-    let mut waiting = vec![false; last];
-    for (i, p) in cs.changes[..last].iter().enumerate() {
-        let (text, columns): (Option<String>, Vec<ColumnRef>) = match &p.change {
-            Change::AddCheck { constraint, .. } => {
-                (Some(constraint.expression.clone()), Vec::new())
-            }
+        .map(|p| match &p.change {
+            Change::AddCheck { constraint, .. } => calls(&constraint.expression),
             Change::AlterColumnDefault {
                 column,
                 to: Some(to),
                 ..
-            } if !taken.contains(column) => (Some(to.clone()), Vec::new()),
+            } => !taken.contains(column) && calls(to),
             // A partition's, its own or its parent's taken back (#1588). A
             // row written through its parent takes the parent's default, not
             // the partition's (DEC-1578.1), so none is taken ahead of it.
-            Change::SetPartitionDefault { to, fallback, .. } => {
-                (to.as_ref().or(fallback.as_ref()).cloned(), Vec::new())
-            }
+            Change::SetPartitionDefault { to, fallback, .. } => to
+                .as_ref()
+                .or(fallback.as_ref())
+                .is_some_and(|text| calls(text)),
             // A generation expression binds the functions it calls exactly
             // as a default does (DEC-1168.1). No row writes a generated
-            // column, so none is taken ahead of it. One that releases a
-            // generated column from a module the plan drops stays ahead of
-            // that drop, which `weave` put after it.
-            Change::AlterColumnExpression { column, to, .. } if recomputed.contains(column) => {
-                (Some(to.clone()), Vec::new())
-            }
+            // column, so none is taken ahead of it.
+            // One that releases a generated column from a module the plan
+            // drops stays ahead of that drop, which `weave` put after it.
+            Change::AlterColumnExpression { column, .. } => recomputed.contains(column),
             // What validates a recomputed column's values stays behind its new
-            // expression: a `NOT NULL`, and a key over it on either side of a
-            // foreign key. Ahead of it, it would judge the values the old
-            // expression stored.
+            // expression, which the order kept among the moved preserves: a
+            // `NOT NULL`, and a key over it on either side of a foreign key.
+            // Left here, it would judge the values the old expression stored.
             Change::AlterColumnNullability {
                 column,
                 to_nullable: false,
                 ..
-            } => (None, vec![column.clone()]),
-            // Each plain key, also beside an expression key: `column_keys`
-            // is all or nothing, and an index over `(c, f(id))` validates
-            // `c` as much as one over `(c)` does (#2125 review).
-            Change::AddIndex { table, index, .. } => (
-                index.holds_expression().then(|| index_text(index)),
-                index
-                    .columns
-                    .iter()
-                    .filter_map(|c| c.key.column())
-                    .map(|k| table.column(k))
-                    .collect(),
-            ),
+            } => recomputed.contains(column),
+            Change::AddIndex { table, index, .. } => {
+                (index.holds_expression() && calls(&index_text(index)))
+                    || index.column_keys().is_some_and(|keys| {
+                        keys.iter().any(|k| recomputed.contains(&table.column(k)))
+                    })
+            }
             Change::AddUnique {
                 table, constraint, ..
-            } => (
-                None,
-                constraint.columns.iter().map(|c| table.column(c)).collect(),
-            ),
+            } => constraint
+                .columns
+                .iter()
+                .any(|c| recomputed.contains(&table.column(c))),
             Change::SetPrimaryKey {
                 table,
                 to: Some(pk),
                 ..
-            } => (None, pk.columns.iter().map(|c| table.column(c)).collect()),
+            } => pk
+                .columns
+                .iter()
+                .any(|c| recomputed.contains(&table.column(c))),
             Change::AddForeignKey {
                 table, constraint, ..
-            } => (
-                None,
+            } => {
                 constraint
                     .columns
                     .iter()
-                    .map(|c| table.column(c))
-                    .chain(
-                        constraint
-                            .references_columns
-                            .iter()
-                            .map(|c| constraint.references_table.column(c)),
-                    )
-                    .collect(),
-            ),
-            _ => (None, Vec::new()),
-        };
-        // A check's and an expression index's text is evaluated over the
-        // table's rows, so a recomputed column it may read is validated by it
-        // as much as by a key over it (#2125 review).
-        let evaluated = match &p.change {
-            Change::AddCheck { table, .. } | Change::AddIndex { table, .. } => Some(table),
-            _ => None,
-        };
-        if let Some(text) = &text {
-            for (k, (name, _)) in functions.iter().enumerate() {
-                if pbps_pg::generated::may_call(text, name) {
-                    for callee in reach(k) {
-                        schedule.edge(
-                            functions[callee].1,
-                            i,
-                            Source::Lexical,
-                            OrderReason::Structural,
-                        );
-                        waiting[i] = true;
-                    }
-                }
+                    .any(|c| recomputed.contains(&table.column(c)))
+                    || constraint
+                        .references_columns
+                        .iter()
+                        .any(|c| recomputed.contains(&constraint.references_table.column(c)))
             }
-        }
-        for (column, at) in &expressions {
-            let reads = evaluated.zip(text.as_deref()).is_some_and(|(table, text)| {
-                partitions.column(&table.column(&column.name)) == *column
-                    && pbps_pg::generated::may_read(text, &column.name)
-            });
-            let keyed = columns.iter().any(|c| partitions.column(c) == *column);
-            if *at != i && (keyed || reads) {
-                schedule.edge(*at, i, Source::Effect, OrderReason::Structural);
-                waiting[i] = true;
-            }
-        }
+            _ => false,
+        })
+        .collect();
+    // Each addition that moves waits for the last function create, a
+    // `Lexical` edge (#1967, DEC-1967.1): its text names a function the plan
+    // creates or rebuilds, or it validates a column such text recomputes.
+    // `settle` puts them right after that create, in the order they had,
+    // ahead of what followed it. The barrier is the last create, not the
+    // functions each names: a function may call another the plan creates
+    // after it, a moved addition may rest on another, and a validator follows
+    // the recomputation it judges only through the order they keep.
+    let mut schedule = Schedule::new(cs.changes.len());
+    for (i, _) in moves.iter().enumerate().filter(|(_, m)| **m) {
+        schedule.edge(last, i, Source::Lexical, OrderReason::Structural);
     }
-    // What a delayed addition brings stays ahead of what rests on it: a
-    // literal naming its relation, a foreign key on its unique index, a
-    // replica identity on it ([`rests_on`]). The old pass kept the moved
-    // additions in the order they had; edges from their functions alone may
-    // sink one past another that needs it (#2125 review). Only from an
-    // addition that waits for something, since one that does not keeps its
-    // place ahead of what follows it, and never into a module, so every such
-    // edge runs forward and the graph stays acyclic. What rests on one waits
-    // in turn, so the walk runs in plan order.
-    for earlier in 0..last {
-        if !waiting[earlier] {
-            continue;
-        }
-        for (later, p) in cs.changes.iter().enumerate().take(last).skip(earlier + 1) {
-            let change = &p.change;
-            let module = matches!(
-                change,
-                Change::CreateModule { .. }
-                    | Change::AlterModule { .. }
-                    | Change::DropModule { .. }
-            );
-            if !module && rests_on(change, &cs.changes[earlier].change, dialect) {
-                schedule.edge(earlier, later, Source::Effect, OrderReason::Structural);
-                waiting[later] = true;
-            }
-        }
-    }
+    let count = moves.iter().filter(|m| **m).count();
     let settled = schedule
         .settle(std::mem::take(cs))
         .map_err(|refusal| refusal.to_string())?;
-    let count = pbps_diff::order::schedule::moved(&settled.sequence);
     *cs = settled.changes;
     Ok(count + after_their_functions(cs, deps, &Partitions::of(declared))?)
 }
@@ -3892,7 +3761,6 @@ mod tests {
             released,
             &ModuleDeps::new(),
             &pbps_model::Schema::default(),
-            pg().as_ref(),
         )
         .unwrap()
     }
@@ -5033,7 +4901,6 @@ mod tests {
             &BTreeSet::new(),
             &ModuleDeps::new(),
             &pbps_model::Schema::default(),
-            pg().as_ref(),
         )
         .unwrap_err();
         assert!(
@@ -5239,14 +5106,7 @@ mod tests {
                 },
             );
         }
-        after_the_rebuilds(
-            &mut cs,
-            &BTreeSet::new(),
-            &ModuleDeps::new(),
-            &declared,
-            pg().as_ref(),
-        )
-        .unwrap();
+        after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), &declared).unwrap();
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
@@ -5598,8 +5458,7 @@ mod tests {
                 &mut cs,
                 &BTreeSet::new(),
                 &deps,
-                &pbps_model::Schema::default(),
-                pg().as_ref()
+                &pbps_model::Schema::default()
             ),
             Ok(1)
         );
@@ -5658,7 +5517,6 @@ mod tests {
                 &BTreeSet::new(),
                 &ModuleDeps::new(),
                 &pbps_model::Schema::default(),
-                pg().as_ref(),
             )
             .unwrap_err();
             assert!(why.contains("`app.t.g`"), "{why}");
@@ -5701,27 +5559,15 @@ mod tests {
             ])
         };
         let mut cs = changes("app.t_1");
-        let why = after_the_rebuilds(
-            &mut cs,
-            &BTreeSet::new(),
-            &ModuleDeps::new(),
-            &declared,
-            pg().as_ref(),
-        )
-        .unwrap_err();
+        let why = after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), &declared)
+            .unwrap_err();
         assert!(why.contains("`app.t.g`"), "{why}");
         assert!(why.contains("`app.v`"), "{why}");
         // Negative: a view over a table that is no partition of it is free to
         // go ahead, and the column follows the function.
         let mut other = changes("app.u_1");
         assert_eq!(
-            after_the_rebuilds(
-                &mut other,
-                &BTreeSet::new(),
-                &ModuleDeps::new(),
-                &declared,
-                pg().as_ref()
-            ),
+            after_the_rebuilds(&mut other, &BTreeSet::new(), &ModuleDeps::new(), &declared),
             Ok(1)
         );
         // Negative: without the declared partition the same plan orders, as
@@ -5732,8 +5578,7 @@ mod tests {
                 &mut unknown,
                 &BTreeSet::new(),
                 &ModuleDeps::new(),
-                &Schema::default(),
-                pg().as_ref()
+                &Schema::default()
             ),
             Ok(1)
         );
@@ -5772,7 +5617,6 @@ mod tests {
                 &BTreeSet::new(),
                 &ModuleDeps::new(),
                 &pbps_model::Schema::default(),
-                pg().as_ref(),
             )
         };
         let why = ordered(insert(&["g"], &[])).unwrap_err();
@@ -6147,13 +5991,13 @@ mod tests {
         }
     }
 
-    /// #1967: an addition waits for each function its text may call, by a
-    /// `Lexical` edge, and runs right after the last of them, no longer after
-    /// every function the plan creates (DEC-1967.1). Negatives: one naming a
-    /// function created ahead of it keeps its place, and so does one naming
-    /// none. Settled again, nothing moves.
+    /// #1967: an addition whose text names a function the plan creates waits
+    /// for the last function create by a `Lexical` edge, and `settle` puts the
+    /// moved ones right after it in the order they had, ahead of what followed
+    /// it: the old pass's order (DEC-1967.1). Negative: one naming no
+    /// function keeps its place. Settled again, nothing moves.
     #[test]
-    fn an_addition_runs_right_after_the_functions_its_text_names() {
+    fn an_addition_naming_a_created_function_follows_the_last_function_create() {
         let mut cs = plan(vec![
             routine("app.g()", "SELECT 2"),
             check_of("calls_g", "app.g() > 0"),
@@ -6179,207 +6023,24 @@ mod tests {
             &BTreeSet::new(),
             &ModuleDeps::new(),
             &Schema::default(),
-            pg().as_ref(),
         )
         .unwrap();
         assert_eq!(
             order(&cs),
             [
-                "app.g()", "calls_g", "plain", "app.f()", "calls_f", "app.h()"
+                "app.g()", "plain", "app.f()", "app.h()", "calls_g", "calls_f"
             ]
         );
-        assert_eq!(moved, 1);
+        assert_eq!(moved, 2);
         let settled = cs.clone();
         let again = after_the_rebuilds(
             &mut cs,
             &BTreeSet::new(),
             &ModuleDeps::new(),
             &Schema::default(),
-            pg().as_ref(),
         )
         .unwrap();
         assert_eq!((again, &cs), (0, &settled));
-    }
-
-    /// #2125 review: an addition evaluated over rows waits for every function
-    /// its call may reach through the plan's function bodies, a mutually
-    /// recursive pair included; for the recomputation of a generated column
-    /// its text or a plain key beside an expression key may read; and for a
-    /// delayed addition bringing a relation it names. Negatives: a function
-    /// the called one does not name, a check reading another column, and one
-    /// naming another relation, are not waited for.
-    #[test]
-    fn an_evaluated_addition_waits_for_what_its_call_reaches_and_the_columns_it_reads() {
-        let order = |cs: &ChangeSet| -> Vec<String> {
-            cs.changes
-                .iter()
-                .map(|p| {
-                    if let Change::AddCheck { name, .. } | Change::AddIndex { name, .. } = &p.change
-                    {
-                        name.clone()
-                    } else {
-                        p.change.subject()
-                    }
-                })
-                .collect()
-        };
-        let run = |changes: Vec<Change>| {
-            let mut cs = plan(changes);
-            after_the_rebuilds(
-                &mut cs,
-                &BTreeSet::new(),
-                &ModuleDeps::new(),
-                &Schema::default(),
-                pg().as_ref(),
-            )
-            .unwrap();
-            order(&cs)
-        };
-        // `f` calls `gx` and `gx` calls `f`: created in name order, the check
-        // calling only `f` follows both. `f` spells the call in capitals,
-        // which folds to `gx`.
-        assert_eq!(
-            run(vec![
-                routine("app.f()", "SELECT APP.GX()"),
-                check_of("calls_f", "app.f() > 0"),
-                routine("app.gx()", "SELECT app.f()"),
-                routine("app.h()", "SELECT 3"),
-            ]),
-            ["app.f()", "app.gx()", "calls_f", "app.h()"]
-        );
-        // Negative: `f` names no other function, so `g` is not waited for.
-        assert_eq!(
-            run(vec![
-                routine("app.f()", "SELECT 1"),
-                check_of("calls_f", "app.f() > 0"),
-                routine("app.g()", "SELECT app.f()"),
-            ]),
-            ["app.f()", "calls_f", "app.g()"]
-        );
-        // A generated column recomputed by `g`, read by a check that calls
-        // only `f`, created ahead of `g`: the check follows the recomputation.
-        let recompute = Change::AlterColumnExpression {
-            uid: "c_d4e5f6".parse().unwrap(),
-            column: TableName::new("app", "t").column("c"),
-            from: "id".into(),
-            to: "app.g(id)".into(),
-        };
-        assert_eq!(
-            run(vec![
-                recompute.clone(),
-                routine("app.f()", "SELECT 1"),
-                check_of("reads_c", "c >= app.f()"),
-                check_of("reads_d", "d >= app.f()"),
-                routine("app.g()", "SELECT 2"),
-            ]),
-            ["app.f()", "reads_d", "app.g()", "app.t", "reads_c"]
-        );
-        // An index whose plain key is the recomputed column, beside an
-        // expression key calling `f`, follows the recomputation too.
-        let index =
-            |table: &str, name: &str, keys: Vec<pbps_model::IndexColumn>| Change::AddIndex {
-                table: table.parse().unwrap(),
-                name: name.into(),
-                index: Box::new(pbps_model::Index {
-                    columns: keys,
-                    include: Vec::new(),
-                    unique: true,
-                    filter: None,
-                    method: Default::default(),
-                    storage_parameters: Default::default(),
-                }),
-                clustered: false,
-            };
-        let expression = |text: &str| pbps_model::IndexColumn {
-            key: pbps_model::IndexKey::Expression(text.into()),
-            descending: false,
-            opclass: None,
-        };
-        assert_eq!(
-            run(vec![
-                recompute,
-                routine("app.f()", "SELECT 1"),
-                index(
-                    "app.t",
-                    "mixed",
-                    vec![
-                        pbps_model::IndexColumn::column("c"),
-                        expression("app.f(id)")
-                    ]
-                ),
-                routine("app.g()", "SELECT 2"),
-            ]),
-            ["app.f()", "app.g()", "app.t", "mixed"]
-        );
-        // What a delayed addition brings stays ahead of what names it: the
-        // index calling `g` brings `app.ix`, and the check calling only `f`
-        // names it. Negative: a check naming another relation does not wait.
-        let ix = index("app.a", "ix", vec![expression("app.g(k)")]);
-        assert_eq!(
-            run(vec![
-                ix.clone(),
-                check_of("names_ix", "'app.ix'::regclass IS NOT NULL AND app.f() > 0"),
-                check_of(
-                    "names_other",
-                    "'app.other'::regclass IS NOT NULL AND app.f() > 0"
-                ),
-                routine("app.f()", "SELECT 1"),
-                routine("app.g()", "SELECT 2"),
-            ]),
-            ["app.f()", "names_other", "app.g()", "ix", "names_ix"]
-        );
-        // A parent's generated column recomputed by `g`: a partition's check
-        // reading the inherited column follows the recomputation too.
-        // Negative: a check on a table that is no partition of it does not.
-        let mut declared = Schema::default();
-        declared.tables.insert(
-            "app.ev_1".parse().unwrap(),
-            Table {
-                partition_of: Some(pbps_model::PartitionOf {
-                    parent: "app.ev".parse().unwrap(),
-                    bound: pbps_model::PartitionBound::Default,
-                    columns: Default::default(),
-                }),
-                ..Table::default()
-            },
-        );
-        let on = |table: &str, name: &str| Change::AddCheck {
-            table: table.parse().unwrap(),
-            name: name.into(),
-            constraint: CheckConstraint {
-                expression: "c >= app.f()".into(),
-            },
-        };
-        let mut cs = plan(vec![
-            Change::AlterColumnExpression {
-                uid: "c_d4e5f6".parse().unwrap(),
-                column: TableName::new("app", "ev").column("c"),
-                from: "id".into(),
-                to: "app.g(id)".into(),
-            },
-            routine("app.f()", "SELECT 1"),
-            on("app.ev_1", "partition_reads_c"),
-            on("app.u", "other_reads_c"),
-            routine("app.g()", "SELECT 2"),
-        ]);
-        after_the_rebuilds(
-            &mut cs,
-            &BTreeSet::new(),
-            &ModuleDeps::new(),
-            &declared,
-            pg().as_ref(),
-        )
-        .unwrap();
-        assert_eq!(
-            order(&cs),
-            [
-                "app.f()",
-                "other_reads_c",
-                "app.g()",
-                "app.ev",
-                "partition_reads_c"
-            ]
-        );
     }
 
     /// A parent's new index goes ahead of every partition index it could take

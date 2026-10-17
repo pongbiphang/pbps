@@ -6293,68 +6293,38 @@ and `a_partition_change_under_a_standing_parent_is_probed`.
 <a id="dec-1967-1"></a>
 
 **DEC-1967.1. An addition whose text may call a function the plan creates
-waits for each such create by a `Lexical` edge, and runs right after the
-last of them.** (#1967, S6a of #1776)
+waits for the last function create by a `Lexical` edge.** (#1967, S6a of
+#1776)
 
-`after_the_rebuilds` used to move every such addition to just after the last
-function create in the plan, whichever function that was. It now states what
-each addition waits for and lets `settle` place it:
+`after_the_rebuilds` used to cut the additions it moves out of the plan and
+put them back right after the last function create, in the order they had.
+It now draws a `Lexical` edge from that create to each of them, and `settle`
+places them: right after it, in their order, ahead of what followed it. The
+set is unchanged: a check, a default, a partition's default, an index or a
+generation expression whose text names a function the plan creates or
+rebuilds (DEC-1364.1's `may_call`), and what validates a column such a
+generation expression recomputes.
 
-- a `Lexical` edge from each function create its text may call
-  (`may_call`, DEC-1364.1's over-approximation, unchanged), and from each
-  create a call may reach through the bodies of the plan's functions. An
-  addition is evaluated over rows, so it runs what its function calls in
-  turn, and PL/pgSQL creates a mutually recursive pair in either order. A
-  body is read once, and only for a function some addition calls; a name it
-  does not hold case-blind is not lexed for, unless the name holds a quote or
-  the body an escape. A chain of 1000 functions with one check calling its
-  head settles in about 14 ms in a release build;
-- an `Effect` edge from a recomputed column's new expression to what
-  validates its values: a `NOT NULL`, a key or index over it (each plain key,
-  also beside an expression key), and a check or expression index whose text
-  may read it, on its table or on a partition inheriting the column (columns
-  meet through `Partitions::column`);
-- an `Effect` edge from an addition that waits for any of these to each later
-  change resting on what it brings (`rests_on`: a literal naming its
-  relation, a foreign key on its unique index, a replica identity on it),
-  and on from there. The old pass kept the moved additions in their order;
-  these keep what that order protected. They never enter a module, so every
-  one runs forward and no cycle is added.
+**Why the last create, not the functions each names.** An edge from each
+named function would place an addition right after its own functions, and
+that loses what the old order kept without saying so. Four rounds of review
+on #2125 each found another such loss:
+- a function calling another the plan creates after it, as a mutually
+  recursive pair is, or through a function the plan leaves alone;
+- a check or key, on the table or a partition inheriting the column, ahead
+  of the recomputation it validates;
+- a change resting on another moved addition: a check naming a delayed
+  index, a new table whose default names one, with its rows after it;
+- a default the rows take, which must stay ahead of them.
 
-What waits for nothing keeps the differ's place, as before.
+The barrier keeps them all, because the old pass's order is what kept them.
+A narrower placement is a separate change, with these as its cases.
 
-**What changes.** An addition naming only an early function now runs right
-after that function, not after functions it never names. A function created
-later that reads the relation the addition brings (a literal in its body) no
-longer finds it missing, and a default reading it rests on it and follows it.
-`bootstrap` used to refuse both as "names a relation this plan creates
-later"; the engine builds them. What is still refused is a reader the
-reordering cannot carry: a function created ahead of the one the addition
-waits for (`a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused`,
-rewritten around such a function, `app.a_reader()`).
+**Side by side.** Over the full local gate, every plan the pass saw was
+ordered by the old move and by the edges and compared: 1983 plans, 122 of
+them with an addition moved, all byte-identical.
 
-**Side by side.** The old pass ran beside the new one over the full local
-gate:
-- 68 calls moved the same way, and 9 were refused alike, with the same text;
-- 50 calls (13 distinct plans) differ, each only by an addition landing
-  right after the last function its text names instead of after the last
-  function create;
-- 2 calls moved on the old side and not the new: the addition already
-  followed its function. One of them is a re-run of a settled plan, which
-  the old pass moved again.
-No call changed from accepted to refused or back.
-
-Pinned by `an_addition_runs_right_after_the_functions_its_text_names`: the
-placement, the two negatives (a function created ahead, no function named)
-and idempotency. `an_evaluated_addition_waits_for_what_its_call_reaches_and_the_columns_it_reads`
-pins the reach through a recursive pair (spelled in capitals), the check
-and the mixed index reading a recomputed column, a partition's check reading
-its parent's, and the check naming a delayed index, with a negative for each.
-
-Only a change reading a recomputed column, or resting on a delayed
-addition, can land later than the old pass put it: one naming no function
-used to stay ahead of what it reads. Every other edge comes from a function create,
-all of which the old pass put the addition after.
+Pinned by `an_addition_naming_a_created_function_follows_the_last_function_create`.
 
 <a id="dec-1967-2"></a>
 

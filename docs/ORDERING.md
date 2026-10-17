@@ -137,12 +137,11 @@ Then, in this order:
   - `split_moving_defaults` sets a create's own default after the last
     function its text may call, where the create moves rows out of a DEFAULT
     partition (DEC-1547.1).
-  - `after_the_rebuilds` settles the expression-bearing additions over
-    `Lexical` edges from each function create their text may call, so each
-    runs right after the last of those, and keeps what validates a
-    recomputed column after its new expression; it places a new column whose
-    expression names one after that create, with what may read the column
-    after it (DEC-942.1, DEC-1364.1, DEC-1967.1).
+  - `after_the_rebuilds` settles the expression-bearing additions whose
+    text names a function the plan creates over `Lexical` edges from the last
+    function create, so they run right after it in their order, and places a
+    new column whose expression names one after that create, with what may
+    read the column after it (DEC-942.1, DEC-1364.1, DEC-1967.1).
   - `after_their_parents_defaults` then sets each partition's own default
     again after a parent's default the plan sets, which reaches every
     partition (DEC-1581.1).
@@ -385,7 +384,7 @@ and the expression-bearing changes that need a function.
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
 | Row writes → `SetDataMode` / `SetEnsureKeys` of their table | fixed | class 11 and 12 before 17 | ✓ |
 | Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315) | ✓ |
-| Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: a `Lexical` edge from each function create its text names, settled | ✓ DEC-942.1, DEC-1364.1, DEC-1967.1 |
+| Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: a `Lexical` edge from the last function create, when its text names the function, settled | ✓ DEC-942.1, DEC-1364.1, DEC-1967.1 |
 | Function created or rebuilt → `AlterColumnExpression` calling it | content, over-approximated | `after_the_rebuilds`, when its text names the function | ✓ DEC-1168.1, DEC-1364.1 |
 | Function created or rebuilt → `AddColumn` whose default or generation expression calls it | content, over-approximated | `after_their_functions`: after the create its text names, and what may read the column, or a partition holding it, after it; a cycle is refused by name | ✓ DEC-1364.1 |
 | `AddColumn` → a module created that reads it | content, over-approximated | class 8 before 14; reordered after a column that moves, when it names the column or its table | ✓ DEC-1364.1 |
@@ -489,10 +488,10 @@ is conservative, so it can never be wrong in the dangerous direction.
   315).
 - `after_the_rebuilds` reads a check's, an index's, a default's and a
   generation expression's text for the functions the plan creates or rebuilds
-  (DEC-1364.1). Only an addition whose text names one moves, right after the
-  last create it names (DEC-1967.1); the rest keep the differ's place. A new column whose expression
-  names one follows that create, and what may read the column follows the
-  column: a module naming it, or naming its table. Where the
+  (DEC-1364.1). Only an addition whose text names one moves after the last
+  create (DEC-1967.1); the rest keep the differ's place. A new column whose
+  expression names one follows that create, and what may read the column
+  follows the column: a module naming it, or naming its table. Where the
   function itself may read the column, or a row the plan writes needs it,
   no order performs both, and the plan is refused by name with a two-plan
   remedy. Over-approximated in both directions, a refusal can name a cycle the
