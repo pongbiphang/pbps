@@ -415,6 +415,10 @@ struct Prepared {
     /// What fill sends once the managed tables exist, what it filled, and
     /// what it could not (#1778).
     staging: draft::Staging,
+    /// What fill created ahead of the managed objects, roots and members,
+    /// as `pg_describe_object` names them: a difference from the target in
+    /// one of them is named as fill's.
+    filled_objects: BTreeSet<String>,
     /// The role a run-owned layout gives USAGE on a schema the externals file
     /// created; `None` where the scratch account compiles as itself.
     grantee: Option<String>,
@@ -698,6 +702,7 @@ impl Run<'_> {
                     target,
                     &chained,
                     &[&base_managed, &desired_managed],
+                    &descriptions(&chained),
                 )
                 .await
                 .map_err(|error| match error {
@@ -928,13 +933,13 @@ impl Run<'_> {
         if let Some(statements) = self.externals {
             run_externals(&mut setup, statements, self.provenance.outside_writes).await?;
         }
-        let staging = fill.staging(&identities(&externals::created(
-            &before,
-            &inventory(&mut owner).await?,
-        )));
+        let mid = inventory(&mut owner).await?;
+        let staging = fill.staging(&identities(&externals::created(&before, &mid)));
         run_fill(&mut setup, &staging.ahead, self.provenance.outside_writes).await?;
         drop(setup);
-        let created = externals::created(&before, &inventory(&mut owner).await?);
+        let after = inventory(&mut owner).await?;
+        let created = externals::created(&before, &after);
+        let filled_objects = descriptions(&externals::created(&mid, &after));
         // Opened after the reproduction, so the login defaults it stored
         // load into this session as they load on the target's.
         let mut session = Conn::connect_with(
@@ -980,6 +985,7 @@ impl Run<'_> {
             differences,
             created,
             staging,
+            filled_objects,
             grantee,
         })
     }
@@ -1073,13 +1079,13 @@ impl Run<'_> {
         }
         // What fill stages ahead of the managed objects, on the same checked
         // connection (DEC-1778.2).
-        let staging = fill.staging(&identities(&externals::created(
-            &before,
-            &inventory(admin).await?,
-        )));
+        let mid = inventory(admin).await?;
+        let staging = fill.staging(&identities(&externals::created(&before, &mid)));
         run_fill(admin, &staging.ahead, self.provenance.outside_writes).await?;
         pinned(admin, self.backend).await?;
-        let created = externals::created(&before, &inventory(admin).await?);
+        let after = inventory(admin).await?;
+        let created = externals::created(&before, &after);
+        let filled_objects = descriptions(&externals::created(&mid, &after));
         let unusable = authorization
             .unusable_schemas(&request.planned)
             .into_iter()
@@ -1117,6 +1123,7 @@ impl Run<'_> {
             differences: Vec::new(),
             created,
             staging,
+            filled_objects,
             grantee: None,
         })
     }
@@ -1425,13 +1432,18 @@ impl Run<'_> {
             (Some(capture), _) | (None, Some(capture)) => capture,
             (None, None) => &mut *admin,
         };
-        let staged =
-            pbps_pg::resolver::capture::compare_staged(capture, target, &prepared.created, managed)
-                .await
-                .map_err(|error| match error {
-                    StageError::Capture(error) => engine::catalog_read_failed(error),
-                    StageError::Refused(findings) => Error::Externals(findings),
-                })?;
+        let staged = pbps_pg::resolver::capture::compare_staged(
+            capture,
+            target,
+            &prepared.created,
+            managed,
+            &prepared.filled_objects,
+        )
+        .await
+        .map_err(|error| match error {
+            StageError::Capture(error) => engine::catalog_read_failed(error),
+            StageError::Refused(findings) => Error::Externals(findings),
+        })?;
         // Every schema the externals file created, an extension's member too
         // (`pg_cron`'s `cron`): a member is no root, but the deployer's
         // calls into it need USAGE all the same.
@@ -1540,6 +1552,17 @@ fn identities(created: &externals::Created) -> BTreeSet<(String, String)> {
         .iter()
         .chain(&created.members)
         .map(|object| (object.catalog.clone(), object.described.clone()))
+        .collect()
+}
+
+/// The roots and extension members in `created`, as `pg_describe_object`
+/// names them.
+fn descriptions(created: &externals::Created) -> BTreeSet<String> {
+    created
+        .roots
+        .iter()
+        .chain(&created.members)
+        .map(|object| object.described.clone())
         .collect()
 }
 

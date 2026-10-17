@@ -3411,6 +3411,15 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
   reads come after a `RESET ALL`: a chained fill runs on a session the
   compile pinned to the target's zone, and a role's `VALID UNTIL` would
   otherwise render differently in the two.
+- **A filled object that differs from the target is named as fill's.**
+  Fill installs what the target's managed objects depend on now, whether or
+  not the desired declarations still need it: which ones they need only
+  the compile tells, and the comparison precedes it. A target object
+  altered in place (an extension's member made `VOLATILE`, say) differs
+  from a new one, and the comparison refuses. The refusal names fill and
+  its remedy: write the object in the externals file as the target has it,
+  and the file holds it. It is a rare, detectable combination with a named
+  remedy, so the plan is refused rather than fill's scope narrowed.
 - **An extension never waits.** An extension's script runs code of its
   own, an event trigger among it, and creates operators, casts and other
   names. Ahead of everything both are covered: the outside-write check is
@@ -3503,6 +3512,7 @@ copy is not filled over), live; and the `resolver::draft` unit tests
 `a_chained_shape_waits_for_every_managed_relation_it_names`,
 `what_names_a_partly_staged_object_is_not_filled`,
 `an_extension_never_waits_for_the_managed_tables`,
+`resolver_names_fills_altered_extension_member_and_its_remedy`,
 `only_the_chains_waiting_for_an_absent_relation_are_dropped` and
 `an_extension_whose_member_the_externals_file_created_is_the_files`, with
 `reconstruct`'s
