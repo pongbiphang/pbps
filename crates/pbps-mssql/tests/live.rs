@@ -17385,6 +17385,9 @@ mod key_spelling;
 #[path = "live/doctor_select.rs"]
 mod doctor_select;
 
+#[path = "live/capture2141.rs"]
+mod capture2141;
+
 #[path = "live/binding619.rs"]
 mod binding619;
 
