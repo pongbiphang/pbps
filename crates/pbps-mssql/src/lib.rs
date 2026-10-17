@@ -399,7 +399,9 @@ impl Dialect for Mssql {
     }
 
     fn declaration_notes(&self, schema: &Schema) -> Vec<String> {
-        rows::not_checked_offline(schema)
+        let mut notes = rows::not_checked_offline(schema);
+        notes.extend(validate::checks_over_computed_columns(schema));
+        notes
     }
 
     fn validate_module(&self, id: &ModuleId, module: &Module) -> Vec<DialectError> {

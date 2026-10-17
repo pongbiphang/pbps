@@ -472,6 +472,39 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
 ///
 /// Stopping at the first would turn fixing a table into as many round trips as
 /// it has mistakes.
+/// The checks that may read a computed column that is not persisted, as
+/// notes rather than errors (#1450).
+///
+/// Measured on 17.0: SQL Server refuses a CHECK over a non-persisted computed
+/// column with 1764, "Computed Column 'c' in table 't' is invalid for use in
+/// 'CHECK CONSTRAINT' because it is not persisted", the CHECK half of the rule
+/// 8183 states for NOT NULL. Whether a check *reads* the column is a question
+/// of what the name binds to, which only the engine answers: with computed
+/// columns named `len` and `int`, `LEN(a) > 0` and `CAST(a AS int) > 0` are
+/// accepted, and `len > 0` and `[int] > 0` are refused (measured on 17.0,
+/// comment on #2156). `may_name` reads code and not literals, but it cannot
+/// tell a column from a function or a type of the same name, so refusing on it
+/// would refuse those valid checks. Offline, it says what it could not settle,
+/// and `plan --dev` and the apply leave the answer to the engine.
+pub(crate) fn checks_over_computed_columns(schema: &pbps_model::Schema) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (name, table) in &schema.tables {
+        for (check, c) in &table.checks {
+            for (column, computed) in &table.computed {
+                if !computed.persisted && crate::Mssql.may_name(&c.expression, column) {
+                    notes.push(format!(
+                        "{name}: check constraint `{check}` may read the computed column \
+                         `{column}`, which is not `persisted`; SQL Server refuses a CHECK over \
+                         one (1764). If it does read it, declare `{column}` with \
+                         `persisted: true`; `plan --dev` asks the engine before anything runs"
+                    ));
+                }
+            }
+        }
+    }
+    notes
+}
+
 pub fn table(name: &TableName, table: &Table) -> Vec<DialectError> {
     table_sources(name, table, Default::default())
 }
@@ -901,21 +934,6 @@ pub(crate) fn table_sources(
                 "check constraint `{n}` has an empty expression"
             )));
         }
-        // Measured on 17.0: 1764, "Computed Column 'c' in table 't' is invalid
-        // for use in 'CHECK CONSTRAINT' because it is not persisted" — the
-        // CHECK half of the rule 8183 states for NOT NULL above (#1438's
-        // measurement, #1450). `may_name` over-approximates: a false yes asks
-        // for `persisted: true` on a column the check does not read, which
-        // costs storage and refuses nothing valid.
-        for (column, computed) in &table.computed {
-            if !computed.persisted && crate::Mssql.may_name(&c.expression, column) {
-                errs.push(invalid(format!(
-                    "check constraint `{n}` reads the computed column `{column}`, which is not \
-                     `persisted`, and SQL Server holds a CHECK over a persisted computed column \
-                     only; declare `{column}` with `persisted: true`"
-                )));
-            }
-        }
     }
 
     for (n, idx) in &table.indexes {
@@ -1235,50 +1253,89 @@ mod tests {
     }
 
     /// #1450: SQL Server refuses a CHECK over a non-persisted computed column
-    /// (1764), and validation used to let it through to fail at apply.
+    /// (1764). Whether a check reads one is the engine's to say, so validation
+    /// refuses none of them and notes each one that may.
     #[test]
-    fn a_check_over_a_computed_column_needs_it_persisted() {
+    fn a_check_that_may_read_an_unpersisted_computed_column_is_noted_not_refused() {
         let computed = |persisted: bool| pbps_model::ComputedColumn {
-            expression: "a * 2".into(),
+            expression: "LEN(a) * 2".into(),
             persisted,
             not_null: false,
         };
-        let check = |expression: &str| pbps_model::CheckConstraint {
-            expression: expression.into(),
+        let mut table = Table::default();
+        table.columns.insert(
+            "a".into(),
+            Column::new("varchar(10)".parse().unwrap()).not_null(),
+        );
+        // Named like a built-in function and a type, as measured on 17.0.
+        table.computed.insert("len".into(), computed(false));
+        table.computed.insert("int".into(), computed(false));
+        table.computed.insert("p".into(), computed(true));
+        let with = |expression: &str| {
+            let mut t = table.clone();
+            t.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: expression.into(),
+                },
+            );
+            let mut schema = pbps_model::Schema::default();
+            schema.tables.insert("dbo.t".parse().unwrap(), t);
+            schema
         };
-        let found = |t: &Table| {
-            super::table(&"dbo.t".parse().unwrap(), t)
-                .into_iter()
+        let errors = |schema: &pbps_model::Schema| {
+            schema
+                .tables
+                .iter()
+                .flat_map(|(name, t)| super::table(name, t))
                 .map(|e| e.to_string())
                 .collect::<Vec<_>>()
         };
-        let mut table = Table::default();
-        table
-            .columns
-            .insert("a".into(), Column::new("int".parse().unwrap()).not_null());
-        table.computed.insert("c".into(), computed(false));
-        table.computed.insert("p".into(), computed(true));
 
-        // Over the persisted one, over a plain column, and naming the
-        // non-persisted one only inside a literal: all accepted.
-        for accepted in ["p > 0", "[p] > 0", "a > 0", "a <> LEN('c')"] {
-            let mut t = table.clone();
-            t.checks.insert("ck".into(), check(accepted));
-            assert!(found(&t).is_empty(), "{accepted}: {:?}", found(&t));
-        }
-        // Over the non-persisted one, however it is spelled.
-        for refused in ["c > 0", "[c] > 0", "C > 0", "a + c > 0"] {
-            let mut t = table.clone();
-            t.checks.insert("ck".into(), check(refused));
-            let messages = found(&t);
+        // No check is refused: the engine accepted the first two and refused
+        // the last two, and validation cannot tell them apart.
+        for expression in [
+            "LEN(a) > 0",
+            "CAST(LEFT(a, 1) AS int) >= 0",
+            "len > 0",
+            "[int] > 0",
+            "p > 0",
+            "a <> 'len'",
+        ] {
+            let schema = with(expression);
             assert!(
-                messages.iter().any(|m| m.contains(
-                    "check constraint `ck` reads the computed column `c`, which is not `persisted`"
-                ) && m.contains("declare `c` with `persisted: true`")),
-                "{refused}: {messages:?}"
+                errors(&schema).is_empty(),
+                "{expression}: {:?}",
+                errors(&schema)
             );
-            // Named once, for the column it reads, not for `p`.
-            assert_eq!(messages.len(), 1, "{refused}: {messages:?}");
+        }
+
+        // A note for each check that may read one, naming it and the remedy.
+        for (expression, column) in [
+            ("len > 0", "len"),
+            ("[int] > 0", "int"),
+            ("LEN(a) > 0", "len"),
+        ] {
+            let notes = checks_over_computed_columns(&with(expression));
+            assert!(
+                notes.iter().any(|n| n.contains(&format!(
+                    "check constraint `ck` may read the computed column `{column}`, which is not `persisted`"
+                )) && n.contains(&format!("declare `{column}` with `persisted: true`"))
+                    && n.contains("plan --dev")),
+                "{expression}: {notes:?}"
+            );
+        }
+        // What `validate` prints: the dialect's own declaration notes.
+        assert!(
+            crate::Mssql
+                .declaration_notes(&with("len > 0"))
+                .iter()
+                .any(|n| n.contains("may read the computed column `len`"))
+        );
+        // None over a persisted one, a plain column, or a literal.
+        for expression in ["p > 0", "a > 0", "a <> 'len'"] {
+            let notes = checks_over_computed_columns(&with(expression));
+            assert!(notes.is_empty(), "{expression}: {notes:?}");
         }
     }
 
