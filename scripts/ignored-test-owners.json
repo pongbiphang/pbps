@@ -489,6 +489,8 @@
         "type_refs::a_null_generated_composite_evaluates_no_attribute_domain_check",
         "type_refs::routine_overloads_and_relations_have_distinct_dependency_identities",
         "type_refs::domain_coercions_keep_null_defaults_on_enum_columns_and_partition_overrides",
+        "type_refs::empty_array_defaults_evaluate_no_element_domain_check",
+        "type_refs::empty_arrays_still_evaluate_outer_domain_checks_and_keep_array_type_ownership",
         "abrupt_committed_apply_without_caller_success_is_not_replayed",
         "abrupt_staged_ddl_refuses_unrecorded_progress",
         "abrupt_staged_row_write_refuses_unproved_replay",

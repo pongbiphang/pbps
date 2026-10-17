@@ -20,6 +20,28 @@ fn plan(d: &Demo, connection: &str) -> PathBuf {
     path
 }
 
+struct UntrustedRole {
+    server: String,
+    name: String,
+}
+
+impl UntrustedRole {
+    fn new(server: &str, slug: &str) -> Self {
+        let name = format!("pbps_refs_{slug}_{}", std::process::id());
+        on_server(server, &format!("CREATE ROLE {name}"));
+        Self {
+            server: server.into(),
+            name,
+        }
+    }
+}
+
+impl Drop for UntrustedRole {
+    fn drop(&mut self) {
+        let _ = try_on_server(&self.server, &format!("DROP ROLE {}", self.name));
+    }
+}
+
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays() {
@@ -816,5 +838,245 @@ fn domain_coercions_keep_null_defaults_on_enum_columns_and_partition_overrides()
                 );
             }
         }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn empty_array_defaults_evaluate_no_element_domain_check() {
+    let forms = [
+        "ARRAY[]::app.checked[]",
+        "ARRAY[ ]::app.checked[]",
+        "CAST(ARRAY[] AS app.checked[])",
+        "'{}'::app.checked[]",
+        "CAST('{}' AS app.checked[])",
+    ];
+    for server in servers() {
+        let role = UntrustedRole::new(&server, "empty_element");
+        let own = OwnDatabase::new(&server, "refs_empty_array");
+        let db = own.connection();
+        on_server(
+            db,
+            &format!(
+                "CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO {};
+            CREATE TABLE app.calls (n integer);
+            CREATE FUNCTION app.seen(text) RETURNS boolean LANGUAGE plpgsql AS $$
+            BEGIN INSERT INTO app.calls VALUES (1); RETURN true; END $$;
+            ALTER FUNCTION app.seen(text) OWNER TO {};
+            CREATE DOMAIN app.checked AS text CHECK (app.seen(VALUE));
+            CREATE TABLE app.measure (id integer); INSERT INTO app.measure VALUES (1), (2)",
+                role.name, role.name
+            ),
+        );
+        // Measure the engine before testing admission: none of these empty
+        // values coerces an element, while both non-empty controls do.
+        for expr in forms {
+            on_server(
+                db,
+                &format!("ALTER TABLE app.measure ADD COLUMN items app.checked[] DEFAULT {expr}"),
+            );
+            assert_eq!(
+                scalar(db, "SELECT count(*)::bigint FROM app.calls"),
+                0,
+                "{expr} on {server}"
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM app.measure WHERE cardinality(items)=0"
+                ),
+                2
+            );
+            on_server(db, "ALTER TABLE app.measure DROP COLUMN items");
+        }
+        for expr in ["ARRAY['x']::app.checked[]", "'{x}'::app.checked[]"] {
+            on_server(db, &format!("SELECT {expr}"));
+            assert!(
+                scalar(db, "SELECT count(*)::bigint FROM app.calls") > 0,
+                "{expr}"
+            );
+            on_server(db, "DELETE FROM app.calls");
+        }
+        let d = Demo::new("refs-empty-array");
+        d.keyed(db);
+        let table = |extra: &str, overrides: &str| {
+            format!(
+                "{}partition_by: [id]\npartitions:\n  low:\n    from: ['0']\n    to: ['100']\n{overrides}",
+                declarations(extra)
+            )
+        };
+        d.table(&table("", ""));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        on_server(db, "INSERT INTO app.t VALUES (1), (2)");
+        let mut columns = String::new();
+        let mut overrides = String::from("    columns:\n");
+        for (index, expr) in forms.into_iter().enumerate() {
+            let expr_yaml = serde_json::to_string(expr).unwrap();
+            columns.push_str(&format!("  items{index}: {{type: 'app.checked[]', default: {expr_yaml}}}\n  override{index}: {{type: 'app.checked[]'}}\n"));
+            overrides.push_str(&format!(
+                "      override{index}: {{default: {expr_yaml}}}\n"
+            ));
+            d.table(&table(&columns, &overrides));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let path = plan(&d, db);
+            succeeds(apply_plan(&d, db, &path, false));
+            on_server(
+                db,
+                &format!("INSERT INTO app.low (id) VALUES ({})", index + 3),
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    &format!(
+                        "SELECT count(*)::bigint FROM app.t WHERE cardinality(items{index})=0"
+                    )
+                ),
+                index as i64 + 3
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    &format!(
+                        "SELECT count(*)::bigint FROM app.low WHERE cardinality(override{index})=0"
+                    )
+                ),
+                1
+            );
+            assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+            succeeds(d.run(&["verify", "--db", db]));
+            let next: pbps_model::SavedPlan =
+                serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
+            assert!(next.changes.is_empty(), "{expr}: {:?}", next.changes);
+        }
+        for expr in ["ARRAY['x']::app.checked[]", "'{x}'::app.checked[]"] {
+            let extra = format!(
+                "{columns}  refused: {{type: 'app.checked[]', default: {}}}\n",
+                serde_json::to_string(expr).unwrap()
+            );
+            d.table(&table(&extra, &overrides));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let out = d.run(&["plan", "--db", db]);
+            assert_ne!(code(&out), 0, "{expr} on {server}");
+            assert!(
+                stderr(&out).contains("app.seen") && stderr(&out).contains(&role.name),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_catalog.pg_attribute WHERE attrelid='app.t'::regclass AND attname='refused' AND NOT attisdropped"
+                ),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn empty_arrays_still_evaluate_outer_domain_checks_and_keep_array_type_ownership() {
+    for server in servers() {
+        let role = UntrustedRole::new(&server, "empty_outer");
+        let own = OwnDatabase::new(&server, "refs_empty_outer");
+        let db = own.connection();
+        on_server(db, &format!("CREATE SCHEMA app; GRANT USAGE ON SCHEMA app TO {};
+            CREATE TABLE app.calls (kind text);
+            CREATE FUNCTION app.element_seen(text) RETURNS boolean LANGUAGE plpgsql AS $$
+            BEGIN INSERT INTO app.calls VALUES ('element'); RETURN true; END $$;
+            CREATE DOMAIN app.checked AS text CHECK (app.element_seen(VALUE));
+            CREATE FUNCTION app.outer_seen(app.checked[]) RETURNS boolean LANGUAGE plpgsql AS $$
+            BEGIN INSERT INTO app.calls VALUES ('outer'); RETURN true; END $$;
+            ALTER FUNCTION app.outer_seen(app.checked[]) OWNER TO {};
+            CREATE DOMAIN app.outer_array AS app.checked[] CHECK (app.outer_seen(VALUE));
+            CREATE TABLE app.measure (id integer); INSERT INTO app.measure VALUES (1), (2);
+            ALTER TABLE app.measure ADD COLUMN items app.outer_array DEFAULT ARRAY[]::app.checked[]", role.name, role.name));
+        assert!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.calls WHERE kind='outer'"
+            ) > 0
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.calls WHERE kind='element'"
+            ),
+            0
+        );
+        on_server(db, "DELETE FROM app.calls");
+        let d = Demo::new("refs-empty-outer");
+        d.keyed(db);
+        d.table(&declarations(""));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        on_server(db, "INSERT INTO app.t VALUES (1), (2)");
+        d.table(&declarations(
+            "  items: {type: app.outer_array, default: 'ARRAY[]::app.checked[]'}\n",
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("app.outer_seen") && stderr(&out).contains(&role.name),
+            "{}",
+            stderr(&out)
+        );
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+        on_server(
+            db,
+            &format!("ALTER DOMAIN app.checked OWNER TO {}", role.name),
+        );
+        // PostgreSQL changes the array's owner along with the element type's.
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_catalog.pg_type e JOIN pg_catalog.pg_type a ON a.oid=e.typarray WHERE e.oid='app.checked'::regtype AND a.typowner=e.typowner"
+            ),
+            1
+        );
+        d.table(&declarations(
+            "  items: {type: 'app.checked[]', default: 'ARRAY[]::app.checked[]'}\n",
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains(&role.name) && stderr(&out).contains("owned by"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(
+            !stderr(&out)
+                .split("error:")
+                .last()
+                .unwrap()
+                .contains("app.element_seen"),
+            "{}",
+            stderr(&out)
+        );
+        let config = d.dir.join("pbps.yml");
+        let mut trusted = std::fs::read_to_string(&config).unwrap();
+        trusted.push_str(&format!("trusted_roles: [{}]\n", role.name));
+        std::fs::write(config, trusted).unwrap();
+        let path = plan(&d, db);
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.t WHERE cardinality(items)=0"
+            ),
+            2
+        );
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+        succeeds(d.run(&["verify", "--db", db]));
     }
 }
