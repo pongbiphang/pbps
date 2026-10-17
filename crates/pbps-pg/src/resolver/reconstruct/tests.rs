@@ -770,3 +770,97 @@ fn a_compile_failure_is_a_verdict_only_when_the_server_judged_the_statement() {
         "refused".into()
     )));
 }
+
+/// A fill's chained shapes go just after the step that creates the last
+/// managed relation they name, which for a table generating from a declared
+/// function is among the modules, after that function (#1778).
+#[test]
+fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
+    use pbps_model::{Column, Generated, Module, Schema};
+    let mut generated = Column::new("integer".parse().unwrap());
+    generated.value_source = pbps_model::ValueSource::Generated(Generated {
+        expression: "app.f(id)".into(),
+        stored: true,
+    });
+    let mut n = Table::default();
+    n.columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    n.columns.insert("g".into(), generated);
+    let mut plain = Table::default();
+    plain
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let mut schema = Schema::default();
+    schema.tables.insert(TableName::new("app", "n"), n);
+    schema.tables.insert(TableName::new("app", "plain"), plain);
+    schema.modules.insert(
+        "app.f(integer)".parse().unwrap(),
+        Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+        },
+    );
+    let ids = pbps_diff::resolve(
+        &schema,
+        &pbps_model::IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "1778-test".into(),
+            today: "2026-10-17".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    let empty = Schema::default();
+    let bootstrap: Vec<_> = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &empty,
+            ids: &pbps_model::IdsFile::default(),
+        },
+        pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        },
+        &crate::Postgres::new(),
+        &pbps_model::Hints::default(),
+    )
+    .unwrap()
+    .changes
+    .into_iter()
+    .map(|planned| planned.change)
+    .collect();
+    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let at = |declaration: &str| {
+        reconstruction
+            .steps
+            .iter()
+            .position(|step| step.declaration == declaration)
+            .unwrap()
+    };
+    let named = |relations: &[(&str, &str)]| {
+        relations
+            .iter()
+            .map(|(schema, name)| ((*schema).to_owned(), (*name).to_owned()))
+            .collect::<BTreeSet<_>>()
+    };
+    assert!(at("function app.f(integer)") < at("table app.n"));
+    assert_eq!(
+        reconstruction.after_creating(&named(&[("app", "n")])),
+        Some(at("table app.n") + 1)
+    );
+    assert_eq!(
+        reconstruction.after_creating(&named(&[("app", "plain"), ("app", "n")])),
+        Some(at("table app.n") + 1),
+        "the last of them"
+    );
+    assert_eq!(
+        reconstruction.after_creating(&named(&[("app", "plain")])),
+        Some(at("table app.plain") + 1)
+    );
+    assert_eq!(
+        reconstruction.after_creating(&named(&[("app", "absent")])),
+        None,
+        "a relation no step creates"
+    );
+}

@@ -2194,15 +2194,24 @@ DEC-1778.2).**
   the session that ran the externals file, in a transaction of its own,
   after it and before any managed object. What it creates joins what the
   file created: it is compared with the target, sealed, and rechecked.
+  - It is held to the file's outside-write rule: something the file
+    created, such as an event trigger, runs on fill's statements too, and a
+    write outside the scratch database is rolled back and refused.
+  - An object one of whose parts the file created (an owned sequence, for
+    instance) is the file's, and is not filled.
 - **It lifts a chain through what it writes.** A shape that names a managed
-  table's row type cannot exist before that table does, so the compile then
-  runs in two parts:
-  - the deployer's session creates and commits the managed tables;
+  relation's row type cannot exist before that relation does, so the compile
+  then runs in two parts:
+  - the deployer's session compiles up to the step that creates the last
+    managed relation those shapes name, and commits;
   - the setup session creates the chained shapes, in `pg_depend` order;
-  - the deployer's session compiles everything else.
+  - the deployer's session compiles the rest.
 
-  The chained shapes are compared with the target after the compile, before
-  any binding question is answered.
+  That step can come among the modules: a table whose generated column calls
+  a declared function is created after the function. A declaration scratch
+  compiles before it cannot read a chained shape, and that failure refuses,
+  naming what waits for what. The chained shapes are compared with the target
+  after the compile, before any binding question is answered.
 - **What it does not stage**, it names when the compile fails for want of it:
   - a routine (pbps sends no routine source);
   - what the draft lists for writing by hand;

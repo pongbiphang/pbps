@@ -2340,6 +2340,142 @@ async fn resolver_lifts_a_chain_through_an_object_fill_stages() {
     }
 }
 
+/// `chain_target`, with the managed table's generated column calling the
+/// declared function `f`: scratch creates that table after the function,
+/// among the modules, and fill waits for that step. With `calling`, the
+/// managed views call `f` too, so they compile after it.
+async fn after_its_function(calling: bool) -> Result<ResolvedPlan, ProduceError> {
+    let function = "f";
+    let filter = if calling {
+        format!(" WHERE {MANAGED}.f(id) > 0")
+    } else {
+        String::new()
+    };
+    let body = "(x integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN x";
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE FUNCTION {MANAGED}.{function}{body}"),
+        format!(
+            "CREATE TABLE {MANAGED}.m (id integer, \
+             g integer GENERATED ALWAYS AS ({MANAGED}.{function}(id)) STORED)"
+        ),
+        format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
+        format!("CREATE VIEW {MANAGED}.a AS SELECT id FROM {EXTERNAL}.e{filter}"),
+    ];
+    let with_function = |mut schema: pbps_model::Schema| {
+        schema.modules.insert(
+            format!("{MANAGED}.{function}(integer)").parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::Function,
+                description: None,
+                definition: body.into(),
+            },
+        );
+        let mut generated = pbps_model::Column::new("integer".parse().unwrap());
+        generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+            expression: format!("{MANAGED}.{function}(id)"),
+            stored: true,
+        });
+        schema
+            .tables
+            .get_mut(&format!("{MANAGED}.m").parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("g".into(), generated);
+        schema
+    };
+    let a = format!("{}{filter}", reading("id", "e"));
+    let b = format!("{}{filter}", reading("m", "e"));
+    let inputs = Inputs::from_pair((
+        with_function(declared(&[("a", &a)], &["m"])),
+        with_function(declared(&[("a", &a), ("b", &b)], &["m"])),
+    ));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_filled(&scratch.server, &target.on(&target_db), &inputs, &key, None).await;
+    target.drop().await;
+    result
+}
+
+/// Views that call the function compile after it, and after the table, so
+/// fill's chained shape is in place for them. Negative: views that do not
+/// call it compile first, and the run refuses, naming what waits for what.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_lifts_a_chain_through_a_table_that_compiles_after_its_function() {
+    assert_staged(
+        after_its_function(true).await,
+        "e",
+        "a table after its function",
+    );
+    let refused = externals_refusal(after_its_function(false).await);
+    assert!(
+        refused.contains(&format!(
+            "fill creates table {EXTERNAL}.e only once scratch has created {MANAGED}.m, and a \
+             declaration scratch compiles before that cannot read it"
+        )),
+        "{refused}"
+    );
+}
+
+/// An event trigger the externals file installed fires on fill's statements
+/// too. What it writes outside the scratch database is rolled back and
+/// refused, as the file's own writes are (#1783).
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_refuses_an_outside_write_fill_sets_off_and_leaves_none() {
+    let role = "pbps_fill_escape_1778";
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &guarded_target()).await;
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let externals = format!(
+        "CREATE SCHEMA {EXTERNAL};\n\
+         CREATE FUNCTION {EXTERNAL}.escape() RETURNS event_trigger LANGUAGE plpgsql \
+         AS $$BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{role}') \
+         THEN EXECUTE 'CREATE ROLE {role}'; END IF; END$$;\n\
+         CREATE EVENT TRIGGER pbps_fill_escape ON ddl_command_end \
+         EXECUTE FUNCTION {EXTERNAL}.escape();"
+    );
+    let refused = externals_refusal(
+        produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &externals,
+        )
+        .await,
+    );
+    let mut cluster = Conn::connect(Driver::Postgres, &scratch.server)
+        .await
+        .unwrap();
+    let left = cluster
+        .query(&format!(
+            "SELECT count(*)::text AS n FROM pg_catalog.pg_roles WHERE rolname = '{role}'"
+        ))
+        .await
+        .unwrap()[0]
+        .try_get::<&str>("n")
+        .unwrap()
+        .map(str::to_owned);
+    let _ = cluster
+        .execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await;
+    target.drop().await;
+    assert!(
+        refused.contains(&format!(
+            "filling what the externals file lacks changed role {role}"
+        )),
+        "{refused}"
+    );
+    assert_eq!(left.as_deref(), Some("0"), "the role was rolled back");
+}
+
 /// The negative: the externals file holds `ext.e` itself, so it is the
 /// file's, and the file runs before any managed object exists.
 #[tokio::test]

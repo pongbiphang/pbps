@@ -3404,12 +3404,27 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
   still refuses: fill never replaces it.
 - **What it creates is compared, sealed and rechecked** like what the file
   created. The evidence gains no field.
+- **The file's outside-write rule holds for fill.** Something the file
+  created, such as an event trigger, runs on fill's statements too. So fill
+  runs in a `REPEATABLE READ` transaction with the same shared-state reads,
+  and a write outside the scratch database is rolled back and refused.
+- **An object one of whose parts the file created is the file's.** A file
+  that stages an owned sequence alone keeps it, and fill does not create
+  the table that carries it again.
 - **A chain is lifted for what fill writes.** A shape that names a managed
-  table's row type is created between two parts of the compile:
-  - the deployer's session commits the tables;
+  relation's row type is created between two parts of the compile:
+  - the deployer's session compiles up to the step that creates the last
+    relation those shapes name, and commits;
   - the setup session creates the shape, as the externals file's owner
     would;
   - the deployer's session compiles the rest.
+
+  That step can be among the modules: a table whose generated column calls
+  a declared function follows the function there. Which declarations read a
+  chained shape only the compile tells, since a new one has no recorded
+  dependency. So a declaration scratch compiles before the split, and that
+  fails, refuses with a finding naming what waits for what, and the two
+  remedies.
 
   Those shapes are compared after the compile. A chain through a routine,
   through what the draft lists for writing by hand, or through a foreign
@@ -3419,6 +3434,9 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
 
 **Pinned by** `resolver_lifts_a_chain_through_an_object_fill_stages`
 (run-owned, and supplied on 16 and 18),
+`resolver_lifts_a_chain_through_a_table_that_compiles_after_its_function`
+(and its named refusal),
+`resolver_refuses_an_outside_write_fill_sets_off_and_leaves_none`,
 `resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it`,
 `resolver_fills_the_external_objects_no_externals_file_stages`,
 `resolver_refuses_a_routine_fill_cannot_stage_naming_it` and
@@ -3426,4 +3444,7 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
 copy is not filled over), live; and the `resolver::draft` unit tests
 `fill_stages_what_the_externals_file_lacks_and_leaves_what_it_holds`,
 `a_shape_naming_a_managed_row_type_is_filled_once_the_managed_tables_exist`
-and `what_fill_cannot_stage_is_named_with_what_names_it`.
+`what_fill_cannot_stage_is_named_with_what_names_it` and
+`an_object_whose_part_the_externals_file_created_is_the_files`, with
+`reconstruct`'s
+`chained_shapes_wait_for_the_step_that_creates_what_they_name`.

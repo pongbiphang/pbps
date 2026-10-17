@@ -83,27 +83,6 @@ enum Phase {
     Expressions,
 }
 
-/// Which steps one compile runs: all of them, or the tables and then the
-/// rest. A fill's chained shapes name a managed table's row type, so they
-/// are created between the two, outside the deployer's transaction
-/// (#1778, DEC-1778.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Part {
-    Whole,
-    Tables,
-    AfterTables,
-}
-
-impl Part {
-    fn holds(self, phase: Phase) -> bool {
-        match self {
-            Self::Whole => true,
-            Self::Tables => phase == Phase::Tables,
-            Self::AfterTables => phase != Phase::Tables,
-        }
-    }
-}
-
 /// What kind of object a step makes nameable, and so which bindings it
 /// could have taken over had it existed earlier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -534,17 +513,47 @@ impl Reconstruction {
         zone: &pbps_model::SessionZone,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
     ) -> Result<(), ReconstructError> {
-        self.compile_part(dialect, zone, conn, Part::Whole).await
+        self.compile_steps_in(dialect, zone, conn, 0..self.steps.len())
+            .await
     }
 
-    /// [`Self::compile`] for `part` of the steps only, in a transaction of
-    /// its own.
-    pub async fn compile_part(
+    /// The position just after the last step that creates one of
+    /// `relations`, by schema and name: where a fill's chained shapes, which
+    /// name those relations' row types, can be created (#1778,
+    /// DEC-1778.2). A table whose generated column calls a declared
+    /// function comes after that function, so the position is the step's,
+    /// not a phase's. `None` when one of them is created by no step.
+    pub fn after_creating(&self, relations: &BTreeSet<(String, String)>) -> Option<usize> {
+        relations
+            .iter()
+            .map(|(schema, name)| {
+                self.steps.iter().position(|step| {
+                    step.names
+                        .iter()
+                        .any(|(kind, s, n)| *kind == Nameable::Relation && s == schema && n == name)
+                })
+            })
+            .try_fold(0, |last, position| Some(last.max(position? + 1)))
+    }
+
+    /// The number of steps, for [`Self::compile_steps_in`].
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// [`Self::compile`] for the steps in `range` only, in a transaction of
+    /// its own: a fill's chained shapes are created between two of them,
+    /// outside the deployer's transaction (#1778, DEC-1778.2).
+    pub async fn compile_steps_in(
         &mut self,
         dialect: &crate::Postgres,
         zone: &pbps_model::SessionZone,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
-        part: Part,
+        range: std::ops::Range<usize>,
     ) -> Result<(), ReconstructError> {
         let framing = dialect.transaction_framing(zone);
         conn.execute(&framing.begin).await.map_err(|e| {
@@ -564,7 +573,7 @@ impl Reconstruction {
                 ReconstructError::Transaction("begin")
             }
         })?;
-        let outcome = self.compile_steps(conn, part).await;
+        let outcome = self.compile_steps(conn, range).await;
         if outcome.is_err() {
             let _ = conn.execute(&framing.rollback).await;
             return outcome;
@@ -577,9 +586,9 @@ impl Reconstruction {
     async fn compile_steps(
         &mut self,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
-        part: Part,
+        range: std::ops::Range<usize>,
     ) -> Result<(), ReconstructError> {
-        for step in self.steps.iter_mut().filter(|step| part.holds(step.phase)) {
+        for step in &mut self.steps[range] {
             let failed = |reason: String| ReconstructError::Compile {
                 declaration: step.declaration.clone(),
                 reason,

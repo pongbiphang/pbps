@@ -1657,6 +1657,8 @@
         "resolver::server::scratch::live_tests::resolver_runs_the_externals_file_before_any_managed_object",
         "resolver::server::scratch::live_tests::resolver_refuses_an_externals_file_object_left_uncompared",
         "resolver::server::scratch::live_tests::resolver_lifts_a_chain_through_an_object_fill_stages",
+        "resolver::server::scratch::live_tests::resolver_lifts_a_chain_through_a_table_that_compiles_after_its_function",
+        "resolver::server::scratch::live_tests::resolver_refuses_an_outside_write_fill_sets_off_and_leaves_none",
         "resolver::server::scratch::live_tests::resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it",
         "resolver::server::scratch::live_tests::resolver_fills_the_external_objects_no_externals_file_stages",
         "resolver::server::scratch::live_tests::resolver_refuses_a_routine_fill_cannot_stage_naming_it",

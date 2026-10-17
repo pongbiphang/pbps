@@ -31,7 +31,6 @@ use pbps_db::{Conn, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{OutsideWrites, ResolverRuntime, ScratchLayout, ScratchSource};
 use pbps_pg::resolver::capture::{StageError, Staged};
-use pbps_pg::resolver::reconstruct::Part;
 use pbps_pg::resolver::scratch::{self as sql, Placement};
 use pbps_pg::resolver::standard::{self, Standard};
 use pbps_pg::resolver::{draft, externals};
@@ -538,8 +537,33 @@ impl Run<'_> {
         let mut any = self.routine_oids(target, binding.base).await?;
         any.extend(kept.iter().copied());
         let routines = externals::ManagedRoutines { desired: kept, any };
+        let extras = &request.write_path_extras;
+        let mut reconstruction =
+            engine::reconstruction(driver, extras, binding.bootstrap).map_err(Error::Binding)?;
+        // Where the chained shapes go: just after the last step that creates
+        // a managed relation they name. One scratch never creates is not
+        // filled, and the chain stays a finding (DEC-1778.2).
+        let split = if prepared.staging.chained.is_empty() {
+            None
+        } else {
+            match reconstruction.after_creating(&prepared.staging.chained_after) {
+                Some(split) => Some(split),
+                None => {
+                    let staging = &mut prepared.staging;
+                    for object in std::mem::take(&mut staging.chained_objects) {
+                        staging.filled.remove(&object);
+                        staging.unfillable.push(format!(
+                            "{object} is not filled: its shape names a managed relation the \
+                             scratch compile does not create"
+                        ));
+                    }
+                    staging.chained.clear();
+                    None
+                }
+            }
+        };
         // A chain through a filled object is lifted: fill created it once
-        // the managed tables existed.
+        // the managed relations it names existed.
         let links: Vec<_> = links
             .into_iter()
             .filter(|link| !prepared.staging.filled.contains(&link.middle.described))
@@ -564,21 +588,20 @@ impl Run<'_> {
                 .await
                 .map_err(db("the test's target write"))?;
         }
-        let extras = &request.write_path_extras;
-        let mut reconstruction =
-            engine::reconstruction(driver, extras, binding.bootstrap).map_err(Error::Binding)?;
         // The target's zone, read before the scratch is compiled in it.
         let zone = target.session_zone().cloned();
+        let outside_writes = self.provenance.outside_writes;
         let unfillable = prepared.staging.unfillable.clone();
-        let failed = |error: Error, staged: &Staged| {
+        let failed = |error: Error, staged: &Staged, waiting: Option<&String>| {
             let error = through_shape_view(error, staged);
             if let Error::Binding(reason) = &error
-                && !(chains.is_empty() && unfillable.is_empty())
+                && !(chains.is_empty() && unfillable.is_empty() && waiting.is_none())
             {
                 return Error::Externals(
                     chains
                         .iter()
                         .chain(&unfillable)
+                        .chain(waiting)
                         .cloned()
                         .chain([reason.clone()])
                         .collect(),
@@ -586,8 +609,31 @@ impl Run<'_> {
             }
             error
         };
-        let whole = prepared.staging.chained.is_empty();
-        let first = if whole { Part::Whole } else { Part::Tables };
+        // A module scratch compiles before the split cannot read a chained
+        // shape, which does not exist yet; which modules read one only the
+        // compile tells, so a failure there is named as this.
+        let waiting = split.map(|_| {
+            format!(
+                "fill creates {} only once scratch has created {}, and a declaration scratch \
+                 compiles before that cannot read it: adopt the filled object into the managed \
+                 set, or select no resolver and keep ADR-0013's conservative rebuild",
+                prepared
+                    .staging
+                    .chained_objects
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                prepared
+                    .staging
+                    .chained_after
+                    .iter()
+                    .map(|(schema, name)| format!("{schema}.{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+        let steps = reconstruction.len();
         let compile = match prepared.compile.as_mut() {
             Some(compile) => compile,
             None => &mut *admin,
@@ -598,20 +644,20 @@ impl Run<'_> {
             driver,
             zone.as_ref(),
             compile,
-            first,
+            0..split.unwrap_or(steps),
         )
         .await
-        .map_err(|error| failed(error, &staged))?;
-        if !whole {
-            // Its shapes name the managed tables just committed, so it runs
-            // now, as the setup role, before anything else compiles
-            // (DEC-1778.2).
+        .map_err(|error| failed(error, &staged, waiting.as_ref()))?;
+        if let Some(split) = split {
+            // Its shapes name the managed relations just committed, so it
+            // runs now, as the setup role, before anything after them
+            // compiles (DEC-1778.2).
             let setup = match prepared.capture.as_mut() {
                 Some(owner) => owner,
                 None => &mut *admin,
             };
             let before = inventory(setup).await?;
-            run_fill(setup, &prepared.staging.chained).await?;
+            run_fill(setup, &prepared.staging.chained, outside_writes).await?;
             let chained = externals::created(&before, &inventory(setup).await?);
             let compile = match prepared.compile.as_mut() {
                 Some(compile) => compile,
@@ -623,10 +669,10 @@ impl Run<'_> {
                 driver,
                 zone.as_ref(),
                 compile,
-                Part::AfterTables,
+                split..steps,
             )
             .await
-            .map_err(|error| failed(error, &staged))?;
+            .map_err(|error| failed(error, &staged, None))?;
             let capture = match (prepared.capture.as_mut(), prepared.compile.as_mut()) {
                 (Some(capture), _) | (None, Some(capture)) => capture,
                 (None, None) => &mut *admin,
@@ -871,7 +917,7 @@ impl Run<'_> {
             &before,
             &inventory(&mut owner).await?,
         )));
-        run_fill(&mut setup, &staging.ahead).await?;
+        run_fill(&mut setup, &staging.ahead, self.provenance.outside_writes).await?;
         drop(setup);
         let created = externals::created(&before, &inventory(&mut owner).await?);
         // Opened after the reproduction, so the login defaults it stored
@@ -1016,7 +1062,7 @@ impl Run<'_> {
             &before,
             &inventory(admin).await?,
         )));
-        run_fill(admin, &staging.ahead).await?;
+        run_fill(admin, &staging.ahead, self.provenance.outside_writes).await?;
         pinned(admin, self.backend).await?;
         let created = externals::created(&before, &inventory(admin).await?);
         let unusable = authorization
@@ -1482,21 +1528,37 @@ fn identities(created: &externals::Created) -> BTreeSet<(String, String)> {
         .collect()
 }
 
-/// Sends fill's statements on `session` in one transaction, under the empty
-/// path every pbps session pins (#1778). pbps renders them, from the
-/// target's catalog, so a refusal is the target's shape not reproducing
-/// here, and is named as fill's.
-async fn run_fill(session: &mut Conn, sql: &str) -> Result<(), Error> {
+/// Sends fill's statements on `session` in one `REPEATABLE READ`
+/// transaction, under the empty path every pbps session pins (#1778). pbps
+/// renders them from the target's catalog, so a refusal is the target's
+/// shape not reproducing here, and is named as fill's. They are held to
+/// the externals file's outside-write rule (#1783): an event trigger the
+/// file installed fires on fill's statements too, and what it changes
+/// outside the scratch database is rolled back and refused like the file's
+/// own.
+async fn run_fill(
+    session: &mut Conn,
+    sql: &str,
+    outside_writes: OutsideWrites,
+) -> Result<(), Error> {
     if sql.is_empty() {
         return Ok(());
     }
+    let checked = outside_writes == OutsideWrites::Refused;
     let read =
         |what: &'static str| move |error: pbps_db::DbError| Error::Read(format!("{what}: {error}"));
     session
-        .execute("BEGIN")
+        .execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
         .await
         .map_err(read("the fill's transaction"))?;
     let outcome = async {
+        let before = if checked {
+            externals::shared_state(session)
+                .await
+                .map_err(read("the cluster's shared state"))?
+        } else {
+            externals::SharedState::new()
+        };
         session
             .execute("SELECT pg_catalog.set_config('search_path', '', true)")
             .await
@@ -1507,7 +1569,40 @@ async fn run_fill(session: &mut Conn, sql: &str) -> Result<(), Error> {
                  refused it: {}; write the object it names in the externals file",
                 failed.error
             )])
-        })
+        })?;
+        if !checked {
+            return Ok(());
+        }
+        session
+            .execute("RESET ALL")
+            .await
+            .map_err(read("the fill session's settings"))?;
+        session
+            .execute("SELECT pg_catalog.set_config('search_path', '', true)")
+            .await
+            .map_err(read("the fill session's path"))?;
+        let after = externals::shared_state(session)
+            .await
+            .map_err(read("the cluster's shared state"))?;
+        let changed = externals::shared_changes(&before, &after);
+        if changed.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Externals(
+                changed
+                    .into_iter()
+                    .map(|name| {
+                        format!(
+                            "filling what the externals file lacks changed {name}, outside the \
+                             scratch database: something the externals file created, such as \
+                             an event trigger, ran on fill's statements; an externals file \
+                             creates only objects in the database, unless the resolver sets \
+                             `outside_writes: allow`"
+                        )
+                    })
+                    .collect(),
+            ))
+        }
     }
     .await;
     if let Err(error) = outcome {

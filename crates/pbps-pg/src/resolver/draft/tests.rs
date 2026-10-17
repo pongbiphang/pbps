@@ -645,3 +645,33 @@ fn what_fill_cannot_stage_is_named_with_what_names_it() {
     assert_eq!(held.filled, BTreeSet::from(["table ext.t".to_owned()]));
     assert_eq!(held.unfillable.len(), 1, "{:?}", held.unfillable);
 }
+
+#[test]
+fn an_object_whose_part_the_externals_file_created_is_the_files() {
+    let (mut target, table, _, _) = reading_a_view();
+    let sequence = target.object("pg_class", 20005, "ext", "sequence ext.t_id_seq");
+    target.depend(&sequence, &table, 'a', true);
+    let reader = target.relation(20030, 'v', "app", "s", &[("n", "bigint")]);
+    target.depend(&reader, &sequence, 'n', false);
+    target.managed(&reader);
+    let fill = target.fill();
+    assert!(
+        fill.staging(&BTreeSet::new())
+            .filled
+            .contains("table ext.t"),
+        "the sequence folds into its table"
+    );
+    let held = fill.staging(&file_created(&[("pg_class", "sequence ext.t_id_seq")]));
+    assert!(
+        !held.filled.contains("table ext.t") && !held.ahead.contains("ext.t "),
+        "{}",
+        held.ahead
+    );
+    assert!(
+        held.unfillable.iter().any(|line| line.contains(
+            "table ext.t is not filled: the externals file created its sequence ext.t_id_seq"
+        )),
+        "{:?}",
+        held.unfillable
+    );
+}

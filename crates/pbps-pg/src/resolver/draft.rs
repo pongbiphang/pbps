@@ -803,11 +803,18 @@ pub struct Fill {
 struct Filled {
     catalog: String,
     described: String,
+    /// Its carried parts (an owned sequence, an index), by catalog and
+    /// description: an externals file that created one of them holds the
+    /// object, and fill does not create it again.
+    parts: Vec<(String, String)>,
     /// The schemas its SQL writes into, quoted.
     schemas: Vec<String>,
     how: How,
     /// What its shape names among the objects before it, by index.
     names: Vec<usize>,
+    /// The managed relations its shape names, by schema and name: a chained
+    /// shape is created once the last of them exists.
+    after: BTreeSet<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -828,8 +835,13 @@ pub struct Staging {
     /// schema it writes into, then every object no managed object must
     /// precede.
     pub ahead: String,
-    /// Run once the managed tables exist (empty for none).
+    /// Run once the managed relations in `chained_after` exist (empty for
+    /// none).
     pub chained: String,
+    /// The managed relations, by schema and name, the chained shapes name.
+    pub chained_after: BTreeSet<(String, String)>,
+    /// What each chained object is, as `pg_describe_object` names it.
+    pub chained_objects: BTreeSet<String>,
     /// What each filled object is, as `pg_describe_object` names it.
     pub filled: BTreeSet<String>,
     /// One finding for each object fill cannot stage, for a compile that
@@ -856,8 +868,21 @@ impl Fill {
         let mut ahead = Vec::new();
         let mut chained = Vec::new();
         let mut schemas = BTreeSet::new();
+        let mut afters: Vec<BTreeSet<(String, String)>> = Vec::with_capacity(self.objects.len());
         for object in &self.objects {
+            let mut after = object.after.clone();
+            for &index in &object.names {
+                after.extend(afters[index].iter().cloned());
+            }
+            let part = object.parts.iter().find(|part| created.contains(*part));
             let state = if created.contains(&(object.catalog.clone(), object.described.clone())) {
+                State::Created
+            } else if let Some((_, part)) = part {
+                staging.unfillable.push(format!(
+                    "{} is not filled: the externals file created its {part}; write the whole \
+                     of it in the externals file if a binding needs it",
+                    object.described
+                ));
                 State::Created
             } else if let Some(&missing) = object
                 .names
@@ -902,7 +927,12 @@ impl Fill {
                 staging.filled.insert(object.described.clone());
                 schemas.extend(object.schemas.iter().cloned());
             }
+            if state == State::Chained {
+                staging.chained_objects.insert(object.described.clone());
+                staging.chained_after.extend(after.iter().cloned());
+            }
             states.push(state);
+            afters.push(after);
         }
         staging.ahead = schemas
             .iter()
@@ -977,6 +1007,7 @@ fn survey_fill(facts: &Facts, managed: &dyn Fn(&Key) -> bool) -> Fill {
         .iter()
         .map(|key| {
             let item = &items[key];
+            let mut after = BTreeSet::new();
             let how = match (chained.get(key), &item.body) {
                 (Some(Chain::Foreign), _) => {
                     How::Not("the comparison does not qualify a foreign table's properties".into())
@@ -984,9 +1015,31 @@ fn survey_fill(facts: &Facts, managed: &dyn Fn(&Key) -> bool) -> Fill {
                 (_, Body::Listed(line)) => {
                     How::Not(item.why.clone().unwrap_or_else(|| line.clone()))
                 }
-                (Some(Chain::Names(_)), Body::Sql(sql)) => How::Chained(sql.clone()),
+                (Some(Chain::Names(named)), Body::Sql(sql)) => match facts.relations.get(&named.1)
+                {
+                    Some(relation) if named.0 == "pg_class" => {
+                        after.insert((relation.schema.clone(), relation.name.clone()));
+                        How::Chained(sql.clone())
+                    }
+                    _ => How::Not(format!(
+                        "its shape names the managed {}, and fill orders a shape only after the \
+                         managed relations it names",
+                        described(named)
+                    )),
+                },
                 (Some(Chain::Through(_)) | None, Body::Sql(sql)) => How::Ahead(sql.clone()),
             };
+            let parts = folded
+                .carriers
+                .keys()
+                .filter(|part| folded.top(part) == *key)
+                .filter_map(|part| {
+                    facts
+                        .objects
+                        .get(*part)
+                        .map(|object| (part.0.clone(), object.described.clone()))
+                })
+                .collect();
             let mut schemas = Vec::new();
             if let Some(object) = facts.objects.get(key)
                 && !object.schema.is_empty()
@@ -1003,8 +1056,10 @@ fn survey_fill(facts: &Facts, managed: &dyn Fn(&Key) -> bool) -> Fill {
             Filled {
                 catalog: key.0.clone(),
                 described: described(key),
+                parts,
                 schemas,
                 how,
+                after,
                 names: folded
                     .shapes(key)
                     .filter_map(|referenced| index.get(referenced).copied())
