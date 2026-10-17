@@ -875,8 +875,9 @@ fn constraints_query() -> String {
 /// with no `pg_cast` entry (measured on 16 and 18). They are a fallback after
 /// exact and preferred-type matches.
 ///
-/// A domain is unwrapped to its base type first, for the same reason the engine
-/// does it. And a key's class is reported unless it `IS NOT DISTINCT FROM` the
+/// All domain layers are unwrapped first: `typbasetype` preserves the immediate
+/// domain base, while the engine uses the ultimate base (measured on 16 and 18).
+/// A key's class is reported unless it `IS NOT DISTINCT FROM` the
 /// resolved default, so a default this query cannot resolve reports the class
 /// rather than passing it as the default — not being able to tell is not the
 /// same as there being nothing to tell.
@@ -948,10 +949,16 @@ fn indexes_query() -> String {
                JOIN pg_catalog.pg_opclass occ ON occ.oid = i.indclass[k.n - 1]
                JOIN pg_catalog.pg_namespace ocn ON ocn.oid = occ.opcnamespace
                LEFT JOIN LATERAL (
-                 SELECT COALESCE(
-                   (SELECT t.typbasetype FROM pg_catalog.pg_type t
-                     WHERE t.oid = a.atttypid AND t.typtype = 'd' AND t.typbasetype <> 0),
-                   a.atttypid) AS coltype
+                 SELECT (
+                   WITH RECURSIVE bases(oid) AS (
+                     SELECT a.atttypid
+                     UNION
+                     SELECT t.typbasetype FROM bases b
+                       JOIN pg_catalog.pg_type t ON t.oid = b.oid
+                      WHERE t.typtype = 'd' AND t.typbasetype <> 0)
+                   SELECT b.oid FROM bases b
+                     JOIN pg_catalog.pg_type t ON t.oid = b.oid
+                    WHERE t.typtype <> 'd') AS coltype
                    FROM pg_catalog.pg_attribute a
                   WHERE (i.indkey[k.n - 1] <> 0
                          AND a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1])

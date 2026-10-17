@@ -1083,7 +1083,7 @@ fn empty_arrays_still_evaluate_outer_domain_checks_and_keep_array_type_ownership
 
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
-fn enum_composite_array_range_and_multirange_keys_use_polymorphic_defaults() {
+fn polymorphic_index_defaults_survive_multiple_domain_layers() {
     let setup = "CREATE SCHEMA app;
         CREATE TYPE app.mood AS ENUM ('ok');
         CREATE TYPE app.pair AS (n integer, s text);
@@ -1091,7 +1091,12 @@ fn enum_composite_array_range_and_multirange_keys_use_polymorphic_defaults() {
         CREATE DOMAIN app.pair_domain AS app.pair;
         CREATE DOMAIN app.moods_domain AS app.mood[];
         CREATE DOMAIN app.int_range AS int4range;
-        CREATE DOMAIN app.int_multirange AS int4multirange";
+        CREATE DOMAIN app.int_multirange AS int4multirange;
+        CREATE DOMAIN app.mood_d2 AS app.mood_domain;
+        CREATE DOMAIN app.pair_d2 AS app.pair_domain;
+        CREATE DOMAIN app.moods_d2 AS app.moods_domain;
+        CREATE DOMAIN app.range_d2 AS app.int_range;
+        CREATE DOMAIN app.multirange_d2 AS app.int_multirange";
     let columns = [
         ("mood", "app.mood"),
         ("pair", "app.pair"),
@@ -1102,12 +1107,25 @@ fn enum_composite_array_range_and_multirange_keys_use_polymorphic_defaults() {
         ("da", "app.moods_domain"),
         ("dr", "app.int_range"),
         ("dmr", "app.int_multirange"),
+        ("de2", "app.mood_d2"),
+        ("dc2", "app.pair_d2"),
+        ("da2", "app.moods_d2"),
+        ("dr2", "app.range_d2"),
+        ("dm2", "app.multirange_d2"),
     ];
     // Measure both majors before relying on pbps's classification of a key.
     for server in servers() {
         let own = OwnDatabase::new(&server, "refs_index_measure");
         let db = own.connection();
         on_server(db, setup);
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_catalog.pg_type
+            WHERE oid='app.mood_d2'::regtype AND typbasetype='app.mood_domain'::regtype"
+            ),
+            1
+        );
         on_server(
             db,
             &format!(
@@ -1126,11 +1144,11 @@ fn enum_composite_array_range_and_multirange_keys_use_polymorphic_defaults() {
             );
         }
         for (names, input, count) in [
-            ("'ix_mood','ix_dm'", "anyenum", 2),
-            ("'ix_pair','ix_dp'", "record", 2),
-            ("'ix_moods','ix_pairs','ix_da'", "anyarray", 3),
-            ("'ix_dr'", "anyrange", 1),
-            ("'ix_dmr'", "anymultirange", 1),
+            ("'ix_mood','ix_dm','ix_de2'", "anyenum", 3),
+            ("'ix_pair','ix_dp','ix_dc2'", "record", 3),
+            ("'ix_moods','ix_pairs','ix_da','ix_da2'", "anyarray", 4),
+            ("'ix_dr','ix_dr2'", "anyrange", 2),
+            ("'ix_dmr','ix_dm2'", "anymultirange", 2),
         ] {
             assert_eq!(
                 scalar(
