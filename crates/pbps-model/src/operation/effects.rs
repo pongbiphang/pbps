@@ -1682,12 +1682,27 @@ impl Cx<'_> {
         // Only a key that stands throughout constrains the row: one the plan
         // adds is installed after the rows it checks, one it drops is gone
         // before them.
-        let (Some((_, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner)) else {
+        let (Some((base_name, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner))
+        else {
             return;
         };
+        // Compared as the differ compares them, through the plan's renames
+        // of the tables and columns a key names: a key whose referenced table
+        // is renamed stands.
+        let forward = self
+            .renames_of(base_name, was)
+            .apply(
+                &Table {
+                    foreign_keys: was.foreign_keys.clone(),
+                    partition_of: was.partition_of.clone(),
+                    ..Table::default()
+                },
+                base_name,
+            )
+            .into_owned();
         let mut wanted = Vec::new();
         for (name, fk) in &will.foreign_keys {
-            if was.foreign_keys.get(name) != Some(fk) {
+            if forward.foreign_keys.get(name) != Some(fk) {
                 continue;
             }
             let Some(parent) = self
@@ -1768,26 +1783,69 @@ impl Cx<'_> {
         changed: Option<&[&str]>,
         ends: bool,
     ) {
-        let Some((_, table)) = (if ends {
-            self.base_of(owner)
-        } else {
-            self.final_of(owner)
-        }) else {
+        let (Some((base_name, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner))
+        else {
             return;
         };
+        // Only a key that stands throughout names a row: one the plan adds or
+        // rebuilds is absent while rows move, so it constrains none, and a
+        // foreign key over it is not one that stands either. Compared as the
+        // differ compares, through the plan's renames and without storage
+        // parameters, which change in place.
+        let forward = self
+            .renames_of(base_name, was)
+            .apply(
+                &Table {
+                    primary_key: was.primary_key.clone(),
+                    unique: was.unique.clone(),
+                    indexes: was.indexes.clone(),
+                    partition_of: was.partition_of.clone(),
+                    ..Table::default()
+                },
+                base_name,
+            )
+            .into_owned();
+        let table = if ends { was } else { will };
         let mut keys: Vec<Vec<String>> = Vec::new();
         if let Some(pk) = &table.primary_key
             && pk.columns.len() > 1
+            && forward.primary_key == will.primary_key
         {
             keys.push(pk.columns.clone());
         }
-        keys.extend(table.unique.values().map(|u| u.columns.clone()));
+        let unique_bare = |u: &crate::UniqueConstraint| {
+            let mut u = u.clone();
+            u.storage_parameters.clear();
+            u
+        };
+        keys.extend(
+            table
+                .unique
+                .iter()
+                .filter(|(n, _)| {
+                    forward.unique.get(*n).map(unique_bare).is_some()
+                        && forward.unique.get(*n).map(unique_bare)
+                            == will.unique.get(*n).map(unique_bare)
+                })
+                .map(|(_, u)| u.columns.clone()),
+        );
+        let index_bare = |i: &crate::Index| {
+            let mut i = i.clone();
+            i.storage_parameters.clear();
+            i
+        };
         keys.extend(
             table
                 .indexes
-                .values()
-                .filter(|i| i.unique && i.filter.is_none())
-                .filter_map(|i| {
+                .iter()
+                .filter(|(n, i)| {
+                    i.unique
+                        && i.filter.is_none()
+                        && forward.indexes.get(*n).map(index_bare).is_some()
+                        && forward.indexes.get(*n).map(index_bare)
+                            == will.indexes.get(*n).map(index_bare)
+                })
+                .filter_map(|(_, i)| {
                     i.columns
                         .iter()
                         .map(|c| match &c.key {
