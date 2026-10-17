@@ -6616,18 +6616,21 @@ a valid plan:
 - **Rows are ordered by the foreign keys between their tables, and no value
   is read.** An insert or update makes the written side of its table's rows
   (`ObjectKey::Rows`) and a delete ends the held side. A child's insert or
-  update requires the parent's written side, and a child's delete requires
-  the parent's held side, so a parent's rows come first and a child's rows
-  leave first. A foreign key counts if it stands throughout, compared
+  update requires the parent's written side, and a child's delete or update
+  requires the parent's held side, so a parent's rows come first and a
+  child's rows leave first. A delete also waits for a foreign key into its
+  table that the plan drops or replaces. A foreign key counts if it stands throughout, compared
   through the plan's renames as the differ compares. The first design named
   the row a reference needs by its key, unique-key or default value; each
   value the effects could not read (a literal default of some type, a
   payload's key column, a tuple, a renamed or retyped key) was an order the
   hand graph kept and the effects lost, and they were found one review
   round at a time (#2140). Two tables in one cycle of foreign keys, a table
-  and itself included, draw no edge: the differ plans their rows in name
-  order and does not refuse the cycle (`data::supply_order`), so the
-  resolver must not either. Their rows keep the order given. The two sides
+  and itself included, draw no edge from the keys: the differ plans their
+  rows in name order and does not refuse the cycle (`data::supply_order`), so
+  the resolver must not either. Their rows keep the order given, as writes of
+  one resource that all of them share, which the effect graph orders by the
+  operations' ids. The two sides
   are two keys because a key both made and ended would put the first
   ending before every making.
 

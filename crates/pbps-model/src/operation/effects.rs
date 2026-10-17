@@ -840,7 +840,8 @@ impl Cx<'_> {
                     }
                 }
                 self.row_meets_constraints(&owner, table, &written);
-                self.row_parents(&owner, true);
+                self.row_parents(&owner, true, false);
+                self.row_cycle(&owner);
                 for (c, v) in row.columns() {
                     if v.is_null() {
                         self.row_needs_nullable(&owner, table, c);
@@ -909,7 +910,8 @@ impl Cx<'_> {
                         }
                     }
                 }
-                self.row_parents(&owner, true);
+                self.row_parents(&owner, true, true);
+                self.row_cycle(&owner);
                 self.creates(Resource::Object(
                     ObjectKey::Rows {
                         table: owner.clone(),
@@ -932,7 +934,9 @@ impl Cx<'_> {
                 self.row_basics(&owner, table, key);
                 let written: Vec<&str> = row.keys().map(String::as_str).collect();
                 self.row_writes(table, &owner, &written);
-                self.row_parents(&owner, false);
+                self.row_parents(&owner, false, true);
+                self.row_cycle(&owner);
+                self.row_inbound_keys_gone(&owner);
                 self.removes(Resource::Object(
                     ObjectKey::Rows {
                         table: owner,
@@ -1662,7 +1666,7 @@ impl Cx<'_> {
     /// after the rows it checks, one it drops is gone before them. Two tables
     /// in one cycle of foreign keys, a table and itself included, are left in
     /// the order given, as the differ leaves them (`data::supply_order`).
-    fn row_parents(&mut self, owner: &Recorded, writes: bool) {
+    fn row_parents(&mut self, owner: &Recorded, written: bool, held: bool) {
         let (Some((base_name, was)), Some((own_name, will))) =
             (self.base_of(owner), self.final_of(owner))
         else {
@@ -1695,15 +1699,16 @@ impl Cx<'_> {
             }
         }
         for parent in parents {
-            if writes {
+            if written {
                 self.requires(Requirement::Is(
                     ObjectKey::Rows {
-                        table: parent,
+                        table: parent.clone(),
                         side: RowSide::Written,
                     },
                     Incarnation::Final,
                 ));
-            } else {
+            }
+            if held {
                 self.requires(Requirement::Is(
                     ObjectKey::Rows {
                         table: parent,
@@ -1712,6 +1717,103 @@ impl Cx<'_> {
                     Incarnation::Base,
                 ));
             }
+        }
+    }
+
+    /// The rows of the tables in one cycle of foreign keys with this one keep
+    /// the order given: a write of one resource that all of them share, which
+    /// the effect graph orders by the operations' ids (DEC-1954.6). The
+    /// differ leaves such tables in name order and draws no edge between them
+    /// from the keys (`data::supply_order`), so neither do the effects.
+    fn row_cycle(&mut self, owner: &Recorded) {
+        let Some((own_name, _)) = self.final_of(owner) else {
+            return;
+        };
+        if !self.references_back_from_own(own_name) {
+            return;
+        }
+        let mut members = BTreeSet::new();
+        members.insert(owner.clone());
+        let mut seen: BTreeSet<&TableName> = BTreeSet::new();
+        let mut queue = vec![own_name];
+        while let Some(current) = queue.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let Some(table) = self.after.schema.tables.get(current) else {
+                continue;
+            };
+            for fk in table.foreign_keys.values() {
+                queue.push(&fk.references_table);
+            }
+        }
+        for name in seen {
+            if name != own_name
+                && self.references_back(name, own_name)
+                && let Some(member) = self.final_table(name)
+            {
+                members.insert(member);
+            }
+        }
+        if let Some(representative) = members.into_iter().next() {
+            self.rewrites(Resource::Column(ObjectKey::Rows {
+                table: representative,
+                side: RowSide::Written,
+            }));
+        }
+    }
+
+    /// Whether the table reaches itself through the desired state's foreign
+    /// keys.
+    fn references_back_from_own(&self, own: &TableName) -> bool {
+        self.after.schema.tables.get(own).is_some_and(|table| {
+            table
+                .foreign_keys
+                .values()
+                .any(|fk| self.references_back(&fk.references_table, own))
+        })
+    }
+
+    /// A foreign key the plan drops or replaces, into this table, is gone
+    /// before the table's rows go: a delete leaves the rows that reference
+    /// them standing otherwise.
+    fn row_inbound_keys_gone(&mut self, owner: &Recorded) {
+        let Some((name, _)) = self.base_of(owner) else {
+            return;
+        };
+        let name = name.clone();
+        let mut gone = Vec::new();
+        for (other_name, other) in &self.before.schema.tables {
+            let Some(other_owner) = self.base_table(other_name) else {
+                continue;
+            };
+            let Some((_, will)) = self.final_of(&other_owner) else {
+                continue;
+            };
+            let forward = self
+                .renames_of(other_name, other)
+                .apply(
+                    &Table {
+                        foreign_keys: other.foreign_keys.clone(),
+                        partition_of: other.partition_of.clone(),
+                        ..Table::default()
+                    },
+                    other_name,
+                )
+                .into_owned();
+            for (fk_name, fk) in &other.foreign_keys {
+                if fk.references_table == name
+                    && will.foreign_keys.get(fk_name) != forward.foreign_keys.get(fk_name)
+                {
+                    gone.push(Self::part(
+                        &other_owner,
+                        PartKey::ForeignKey(fk_name.clone()),
+                    ));
+                }
+            }
+        }
+        for key in gone {
+            self.requires(Requirement::Absent(key));
         }
     }
 

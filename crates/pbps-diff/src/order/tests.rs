@@ -3760,3 +3760,153 @@ fn the_rows_of_two_tables_referencing_each_other_keep_the_order_given() {
             .any(|v| matches!(v, Violation::Edge { .. }))
     );
 }
+
+/// A child update that gives its reference up goes before the parent's
+/// delete, as the child's own delete does (review of #2120).
+#[test]
+fn a_child_update_releasing_its_reference_goes_before_the_parent_row_is_deleted() {
+    let none = ModuleDeps::new();
+    let update = p(Change::UpdateRow {
+        table: t("c"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        columns: [(
+            "pid".to_owned(),
+            (
+                pbps_model::Cell::Value(Value::Int(1)),
+                pbps_model::Cell::Value(Value::Null),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    });
+    let plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![update, delete("p", 1, &[])],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+}
+
+/// A foreign key into a table that the plan drops goes before that table's
+/// rows are deleted; one that stands is no such obligation (review of #2120).
+#[test]
+fn a_parent_row_is_deleted_after_the_incoming_foreign_key_the_plan_drops() {
+    let none = ModuleDeps::new();
+    let mut dropped = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![
+            p(Change::DropForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+            }),
+            delete("p", 1, &[]),
+        ],
+    );
+    dropped
+        .after
+        .tables
+        .get_mut(&t("c"))
+        .unwrap()
+        .foreign_keys
+        .clear();
+    let (ops, fx, baseline) = dropped.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::StillPresent { .. }))
+    );
+    // Negative: a key that stands is not waited for.
+    let stands = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![delete("p", 1, &[])],
+    );
+    let (_, fx, _) = stands.analysed(ModuleEdits::InPlace);
+    assert!(
+        !fx[0]
+            .requires
+            .iter()
+            .any(|r| matches!(r, Requirement::Absent(_))),
+        "{:?}",
+        fx[0].requires
+    );
+}
+
+/// The rows of tables in one cycle of foreign keys keep the order given, when
+/// the order matters and the keys do not say: an insert, then an update of
+/// the other table to reference it (review of #2120).
+#[test]
+fn the_rows_of_tables_in_a_cycle_of_foreign_keys_keep_their_relative_order() {
+    let none = ModuleDeps::new();
+    let update = p(Change::UpdateRow {
+        table: t("c"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        columns: [(
+            "pid".to_owned(),
+            (
+                pbps_model::Cell::Value(Value::Null),
+                pbps_model::Cell::Value(Value::Int(1)),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    });
+    let mut plan = parent_and_child(
+        &["id", "cid"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![plain_row("p", 1, &[("cid", 1)]), update],
+    );
+    for schema in [&mut plan.before, &mut plan.after] {
+        schema.tables.get_mut(&t("p")).unwrap().foreign_keys.insert(
+            "back".into(),
+            ForeignKey {
+                columns: vec!["cid".into()],
+                references_table: t("c"),
+                references_columns: vec!["id".into()],
+                on_delete: ReferentialAction::default(),
+                on_update: ReferentialAction::default(),
+            },
+        );
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+}
