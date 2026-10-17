@@ -941,6 +941,30 @@ impl Fill {
                         ));
                         State::Missing
                     }
+                    // An extension's script runs code of its own, an event
+                    // trigger among it, and creates operators, casts and
+                    // other names the split's order check does not model.
+                    // Ahead of everything both are covered: the outside-write
+                    // check is around it and the staged comparison follows
+                    // before any compile. Between two parts of the compile
+                    // neither is, so an extension never waits (#1778).
+                    How::Chained(_) | How::Ahead(_)
+                        if object.catalog == "pg_extension"
+                            && (matches!(object.how, How::Chained(_))
+                                || object
+                                    .names
+                                    .iter()
+                                    .any(|&index| states[index] == State::Chained)) =>
+                    {
+                        staging.unfillable.push(format!(
+                            "{} cannot be filled: its shape names a managed relation, and an \
+                             extension's script runs code and creates names fill cannot order \
+                             between two parts of the compile; select no resolver and keep \
+                             ADR-0013's conservative rebuild",
+                            object.described
+                        ));
+                        State::Missing
+                    }
                     How::Chained(sql) => {
                         chained.push(sql.as_str());
                         State::Chained

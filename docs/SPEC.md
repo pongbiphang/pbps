@@ -2212,7 +2212,9 @@ DEC-1778.2).**
   a declared function is created after the function. The split waits for
   every managed relation a chained shape names; a shape waiting for one the
   compile does not create (a base table the plan renames) is not filled,
-  and neither is what names it, while the other shapes are. Where the setup
+  and neither is what names it, while the other shapes are. An extension
+  never waits: its script runs code and creates names the split does not
+  order, so one that would is not filled. Where the setup
   session is the compiling one, the deployer's reproduced settings are set
   again after fill. A declaration scratch
   compiles before the split cannot read a chained shape, and that failure

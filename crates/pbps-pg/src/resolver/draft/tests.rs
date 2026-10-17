@@ -839,3 +839,64 @@ fn only_the_chains_waiting_for_an_absent_relation_are_dropped() {
         BTreeSet::from([("app".to_owned(), "m".to_owned())])
     );
 }
+
+/// An extension whose member names a managed row type would wait for the
+/// managed tables, and its script would then run between two parts of the
+/// compile: it is never filled there, and is named. Negative: the same
+/// extension naming nothing managed is filled ahead.
+#[test]
+fn an_extension_never_waits_for_the_managed_tables() {
+    let staging = |naming: bool| {
+        let mut target = Target::default();
+        let managed = target.relation(20600, 'r', "app", "m", &[("id", "integer")]);
+        target.managed(&managed);
+        let extension = target.object("pg_extension", 20610, "", "extension inhouse");
+        target.facts.extensions.insert(
+            20610,
+            Extension {
+                name: "inhouse".into(),
+                schema: "ext".into(),
+                version: "'1.0'".into(),
+            },
+        );
+        let member = target.object("pg_type", 20620, "ext", "type ext.x");
+        target.facts.types.insert(
+            20620,
+            Type {
+                kind: 'e',
+                qualified: "ext.x".into(),
+                ..Type::default()
+            },
+        );
+        target.depend(&member, &extension, 'e', true);
+        if naming {
+            target.depend(&member, &key("pg_type", 20601), 'n', true);
+        }
+        let reader = target.relation(20630, 'v', "app", "a", &[("x", "ext.x")]);
+        target.depend(&reader, &member, 'n', true);
+        target.managed(&reader);
+        target.fill().staging(&BTreeSet::new())
+    };
+    let ahead = staging(false);
+    assert!(
+        ahead.ahead.contains("CREATE EXTENSION inhouse"),
+        "{}",
+        ahead.ahead
+    );
+    let named = staging(true);
+    assert!(
+        !named.chained.contains("CREATE EXTENSION"),
+        "{}",
+        named.chained
+    );
+    assert!(!named.ahead.contains("CREATE EXTENSION"), "{}", named.ahead);
+    assert!(!named.filled.contains("extension inhouse"));
+    assert!(
+        named.unfillable.iter().any(|line| line.starts_with(
+            "extension inhouse cannot be filled: its shape names a managed relation, and an \
+             extension's script runs code"
+        )),
+        "{:?}",
+        named.unfillable
+    );
+}

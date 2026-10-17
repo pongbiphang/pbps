@@ -3411,6 +3411,14 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
   reads come after a `RESET ALL`: a chained fill runs on a session the
   compile pinned to the target's zone, and a role's `VALID UNTIL` would
   otherwise render differently in the two.
+- **An extension never waits.** An extension's script runs code of its
+  own, an event trigger among it, and creates operators, casts and other
+  names. Ahead of everything both are covered: the outside-write check is
+  around it, and the staged comparison refuses an uncovered member before
+  any compile. Between two parts of the compile neither is, and the order
+  check models only relations, types and routines. So an extension that
+  would wait for a managed relation, its own shape or one it names, is not
+  filled, and is named in the findings.
 - **A reset leaves the session's empty path pinned.** `pbps-db` pins the
   empty path with a plain `SET`, which `RESET ALL` and `DISCARD ALL`
   clear, and what runs on the session after the commit relies on it: the
@@ -3494,6 +3502,7 @@ copy is not filled over), live; and the `resolver::draft` unit tests
 `an_object_whose_part_the_externals_file_created_is_the_files` and
 `a_chained_shape_waits_for_every_managed_relation_it_names`,
 `what_names_a_partly_staged_object_is_not_filled`,
+`an_extension_never_waits_for_the_managed_tables`,
 `only_the_chains_waiting_for_an_absent_relation_are_dropped` and
 `an_extension_whose_member_the_externals_file_created_is_the_files`, with
 `reconstruct`'s
