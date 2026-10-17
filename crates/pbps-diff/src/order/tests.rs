@@ -1054,37 +1054,87 @@ fn rows_of_c(before_key: bool, after_key: bool, logical: Vec<PlannedChange>) -> 
 #[test]
 fn rows_wait_only_for_a_key_that_stands_when_they_are_written() {
     let none = ModuleDeps::new();
-    // The key is added after the rows it checks: 1 -> 2 and 2 -> NULL, the
-    // child first, as the ids give it.
-    let adds = rows_of_c(
-        false,
-        true,
+    let rows = |child: i64, parent: i64| {
         vec![
-            child_row(1, Some(2)),
-            child_row(2, None),
-            p(Change::AddForeignKey {
-                table: t("c"),
-                name: "fk".into(),
-                constraint: Box::new(self_referencing(true).foreign_keys["fk"].clone()),
-            }),
-        ],
+            plain_row("c", child, &[("pid", 1)]),
+            plain_row("p", parent, &[]),
+        ]
+    };
+    // The key is added after the rows it checks: the child first, as the
+    // ids give it, is the order that works.
+    let mut added = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        rows(1, 1),
     );
-    let (ops, fx, baseline) = adds.analysed(ModuleEdits::InPlace);
+    added
+        .before
+        .tables
+        .get_mut(&t("c"))
+        .unwrap()
+        .foreign_keys
+        .clear();
+    added.logical.push(p(Change::AddForeignKey {
+        table: t("c"),
+        name: "fk".into(),
+        constraint: Box::new(reference(&["pid"], &["id"])),
+    }));
+    let (ops, fx, baseline) = added.analysed(ModuleEdits::InPlace);
     assert_eq!(
         run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
         []
     );
-    // Negative: a key that stands throughout wants the parent row first.
-    let stands = rows_of_c(true, true, vec![child_row(2, None), child_row(1, Some(2))]);
+    // Negative: a key that stands throughout wants the parent's rows first.
+    let stands = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        rows(1, 1),
+    );
     let (ops, fx, baseline) = stands.analysed(ModuleEdits::InPlace);
-    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
-    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+    // Negative: one the plan drops is gone before the rows.
+    let mut dropped = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        rows(1, 1),
+    );
+    dropped
+        .after
+        .tables
+        .get_mut(&t("c"))
+        .unwrap()
+        .foreign_keys
+        .clear();
+    dropped.logical.insert(
+        0,
+        p(Change::DropForeignKey {
+            table: t("c"),
+            name: "fk".into(),
+        }),
+    );
+    let (ops, fx, baseline) = dropped.analysed(ModuleEdits::InPlace);
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
 }
 
 #[test]
-fn a_row_value_names_a_row_only_through_the_referenced_primary_key() {
-    // `code` is unique but is not the key rows are named by: the referenced
-    // value 2 need not be the row keyed 2.
+fn the_rows_of_a_table_referencing_itself_keep_the_order_given() {
+    // A table in a cycle of one: its rows are left in the order given, as the
+    // differ leaves them (`supply_order`), and draw no edge between them but
+    // the write order of one table.
     let mut table = self_referencing(false);
     table.columns.insert("code".into(), Column::new(int()));
     table.unique.insert(
@@ -1127,6 +1177,14 @@ fn a_row_value_names_a_row_only_through_the_referenced_primary_key() {
         ),
         []
     );
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
 }
 
 #[test]
@@ -2901,11 +2959,11 @@ fn rows_across(
     }
 }
 
-/// A child row that names a parent row through a unique column other than its
-/// primary key, or through several columns, waits for the parent rows the
-/// plan writes (review of #2120).
+/// A child row waits for the parent's rows whatever its reference names, a
+/// unique column other than the key or several columns: the order is table
+/// against table and reads no value (DEC-1968.2).
 #[test]
-fn a_child_row_waits_for_the_parent_row_a_unique_or_composite_reference_names() {
+fn a_child_row_waits_for_the_parent_rows_whatever_its_reference_names() {
     let none = ModuleDeps::new();
     for plan in [
         // A unique column that is not the parent's key.
@@ -2924,6 +2982,14 @@ fn a_child_row_waits_for_the_parent_row_a_unique_or_composite_reference_names() 
             &[("a", 1), ("b", 2)],
             &[("id", 1), ("pa", 1), ("pb", 2)],
         ),
+        // A value no parent row holds: the table is the dependency.
+        rows_across(
+            &["id", "code"],
+            &["code"],
+            &["pcode"],
+            &[("id", 1), ("code", 9)],
+            &[("id", 1), ("pcode", 8)],
+        ),
     ] {
         let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
         // The child first, as the differ's row order may leave it.
@@ -2934,35 +3000,6 @@ fn a_child_row_waits_for_the_parent_row_a_unique_or_composite_reference_names() 
         );
         assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
     }
-    // Negative: a child that names another value than the parent row holds
-    // waits for nothing the plan writes.
-    let other = rows_across(
-        &["id", "code"],
-        &["code"],
-        &["pcode"],
-        &[("id", 1), ("code", 9)],
-        &[("id", 1), ("pcode", 8)],
-    );
-    let (ops, fx, baseline) = other.analysed(ModuleEdits::InPlace);
-    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
-    // Negative: a child that names no value (NULL) waits for nothing.
-    let mut free = rows_across(
-        &["id", "code"],
-        &["code"],
-        &["pcode"],
-        &[("id", 1), ("code", 9)],
-        &[("id", 1), ("pcode", 9)],
-    );
-    if let Change::InsertRow { row, .. } = &mut free.logical[0].change {
-        *row = [
-            ("id".to_owned(), Value::Int(1)),
-            ("pcode".to_owned(), Value::Null),
-        ]
-        .into_iter()
-        .collect::<Row>();
-    }
-    let (ops, fx, baseline) = free.analysed(ModuleEdits::InPlace);
-    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
 }
 
 /// A retype of a column a foreign key stands over, through the differ, whose
@@ -3195,73 +3232,6 @@ fn a_parent_row_deleted_with_the_child_that_names_its_unique_value_goes_last() {
             delete("p", 1, &[("code", 9)]),
             delete("c", 1, &[("pcode", 9)]),
         ],
-    );
-    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
-    assert!(
-        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
-            .iter()
-            .any(|v| matches!(v, Violation::Edge { .. }))
-    );
-    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
-}
-
-/// A primary key's text can spell anything, so the name a unique key gives a
-/// row is a key of its own, not another text (review of #2120).
-#[test]
-fn a_primary_key_that_spells_a_unique_key_name_is_not_that_name() {
-    let none = ModuleDeps::new();
-    let lookalike = p(Change::InsertRow {
-        table: t("p"),
-        key_column: "id".into(),
-        identity_key: false,
-        // What an alias spelled as text would read for `code = 5`.
-        key: RowKey::from("unique(code)=(5)"),
-        row: [("code".to_owned(), Value::Int(7))]
-            .into_iter()
-            .collect::<Row>(),
-        defaults: Default::default(),
-        types: Default::default(),
-    });
-    let plan = parent_and_child(
-        &["id", "code"],
-        &["code"],
-        &["id", "pcode"],
-        reference(&["pcode"], &["code"]),
-        vec![plain_row("c", 1, &[("pcode", 5)]), lookalike],
-    );
-    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
-    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
-}
-
-/// A parent row that gives up a unique value ends the name the child's row
-/// holds it by, so the child goes first (review of #2120).
-#[test]
-fn a_parent_update_giving_up_a_unique_value_follows_the_child_row_that_names_it() {
-    let none = ModuleDeps::new();
-    let update = p(Change::UpdateRow {
-        table: t("p"),
-        key_column: "id".into(),
-        key: RowKey::from("1"),
-        columns: [(
-            "code".to_owned(),
-            (
-                pbps_model::Cell::Value(Value::Int(9)),
-                pbps_model::Cell::Value(Value::Int(10)),
-            ),
-        )]
-        .into_iter()
-        .collect(),
-        unchanged: Default::default(),
-        types: Default::default(),
-        after_types: Default::default(),
-        key_type: Default::default(),
-    });
-    let plan = parent_and_child(
-        &["id", "code"],
-        &["code"],
-        &["id", "pcode"],
-        reference(&["pcode"], &["code"]),
-        vec![update, delete("c", 1, &[("pcode", 9)])],
     );
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
     assert!(
@@ -3571,10 +3541,10 @@ fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
     assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
 }
 
-/// `SET c = DEFAULT` with a literal default sets the value the default spells,
-/// so a child that names it waits for the update (review of #2120).
+/// A child waits for a parent's update, whatever value `SET c = DEFAULT` sets
+/// (review of #2120).
 #[test]
-fn a_parent_update_to_a_literal_default_is_the_row_a_child_names() {
+fn a_child_row_waits_for_a_parent_update_to_a_literal_default() {
     let none = ModuleDeps::new();
     let update = p(Change::UpdateRow {
         table: t("p"),
@@ -3623,7 +3593,7 @@ fn a_parent_update_to_a_literal_default_is_the_row_a_child_names() {
 /// A parent row deleted while it held a literal default as its unique value
 /// still ends the name its child holds it by.
 #[test]
-fn a_parent_row_deleted_holding_a_literal_default_goes_after_the_child_that_names_it() {
+fn a_parent_row_deleted_holding_a_default_goes_after_its_child() {
     let none = ModuleDeps::new();
     let parent = p(Change::DeleteRow {
         table: t("p"),
@@ -3652,4 +3622,141 @@ fn a_parent_row_deleted_holding_a_literal_default_goes_after_the_child_that_name
             .any(|v| matches!(v, Violation::Edge { .. }))
     );
     assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// A default that is no literal names no value before it runs, and the child
+/// still waits: the dependency is the table's (DEC-1968.2).
+#[test]
+fn a_child_row_taking_a_computed_default_for_its_reference_waits_for_the_parent() {
+    let none = ModuleDeps::new();
+    let child = p(Change::InsertRow {
+        table: t("c"),
+        key_column: "id".into(),
+        identity_key: false,
+        key: RowKey::from("1"),
+        row: Row::default(),
+        defaults: [("pid".to_owned(), "app.next_parent()".to_owned())]
+            .into_iter()
+            .collect(),
+        types: Default::default(),
+    });
+    let mut plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![child, plain_row("p", 1, &[])],
+    );
+    for schema in [&mut plan.before, &mut plan.after] {
+        schema
+            .tables
+            .get_mut(&t("c"))
+            .unwrap()
+            .columns
+            .get_mut("pid")
+            .unwrap()
+            .value_source = pbps_model::ValueSource::Default("app.next_parent()".into());
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// A third table no foreign key joins to either is ordered by neither
+/// (DEC-1968.2).
+#[test]
+fn a_table_no_foreign_key_joins_to_the_others_gets_no_row_edge() {
+    let mut plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![
+            plain_row("c", 1, &[("pid", 1)]),
+            plain_row("p", 1, &[]),
+            plain_row("u", 1, &[]),
+        ],
+    );
+    for (schema, ids) in [
+        (&mut plan.before, &mut plan.before_ids),
+        (&mut plan.after, &mut plan.after_ids),
+    ] {
+        schema.tables.insert(t("u"), table_with(&["id"]));
+        ids.tables.insert(uid(UidKind::Table, "u"), t("u"));
+        ids.columns
+            .insert(uid(UidKind::Column, "u.id"), t("u").column("id"));
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(
+        g.edges.iter().all(|e| e.before != 2 && e.after != 2),
+        "{:?}",
+        g.edges
+    );
+}
+
+/// Two tables that reference each other draw no row edge between them: the
+/// differ leaves such tables in name order and does not refuse them
+/// (`data::supply_order`), so the rows keep the order given in either
+/// direction and the graph has no cycle.
+#[test]
+fn the_rows_of_two_tables_referencing_each_other_keep_the_order_given() {
+    let none = ModuleDeps::new();
+    let mut plan = parent_and_child(
+        &["id", "cid"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![
+            plain_row("p", 1, &[("cid", 1)]),
+            plain_row("c", 1, &[("pid", 1)]),
+        ],
+    );
+    // And the parent references the child back.
+    for schema in [&mut plan.before, &mut plan.after] {
+        schema.tables.get_mut(&t("p")).unwrap().foreign_keys.insert(
+            "back".into(),
+            ForeignKey {
+                columns: vec!["cid".into()],
+                references_table: t("c"),
+                references_columns: vec!["id".into()],
+                on_delete: ReferentialAction::default(),
+                on_update: ReferentialAction::default(),
+            },
+        );
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // Negative: a chain that is no cycle keeps its edge.
+    let chain = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![plain_row("p", 1, &[]), plain_row("c", 1, &[("pid", 1)])],
+    );
+    let (ops, fx, baseline) = chain.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
 }

@@ -310,14 +310,15 @@ pub enum ObjectKey {
         table: Recorded,
         key: RowKey,
     },
-    /// A row by the values it holds in a unique key of its table other than
-    /// a single-column primary key: what a foreign key over those columns
-    /// names. Its own variant, since no text a key can hold is not a key
-    /// (DEC-1968.2). The columns are sorted, the values in their order.
-    RowByUnique {
+    /// The rows of a table, as the tables that reference it see them: the
+    /// written side is made by every insert and update, the held side ended by
+    /// every delete. Two keys, so that no key is both made and ended, which
+    /// would put the first ending before every making. A child's rows wait
+    /// for the parent's written side and leave before its held side, and no
+    /// value is read (DEC-1968.2).
+    Rows {
         table: Recorded,
-        columns: Vec<String>,
-        values: Vec<String>,
+        side: RowSide,
     },
     /// A grantee's permissions on one target, by the names the change
     /// carries: roles and targets of grants are spelled where the grant runs.
@@ -325,6 +326,13 @@ pub enum ObjectKey {
         grantee: Grantee,
         target: GrantTarget,
     },
+}
+
+/// Which side of a table's rows a [`ObjectKey::Rows`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RowSide {
+    Written,
+    Held,
 }
 
 /// Which instance of an object: the baseline's or the plan's.

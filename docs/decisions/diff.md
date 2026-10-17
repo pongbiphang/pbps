@@ -6592,9 +6592,9 @@ derived by hand are gone.** (#1968)
 
 `graph::constraints` states only the bindings and the executions of
 DEC-1968.1. The effects are read in every build here, as DEC-1956.3 allows
-where an order is made. Replacing the hand rules showed four orders they
-kept that the effects did not, each now an effect or an edge, and none
-refusing a valid plan:
+where an order is made. Replacing the hand rules showed orders they kept
+that the effects did not, each now an effect or an edge, and none refusing
+a valid plan:
 
 - **A reader of the base incarnation is ordered against the rename of what it
   reads by the name it spells**, as `Exists` is (DEC-1998.1 added the edge
@@ -6609,30 +6609,31 @@ refusing a valid plan:
   before the retype**, found through the column's uid, since the step spells
   the name the column ends with.
 - **A row update names the columns its guards read**, the cells it leaves
-  alone and its key, so a rename of one goes first. Its references are
-  read from the tuple it ends with and the one it starts from, those cells
-  included, and every row's cells include its key, which a payload leaves out.
-  **A row that references its parent through a unique column other than the
-  key, or through several columns, waits for the parent row that holds those
-  values**: a row also goes by each of its unique keys' values
-  (`ObjectKey::RowByUnique`, a key of its own, since a primary key's text can
-  spell anything), which an insert or update creates, a delete or an update
-  that gives the values up ends, and the child's reference requires, as the
-  primary key's value does for a single-column reference to it. Only a key
-  that stands throughout names a row, and a foreign key stands when it is the
-  same one through the plan's renames, as the differ compares them: a key the
-  plan rebuilds is absent while rows move, and names would otherwise swap in
-  a cycle. A key over a column the plan retypes is taken for rebuilt, as SQL
-  Server rebuilds it, and a column a row omits or sets to its default takes a
-  literal default as its value.
-  The update half of #2079 closes with it, so the commutation suites drop
-  their `a_row_updated_beside_a_new_column` gap (DEC-1965.1); the insert half
+  alone and its key, so a rename of one goes first. The update half of
+  #2079 closes with it, so the commutation suites drop their
+  `a_row_updated_beside_a_new_column` gap (DEC-1965.1); the insert half
   stays open.
-- **The name slots' handovers are edges** (`order::slots::edges`, offline, so
-  without the catalog's alike names), sealed `Identity`.
+- **Rows are ordered by the foreign keys between their tables, and no value
+  is read.** An insert or update makes the written side of its table's rows
+  (`ObjectKey::Rows`) and a delete ends the held side. A child's insert or
+  update requires the parent's written side, and a child's delete requires
+  the parent's held side, so a parent's rows come first and a child's rows
+  leave first. A foreign key counts if it stands throughout, compared
+  through the plan's renames as the differ compares. The first design named
+  the row a reference needs by its key, unique-key or default value; each
+  value the effects could not read (a literal default of some type, a
+  payload's key column, a tuple, a renamed or retyped key) was an order the
+  hand graph kept and the effects lost, and they were found one review
+  round at a time (#2140). Two tables in one cycle of foreign keys, a table
+  and itself included, draw no edge: the differ plans their rows in name
+  order and does not refuse the cycle (`data::supply_order`), so the
+  resolver must not either. Their rows keep the order given. The two sides
+  are two keys because a key both made and ended would put the first
+  ending before every making.
 
 **Differences from the hand graph**, measured side by side over the unit
-suites and both engines' live suites (no plan of either was unowned):
+suites and both engines' live suites, before the rows were ordered table
+against table (no plan of either was unowned):
 
 - **Order.** In 56 of the 118 plans the live suites made, one mechanism: a rebuild's
   `DropCheck` and `AddCheck` of one name, its `DropIndex` and its default
@@ -6661,6 +6662,9 @@ Pinned by `a_binding_edge_is_respected_where_the_effects_allow_the_other_order`,
 `a_resolver_plan_with_a_cycle_through_the_evidence_is_refused_by_name`,
 `a_base_spelled_reader_precedes_the_rename_of_what_it_names_and_not_a_retype`,
 `a_default_removal_in_a_column_rename_chain_reads_its_column_uid`,
+`a_child_row_waits_for_the_parent_rows_whatever_its_reference_names`,
+`the_rows_of_two_tables_referencing_each_other_keep_the_order_given`,
+`two_reference_tables_referencing_each_other_plan_and_settle_in_the_differs_order`,
 `a_parents_new_index_precedes_its_partitions_own_under_the_resolver`,
 `a_delayed_child_rename_does_not_lose_its_foreign_key_drop_dependency` and
 `an_appended_teardown_belongs_to_its_base_table_in_a_rename_chain`.
