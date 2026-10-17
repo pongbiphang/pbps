@@ -878,6 +878,7 @@
         "capture2141::mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_it",
         "capture2141::mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured",
         "capture2141::mssql_a_checks_disabled_and_untrusted_states_are_differences",
+        "capture2141::mssql_a_one_part_type_in_a_body_is_runtime_bound_with_type_candidates",
         "binding619::schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not",
         "binding619::a_modules_set_options_are_fixed_when_it_is_created",
         "binding619::synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed",

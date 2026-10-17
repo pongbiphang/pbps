@@ -37,6 +37,8 @@ pub(super) enum RuntimeName {
     /// A procedure call: `sys`, then the executing principal's default
     /// schema, then `dbo`.
     Call(String),
+    /// A type, such as a local variable's: the module's schema, then `dbo`.
+    Type(String),
 }
 
 #[derive(Clone)]
@@ -77,6 +79,11 @@ pub(super) fn lookups(scope: &CaptureScope) -> Lookups {
             }
             CandidateClass::SystemProcedure => {
                 lookups.system.insert(candidate.name.clone());
+            }
+            CandidateClass::Type => {
+                lookups
+                    .types
+                    .insert((candidate.schema.clone(), candidate.name.clone()));
             }
         }
     }
@@ -442,11 +449,22 @@ impl Builder<'_> {
                 continue;
             }
             if dependency.schema.is_none() && !dependency.schema_bound {
+                // Its id is what the name resolves to now, by class.
+                let name = match dependency.class {
+                    1 => RuntimeName::Object(dependency.entity.clone()),
+                    6 => RuntimeName::Type(dependency.entity.clone()),
+                    _ => {
+                        return Err(Uncovered::object(
+                            &me,
+                            "a reference is of a class this capture does not read",
+                        ));
+                    }
+                };
                 self.result
                     .runtime
                     .entry(me.clone())
                     .or_default()
-                    .insert(RuntimeName::Object(dependency.entity.clone()));
+                    .insert(name);
                 continue;
             }
             let Some(referenced) = dependency.referenced else {
@@ -738,6 +756,15 @@ pub(super) fn select(catalog: &Catalog, scope: &CaptureScope) -> Result<Selected
                 builder.engine.extend(members.iter().cloned());
                 members
             }
+            CandidateClass::Type => {
+                let key = (candidate.schema.clone(), candidate.name.clone());
+                let mut members = BTreeSet::new();
+                for id in catalog.types_named.get(&key).into_iter().flatten() {
+                    builder.types.insert(*id);
+                    members.insert(builder.index.type_identity(*id)?);
+                }
+                members
+            }
         };
         builder.result.candidates.insert(candidate.clone(), members);
     }
@@ -801,6 +828,10 @@ pub(super) fn runtime_candidates(
         let properties = inputs.get(module).map(|input| &input.properties);
         for name in names {
             match name {
+                RuntimeName::Type(name) => {
+                    candidates.insert(set(CandidateClass::Type, own, name));
+                    candidates.insert(set(CandidateClass::Type, "dbo", name));
+                }
                 RuntimeName::Object(name) => {
                     candidates.insert(set(CandidateClass::Object, own, name));
                     candidates.insert(set(CandidateClass::Object, "dbo", name));

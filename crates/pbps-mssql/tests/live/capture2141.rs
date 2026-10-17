@@ -899,3 +899,61 @@ async fn mssql_a_checks_disabled_and_untrusted_states_are_differences() {
     }
     db.drop().await;
 }
+
+/// A one-part type in a module body, such as a local variable's, resolves
+/// like a one-part object name: in the module's schema, then `dbo`, again
+/// whenever it is read. It is runtime-bound, its candidates are types, and a
+/// type arriving in the module's schema joins them.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_one_part_type_in_a_body_is_runtime_bound_with_type_candidates() {
+    let mut db = TestDb::create("localtype2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE TYPE dbo.amount FROM int;",
+            "CREATE PROCEDURE app.declares AS BEGIN DECLARE @x amount; SELECT @x; END;",
+        ],
+    )
+    .await;
+    let first = capture::capture(&mut db.conn, &objects(&[("app", "declares")]))
+        .await
+        .expect("capture");
+    assert_eq!(
+        first.runtime_bound().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([object("app", "declares")])
+    );
+    assert!(
+        !bound(&first, &object("app", "declares")).contains(&user_type("dbo", "amount")),
+        "a one-part type is not a binding"
+    );
+    let scope = first.runtime_scope();
+    let in_app = candidate(CandidateClass::Type, "app", "amount");
+    assert!(scope.candidates.contains(&in_app));
+    assert!(
+        scope
+            .candidates
+            .contains(&candidate(CandidateClass::Type, "dbo", "amount"))
+    );
+    let sealed = capture::capture(&mut db.conn, &scope)
+        .await
+        .expect("capture");
+    assert_eq!(sealed.members(&in_app), Some(&BTreeSet::new()));
+
+    run(&mut db.conn, &["CREATE TYPE app.amount FROM bigint;"]).await;
+    let (now, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differences
+            .iter()
+            .any(|d| d.change == InputChange::Membership),
+        "{differences:?}"
+    );
+    assert_eq!(
+        now.members(&in_app),
+        Some(&BTreeSet::from([user_type("app", "amount")]))
+    );
+    db.drop().await;
+}

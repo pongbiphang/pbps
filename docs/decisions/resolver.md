@@ -3546,6 +3546,11 @@ Planning does not use it yet (#2143).
     With no id the name does not exist yet, and it refuses: nothing can say
     what it will bind.
 
+  A one-part *type* in a body, such as a local variable's, is the same
+  case: its row's id moves to a type arriving in the module's schema
+  (measured), so it is runtime-bound, with `sys.types` candidates in the
+  module's schema and `dbo`.
+
   Types bind where they are used: a column's from `sys.columns`, which
   the dependency catalog does not list, and a parameter's from
   `sys.parameters`.
@@ -3599,5 +3604,7 @@ Planning does not use it yet (#2143).
 `mssql_an_encrypted_module_refuses_by_name` and
 `mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_it`
 `mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured` and
-`mssql_a_checks_disabled_and_untrusted_states_are_differences`, live;
+`mssql_a_checks_disabled_and_untrusted_states_are_differences` and
+`mssql_a_one_part_type_in_a_body_is_runtime_bound_with_type_candidates`,
+live;
 and the `resolver::capture` unit tests.

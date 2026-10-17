@@ -189,6 +189,26 @@ fn a_one_part_name_is_runtime_bound_and_binds_nothing_even_when_it_resolves() {
 }
 
 #[test]
+fn a_one_part_type_is_runtime_bound_and_asks_for_types_not_objects() {
+    let mut catalog = catalog();
+    let mut row = reference(None, "amount", Some(300));
+    row.class = 6;
+    catalog.dependencies.push(row);
+    let captured = captured(catalog, scope());
+    assert_eq!(
+        captured.runtime_bound().collect::<Vec<_>>(),
+        [&object("app", "v")]
+    );
+    assert_eq!(
+        captured.runtime_scope().candidates,
+        BTreeSet::from([
+            set(CandidateClass::Type, "app", "amount"),
+            set(CandidateClass::Type, "dbo", "amount"),
+        ])
+    );
+}
+
+#[test]
 fn a_call_has_sys_dbo_and_every_principals_schema_but_never_its_own() {
     let mut catalog = catalog();
     catalog.dependencies.push(call("q"));

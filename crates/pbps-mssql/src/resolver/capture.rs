@@ -68,6 +68,11 @@ pub enum CandidateClass {
     /// (§2): the set's members prove the name is the engine's, its absence
     /// that the call's other candidates apply.
     SystemProcedure,
+    /// Every type of the name in the schema. A one-part type in a module
+    /// body, such as a local variable's, resolves like a one-part object
+    /// name, in the module's schema and then `dbo`, again whenever it is
+    /// read (measured on #2141).
+    Type,
 }
 
 impl CandidateClass {
@@ -75,6 +80,7 @@ impl CandidateClass {
         match self {
             Self::Object => "sys.objects",
             Self::SystemProcedure => "sys.system_objects",
+            Self::Type => "sys.types",
         }
     }
 }
