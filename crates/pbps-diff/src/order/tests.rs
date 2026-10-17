@@ -681,6 +681,7 @@ fn attached_partition() -> Plan {
                 table: t("pt"),
                 parent: t("par"),
                 bound: PartitionBound::Default,
+                key: Vec::new(),
                 shape: Box::new(member),
             }),
             p(Change::SetPartitionDefault {

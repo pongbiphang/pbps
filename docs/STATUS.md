@@ -89,7 +89,8 @@ unlogged partition under a key from a table outside the declarations is
 refused from the catalog (#1595, DEC-1595.1). An ordinary table declared
 in its parent's `partitions:` with its parent's columns is attached with its
 rows, after a pre-flight count of the rows its range does not take (#1545,
-DEC-1545.1). A standing parent's columns change, recursed into every partition
+DEC-1545.1); a staged plan attaches a range or list partition without the
+scan, through a CHECK it validates first (#1638, DEC-1638.1). A standing parent's columns change, recursed into every partition
 (#1687, DEC-1687.1), and its indexes (#1688, DEC-1688.1), keys, checks and
 foreign keys (#1689, DEC-1689.1) are added and dropped, and it is renamed
 (#1690, DEC-1690.1). Attaching as the DEFAULT partition (#1639) stays refused

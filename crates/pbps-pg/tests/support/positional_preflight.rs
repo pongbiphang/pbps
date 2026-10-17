@@ -40,6 +40,7 @@ async fn an_attach_cannot_borrow_a_later_detachs_empty_range() {
             from: vec![pbps_model::BoundDatum::Value("0".into())],
             to: vec![pbps_model::BoundDatum::Value("10".into())],
         },
+        key: Vec::new(),
         shape: Box::new(shape.clone()),
     };
     let detach = Change::DetachPartition {
@@ -166,6 +167,7 @@ async fn tightening_sees_an_attached_child_only_after_the_attach() {
             from: vec![pbps_model::BoundDatum::Value("0".into())],
             to: vec![pbps_model::BoundDatum::Value("10".into())],
         },
+        key: Vec::new(),
         shape: Box::new(shape),
     };
     let ids = IdsFile {

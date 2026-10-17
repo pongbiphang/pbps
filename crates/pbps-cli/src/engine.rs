@@ -186,6 +186,38 @@ pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
     }
 }
 
+/// Takes out the temporary CHECK a staged attach left on its table, before
+/// `baseline` takes the database as it stands (#1638, DEC-1638.1).
+///
+/// Only under the exact name a table's identity in the project's ids file
+/// gives: never by a prefix. Not from the ledger: `baseline` is the remedy
+/// for an entry this build cannot read (DECISIONS 203), and a run that dies
+/// between the `ADD` and the `VALIDATE`'s checkpoint records nothing, so no
+/// entry's kind or ids can be asked first. No declared constraint can hold
+/// the name, the database cannot be read while a `NOT VALID` one stands, and
+/// a validated one is pbps's own. SQL Server's staged plans write none.
+/// Returns each removed, named, for the record.
+pub async fn remove_scan_checks(
+    conn: &mut Conn,
+    ids: &pbps_model::IdsFile,
+) -> anyhow::Result<Vec<String>> {
+    let removed = match conn.driver() {
+        Driver::Mssql => return Ok(Vec::new()),
+        Driver::Postgres => pbps_pg::staged::remove_scan_checks(conn, &ids.tables).await?,
+    };
+    Ok(removed
+        .into_iter()
+        .map(|check| {
+            let said = format!(
+                "the staged attach's temporary CHECK `{}` on `{}`",
+                check.name, check.table
+            );
+            println!("Removed {said}.");
+            said
+        })
+        .collect())
+}
+
 pub async fn latest(conn: &mut Conn) -> Result<Option<LedgerEntry>, LedgerError> {
     match conn.driver() {
         Driver::Mssql => pbps_mssql::state::latest(conn).await,

@@ -5976,6 +5976,7 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
                 table: t(table),
                 parent: t(parent),
                 bound,
+                key: Vec::new(),
                 shape: Box::default(),
             })],
         };
@@ -7812,6 +7813,7 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
                 table: TableName::new(&s, table),
                 parent: TableName::new(&s, "m"),
                 bound: B::Range { from, to },
+                key: Vec::new(),
                 shape: Box::default(),
             })],
         };
@@ -7937,6 +7939,7 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
                         from: vec![value("0")],
                         to: vec![value("10")],
                     },
+                    key: Vec::new(),
                     shape: Box::default(),
                 }),
                 pbps_model::PlannedChange::new(Change::AddForeignKey {

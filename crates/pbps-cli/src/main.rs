@@ -3485,7 +3485,7 @@ fn cmd_plan(
             "plan",
             json,
             "plan.unrenderable",
-            statements(&cs, dialect.as_ref()),
+            statements(&cs, dialect.as_ref(), pbps_model::PlanMode::Transactional),
         )?;
         let rehearsal = output::or_unanswerable(
             "plan",
@@ -3585,7 +3585,8 @@ fn render_sql(
     dialect: &dyn Dialect,
     baseline: &str,
 ) -> anyhow::Result<String> {
-    let statements = statements(cs, dialect)?;
+    // An offline plan is never staged: `--staged` needs a target.
+    let statements = statements(cs, dialect, pbps_model::PlanMode::Transactional)?;
     // No target to ask: UTC, as before, until #1918 gives a preview the
     // declared zone or a refusal (DEC-1916.1).
     Ok(sql_script(
@@ -3622,16 +3623,29 @@ pub(crate) fn sql_script(
 pub(crate) fn statements(
     cs: &pbps_model::ChangeSet,
     dialect: &dyn Dialect,
+    mode: pbps_model::PlanMode,
 ) -> anyhow::Result<Vec<pbps_dialect::Statement>> {
     let mut statements = Vec::new();
     for p in &cs.changes {
-        statements.extend(
-            dialect
-                .emit(&p.change, p.strategy)
-                .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))?,
-        );
+        statements.extend(emitted(dialect, p, mode)?);
     }
     Ok(statements)
+}
+
+/// One planned change's statements in a plan of `mode`. A staged plan
+/// commits each statement on its own, and the dialect may write a change
+/// otherwise for it (#1638, DEC-1638.1), so everything that counts a staged
+/// plan's statements per change counts these.
+pub(crate) fn emitted(
+    dialect: &dyn Dialect,
+    p: &pbps_model::PlannedChange,
+    mode: pbps_model::PlanMode,
+) -> anyhow::Result<Vec<pbps_dialect::Statement>> {
+    match mode {
+        pbps_model::PlanMode::Transactional => dialect.emit(&p.change, p.strategy),
+        pbps_model::PlanMode::Staged => dialect.emit_staged(&p.change, p.strategy),
+    }
+    .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))
 }
 
 /// How many changes `--staged` sees, which is not how many entries the plan

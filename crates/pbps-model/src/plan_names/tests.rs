@@ -521,6 +521,7 @@ fn an_attach_retires_known_column_identities_without_dropping_its_table() {
             table: t("a"),
             parent: t("parent"),
             bound: crate::PartitionBound::Default,
+            key: Vec::new(),
             shape: Box::new(Table::default()),
         }),
     ];
@@ -553,6 +554,7 @@ fn a_final_detachs_column_identity_does_not_leak_into_an_earlier_ownership_scope
             table: t("leaf"),
             parent: t("parent"),
             bound: crate::PartitionBound::Default,
+            key: Vec::new(),
             shape: Box::new(shape.clone()),
         })
     };

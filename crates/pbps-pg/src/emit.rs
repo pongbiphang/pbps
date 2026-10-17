@@ -48,7 +48,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_dialect::{Created, DialectError, Statement};
+use pbps_dialect::{Created, DialectError, ScanCheckStep, Statement};
 use pbps_model::{
     Cell, Change, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleId, ModuleKind,
     Permission, PrimaryKey, PublicAccess, ReferentialAction, ReplicaIdentity, RoutineArg, Row,
@@ -66,6 +66,16 @@ pub(crate) fn drop_failed_index(build: &pbps_dialect::IndexBuild) -> Result<Stri
         "DROP INDEX CONCURRENTLY {}.{};",
         quote(&build.table.schema)?,
         quote(&build.name)?
+    ))
+}
+
+/// Takes out a staged attach's temporary CHECK (#1638): after a failed
+/// `VALIDATE`, and before a `baseline` reads the table.
+pub(crate) fn drop_scan_check(check: &pbps_dialect::ScanCheck) -> Result<String, DialectError> {
+    Ok(format!(
+        "ALTER TABLE {} DROP CONSTRAINT {};",
+        qualified(&check.table)?,
+        quote(&check.name)?
     ))
 }
 
@@ -3828,6 +3838,192 @@ fn bound_clause(bound: &pbps_model::PartitionBound) -> String {
     }
 }
 
+/// An attach in a staged plan, where each statement commits on its own
+/// (#1638, DEC-1638.1): a CHECK that implies the bound is added `NOT VALID`,
+/// validated, and dropped once the attach has found it and skipped its scan.
+/// `None` where the single statement is the form, and the attach is
+/// [`emit`]'s.
+///
+/// Measured on 16 and 18:
+///
+/// - **Locks.** The `ADD … NOT VALID` takes the table's ACCESS EXCLUSIVE lock
+///   only for the statement. `VALIDATE` scans under SHARE UPDATE EXCLUSIVE,
+///   which blocks neither reads nor writes. The attach then logs `partition
+///   constraint for table "t" is implied by existing constraints` and leaves
+///   `seq_scan` where it was. In one transaction the first lock is held to
+///   the commit, and a reader waited through the scan all the same, so a
+///   transactional plan keeps the single statement.
+/// - **The CHECK.** The engine proves the bound from a CHECK that spells it
+///   as its own partition constraint does: every key column `IS NOT NULL` and
+///   the range's two ends compared column by column, or the list's values by
+///   `IN`, with `IS NULL` for a list's NULL. Untyped literals take the key
+///   columns' types. A `MINVALUE` or `MAXVALUE` end leaves out the columns
+///   after it.
+/// - **HASH is left out.** `satisfies_hash_partition` on a text key column
+///   is not proved by the same call written in a CHECK, with or without
+///   `COLLATE`, while an integer key is. A CHECK that is not proved costs a
+///   second scan, so a HASH bound attaches by the single statement.
+///
+/// The CHECK's name is the table's identity in the plan, so a resume and a
+/// `baseline` find it by name and never by a prefix (DEC-1638.1).
+pub(crate) fn staged_attach(change: &Change) -> Option<Sql> {
+    let Change::AttachPartition {
+        uid,
+        table,
+        parent,
+        bound,
+        key,
+        ..
+    } = change
+    else {
+        return None;
+    };
+    let expression = match bound_check(bound, key) {
+        Ok(Some(expression)) => expression,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    Some((|| {
+        let name = scan_check_name(uid);
+        let on = qualified(table)?;
+        let check = quote(&name)?;
+        Ok(vec![
+            Statement::new(format!(
+                "ALTER TABLE {on} ADD CONSTRAINT {check} CHECK ({expression}) NOT VALID;"
+            ))
+            .scan_check(table.clone(), &name, ScanCheckStep::Add),
+            Statement::new(format!("ALTER TABLE {on} VALIDATE CONSTRAINT {check};")).scan_check(
+                table.clone(),
+                &name,
+                ScanCheckStep::Validate,
+            ),
+            Statement::new(format!(
+                "ALTER TABLE {} ATTACH PARTITION {on} {};",
+                qualified(parent)?,
+                bound_clause(bound)
+            )),
+            Statement::new(format!("ALTER TABLE {on} DROP CONSTRAINT {check};")),
+        ])
+    })())
+}
+
+/// The temporary CHECK's name for the table whose identity is `uid`.
+pub fn scan_check_name(uid: &pbps_model::Uid) -> String {
+    format!("{SCAN_CHECK_PREFIX}{uid}")
+}
+
+/// What every [`scan_check_name`] starts with, and no declared check may
+/// (DEC-1638.1).
+pub const SCAN_CHECK_PREFIX: &str = "pbps_attach_";
+
+/// A CHECK expression on the parent's `key` that implies `bound`, or `None`
+/// where the staged form does not apply: a HASH or DEFAULT bound, an empty
+/// key (a plan from before #1638), or a range end the engine reads as empty.
+fn bound_check(
+    bound: &pbps_model::PartitionBound,
+    key: &[String],
+) -> Result<Option<String>, DialectError> {
+    use pbps_model::{BoundDatum, ListDatum, PartitionBound};
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let columns = key
+        .iter()
+        .map(|c| quote(c))
+        .collect::<Result<Vec<_>, _>>()?;
+    match bound {
+        PartitionBound::Default | PartitionBound::Hash { .. } => Ok(None),
+        PartitionBound::List { values } => {
+            let [column] = columns.as_slice() else {
+                return Ok(None);
+            };
+            let listed: Vec<String> = values
+                .iter()
+                .filter_map(|v| match v {
+                    ListDatum::Null => None,
+                    ListDatum::Value(v) => Some(value_literal(v)),
+                })
+                .collect();
+            let null = values.contains(&ListDatum::Null);
+            Ok(Some(match (listed.is_empty(), null) {
+                (true, true) => format!("{column} IS NULL"),
+                (true, false) => return Ok(None),
+                (false, false) => format!(
+                    "{column} IS NOT NULL AND {column} IN ({})",
+                    listed.join(", ")
+                ),
+                (false, true) => {
+                    format!("({column} IS NULL OR {column} IN ({}))", listed.join(", "))
+                }
+            }))
+        }
+        PartitionBound::Range { from, to } => {
+            if from.len() != columns.len() || to.len() != columns.len() {
+                return Ok(None);
+            }
+            // The values before the first infinite end, and how that end
+            // closes the comparison of the prefix: `(a, b) >= (1, MINVALUE)`
+            // is `a >= 1`, `>= (1, MAXVALUE)` is `a > 1`, `< (1, MAXVALUE)`
+            // is `a <= 1`, `< (1, MINVALUE)` is `a < 1`. An end of all values
+            // is `>=` below and `<` above.
+            let end = |data: &[BoundDatum], lower: bool| -> (Vec<String>, bool) {
+                let values: Vec<String> = data
+                    .iter()
+                    .map_while(|d| match d {
+                        BoundDatum::Value(v) => Some(value_literal(v)),
+                        BoundDatum::MinValue | BoundDatum::MaxValue => None,
+                    })
+                    .collect();
+                // `map_while` stops at an infinite end or at the end: a
+                // value cannot follow.
+                let inclusive = match data.get(values.len()) {
+                    None | Some(BoundDatum::MinValue) | Some(BoundDatum::Value(_)) => lower,
+                    Some(BoundDatum::MaxValue) => !lower,
+                };
+                (values, inclusive)
+            };
+            let mut parts: Vec<String> =
+                columns.iter().map(|c| format!("{c} IS NOT NULL")).collect();
+            for (data, lower) in [(from, true), (to, false)] {
+                let (values, inclusive) = end(data, lower);
+                if values.is_empty() {
+                    // `FROM (MINVALUE)` and `TO (MAXVALUE)` bound nothing;
+                    // the other two infinite ends bound an empty range,
+                    // which the single statement refuses as the engine does.
+                    match (data.first(), lower) {
+                        (Some(BoundDatum::MinValue), true)
+                        | (Some(BoundDatum::MaxValue), false) => continue,
+                        _ => return Ok(None),
+                    }
+                }
+                parts.push(lexicographic(&columns, &values, lower, inclusive));
+            }
+            Ok(Some(parts.join(" AND ")))
+        }
+    }
+}
+
+/// `(c1, …, cn) op (v1, …, vn)` over the first `values.len()` columns, column
+/// by column as the engine writes a range partition's constraint:
+/// `(a > 1 OR (a = 1 AND b >= 'x'))`.
+fn lexicographic(columns: &[String], values: &[String], lower: bool, inclusive: bool) -> String {
+    let strict = if lower { ">" } else { "<" };
+    let last = match (lower, inclusive) {
+        (true, true) => ">=",
+        (true, false) => ">",
+        (false, true) => "<=",
+        (false, false) => "<",
+    };
+    let (column, value) = (&columns[0], &values[0]);
+    if values.len() == 1 {
+        return format!("{column} {last} {value}");
+    }
+    format!(
+        "({column} {strict} {value} OR ({column} = {value} AND {}))",
+        lexicographic(&columns[1..], &values[1..], lower, inclusive)
+    )
+}
+
 /// A range or list partition made beside its parent's DEFAULT partition,
 /// which may hold rows of its range or values (#1547, DEC-1547.1, #1632). `CREATE ... PARTITION OF`
 /// refuses over such rows (#1171), so the partition is made as a plain table
@@ -5281,6 +5477,7 @@ mod tests {
                         from: vec![pbps_model::BoundDatum::Value("2024-01-01".into())],
                         to: vec![pbps_model::BoundDatum::MaxValue],
                     },
+                    key: Vec::new(),
                     shape: Box::default(),
                 },
                 Default::default(),
@@ -5298,6 +5495,144 @@ mod tests {
         );
         // Negative: nothing runs on a schema's path.
         assert!(!sql[0].contains("search_path"), "{sql:?}");
+    }
+
+    /// A staged attach validates a CHECK its bound implies, attaches, and
+    /// drops it, the CHECK named after the table's identity; a transactional
+    /// one stays the single statement (#1638, DEC-1638.1).
+    #[test]
+    fn a_staged_attach_validates_a_check_its_bound_implies_first() {
+        use pbps_model::{BoundDatum as D, ListDatum as L, PartitionBound as B};
+        let attach = |bound: B, key: &[&str]| Change::AttachPartition {
+            uid: "t_aaaaaa".parse().unwrap(),
+            table: "app.t".parse().unwrap(),
+            parent: "app.ev".parse().unwrap(),
+            bound,
+            key: key.iter().map(|k| k.to_string()).collect(),
+            shape: Box::default(),
+        };
+        let staged = |change: &Change| -> Vec<pbps_dialect::Statement> {
+            Postgres::new()
+                .emit_staged(change, Default::default())
+                .expect("emit")
+        };
+        let v = |s: &str| D::Value(s.into());
+        let range = attach(
+            B::Range {
+                from: vec![v("1"), v("x")],
+                to: vec![v("5"), D::MaxValue],
+            },
+            &["a", "b"],
+        );
+        let four = staged(&range);
+        assert_eq!(
+            four.iter().map(|s| s.sql.as_str()).collect::<Vec<_>>(),
+            [
+                "ALTER TABLE \"app\".\"t\" ADD CONSTRAINT \"pbps_attach_t_aaaaaa\" CHECK (\"a\" IS \
+                 NOT NULL AND \"b\" IS NOT NULL AND (\"a\" > E'1' OR (\"a\" = E'1' AND \"b\" >= \
+                 E'x')) AND \"a\" <= E'5') NOT VALID;",
+                "ALTER TABLE \"app\".\"t\" VALIDATE CONSTRAINT \"pbps_attach_t_aaaaaa\";",
+                "ALTER TABLE \"app\".\"ev\" ATTACH PARTITION \"app\".\"t\" FOR VALUES FROM \
+                 (E'1', E'x') TO (E'5', MAXVALUE);",
+                "ALTER TABLE \"app\".\"t\" DROP CONSTRAINT \"pbps_attach_t_aaaaaa\";",
+            ]
+        );
+        assert_eq!(
+            four.iter()
+                .map(|s| s.scan_check.as_ref().map(|c| c.step))
+                .collect::<Vec<_>>(),
+            [
+                Some(pbps_dialect::ScanCheckStep::Add),
+                Some(pbps_dialect::ScanCheckStep::Validate),
+                None,
+                None
+            ]
+        );
+        // Each end that opens with an infinite value bounds nothing, and the
+        // others close the prefix before it.
+        let expression = |change: &Change| {
+            let sql = staged(change)[0].sql.clone();
+            let start = sql.find("CHECK (").unwrap() + "CHECK (".len();
+            sql[start..sql.len() - ") NOT VALID;".len()].to_owned()
+        };
+        assert_eq!(
+            expression(&attach(
+                B::Range {
+                    from: vec![D::MinValue],
+                    to: vec![v("10")],
+                },
+                &["a"],
+            )),
+            "\"a\" IS NOT NULL AND \"a\" < E'10'"
+        );
+        assert_eq!(
+            expression(&attach(
+                B::Range {
+                    from: vec![v("5"), D::MaxValue],
+                    to: vec![v("7"), D::MinValue],
+                },
+                &["a", "b"],
+            )),
+            "\"a\" IS NOT NULL AND \"b\" IS NOT NULL AND \"a\" > E'5' AND \"a\" < E'7'"
+        );
+        let list = |values: Vec<L>| {
+            expression(&attach(
+                B::List {
+                    values: values.into_iter().collect(),
+                },
+                &["k"],
+            ))
+        };
+        assert_eq!(
+            list(vec![L::Value("a".into()), L::Value("b".into())]),
+            "\"k\" IS NOT NULL AND \"k\" IN (E'a', E'b')"
+        );
+        assert_eq!(
+            list(vec![L::Null, L::Value("a".into())]),
+            "(\"k\" IS NULL OR \"k\" IN (E'a'))"
+        );
+        assert_eq!(list(vec![L::Null]), "\"k\" IS NULL");
+
+        // Negative: a transactional plan, a HASH or DEFAULT bound, a plan
+        // with no key, and an empty range keep the single statement.
+        let single = |change: &Change, statements: Vec<pbps_dialect::Statement>| {
+            assert_eq!(statements.len(), 1, "{change:?}: {statements:?}");
+            assert!(
+                statements[0].sql.contains("ATTACH PARTITION"),
+                "{statements:?}"
+            );
+            assert!(statements[0].scan_check.is_none(), "{statements:?}");
+        };
+        single(
+            &range,
+            Postgres::new().emit(&range, Default::default()).unwrap(),
+        );
+        for change in [
+            attach(
+                B::Hash {
+                    modulus: 4,
+                    remainder: 1,
+                },
+                &["a"],
+            ),
+            attach(B::Default, &["a"]),
+            attach(
+                B::Range {
+                    from: vec![v("1")],
+                    to: vec![v("5")],
+                },
+                &[],
+            ),
+            attach(
+                B::Range {
+                    from: vec![D::MaxValue],
+                    to: vec![D::MaxValue],
+                },
+                &["a"],
+            ),
+        ] {
+            single(&change, staged(&change));
+        }
     }
 
     /// The rows the move counts are refused unless a human allowed the move,

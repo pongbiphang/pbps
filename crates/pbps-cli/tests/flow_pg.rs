@@ -9757,6 +9757,295 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
     );
 }
 
+/// A staged attach skips its scan through a CHECK it validates first, and
+/// what a stopped run leaves of that CHECK is pbps's to take out (#1638,
+/// DEC-1638.1). A `VALIDATE` that fails takes it out itself, with no
+/// checkpoint to resume from. An attach that fails after its checkpoint
+/// leaves it validated: `baseline` takes it out by its exact name before it
+/// records, as it does one a run that died before any checkpoint left, and
+/// `--resume` drops it as the run's last statement. Measured
+/// by `seq_scan`, the staged attach scans its table no more often than a
+/// transactional one does, which reads the table once more for the attach.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "attach-1638");
+    let connection = own.connection().to_owned();
+    on_server(&connection, "CREATE SCHEMA app");
+    let d = Demo::new("attach-1638");
+    let tree = |partitions: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!(
+                "table: app.ev\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 ts: {{type: date, nullable: false}}\nprimary_key: [id, ts]\n\
+                 partition_by: [ts]\npartitions:\n  \
+                 ev_2025: {{from: [\"2025-01-01\"], to: [\"2026-01-01\"]}}\n{partitions}"
+            ),
+        )
+        .unwrap();
+    };
+    let ordinary = |name: &str| {
+        std::fs::write(
+            d.dir.join(format!("schema/app.{name}.yml")),
+            format!(
+                "table: app.{name}\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 ts: {{type: date, nullable: false}}\nprimary_key: [id, ts]\n"
+            ),
+        )
+        .unwrap();
+    };
+    tree("");
+    for name in ["t", "u_st", "u_tx"] {
+        ordinary(name);
+    }
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &connection]));
+    on_server(
+        &connection,
+        "INSERT INTO app.t SELECT g, DATE '2024-01-01' + g % 300 FROM generate_series(1, 1000) g; \
+         INSERT INTO app.u_st SELECT g, DATE '2023-01-01' + g % 300 FROM generate_series(1, 1000) g; \
+         INSERT INTO app.u_tx SELECT g, DATE '2022-01-01' + g % 300 FROM generate_series(1, 1000) g",
+    );
+    let temporaries = || {
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_constraint WHERE conname LIKE 'pbps_attach_%'",
+        )
+    };
+    let attached = |name: &str| {
+        scalar(
+            &connection,
+            &format!("SELECT count(*) FROM pg_inherits WHERE inhrelid = 'app.{name}'::regclass"),
+        )
+    };
+    let stop = |name: &str, when: &str| {
+        on_server(
+            &connection,
+            &format!(
+                "CREATE FUNCTION public.{name}() RETURNS event_trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN IF {when} THEN RAISE EXCEPTION '{name}'; END IF; END $$; \
+                 CREATE EVENT TRIGGER {name} ON ddl_command_end WHEN TAG IN ('ALTER TABLE') \
+                 EXECUTE FUNCTION public.{name}()"
+            ),
+        );
+    };
+    let unstop = |name: &str| {
+        on_server(
+            &connection,
+            &format!("DROP EVENT TRIGGER {name}; DROP FUNCTION public.{name}()"),
+        );
+    };
+    let t_range = "  t: {from: [\"2024-01-01\"], to: [\"2025-01-01\"]}\n";
+    std::fs::remove_file(d.dir.join("schema/app.t.yml")).unwrap();
+    tree(t_range);
+    let plan = connected_artifact(&d, &connection, true);
+    let shown = std::fs::read_to_string(&plan).unwrap();
+    assert!(
+        shown.contains("\"key\": [\n"),
+        "the plan carries the key: {shown}"
+    );
+
+    // A: the VALIDATE fails. Its CHECK is taken out, and the run starts again
+    // without `--resume`.
+    stop(
+        "stop_validate",
+        "EXISTS (SELECT FROM pg_constraint WHERE conname LIKE 'pbps_attach_%' AND convalidated)",
+    );
+    let o = approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--staged", "--allow", "constraint"],
+    );
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        code(&o) != 0
+            && said.contains("statement 1 of 4 done (checkpointed with the next)")
+            && said.contains("was removed; the database is as the last checkpoint recorded it")
+            && said.contains("start this plan again with `pbps apply --staged` without `--resume`"),
+        "{said}"
+    );
+    assert_eq!((temporaries(), attached("t")), (0, 0), "{said}");
+    unstop("stop_validate");
+
+    // B: the attach fails after the VALIDATE's checkpoint. `baseline` takes
+    // the validated CHECK out by its name and says so in the record.
+    stop(
+        "stop_attach",
+        "EXISTS (SELECT FROM pg_inherits WHERE inhrelid = 'app.t'::regclass)",
+    );
+    let o = approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--staged", "--allow", "constraint"],
+    );
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        code(&o) != 0 && said.contains("statement 2 of 4 done (checkpoint #"),
+        "{said}"
+    );
+    assert_eq!((temporaries(), attached("t")), (1, 0), "{said}");
+    let o = succeeds(d.run(&[
+        "baseline",
+        "--db",
+        &connection,
+        "--reason",
+        "the attach is given up",
+    ]));
+    assert!(
+        stdout(&o).contains("Removed the staged attach's temporary CHECK `pbps_attach_t_"),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(temporaries(), 0);
+    let reason = latest_snapshot(&connection)
+        .reason
+        .map(pbps_model::Text::into_raw)
+        .unwrap_or_default();
+    assert!(
+        reason.starts_with("the attach is given up (first removed the staged attach's"),
+        "{reason}"
+    );
+
+    // B': a run that dies after the `ADD` commits and before the `VALIDATE`'s
+    // checkpoint records nothing: the newest entry is the baseline above.
+    // `baseline` still takes the CHECK out, which no declaration can name.
+    let removed = stdout(&o);
+    let name = removed
+        .split("CHECK `")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .expect("the removed CHECK is named");
+    on_server(
+        &connection,
+        &format!(
+            "ALTER TABLE app.t ADD CONSTRAINT \"{name}\" \
+             CHECK (ts >= DATE '2024-01-01') NOT VALID"
+        ),
+    );
+    // A reason the column holds only on its own keeps its own text: the
+    // note is left out rather than overflowing the record.
+    let full = format!("the run died{}", ".".repeat(988));
+    let o = succeeds(d.run(&["baseline", "--db", &connection, "--reason", &full]));
+    assert!(
+        stdout(&o).contains(&format!(
+            "Removed the staged attach's temporary CHECK `{name}`"
+        )),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(temporaries(), 0);
+    assert_eq!(
+        latest_snapshot(&connection)
+            .reason
+            .map(pbps_model::Text::into_raw)
+            .unwrap_or_default(),
+        full
+    );
+
+    // B'': the same, under a newest entry this build cannot read. `baseline`
+    // is that entry's remedy (DECISIONS 203), so the CHECK is found by the
+    // project's identities, not the ledger's.
+    on_server(
+        &connection,
+        &format!(
+            "ALTER TABLE app.t ADD CONSTRAINT \"{name}\" \
+             CHECK (ts >= DATE '2024-01-01') NOT VALID; \
+             UPDATE public.__pbps_state \
+             SET state_json = jsonb_set(state_json::jsonb, '{{version}}', '5')::text \
+             WHERE id = (SELECT max(id) FROM public.__pbps_state)"
+        ),
+    );
+    let o = d.run(&["verify", "--db", &connection]);
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        code(&o) != 0 && said.contains("this is a version 5 state"),
+        "{said}"
+    );
+    let o = succeeds(d.run(&["baseline", "--db", &connection, "--reason", "an old ledger"]));
+    assert!(
+        stdout(&o).contains(&format!(
+            "Removed the staged attach's temporary CHECK `{name}`"
+        )),
+        "{}",
+        stdout(&o)
+    );
+    assert_eq!(temporaries(), 0);
+    let reason = latest_snapshot(&connection)
+        .reason
+        .map(pbps_model::Text::into_raw)
+        .unwrap_or_default();
+    assert_eq!(
+        reason,
+        format!(
+            "an old ledger (first removed the staged attach's temporary CHECK `{name}` on \
+             `app.t`)"
+        )
+    );
+
+    // C: stopped there again, and resumed: the run drops the CHECK itself.
+    let plan = connected_artifact(&d, &connection, true);
+    let o = approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--staged", "--allow", "constraint"],
+    );
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    unstop("stop_attach");
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--staged", "--resume", "--allow", "constraint"],
+    ));
+    assert_eq!((temporaries(), attached("t")), (0, 1));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+
+    // D: as many scans of its table as a transactional attach makes, which
+    // scans it once more for the attach itself.
+    let scans = |name: &str| {
+        scalar(
+            &connection,
+            &format!(
+                "SELECT seq_scan FROM pg_stat_user_tables WHERE relid = 'app.{name}'::regclass"
+            ),
+        )
+    };
+    let mut deltas = Vec::new();
+    for (name, from, staged) in [("u_st", "2023", true), ("u_tx", "2022", false)] {
+        std::fs::remove_file(d.dir.join(format!("schema/app.{name}.yml"))).unwrap();
+        let ranges = std::fs::read_to_string(d.dir.join("schema/app.ev.yml")).unwrap();
+        let next = format!(
+            "  {name}: {{from: [\"{from}-01-01\"], to: [\"{}-01-01\"]}}\n",
+            from.parse::<i32>().unwrap() + 1
+        );
+        std::fs::write(d.dir.join("schema/app.ev.yml"), format!("{ranges}{next}")).unwrap();
+        let plan = connected_artifact(&d, &connection, staged);
+        let before = scans(name);
+        let flags: &[&str] = if staged {
+            &["--staged", "--allow", "constraint"]
+        } else {
+            &["--allow", "constraint"]
+        };
+        succeeds(approved_apply(&d, &connection, &plan, flags));
+        deltas.push(scans(name) - before);
+        assert_eq!((temporaries(), attached(name)), (0, 1), "{name}");
+    }
+    assert_eq!(
+        deltas[0], deltas[1],
+        "staged and transactional scans: {deltas:?}"
+    );
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// Index storage parameters go the whole way through the CLI (#1442):
 /// pulled with the index, changed in place by one `ALTER INDEX` that
 /// applies and verifies, after which the next plan is empty.

@@ -1009,6 +1009,7 @@ mod tests {
             table: t(),
             parent: "dbo.p".parse().unwrap(),
             bound: crate::PartitionBound::Default,
+            key: Vec::new(),
             shape: Box::new(shape),
         }]));
         assert_eq!(

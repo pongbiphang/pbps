@@ -75,6 +75,7 @@ fn changes(detach: bool, rebuild_first: bool) -> ChangeSet {
             table: table("child"),
             parent: table("parent"),
             bound: PartitionBound::Default,
+            key: Vec::new(),
             shape: Box::new(partition()),
         }
     };
@@ -468,6 +469,7 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
         table: child.clone(),
         parent,
         bound: PartitionBound::Default,
+        key: Vec::new(),
         shape: Box::new(attached),
     };
     let changes = if rebuild_first {

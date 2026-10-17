@@ -1465,6 +1465,7 @@ mod tests {
             table: "app.t".parse().unwrap(),
             parent: "app.ev".parse().unwrap(),
             bound: pbps_model::PartitionBound::Default,
+            key: Vec::new(),
             shape: Box::default(),
         };
         assert_eq!(
