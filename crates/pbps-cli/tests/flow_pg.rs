@@ -16,6 +16,9 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[path = "support/type_refs.rs"]
+mod type_refs;
+
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
 #[path = "support/alias_batches.rs"]

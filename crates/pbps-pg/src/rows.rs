@@ -156,6 +156,19 @@ pub fn query(
     scope: &RowScope,
 ) -> Result<Option<RowQuery>, RowsError> {
     let key = key_column(name, table)?;
+    if let Some((column, spec)) = table
+        .columns
+        .iter()
+        .find(|(_, c)| c.ty.type_ref().is_some())
+    {
+        return Err(RowsError::Unreadable {
+            table: name.clone(),
+            why: format!(
+                "its column `{column}` is `{}`, a user-defined type reference, and pbps reads no rows of this type",
+                spec.ty
+            ),
+        });
+    }
     // A row's values are scalars, and an array's base is its element's: read
     // as one, `{1,2}` would fail as a malformed integer, or worse. Refused
     // by name before any query, as `validate` refuses `data:` beside one
@@ -668,8 +681,14 @@ pub(crate) fn unwrapped(default: &str) -> &str {
 /// the type the whole expression has, which is what the engine coerces to
 /// the column's (DECISIONS 361). `None` where nothing was cast.
 pub(crate) fn unwrapped_with_type(default: &str) -> (&str, Option<String>) {
+    let (core, casts) = unwrapped_with_casts(default);
+    (core, casts.into_iter().next())
+}
+
+// An inner domain coercion survives an outer cast back to the column's type.
+pub(crate) fn unwrapped_with_casts(default: &str) -> (&str, Vec<String>) {
     let mut s = default.trim();
-    let mut outermost = None;
+    let mut casts = Vec::new();
     loop {
         let before = s;
         s = crate::emit::without_trailing_trivia(crate::emit::after_the_gap(s).0);
@@ -677,15 +696,15 @@ pub(crate) fn unwrapped_with_type(default: &str) -> (&str, Option<String>) {
             s = s[1..s.len() - 1].trim();
         }
         if let Some((rest, ty)) = without_a_cast_typed(s) {
-            outermost.get_or_insert(ty);
+            casts.push(ty);
             s = rest;
         }
         if let Some((rest, ty)) = without_a_cast_call_typed(s) {
-            outermost.get_or_insert(ty);
+            casts.push(ty);
             s = rest;
         }
         if s == before {
-            return (s, outermost);
+            return (s, casts);
         }
     }
 }
@@ -3114,5 +3133,22 @@ mod tests {
         );
         assert!(q.sql.contains("GROUP BY CAST(v.s AS numeric)"), "{}", q.sql);
         assert!(q.sql.contains("HAVING count(*) > 1"), "{}", q.sql);
+    }
+    #[test]
+    fn a_reference_column_refuses_the_row_query_before_any_value_is_read() {
+        let with = table(
+            Some(vec!["id"]),
+            &[("id", "integer", None), ("mood", "app.mood", None)],
+        );
+        let error = query(&name(), &with, &every()).unwrap_err().to_string();
+        assert!(
+            error.contains("user-defined type reference") && error.contains("mood"),
+            "{error}"
+        );
+        let without = table(
+            Some(vec!["id"]),
+            &[("id", "integer", None), ("mood", "text", None)],
+        );
+        assert!(query(&name(), &without, &every()).is_ok());
     }
 }

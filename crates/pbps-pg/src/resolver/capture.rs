@@ -40,6 +40,8 @@ pub(crate) struct Bound {
     pub row_compares: BTreeSet<(u32, u32)>,
     /// Every type: the type a coercion or a literal names.
     pub types: BTreeSet<u32>,
+    /// Domain coercions execute CHECKs; a CONST merely holds an already typed value.
+    pub domain_coercions: BTreeSet<u32>,
 }
 
 /// Where in the tree a row comparison's operator or family sits: the path to
@@ -83,7 +85,12 @@ pub(crate) fn bound_objects(text: &str, major: u32) -> Result<Bound, String> {
         match reference.class {
             nodes::ReferenceClass::Routine => bound.routines.insert(reference.oid),
             nodes::ReferenceClass::Operator => bound.operators.insert(reference.oid),
-            nodes::ReferenceClass::Type => bound.types.insert(reference.oid),
+            nodes::ReferenceClass::Type => {
+                if reference.node == "COERCETODOMAIN" {
+                    bound.domain_coercions.insert(reference.oid);
+                }
+                bound.types.insert(reference.oid)
+            }
             nodes::ReferenceClass::Relation
             | nodes::ReferenceClass::Collation
             | nodes::ReferenceClass::Role

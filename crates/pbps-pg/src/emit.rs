@@ -774,7 +774,7 @@ fn owned_sequence_statements(
         format!(
             "CREATE {}SEQUENCE {q} AS {} START WITH {} INCREMENT BY {}{};",
             if unlogged { "UNLOGGED " } else { "" },
-            types::normalize(&declared.ty)?,
+            sql_type(&declared.ty)?,
             sequence.start,
             sequence.increment,
             created_options(&sequence.options)
@@ -952,7 +952,7 @@ fn numbering(
                 "{found}\n\
                  EXECUTE pg_catalog.format('ALTER SEQUENCE %s AS {} START WITH {} INCREMENT BY \
                  {}{}', pbps.pbps_seq);",
-                types::normalize(ty)?,
+                sql_type(ty)?,
                 sequence.start,
                 sequence.increment,
                 retuned_options(&was.options, &sequence.options, "")
@@ -1040,7 +1040,7 @@ fn numbering(
             let q = qualified(&owned_sequence(table, &column.name, sequence))?;
             body.push(format!(
                 "CREATE SEQUENCE {q} AS {} START WITH {} INCREMENT BY {}{};",
-                types::normalize(ty)?,
+                sql_type(ty)?,
                 sequence.start,
                 sequence.increment,
                 created_options(&sequence.options)
@@ -1113,6 +1113,19 @@ fn numbering(
     block(&body, &variables)
 }
 
+fn sql_type(ty: &ColumnType) -> Result<String, DialectError> {
+    let normalized = types::normalize(ty)?;
+    match normalized.type_ref() {
+        Some(reference) => Ok(format!(
+            "{}.{}{}",
+            quote(reference.schema())?,
+            quote(reference.name())?,
+            if normalized.is_array() { "[]" } else { "" }
+        )),
+        None => Ok(normalized.to_string()),
+    }
+}
+
 /// One line of a `CREATE TABLE` column list, or the body of an `ALTER TABLE ADD`.
 fn column_definition(
     table: &TableName,
@@ -1122,7 +1135,7 @@ fn column_definition(
     if let Some(collation) = &column.collation {
         return Err(no_column_collation(name, collation));
     }
-    let mut s = format!("{} {}", quote(name)?, types::normalize(&column.ty)?);
+    let mut s = format!("{} {}", quote(name)?, sql_type(&column.ty)?);
     let default = match &column.value_source {
         pbps_model::ValueSource::None => None,
         pbps_model::ValueSource::Identity(id) => {
@@ -1615,7 +1628,7 @@ fn drop_primary_key(table: &TableName, pk: &PrimaryKey) -> Result<String, Dialec
 /// legal identifier that would do exactly that, with the rest of the block
 /// arriving as top-level SQL. Choosing a tag the body does not contain makes
 /// that unrepresentable rather than checked for.
-fn dollar_tag(body: &str) -> String {
+pub(crate) fn dollar_tag(body: &str) -> String {
     (0..)
         .map(|n| {
             if n == 0 {
@@ -2992,6 +3005,14 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         } => {
             let normalized = types::normalize(to)?;
             let was = types::normalize(from)?;
+            if from.type_ref().is_some() || to.type_ref().is_some() {
+                return Err(invalid(format!(
+                    "column `{}` cannot be changed from `{was}` to `{normalized}`: retyping a \
+                     user-defined type reference is not supported. Add the new column, fill \
+                     it in a declared step, and drop the old one.",
+                    column.name
+                )));
+            }
             // No `USING`, ever (ADR-0012 §5). Where the engine would need one,
             // the change is refused here with the clause named, rather than
             // carried to the server to fail there — or, worse, performed under
@@ -5001,11 +5022,12 @@ fn key_equals(
     key: &RowKey,
     key_type: Option<&ColumnType>,
 ) -> Result<String, DialectError> {
-    let operator = if key_type.is_some_and(|ty| types::normalize(ty).is_ok()) {
-        "OPERATOR(pg_catalog.=)"
-    } else {
-        "="
-    };
+    let operator =
+        if key_type.is_some_and(|ty| ty.type_ref().is_none() && types::normalize(ty).is_ok()) {
+            "OPERATOR(pg_catalog.=)"
+        } else {
+            "="
+        };
     Ok(format!(
         "{} {operator} {}",
         quote(key_column)?,
@@ -9221,6 +9243,59 @@ mod tests {
                 bare,
                 declared + labelled,
                 "{variable} used unlabelled: {sql}"
+            );
+        }
+    }
+    #[test]
+    fn reference_sql_quotes_both_parts_and_preserves_the_array_marker() {
+        assert_eq!(sql_type(&ty("app.mood[]")).unwrap(), "\"app\".\"mood\"[]");
+        assert_eq!(
+            sql_type(&ty("\"App\".\"Mood\"")).unwrap(),
+            "\"App\".\"Mood\""
+        );
+    }
+
+    #[test]
+    fn key_equality_distinguishes_references_from_catalogue_builtins() {
+        let key = RowKey::from("happy");
+        assert!(
+            key_equals("k", &key, Some(&ty("app.mood")))
+                .unwrap()
+                .contains(" = ")
+        );
+        assert!(
+            !key_equals("k", &key, Some(&ty("app.mood")))
+                .unwrap()
+                .contains("pg_catalog")
+        );
+        assert!(
+            key_equals("k", &key, Some(&ty("varchar(20)")))
+                .unwrap()
+                .contains("OPERATOR(pg_catalog.=)")
+        );
+    }
+
+    #[test]
+    fn every_retype_involving_a_reference_is_refused_with_the_same_remedy() {
+        for (from, to) in [
+            ("app.mood", "text"),
+            ("text", "app.mood"),
+            ("app.mood", "app.other"),
+            ("app.mood[]", "app.other[]"),
+            ("app.mood", "app.mood[]"),
+        ] {
+            let error = Postgres::new()
+                .emit(&retype(from, to), pbps_model::Strategy::default())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("retyping a user-defined type reference")
+                    && error.contains("fill it in a declared step"),
+                "{error}"
+            );
+            assert_eq!(
+                types::change_risk(&ty(from), &ty(to)),
+                pbps_dialect::TypeChangeRisk::Incompatible
             );
         }
     }

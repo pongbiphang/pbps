@@ -688,6 +688,10 @@ fn columns_query() -> String {
     format!(
         "SELECT a.attrelid::int8 AS table_oid, a.attnum::int4 AS attnum, a.attname AS name,
             pg_catalog.format_type(a.atttypid, a.atttypmod) AS ty,
+            ut.oid::int8 AS user_type_oid, un.nspname AS user_type_schema,
+            ut.typname AS user_type_name, ut.typtype::text AS user_type_kind,
+            ut.typisdefined AS user_type_defined, ur.relkind::text AS user_type_relkind,
+            (el.oid IS NOT NULL) AS type_array,
             NOT a.attnotnull AS nullable,
             pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS default_expr,
             a.attidentity::text AS identity_kind,
@@ -722,6 +726,10 @@ fn columns_query() -> String {
        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
        JOIN pg_catalog.pg_type ty ON ty.oid = a.atttypid
+       LEFT JOIN pg_catalog.pg_type el ON el.oid = ty.typelem AND el.typarray = ty.oid
+       LEFT JOIN pg_catalog.pg_type ut ON ut.oid = COALESCE(el.oid, ty.oid) AND ut.oid >= 16384
+       LEFT JOIN pg_catalog.pg_namespace un ON un.oid = ut.typnamespace
+       LEFT JOIN pg_catalog.pg_class ur ON ur.oid = ut.typrelid
        LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
        LEFT JOIN (pg_catalog.pg_depend own
                   JOIN pg_catalog.pg_class seq
@@ -829,9 +837,14 @@ fn constraints_query() -> String {
 /// *preferred* type in the same category that the column's type is binary
 /// coercible to, which is how `varchar` reaches `text_ops`; the `count(*) = 1`
 /// guard is its "ambiguous operator class" case.
+/// Enum, composite, array and range/multirange domain keys use polymorphic
+/// `anyenum`, `record`, `anyarray`, `anyrange` and `anymultirange` defaults,
+/// with no `pg_cast` entry (measured on 16 and 18). They are a fallback after
+/// exact and preferred-type matches.
 ///
-/// A domain is unwrapped to its base type first, for the same reason the engine
-/// does it. And a key's class is reported unless it `IS NOT DISTINCT FROM` the
+/// All domain layers are unwrapped first: `typbasetype` preserves the immediate
+/// domain base, while the engine uses the ultimate base (measured on 16 and 18).
+/// A key's class is reported unless it `IS NOT DISTINCT FROM` the
 /// resolved default, so a default this query cannot resolve reports the class
 /// rather than passing it as the default — not being able to tell is not the
 /// same as there being nothing to tell.
@@ -884,7 +897,18 @@ fn indexes_query() -> String {
                                               WHERE ct.castsource = col.coltype
                                                 AND ct.casttarget = oc.opcintype
                                                 AND ct.castmethod = 'b'
-                                                AND ct.castcontext = 'i')))
+                                                AND ct.castcontext = 'i')),
+                             (SELECT CASE WHEN count(*) = 1 THEN min(oc.oid) END
+                                FROM pg_catalog.pg_opclass oc
+                                JOIN pg_catalog.pg_type st ON st.oid = col.coltype
+                               WHERE oc.opcmethod = ic.relam AND oc.opcdefault
+                                 AND ((st.typtype = 'e' AND oc.opcintype = 'pg_catalog.anyenum'::pg_catalog.regtype)
+                                   OR (st.typtype = 'c' AND oc.opcintype = 'pg_catalog.record'::pg_catalog.regtype)
+                                   OR (st.typtype = 'r' AND oc.opcintype = 'pg_catalog.anyrange'::pg_catalog.regtype)
+                                   OR (st.typtype = 'm' AND oc.opcintype = 'pg_catalog.anymultirange'::pg_catalog.regtype)
+                                   OR (oc.opcintype = 'pg_catalog.anyarray'::pg_catalog.regtype
+                                       AND EXISTS (SELECT 1 FROM pg_catalog.pg_type el
+                                                    WHERE el.oid = st.typelem AND el.typarray = st.oid)))))
                            THEN ''
                            ELSE ocn.nspname || '.' || occ.opcname END
                       ORDER BY k.n), '[]'::pg_catalog.json)
@@ -892,10 +916,16 @@ fn indexes_query() -> String {
                JOIN pg_catalog.pg_opclass occ ON occ.oid = i.indclass[k.n - 1]
                JOIN pg_catalog.pg_namespace ocn ON ocn.oid = occ.opcnamespace
                LEFT JOIN LATERAL (
-                 SELECT COALESCE(
-                   (SELECT t.typbasetype FROM pg_catalog.pg_type t
-                     WHERE t.oid = a.atttypid AND t.typtype = 'd' AND t.typbasetype <> 0),
-                   a.atttypid) AS coltype
+                 SELECT (
+                   WITH RECURSIVE bases(oid) AS (
+                     SELECT a.atttypid
+                     UNION
+                     SELECT t.typbasetype FROM bases b
+                       JOIN pg_catalog.pg_type t ON t.oid = b.oid
+                      WHERE t.typtype = 'd' AND t.typbasetype <> 0)
+                   SELECT b.oid FROM bases b
+                     JOIN pg_catalog.pg_type t ON t.oid = b.oid
+                    WHERE t.typtype <> 'd') AS coltype
                    FROM pg_catalog.pg_attribute a
                   WHERE (i.indkey[k.n - 1] <> 0
                          AND a.attrelid = i.indrelid AND a.attnum = i.indkey[k.n - 1])
@@ -1372,6 +1402,18 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             attnum: small(row, "attnum")?,
             name: text(row, "name")?,
             ty: text(row, "ty")?,
+            user_type: if row.integer("user_type_oid")?.is_some() {
+                Some(crate::introspect::RawUserType {
+                    schema: text(row, "user_type_schema")?,
+                    name: text(row, "user_type_name")?,
+                    kind: text(row, "user_type_kind")?,
+                    defined: flag(row, "user_type_defined")?,
+                    relkind: optional_text(row, "user_type_relkind")?,
+                    array: flag(row, "type_array")?,
+                })
+            } else {
+                None
+            },
             nullable: flag(row, "nullable")?,
             default: optional_text(row, "default_expr")?,
             identity,

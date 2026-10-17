@@ -5309,7 +5309,18 @@ pub fn cmd_bootstrap(
     // Emitted now and rendered at the write: the pins carry the zone the
     // build ran in, which a target tells only once connected (DEC-1916.1).
     let script = sql_out
-        .map(|_| crate::statements(&cs, dialect.as_ref(), pbps_model::PlanMode::Transactional))
+        .map(|_| -> anyhow::Result<_> {
+            let mut statements =
+                crate::statements(&cs, dialect.as_ref(), pbps_model::PlanMode::Transactional)?;
+            if let Some(guard) = crate::engine::bootstrap_type_guard(
+                dialect.name(),
+                &loaded.schema,
+                &project.config.trusted_roles,
+            )? {
+                statements.insert(0, guard);
+            }
+            Ok(statements)
+        })
         .transpose()?;
     let write_script = |zone: &SessionZone| -> anyhow::Result<()> {
         if let (Some(path), Some(statements)) = (sql_out, &script) {
@@ -5337,6 +5348,13 @@ pub fn cmd_bootstrap(
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+        let bootstrap_pins = crate::engine::seal_type_pins(
+            &mut conn,
+            &[&loaded.schema],
+            &cs,
+            &project.config.trusted_roles,
+        )
+        .await?;
         // A collation the server lacks is refused here, by name, rather than
         // by the `CREATE TABLE` that names it after the ones before it ran
         // (#1175).
@@ -5470,8 +5488,17 @@ pub fn cmd_bootstrap(
                 );
             }
 
+            crate::engine::recheck_type_prerequisites(&mut conn, &bootstrap_pins, &cs, false)
+                .await?;
             transaction_attempted = true;
-            execute_transaction_body(&mut conn, dialect.as_ref(), &statements).await?;
+            execute_transaction_body(
+                &mut conn,
+                dialect.as_ref(),
+                &statements,
+                &bootstrap_pins,
+                &cs,
+            )
+            .await?;
             // Bootstrap creates routines as `apply` does, so the same form is
             // required of a definer among them (#322).
             crate::engine::refuse_unsafe_definers(
@@ -5521,6 +5548,8 @@ pub fn cmd_bootstrap(
             crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
             let gone = crate::engine::absent_roles(&mut conn, &built.missing_roles).await?;
             let held = ids.without(&built.missing).without_roles(&gone);
+            crate::engine::recheck_type_prerequisites(&mut conn, &bootstrap_pins, &cs, true)
+                .await?;
             let mut snapshot = with_provenance(
                 project.root(),
                 StateSnapshot::new(StateKind::Bootstrap, built.schema, held, &operator),
@@ -5718,6 +5747,13 @@ pub fn cmd_plan_db(
 
     let connected = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
+        crate::engine::seal_type_pins(
+            &mut conn,
+            &[&loaded.schema],
+            &Default::default(),
+            &project.config.trusted_roles,
+        )
+        .await?;
         let mut findings = Vec::new();
 
         let Some(mut entry) = crate::engine::latest(&mut conn).await? else {
@@ -6129,6 +6165,15 @@ pub fn cmd_plan_db(
             )?;
         }
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
+        crate::engine::check_added_type_paths(
+            &mut conn,
+            &cs,
+            &resolved.ids,
+            &recorded_ids,
+            &project.config.trusted_roles,
+            false,
+        )
+        .await?;
         conn.begin(&dialect.transaction_framing(&pin_zone(&conn)))
             .await?;
         let checks = async {
@@ -6482,6 +6527,22 @@ pub fn cmd_plan_db(
         )?;
         let baseline = pbps_model::state_checksum(&pinned, &recorded_ids);
         let cost = crate::engine::operational_cost(&mut conn, &cs, &resolved.ids).await;
+        crate::engine::check_added_type_paths(
+            &mut conn,
+            &cs,
+            &resolved.ids,
+            &recorded_ids,
+            &project.config.trusted_roles,
+            false,
+        )
+        .await?;
+        let type_pins = crate::engine::seal_type_pins(
+            &mut conn,
+            &[&entry.snapshot.schema, &loaded.schema],
+            &cs,
+            &project.config.trusted_roles,
+        )
+        .await?;
         // Last, so that the routines are sealed as close to the gate as the
         // plan can get them. The managed set is the one `apply` rebuilds from
         // the ledger and the plan: what was recorded, and what is declared.
@@ -6557,6 +6618,7 @@ pub fn cmd_plan_db(
             findings,
             cost,
             routine_pins,
+            type_pins,
             resolver_assessment,
             resolution,
         ))))
@@ -6569,6 +6631,7 @@ pub fn cmd_plan_db(
         findings,
         cost,
         routine_pins,
+        type_pins,
         resolver_assessment,
         resolution,
     ) = match connected {
@@ -6676,6 +6739,8 @@ pub fn cmd_plan_db(
     // declarations' scope, carried so that `apply` needs no checkout.
     plan.data = loaded.schema.data_scopes();
     plan.routine_pins = routine_pins;
+    plan.type_pins = type_pins;
+    plan.trusted_roles = project.config.trusted_roles.clone();
     if let Some(resolution) = resolution {
         plan = plan.with_resolution(resolution.evidence).map_err(|e| {
             anyhow::anyhow!(
@@ -7280,7 +7345,7 @@ async fn apply_under_lock(
         conn,
         project,
         target,
-        plan.routine_pins.as_ref(),
+        plan,
         &pinned_managed,
         crate::pins::Check::BeforeProbes,
     )
@@ -7327,7 +7392,7 @@ async fn apply_under_lock(
             conn,
             project,
             target,
-            plan.routine_pins.as_ref(),
+            plan,
             &pinned_managed,
             crate::pins::Check::BeforeStatements,
         )
@@ -7338,6 +7403,15 @@ async fn apply_under_lock(
         if let Some(resolved) = resolved {
             resolved.before_statements(conn).await?;
         }
+        crate::engine::check_added_type_paths(
+            conn,
+            &plan.changes,
+            &plan.ids,
+            &recorded_ids,
+            &plan.trusted_roles,
+            true,
+        )
+        .await?;
         execute_statements(conn, statements, &data_guard).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
         crate::engine::refuse_unsafe_definers(
@@ -7435,7 +7509,7 @@ async fn apply_under_lock(
             conn,
             project,
             target,
-            plan.routine_pins.as_ref(),
+            plan,
             &pinned_managed,
             crate::pins::Check::BeforeRecording,
         )
@@ -7765,7 +7839,7 @@ async fn apply_staged_under_lock(
             conn,
             project,
             target,
-            plan.routine_pins.as_ref(),
+            plan,
             &pinned_managed(&entry.snapshot, &plan.changes),
             crate::pins::Check::BeforeProbes,
         )
@@ -7848,9 +7922,18 @@ async fn apply_staged_under_lock(
             conn,
             project,
             target,
-            plan.routine_pins.as_ref(),
+            plan,
             &pinned_managed,
             crate::pins::Check::BeforeStep { step: i + 1, total },
+        )
+        .await?;
+        crate::engine::check_added_type_paths(
+            conn,
+            &plan.changes,
+            &plan.ids,
+            &entry.snapshot.ids,
+            &plan.trusted_roles,
+            false,
         )
         .await?;
         let executed = if stmt.row_write.is_some() {
@@ -7885,7 +7968,7 @@ async fn apply_staged_under_lock(
                     conn,
                     project,
                     target,
-                    plan.routine_pins.as_ref(),
+                    plan,
                     &pinned_managed,
                     crate::pins::Check::BeforeStepCommits { step: i + 1, total },
                 )
@@ -8023,7 +8106,7 @@ async fn apply_staged_under_lock(
             conn,
             project,
             target,
-            plan.routine_pins.as_ref(),
+            plan,
             &pinned_managed,
             crate::pins::Check::AfterStep { step: i + 1, total },
         )
@@ -8118,7 +8201,7 @@ async fn apply_staged_under_lock(
         conn,
         project,
         target,
-        plan.routine_pins.as_ref(),
+        plan,
         &pinned_managed,
         crate::pins::Check::BeforeClosing,
     )
@@ -8509,6 +8592,15 @@ async fn preflight(
     // caller that gets the old bug back, and this function is the one whose
     // answers depend on it.
     pin_session(conn, dialect).await?;
+    crate::engine::check_added_type_paths(
+        conn,
+        &plan.changes,
+        &plan.ids,
+        stored_ids,
+        &plan.trusted_roles,
+        false,
+    )
+    .await?;
     drop_preflight(conn, dialect, &plan.changes, &plan.ids, stored, stored_ids).await?;
     // Asked again, as the edition is below: a table outside the declarations
     // can gain a key to the parent between the plan and this apply, and the
@@ -8827,10 +8919,13 @@ async fn execute_transaction_body(
     conn: &mut Conn,
     dialect: &dyn Dialect,
     statements: &[pbps_dialect::Statement],
+    type_pins: &[pbps_model::TypePin],
+    changes: &pbps_model::ChangeSet,
 ) -> anyhow::Result<()> {
     conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
         .await
         .context("cannot open a transaction")?;
+    crate::engine::recheck_type_prerequisites(conn, type_pins, changes, true).await?;
     execute_statements(conn, statements, &crate::engine::DataWriteGuard::default()).await
 }
 

@@ -1179,3 +1179,7 @@ limitation, so every table it recorded is neither, which is what the absent
 fields read as. An older build reading a version 25 plan would create an
 ordinary table where a partition tree was planned. The published schema set
 is 29.
+
+<a id="dec-1523-2"></a>
+
+**DEC-1523.2. State 26 admits type references; plan 43 requires their pins; published schema set 50 adds trusted_roles.** States 6–25 remain readable. Measured on 16 and 18, a referenced domain remains a domain in the column catalog: an older reader's omission cannot represent the new state. Plans require the current version so an older apply cannot skip prerequisites.
