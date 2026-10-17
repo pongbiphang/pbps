@@ -1080,3 +1080,153 @@ fn empty_arrays_still_evaluate_outer_domain_checks_and_keep_array_type_ownership
         succeeds(d.run(&["verify", "--db", db]));
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn enum_composite_array_range_and_multirange_keys_use_polymorphic_defaults() {
+    let setup = "CREATE SCHEMA app;
+        CREATE TYPE app.mood AS ENUM ('ok');
+        CREATE TYPE app.pair AS (n integer, s text);
+        CREATE DOMAIN app.mood_domain AS app.mood;
+        CREATE DOMAIN app.pair_domain AS app.pair;
+        CREATE DOMAIN app.moods_domain AS app.mood[];
+        CREATE DOMAIN app.int_range AS int4range;
+        CREATE DOMAIN app.int_multirange AS int4multirange";
+    let columns = [
+        ("mood", "app.mood"),
+        ("pair", "app.pair"),
+        ("moods", "app.mood[]"),
+        ("pairs", "app.pair[]"),
+        ("dm", "app.mood_domain"),
+        ("dp", "app.pair_domain"),
+        ("da", "app.moods_domain"),
+        ("dr", "app.int_range"),
+        ("dmr", "app.int_multirange"),
+    ];
+    // Measure both majors before relying on pbps's classification of a key.
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "refs_index_measure");
+        let db = own.connection();
+        on_server(db, setup);
+        on_server(
+            db,
+            &format!(
+                "CREATE TABLE app.measure ({})",
+                columns
+                    .iter()
+                    .map(|(name, ty)| format!("{name} {ty}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+        for (name, _) in columns {
+            on_server(
+                db,
+                &format!("CREATE INDEX ix_{name} ON app.measure ({name})"),
+            );
+        }
+        for (names, input, count) in [
+            ("'ix_mood','ix_dm'", "anyenum", 2),
+            ("'ix_pair','ix_dp'", "record", 2),
+            ("'ix_moods','ix_pairs','ix_da'", "anyarray", 3),
+            ("'ix_dr'", "anyrange", 1),
+            ("'ix_dmr'", "anymultirange", 1),
+        ] {
+            assert_eq!(
+                scalar(
+                    db,
+                    &format!(
+                        "SELECT count(*)::bigint FROM pg_catalog.pg_index i
+                JOIN pg_catalog.pg_class c ON c.oid=i.indexrelid
+                JOIN pg_catalog.pg_opclass oc ON oc.oid=i.indclass[0]
+                WHERE i.indrelid='app.measure'::regclass AND c.relname IN ({names})
+                  AND oc.opcdefault AND oc.opcintype='pg_catalog.{input}'::regtype"
+                    )
+                ),
+                count
+            );
+        }
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_catalog.pg_cast
+                WHERE castsource IN ('app.mood'::regtype, 'app.pair'::regtype,
+                                     'app.mood[]'::regtype, 'app.pair[]'::regtype,
+                                     'pg_catalog.int4range'::regtype, 'pg_catalog.int4multirange'::regtype)
+                  AND casttarget IN ('pg_catalog.anyenum'::regtype,
+                                     'pg_catalog.record'::regtype, 'pg_catalog.anyarray'::regtype,
+                                     'pg_catalog.anyrange'::regtype, 'pg_catalog.anymultirange'::regtype)"
+            ),
+            0
+        );
+        on_server(
+            db,
+            "CREATE INDEX ix_image ON app.measure (pair pg_catalog.record_image_ops)",
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_catalog.pg_index i
+            JOIN pg_catalog.pg_opclass oc ON oc.oid=i.indclass[0]
+            WHERE i.indexrelid='app.ix_image'::regclass AND NOT oc.opcdefault
+              AND oc.opcintype='pg_catalog.record'::regtype"
+            ),
+            1
+        );
+        let major = scalar(db, "SELECT current_setting('server_version_num')::bigint") / 10000;
+        eprintln!(
+            "PostgreSQL {major}: enum/domain keys use anyenum, composite/domain keys use record, array/domain keys use anyarray, range/multirange domain keys use anyrange/anymultirange; record_image_ops is nondefault"
+        );
+    }
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "refs_index_cli");
+        let db = own.connection();
+        on_server(db, setup);
+        let d = Demo::new("refs-index-roundtrip");
+        let mut extra = String::new();
+        let mut indexes = String::from("indexes:\n");
+        for (name, ty) in columns {
+            extra.push_str(&format!("  {name}: {{type: '{ty}'}}\n"));
+            indexes.push_str(&format!("  ix_{name}: {{columns: [{name}]}}\n"));
+        }
+        d.table(&format!("{}{indexes}", declarations(&extra)));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        succeeds(d.run(&["verify", "--db", db]));
+        let next: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
+        assert!(next.changes.is_empty(), "{:?}", next.changes);
+        // A connected apply must also read back an enum index it just built.
+        d.table(&format!(
+            "{}{indexes}  ix_mood_id: {{columns: [mood, id]}}\n",
+            declarations(&extra)
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = plan(&d, db);
+        succeeds(apply_plan(&d, db, &path, false));
+        succeeds(d.run(&["verify", "--db", db]));
+        succeeds(d.run(&["pull", "--db", db, "--force"]));
+        succeeds(d.run(&["validate"]));
+        let pulled = std::fs::read_to_string(d.dir.join("schema/app.t.yml")).unwrap();
+        for (name, _) in columns {
+            assert!(pulled.contains(&format!("ix_{name}")), "{pulled}");
+        }
+        let next: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
+        assert!(next.changes.is_empty(), "{:?}", next.changes);
+        // The polymorphic input type does not make every record class default.
+        on_server(
+            db,
+            "DROP INDEX app.ix_pair; CREATE INDEX ix_pair ON app.t (pair pg_catalog.record_image_ops)",
+        );
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("record_image_ops"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}

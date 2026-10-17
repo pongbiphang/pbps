@@ -837,6 +837,10 @@ fn constraints_query() -> String {
 /// *preferred* type in the same category that the column's type is binary
 /// coercible to, which is how `varchar` reaches `text_ops`; the `count(*) = 1`
 /// guard is its "ambiguous operator class" case.
+/// Enum, composite, array and range/multirange domain keys use polymorphic
+/// `anyenum`, `record`, `anyarray`, `anyrange` and `anymultirange` defaults,
+/// with no `pg_cast` entry (measured on 16 and 18). They are a fallback after
+/// exact and preferred-type matches.
 ///
 /// A domain is unwrapped to its base type first, for the same reason the engine
 /// does it. And a key's class is reported unless it `IS NOT DISTINCT FROM` the
@@ -892,7 +896,18 @@ fn indexes_query() -> String {
                                               WHERE ct.castsource = col.coltype
                                                 AND ct.casttarget = oc.opcintype
                                                 AND ct.castmethod = 'b'
-                                                AND ct.castcontext = 'i')))
+                                                AND ct.castcontext = 'i')),
+                             (SELECT CASE WHEN count(*) = 1 THEN min(oc.oid) END
+                                FROM pg_catalog.pg_opclass oc
+                                JOIN pg_catalog.pg_type st ON st.oid = col.coltype
+                               WHERE oc.opcmethod = ic.relam AND oc.opcdefault
+                                 AND ((st.typtype = 'e' AND oc.opcintype = 'pg_catalog.anyenum'::pg_catalog.regtype)
+                                   OR (st.typtype = 'c' AND oc.opcintype = 'pg_catalog.record'::pg_catalog.regtype)
+                                   OR (st.typtype = 'r' AND oc.opcintype = 'pg_catalog.anyrange'::pg_catalog.regtype)
+                                   OR (st.typtype = 'm' AND oc.opcintype = 'pg_catalog.anymultirange'::pg_catalog.regtype)
+                                   OR (oc.opcintype = 'pg_catalog.anyarray'::pg_catalog.regtype
+                                       AND EXISTS (SELECT 1 FROM pg_catalog.pg_type el
+                                                    WHERE el.oid = st.typelem AND el.typarray = st.oid)))))
                            THEN ''
                            ELSE ocn.nspname || '.' || occ.opcname END
                       ORDER BY k.n), '[]'::pg_catalog.json)
