@@ -187,3 +187,73 @@ cargo check --profile test -p pbps-cli --bin pbps --message-format json
 
 Optimizing every dependency (`profile.dev.package."*"`, `opt-level = 1`) was
 measured as a comparison and is not adopted (DEC-2113.1).
+
+## Resolver scratch profile comparison
+
+Measured #2114 on `8e6a6d344f6a13ac5be412285c7327a9fa5a9565`, including
+#2113, on a shared Intel Core i7-8850H host with Rust 1.99.0, two build jobs
+and debug information disabled in both profiles. Both used lane 4's same
+pinned PostgreSQL 18.6/16.15 targets and separate PostgreSQL 18.6 scratch.
+
+Build cost is marginal to the existing job sequence. Untimed preparation used
+`--no-run`: `pbps-pg --lib` under `live-test`, and `pbps-pg --test live`,
+`pbps-db --test live_pg`, `pbps-cli --bin pbps` and `pbps-cli --test flow_pg`
+under `test`. Each timed candidate was `cargo test --locked --profile
+<profile> -p pbps-cli --lib --no-run --message-format json`.
+
+CI's per-suite dependency cache hits in full (DEC-1370.1). `rust-cache` keeps
+third-party artifacts and rebuilds workspace crates by default
+(`cache-workspace-crates: false`). The cache-hit measurement populated both
+candidates first, then used `cargo clean --profile <profile> -p <package>`
+only for workspace packages each candidate had newly compiled. Cargo's
+records confirmed zero third-party rebuilds in both timed candidates.
+`test` rebuilt `pbps-cli`; `live-test` rebuilt `pbps-cli`, `pbps-config`,
+`pbps-db`, `pbps-dialect`, `pbps-diff`, `pbps-docs`, `pbps-load`, `pbps-model`,
+`pbps-mssql`, `pbps-pg`, `pbps-policy` and `pbps-ui`.
+
+The dependency-cache-miss comparison instead copied the prepared state once
+and restored it at the same absolute path between candidates, without first
+populating the extra CLI dependency variants. The temporary copy was deleted.
+
+| Build after existing steps | Profile | Wall | User CPU | System CPU |
+| --- | --- | ---: | ---: | ---: |
+| Dependency cache hit; workspace rebuild | `test` | 9.85 s | 12.40 s | 1.21 s |
+| Dependency cache hit; workspace rebuild | `live-test` | 270.26 s | 521.75 s | 11.45 s |
+| Dependency cache miss | `test` | 8.97 s | 10.96 s | 1.10 s |
+| Dependency cache miss | `live-test` | 426.98 s | 811.19 s | 22.60 s |
+
+After one full warm-up per profile, Cargo's artifact executables ran in
+`test`, `live-test`, `test`, `live-test` order, without compilation:
+
+```bash
+/usr/bin/time -f '%e %U %S' "$executable" \
+  --ignored --test-threads=1 resolver::server::scratch::live_tests --show-output
+```
+
+| Trial | Profile | Wall | User CPU | 1,000 roles | 10,000 roles |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | `test` | 1380.86 s | 947.44 s | 14.94 s | 29.68 s |
+| 1 | `live-test` | 623.97 s | 232.81 s | 5.94 s | 12.25 s |
+| 2 | `test` | 1338.98 s | 935.08 s | 14.35 s | 30.47 s |
+| 2 | `live-test` | 639.91 s | 240.47 s | 6.04 s | 12.23 s |
+
+Both warm-ups and all four trials passed the identical 76 scratch tests,
+including the Docker cases. No known flake occurred. The role-cost test's
+20 s difference bound had gaps of 14.74/16.12 s under `test` and 6.31/6.20 s
+under `live-test`. Cargo's artifact records showed optimization levels 0/1
+and debug information 0 for the harnesses and all workspace libraries, with
+`debug_assertions` and `overflow_checks` true. Both profiles retained #2113's
+optimization level 3 for `postgres-protocol` and `sha2 0.11`.
+
+Both paired user-CPU savings, 714.63/694.61 s, exceed the cache-hit workspace
+build premium of 509.35 s. This premium is an upper bound because cleaning
+also removed `pbps-model`, `pbps-dialect`, `pbps-db`, `pbps-diff` and
+`pbps-load`, which the job's earlier `pbps-pg --lib` step already builds under
+`live-test`, so the actual premium is lower and strengthens the decision.
+The scratch runners therefore select `live-test`
+(DEC-1208.1), saving a median 195.27 s of CPU after compilation. The per-suite
+`live-pg` job is on the merge-group critical path: median execution wall
+saving is 727.98 s against 260.41 s extra build wall, net 467.57 s. CPU remains
+the deciding metric. With the extra dependency variants missing, the 800.23 s
+CPU build premium takes two module executions to amortize; dependency-cache
+reuse is part of this tradeoff.
