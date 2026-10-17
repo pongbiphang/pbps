@@ -85,6 +85,7 @@ fn catalog() -> Catalog {
         parameters: Vec::new(),
         types: Vec::new(),
         synonyms: BTreeMap::new(),
+        table_types: BTreeMap::new(),
         constraints: BTreeMap::new(),
         dependencies: Vec::new(),
         objects_named: BTreeMap::from([(("app".into(), "v".into()), BTreeSet::from([VIEW]))]),

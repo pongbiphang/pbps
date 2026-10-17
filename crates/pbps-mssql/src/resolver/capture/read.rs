@@ -70,6 +70,41 @@ pub(super) struct Parameter {
     pub readonly: bool,
 }
 
+/// One column of a user-defined table type, keyed by the type.
+pub(super) struct TypeColumn {
+    pub id: i64,
+    pub name: String,
+    pub user_type: i64,
+    pub max_length: i64,
+    pub precision: i64,
+    pub scale: i64,
+    pub collation: Option<String>,
+    pub nullable: bool,
+    pub identity: bool,
+    pub computed: Option<String>,
+    pub default: Option<String>,
+}
+
+/// One key column of a table type's primary key or unique constraint.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub(super) struct TypeKey {
+    pub index: i64,
+    pub primary: bool,
+    pub ordinal: i64,
+    pub column: String,
+    pub descending: bool,
+}
+
+/// What a user-defined table type is made of. Its own table object is the
+/// engine's (`is_ms_shipped = 1`, measured on #2141), so the ordinary object
+/// reads never list it.
+#[derive(Default)]
+pub(super) struct TableType {
+    pub columns: Vec<TypeColumn>,
+    pub checks: Vec<String>,
+    pub keys: Vec<TypeKey>,
+}
+
 pub(super) struct Type {
     pub id: i64,
     pub schema: i64,
@@ -136,6 +171,8 @@ pub(super) struct Catalog {
     pub parameters: Vec<Parameter>,
     pub types: Vec<Type>,
     pub synonyms: BTreeMap<i64, String>,
+    /// Each user-defined table type's structure, by its `user_type_id`.
+    pub table_types: BTreeMap<i64, TableType>,
     pub constraints: BTreeMap<i64, Constraint>,
     pub dependencies: Vec<Dependency>,
     /// What each requested `(schema, name)` names in `sys.objects`, matched
@@ -231,6 +268,30 @@ const TYPES: &str = "SELECT CONVERT(nvarchar(20), user_type_id) AS id, \
     CONVERT(nvarchar(1), is_user_defined) AS user_defined, \
     CONVERT(nvarchar(1), is_table_type) AS table_type \
     FROM sys.types;";
+
+const TABLE_TYPE_COLUMNS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) AS type, \
+    CONVERT(nvarchar(20), c.column_id) AS id, CONVERT(nvarchar(128), c.name) AS name, \
+    CONVERT(nvarchar(20), c.user_type_id) AS user_type, \
+    CONVERT(nvarchar(20), c.max_length) AS max_length, \
+    CONVERT(nvarchar(20), c.precision) AS precision, CONVERT(nvarchar(20), c.scale) AS scale, \
+    CONVERT(nvarchar(128), c.collation_name) AS collation, \
+    CONVERT(nvarchar(1), c.is_nullable) AS nullable, CONVERT(nvarchar(1), c.is_identity) AS [identity], \
+    cc.definition AS computed, dc.definition AS [default] \
+    FROM sys.table_types tt JOIN sys.columns c ON c.object_id = tt.type_table_object_id \
+    LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id = c.column_id \
+    LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id;";
+
+const TABLE_TYPE_CHECKS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) AS type, ck.definition \
+    FROM sys.table_types tt JOIN sys.check_constraints ck ON ck.parent_object_id = tt.type_table_object_id;";
+
+const TABLE_TYPE_KEYS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) AS type, \
+    CONVERT(nvarchar(20), i.index_id) AS [index], CONVERT(nvarchar(1), i.is_primary_key) AS [primary], \
+    CONVERT(nvarchar(20), ic.key_ordinal) AS ordinal, CONVERT(nvarchar(128), c.name) AS [column], \
+    CONVERT(nvarchar(1), ic.is_descending_key) AS descending \
+    FROM sys.table_types tt JOIN sys.indexes i ON i.object_id = tt.type_table_object_id \
+    JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 \
+    JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+    WHERE i.is_primary_key = 1 OR i.is_unique_constraint = 1;";
 
 const SYNONYMS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
     CONVERT(nvarchar(1035), base_object_name) AS base FROM sys.synonyms;";
@@ -525,6 +586,49 @@ pub(super) async fn read(
             table_type: row.flag("table_type")?,
         });
     }
+    let mut table_types: BTreeMap<i64, TableType> = BTreeMap::new();
+    for row in rows(conn, TABLE_TYPE_COLUMNS).await? {
+        let row = Text(&row);
+        table_types
+            .entry(row.number("type")?)
+            .or_default()
+            .columns
+            .push(TypeColumn {
+                id: row.number("id")?,
+                name: row.required("name")?,
+                user_type: row.number("user_type")?,
+                max_length: row.number("max_length")?,
+                precision: row.number("precision")?,
+                scale: row.number("scale")?,
+                collation: row.optional("collation")?,
+                nullable: row.flag("nullable")?,
+                identity: row.flag("identity")?,
+                computed: row.optional("computed")?,
+                default: row.optional("default")?,
+            });
+    }
+    for row in rows(conn, TABLE_TYPE_CHECKS).await? {
+        let row = Text(&row);
+        table_types
+            .entry(row.number("type")?)
+            .or_default()
+            .checks
+            .push(row.required("definition")?);
+    }
+    for row in rows(conn, TABLE_TYPE_KEYS).await? {
+        let row = Text(&row);
+        table_types
+            .entry(row.number("type")?)
+            .or_default()
+            .keys
+            .push(TypeKey {
+                index: row.number("index")?,
+                primary: row.flag("primary")?,
+                ordinal: row.number("ordinal")?,
+                column: row.required("column")?,
+                descending: row.flag("descending")?,
+            });
+    }
     let mut synonyms = BTreeMap::new();
     for row in rows(conn, SYNONYMS).await? {
         let row = Text(&row);
@@ -629,6 +733,7 @@ pub(super) async fn read(
         parameters,
         types,
         synonyms,
+        table_types,
         constraints,
         dependencies,
         objects_named,

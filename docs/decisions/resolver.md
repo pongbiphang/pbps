@@ -3567,6 +3567,12 @@ Planning does not use it yet (#2143).
   principals' default schemas, and every owner is a principal. An object the
   engine owns that something names, such as a `sys` view or a system
   procedure, is in the capture by identity only.
+- **What cannot be read is refused, not sealed.** A module created `WITH
+  ENCRYPTION` reads its definition as NULL even to `sa`, so it refuses by
+  name. A user-defined table type is captured with its columns, CHECKs and
+  keys. Its own table object is the engine's (`is_ms_shipped = 1`), so the
+  ordinary object reads never list it, and a type rebuilt with another shape
+  would otherwise read as unchanged.
 - **Ownership matches the catalog's spelling.** A declaration spelled
   differently owns nothing, which leaves its record unqualified, never
   another object's.
@@ -3578,5 +3584,8 @@ Planning does not use it yet (#2143).
 `mssql_a_procedure_calls_candidates_follow_sys_and_the_executing_principals`,
 `mssql_a_recapture_finds_a_lasting_change_from_another_session_and_not_a_restored_one`,
 `mssql_ownership_follows_the_declaration_and_an_owner_change_is_a_difference`
-and `mssql_a_candidate_is_matched_under_the_databases_collation`, live;
+`mssql_a_candidate_is_matched_under_the_databases_collation`,
+`mssql_an_encrypted_module_refuses_by_name` and
+`mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_it`,
+live;
 and the `resolver::capture` unit tests.

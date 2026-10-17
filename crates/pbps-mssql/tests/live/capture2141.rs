@@ -669,3 +669,76 @@ async fn mssql_a_candidate_is_matched_under_the_databases_collation() {
         db.drop().await;
     }
 }
+
+/// A module created `WITH ENCRYPTION` reads its definition as NULL to every
+/// reader, `sa` included: an unreadable definition is not an empty one, so
+/// the capture refuses it by name rather than seal what it cannot see.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_an_encrypted_module_refuses_by_name() {
+    let mut db = TestDb::create("encrypted2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE VIEW app.plain AS SELECT 1 AS one;",
+            "CREATE VIEW app.secret WITH ENCRYPTION AS SELECT 1 AS one;",
+        ],
+    )
+    .await;
+    capture::capture(&mut db.conn, &objects(&[("app", "plain")]))
+        .await
+        .expect("a readable module is captured");
+    let refused = capture::capture(&mut db.conn, &objects(&[("app", "secret")])).await;
+    assert!(
+        matches!(&refused, Err(CaptureError::Coverage(u)) if u.condition.contains("encrypted")),
+        "{:?}",
+        refused.err()
+    );
+    db.drop().await;
+}
+
+/// A table type is its columns, CHECKs and keys. Its own table object is the
+/// engine's (`is_ms_shipped = 1`), so the ordinary object reads never list
+/// it: a type rebuilt under the same name with another shape, with the
+/// procedure that takes it rebuilt alike, must still differ.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_it() {
+    let mut db = TestDb::create("tabletype2141").await;
+    let build = |label: &'static str| {
+        [
+            format!("CREATE TYPE app.rows AS TABLE (id int NOT NULL PRIMARY KEY, {label});"),
+            "CREATE PROCEDURE app.takes @r app.rows READONLY AS SELECT * FROM @r;".to_owned(),
+        ]
+    };
+    run(&mut db.conn, &["CREATE SCHEMA app;"]).await;
+    for batch in build("label nvarchar(20)") {
+        run(&mut db.conn, &[&batch]).await;
+    }
+    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "takes")]))
+        .await
+        .expect("capture");
+    let rows = user_type("app", "rows");
+    assert!(bound(&sealed, &object("app", "takes")).contains(&rows));
+    assert!(bound(&sealed, &rows).contains(&user_type("sys", "nvarchar")));
+
+    run(
+        &mut db.conn,
+        &["DROP PROCEDURE app.takes;", "DROP TYPE app.rows;"],
+    )
+    .await;
+    for batch in build("label nvarchar(40) CHECK (label <> N'')") {
+        run(&mut db.conn, &[&batch]).await;
+    }
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(&rows) && d.change == InputChange::Properties),
+        "{differences:?}"
+    );
+    db.drop().await;
+}

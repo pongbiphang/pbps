@@ -244,6 +244,14 @@ impl Builder<'_> {
         };
         properties.insert("parent".into(), json!(parent));
         if let Some(module) = catalog.modules.get(&id) {
+            // `WITH ENCRYPTION` hides the text from every reader, `sa`
+            // included: an unreadable definition is not an empty one.
+            if module.definition.is_none() {
+                return Err(Uncovered::object(
+                    &me,
+                    "an encrypted module's definition cannot be read",
+                ));
+            }
             let execute_as = match module.execute_as {
                 None => json!("caller"),
                 Some(-2) => json!("owner"),
@@ -480,7 +488,54 @@ impl Builder<'_> {
             } else {
                 None
             };
+            let mut bindings: BTreeSet<Binding> = base
+                .iter()
+                .map(|target| Binding {
+                    node: "sys.types".into(),
+                    path: Vec::new(),
+                    target: target.clone(),
+                })
+                .collect();
+            // A table type is its columns, CHECKs and keys: a procedure's
+            // table-valued parameter binds that shape.
+            let mut structure = None;
+            if found.table_type {
+                let table = self.index.catalog.table_types.get(&id).ok_or_else(|| {
+                    Uncovered::object(&me, "a table type's columns are not in the catalog")
+                })?;
+                let mut columns = Vec::new();
+                let mut ordered: Vec<_> = table.columns.iter().collect();
+                ordered.sort_by_key(|c| c.id);
+                for column in ordered {
+                    pending.push_back(column.user_type);
+                    let target = self.index.type_identity(column.user_type)?;
+                    bindings.insert(Binding {
+                        node: "sys.table_types".into(),
+                        path: vec![column.name.clone()],
+                        target: target.clone(),
+                    });
+                    columns.push(json!({
+                        "name": column.name,
+                        "column_id": column.id,
+                        "type": target,
+                        "max_length": column.max_length,
+                        "precision": column.precision,
+                        "scale": column.scale,
+                        "collation": column.collation,
+                        "nullable": column.nullable,
+                        "identity": column.identity,
+                        "computed": column.computed,
+                        "default": column.default,
+                    }));
+                }
+                let mut checks = table.checks.clone();
+                checks.sort();
+                let mut keys = table.keys.clone();
+                keys.sort();
+                structure = Some(json!({"columns": columns, "checks": checks, "keys": keys}));
+            }
             let properties = BTreeMap::from([
+                ("structure".to_owned(), json!(structure)),
                 ("base".to_owned(), json!(base)),
                 ("max_length".to_owned(), json!(found.max_length)),
                 ("precision".to_owned(), json!(found.precision)),
@@ -490,14 +545,6 @@ impl Builder<'_> {
                 ("user_defined".to_owned(), json!(found.user_defined)),
                 ("table_type".to_owned(), json!(found.table_type)),
             ]);
-            let bindings = base
-                .into_iter()
-                .map(|target| Binding {
-                    node: "sys.types".into(),
-                    path: Vec::new(),
-                    target,
-                })
-                .collect();
             self.insert(
                 me,
                 Input {
