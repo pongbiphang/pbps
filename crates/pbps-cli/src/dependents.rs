@@ -1862,12 +1862,16 @@ fn after_the_rebuilds(
     // recomputed column it validates, an `Effect` edge. `settle` holds it
     // right after the last of them; what waits for nothing keeps the
     // differ's place.
-    let expressions: Vec<(&ColumnRef, usize)> = cs.changes[..last]
+    // Keyed by the column each is, its parent's for a partition's: a
+    // partition's check or key over an inherited column validates the
+    // parent's recomputation as much as the parent's own (#2125 review).
+    let partitions = Partitions::of(declared);
+    let expressions: Vec<(ColumnRef, usize)> = cs.changes[..last]
         .iter()
         .enumerate()
         .filter_map(|(i, p)| match &p.change {
             Change::AlterColumnExpression { column, .. } if recomputed.contains(column) => {
-                Some((column, i))
+                Some((partitions.column(column), i))
             }
             _ => None,
         })
@@ -1887,21 +1891,43 @@ fn after_the_rebuilds(
             _ => "",
         })
         .collect();
-    let reach: Vec<BTreeSet<usize>> = (0..functions.len())
-        .map(|from| {
-            let mut seen = BTreeSet::from([from]);
-            let mut stack = vec![from];
-            while let Some(k) = stack.pop() {
-                for (j, (name, _)) in functions.iter().enumerate() {
-                    if !seen.contains(&j) && pbps_pg::generated::may_call(bodies[k], name) {
-                        seen.insert(j);
-                        stack.push(j);
-                    }
+    // Each body is read once for the functions it may call, and only for a
+    // function some addition reaches: a plan of routines alone reads none
+    // (#2125 review).
+    // A call spells the name, folded or quoted, so a body that does not hold
+    // it case-blind is not lexed for it. A name holding a quote may be spelled
+    // with it doubled, and a body with an escape (`U&`, a backslash) may spell
+    // any name in code points: both are always lexed.
+    let folded: Vec<String> = bodies.iter().map(|b| b.to_lowercase()).collect();
+    let escaped: Vec<bool> = folded
+        .iter()
+        .map(|b| b.contains("u&") || b.contains('\\'))
+        .collect();
+    let names: Vec<String> = functions.iter().map(|(n, _)| n.to_lowercase()).collect();
+    let mut callees: Vec<Option<Vec<usize>>> = vec![None; functions.len()];
+    let mut reach = |from: usize| -> BTreeSet<usize> {
+        let mut seen = BTreeSet::from([from]);
+        let mut stack = vec![from];
+        while let Some(k) = stack.pop() {
+            let next = callees[k].get_or_insert_with(|| {
+                (0..functions.len())
+                    .filter(|&j| {
+                        j != k
+                            && (escaped[k]
+                                || names[j].contains('"')
+                                || folded[k].contains(&names[j]))
+                            && pbps_pg::generated::may_call(bodies[k], &functions[j].0)
+                    })
+                    .collect()
+            });
+            for &j in next.iter() {
+                if seen.insert(j) {
+                    stack.push(j);
                 }
             }
-            seen
-        })
-        .collect();
+        }
+        seen
+    };
     let mut schedule = Schedule::new(cs.changes.len());
     let mut waiting = vec![false; last];
     for (i, p) in cs.changes[..last].iter().enumerate() {
@@ -1988,7 +2014,7 @@ fn after_the_rebuilds(
         if let Some(text) = &text {
             for (k, (name, _)) in functions.iter().enumerate() {
                 if pbps_pg::generated::may_call(text, name) {
-                    for &callee in &reach[k] {
+                    for callee in reach(k) {
                         schedule.edge(
                             functions[callee].1,
                             i,
@@ -2002,9 +2028,11 @@ fn after_the_rebuilds(
         }
         for (column, at) in &expressions {
             let reads = evaluated.zip(text.as_deref()).is_some_and(|(table, text)| {
-                column.table == *table && pbps_pg::generated::may_read(text, &column.name)
+                partitions.column(&table.column(&column.name)) == *column
+                    && pbps_pg::generated::may_read(text, &column.name)
             });
-            if *at != i && (columns.contains(column) || reads) {
+            let keyed = columns.iter().any(|c| partitions.column(c) == *column);
+            if *at != i && (keyed || reads) {
                 schedule.edge(*at, i, Source::Effect, OrderReason::Structural);
                 waiting[i] = true;
             }
@@ -6207,16 +6235,17 @@ mod tests {
             .unwrap();
             order(&cs)
         };
-        // `f` calls `g` and `g` calls `f`: created in name order, the check
-        // calling only `f` follows both.
+        // `f` calls `gx` and `gx` calls `f`: created in name order, the check
+        // calling only `f` follows both. `f` spells the call in capitals,
+        // which folds to `gx`.
         assert_eq!(
             run(vec![
-                routine("app.f()", "SELECT app.g()"),
+                routine("app.f()", "SELECT APP.GX()"),
                 check_of("calls_f", "app.f() > 0"),
-                routine("app.g()", "SELECT app.f()"),
+                routine("app.gx()", "SELECT app.f()"),
                 routine("app.h()", "SELECT 3"),
             ]),
-            ["app.f()", "app.g()", "calls_f", "app.h()"]
+            ["app.f()", "app.gx()", "calls_f", "app.h()"]
         );
         // Negative: `f` names no other function, so `g` is not waited for.
         assert_eq!(
@@ -6298,6 +6327,58 @@ mod tests {
                 routine("app.g()", "SELECT 2"),
             ]),
             ["app.f()", "names_other", "app.g()", "ix", "names_ix"]
+        );
+        // A parent's generated column recomputed by `g`: a partition's check
+        // reading the inherited column follows the recomputation too.
+        // Negative: a check on a table that is no partition of it does not.
+        let mut declared = Schema::default();
+        declared.tables.insert(
+            "app.ev_1".parse().unwrap(),
+            Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: "app.ev".parse().unwrap(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        let on = |table: &str, name: &str| Change::AddCheck {
+            table: table.parse().unwrap(),
+            name: name.into(),
+            constraint: CheckConstraint {
+                expression: "c >= app.f()".into(),
+            },
+        };
+        let mut cs = plan(vec![
+            Change::AlterColumnExpression {
+                uid: "c_d4e5f6".parse().unwrap(),
+                column: TableName::new("app", "ev").column("c"),
+                from: "id".into(),
+                to: "app.g(id)".into(),
+            },
+            routine("app.f()", "SELECT 1"),
+            on("app.ev_1", "partition_reads_c"),
+            on("app.u", "other_reads_c"),
+            routine("app.g()", "SELECT 2"),
+        ]);
+        after_the_rebuilds(
+            &mut cs,
+            &BTreeSet::new(),
+            &ModuleDeps::new(),
+            &declared,
+            pg().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            order(&cs),
+            [
+                "app.f()",
+                "other_reads_c",
+                "app.g()",
+                "app.ev",
+                "partition_reads_c"
+            ]
         );
     }
 

@@ -6304,11 +6304,16 @@ each addition waits for and lets `settle` place it:
   (`may_call`, DEC-1364.1's over-approximation, unchanged), and from each
   create a call may reach through the bodies of the plan's functions. An
   addition is evaluated over rows, so it runs what its function calls in
-  turn, and PL/pgSQL creates a mutually recursive pair in either order;
+  turn, and PL/pgSQL creates a mutually recursive pair in either order. A
+  body is read once, and only for a function some addition calls; a name it
+  does not hold case-blind is not lexed for, unless the name holds a quote or
+  the body an escape. A chain of 1000 functions with one check calling its
+  head settles in about 14 ms in a release build;
 - an `Effect` edge from a recomputed column's new expression to what
   validates its values: a `NOT NULL`, a key or index over it (each plain key,
   also beside an expression key), and a check or expression index whose text
-  may read it;
+  may read it, on its table or on a partition inheriting the column (columns
+  meet through `Partitions::column`);
 - an `Effect` edge from an addition that waits for any of these to each later
   change resting on what it brings (`rests_on`: a literal naming its
   relation, a foreign key on its unique index, a replica identity on it),
@@ -6342,9 +6347,9 @@ No call changed from accepted to refused or back.
 Pinned by `an_addition_runs_right_after_the_functions_its_text_names`: the
 placement, the two negatives (a function created ahead, no function named)
 and idempotency. `an_evaluated_addition_waits_for_what_its_call_reaches_and_the_columns_it_reads`
-pins the reach through a recursive pair, the check and the mixed index
-reading a recomputed column, and the check naming a delayed index, with a
-negative for each.
+pins the reach through a recursive pair (spelled in capitals), the check
+and the mixed index reading a recomputed column, a partition's check reading
+its parent's, and the check naming a delayed index, with a negative for each.
 
 Only a change reading a recomputed column, or resting on a delayed
 addition, can land later than the old pass put it: one naming no function
