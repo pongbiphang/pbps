@@ -253,6 +253,33 @@ fn null_default(column: &pbps_model::Column) -> bool {
         if crate::rows::unwrapped_with_type(expr).0.eq_ignore_ascii_case("null"))
 }
 
+fn empty_array_default(column: &pbps_model::Column) -> bool {
+    let pbps_model::ValueSource::Default(expr) = &column.value_source else {
+        return false;
+    };
+    if !column.ty.is_array() {
+        // In particular, a domain over an array still evaluates its own CHECK.
+        return false;
+    }
+    let (core, casts) = crate::rows::unwrapped_with_casts(expr);
+    let empty = core == "'{}'"
+        || (core
+            .get(..6)
+            .is_some_and(|s| s.eq_ignore_ascii_case("array["))
+            && core.ends_with(']')
+            && core[6..core.len() - 1]
+                .bytes()
+                .all(|b| b.is_ascii_whitespace()));
+    empty
+        && !casts.is_empty()
+        && casts.iter().all(|cast| {
+            cast.parse::<ColumnType>()
+                .ok()
+                .and_then(|ty| crate::types::normalize(&ty).ok())
+                .is_some_and(|ty| ty == column.ty)
+        })
+}
+
 /// Checking for rows reads no values through a user-defined type.
 pub async fn check_added(
     conn: &mut Conn,
@@ -296,7 +323,13 @@ pub async fn check_added(
         let fills_null = null_default(column)
             || matches!(&column.value_source, pbps_model::ValueSource::Generated(g)
                 if crate::rows::unwrapped_with_type(&g.expression).0.eq_ignore_ascii_case("null"));
-        let added = if fills_null { added.null_fill() } else { added };
+        let added = if fills_null {
+            added.null_fill()
+        } else if empty_array_default(column) {
+            added.empty_array_fill()
+        } else {
+            added
+        };
         let trusted: Vec<_> = trusted.iter().cloned().collect();
         let answers = crate::input_path::read(conn, within, &trusted, &[added]).await;
         let answer = answers
@@ -338,6 +371,43 @@ pub fn bootstrap_guard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_measured_empty_arrays_cast_to_the_column_element_type_skip_elements() {
+        let ty = "app.checked[]".parse::<ColumnType>().unwrap();
+        for expr in [
+            "ARRAY[]::app.checked[]",
+            "ARRAY[ \t\n ]::app.checked[]",
+            "CAST(ARRAY[] AS app.checked[])",
+            "'{}'::app.checked[]",
+            "CAST('{}' AS app.checked[])",
+            "(ARRAY[]::app.checked[])::app.checked[]",
+        ] {
+            let mut column = pbps_model::Column::new(ty.clone());
+            column.value_source = pbps_model::ValueSource::Default(expr.into());
+            assert!(empty_array_default(&column), "{expr}");
+        }
+        for expr in [
+            "ARRAY[NULL]::app.checked[]",
+            "ARRAY['x']::app.checked[]",
+            "'{x}'::app.checked[]",
+            "'{{}}'::app.checked[]",
+            "ARRAY[ARRAY[]]::app.checked[]",
+            "app.empty_array()::app.checked[]",
+            "'{}'",
+            "ARRAY[]",
+            "ARRAY[]::app.other[]",
+            "ARRAY[]::app.other[]::app.checked[]",
+            "ARRAY[\u{a0}]::app.checked[]",
+        ] {
+            let mut column = pbps_model::Column::new(ty.clone());
+            column.value_source = pbps_model::ValueSource::Default(expr.into());
+            assert!(!empty_array_default(&column), "{expr}");
+        }
+        let mut outer = pbps_model::Column::new("app.outer_domain".parse().unwrap());
+        outer.value_source = pbps_model::ValueSource::Default("ARRAY[]::app.checked[]".into());
+        assert!(!empty_array_default(&outer));
+    }
 
     #[test]
     fn bootstrap_guards_only_references_and_choose_a_tag_the_names_cannot_close() {

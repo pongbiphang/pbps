@@ -29,7 +29,8 @@
 //!   [`crate::catalog`]), or when the caller has declared it trusted. A role that
 //!   can act as an owner without being trusted is named in the refusal.
 //!
-//! A type contributing no evaluated code needs no trusted owner. A type whose
+//! Except for a proven-empty array cast, which retains its target owner check,
+//! a type contributing no evaluated code needs no trusted owner. A type whose
 //! whole input path runs no code at all is admitted without either
 //! question: an enum, a composite or an array whose leaves have no CHECK and no
 //! DEFAULT, a domain with neither. Nothing is evaluated, so nobody's code runs.
@@ -445,9 +446,10 @@ struct OwnedType {
 
 /// The verdict on what was read. `actors` maps a type to the untrusted roles
 /// that can act as its owner.
-fn verdict(facts: Facts, actors: &BTreeMap<Oid, Vec<String>>) -> InputPath {
-    // A path that runs nothing asks nobody anything: no owner, no routine.
-    if !facts.runs_code {
+fn verdict(facts: Facts, actors: &BTreeMap<Oid, Vec<String>>, check_owners: bool) -> InputPath {
+    // Ordinary code-free paths ask nobody anything. A proven-empty array
+    // skips element code only, retaining the cast target's owner check.
+    if !facts.runs_code && !check_owners {
         return InputPath::Admitted(Admitted { runs_code: false });
     }
     let mut reasons: Vec<Reason> = facts.routines.into_iter().map(Reason::Routine).collect();
@@ -463,7 +465,9 @@ fn verdict(facts: Facts, actors: &BTreeMap<Oid, Vec<String>>) -> InputPath {
     reasons.sort();
     reasons.dedup();
     if reasons.is_empty() {
-        InputPath::Admitted(Admitted { runs_code: true })
+        InputPath::Admitted(Admitted {
+            runs_code: facts.runs_code,
+        })
     } else {
         InputPath::Refused(reasons)
     }
@@ -492,6 +496,7 @@ pub struct Added<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fill {
     Null,
+    EmptyArray,
     StatementDefault,
     TypeDefault,
 }
@@ -525,6 +530,14 @@ impl<'a> Added<'a> {
     #[must_use]
     pub fn null_fill(mut self) -> Self {
         self.fill = Fill::Null;
+        self
+    }
+
+    /// A proven-empty array coerces no elements (measured on 16 and 18).
+    /// Retain the cast target's owner check while skipping element code.
+    #[must_use]
+    pub fn empty_array_fill(mut self) -> Self {
+        self.fill = Fill::EmptyArray;
         self
     }
 
@@ -707,14 +720,14 @@ async fn pass(
     let wanted: BTreeSet<Oid> = gathered
         .iter()
         .flatten()
-        .filter(|f| f.runs_code)
         .flat_map(|f| f.types.iter().map(|t| t.oid))
         .collect();
     let actors = untrusted_actors(conn, trusted, &wanted).await?;
     Ok(gathered
         .into_iter()
-        .map(|facts| match facts {
-            Ok(facts) => verdict(facts, &actors),
+        .zip(added)
+        .map(|(facts, column)| match facts {
+            Ok(facts) => verdict(facts, &actors, column.fill == Fill::EmptyArray),
             Err(why) => InputPath::Unreadable(Unreadable::Failed(why)),
         })
         .collect())
@@ -814,6 +827,26 @@ async fn gather(
             runs_code: false,
             routines: Vec::new(),
             types: Vec::new(),
+        });
+    }
+    if added.array && added.fill == Fill::EmptyArray {
+        let ty = reach(conn, &[root], false)
+            .await?
+            .into_iter()
+            .find(|t| t.oid == root)
+            .ok_or_else(|| {
+                DbError::BadRow(format!("type {root} disappeared while it was being read"))
+            })?;
+        return Ok(Facts {
+            runs_code: false,
+            routines: Vec::new(),
+            // PostgreSQL keeps an array's owner equal to its element type's.
+            // Check that owner without visiting the unevaluated element path.
+            types: vec![OwnedType {
+                oid: ty.oid,
+                ty: ty.name,
+                owner: ty.owner,
+            }],
         });
     }
     let mut evaluated = BTreeSet::new();
@@ -1491,7 +1524,7 @@ mod tests {
             types: vec![owned(40001, "app.mood", "mallory")],
         };
         let actors = BTreeMap::from([(40001, vec!["mallory".to_owned()])]);
-        let InputPath::Admitted(admitted) = verdict(facts, &actors) else {
+        let InputPath::Admitted(admitted) = verdict(facts, &actors, false) else {
             panic!("a path that runs no code must be admitted");
         };
         assert!(!admitted.runs_code());
@@ -1504,10 +1537,28 @@ mod tests {
             routines: Vec::new(),
             types: vec![owned(40002, "app.positive", "deployer")],
         };
-        let InputPath::Admitted(admitted) = verdict(facts, &no_actors()) else {
+        let InputPath::Admitted(admitted) = verdict(facts, &no_actors(), false) else {
             panic!("built-in code on a trusted type must be admitted");
         };
         assert!(admitted.runs_code());
+    }
+
+    #[test]
+    fn skipping_empty_array_elements_retains_the_target_owner_check() {
+        let facts = Facts {
+            runs_code: false,
+            routines: Vec::new(),
+            types: vec![owned(40002, "app.checked", "owner_role")],
+        };
+        let actors = BTreeMap::from([(40002, vec!["member".to_owned()])]);
+        let InputPath::Refused(reasons) = verdict(facts.clone(), &actors, true) else {
+            panic!("an empty array still requires a trusted target owner");
+        };
+        assert!(reasons[0].to_string().contains("member"));
+        assert_eq!(
+            verdict(facts, &no_actors(), true),
+            InputPath::Admitted(Admitted { runs_code: false })
+        );
     }
 
     #[test]
@@ -1517,7 +1568,7 @@ mod tests {
             routines: vec![user_function()],
             types: vec![owned(40002, "app.positive", "deployer")],
         };
-        let InputPath::Refused(reasons) = verdict(facts, &no_actors()) else {
+        let InputPath::Refused(reasons) = verdict(facts, &no_actors(), false) else {
             panic!("a user function must refuse");
         };
         assert_eq!(reasons, vec![Reason::Routine(user_function())]);
@@ -1539,7 +1590,7 @@ mod tests {
         };
         let actors =
             BTreeMap::from([(40002, vec!["member_a".to_owned(), "owner_role".to_owned()])]);
-        let InputPath::Refused(reasons) = verdict(facts, &actors) else {
+        let InputPath::Refused(reasons) = verdict(facts, &actors, false) else {
             panic!("an untrusted actor must refuse");
         };
         assert_eq!(reasons.len(), 2, "{reasons:?}");
@@ -1565,7 +1616,7 @@ mod tests {
             routines: vec![user_function(), user_function()],
             types: Vec::new(),
         };
-        let InputPath::Refused(reasons) = verdict(facts, &no_actors()) else {
+        let InputPath::Refused(reasons) = verdict(facts, &no_actors(), false) else {
             panic!("refused");
         };
         assert_eq!(reasons.len(), 1);
