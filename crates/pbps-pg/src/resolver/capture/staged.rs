@@ -55,6 +55,14 @@ impl Staged {
         self.compared.contains(object)
     }
 
+    /// `other`'s objects too: a fill's chained shapes are compared after the
+    /// compile, apart from what was staged before it (#1778).
+    pub fn extend(&mut self, other: Staged) {
+        self.compared.extend(other.compared);
+        self.accepted.extend(other.accepted);
+        self.described.extend(other.described);
+    }
+
     /// What changed on the target, among the shapes the comparison
     /// accepted, by the time of `current`, the capture the plan seals. The
     /// comparison and that capture are two reads; a writer between them
@@ -117,12 +125,15 @@ pub enum StageError {
 /// Compares what the externals file created on `scratch`, `created` as the
 /// inventory found it there, with the same objects on `target`: each root,
 /// and each extension member, on its own. `managed` is every side of the
-/// managed set the plan touches.
+/// managed set the plan touches. `filled` names, as `pg_describe_object`
+/// does, the roots and members fill created rather than the file, so a
+/// difference in one of them is named as fill's, with its remedy (#1778).
 pub async fn compare(
     scratch: &mut impl QueryConnection,
     target: &mut impl QueryConnection,
     created: &Created,
     managed: &[&Managed],
+    filled: &BTreeSet<String>,
 ) -> Result<Staged, StageError> {
     let mut resolved: BTreeMap<ObjectIdentity, String> = BTreeMap::new();
     let mut refused = Vec::new();
@@ -132,6 +143,11 @@ pub async fn compare(
                 Some(identity) => {
                     resolved.insert(identity, object.described.clone());
                 }
+                None if filled.contains(&object.described) => refused.push(format!(
+                    "fill created {}, which the comparison with the target does not cover; \
+                     select no resolver and keep ADR-0013's conservative rebuild",
+                    object.described
+                )),
                 None => refused.push(format!(
                     "the externals file created {}, which the comparison with the target does not \
                      cover; leave it out of the externals file",
@@ -149,6 +165,12 @@ pub async fn compare(
                 Some(identity) => {
                     resolved.insert(identity, object.described.clone());
                 }
+                None if filled.contains(&object.described) => refused.push(format!(
+                    "fill created {}, an extension's member the comparison with the target \
+                     cannot read, so no plan can seal its extension; select no resolver and \
+                     keep ADR-0013's conservative rebuild",
+                    object.described
+                )),
                 None => refused.push(format!(
                     "the externals file created {}, an extension's member the comparison with the \
                      target cannot read, so no plan can seal its extension; leave the \
@@ -195,10 +217,20 @@ pub async fn compare(
     let mut findings: Vec<String> = absent
         .iter()
         .map(|identity| {
-            format!(
-                "the externals file created {}, which the target does not have",
-                resolved[identity]
-            )
+            let described = &resolved[identity];
+            if filled.contains(described) {
+                // Fill created it as the target's dependencies name it; the
+                // target holds it under another identity now, as a member
+                // renamed after its extension was installed.
+                format!(
+                    "fill created {described}, which the target does not have: the target's was \
+                     changed after it was created, which fill cannot reproduce: write it in the \
+                     externals file as the target has it (an extension's member with its \
+                     extension and the change), and fill leaves it to the file"
+                )
+            } else {
+                format!("the externals file created {described}, which the target does not have")
+            }
         })
         .collect();
     let compared: BTreeSet<ObjectIdentity> = resolved.keys().cloned().collect();
@@ -213,6 +245,7 @@ pub async fn compare(
         &accepted,
         &shapes(&staged.inputs, &present),
         &resolved,
+        filled,
     ));
     if findings.is_empty() {
         Ok(Staged {
@@ -479,6 +512,7 @@ fn differences(
     target: &BTreeMap<ObjectIdentity, BTreeMap<String, Value>>,
     scratch: &BTreeMap<ObjectIdentity, BTreeMap<String, Value>>,
     described: &BTreeMap<ObjectIdentity, String>,
+    filled: &BTreeSet<String>,
 ) -> Vec<String> {
     let name = |object: &ObjectIdentity| {
         described
@@ -486,13 +520,44 @@ fn differences(
             .cloned()
             .unwrap_or_else(|| named(object))
     };
+    // The root or member fill created that `object` is, or is a part of:
+    // a column or a constraint names its owner first in its signature.
+    let fill_root = |object: &ObjectIdentity| {
+        let mut at = object;
+        for _ in 0..4 {
+            if let Some(root) = described.get(at).filter(|root| filled.contains(*root)) {
+                return Some(root.clone());
+            }
+            match at.signature.first() {
+                Some(owner) => at = owner,
+                None => break,
+            }
+        }
+        None
+    };
+    // The target's copy was changed after it was created, and a new one
+    // cannot be: the file, which wins over fill, can write it as it is.
+    let remedy = |root: &str| {
+        format!(
+            "; the target's was changed after it was created, which fill cannot reproduce: write \
+             {root} in the externals file as the target has it (an extension's member with its \
+             extension and the change), and fill leaves it to the file"
+        )
+    };
     let mut findings = Vec::new();
     for (object, on_target) in target {
         match scratch.get(object) {
-            None => findings.push(format!(
-                "the target has {} and the externals file does not",
-                name(object)
-            )),
+            None => findings.push(match fill_root(object) {
+                Some(root) => format!(
+                    "the target has {} and fill's {root} does not{}",
+                    name(object),
+                    remedy(&root)
+                ),
+                None => format!(
+                    "the target has {} and the externals file does not",
+                    name(object)
+                ),
+            }),
             Some(staged) if staged != on_target => {
                 let fields: Vec<&str> = on_target
                     .keys()
@@ -502,21 +567,36 @@ fn differences(
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect();
-                findings.push(format!(
-                    "the externals file's {} differs from the target's in {}",
-                    name(object),
-                    fields.join(", ")
-                ));
+                findings.push(match fill_root(object) {
+                    Some(root) => format!(
+                        "fill created {}, which differs from the target's in {}{}",
+                        name(object),
+                        fields.join(", "),
+                        remedy(&root)
+                    ),
+                    None => format!(
+                        "the externals file's {} differs from the target's in {}",
+                        name(object),
+                        fields.join(", ")
+                    ),
+                });
             }
             Some(_) => {}
         }
     }
     for object in scratch.keys() {
         if !target.contains_key(object) && described.get(object).is_none() {
-            findings.push(format!(
-                "the externals file has {} and the target does not",
-                name(object)
-            ));
+            findings.push(match fill_root(object) {
+                Some(root) => format!(
+                    "fill's {root} has {} and the target does not{}",
+                    name(object),
+                    remedy(&root)
+                ),
+                None => format!(
+                    "the externals file has {} and the target does not",
+                    name(object)
+                ),
+            });
         }
     }
     findings
@@ -670,6 +750,7 @@ mod tests {
             &shapes(&target, &roots),
             &shapes(&staged, &roots),
             &described,
+            &BTreeSet::new(),
         );
         assert_eq!(
             findings,
@@ -684,9 +765,25 @@ mod tests {
             differences(
                 &shapes(&target, &roots),
                 &shapes(&target, &roots),
-                &described
+                &described,
+                &BTreeSet::new(),
             )
             .is_empty()
+        );
+        // What fill created is named as fill's, with the remedy: the file
+        // wins over fill, and can write it as the target has it (#1778).
+        let filled = differences(
+            &shapes(&target, &roots),
+            &shapes(&staged, &roots),
+            &described,
+            &BTreeSet::from(["table ext.t".to_owned()]),
+        );
+        assert_eq!(
+            filled[0],
+            "fill created column a of relation ext.t, which differs from the target's in \
+             atttypid; the target's was changed after it was created, which fill cannot \
+             reproduce: write table ext.t in the externals file as the target has it (an \
+             extension's member with its extension and the change), and fill leaves it to the file"
         );
     }
 

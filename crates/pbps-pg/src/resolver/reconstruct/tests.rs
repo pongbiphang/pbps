@@ -770,3 +770,233 @@ fn a_compile_failure_is_a_verdict_only_when_the_server_judged_the_statement() {
         "refused".into()
     )));
 }
+
+/// A fill's chained shapes go just after the step that creates the last
+/// managed relation they name, which for a table generating from a declared
+/// function is among the modules, after that function (#1778).
+#[test]
+fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
+    use pbps_model::{Column, Generated, Module, Schema};
+    let mut generated = Column::new("integer".parse().unwrap());
+    generated.value_source = pbps_model::ValueSource::Generated(Generated {
+        expression: "app.f(id)".into(),
+        stored: true,
+    });
+    let mut n = Table::default();
+    n.columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    n.columns.insert("g".into(), generated);
+    let mut plain = Table::default();
+    plain
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let mut schema = Schema::default();
+    schema.tables.insert(TableName::new("app", "n"), n);
+    schema.tables.insert(TableName::new("app", "plain"), plain);
+    schema.modules.insert(
+        "app.f(integer)".parse().unwrap(),
+        Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+        },
+    );
+    let ids = pbps_diff::resolve(
+        &schema,
+        &pbps_model::IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "1778-test".into(),
+            today: "2026-10-17".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    let empty = Schema::default();
+    let bootstrap: Vec<_> = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &empty,
+            ids: &pbps_model::IdsFile::default(),
+        },
+        pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        },
+        &crate::Postgres::new(),
+        &pbps_model::Hints::default(),
+    )
+    .unwrap()
+    .changes
+    .into_iter()
+    .map(|planned| planned.change)
+    .collect();
+    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let at = |declaration: &str| {
+        reconstruction
+            .steps
+            .iter()
+            .position(|step| step.declaration == declaration)
+            .unwrap()
+    };
+    let named = |relations: &[(&str, &str)]| {
+        relations
+            .iter()
+            .map(|(schema, name)| ((*schema).to_owned(), (*name).to_owned()))
+            .collect::<BTreeSet<_>>()
+    };
+    assert!(at("function app.f(integer)") < at("table app.n"));
+    assert_eq!(
+        reconstruction.after_creating(&named(&[("app", "n")])),
+        Some(at("table app.n") + 1)
+    );
+    assert_eq!(
+        reconstruction.after_creating(&named(&[("app", "plain"), ("app", "n")])),
+        Some(at("table app.n") + 1),
+        "the last of them"
+    );
+    assert_eq!(
+        reconstruction.after_creating(&named(&[("app", "plain")])),
+        Some(at("table app.plain") + 1)
+    );
+    assert_eq!(
+        reconstruction.after_creating(&named(&[("app", "absent")])),
+        None,
+        "a relation no step creates"
+    );
+}
+
+/// Names made resolvable between two steps, as a fill's chained shapes are,
+/// count as later for a module compiled before them and not for one after
+/// (#1778).
+#[test]
+fn names_created_between_steps_are_later_only_for_modules_before_them() {
+    let mut reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap()).unwrap();
+    let view = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec!["app".into(), "v".into()],
+        signature: Vec::new(),
+    };
+    let shape = (Nameable::Type, "ext".to_owned(), "d".to_owned());
+    let later = |reconstruction: &Reconstruction| {
+        reconstruction
+            .later_names(&view)
+            .unwrap()
+            .contains(&(Nameable::Type, "ext", "d"))
+    };
+    assert!(!later(&reconstruction), "nothing is recorded yet");
+    let v = reconstruction
+        .steps
+        .iter()
+        .position(|step| step.declaration == "view app.v")
+        .unwrap();
+    reconstruction.created_before(v, vec![shape.clone()]);
+    assert!(!later(&reconstruction), "created before the view compiled");
+    reconstruction.created_before(v + 1, vec![shape]);
+    assert!(later(&reconstruction), "created after the view compiled");
+}
+
+/// A generated column's expression compiles in its table's step, so what
+/// came after that step is later for it; a plain column, or a table no
+/// step creates, has no such step (#1778).
+#[test]
+fn a_generated_columns_later_names_follow_its_tables_step() {
+    use pbps_model::{Column, Generated, Module, Schema};
+    let mut generated = Column::new("integer".parse().unwrap());
+    generated.value_source = pbps_model::ValueSource::Generated(Generated {
+        expression: "app.f(id)".into(),
+        stored: true,
+    });
+    let mut n = Table::default();
+    n.columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    n.columns.insert("g".into(), generated);
+    let mut schema = Schema::default();
+    schema.tables.insert(TableName::new("app", "n"), n);
+    for (name, definition) in [
+        (
+            "app.f(integer)",
+            "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1",
+        ),
+        ("app.v", "SELECT 1 AS x"),
+    ] {
+        let kind = if name.contains('(') {
+            ModuleKind::Function
+        } else {
+            ModuleKind::View
+        };
+        schema.modules.insert(
+            name.parse().unwrap(),
+            Module {
+                kind,
+                description: None,
+                definition: definition.into(),
+            },
+        );
+    }
+    let ids = pbps_diff::resolve(
+        &schema,
+        &pbps_model::IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "1778-test".into(),
+            today: "2026-10-17".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    let empty = Schema::default();
+    let bootstrap: Vec<_> = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &empty,
+            ids: &pbps_model::IdsFile::default(),
+        },
+        pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        },
+        &crate::Postgres::new(),
+        &pbps_model::Hints::default(),
+    )
+    .unwrap()
+    .changes
+    .into_iter()
+    .map(|planned| planned.change)
+    .collect();
+    let mut reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let table = reconstruction
+        .steps
+        .iter()
+        .position(|step| step.declaration == "table app.n")
+        .unwrap();
+    let later: Vec<_> = reconstruction.steps[table + 1..]
+        .iter()
+        .flat_map(|step| step.names.clone())
+        .collect();
+    let names = reconstruction
+        .later_names_generated("app", "n", "g")
+        .unwrap();
+    for (kind, schema, name) in &later {
+        assert!(
+            names.contains(&(*kind, schema.as_str(), name.as_str())),
+            "{later:?}"
+        );
+    }
+    assert!(
+        reconstruction
+            .later_names_generated("app", "n", "id")
+            .is_none()
+    );
+    assert!(
+        reconstruction
+            .later_names_generated("app", "x", "g")
+            .is_none()
+    );
+    reconstruction.created_before(table + 1, vec![(Nameable::Type, "ext".into(), "d".into())]);
+    assert!(
+        reconstruction
+            .later_names_generated("app", "n", "g")
+            .unwrap()
+            .contains(&(Nameable::Type, "ext", "d")),
+        "a fill after the table"
+    );
+}

@@ -600,9 +600,19 @@ SELECT e.oid::text AS oid, pg_catalog.quote_ident(e.extname) AS name, \
 
 // ---- What the draft writes -------------------------------------------------
 
-/// The draft for `facts`, with `managed` saying which objects the
-/// declarations manage.
-fn compose(facts: &Facts, managed: &dyn Fn(&Key) -> bool, schemas: &[String]) -> Draft {
+/// What a draft or a fill stages: every object outside the managed set
+/// that the managed objects reach, with the shapes those need in turn, and
+/// which of them form a chain.
+struct Survey<'a> {
+    folded: Folded<'a>,
+    drafted: BTreeSet<Key>,
+    chained: BTreeMap<Key, Chain>,
+}
+
+/// The survey of `facts`, with `managed` saying which objects the
+/// declarations manage and `schemas` the schemas whose every unmanaged
+/// object is staged too.
+fn survey<'a>(facts: &'a Facts, managed: &dyn Fn(&Key) -> bool, schemas: &[String]) -> Survey<'a> {
     let folded = Folded::new(facts);
     let user =
         |key: &Key| key.0 != "pg_namespace" && facts.objects.contains_key(key) && !managed(key);
@@ -678,6 +688,21 @@ fn compose(facts: &Facts, managed: &dyn Fn(&Key) -> bool, schemas: &[String]) ->
             chained.insert(key, Chain::Through(referenced));
         }
     }
+    Survey {
+        folded,
+        drafted,
+        chained,
+    }
+}
+
+/// The draft for `facts`, with `managed` saying which objects the
+/// declarations manage.
+fn compose(facts: &Facts, managed: &dyn Fn(&Key) -> bool, schemas: &[String]) -> Draft {
+    let Survey {
+        folded,
+        drafted,
+        chained,
+    } = survey(facts, managed, schemas);
     let described = |key: &Key| {
         facts
             .objects
@@ -763,6 +788,378 @@ fn compose(facts: &Facts, managed: &dyn Fn(&Key) -> bool, schemas: &[String]) ->
     Draft { sql, listed }
 }
 
+// ---- What fill stages -------------------------------------------------------
+
+/// The shapes a resolver run fills on scratch (#1778, DEC-1778.2): every
+/// object a draft would stage, read from the target at plan time, in the
+/// order that creates what a shape names before the shape. What the
+/// externals file created is left to it ([`Fill::staging`]).
+#[derive(Debug, Clone, Default)]
+pub struct Fill {
+    objects: Vec<Filled>,
+}
+
+#[derive(Debug, Clone)]
+struct Filled {
+    catalog: String,
+    described: String,
+    /// Its carried parts (an owned sequence, an index), by catalog and
+    /// description: an externals file that created one of them holds the
+    /// object, and fill does not create it again.
+    parts: Vec<(String, String)>,
+    /// The schemas its SQL writes into, quoted.
+    schemas: Vec<String>,
+    how: How,
+    /// What its shape names among the objects before it, by index.
+    names: Vec<usize>,
+    /// The managed relations its shape names, by schema and name: a chained
+    /// shape is created once the last of them exists.
+    after: BTreeSet<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+enum How {
+    /// Created after the externals file, before any managed object.
+    Ahead(String),
+    /// Its shape names a managed object, so it is created once the managed
+    /// tables exist and before anything else managed compiles.
+    Chained(String),
+    /// Not filled, and why.
+    Not(String),
+}
+
+/// What fill sends, once the externals file has run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Staging {
+    /// Run after the externals file, in the session that ran it: each
+    /// schema it writes into, then every object no managed object must
+    /// precede.
+    pub ahead: String,
+    /// Run once the managed relations in `chained_after` exist (empty for
+    /// none).
+    pub chained: String,
+    /// The managed relations, by schema and name, the chained shapes name.
+    pub chained_after: BTreeSet<(String, String)>,
+    /// What each chained object is, as `pg_describe_object` names it.
+    pub chained_objects: BTreeSet<String>,
+    /// What each filled object is, as `pg_describe_object` names it.
+    pub filled: BTreeSet<String>,
+    /// One finding for each object fill cannot stage, for a compile that
+    /// fails for want of one.
+    pub unfillable: Vec<String>,
+    /// Each chained object, in order: its description, its SQL, and the
+    /// managed relations it waits for, its own and those of the chained
+    /// objects it names.
+    links: Vec<Link>,
+}
+
+/// A chained object: its description, its SQL, and the managed relations
+/// it waits for.
+type Link = (String, String, BTreeSet<(String, String)>);
+
+impl Staging {
+    /// Keeps the chained objects whose managed relations are all
+    /// `available` (the scratch compile creates each). One that waits for a
+    /// relation it does not create, such as a base table the plan renames,
+    /// is not filled and is named in the findings; what names it waits for
+    /// that relation too, so it goes with it. The rest still are (#1778).
+    pub fn keep_chained(&mut self, available: impl Fn(&BTreeSet<(String, String)>) -> bool) {
+        let (kept, gone): (Vec<_>, Vec<_>) = std::mem::take(&mut self.links)
+            .into_iter()
+            .partition(|(_, _, after)| available(after));
+        for (described, _, _) in gone {
+            self.filled.remove(&described);
+            self.chained_objects.remove(&described);
+            self.unfillable.push(format!(
+                "{described} is not filled: its shape names a managed relation the scratch \
+                 compile does not create"
+            ));
+        }
+        self.chained = kept.iter().map(|(_, sql, _)| sql.as_str()).collect();
+        self.chained_after = kept
+            .iter()
+            .flat_map(|(_, _, after)| after.iter().cloned())
+            .collect();
+        self.links = kept;
+    }
+}
+
+impl Fill {
+    /// What fill sends once the externals file created `created`, each
+    /// object by catalog and `pg_describe_object` description, which names
+    /// an object alike on the target and on scratch under the empty path
+    /// both read with. The externals file wins on overlap; an object whose
+    /// shape names one fill cannot stage is not filled either.
+    pub fn staging(&self, created: &BTreeSet<(String, String)>) -> Staging {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum State {
+            Created,
+            Ahead,
+            Chained,
+            Missing,
+        }
+        let mut states = Vec::with_capacity(self.objects.len());
+        let mut staging = Staging::default();
+        let mut ahead = Vec::new();
+        let mut chained = Vec::new();
+        let mut schemas = BTreeSet::new();
+        let mut afters: Vec<BTreeSet<(String, String)>> = Vec::with_capacity(self.objects.len());
+        for object in &self.objects {
+            let mut after = object.after.clone();
+            for &index in &object.names {
+                after.extend(afters[index].iter().cloned());
+            }
+            let part = object.parts.iter().find(|part| created.contains(*part));
+            let state = if created.contains(&(object.catalog.clone(), object.described.clone())) {
+                State::Created
+            } else if let Some((_, part)) = part {
+                // Neither the file's nor fill's: what names it cannot be
+                // filled either.
+                staging.unfillable.push(format!(
+                    "{} is not filled: the externals file created its {part}; write the whole \
+                     of it in the externals file if a binding needs it",
+                    object.described
+                ));
+                State::Missing
+            } else if let Some(&missing) = object
+                .names
+                .iter()
+                .find(|&&index| states[index] == State::Missing)
+            {
+                staging.unfillable.push(format!(
+                    "{} cannot be filled: its shape names {}, which cannot be filled either",
+                    object.described, self.objects[missing].described
+                ));
+                State::Missing
+            } else {
+                match &object.how {
+                    How::Not(why) => {
+                        staging.unfillable.push(format!(
+                            "{} cannot be filled: {why}; write it in the externals file, or \
+                             select no resolver and keep ADR-0013's conservative rebuild",
+                            object.described
+                        ));
+                        State::Missing
+                    }
+                    // An extension's script runs code of its own, an event
+                    // trigger among it, and creates operators, casts and
+                    // other names the split's order check does not model.
+                    // Ahead of everything both are covered: the outside-write
+                    // check is around it and the staged comparison follows
+                    // before any compile. Between two parts of the compile
+                    // neither is, so an extension never waits (#1778).
+                    How::Chained(_) | How::Ahead(_)
+                        if object.catalog == "pg_extension"
+                            && (matches!(object.how, How::Chained(_))
+                                || object
+                                    .names
+                                    .iter()
+                                    .any(|&index| states[index] == State::Chained)) =>
+                    {
+                        staging.unfillable.push(format!(
+                            "{} cannot be filled: its shape names a managed relation, and an \
+                             extension's script runs code and creates names fill cannot order \
+                             between two parts of the compile; select no resolver and keep \
+                             ADR-0013's conservative rebuild",
+                            object.described
+                        ));
+                        State::Missing
+                    }
+                    How::Chained(sql) => {
+                        chained.push(sql.as_str());
+                        State::Chained
+                    }
+                    How::Ahead(sql)
+                        if object
+                            .names
+                            .iter()
+                            .any(|&index| states[index] == State::Chained) =>
+                    {
+                        chained.push(sql.as_str());
+                        State::Chained
+                    }
+                    How::Ahead(sql) => {
+                        ahead.push(sql.as_str());
+                        State::Ahead
+                    }
+                }
+            };
+            if matches!(state, State::Ahead | State::Chained) {
+                staging.filled.insert(object.described.clone());
+                schemas.extend(object.schemas.iter().cloned());
+            }
+            if state == State::Chained {
+                staging.chained_objects.insert(object.described.clone());
+                staging.chained_after.extend(after.iter().cloned());
+                if let How::Ahead(sql) | How::Chained(sql) = &object.how {
+                    staging
+                        .links
+                        .push((object.described.clone(), sql.clone(), after.clone()));
+                }
+            }
+            states.push(state);
+            afters.push(after);
+        }
+        staging.ahead = schemas
+            .iter()
+            .map(|schema| format!("CREATE SCHEMA IF NOT EXISTS {schema};\n"))
+            .chain(ahead.into_iter().map(str::to_owned))
+            .collect();
+        staging.chained = chained.concat();
+        debug_assert_eq!(
+            staging.chained,
+            staging
+                .links
+                .iter()
+                .map(|(_, sql, _)| sql.as_str())
+                .collect::<String>()
+        );
+        staging
+    }
+}
+
+/// What fill stages for the managed set of `desired` and `base`, read from
+/// the connected target: the objects a draft stages without `--schema`.
+/// A declared routine's signature is looked up on the write path with
+/// `extras`, as the run's other lookups of the managed routines are.
+pub async fn fill(
+    conn: &mut impl QueryConnection,
+    desired: &pbps_model::Schema,
+    base: &pbps_model::Schema,
+    extras: &[String],
+) -> Result<Fill, Error> {
+    let managed = [
+        super::capture::Managed::from_schema(desired),
+        super::capture::Managed::from_schema(base),
+    ];
+    let dialect = crate::Postgres::with_write_path_extras(extras.to_vec());
+    let mut signatures = Vec::new();
+    for schema in [desired, base] {
+        for (id, module) in &schema.modules {
+            if let Some(signature) =
+                super::reconstruct::dropped_signature(&dialect, id, module.kind)
+                    .map_err(|error| Error::Declaration(error.to_string()))?
+            {
+                signatures.push(signature);
+            }
+        }
+    }
+    let (routines, facts) = read(conn, &signatures)
+        .await
+        .map_err(|source| Error::Read {
+            what: "the target's catalog",
+            source,
+        })?;
+    let is_managed = |key: &Key| match key.0.as_str() {
+        "pg_class" => facts.relations.get(&key.1).is_some_and(|relation| {
+            managed
+                .iter()
+                .any(|managed| managed.relation(&relation.schema, &relation.name))
+        }),
+        "pg_proc" => routines.contains(&key.1),
+        _ => false,
+    };
+    Ok(survey_fill(&facts, &is_managed))
+}
+
+fn survey_fill(facts: &Facts, managed: &dyn Fn(&Key) -> bool) -> Fill {
+    let Survey {
+        folded,
+        drafted,
+        chained,
+    } = survey(facts, managed, &[]);
+    let described = |key: &Key| {
+        facts
+            .objects
+            .get(key)
+            .map_or_else(|| format!("{} {}", key.0, key.1), |o| o.described.clone())
+    };
+    let items: BTreeMap<Key, Item> = drafted
+        .iter()
+        .map(|key| (key.clone(), item(facts, key, &described(key))))
+        .collect();
+    let order = order(&folded, &items, &described);
+    let index: BTreeMap<&Key, usize> = order.iter().enumerate().map(|(i, k)| (k, i)).collect();
+    let objects = order
+        .iter()
+        .map(|key| {
+            let item = &items[key];
+            let mut after = BTreeSet::new();
+            let how = match (chained.get(key), &item.body) {
+                (Some(Chain::Foreign), _) => {
+                    How::Not("the comparison does not qualify a foreign table's properties".into())
+                }
+                (_, Body::Listed(line)) => {
+                    How::Not(item.why.clone().unwrap_or_else(|| line.clone()))
+                }
+                // The chain keeps one managed object it names; the split
+                // waits for every one.
+                (Some(Chain::Names(_)), Body::Sql(sql)) => {
+                    let mut not = None;
+                    for named in folded.shapes(key).filter(|referenced| managed(referenced)) {
+                        match facts.relations.get(&named.1) {
+                            Some(relation) if named.0 == "pg_class" => {
+                                after.insert((relation.schema.clone(), relation.name.clone()));
+                            }
+                            _ => {
+                                not.get_or_insert_with(|| {
+                                    How::Not(format!(
+                                        "its shape names the managed {}, and fill orders a \
+                                         shape only after the managed relations it names",
+                                        described(named)
+                                    ))
+                                });
+                            }
+                        }
+                    }
+                    not.unwrap_or_else(|| How::Chained(sql.clone()))
+                }
+                (Some(Chain::Through(_)) | None, Body::Sql(sql)) => How::Ahead(sql.clone()),
+            };
+            // An extension's members are its parts too.
+            let parts = folded
+                .carriers
+                .keys()
+                .chain(folded.members.keys())
+                .filter(|part| folded.top(part) == *key)
+                .filter_map(|part| {
+                    facts
+                        .objects
+                        .get(*part)
+                        .map(|object| (part.0.clone(), object.described.clone()))
+                })
+                .collect();
+            let mut schemas = Vec::new();
+            if let Some(object) = facts.objects.get(key)
+                && !object.schema.is_empty()
+                && object.schema != "pg_catalog"
+            {
+                schemas.push(object.schema.clone());
+            }
+            if let Some(extension) = (key.0 == "pg_extension")
+                .then(|| facts.extensions.get(&key.1))
+                .flatten()
+            {
+                schemas.push(extension.schema.clone());
+            }
+            Filled {
+                catalog: key.0.clone(),
+                described: described(key),
+                parts,
+                schemas,
+                how,
+                after,
+                names: folded
+                    .shapes(key)
+                    .filter_map(|referenced| index.get(referenced).copied())
+                    .filter(|&i| i < index[key])
+                    .collect(),
+            }
+        })
+        .collect();
+    Fill { objects }
+}
+
 const HEADER: &str = "\
 -- An externals file drafted by `pbps resolver externals` from the target
 -- (SPEC section 9.3.2). It stages the objects outside the managed set that
@@ -784,6 +1181,8 @@ enum Chain {
 struct Item {
     rank: u8,
     body: Body,
+    /// Why it is listed rather than written, as a fill finding says it.
+    why: Option<String>,
 }
 
 enum Body {
@@ -796,7 +1195,13 @@ impl Item {
         Self {
             rank: rank(key),
             body: Body::Listed(line),
+            why: None,
         }
+    }
+
+    fn because(mut self, why: String) -> Self {
+        self.why = Some(why);
+        self
     }
 }
 
@@ -944,6 +1349,7 @@ fn item(facts: &Facts, key: &Key, described: &str) -> Item {
                 "{described}: write it here by hand if a binding needs it; the draft writes no {what}"
             ),
         )
+        .because(format!("pbps writes no {what}"))
     };
     let body = match key.0.as_str() {
         "pg_extension" => facts.extensions.get(&key.1).map(|e| {
@@ -959,7 +1365,8 @@ fn item(facts: &Facts, key: &Key, described: &str) -> Item {
                     "{described}: listed, never written; pbps sends no routine source to \
                      scratch, so add its definition here if a binding needs it"
                 ),
-            );
+            )
+            .because("pbps sends no routine source to scratch".into());
         }
         "pg_type" => match facts.types.get(&key.1) {
             Some(t) if t.kind == 'e' => Some(format!(
@@ -1044,6 +1451,7 @@ fn item(facts: &Facts, key: &Key, described: &str) -> Item {
                 _ => rank(key),
             },
             body: Body::Sql(sql),
+            why: None,
         },
         None => by_hand("object of this class"),
     }

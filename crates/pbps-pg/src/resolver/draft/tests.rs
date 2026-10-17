@@ -523,3 +523,380 @@ fn a_table_with_an_invalid_unique_index_is_listed_for_writing_by_hand() {
         draft.sql
     );
 }
+
+impl Target {
+    fn fill(&self) -> Fill {
+        survey_fill(&self.facts, &|key| self.managed.contains(key))
+    }
+}
+
+fn file_created(objects: &[(&str, &str)]) -> BTreeSet<(String, String)> {
+    objects
+        .iter()
+        .map(|(catalog, described)| ((*catalog).to_owned(), (*described).to_owned()))
+        .collect()
+}
+
+#[test]
+fn fill_stages_what_the_externals_file_lacks_and_leaves_what_it_holds() {
+    let (target, _, _, _) = reading_a_view();
+    let fill = target.fill();
+    let staging = fill.staging(&BTreeSet::new());
+    assert_eq!(
+        staging.ahead,
+        "CREATE SCHEMA IF NOT EXISTS ext;\n\
+         CREATE VIEW ext.v AS SELECT NULL::integer AS id WHERE false;\n"
+    );
+    assert_eq!(staging.chained, "");
+    assert_eq!(staging.filled, BTreeSet::from(["view ext.v".to_owned()]));
+    assert!(staging.unfillable.is_empty(), "{:?}", staging.unfillable);
+    // Negative: what the externals file created is the file's, never filled
+    // over it.
+    let held = fill.staging(&file_created(&[("pg_class", "view ext.v")]));
+    assert_eq!(held, Staging::default());
+}
+
+/// `ext.c (m app.m)`, a table whose column is the managed table `app.m`'s
+/// row type, read by the managed view `app.a`.
+fn naming_a_managed_row_type() -> Target {
+    let mut target = Target::default();
+    let managed = target.relation(20200, 'r', "app", "m", &[("id", "integer")]);
+    target.managed(&managed);
+    let chained = target.relation(20210, 'r', "ext", "c", &[("m", "app.m")]);
+    target.depend(&chained, &key("pg_type", 20201), 'n', true);
+    let reader = target.relation(20220, 'v', "app", "a", &[("m", "app.m")]);
+    target.depend(&reader, &chained, 'n', false);
+    target.managed(&reader);
+    target
+}
+
+#[test]
+fn a_shape_naming_a_managed_row_type_is_filled_once_the_managed_tables_exist() {
+    let target = naming_a_managed_row_type();
+    let fill = target.fill();
+    let staging = fill.staging(&BTreeSet::new());
+    assert_eq!(staging.ahead, "CREATE SCHEMA IF NOT EXISTS ext;\n");
+    assert!(
+        staging
+            .chained
+            .starts_with("CREATE TABLE ext.c (\n    m app.m"),
+        "{}",
+        staging.chained
+    );
+    assert_eq!(staging.filled, BTreeSet::from(["table ext.c".to_owned()]));
+    // The draft still lists it: a file written before the managed objects
+    // cannot stage it.
+    assert!(
+        target
+            .draft(&[])
+            .listed
+            .iter()
+            .any(|line| line.contains("ext.c cannot be staged")),
+        "{:?}",
+        target.draft(&[]).listed
+    );
+    // Negative: the externals file's own copy is not filled over, so nothing
+    // is created between the compile's two parts.
+    let held = fill.staging(&file_created(&[("pg_class", "table ext.c")]));
+    assert_eq!(held.chained, "");
+    assert!(held.filled.is_empty(), "{:?}", held.filled);
+}
+
+#[test]
+fn what_fill_cannot_stage_is_named_with_what_names_it() {
+    let mut target = Target::default();
+    let range = target.object("pg_type", 20300, "ext", "type ext.r");
+    target.facts.types.insert(
+        20300,
+        Type {
+            kind: 'r',
+            qualified: "ext.r".into(),
+            ..Type::default()
+        },
+    );
+    let table = target.relation(20310, 'r', "ext", "t", &[("span", "ext.r")]);
+    target.depend(&table, &range, 'n', true);
+    let routine = target.object("pg_proc", 20320, "ext", "function ext.f(integer)");
+    let reader = target.relation(20330, 'v', "app", "a", &[("span", "ext.r")]);
+    target.depend(&reader, &table, 'n', false);
+    target.depend(&reader, &routine, 'n', false);
+    target.managed(&reader);
+    let fill = target.fill();
+    let staging = fill.staging(&BTreeSet::new());
+    assert_eq!(staging.ahead, "");
+    assert!(staging.filled.is_empty(), "{:?}", staging.filled);
+    let unfillable = staging.unfillable.join("\n");
+    for expected in [
+        "function ext.f(integer) cannot be filled: pbps sends no routine source to scratch; \
+         write it in the externals file",
+        "type ext.r cannot be filled: pbps writes no range type",
+        "table ext.t cannot be filled: its shape names type ext.r, which cannot be filled either",
+    ] {
+        assert!(unfillable.contains(expected), "{unfillable}");
+    }
+    // Negative: once the externals file holds the range type, the table
+    // that names it is filled.
+    let held = fill.staging(&file_created(&[("pg_type", "type ext.r")]));
+    assert!(
+        held.ahead.contains("CREATE TABLE ext.t (\n    span ext.r"),
+        "{}",
+        held.ahead
+    );
+    assert_eq!(held.filled, BTreeSet::from(["table ext.t".to_owned()]));
+    assert_eq!(held.unfillable.len(), 1, "{:?}", held.unfillable);
+}
+
+#[test]
+fn an_object_whose_part_the_externals_file_created_is_the_files() {
+    let (mut target, table, _, _) = reading_a_view();
+    let sequence = target.object("pg_class", 20005, "ext", "sequence ext.t_id_seq");
+    target.depend(&sequence, &table, 'a', true);
+    let reader = target.relation(20030, 'v', "app", "s", &[("n", "bigint")]);
+    target.depend(&reader, &sequence, 'n', false);
+    target.managed(&reader);
+    let fill = target.fill();
+    assert!(
+        fill.staging(&BTreeSet::new())
+            .filled
+            .contains("table ext.t"),
+        "the sequence folds into its table"
+    );
+    let held = fill.staging(&file_created(&[("pg_class", "sequence ext.t_id_seq")]));
+    assert!(
+        !held.filled.contains("table ext.t") && !held.ahead.contains("ext.t "),
+        "{}",
+        held.ahead
+    );
+    assert!(
+        held.unfillable.iter().any(|line| line.contains(
+            "table ext.t is not filled: the externals file created its sequence ext.t_id_seq"
+        )),
+        "{:?}",
+        held.unfillable
+    );
+}
+
+/// Negative of the part rule: the table is the file's in part only, so a
+/// shape naming its row type is not filled, rather than sent to fail on a
+/// type nobody created.
+#[test]
+fn what_names_a_partly_staged_object_is_not_filled() {
+    let (mut target, table, _, _) = reading_a_view();
+    let sequence = target.object("pg_class", 20005, "ext", "sequence ext.t_id_seq");
+    target.depend(&sequence, &table, 'a', true);
+    let reader = target.relation(20030, 'v', "app", "s", &[("n", "bigint")]);
+    target.depend(&reader, &sequence, 'n', false);
+    target.managed(&reader);
+    let shaped = target.relation(20040, 'r', "ext", "c", &[("t", "ext.t")]);
+    target.depend(&shaped, &key("pg_type", 20001), 'n', true);
+    let other = target.relation(20050, 'v', "app", "o", &[("t", "ext.t")]);
+    target.depend(&other, &shaped, 'n', false);
+    target.managed(&other);
+    let fill = target.fill();
+    assert!(
+        fill.staging(&BTreeSet::new())
+            .filled
+            .contains("table ext.c"),
+        "filled when the file holds no part of ext.t"
+    );
+    let held = fill.staging(&file_created(&[("pg_class", "sequence ext.t_id_seq")]));
+    assert!(
+        !held.filled.contains("table ext.c") && !held.ahead.contains("ext.c "),
+        "{}",
+        held.ahead
+    );
+    assert!(
+        held.unfillable.iter().any(|line| line
+            == "table ext.c cannot be filled: its shape names table ext.t, which cannot be \
+                filled either"),
+        "{:?}",
+        held.unfillable
+    );
+}
+
+/// An extension's members are its parts: a file that created one of them
+/// holds the extension, and fill sends no `CREATE EXTENSION` whose script
+/// would create that member again.
+#[test]
+fn an_extension_whose_member_the_externals_file_created_is_the_files() {
+    let mut target = Target::default();
+    let extension = target.object("pg_extension", 20100, "", "extension citext");
+    target.facts.extensions.insert(
+        20100,
+        Extension {
+            name: "citext".into(),
+            schema: "public".into(),
+            version: "'1.6'".into(),
+        },
+    );
+    let citext = target.object("pg_type", 20101, "public", "type public.citext");
+    target.depend(&citext, &extension, 'e', true);
+    let reader = target.relation(20130, 'v', "app", "a", &[("c", "public.citext")]);
+    target.depend(&reader, &citext, 'n', true);
+    target.managed(&reader);
+    let fill = target.fill();
+    assert!(
+        fill.staging(&BTreeSet::new())
+            .ahead
+            .contains("CREATE EXTENSION"),
+        "filled when the file holds no member"
+    );
+    let held = fill.staging(&file_created(&[("pg_type", "type public.citext")]));
+    assert!(!held.ahead.contains("CREATE EXTENSION"), "{}", held.ahead);
+    assert!(
+        held.unfillable.iter().any(|line| line.contains(
+            "extension citext is not filled: the externals file created its type public.citext"
+        )),
+        "{:?}",
+        held.unfillable
+    );
+}
+
+#[test]
+fn a_chained_shape_waits_for_every_managed_relation_it_names() {
+    let mut target = Target::default();
+    let first = target.relation(20300, 'r', "app", "m", &[("id", "integer")]);
+    let second = target.relation(20310, 'r', "app", "n", &[("id", "integer")]);
+    target.managed(&first);
+    target.managed(&second);
+    let chained = target.relation(20320, 'r', "ext", "c", &[("m", "app.m"), ("n", "app.n")]);
+    target.depend(&chained, &key("pg_type", 20301), 'n', true);
+    target.depend(&chained, &key("pg_type", 20311), 'n', true);
+    let reader = target.relation(20330, 'v', "app", "a", &[("m", "app.m")]);
+    target.depend(&reader, &chained, 'n', false);
+    target.managed(&reader);
+    let staging = target.fill().staging(&BTreeSet::new());
+    assert_eq!(staging.filled, BTreeSet::from(["table ext.c".to_owned()]));
+    assert_eq!(
+        staging.chained_after,
+        BTreeSet::from([
+            ("app".to_owned(), "m".to_owned()),
+            ("app".to_owned(), "n".to_owned())
+        ]),
+        "both, not the first the chain kept"
+    );
+}
+
+/// A chained shape waiting for a managed relation the compile does not
+/// create goes, with what names it; one waiting only for relations it
+/// creates stays.
+#[test]
+fn only_the_chains_waiting_for_an_absent_relation_are_dropped() {
+    let mut target = Target::default();
+    let kept = target.relation(20400, 'r', "app", "m", &[("id", "integer")]);
+    let renamed = target.relation(20410, 'r', "app", "n", &[("id", "integer")]);
+    target.managed(&kept);
+    target.managed(&renamed);
+    let on_kept = target.relation(20420, 'r', "ext", "c", &[("m", "app.m")]);
+    target.depend(&on_kept, &key("pg_type", 20401), 'n', true);
+    let on_renamed = target.relation(20430, 'r', "ext", "d", &[("n", "app.n")]);
+    target.depend(&on_renamed, &key("pg_type", 20411), 'n', true);
+    let naming = target.relation(20440, 'r', "ext", "x", &[("d", "ext.d")]);
+    target.depend(&naming, &key("pg_type", 20431), 'n', true);
+    for (oid, name, read) in [(20450, "a", &on_kept), (20460, "b", &naming)] {
+        let reader = target.relation(oid, 'v', "app", name, &[("id", "integer")]);
+        target.depend(&reader, read, 'n', false);
+        target.managed(&reader);
+    }
+    let mut staging = target.fill().staging(&BTreeSet::new());
+    for table in ["ext.c", "ext.d", "ext.x"] {
+        assert!(
+            staging.chained.contains(&format!("CREATE TABLE {table} ")),
+            "{table}"
+        );
+    }
+    let absent = ("app".to_owned(), "n".to_owned());
+    staging.keep_chained(|after| !after.contains(&absent));
+    assert!(
+        staging.chained.contains("CREATE TABLE ext.c "),
+        "{}",
+        staging.chained
+    );
+    for table in ["ext.d", "ext.x"] {
+        assert!(
+            !staging.chained.contains(&format!("CREATE TABLE {table} ")),
+            "{table}: {}",
+            staging.chained
+        );
+        assert!(
+            !staging.filled.contains(&format!("table {table}")),
+            "{table}"
+        );
+        assert!(
+            staging
+                .unfillable
+                .iter()
+                .any(|line| line.starts_with(&format!(
+                    "table {table} is not filled: its shape names a managed relation"
+                ))),
+            "{table}: {:?}",
+            staging.unfillable
+        );
+    }
+    assert!(staging.filled.contains("table ext.c"));
+    assert_eq!(
+        staging.chained_after,
+        BTreeSet::from([("app".to_owned(), "m".to_owned())])
+    );
+}
+
+/// An extension whose member names a managed row type would wait for the
+/// managed tables, and its script would then run between two parts of the
+/// compile: it is never filled there, and is named. Negative: the same
+/// extension naming nothing managed is filled ahead.
+#[test]
+fn an_extension_never_waits_for_the_managed_tables() {
+    let staging = |naming: bool| {
+        let mut target = Target::default();
+        let managed = target.relation(20600, 'r', "app", "m", &[("id", "integer")]);
+        target.managed(&managed);
+        let extension = target.object("pg_extension", 20610, "", "extension inhouse");
+        target.facts.extensions.insert(
+            20610,
+            Extension {
+                name: "inhouse".into(),
+                schema: "ext".into(),
+                version: "'1.0'".into(),
+            },
+        );
+        let member = target.object("pg_type", 20620, "ext", "type ext.x");
+        target.facts.types.insert(
+            20620,
+            Type {
+                kind: 'e',
+                qualified: "ext.x".into(),
+                ..Type::default()
+            },
+        );
+        target.depend(&member, &extension, 'e', true);
+        if naming {
+            target.depend(&member, &key("pg_type", 20601), 'n', true);
+        }
+        let reader = target.relation(20630, 'v', "app", "a", &[("x", "ext.x")]);
+        target.depend(&reader, &member, 'n', true);
+        target.managed(&reader);
+        target.fill().staging(&BTreeSet::new())
+    };
+    let ahead = staging(false);
+    assert!(
+        ahead.ahead.contains("CREATE EXTENSION inhouse"),
+        "{}",
+        ahead.ahead
+    );
+    let named = staging(true);
+    assert!(
+        !named.chained.contains("CREATE EXTENSION"),
+        "{}",
+        named.chained
+    );
+    assert!(!named.ahead.contains("CREATE EXTENSION"), "{}", named.ahead);
+    assert!(!named.filled.contains("extension inhouse"));
+    assert!(
+        named.unfillable.iter().any(|line| line.starts_with(
+            "extension inhouse cannot be filled: its shape names a managed relation, and an \
+             extension's script runs code"
+        )),
+        "{:?}",
+        named.unfillable
+    );
+}

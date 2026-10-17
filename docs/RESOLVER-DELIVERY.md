@@ -16,9 +16,9 @@ transfer (#617) is closed. #615 is delivered for PostgreSQL planning by
 pre-publication recheck, from the sealed order (DEC-1516.1), and `explain`
 shows its evidence offline (DEC-1517.1). #616 applies it in one transaction
 (DEC-616.1, below). The remaining order:
-1. [#1778](https://github.com/pongbiphang/pbps/issues/1778): automatic fill of
-   the externals file after #1956; its draft command, `pbps resolver
-   externals` (DEC-1778.1), is delivered;
+1. [#1778](https://github.com/pongbiphang/pbps/issues/1778) is delivered:
+   the draft command, `pbps resolver externals` (DEC-1778.1), and fill of
+   what the externals file lacks (DEC-1778.2);
 2. SQL Server: [#620](https://github.com/pongbiphang/pbps/issues/620)
    implements [the measured design](RESOLVER-MSSQL.md) #619 delivered, then
    [#621](https://github.com/pongbiphang/pbps/issues/621).

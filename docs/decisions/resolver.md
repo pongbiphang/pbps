@@ -2828,8 +2828,7 @@ maintainer's (2026-10-15).
 - The reader is new code in `pbps-pg`: the plan model and emitter hold no
   types, domains, enums, extensions or shape views.
 
-Fill, the second step, waits for #1956: its order is `Catalog` edges
-`settle` consumes under #1776, not a new pass.
+Fill, the second step, is DEC-1778.2.
 
 **Pinned by** `resolver_stages_an_externals_file_drafted_from_the_target_unchanged`
 and `resolver_draft_lists_a_routine_and_a_chain_and_writes_neither` (live,
@@ -3378,3 +3377,149 @@ makes the change, which moves the rule identifier (DEC-2012.1).
 `a_persisted_column_needs_its_functions_owner_to_be_the_tables`
 and `synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed`
 (the three-part name).
+
+<a id="dec-1778-2"></a>
+
+**DEC-1778.2. Fill stages what the externals file lacks, in scratch's
+order, and splits the compile around the managed tables for a chain it
+lifts (#1778).** The maintainer chose this on 2026-10-17. It corrects the
+2026-10-14 plan that fill would order its objects as `Catalog` edges for
+`settle`.
+
+**Why not `settle`.** `settle` orders the sealed plan, and refuses a node
+that is no change of it (`Refusal::Outside`, `Refusal::Mismatch`). A
+filled object exists on the target already, so it never enters the plan.
+Scratch is built by the reconstruction instead: the plan from an empty
+schema, sorted into tables, keys, modules and expressions. Fill is placed
+in that order, so the plan's ordering gains no edge and no pass (#1776).
+
+**What was decided.**
+- **What it stages.** Fill reads what the draft reads without `--schema`, at
+  plan time and from the target. It runs the draft's SQL for every object
+  the externals file did not create. It runs after that file, in its session
+  and in a transaction of its own, before any managed object.
+- **The externals file wins on overlap.** Objects are matched by catalog and
+  by `pg_describe_object` under the empty path, which names an object alike
+  on both databases. A file's copy that differs from the target therefore
+  still refuses: fill never replaces it.
+- **What it creates is compared, sealed and rechecked** like what the file
+  created. The evidence gains no field.
+- **The file's outside-write rule holds for fill.** Something the file
+  created, such as an event trigger, runs on fill's statements too. So fill
+  runs in a `REPEATABLE READ` transaction with the same shared-state reads,
+  and a write outside the scratch database is rolled back and refused. Both
+  reads come after a `RESET ALL`: a chained fill runs on a session the
+  compile pinned to the target's zone, and a role's `VALID UNTIL` would
+  otherwise render differently in the two.
+- **A filled object that differs from the target is named as fill's.**
+  Fill installs what the target's managed objects depend on now, whether or
+  not the desired declarations still need it: which ones they need only
+  the compile tells, and the comparison precedes it. A target object
+  altered in place (an extension's member made `VOLATILE`, say) differs
+  from a new one, and the comparison refuses. The refusal names fill and
+  its remedy: write the object in the externals file as the target has it,
+  and the file holds it. It is a rare, detectable combination with a named
+  remedy, so the plan is refused rather than fill's scope narrowed. Every
+  refusal of the comparison names who created the object, fill or the file:
+  a difference, an identity the target does not have (a member renamed in
+  place), and a kind the comparison cannot read (an extension's
+  foreign-data wrapper), each with fill's own remedy.
+- **An extension never waits.** An extension's script runs code of its
+  own, an event trigger among it, and creates operators, casts and other
+  names. Ahead of everything both are covered: the outside-write check is
+  around it, and the staged comparison refuses an uncovered member before
+  any compile. Between two parts of the compile neither is, and the order
+  check models only relations, types and routines. So an extension that
+  would wait for a managed relation, its own shape or one it names, is not
+  filled, and is named in the findings.
+- **A reset leaves the session's empty path pinned.** `pbps-db` pins the
+  empty path with a plain `SET`, which `RESET ALL` and `DISCARD ALL`
+  clear, and what runs on the session after the commit relies on it: the
+  backend check's `::text`, the compile, the cleanup reads. A type fill or
+  the file created may be named `text`. So every reset, in fill and after
+  the externals file's discard, pins the path again for the session, not
+  the transaction. Fill also resets its session after the commit, as the
+  file's discard does, so a `SET` an event trigger made there reaches
+  nothing that runs next; it leaves the role as it is.
+- **The managed routines are found with the run's write path.** Fill looks
+  up a declared routine's signature with the request's write-path extras,
+  as the run's other lookups of the managed routines do, so a type named
+  through an extra schema is found and filled.
+- **An object one of whose parts the file created is not filled.** A file
+  that stages an owned sequence alone keeps it, and fill does not create
+  the table that carries it again. An extension's members are its parts, so
+  no `CREATE EXTENSION` recreates a member the file staged. The object
+  itself exists nowhere, so a shape naming it is not filled either.
+- **A chain is lifted for what fill writes.** A shape that names a managed
+  relation's row type is created between two parts of the compile:
+  - the deployer's session compiles up to the step that creates the last
+    relation those shapes name, and commits;
+  - the setup session creates the shape, as the externals file's owner
+    would;
+  - the deployer's session compiles the rest.
+
+  That step can be among the modules: a table whose generated column calls
+  a declared function follows the function there. The split waits for every
+  managed relation the shapes name, not the one the chain keeps. Each
+  chained object carries its own prerequisites, so one waiting for a
+  relation the compile does not create (a base table the plan renames) is
+  dropped with what names it, and the rest are still filled. In the supplied
+  layout fill runs on the compiling session, and its check ends in `RESET
+  ALL`, so the deployer's reproduced settings are applied again before the
+  rest compiles. The order
+  check that leaves a binding unresolved when a same-named object came later
+  (`Reconstruction::later_names`) counts the chained shapes' names, read
+  from scratch's catalog after fill, as created at the split. A module
+  compiled before it that bound, say, a routine the target's call casts to a
+  domain instead is then unresolved, never sealed.
+  - A generated column's expression compiles in its table's `CREATE TABLE`,
+    which can come before the split. So the check finds that step from the
+    column and counts what came after it: later modules too, since a table
+    whose expression calls a declared function is created among them. A
+    plain default, a check or an index expression compiles after every
+    module, so it keeps the rule it had.
+  - Filled names are classified as the step names are. A sequence, like an
+    index, has no row type (measured on 16 and 18), so it shadows only a
+    relation. Which declarations read a
+  chained shape only the compile tells, since a new one has no recorded
+  dependency. So a declaration scratch compiles before the split, and that
+  fails, refuses with a finding naming what waits for what, and the two
+  remedies.
+
+  Those shapes are compared after the compile. A chain through a routine,
+  through what the draft lists for writing by hand, or through a foreign
+  table still refuses. When the compile fails, each object fill could not
+  stage is named, with the externals file as the remedy.
+- **It always runs.** An entry without an externals file is filled whole.
+
+**Pinned by** `resolver_lifts_a_chain_through_an_object_fill_stages`
+(run-owned, and supplied on 16 and 18),
+`resolver_lifts_a_chain_through_a_table_that_compiles_after_its_function`
+(and its named refusal),
+`resolver_refuses_an_outside_write_fill_sets_off_and_leaves_none`,
+`resolver_leaves_unresolved_a_binding_a_chained_shape_would_take`,
+`resolver_leaves_unresolved_a_generated_column_a_chained_shape_would_take`,
+`resolver_resolves_a_call_named_like_a_chained_sequence`,
+`resolver_compiles_after_a_chained_fill_under_the_deployers_settings`,
+`resolver_reads_a_roles_expiry_alike_around_a_chained_fill`,
+`resolver_keeps_the_empty_path_after_the_outside_write_check`,
+`resolver_fills_what_a_routine_declared_through_the_extras_needs`,
+`resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it`,
+`resolver_fills_the_external_objects_no_externals_file_stages`,
+`resolver_refuses_a_routine_fill_cannot_stage_naming_it` and
+`resolver_compiles_a_managed_view_over_an_externals_table` (the file's
+copy is not filled over), live; and the `resolver::draft` unit tests
+`fill_stages_what_the_externals_file_lacks_and_leaves_what_it_holds`,
+`a_shape_naming_a_managed_row_type_is_filled_once_the_managed_tables_exist`
+`what_fill_cannot_stage_is_named_with_what_names_it` and
+`an_object_whose_part_the_externals_file_created_is_the_files` and
+`a_chained_shape_waits_for_every_managed_relation_it_names`,
+`what_names_a_partly_staged_object_is_not_filled`,
+`an_extension_never_waits_for_the_managed_tables`,
+`resolver_names_fills_altered_extension_member_and_its_remedy`,
+`only_the_chains_waiting_for_an_absent_relation_are_dropped` and
+`an_extension_whose_member_the_externals_file_created_is_the_files`, with
+`reconstruct`'s
+`chained_shapes_wait_for_the_step_that_creates_what_they_name` and
+`names_created_between_steps_are_later_only_for_modules_before_them` and
+`a_generated_columns_later_names_follow_its_tables_step`.

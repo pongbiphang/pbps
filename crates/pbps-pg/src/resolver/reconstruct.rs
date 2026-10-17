@@ -117,6 +117,10 @@ impl Nameable {
     }
 }
 
+/// What a step, or a fill between two steps, makes resolvable: its kind,
+/// schema and name.
+pub type Named = (Nameable, String, String);
+
 #[derive(Debug, Clone)]
 struct Step {
     phase: Phase,
@@ -126,6 +130,9 @@ struct Step {
     /// What this step makes resolvable, for the order check: its kind,
     /// schema and name.
     names: Vec<(Nameable, String, String)>,
+    /// The columns whose generated expressions this step compiles: a
+    /// table's, in its `CREATE TABLE`.
+    generated: Vec<String>,
     /// The module this step compiles, if it is one.
     module: Option<ModuleId>,
     /// The routine the engine created for this step, as the capture names
@@ -144,6 +151,9 @@ pub struct Reconstruction {
     /// catalog identity each declared signature names in the target
     /// capture's snapshot: `None` where it names none (#1063, #1124, #1148).
     dropped: BTreeMap<ModuleId, Option<ObjectIdentity>>,
+    /// Names something other than a step made resolvable just before the
+    /// step at each position: a fill's chained shapes (#1778).
+    between: Vec<(usize, Vec<Named>)>,
 }
 
 impl Reconstruction {
@@ -214,6 +224,12 @@ impl Reconstruction {
                         }
                     }
                     let declaration = format!("table {name}");
+                    let generated_columns: Vec<String> = bare
+                        .columns
+                        .iter()
+                        .filter(|(_, spec)| matches!(spec.value_source, ValueSource::Generated(_)))
+                        .map(|(column, _)| column.clone())
+                        .collect();
                     steps.push(step(
                         dialect,
                         Phase::Tables,
@@ -228,6 +244,9 @@ impl Reconstruction {
                         relation(&name.schema, &name.name),
                         None,
                     )?);
+                    if let Some(step) = steps.last_mut() {
+                        step.generated = generated_columns;
+                    }
                     for (key, constraint) in keys {
                         foreign.insert(steps.len());
                         steps.push(step(
@@ -430,6 +449,7 @@ impl Reconstruction {
         Ok(Self {
             steps,
             dropped: BTreeMap::new(),
+            between: Vec::new(),
         })
     }
 
@@ -438,8 +458,9 @@ impl Reconstruction {
     /// to an object of one of these names may have been made before a better
     /// candidate existed. A view is found by its name; a routine by the exact
     /// overload the engine created for its step, since overloads of one name
-    /// are compiled at different steps. `None` for an object no compiled
-    /// module is.
+    /// are compiled at different steps. Names made resolvable between two
+    /// steps (see [`Self::created_before`]) count for every module compiled
+    /// before them. `None` for an object no compiled module is.
     pub fn later_names(
         &self,
         owner: &ObjectIdentity,
@@ -454,16 +475,59 @@ impl Reconstruction {
                 }),
                 _ => false,
             })?;
-        Some(
-            self.steps[at + 1..]
-                .iter()
-                .flat_map(|step| {
-                    step.names
-                        .iter()
-                        .map(|(kind, schema, name)| (*kind, schema.as_str(), name.as_str()))
-                })
-                .collect(),
-        )
+        Some(self.names_after(at))
+    }
+
+    /// The names made resolvable after the step at `at`: by every later
+    /// step, and between steps after it.
+    fn names_after(&self, at: usize) -> std::collections::BTreeSet<(Nameable, &str, &str)> {
+        self.steps[at + 1..]
+            .iter()
+            .map(|step| &step.names)
+            .chain(
+                self.between
+                    .iter()
+                    .filter(|(before, _)| at < *before)
+                    .map(|(_, names)| names),
+            )
+            .flat_map(|names| {
+                names
+                    .iter()
+                    .map(|(kind, schema, name)| (*kind, schema.as_str(), name.as_str()))
+            })
+            .collect()
+    }
+
+    /// [`Self::later_names`] for the generated expression of `column` on the
+    /// table `schema.table`, which compiles in that table's own step: a
+    /// table whose expression calls a declared function is created among the
+    /// modules, so later modules, and a fill's chained shapes, may come
+    /// after it (#1778). `None` where no step compiles that expression, as
+    /// for a plain default, which compiles after every module.
+    pub fn later_names_generated(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Option<std::collections::BTreeSet<(Nameable, &str, &str)>> {
+        let at = self.steps.iter().position(|step| {
+            step.module.is_none()
+                && step.generated.iter().any(|generated| generated == column)
+                && step
+                    .names
+                    .iter()
+                    .any(|(kind, s, n)| *kind == Nameable::Relation && s == schema && n == table)
+        })?;
+        Some(self.names_after(at))
+    }
+
+    /// Records `names` as made resolvable just before the step at
+    /// `position`, by something no step compiles: a fill's chained shapes,
+    /// created between two parts of the compile (#1778, DEC-1778.2). A module
+    /// compiled earlier may have bound one of these names to another object,
+    /// and [`Self::later_names`] then says so.
+    pub fn created_before(&mut self, position: usize, names: Vec<Named>) {
+        self.between.push((position, names));
     }
 
     /// The catalog identity of the routine compiled for `id`, once the
@@ -513,6 +577,48 @@ impl Reconstruction {
         zone: &pbps_model::SessionZone,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
     ) -> Result<(), ReconstructError> {
+        self.compile_steps_in(dialect, zone, conn, 0..self.steps.len())
+            .await
+    }
+
+    /// The position just after the last step that creates one of
+    /// `relations`, by schema and name: where a fill's chained shapes, which
+    /// name those relations' row types, can be created (#1778,
+    /// DEC-1778.2). A table whose generated column calls a declared
+    /// function comes after that function, so the position is the step's,
+    /// not a phase's. `None` when one of them is created by no step.
+    pub fn after_creating(&self, relations: &BTreeSet<(String, String)>) -> Option<usize> {
+        relations
+            .iter()
+            .map(|(schema, name)| {
+                self.steps.iter().position(|step| {
+                    step.names
+                        .iter()
+                        .any(|(kind, s, n)| *kind == Nameable::Relation && s == schema && n == name)
+                })
+            })
+            .try_fold(0, |last, position| Some(last.max(position? + 1)))
+    }
+
+    /// The number of steps, for [`Self::compile_steps_in`].
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// [`Self::compile`] for the steps in `range` only, in a transaction of
+    /// its own: a fill's chained shapes are created between two of them,
+    /// outside the deployer's transaction (#1778, DEC-1778.2).
+    pub async fn compile_steps_in(
+        &mut self,
+        dialect: &crate::Postgres,
+        zone: &pbps_model::SessionZone,
+        conn: &mut impl pbps_db::transport::ExecuteConnection,
+        range: std::ops::Range<usize>,
+    ) -> Result<(), ReconstructError> {
         let framing = dialect.transaction_framing(zone);
         conn.execute(&framing.begin).await.map_err(|e| {
             // `invalid_parameter_value`, measured on 18.6 for an unknown
@@ -531,7 +637,7 @@ impl Reconstruction {
                 ReconstructError::Transaction("begin")
             }
         })?;
-        let outcome = self.compile_steps(conn).await;
+        let outcome = self.compile_steps(conn, range).await;
         if outcome.is_err() {
             let _ = conn.execute(&framing.rollback).await;
             return outcome;
@@ -544,8 +650,9 @@ impl Reconstruction {
     async fn compile_steps(
         &mut self,
         conn: &mut impl pbps_db::transport::ExecuteConnection,
+        range: std::ops::Range<usize>,
     ) -> Result<(), ReconstructError> {
-        for step in &mut self.steps {
+        for step in &mut self.steps[range] {
             let failed = |reason: String| ReconstructError::Compile {
                 declaration: step.declaration.clone(),
                 reason,
@@ -901,6 +1008,7 @@ fn step(
         declaration: declaration.to_owned(),
         statements,
         names,
+        generated: Vec::new(),
         module,
         created: None,
     })

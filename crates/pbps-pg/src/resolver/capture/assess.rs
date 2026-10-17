@@ -791,7 +791,19 @@ fn compiled_early(
     paths: &Paths,
 ) -> bool {
     let owner = owner(object);
-    let Some(later) = order.later_names(owner) else {
+    // A generated column's expression compiles with its table, not as a
+    // module: found by its column (#1778).
+    let generated = match (object.class.as_str(), object.signature.as_slice()) {
+        ("pg_attrdef", [column]) => match (column.name.as_slice(), column.signature.as_slice()) {
+            ([name], [table]) => match table.name.as_slice() {
+                [schema, table] => order.later_names_generated(schema, table, name),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(later) = generated.or_else(|| order.later_names(owner)) else {
         return false;
     };
     let path = owner

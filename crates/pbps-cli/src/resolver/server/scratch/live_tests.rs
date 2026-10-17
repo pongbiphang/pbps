@@ -1893,6 +1893,17 @@ async fn produce_staged(
     key: &ProjectKey,
     externals: &str,
 ) -> Result<ResolvedPlan, ProduceError> {
+    produce_filled(scratch, target, inputs, key, Some(externals)).await
+}
+
+/// `produce_staged`, with an externals file or none.
+async fn produce_filled(
+    scratch: &str,
+    target: &str,
+    inputs: &Inputs,
+    key: &ProjectKey,
+    externals: Option<&str>,
+) -> Result<ResolvedPlan, ProduceError> {
     let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
     let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
         .await
@@ -1910,7 +1921,38 @@ async fn produce_staged(
         &key.project,
         Some(ENVIRONMENT),
         &Standard::default(),
-        Some(externals),
+        externals,
+        &super::Provenance::server(),
+    )
+    .await
+}
+
+/// `produce_filled`, with write-path extras.
+async fn produce_with_extras(
+    scratch: &str,
+    target: &str,
+    inputs: &Inputs,
+    key: &ProjectKey,
+    extras: &[String],
+) -> Result<ResolvedPlan, ProduceError> {
+    let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
+    let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
+        .await
+        .unwrap();
+    super::produce(
+        Driver::Postgres,
+        scratch,
+        target,
+        &identity,
+        &inputs.binding(),
+        inputs.base(),
+        inputs.desired(),
+        &inputs.hints,
+        extras,
+        &key.project,
+        Some(ENVIRONMENT),
+        &Standard::default(),
+        None,
         &super::Provenance::server(),
     )
     .await
@@ -2276,19 +2318,649 @@ async fn resolver_refuses_an_externals_file_object_left_uncompared() {
     );
 }
 
-#[tokio::test]
-#[ignore = "requires the pinned PostgreSQL servers"]
-async fn resolver_refuses_a_chain_through_an_external_object_naming_it() {
-    let mut target = Fixture::new("PBPS_TEST_PG_DB");
-    let scratch = Fixture::new(SCRATCH_SERVER);
-    let setup = vec![
+/// `ext.e`'s column is the managed table `m`'s row type, and the managed
+/// view `a` reads `ext.e`: a chain through the boundary.
+fn chain_target() -> Vec<String> {
+    vec![
         format!("CREATE SCHEMA {MANAGED}"),
         format!("CREATE SCHEMA {EXTERNAL}"),
         format!("CREATE TABLE {MANAGED}.m (id integer)"),
         format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
         format!("CREATE VIEW {MANAGED}.a AS SELECT id FROM {EXTERNAL}.e"),
-    ];
+    ]
+}
+
+/// Fill stages `ext.e` once the managed tables exist, between the
+/// compile's two parts, as the setup role of either layout (#1778,
+/// DEC-1778.2). Before fill such a chain refused.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_lifts_a_chain_through_an_object_fill_stages() {
+    let inputs = staging_inputs(&reading("id", "e"), &reading("m", "e"), &["m"]);
+    let key = ProjectKey::new(true);
+    let only_the_schema = format!("CREATE SCHEMA {EXTERNAL};");
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &chain_target()).await;
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &only_the_schema,
+    )
+    .await;
+    target.drop().await;
+    assert_staged(result, "e", "run-owned");
+    for server in SERVERS {
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &chain_target()).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let result = produce_staged(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            &only_the_schema,
+        )
+        .await;
+        let left = fixture.foreign_objects(&scratch_db).await;
+        fixture.drop().await;
+        assert_staged(result, "e", server);
+        assert_eq!(left.1, 0, "{server}: what fill created is dropped too");
+    }
+}
+
+/// The body of `f`, the declared function `m`'s generated column calls.
+const GENERATING: &str = "(x integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN x";
+
+/// The target's `f` and `m`, whose generated column calls `f`: scratch
+/// creates `m` after `f`, among the modules.
+fn generating_target() -> Vec<String> {
+    vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE FUNCTION {MANAGED}.f{GENERATING}"),
+        format!(
+            "CREATE TABLE {MANAGED}.m (id integer, \
+             g integer GENERATED ALWAYS AS ({MANAGED}.f(id)) STORED)"
+        ),
+    ]
+}
+
+/// `schema`, declaring `f` and `m`'s generated column as the target has
+/// them.
+fn generating(mut schema: pbps_model::Schema) -> pbps_model::Schema {
+    schema.modules.insert(
+        format!("{MANAGED}.f(integer)").parse().unwrap(),
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: GENERATING.into(),
+        },
+    );
+    let mut generated = pbps_model::Column::new("integer".parse().unwrap());
+    generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+        expression: format!("{MANAGED}.f(id)"),
+        stored: true,
+    });
+    schema
+        .tables
+        .get_mut(&format!("{MANAGED}.m").parse().unwrap())
+        .unwrap()
+        .columns
+        .insert("g".into(), generated);
+    schema
+}
+
+/// A plan keeping `a` and adding `b`, both `definition`, beside `f` and
+/// `m`.
+fn generating_inputs(definition: &str) -> Inputs {
+    Inputs::from_pair((
+        generating(declared(&[("a", definition)], &["m"])),
+        generating(declared(&[("a", definition), ("b", definition)], &["m"])),
+    ))
+}
+
+/// `chain_target` over `generating_target`: scratch creates `m` among the
+/// modules, and fill waits for that step. With `calling`, the managed views
+/// call `f` too, so they compile after it.
+async fn after_its_function(calling: bool) -> Result<ResolvedPlan, ProduceError> {
+    let filter = if calling {
+        format!(" WHERE {MANAGED}.f(id) > 0")
+    } else {
+        String::new()
+    };
+    let mut setup = generating_target();
+    setup.extend([
+        format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
+        format!("CREATE VIEW {MANAGED}.a AS SELECT id FROM {EXTERNAL}.e{filter}"),
+    ]);
+    let a = format!("{}{filter}", reading("id", "e"));
+    let b = format!("{}{filter}", reading("m", "e"));
+    let inputs = Inputs::from_pair((
+        generating(declared(&[("a", &a)], &["m"])),
+        generating(declared(&[("a", &a), ("b", &b)], &["m"])),
+    ));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
     let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_filled(&scratch.server, &target.on(&target_db), &inputs, &key, None).await;
+    target.drop().await;
+    result
+}
+
+/// The supplied layout compiles on the session chained fill ran in, and
+/// fill's check ends in `RESET ALL`. A declaration after the split still
+/// compiles under the deployer's settings: under the target database's
+/// `array_nulls = off` the literal `{NULL}` holds the string `NULL`, which
+/// is no integer, and under the default `on` it holds a null. So the plan is
+/// refused there, as the target would refuse it. Negative: on a target
+/// without that setting the same plan is resolved.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_compiles_after_a_chained_fill_under_the_deployers_settings() {
+    let filter = format!(" WHERE {MANAGED}.f(id) > 0");
+    let a = format!("{}{filter}", reading("id", "e"));
+    let b = format!("{a} AND '{{NULL}}'::integer[] IS NOT NULL");
+    let inputs = Inputs::from_pair((
+        generating(declared(&[("a", &a)], &["m"])),
+        generating(declared(&[("a", &a), ("b", &b)], &["m"])),
+    ));
+    let key = ProjectKey::new(true);
+    for (off, server) in [true, false]
+        .into_iter()
+        .flat_map(|off| SERVERS.iter().map(move |&server| (off, server)))
+    {
+        let mut setup = generating_target();
+        setup.extend([
+            format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
+            format!("CREATE VIEW {MANAGED}.a AS {a}"),
+        ]);
+        if off {
+            setup.push(
+                "DO $$BEGIN EXECUTE pg_catalog.format('ALTER DATABASE %I SET array_nulls = off', \
+                 pg_catalog.current_database()); END$$"
+                    .into(),
+            );
+        }
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &setup).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let result = produce_filled(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            None,
+        )
+        .await;
+        fixture.drop().await;
+        if off {
+            let refused = match result {
+                Ok(_) => panic!("{server}: compiled with array_nulls on"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                refused.contains("invalid input syntax for type integer"),
+                "{server}: {refused}"
+            );
+        } else {
+            assert_staged(result, "e", server);
+        }
+    }
+}
+
+/// A managed table `t`, created before the split, whose generated column
+/// reads `ext.d(NULL)`: on the target a cast to the domain `ext.d` over
+/// `m`'s row type, and on scratch, compiled before fill creates that domain,
+/// a call to the externals file's `ext.d(text)`. The expression
+/// compiles with its table, not as a module, and it is unresolved, never
+/// sealed. Negative: without the domain the function is the binding on
+/// both.
+async fn generated_before_a_chained_shape(domain: bool) -> Result<ResolvedPlan, ProduceError> {
+    let function = format!(
+        "CREATE FUNCTION {EXTERNAL}.d(text) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1"
+    );
+    let expression = format!("{EXTERNAL}.d(NULL) IS NULL");
+    let mut setup = generating_target();
+    setup.push(function.clone());
+    if domain {
+        setup.push(format!("CREATE DOMAIN {EXTERNAL}.d AS {MANAGED}.m"));
+    }
+    setup.extend([
+        format!(
+            "CREATE TABLE {MANAGED}.t (id integer, \
+             g boolean GENERATED ALWAYS AS ({expression}) STORED)"
+        ),
+        format!("CREATE VIEW {MANAGED}.a AS SELECT id FROM {MANAGED}.t"),
+    ]);
+    let with_t = |mut schema: pbps_model::Schema| {
+        let mut generated = pbps_model::Column::new("boolean".parse().unwrap());
+        generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+            expression: expression.clone(),
+            stored: true,
+        });
+        schema
+            .tables
+            .get_mut(&format!("{MANAGED}.t").parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("g".into(), generated);
+        generating(schema)
+    };
+    let a = format!("SELECT id FROM {MANAGED}.t");
+    let inputs = Inputs::from_pair((
+        with_t(declared(&[("a", &a)], &["m", "t"])),
+        with_t(declared(&[("a", &a), ("b", &a)], &["m", "t"])),
+    ));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &format!("CREATE SCHEMA {EXTERNAL};\n{function};"),
+    )
+    .await;
+    target.drop().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_leaves_unresolved_a_generated_column_a_chained_shape_would_take() {
+    let plan = generated_before_a_chained_shape(false)
+        .await
+        .unwrap_or_else(|error| panic!("without the domain: {error}"));
+    plan.evidence.validate(&plan.changes).unwrap();
+    let refused = match generated_before_a_chained_shape(true).await {
+        Ok(_) => panic!("a generated binding the domain would take was sealed"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refused.contains("the declaration was compiled before an object sharing a name it bound"),
+        "{refused}"
+    );
+}
+
+/// A chained table's identity column creates the sequence
+/// `ext.e_id_seq`, which has no row type, so it takes no call: a view
+/// compiled before the split, calling the externals file's
+/// `ext.e_id_seq(text)`, binds it on both sides and is resolved. Negative:
+/// a chained shape with a row type of that name leaves the call
+/// unresolved.
+async fn calling_a_chained_sequences_name(sequence: bool) -> Result<ResolvedPlan, ProduceError> {
+    let function = format!(
+        "CREATE FUNCTION {EXTERNAL}.e_id_seq(text) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1"
+    );
+    let mut setup = generating_target();
+    setup.push(function.clone());
+    setup.push(if sequence {
+        format!(
+            "CREATE TABLE {EXTERNAL}.e (id integer GENERATED ALWAYS AS IDENTITY, m {MANAGED}.m)"
+        )
+    } else {
+        format!("CREATE TABLE {EXTERNAL}.e_id_seq (m {MANAGED}.m)")
+    });
+    let reader = if sequence { "e" } else { "e_id_seq" };
+    let call = format!("SELECT {EXTERNAL}.e_id_seq(NULL) AS v");
+    let read = format!("SELECT 1 AS v FROM {EXTERNAL}.{reader} WHERE {MANAGED}.f(1) > 0");
+    setup.extend([
+        format!("CREATE VIEW {MANAGED}.a AS {call}"),
+        format!("CREATE VIEW {MANAGED}.c AS {read}"),
+    ]);
+    let inputs = Inputs::from_pair((
+        generating(declared(&[("a", &call), ("c", &read)], &["m"])),
+        generating(declared(
+            &[("a", &call), ("b", &call), ("c", &read)],
+            &["m"],
+        )),
+    ));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &format!("CREATE SCHEMA {EXTERNAL};\n{function};"),
+    )
+    .await;
+    target.drop().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_resolves_a_call_named_like_a_chained_sequence() {
+    let plan = calling_a_chained_sequences_name(true)
+        .await
+        .unwrap_or_else(|error| panic!("a sequence: {error}"));
+    plan.evidence.validate(&plan.changes).unwrap();
+    let refused = match calling_a_chained_sequences_name(false).await {
+        Ok(_) => panic!("a call a row type would take was sealed"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refused.contains("the declaration was compiled before an object sharing a name it bound"),
+        "{refused}"
+    );
+}
+
+/// A chained fill in the supplied layout runs on a session the compile
+/// pinned to the target's zone. Its outside-write check reads the cluster's
+/// roles before and after, and a role's `VALID UNTIL` renders in the zone of
+/// each read: both read under the same settings, and a cluster holding such
+/// a role resolves the plan. The zone is one scratch's server does not
+/// have.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_reads_a_roles_expiry_alike_around_a_chained_fill() {
+    let role = "pbps_expiring_1778";
+    let filter = format!(" WHERE {MANAGED}.f(id) > 0");
+    let a = format!("{}{filter}", reading("id", "e"));
+    let b = format!("{}{filter}", reading("m", "e"));
+    let inputs = Inputs::from_pair((
+        generating(declared(&[("a", &a)], &["m"])),
+        generating(declared(&[("a", &a), ("b", &b)], &["m"])),
+    ));
+    let key = ProjectKey::new(true);
+    for server in SERVERS {
+        let mut setup = generating_target();
+        setup.extend([
+            format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
+            format!("CREATE VIEW {MANAGED}.a AS {a}"),
+            "DO $$BEGIN EXECUTE pg_catalog.format('ALTER DATABASE %I SET TimeZone = %L', \
+             pg_catalog.current_database(), 'Pacific/Kiritimati'); END$$"
+                .into(),
+        ]);
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &setup).await;
+        let mut cluster = Conn::connect(Driver::Postgres, &fixture.server)
+            .await
+            .unwrap();
+        cluster
+            .execute(&format!(
+                "CREATE ROLE {role} VALID UNTIL '2100-01-01 00:00:00+00'"
+            ))
+            .await
+            .unwrap();
+        let (login, scratch_db) = fixture.confined().await;
+        let result = produce_filled(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            None,
+        )
+        .await;
+        let _ = cluster
+            .execute(&format!("DROP ROLE IF EXISTS {role}"))
+            .await;
+        fixture.drop().await;
+        assert_staged(result, "e", server);
+    }
+}
+
+/// A managed routine declared as `g(status)`, where `status` is an enum in
+/// the write path's extra schema `shared`, is found on the target with that
+/// path, so fill stages the enum it needs. Negative: the enum is what fill
+/// adds; nothing else creates it.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_fills_what_a_routine_declared_through_the_extras_needs() {
+    let body = "(s status) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1";
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        "CREATE SCHEMA shared".to_owned(),
+        "CREATE TYPE shared.status AS ENUM ('a', 'b')".to_owned(),
+        format!(
+            "CREATE FUNCTION {MANAGED}.g(s shared.status) RETURNS integer \
+             LANGUAGE sql IMMUTABLE RETURN 1"
+        ),
+    ];
+    let with_g = |mut schema: pbps_model::Schema| {
+        schema.modules.insert(
+            format!("{MANAGED}.g(status)").parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::Function,
+                description: None,
+                definition: body.into(),
+            },
+        );
+        schema
+    };
+    let inputs = Inputs::from_pair((
+        with_g(declared(&[], &[])),
+        with_g(declared(&[("b", "SELECT 1 AS x")], &[])),
+    ));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_with_extras(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &["shared".to_owned()],
+    )
+    .await;
+    target.drop().await;
+    let plan = result.unwrap_or_else(|error| panic!("{error}"));
+    plan.evidence.validate(&plan.changes).unwrap();
+    assert!(
+        plan.evidence
+            .before()
+            .scope()
+            .retained
+            .iter()
+            .any(|object| object.name == ["shared", "status"]),
+        "the enum fill staged is sealed"
+    );
+}
+
+/// The outside-write check resets the session's settings, and `pbps-db`
+/// pins the empty path with a plain `SET`, which the reset clears. A supplied
+/// login whose own default path is `public, pg_catalog` would then resolve
+/// the backend check's `::text` to the enum `public.text` that fill, or the
+/// externals file, created: the path is pinned again for the session, and
+/// the plan resolves either way.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_keeps_the_empty_path_after_the_outside_write_check() {
+    let enum_type = "CREATE TYPE public.text AS ENUM ('a')";
+    let a = "SELECT 'a'::public.text AS x";
+    let inputs = Inputs::from_pair((
+        declared(&[("a", a)], &[]),
+        declared(&[("a", a), ("b", a)], &[]),
+    ));
+    let key = ProjectKey::new(true);
+    for (externals, server) in
+        [None, Some(format!("{enum_type};"))]
+            .into_iter()
+            .flat_map(|externals| {
+                SERVERS
+                    .iter()
+                    .map(move |&server| (externals.clone(), server))
+            })
+    {
+        let setup = vec![
+            format!("CREATE SCHEMA {MANAGED}"),
+            enum_type.to_owned(),
+            format!("CREATE VIEW {MANAGED}.a AS {a}"),
+        ];
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &setup).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let mut cluster = Conn::connect(Driver::Postgres, &fixture.server)
+            .await
+            .unwrap();
+        cluster
+            .execute(&format!(
+                "ALTER ROLE {} SET search_path = public, pg_catalog",
+                login.0
+            ))
+            .await
+            .unwrap();
+        let result = produce_filled(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            externals.as_deref(),
+        )
+        .await;
+        fixture.drop().await;
+        let context = if externals.is_some() {
+            "the file"
+        } else {
+            "fill"
+        };
+        let plan = result.unwrap_or_else(|error| panic!("{server}, {context}: {error}"));
+        plan.evidence.validate(&plan.changes).unwrap();
+    }
+}
+
+/// On the target `ext.d(NULL)` casts to the domain `ext.d`, which names
+/// `m`'s row type; scratch compiles the views before fill creates the
+/// domain, and they bind the externals file's `ext.d(text)` instead
+/// (measured on 16 and 18). That binding is unresolved, never sealed.
+/// Negative: without the domain the function is the binding on both.
+async fn shadowed_by_a_chained_shape(domain: bool) -> Result<ResolvedPlan, ProduceError> {
+    let function =
+        format!("CREATE FUNCTION {EXTERNAL}.d(text) RETURNS text LANGUAGE sql RETURN $1");
+    let mut setup = generating_target();
+    setup.push(function.clone());
+    if domain {
+        setup.push(format!("CREATE DOMAIN {EXTERNAL}.d AS {MANAGED}.m"));
+    }
+    let view = format!("SELECT {EXTERNAL}.d(NULL) AS x");
+    setup.push(format!("CREATE VIEW {MANAGED}.a AS {view}"));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &generating_inputs(&view),
+        &key,
+        &format!("CREATE SCHEMA {EXTERNAL};\n{function};"),
+    )
+    .await;
+    target.drop().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_leaves_unresolved_a_binding_a_chained_shape_would_take() {
+    let plan = shadowed_by_a_chained_shape(false)
+        .await
+        .unwrap_or_else(|error| panic!("without the domain: {error}"));
+    plan.evidence.validate(&plan.changes).unwrap();
+    let refused = match shadowed_by_a_chained_shape(true).await {
+        Ok(_) => panic!("a binding the domain would take was sealed"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refused.contains("the declaration was compiled before an object sharing a name it bound"),
+        "{refused}"
+    );
+}
+
+/// Views that call the function compile after it, and after the table, so
+/// fill's chained shape is in place for them. Negative: views that do not
+/// call it compile first, and the run refuses, naming what waits for what.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_lifts_a_chain_through_a_table_that_compiles_after_its_function() {
+    assert_staged(
+        after_its_function(true).await,
+        "e",
+        "a table after its function",
+    );
+    let refused = externals_refusal(after_its_function(false).await);
+    assert!(
+        refused.contains(&format!(
+            "fill creates table {EXTERNAL}.e only once scratch has created {MANAGED}.m, and a \
+             declaration scratch compiles before that cannot read it"
+        )),
+        "{refused}"
+    );
+}
+
+/// An event trigger the externals file installed fires on fill's statements
+/// too. What it writes outside the scratch database is rolled back and
+/// refused, as the file's own writes are (#1783).
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_refuses_an_outside_write_fill_sets_off_and_leaves_none() {
+    let role = "pbps_fill_escape_1778";
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &guarded_target()).await;
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let externals = format!(
+        "CREATE SCHEMA {EXTERNAL};\n\
+         CREATE FUNCTION {EXTERNAL}.escape() RETURNS event_trigger LANGUAGE plpgsql \
+         AS $$BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '{role}') \
+         THEN EXECUTE 'CREATE ROLE {role}'; END IF; END$$;\n\
+         CREATE EVENT TRIGGER pbps_fill_escape ON ddl_command_end \
+         EXECUTE FUNCTION {EXTERNAL}.escape();"
+    );
+    let refused = externals_refusal(
+        produce_staged(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            &externals,
+        )
+        .await,
+    );
+    let mut cluster = Conn::connect(Driver::Postgres, &scratch.server)
+        .await
+        .unwrap();
+    let left = cluster
+        .query(&format!(
+            "SELECT count(*)::text AS n FROM pg_catalog.pg_roles WHERE rolname = '{role}'"
+        ))
+        .await
+        .unwrap()[0]
+        .try_get::<&str>("n")
+        .unwrap()
+        .map(str::to_owned);
+    let _ = cluster
+        .execute(&format!("DROP ROLE IF EXISTS {role}"))
+        .await;
+    target.drop().await;
+    assert!(
+        refused.contains(&format!(
+            "filling what the externals file lacks changed role {role}"
+        )),
+        "{refused}"
+    );
+    assert_eq!(left.as_deref(), Some("0"), "the role was rolled back");
+}
+
+/// The negative: the externals file holds `ext.e` itself, so it is the
+/// file's, and the file runs before any managed object exists.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it() {
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &chain_target()).await;
     let inputs = staging_inputs(&reading("id", "e"), &reading("m", "e"), &["m"]);
     let key = ProjectKey::new(true);
     let refused = externals_refusal(
@@ -2297,18 +2969,83 @@ async fn resolver_refuses_a_chain_through_an_external_object_naming_it() {
             &target.on(&target_db),
             &inputs,
             &key,
-            &format!("CREATE SCHEMA {EXTERNAL};"),
+            &format!(
+                "CREATE SCHEMA {EXTERNAL};\n\
+                 CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m);"
+            ),
         )
         .await,
     );
     target.drop().await;
     assert!(
-        refused.contains(&format!(
-            "view {MANAGED}.a binds table {EXTERNAL}.e, whose shape names the managed table \
-             {MANAGED}.m"
-        )) && refused.contains("adopt"),
+        refused.contains(&format!("type \"{MANAGED}.m\" does not exist"))
+            && refused.contains("fill stages it once the managed tables exist"),
         "{refused}"
     );
+}
+
+/// With no externals file at all, fill stages the external table the
+/// managed views read.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_fills_the_external_objects_no_externals_file_stages() {
+    let inputs = staging_inputs(&reading("id", "t"), &reading("name", "t"), &[]);
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &guarded_target()).await;
+    let result = produce_filled(&scratch.server, &target.on(&target_db), &inputs, &key, None).await;
+    target.drop().await;
+    assert_staged(result, "t", "no externals file");
+}
+
+/// Fill writes no routine source: a managed view calling an external
+/// function no externals file stages refuses, naming the function and the
+/// remedy. Negative: the file holding the function answers.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_refuses_a_routine_fill_cannot_stage_naming_it() {
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!(
+            "CREATE FUNCTION {EXTERNAL}.f(x integer) RETURNS integer LANGUAGE sql \
+             IMMUTABLE AS 'SELECT x'"
+        ),
+        format!("CREATE VIEW {MANAGED}.a AS SELECT {EXTERNAL}.f(1) AS id"),
+    ];
+    let calling = format!("SELECT {EXTERNAL}.f(1) AS id");
+    let inputs = staging_inputs(&calling, &calling, &[]);
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let refused = externals_refusal(
+        produce_filled(&scratch.server, &target.on(&target_db), &inputs, &key, None).await,
+    );
+    let answered = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &format!(
+            "CREATE SCHEMA {EXTERNAL};\n\
+             CREATE FUNCTION {EXTERNAL}.f(x integer) RETURNS integer LANGUAGE sql \
+             IMMUTABLE AS 'SELECT x';"
+        ),
+    )
+    .await;
+    target.drop().await;
+    assert!(
+        refused.contains(&format!(
+            "function {EXTERNAL}.f(integer) cannot be filled: pbps sends no routine source to \
+             scratch; write it in the externals file"
+        )),
+        "{refused}"
+    );
+    if let Err(error) = answered {
+        panic!("the externals file's function answers: {error}");
+    }
 }
 
 /// The external view over its table, and a managed view reading it.
@@ -2619,6 +3356,86 @@ async fn resolver_stages_a_cast_and_an_operator_over_external_types_in_the_exter
     }
 }
 
+/// Fill installs the extension the target's current view needs, from the
+/// target's dependencies, whether or not the desired view still does. The
+/// target's member was changed in place (made `VOLATILE`, or renamed),
+/// which a new extension cannot reproduce, so the comparison refuses,
+/// naming fill and the remedy. With the remedy written in the externals file
+/// (the extension and the change), the file holds it, fill leaves it, and
+/// the plan resolves.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_names_fills_altered_extension_member_and_its_remedy() {
+    let done = "SELECT 'done'::text AS r";
+    let cases = [
+        (
+            "VOLATILE",
+            "soundex",
+            format!(
+                "fill created function {EXTERNAL}.soundex(text), which differs from the target's \
+                 in provolatile; the target's was changed after it was created"
+            ),
+        ),
+        (
+            "RENAME TO soundex_renamed",
+            "soundex_renamed",
+            format!(
+                "fill created function {EXTERNAL}.soundex(text), which the target does not have: \
+                 the target's was changed after it was created"
+            ),
+        ),
+    ];
+    for (change, called, named) in cases {
+        let call = format!("SELECT {EXTERNAL}.{called}('pbps') AS r");
+        let altered = format!("ALTER FUNCTION {EXTERNAL}.soundex(text) {change}");
+        let setup = vec![
+            format!("CREATE SCHEMA {MANAGED}"),
+            format!("CREATE SCHEMA {EXTERNAL}"),
+            format!("CREATE EXTENSION fuzzystrmatch SCHEMA {EXTERNAL}"),
+            altered.clone(),
+            format!("CREATE VIEW {MANAGED}.a AS {call}"),
+        ];
+        let inputs = Inputs::from_pair((
+            declared(&[("a", &call)], &[]),
+            declared(&[("a", done)], &[]),
+        ));
+        let key = ProjectKey::new(true);
+        let remedy = format!(
+            "CREATE SCHEMA {EXTERNAL};\nCREATE EXTENSION fuzzystrmatch SCHEMA {EXTERNAL};\n\
+             {altered};"
+        );
+        for externals in [None, Some(remedy.as_str())] {
+            let mut target = Fixture::new("PBPS_TEST_PG_DB");
+            let scratch = Fixture::new(SCRATCH_SERVER);
+            let target_db = staging_target(&mut target, &setup).await;
+            let result = produce_filled(
+                &scratch.server,
+                &target.on(&target_db),
+                &inputs,
+                &key,
+                externals,
+            )
+            .await;
+            target.drop().await;
+            match externals {
+                None => {
+                    let refused = externals_refusal(result);
+                    assert!(
+                        refused.contains(&named)
+                            && refused.contains("in the externals file as the target has it"),
+                        "{change}: {refused}"
+                    );
+                }
+                Some(_) => {
+                    let plan =
+                        result.unwrap_or_else(|error| panic!("{change}, with the remedy: {error}"));
+                    plan.evidence.validate(&plan.changes).unwrap();
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn resolver_compares_each_extension_member_with_the_target() {
@@ -2682,26 +3499,33 @@ async fn resolver_refuses_an_extension_with_a_member_no_capture_identifies() {
         format!("CREATE EXTENSION postgres_fdw SCHEMA {EXTERNAL}"),
         format!("CREATE VIEW {MANAGED}.a AS {call}"),
     ];
-    let mut target = Fixture::new("PBPS_TEST_PG_DB");
-    let scratch = Fixture::new(SCRATCH_SERVER);
-    let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(&call, &call, &[]);
     let key = ProjectKey::new(true);
-    let result = produce_staged(
-        &scratch.server,
-        &target.on(&target_db),
-        &inputs,
-        &key,
-        &externals,
-    )
-    .await;
-    target.drop().await;
-    let refused = externals_refusal(result);
-    assert!(
-        refused.contains("foreign-data wrapper postgres_fdw")
-            && refused.contains("no plan can seal its extension"),
-        "{refused}"
-    );
+    // Written in the externals file, and filled from the target's
+    // dependencies when there is none: each refusal names who created it.
+    for (externals, who) in [
+        (Some(externals.as_str()), "the externals file"),
+        (None, "fill"),
+    ] {
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let scratch = Fixture::new(SCRATCH_SERVER);
+        let target_db = staging_target(&mut target, &setup).await;
+        let result = produce_filled(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            externals,
+        )
+        .await;
+        target.drop().await;
+        let refused = externals_refusal(result);
+        assert!(
+            refused.contains(&format!("{who} created foreign-data wrapper postgres_fdw"))
+                && refused.contains("no plan can seal its extension"),
+            "{who}: {refused}"
+        );
+    }
 }
 
 #[tokio::test]
