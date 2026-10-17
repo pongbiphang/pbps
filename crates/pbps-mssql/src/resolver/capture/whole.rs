@@ -44,7 +44,9 @@ pub(super) struct Whole<'a> {
     parameters: BTreeMap<i64, Vec<&'a WholeRow>>,
     types: BTreeMap<&'static str, BTreeMap<i64, &'a WholeRow>>,
     column_names: BTreeMap<(i64, i64), &'a str>,
-    index_names: BTreeMap<(i64, i64), String>,
+    /// An index's name, `None` for a heap, which has none: any text could
+    /// also be an index's name, so a heap gets no stand-in.
+    index_names: BTreeMap<(i64, i64), Option<String>>,
     /// A table type's own table object, by its id: the type's `user_type_id`.
     table_objects: BTreeMap<i64, i64>,
 }
@@ -96,12 +98,7 @@ impl<'a> Whole<'a> {
             if let (Some(object), Some(index)) = (number(row, "object_id"), number(row, "index_id"))
             {
                 whole.indexes.entry(object).or_default().push(row);
-                // A heap has no name; its number, 0, is fixed.
-                let name = row
-                    .get("name")
-                    .cloned()
-                    .flatten()
-                    .unwrap_or_else(|| "(heap)".to_owned());
+                let name = row.get("name").cloned().flatten();
                 whole.index_names.insert((object, index), name);
             }
         }
@@ -311,16 +308,19 @@ impl<'a> Whole<'a> {
         object: i64,
         index: &super::select::Lookup<'_>,
     ) -> Result<Value, Uncovered> {
-        let mut out = Map::new();
+        // A list in name order, the heap (no name) first: a map keyed by a
+        // stand-in name could collide with a real index of that name.
+        let mut out = Vec::new();
         for row in self.indexes.get(&object).into_iter().flatten() {
             let id = number(row, "index_id").ok_or_else(|| Self::unknown("indexes"))?;
             let name = self
                 .index_names
                 .get(&(object, id))
                 .ok_or_else(|| Self::unknown("indexes"))?;
-            out.insert(
+            out.push((
                 name.clone(),
                 json!({
+                    "name": name,
                     "index": self.translate("indexes", row, index)?,
                     "columns": self.ordered(
                         "index_columns",
@@ -329,9 +329,12 @@ impl<'a> Whole<'a> {
                         index,
                     )?,
                 }),
-            );
+            ));
         }
-        Ok(Value::Object(out))
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Value::Array(
+            out.into_iter().map(|(_, value)| value).collect(),
+        ))
     }
 
     /// Everything the whole views hold about one object, by view.

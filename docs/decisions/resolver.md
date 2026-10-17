@@ -3706,6 +3706,11 @@ column after another, which is why §8 rejected it for the externals file.
   rows without renaming anything. An encryption key carries its values and
   their master keys. A `sql_variant` is read in style 126, which keeps a
   date to the millisecond. This answers #2150's fifth ready review.
+- **No stand-in can collide.** An object's indexes are a list in name
+  order, a heap (which has no name) as `null`, since any text could also be
+  an index's name. A system-procedure candidate must name `sys`, the only
+  schema that holds one; any other refuses rather than seal `sys` members
+  under it. This answers #2150's sixth ready review.
 - **The typed reads stay.** The dependency classification, the closure,
   the candidates and ownership read them (DEC-2141.1). The whole rows are
   what a capture compares.
@@ -3718,7 +3723,9 @@ index's filter and a column's `SPARSE`) and
 `mssql_a_bound_default_or_rule_is_a_binding_and_its_definition_is_compared`
 and `mssql_a_sequences_declaration_and_an_xml_collections_schemas_are_compared`,
 live; and
-`a_dependency_of_a_table_types_own_objects_refuses`. Each test fails with its part
+`a_dependency_of_a_table_types_own_objects_refuses`,
+`a_heap_and_an_index_named_like_a_stand_in_are_both_kept` and
+`a_system_procedure_set_naming_another_schema_refuses`. Each test fails with its part
 of the rule removed. The rebuilt-alike case of
 `mssql_an_identitys_seed_and_not_for_replication_are_differences` fails if
 the dates are compared.

@@ -829,6 +829,14 @@ pub(super) fn select(catalog: &Catalog, scope: &CaptureScope) -> Result<Selected
                 members
             }
             CandidateClass::SystemProcedure => {
+                // Only `sys` holds the engine's procedures: a set naming any
+                // other schema would seal `sys` members under it.
+                if candidate.schema != "sys" {
+                    return Err(Uncovered::class(
+                        "sys.system_objects",
+                        "a system-procedure candidate names a schema other than sys",
+                    ));
+                }
                 let members: BTreeSet<_> = catalog
                     .system_named
                     .get(&candidate.name)

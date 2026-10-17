@@ -337,6 +337,45 @@ fn a_dependency_of_a_table_types_own_objects_refuses() {
 }
 
 #[test]
+fn a_heap_and_an_index_named_like_a_stand_in_are_both_kept() {
+    let mut catalog = catalog();
+    let row = |id: &str, name: Option<&str>| {
+        super::read::WholeRow::from([
+            ("object_id".to_owned(), Some(PRICE.to_string())),
+            ("index_id".to_owned(), Some(id.to_owned())),
+            ("name".to_owned(), name.map(str::to_owned)),
+            ("type".to_owned(), Some(id.to_owned())),
+        ])
+    };
+    catalog
+        .whole
+        .insert("indexes", vec![row("0", None), row("2", Some("(heap)"))]);
+    let mut scope = scope();
+    scope.retained.insert(object("dbo", "price"));
+    catalog
+        .objects_named
+        .insert(("dbo".into(), "price".into()), BTreeSet::from([PRICE]));
+    let captured = captured(catalog, scope);
+    let indexes = &captured.inputs[&object("dbo", "price")].properties["sys.indexes"];
+    assert_eq!(indexes.as_array().map(Vec::len), Some(2), "{indexes}");
+}
+
+#[test]
+fn a_system_procedure_set_naming_another_schema_refuses() {
+    let mut scope = scope();
+    scope
+        .candidates
+        .insert(set(CandidateClass::SystemProcedure, "dbo", "sp_who"));
+    match select::select(&catalog(), &scope) {
+        Ok(_) => panic!("the capture was expected to refuse"),
+        Err(refusal) => assert_eq!(
+            refusal.condition,
+            "a system-procedure candidate names a schema other than sys"
+        ),
+    }
+}
+
+#[test]
 fn an_engine_object_is_read_by_identity_only() {
     let mut catalog = catalog();
     // `sys.objects` is the engine's own: no row of it is in the catalog read.

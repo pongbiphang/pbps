@@ -1454,3 +1454,42 @@ async fn mssql_a_partition_scheme_and_an_encryption_key_are_compared_by_definiti
     );
     db.drop().await;
 }
+
+/// A heap has no name, and an index may be named anything, `(heap)`
+/// included: the two are both compared, and a change to the index differs.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_heap_and_an_index_of_any_name_are_both_compared() {
+    let mut db = TestDb::create("heap2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE TABLE app.h (a int, b int);",
+            "CREATE INDEX [(heap)] ON app.h (a);",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "h")]))
+        .await
+        .expect("capture");
+    run(
+        &mut db.conn,
+        &[
+            "DROP INDEX [(heap)] ON app.h;",
+            "CREATE INDEX [(heap)] ON app.h (b);",
+        ],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(&object("app", "h"))
+                && d.change == InputChange::Properties),
+        "{differences:?}"
+    );
+    db.drop().await;
+}
