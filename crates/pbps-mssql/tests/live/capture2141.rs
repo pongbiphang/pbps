@@ -742,3 +742,74 @@ async fn mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_
     );
     db.drop().await;
 }
+
+/// A key is its ordered columns: rebuilt under the same name on another
+/// column, it differs, though no column did. A foreign key binds its table
+/// and, by index id, the key it references (`docs/RESOLVER-MSSQL.md` §8).
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured() {
+    let mut db = TestDb::create("keys2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE TABLE app.k (a int NOT NULL, b int NOT NULL, \
+             CONSTRAINT pk_k PRIMARY KEY (a), CONSTRAINT uq_k UNIQUE (b));",
+            "CREATE TABLE app.r (x int, CONSTRAINT fk_r FOREIGN KEY (x) REFERENCES app.k (b));",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "r")]))
+        .await
+        .expect("capture");
+    let fk = bound(&sealed, &object("app", "fk_r"));
+    assert!(fk.contains(&object("app", "k")) && fk.contains(&object("app", "uq_k")));
+
+    run(
+        &mut db.conn,
+        &[
+            "ALTER TABLE app.r DROP CONSTRAINT fk_r;",
+            "ALTER TABLE app.k DROP CONSTRAINT uq_k;",
+            "ALTER TABLE app.k ADD CONSTRAINT uq_k UNIQUE (a);",
+            "ALTER TABLE app.r ADD CONSTRAINT fk_r FOREIGN KEY (x) REFERENCES app.k (a);",
+        ],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    for changed in [object("app", "uq_k"), object("app", "fk_r")] {
+        assert!(
+            differences
+                .iter()
+                .any(|d| d.object.as_ref() == Some(&changed) && d.change == InputChange::Properties),
+            "{changed:?}: {differences:?}"
+        );
+    }
+
+    // A unique index that is no constraint is the table's: its columns too.
+    run(&mut db.conn, &["CREATE UNIQUE INDEX ux_b ON app.k (b);"]).await;
+    let indexed = capture::capture(&mut db.conn, &objects(&[("app", "k")]))
+        .await
+        .expect("capture");
+    run(
+        &mut db.conn,
+        &[
+            "DROP INDEX ux_b ON app.k;",
+            "CREATE UNIQUE INDEX ux_b ON app.k (a, b);",
+        ],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &indexed)
+        .await
+        .expect("recapture");
+    assert!(
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(&object("app", "k"))
+                && d.change == InputChange::Properties),
+        "{differences:?}"
+    );
+    db.drop().await;
+}

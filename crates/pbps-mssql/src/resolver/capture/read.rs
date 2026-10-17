@@ -70,6 +70,29 @@ pub(super) struct Parameter {
     pub readonly: bool,
 }
 
+/// A PRIMARY KEY or UNIQUE constraint's ordered key columns and its index's
+/// kind: a foreign key binds the key's index (`docs/RESOLVER-MSSQL.md` §8).
+#[derive(Default)]
+pub(super) struct Key {
+    pub index: String,
+    pub columns: Vec<(i64, String, bool)>,
+}
+
+/// A foreign key: the table and the key it binds, its column pairs and its
+/// actions.
+pub(super) struct ForeignKey {
+    pub referenced: i64,
+    /// The key constraint whose index the key binds, or `None` when it binds
+    /// a unique index that is no constraint, named then by `index`.
+    pub key: Option<i64>,
+    pub index: String,
+    pub on_delete: String,
+    pub on_update: String,
+    pub disabled: bool,
+    pub trusted: bool,
+    pub columns: Vec<(i64, String, String)>,
+}
+
 /// One column of a user-defined table type, keyed by the type.
 pub(super) struct TypeColumn {
     pub id: i64,
@@ -171,6 +194,13 @@ pub(super) struct Catalog {
     pub parameters: Vec<Parameter>,
     pub types: Vec<Type>,
     pub synonyms: BTreeMap<i64, String>,
+    /// Each key constraint's key, by the constraint's object id.
+    pub keys: BTreeMap<i64, Key>,
+    /// Each table's unique indexes that are no constraint, by the table's
+    /// object id: a foreign key may bind one as it binds a key.
+    pub unique_indexes: BTreeMap<i64, BTreeMap<String, Key>>,
+    /// Each foreign key, by its object id.
+    pub foreign_keys: BTreeMap<i64, ForeignKey>,
     /// Each user-defined table type's structure, by its `user_type_id`.
     pub table_types: BTreeMap<i64, TableType>,
     pub constraints: BTreeMap<i64, Constraint>,
@@ -268,6 +298,43 @@ const TYPES: &str = "SELECT CONVERT(nvarchar(20), user_type_id) AS id, \
     CONVERT(nvarchar(1), is_user_defined) AS user_defined, \
     CONVERT(nvarchar(1), is_table_type) AS table_type \
     FROM sys.types;";
+
+const KEYS: &str = "SELECT CONVERT(nvarchar(20), kc.object_id) AS id, \
+    CONVERT(nvarchar(60), i.type_desc) AS [index], CONVERT(nvarchar(20), ic.key_ordinal) AS ordinal, \
+    CONVERT(nvarchar(128), c.name) AS [column], CONVERT(nvarchar(1), ic.is_descending_key) AS descending \
+    FROM sys.key_constraints kc \
+    JOIN sys.indexes i ON i.object_id = kc.parent_object_id AND i.index_id = kc.unique_index_id \
+    JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 \
+    JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+    WHERE kc.is_ms_shipped = 0;";
+
+const UNIQUE_INDEXES: &str = "SELECT CONVERT(nvarchar(20), i.object_id) AS id, \
+    CONVERT(nvarchar(128), i.name) AS name, CONVERT(nvarchar(60), i.type_desc) AS [index], \
+    CONVERT(nvarchar(20), ic.key_ordinal) AS ordinal, CONVERT(nvarchar(128), c.name) AS [column], \
+    CONVERT(nvarchar(1), ic.is_descending_key) AS descending \
+    FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id AND o.is_ms_shipped = 0 \
+    JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.key_ordinal > 0 \
+    JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+    WHERE i.is_unique = 1 AND i.is_primary_key = 0 AND i.is_unique_constraint = 0;";
+
+const FOREIGN_KEYS: &str = "SELECT CONVERT(nvarchar(20), fk.object_id) AS id, \
+    CONVERT(nvarchar(20), fk.referenced_object_id) AS referenced, \
+    CONVERT(nvarchar(20), kc.object_id) AS [key], CONVERT(nvarchar(128), i.name) AS [index], \
+    CONVERT(nvarchar(60), fk.delete_referential_action_desc) AS on_delete, \
+    CONVERT(nvarchar(60), fk.update_referential_action_desc) AS on_update, \
+    CONVERT(nvarchar(1), fk.is_disabled) AS disabled, CONVERT(nvarchar(1), fk.is_not_trusted) AS not_trusted \
+    FROM sys.foreign_keys fk \
+    JOIN sys.indexes i ON i.object_id = fk.referenced_object_id AND i.index_id = fk.key_index_id \
+    LEFT JOIN sys.key_constraints kc ON kc.parent_object_id = fk.referenced_object_id \
+        AND kc.unique_index_id = fk.key_index_id \
+    WHERE fk.is_ms_shipped = 0;";
+
+const FOREIGN_KEY_COLUMNS: &str = "SELECT CONVERT(nvarchar(20), fkc.constraint_object_id) AS id, \
+    CONVERT(nvarchar(20), fkc.constraint_column_id) AS ordinal, \
+    CONVERT(nvarchar(128), pc.name) AS [column], CONVERT(nvarchar(128), rc.name) AS referenced \
+    FROM sys.foreign_key_columns fkc \
+    JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
+    JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id;";
 
 const TABLE_TYPE_COLUMNS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) AS type, \
     CONVERT(nvarchar(20), c.column_id) AS id, CONVERT(nvarchar(128), c.name) AS name, \
@@ -586,6 +653,61 @@ pub(super) async fn read(
             table_type: row.flag("table_type")?,
         });
     }
+    let mut keys: BTreeMap<i64, Key> = BTreeMap::new();
+    for row in rows(conn, KEYS).await? {
+        let row = Text(&row);
+        let key = keys.entry(row.number("id")?).or_default();
+        key.index = row.required("index")?;
+        key.columns.push((
+            row.number("ordinal")?,
+            row.required("column")?,
+            row.flag("descending")?,
+        ));
+    }
+    let mut unique_indexes: BTreeMap<i64, BTreeMap<String, Key>> = BTreeMap::new();
+    for row in rows(conn, UNIQUE_INDEXES).await? {
+        let row = Text(&row);
+        let index = unique_indexes
+            .entry(row.number("id")?)
+            .or_default()
+            .entry(row.required("name")?)
+            .or_default();
+        index.index = row.required("index")?;
+        index.columns.push((
+            row.number("ordinal")?,
+            row.required("column")?,
+            row.flag("descending")?,
+        ));
+    }
+    let mut foreign_keys = BTreeMap::new();
+    for row in rows(conn, FOREIGN_KEYS).await? {
+        let row = Text(&row);
+        foreign_keys.insert(
+            row.number("id")?,
+            ForeignKey {
+                referenced: row.number("referenced")?,
+                key: row.optional_number("key")?,
+                index: row.required("index")?,
+                on_delete: row.required("on_delete")?,
+                on_update: row.required("on_update")?,
+                disabled: row.flag("disabled")?,
+                trusted: !row.flag("not_trusted")?,
+                columns: Vec::new(),
+            },
+        );
+    }
+    for row in rows(conn, FOREIGN_KEY_COLUMNS).await? {
+        let row = Text(&row);
+        foreign_keys
+            .get_mut(&row.number("id")?)
+            .ok_or(CaptureError::Incomplete)?
+            .columns
+            .push((
+                row.number("ordinal")?,
+                row.required("column")?,
+                row.required("referenced")?,
+            ));
+    }
     let mut table_types: BTreeMap<i64, TableType> = BTreeMap::new();
     for row in rows(conn, TABLE_TYPE_COLUMNS).await? {
         let row = Text(&row);
@@ -733,6 +855,9 @@ pub(super) async fn read(
         parameters,
         types,
         synonyms,
+        keys,
+        unique_indexes,
+        foreign_keys,
         table_types,
         constraints,
         dependencies,

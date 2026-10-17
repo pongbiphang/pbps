@@ -3573,6 +3573,12 @@ Planning does not use it yet (#2143).
   keys. Its own table object is the engine's (`is_ms_shipped = 1`), so the
   ordinary object reads never list it, and a type rebuilt with another shape
   would otherwise read as unchanged.
+- **A key is its ordered columns.** A PRIMARY KEY or UNIQUE constraint is
+  captured with its key columns and its index's kind, and a table with its
+  unique indexes that are no constraint. A foreign key binds its table and,
+  by index id, the key it references; its column pairs and actions are
+  properties. A key rebuilt under the same name on another column would
+  otherwise read as unchanged, though no column did.
 - **Ownership matches the catalog's spelling.** A declaration spelled
   differently owns nothing, which leaves its record unqualified, never
   another object's.
@@ -3586,6 +3592,7 @@ Planning does not use it yet (#2143).
 `mssql_ownership_follows_the_declaration_and_an_owner_change_is_a_difference`
 `mssql_a_candidate_is_matched_under_the_databases_collation`,
 `mssql_an_encrypted_module_refuses_by_name` and
-`mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_it`,
+`mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_it`
+and `mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured`,
 live;
 and the `resolver::capture` unit tests.

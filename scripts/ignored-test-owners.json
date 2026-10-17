@@ -876,6 +876,7 @@
         "capture2141::mssql_a_candidate_is_matched_under_the_databases_collation",
         "capture2141::mssql_an_encrypted_module_refuses_by_name",
         "capture2141::mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_it",
+        "capture2141::mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured",
         "binding619::schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not",
         "binding619::a_modules_set_options_are_fixed_when_it_is_created",
         "binding619::synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed",

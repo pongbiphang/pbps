@@ -288,6 +288,92 @@ impl Builder<'_> {
             properties.insert("column".into(), column);
         }
         let mut bindings = BTreeSet::new();
+        if let Some(key) = catalog.keys.get(&id) {
+            let mut columns = key.columns.clone();
+            columns.sort();
+            let columns: Vec<_> = columns
+                .into_iter()
+                .map(|(_, column, descending)| json!({"column": column, "descending": descending}))
+                .collect();
+            properties.insert(
+                "key".into(),
+                json!({"index": key.index, "columns": columns}),
+            );
+        }
+        if let Some(indexes) = catalog.unique_indexes.get(&id) {
+            let indexes: BTreeMap<_, _> = indexes
+                .iter()
+                .map(|(name, index)| {
+                    let mut columns = index.columns.clone();
+                    columns.sort();
+                    let columns: Vec<_> = columns
+                        .into_iter()
+                        .map(|(_, column, descending)| {
+                            json!({"column": column, "descending": descending})
+                        })
+                        .collect();
+                    (
+                        name.clone(),
+                        json!({"index": index.index, "columns": columns}),
+                    )
+                })
+                .collect();
+            properties.insert("unique_indexes".into(), json!(indexes));
+        }
+        if let Some(foreign) = catalog.foreign_keys.get(&id) {
+            // A foreign key binds its referenced table's key by index id: the
+            // table and the key are bindings, and are read too.
+            let table = *self.index.objects.get(&foreign.referenced).ok_or_else(|| {
+                Uncovered::object(
+                    &me,
+                    "a foreign key's referenced table is not in the catalog",
+                )
+            })?;
+            self.enqueue(foreign.referenced);
+            let referenced = self.index.object(table)?;
+            bindings.insert(Binding {
+                node: "sys.foreign_keys".into(),
+                path: vec!["table".into()],
+                target: referenced.clone(),
+            });
+            let key = match foreign.key {
+                Some(key) => {
+                    let found = *self.index.objects.get(&key).ok_or_else(|| {
+                        Uncovered::object(
+                            &me,
+                            "a foreign key's referenced key is not in the catalog",
+                        )
+                    })?;
+                    self.enqueue(key);
+                    let key = self.index.object(found)?;
+                    bindings.insert(Binding {
+                        node: "sys.foreign_keys".into(),
+                        path: vec!["key".into()],
+                        target: key.clone(),
+                    });
+                    json!(key)
+                }
+                None => json!({"unique_index": foreign.index}),
+            };
+            let mut columns = foreign.columns.clone();
+            columns.sort();
+            let columns: Vec<_> = columns
+                .into_iter()
+                .map(|(_, column, target)| json!([column, target]))
+                .collect();
+            properties.insert(
+                "foreign_key".into(),
+                json!({
+                    "references": referenced,
+                    "key": key,
+                    "columns": columns,
+                    "on_delete": foreign.on_delete,
+                    "on_update": foreign.on_update,
+                    "disabled": foreign.disabled,
+                    "trusted": foreign.trusted,
+                }),
+            );
+        }
         let mut parameters = Vec::new();
         let mut owned_parameters: Vec<_> = catalog
             .parameters
