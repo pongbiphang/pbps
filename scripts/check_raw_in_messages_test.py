@@ -41,6 +41,20 @@ class WhatItRefuses(unittest.TestCase):
         for macro in ["write", "writeln"]:
             self.assertEqual(lines(f'{macro}!(out, "{{}}", n.raw());'), [1], macro)
 
+    def test_ensure_builds_a_message_too(self):
+        self.assertEqual(lines('ensure!(ok, "bad {}", n.raw());'), [1])
+        self.assertEqual(lines('anyhow::ensure!(ok, "bad {}", n.raw());'), [1])
+        text = 'ensure!(\n    a.raw() == b.raw(),\n    "bad {}",\n    n.raw(),\n);'
+        self.assertEqual(lines(text), [4])
+
+    def test_the_condition_of_an_ensure_is_not_a_message(self):
+        for text in [
+            'ensure!(a.raw() == b.raw(), "bad {}", n.shown());',
+            'ensure!(same(a.raw(), b), "bad {}", n.shown());',
+            'ensure!(a.raw() == b.raw())',
+        ]:
+            self.assertEqual(lines(text), [], text)
+
     def test_every_delimiter_of_a_macro_call_is_read(self):
         for call in ['format!["{}", n.raw()]', 'format!{"{}", n.raw()}']:
             self.assertEqual(lines(call), [1], call)

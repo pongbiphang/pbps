@@ -9,9 +9,11 @@ chosen for a message, and an unescaped line break in a message starts a line the
 tool never wrote. This is the one hole the types leave, so this check closes it.
 
 It refuses `.raw()` (and the function path `Type::raw`) in the arguments of
-`format!`, `bail!`, `anyhow!`, `print!`, `println!`, `eprint!`, `eprintln!`,
-`write!`, `writeln!` and in a `#[error(...)]` attribute, in any Rust source
-under `crates/`, unless the file is in ALLOWED below. `.raw()` anywhere else -
+`format!`, `bail!`, `anyhow!`, `ensure!`, `print!`, `println!`, `eprint!`,
+`eprintln!`, `write!`, `writeln!` and in a `#[error(...)]` attribute, in any
+Rust source under `crates/`, unless the file is in ALLOWED below. The macros
+are the ones that build a message or an error for a person; `assert!` and
+`panic!` report a bug in the tool, and almost all of theirs are tests. `.raw()` anywhere else -
 a SQL bind, a map key, a comparison, a hash - is not this check's business.
 
 The allowlist is by path, because what makes a `.raw()` right is what the file
@@ -26,7 +28,7 @@ from pathlib import Path
 
 SCANNED = "crates/"
 
-MACROS = ("format", "bail", "anyhow", "print", "println", "eprint", "eprintln", "write", "writeln")
+MACROS = ("format", "bail", "anyhow", "ensure", "print", "println", "eprint", "eprintln", "write", "writeln")
 # `\b` before the name: `my_format!` is another macro. The opening delimiter
 # is the last character of the match.
 MACRO_CALL = re.compile(r"\b(" + "|".join(MACROS) + r")\s*!\s*[(\[{]")
@@ -170,6 +172,27 @@ def closing(code, opened):
     return None
 
 
+def message_start(code, opened, end, name):
+    """Where the message starts inside the call from `opened` to `end`.
+
+    `ensure!(cond, "msg", args)` has a condition first, and comparing two names
+    with `.raw()` there is right; only what follows its first top-level comma is
+    a message. A comma inside a nested call or a generic list is not that comma
+    (a generic's commas are read as top-level, which can only refuse more).
+    """
+    if name != "ensure!":
+        return opened
+    depth = 0
+    for i in range(opened, end):
+        if code[i] in "([{":
+            depth += 1
+        elif code[i] in ")]}":
+            depth -= 1
+        elif code[i] == "," and depth == 1:
+            return i
+    return end
+
+
 def hits(src):
     """([(line, macro)] for each `.raw()` in a message, [line] for each call
     this could not find the end of)."""
@@ -183,7 +206,7 @@ def hits(src):
         if end is None:
             lost.append(line(opened))
             continue
-        for raw in RAW.finditer(code, opened, end):
+        for raw in RAW.finditer(code, message_start(code, opened, end, name), end):
             found.setdefault(raw.start(), name)
     return [(line(at), name) for at, name in sorted(found.items())], lost
 
