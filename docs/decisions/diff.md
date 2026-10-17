@@ -6445,6 +6445,18 @@ on it. It is now one `Catalog` edge from each release to the drop, re-derived
 from the finished plan and settled once. Under `Sink` that is the old
 placement. The edges are transitive, so no fixpoint is needed.
 
+The same final schedule re-derives what the rewrites placed: an edge from
+each removal to the drop and from the create to each restoration, wherever
+the order already runs them forward. A function rebuilt in place that sinks
+after a release then takes its restorations with it, rather than leaving a
+restored check ahead of the rebuild (review of #2145). The differ's class
+order puts an in-place rebuild (class 14) after the alterations that release
+a generated column, so no plan measured here sinks one. The edges hold the
+order for a release that comes later, and the driver checks the obligations
+again after this schedule and refuses a plan it leaves unmet. Pinned by
+`a_rebuild_sunk_after_a_release_keeps_its_restorations_after_it` and
+`a_final_order_that_unmeets_an_obligation_is_refused`.
+
 **Kept as it was:** the refusals that come before any rewrite: an unmanaged
 or unrepresentable dependent, and a rebuild while a partition is detached.
 

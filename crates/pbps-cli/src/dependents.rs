@@ -1326,7 +1326,8 @@ impl Expansion for Weave<'_> {
     /// the expression change that stops calling it, or the drop of the column
     /// or its table (DEC-1168.1), and after the drop of a module that depends
     /// on it, which may itself follow its own releases. An edge from each, so
-    /// `settle` sinks the drop to right after the last (DEC-1958.2).
+    /// `settle` sinks the drop to right after the last (DEC-1958.2), with the
+    /// removals and restorations the rewrites placed held around it.
     ///
     /// The drop moves, not the release. A release keeps the place the differ
     /// gave it, after the column additions, renames, retypes and relaxations
@@ -1360,6 +1361,27 @@ impl Expansion for Weave<'_> {
                         expand::Step::Plan(i),
                         expand::Step::Plan(at.drop_at),
                     ));
+                }
+                if is_generated(&d.holds) {
+                    continue;
+                }
+                // What the rewrites established, re-derived, so a drop that
+                // sinks after a release takes its restorations with it and
+                // never passes a removal (#1958 review). Only edges the order
+                // already runs forward: they hold it, never reverse it.
+                if let Some(i) =
+                    find(&view, &parts, &d.holds, partitions, removes).filter(|i| *i < at.drop_at)
+                {
+                    edges.push(catalog(
+                        expand::Step::Plan(i),
+                        expand::Step::Plan(at.drop_at),
+                    ));
+                }
+                if let Some(create) = at.create_at
+                    && let Some(j) =
+                        find(&view, &parts, &d.holds, partitions, restores).filter(|j| *j > create)
+                {
+                    edges.push(restoring(expand::Step::Plan(create), expand::Step::Plan(j)));
                 }
             }
         }
@@ -6814,6 +6836,51 @@ mod tests {
         for p in &cs.changes {
             assert_eq!(p.risks, pg().change_risks(&p.change), "{:?}", p.change);
         }
+    }
+
+    /// A function rebuilt in place sinks after the expression change that
+    /// releases its generated column, and the check it restores goes with
+    /// it: the final order keeps each restoration after the rebuild, so the
+    /// check never runs against the function's drop (#1958 review).
+    #[test]
+    fn a_rebuild_sunk_after_a_release_keeps_its_restorations_after_it() {
+        let (s, _) = declared();
+        let ids = IdsFile::default();
+        let mut cs = plan(vec![
+            alter(&s, "app.f(integer)"),
+            Change::AlterColumnExpression {
+                uid: "c_d4e5f6".parse().unwrap(),
+                column: TableName::new("app", "t").column("g"),
+                from: "app.f(id)".into(),
+                to: "id * 2".into(),
+            },
+        ]);
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![
+                part(Part::Check("ck".into()), "constraint ck on table app.t"),
+                part(
+                    Part::Generated("g".into()),
+                    "generation expression for column g of table app.t",
+                ),
+            ],
+        )]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        let order = rendered(&cs);
+        let at = |needle: &str| order.iter().position(|c| c.starts_with(needle)).unwrap();
+        assert!(
+            at("drop check ck") < at("alter app.f(integer)"),
+            "{order:?}"
+        );
+        assert!(
+            at("AlterColumnExpression") < at("alter app.f(integer)"),
+            "{order:?}"
+        );
+        assert!(at("alter app.f(integer)") < at("add check ck"), "{order:?}");
+        // And the woven plan is a fixed point.
+        let again = rendered(&cs);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        assert_eq!(rendered(&cs), again);
     }
 
     /// A chain of views over a rebuilt view: dropped deepest first, created
