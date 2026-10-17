@@ -997,8 +997,18 @@ pub fn describe(c: &Change) -> String {
                 .filter(|n| n.name.as_ref() != Some(&n.parent))
                 .count()
         ),
-        Change::AttachPartition { table, parent, .. } => {
-            format!("~ attach table {table} to {parent} as a partition, keeping its rows")
+        Change::AttachPartition {
+            table,
+            parent,
+            bound,
+            ..
+        } => {
+            let partition = if *bound == pbps_model::PartitionBound::Default {
+                "its default partition"
+            } else {
+                "a partition"
+            };
+            format!("~ attach table {table} to {parent} as {partition}, keeping its rows")
         }
         // Said, because the detach is a statement of its own and locks the
         // parent (#1171).
@@ -1470,6 +1480,21 @@ mod tests {
         };
         assert_eq!(
             super::describe(&attach),
+            "~ attach table app.t to app.ev as its default partition, keeping its rows"
+        );
+        let ranged = Change::AttachPartition {
+            uid: "t_aaaaaa".parse().unwrap(),
+            table: "app.t".parse().unwrap(),
+            parent: "app.ev".parse().unwrap(),
+            bound: pbps_model::PartitionBound::Range {
+                from: vec![pbps_model::BoundDatum::Value("1".into())],
+                to: vec![pbps_model::BoundDatum::Value("2".into())],
+            },
+            key: Vec::new(),
+            shape: Box::default(),
+        };
+        assert_eq!(
+            super::describe(&ranged),
             "~ attach table app.t to app.ev as a partition, keeping its rows"
         );
     }

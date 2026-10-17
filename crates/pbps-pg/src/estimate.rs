@@ -906,6 +906,21 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             ),
             Lock::AccessExclusive,
         ),
+        // As the DEFAULT partition, the table alone is scanned, for rows
+        // another partition takes, and no other partition is read or locked;
+        // the parent takes the same lock (#1639, measured on 16 and 18).
+        Change::AttachPartition {
+            table,
+            parent,
+            bound: pbps_model::PartitionBound::Default,
+            ..
+        } => e(
+            format!("attaching {table} to {parent} as its DEFAULT partition"),
+            table,
+            Rewrite::No,
+            Reads::EveryRow,
+            Lock::AccessExclusive,
+        ),
         // The engine scans every row of the table for the range, and builds
         // or checks each of the parent's keys and foreign keys over it,
         // holding it exclusively; the parent takes a lock only other schema

@@ -4104,6 +4104,53 @@ fn partition_probes(
                 continue;
             }
             partition_range_probe(table, parent, bound, &leaving, "attach a table")
+        } else if let Change::AttachPartition {
+            table,
+            parent,
+            bound: pbps_model::PartitionBound::Default,
+            ..
+        } = &p.change
+        {
+            // As the DEFAULT partition (#1639, DEC-1639.1): the table's rows
+            // another partition takes, and a DEFAULT the parent keeps, which
+            // the engine refuses mid-apply and here are named before the first
+            // statement; its triggers and column grants as for any attach.
+            // Detaches and drops go in class 6, before it; a partition the
+            // plan creates or attaches beside it is counted in either order,
+            // since the engine refuses whichever comes second.
+            let leaving = leaving(parent);
+            let beside: Vec<&pbps_model::PartitionBound> = changes
+                .iter()
+                .filter_map(|c| {
+                    if let Change::CreateTable { table: t, .. } = &c.change {
+                        t.partition_of
+                            .as_ref()
+                            .filter(|of| of.parent == *parent)
+                            .map(|of| &of.bound)
+                    } else if let Change::AttachPartition {
+                        parent: of, bound, ..
+                    } = &c.change
+                    {
+                        (of == parent).then_some(bound)
+                    } else {
+                        None
+                    }
+                })
+                .filter(|b| **b != pbps_model::PartitionBound::Default)
+                .collect();
+            for probe in [
+                attach_default_rows_probe(table, parent, &beside, &leaving),
+                attach_trigger_probe(table, parent, &changes[..step]),
+                attach_column_grant_probe(table),
+            ] {
+                match probe {
+                    Ok(probe) => out.push(probe),
+                    Err(error) => {
+                        unchecked.push(Unchecked::for_change(&p.change, error.to_string()));
+                    }
+                }
+            }
+            standing_default_probe(table, parent, &leaving)
         } else {
             continue;
         };
@@ -4830,6 +4877,99 @@ fn attach_range_probe(
     ))
 }
 
+/// The rows of `table`, about to be attached to `parent` as its DEFAULT
+/// partition, that another partition takes (#1639): one standing that the
+/// plan does not detach or drop first, read from the catalog with the
+/// engine's own partition constraint, or one the plan creates or attaches,
+/// by its `beside` bound. Measured on 16 and 18, the engine scans the table
+/// alone for the DEFAULT's constraint, `NOT (key IS NOT NULL AND (each
+/// other bound))`, and refuses on the first row inside one (`partition
+/// constraint of relation … is violated by some row`); a NULL key is the
+/// DEFAULT's under a range, and a list that takes NULL claims it.
+fn attach_default_rows_probe(
+    table: &TableName,
+    parent: &TableName,
+    beside: &[&pbps_model::PartitionBound],
+    leaving: &[&TableName],
+) -> Result<Probe, DialectError> {
+    let mut excluded = String::new();
+    for child in leaving {
+        excluded.push_str(&format!(
+            " AND i.inhrelid IS DISTINCT FROM pg_catalog.to_regclass({})",
+            value_literal(&qualified(child)?)
+        ));
+    }
+    // Every bound the plan brings beside it, already the text of a predicate
+    // on `r` over `pt`.
+    let mut planned = String::new();
+    for bound in beside {
+        planned.push_str(&format!(
+            " || {} || {}",
+            value_literal(" OR "),
+            bound_predicate(bound)
+        ));
+    }
+    let text = format!(
+        "{} || COALESCE((SELECT pg_catalog.string_agg({} || \
+         pg_catalog.pg_get_partition_constraintdef(i.inhrelid) || ')', '') \
+         FROM pg_catalog.pg_inherits i WHERE i.inhparent = pt.partrelid \
+         AND i.inhrelid IS DISTINCT FROM pt.partdefid{excluded}), ''){planned} || ')'",
+        value_literal(&format!(
+            "SELECT count(*) AS n FROM {} AS r WHERE (FALSE",
+            qualified(table)?
+        )),
+        value_literal(" OR ("),
+    );
+    Ok(Probe::new(
+        format!(
+            "rows of {table} that another partition of {parent} takes: as its DEFAULT partition \
+             it may hold only rows no other partition does, and the engine will not attach it \
+             over them; move or delete them first, then plan again"
+        ),
+        format!(
+            "SELECT {}",
+            saturated_count(&format!(
+                "COALESCE((SELECT (pg_catalog.xpath('/row/n/text()', \
+                 pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric \
+                 FROM pg_catalog.pg_partitioned_table pt \
+                 WHERE pt.partrelid = pg_catalog.to_regclass({})), 0)",
+                value_literal(&qualified(parent)?)
+            ))
+        ),
+    ))
+}
+
+/// A DEFAULT partition `parent` has that the plan does not detach or drop
+/// before `table` is attached as its DEFAULT (#1639). A declared one is
+/// refused before any plan (a parent has one at most), so this is the one
+/// the declarations do not hold; measured on 16 and 18, the engine refuses
+/// the attach (`partition "t" conflicts with existing default partition`).
+fn standing_default_probe(
+    table: &TableName,
+    parent: &TableName,
+    leaving: &[&TableName],
+) -> Result<Probe, DialectError> {
+    let mut excluded = String::new();
+    for child in leaving {
+        excluded.push_str(&format!(
+            " AND pt.partdefid IS DISTINCT FROM pg_catalog.to_regclass({})",
+            value_literal(&qualified(child)?)
+        ));
+    }
+    Ok(Probe::new(
+        format!(
+            "a DEFAULT partition of {parent} that this plan neither detaches nor drops: a parent \
+             has one DEFAULT partition, so {table} cannot be attached as another; detach or drop \
+             it first, then plan again"
+        ),
+        format!(
+            "SELECT count(*)::int FROM pg_catalog.pg_partitioned_table pt \
+             WHERE pt.partrelid = pg_catalog.to_regclass({}) AND pt.partdefid <> 0{excluded}",
+            value_literal(&qualified(parent)?)
+        ),
+    ))
+}
+
 /// The triggers on `table`, managed or not, named as a row trigger on
 /// `parent` that the plan keeps up to the attach. Measured on 16 and 18, the
 /// engine clones each of the parent's row triggers onto the table as it
@@ -5341,6 +5481,41 @@ mod tests {
             to: vec![pbps_model::BoundDatum::Value("2025-01-01".into())],
         });
         assert_eq!(attached.len(), 4, "{attached:?}");
+        // As the DEFAULT partition (#1639): the rows another partition
+        // takes, read from the engine's own partition constraints, and a
+        // DEFAULT the parent keeps, in place of the range's two; a range
+        // attach asks neither.
+        let default = attach(B::Default);
+        assert_eq!(default.len(), 4, "{default:?}");
+        assert!(
+            default[0]
+                .description
+                .contains("rows of app.t that another partition of app.ev takes"),
+            "{default:?}"
+        );
+        assert!(
+            default[0]
+                .sql
+                .contains("pg_get_partition_constraintdef(i.inhrelid)")
+                && default[0]
+                    .sql
+                    .contains("i.inhrelid IS DISTINCT FROM pt.partdefid"),
+            "{}",
+            default[0].sql
+        );
+        assert!(
+            default[3].description.contains(
+                "a DEFAULT partition of app.ev that this plan neither detaches nor drops"
+            ),
+            "{default:?}"
+        );
+        assert!(
+            !attached
+                .iter()
+                .any(|p| p.description.contains("another partition of")
+                    || p.description.contains("neither detaches nor drops")),
+            "{attached:?}"
+        );
         assert!(
             attached[0]
                 .description
@@ -5413,8 +5588,6 @@ mod tests {
                 .contains("will not attach a table over them"),
             "{attached:?}"
         );
-        // Negative: a DEFAULT bound, which the differ refuses, asks nothing.
-        assert!(attach(B::Default).is_empty());
     }
 
     /// A partition made beside a standing DEFAULT moves the DEFAULT's rows

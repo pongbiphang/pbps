@@ -3477,13 +3477,6 @@ fn attached(
     if table.partition_by.is_some() {
         what.push("it is partitioned itself".to_owned());
     }
-    if of.bound == pbps_model::PartitionBound::Default {
-        what.push(
-            "it would be the DEFAULT partition, which is never attached here, only a bounded \
-             one; create the DEFAULT partition and move the rows into it"
-                .to_owned(),
-        );
-    }
     // Types in the engine's spelling, as `diff_columns` compares them. A
     // default and NOT NULL may be its own, and are compared below.
     let columns = |t: &Table| -> Vec<(String, pbps_model::Column)> {
@@ -10916,12 +10909,6 @@ mod tests {
                 "`data:`",
             ),
             (
-                ordinary(&|_| {}),
-                &attached(PartitionBound::Default),
-                &[][..],
-                "DEFAULT partition",
-            ),
-            (
                 unpartitioned,
                 &declared,
                 &[][..],
@@ -10948,6 +10935,29 @@ mod tests {
                 "{expected}: {found:?}"
             );
         }
+
+        // As the parent's DEFAULT partition, which it does not have yet: the
+        // same attach, with the DEFAULT bound (#1639, DEC-1639.1).
+        let planned = outcome(&base, &attached(PartitionBound::Default), &[])
+            .2
+            .expect("an attach as the DEFAULT partition is planned");
+        assert_eq!(
+            kinds(&planned),
+            ["DropIndex", "AttachPartition", "SetPartitionDefault"],
+            "{:?}",
+            planned.changes
+        );
+        assert!(
+            matches!(
+                &planned.changes[1].change,
+                Change::AttachPartition {
+                    bound: PartitionBound::Default,
+                    ..
+                }
+            ),
+            "{:?}",
+            planned.changes
+        );
 
         // A trigger on it stays a module of the partition's own through the
         // attach (DEC-1632.3): planned, with no change to the trigger.

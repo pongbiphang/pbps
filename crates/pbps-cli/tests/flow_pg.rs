@@ -9757,6 +9757,162 @@ fn a_table_is_attached_as_a_partition_through_the_cli() {
     );
 }
 
+/// An ordinary table declared as its parent's DEFAULT partition is attached
+/// with its rows (#1639, DEC-1639.1). A row another partition takes is
+/// refused by name before any statement and nothing changes; once it is
+/// gone the attach runs, a row no range takes and a NULL key route to it
+/// through the parent, `verify` is clean and nothing is left to plan. The
+/// staged form keeps the single statement, which no CHECK can spare a scan.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_table_is_attached_as_the_default_partition_through_the_cli() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "attach-1639");
+    let connection = own.connection().to_owned();
+    on_server(&connection, "CREATE SCHEMA app");
+    let d = Demo::new("attach-1639");
+    let tree = |partitions: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!(
+                "table: app.ev\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 k: {{type: integer}}\npartition_by: [k]\npartitions:\n\
+                 \x20 ev_a: {{from: [0], to: [10]}}\n  ev_b: {{from: [10], to: [20]}}\n{partitions}"
+            ),
+        )
+        .unwrap();
+    };
+    let ordinary = d.dir.join("schema/app.t.yml");
+    tree("");
+    std::fs::write(
+        &ordinary,
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  k: {type: integer}\n",
+    )
+    .unwrap();
+    let other = |partitions: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.f.yml"),
+            format!(
+                "table: app.f\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 k: {{type: integer}}\npartition_by: [k]\npartitions:\n\
+                 \x20 f_a: {{from: [0], to: [10]}}\n{partitions}"
+            ),
+        )
+        .unwrap();
+    };
+    other("");
+    let staged = d.dir.join("schema/app.s.yml");
+    std::fs::write(
+        &staged,
+        "table: app.s\ncolumns:\n  id: {type: integer, nullable: false}\n  k: {type: integer}\n",
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &connection]));
+    on_server(
+        &connection,
+        "INSERT INTO app.t VALUES (1, 25), (2, NULL), (3, -5), (4, 5); \
+         INSERT INTO app.ev VALUES (9, 15)",
+    );
+
+    std::fs::remove_file(&ordinary).unwrap();
+    tree("  t: default\n");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("attach.json");
+    let o = succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    assert!(
+        stdout(&o)
+            .contains("~ attach table app.t to app.ev as its default partition, keeping its rows"),
+        "{}",
+        stdout(&o)
+    );
+    // The row of ev_a's range: refused by name, and nothing changed.
+    let o = approved_apply(&d, &connection, &plan, &["--allow", "constraint"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        said.contains("1 rows of app.t that another partition of app.ev takes")
+            && said.contains("nothing has been changed")
+            && !said.contains("violated by some row"),
+        "{said}"
+    );
+    let holds = |sql: &str| scalar(&connection, &format!("SELECT ({sql})::int::int8"));
+    assert_eq!(
+        holds("SELECT relispartition FROM pg_class WHERE oid = 'app.t'::regclass"),
+        0
+    );
+
+    // Out of the way: attached, and routed to through the parent.
+    on_server(&connection, "DELETE FROM app.t WHERE id = 4");
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "constraint"],
+    ));
+    assert_eq!(
+        holds(
+            "SELECT partdefid = 'app.t'::regclass FROM pg_partitioned_table \
+              WHERE partrelid = 'app.ev'::regclass"
+        ),
+        1
+    );
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    on_server(
+        &connection,
+        "INSERT INTO app.ev VALUES (5, 500), (6, NULL), (7, 3)",
+    );
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM app.ev WHERE tableoid = 'app.t'::regclass"
+        ),
+        5
+    );
+    assert_eq!(
+        holds("SELECT tableoid = 'app.ev_a'::regclass FROM app.ev WHERE id = 7"),
+        1
+    );
+
+    // Staged: the single statement, with no temporary CHECK, which no
+    // bound of a DEFAULT can spare a scan.
+    on_server(&connection, "INSERT INTO app.s VALUES (1, 50), (2, NULL)");
+    std::fs::remove_file(&staged).unwrap();
+    other("  s: default\n");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let plan = d.dir.join("staged.json");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        &connection,
+        "--staged",
+        "--out",
+        plan.to_str().unwrap(),
+    ]));
+    let o = succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--staged", "--allow", "constraint"],
+    ));
+    assert!(!stdout(&o).contains("pbps_attach_"), "{}", stdout(&o));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    let next = succeeds(d.run(&["plan", "--db", &connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM app.f WHERE tableoid = 'app.s'::regclass"
+        ),
+        2
+    );
+}
+
 /// A staged attach skips its scan through a CHECK it validates first, and
 /// what a stopped run leaves of that CHECK is pbps's to take out (#1638,
 /// DEC-1638.1). A `VALIDATE` that fails takes it out itself, with no

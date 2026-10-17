@@ -3570,8 +3570,8 @@ plan. The table must hold:
   the table with an ACL, whoever holds it (#1642 review). A revoke leaves the
   ACL NULL again.
 
-The parent must be a partitioned table before the plan. A DEFAULT bound is
-refused: attaching as the DEFAULT partition is #1639.
+The parent must be a partitioned table before the plan. Attaching as the
+DEFAULT partition, refused here at first, is DEC-1639.1.
 
 **What it keeps of its own** is compared with the declaration as a standing
 partition's is (DEC-1581.1). The differ reads the table as the engine leaves
@@ -6243,3 +6243,49 @@ Each mechanism fails the test when reverted. Also pinned by the units
 `a_declared_constraint_cannot_take_the_staged_attachs_name`, and by the staged
 step of `a_table_is_attached_as_a_partition_through_the_cli`, which fails
 without the comparison filter.
+
+<a id="dec-1639-1"></a>
+
+**DEC-1639.1. An ordinary table is attached as its parent's DEFAULT
+partition, and the pre-flight names what the engine would refuse.** (#1639)
+
+Declaring an ordinary table as `t: default` under a standing parent plans the
+same `AttachPartition` as a range attach (DEC-1545.1), with the DEFAULT
+bound. It used to be refused by name.
+
+Measured on 16 and 18:
+- the attach holds the table ACCESS EXCLUSIVE and the parent SHARE UPDATE
+  EXCLUSIVE, and locks no other partition;
+- it scans the table alone, for `NOT (key IS NOT NULL AND (each other
+  bound))`, and reads no other partition;
+- it refuses a row another partition takes with `partition constraint of
+  relation … is violated by some row`, and a second DEFAULT with `conflicts
+  with existing default partition`.
+
+The pre-flight asks two questions before the first statement, beside the
+trigger and column-grant counts every attach asks:
+- *The table's rows another partition takes.* It reads each standing
+  partition's own constraint with `pg_get_partition_constraintdef`, so the
+  count is the engine's predicate rather than a copy of it. The parent's
+  current DEFAULT and any partition the plan detaches or drops are left out,
+  since those go in class 6, before it. A partition the plan creates or
+  attaches beside it is counted by its bound, in either order, because the
+  engine refuses whichever comes second. A NULL key counts only where a list
+  takes NULL.
+- *A DEFAULT the parent keeps.* A declared second DEFAULT is already refused
+  before any plan (`check_partitions`), so this counts the one the
+  declarations do not hold, and leaves out one the plan detaches or drops.
+
+No CHECK can imply "outside every other bound" for the engine to skip its
+scan, so a staged plan keeps the single statement (DEC-1638.1).
+
+Against #1776 it adds no change kind, no order and no pass. "Detach or drop
+the old DEFAULT first" is the existing class 6 before 7.
+
+Pinned by the live `a_default_attach_counts_the_rows_another_partition_takes`
+(on 16 and 18): range and list counts, a planned and a detached sibling, a
+kept and a detached DEFAULT, and the engine refusing and then taking the
+attach. Also by `a_table_is_attached_as_the_default_partition_through_the_cli`
+(on 16 and 18), which fails with the engine's own error when the rows probe
+is removed, and by the units `an_ordinary_table_declared_as_a_partition_is_attached`
+and `a_partition_change_under_a_standing_parent_is_probed`.
