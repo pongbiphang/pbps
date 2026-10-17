@@ -801,6 +801,11 @@ struct Referencing<'a> {
     parent_row: &'a str,
     /// Catalog filters that leave keys out of the read entirely.
     gone: &'a str,
+    /// The keys counted through: a delete meets only those whose delete
+    /// action fires ([`DELETE_ACTION_FIRES`]), a detach every one.
+    keys: &'a str,
+    /// SQL text further narrowing the stored rows counted, or `''`.
+    rows: &'a str,
     /// Per-child-table SQL excluding rows the plan itself moves, or `''`.
     exclusion: &'a str,
     /// Per-child-table SQL adding rows the plan puts onto the parent, or `''`.
@@ -827,6 +832,8 @@ fn counting_expression(r: &Referencing<'_>) -> String {
         parent,
         parent_row,
         gone,
+        keys,
+        rows,
         exclusion,
         arrival,
     } = r;
@@ -838,13 +845,13 @@ fn counting_expression(r: &Referencing<'_>) -> String {
               || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END\n                 \
               || pg_catalog.quote_ident(ns.nspname)\n                 \
               || '.' || pg_catalog.quote_ident(cl.relname) || {}\n                 \
-              || {} || ')' || {exclusion} || ')' || {arrival} || ' AS n' AS stmt\n            \
+              || {} || ')' || {rows} || {exclusion} || ')' || {arrival} || ' AS n' AS stmt\n            \
               FROM pg_catalog.pg_constraint con\n            \
               JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid\n            \
               JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace\n           \
              WHERE con.contype = 'f'\n                 \
                AND con.conparentid = 0\n                 \
-               AND {DELETE_ACTION_FIRES}\n                 \
+               AND {keys}\n                 \
                AND con.confrelid = pg_catalog.to_regclass({})\n                 \
                {gone}) AS x), 0)",
         value_literal(&format!(" AS ch WHERE EXISTS ({parent_row}")),
@@ -912,6 +919,37 @@ fn delete_probe(
         quote(&stored.name)?,
         value_literal(key.as_str())
     );
+    let (exclusion, arrival) = plan_moves(&parent_row, names)?;
+    let gone = gone_keys(names);
+
+    Ok(Probe::new(
+        format!(
+            "rows in other tables that still reference {table} row `{key}`, which its delete \
+             would orphan or cascade into",
+            table = table.raw()
+        ),
+        format!(
+            "SELECT {} AS n;",
+            counting_expression(&Referencing {
+                parent: &parent,
+                parent_row: &parent_row,
+                gone: &gone,
+                keys: DELETE_ACTION_FIRES,
+                rows: "''",
+                exclusion: &exclusion,
+                arrival: &arrival,
+            })
+        ),
+    ))
+}
+
+/// The rows this plan writes before a count over the rows referencing
+/// `parent_row`, as the count's two per-table parts: SQL excluding each
+/// stored row the plan deletes or updates away from it, and SQL adding each
+/// row the plan updates or inserts onto it. Both are `''` where the plan
+/// writes no row of the table. `parent_row` is `SELECT 1 FROM <table> AS p
+/// WHERE …`, to which each key's tuple is appended.
+fn plan_moves(parent_row: &str, names: &AsStored) -> Result<(String, String), DialectError> {
     let mut exclusions = Vec::new();
     let mut arrivals = Vec::new();
     for (child, moved) in &names.moved {
@@ -1046,25 +1084,7 @@ fn delete_probe(
     } else {
         format!("CASE {} ELSE '' END", arrivals.join(" "))
     };
-    let gone = gone_keys(names);
-
-    Ok(Probe::new(
-        format!(
-            "rows in other tables that still reference {table} row `{key}`, which its delete \
-             would orphan or cascade into",
-            table = table.raw()
-        ),
-        format!(
-            "SELECT {} AS n;",
-            counting_expression(&Referencing {
-                parent: &parent,
-                parent_row: &parent_row,
-                gone: &gone,
-                exclusion: &exclusion,
-                arrival: &arrival,
-            })
-        ),
-    ))
+    Ok((exclusion, arrival))
 }
 
 /// The guard a row delete carries: the same count, taken inside the delete's
@@ -1134,6 +1154,8 @@ pub(crate) fn still_referenced(
             // whole; here the plan has already run, and a row referencing the
             // parent now is a row nobody accounted for.
             gone: "",
+            keys: DELETE_ACTION_FIRES,
+            rows: "''",
             // The catalog's keys only, as every read of them is (345). A key
             // this plan adds is not there yet when this runs either — but the
             // probe has already refused the plan for it before the first
@@ -5121,6 +5143,14 @@ fn attach_column_grant_probe(table: &TableName) -> Result<Probe, DialectError> {
 /// So are the rows of a referencing table's partitions that the plan drops
 /// before this one, which `gone_keys` cannot reach: the key names their
 /// still-standing parent (#1549 review).
+///
+/// The rows the plan writes before the detach are counted as they will be,
+/// as the delete probe counts them ([`plan_moves`]): a row the plan deletes
+/// or updates away from the partition first is left out, and one it puts
+/// onto it is added (#1553). Each is compared as the engine's referential
+/// check compares, through the key's operator under the referenced column's
+/// collation ([`PARENT_SIDE`]): a bare `=` between two collations is refused
+/// outright, and the probe went unchecked (#1551).
 fn partition_reference_probe(
     partition: &TableName,
     parent: &TableName,
@@ -5130,27 +5160,19 @@ fn partition_reference_probe(
     let mut gone_rows = String::new();
     for earlier in dropped_before {
         gone_rows.push_str(&format!(
-            " AND r.tableoid IS DISTINCT FROM pg_catalog.to_regclass({})",
+            " AND ch.tableoid IS DISTINCT FROM pg_catalog.to_regclass({})",
             value_literal(&qualified(earlier)?)
         ));
     }
-    let child = value_literal(&format!(
-        " AS r WHERE EXISTS (SELECT 1 FROM ONLY {} AS p WHERE ",
+    // Any row of the partition is the "parent row" a referencing row must
+    // not point at: `ONLY`, so a partitioned partition's own partitions are
+    // not read twice through it.
+    let parent_row = format!(
+        "SELECT 1 FROM ONLY {} AS p WHERE true",
         qualified(partition)?
-    ));
-    let matched = "(SELECT pg_catalog.string_agg('r.' || pg_catalog.quote_ident(ra.attname) || \
-                   ' = p.' || pg_catalog.quote_ident(pa.attname), ' AND ' ORDER BY s.i) \
-                   FROM pg_catalog.generate_subscripts(con.conkey, 1) AS s(i) \
-                   JOIN pg_catalog.pg_attribute ra \
-                   ON ra.attrelid = con.conrelid AND ra.attnum = con.conkey[s.i] \
-                   JOIN pg_catalog.pg_attribute pa \
-                   ON pa.attrelid = con.confrelid AND pa.attnum = con.confkey[s.i])";
-    let text = format!(
-        "'SELECT count(*) AS n FROM ' || CASE WHEN cl.relkind = 'p' THEN '' ELSE 'ONLY ' END \
-         || pg_catalog.quote_ident(ns.nspname) || '.' || pg_catalog.quote_ident(cl.relname) \
-         || {child} || {matched} || ')' || {}",
-        value_literal(&gone_rows)
     );
+    let (exclusion, arrival) = plan_moves(&parent_row, names)?;
+    let gone = gone_keys(names);
     Ok(Probe::new(
         format!(
             "rows that reference {partition} through a foreign key to {parent}: the engine will \
@@ -5160,18 +5182,17 @@ fn partition_reference_probe(
             parent = parent.raw()
         ),
         format!(
-            "SELECT {}",
-            saturated_count(&format!(
-                "COALESCE((SELECT sum((pg_catalog.xpath('/row/n/text()', \
-                 pg_catalog.query_to_xml({text}, false, true, '')))[1]::text::numeric) \
-                 FROM pg_catalog.pg_constraint con \
-                 JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid \
-                 JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace \
-                 WHERE con.contype = 'f' AND con.conparentid = 0 \
-                 AND con.confrelid = pg_catalog.to_regclass({}) {}), 0)",
-                value_literal(&qualified(parent)?),
-                gone_keys(names)
-            ))
+            "SELECT {} AS n;",
+            counting_expression(&Referencing {
+                parent: &qualified(parent)?,
+                parent_row: &parent_row,
+                gone: &gone,
+                // The detach validates every key, whatever its triggers.
+                keys: "true",
+                rows: &value_literal(&gone_rows),
+                exclusion: &exclusion,
+                arrival: &arrival,
+            })
         ),
     ))
 }

@@ -679,6 +679,7 @@
         "a_partition_tree_round_trips_through_the_cli",
         "a_partition_trees_triggers_go_through_the_cli",
         "a_partitions_own_foreign_keys_change_through_the_cli",
+        "a_partitions_drop_follows_the_row_changes_that_stop_referencing_it",
         "created_partition_bounds_are_checked_before_writes_and_survive_staging",
         "pg_partman_parents_are_pulled_with_external_partitions",
         "pull_declares_a_named_parents_partitions_external",
