@@ -162,9 +162,12 @@ for a moment keeps that type.
   writer; it does not lock one out.
 - The deployment lock (`dbo.__pbps_lock`, a committed row) keeps out only
   other pbps applies (SPEC §8.1).
-- Reading `sys.sql_expression_dependencies` needs `VIEW DEFINITION` on the
-  database: without it the view reads empty, which cannot be told from no
-  references. The capture requires the permission and refuses without it.
+- Reading `sys.sql_expression_dependencies` needs two permissions.
+  Without `SELECT` on the view, which only `db_owner` holds by default, the
+  read is refused (229). With `SELECT` but without `VIEW DEFINITION` on the
+  database, it reads empty, which cannot be told from no references
+  (measured on #2141, [DEC-2141.1](decisions/resolver.md#dec-2141-1)). The
+  capture requires both and refuses without either.
 
 ## 5. Reconstruction
 

@@ -3523,3 +3523,60 @@ copy is not filled over), live; and the `resolver::draft` unit tests
 `chained_shapes_wait_for_the_step_that_creates_what_they_name` and
 `names_created_between_steps_are_later_only_for_modules_before_them` and
 `a_generated_columns_later_names_follow_its_tables_step`.
+
+<a id="dec-2141-1"></a>
+
+**DEC-2141.1. The SQL Server target capture binds only id-bound references,
+leaves a one-part name to its candidates, lets the engine match every name,
+and needs both VIEW DEFINITION and SELECT on the dependency catalog
+(#2141, #620 (a)).** It implements DEC-619.1 and DEC-619.2 in
+`pbps-mssql/src/resolver/capture/`, in the shape of `pbps-pg`'s capture.
+Planning does not use it yet (#2143).
+
+- **A dependency row is one of four things**, measured on the pinned
+  build:
+  - a name in another database or server, which refuses by name;
+  - a one-part `EXEC` (`is_caller_dependent`, no id, `EXECUTE AS` or not).
+    A call to a system procedure leaves no row at all, even when `dbo`
+    holds a procedure of that name;
+  - a one-part name in a body that is not schema-bound. Its row carries the
+    id it resolves to *now*, which is no binding: the module is recorded as
+    runtime-bound and the name's candidates stand for it;
+  - an id-bound reference, schema-bound or two-part, which is a binding.
+    With no id the name does not exist yet, and it refuses: nothing can say
+    what it will bind.
+
+  Types bind where they are used: a column's from `sys.columns`, which
+  the dependency catalog does not list, and a parameter's from
+  `sys.parameters`.
+- **A runtime-bound name's candidates** are DEC-619.2's. A call's sets are
+  asked whatever `sys` holds, and the assessment (#2142) reads them in the
+  engine's order: whether `sys` holds the name is that set's own
+  membership, sealed with the rest.
+- **The engine matches every requested name**, by a join under `COLLATE
+  DATABASE_DEFAULT`. Names compare under the database's collation, usually
+  case-insensitive and possibly accent-insensitive. A match folded by hand
+  would answer differently from the resolution it stands for.
+- **Both permissions are required.** Without SELECT on
+  `sys.sql_expression_dependencies`, which only `db_owner` holds by
+  default, the read is refused (229). With SELECT but without VIEW
+  DEFINITION on the database, it reads no rows, which cannot be told from no
+  references. This is measured on #2141 as a `db_ddladmin`; #619's §4 named
+  only the second. Each missing permission refuses by name before the read.
+- **Schemas and principals are complete sets.** A call's candidates are the
+  principals' default schemas, and every owner is a principal. An object the
+  engine owns that something names, such as a `sys` view or a system
+  procedure, is in the capture by identity only.
+- **Ownership matches the catalog's spelling.** A declaration spelled
+  differently owns nothing, which leaves its record unqualified, never
+  another object's.
+
+**Pinned by** `mssql_each_surface_gets_the_engines_answer`,
+`mssql_a_one_part_names_candidates_see_an_arrival_in_the_modules_schema_only`,
+`mssql_a_schema_bound_binding_is_the_targets_observed_one`,
+`mssql_unreadable_dependency_metadata_never_verifies`,
+`mssql_a_procedure_calls_candidates_follow_sys_and_the_executing_principals`,
+`mssql_a_recapture_finds_a_lasting_change_from_another_session_and_not_a_restored_one`,
+`mssql_ownership_follows_the_declaration_and_an_owner_change_is_a_difference`
+and `mssql_a_candidate_is_matched_under_the_databases_collation`, live;
+and the `resolver::capture` unit tests.

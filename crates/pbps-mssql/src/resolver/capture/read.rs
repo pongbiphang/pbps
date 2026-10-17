@@ -1,0 +1,638 @@
+//! The catalog components, one statement each (DEC-619.1).
+//!
+//! Every value is converted to text in the query and parsed here, so a
+//! column's driver type never decides what a fact reads as. A row that does
+//! not parse is incomplete input, never a default.
+
+use super::CaptureError;
+use pbps_db::transport::QueryConnection;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub(super) struct Schema {
+    pub id: i64,
+    pub name: String,
+    pub owner: i64,
+}
+
+pub(super) struct Principal {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub default_schema: Option<String>,
+    pub owner: Option<i64>,
+}
+
+pub(super) struct Object {
+    pub id: i64,
+    pub schema: i64,
+    pub name: String,
+    pub kind: String,
+    pub parent: Option<i64>,
+    /// `NULL` means the schema's owner owns it.
+    pub owner: Option<i64>,
+}
+
+pub(super) struct Module {
+    pub definition: Option<String>,
+    pub ansi_nulls: bool,
+    pub quoted_identifier: bool,
+    pub schema_bound: bool,
+    /// `NULL` is the caller, -2 the owner, any other the principal's id
+    /// (`SELF` is stored as its creator's), measured on #2141.
+    pub execute_as: Option<i64>,
+}
+
+pub(super) struct Column {
+    pub object: i64,
+    pub id: i64,
+    pub name: String,
+    pub user_type: i64,
+    pub max_length: i64,
+    pub precision: i64,
+    pub scale: i64,
+    pub collation: Option<String>,
+    pub nullable: bool,
+    pub identity: bool,
+    pub computed: Option<String>,
+    pub persisted: bool,
+}
+
+pub(super) struct Parameter {
+    pub object: i64,
+    pub id: i64,
+    pub name: String,
+    pub user_type: i64,
+    pub max_length: i64,
+    pub precision: i64,
+    pub scale: i64,
+    pub output: bool,
+    pub has_default: bool,
+    pub readonly: bool,
+}
+
+pub(super) struct Type {
+    pub id: i64,
+    pub schema: i64,
+    pub name: String,
+    pub base: i64,
+    pub max_length: i64,
+    pub precision: i64,
+    pub scale: i64,
+    pub collation: Option<String>,
+    pub nullable: bool,
+    pub user_defined: bool,
+    pub table_type: bool,
+}
+
+/// A DEFAULT or CHECK constraint's text and the column it is on (0 for a
+/// table-level CHECK).
+pub(super) struct Constraint {
+    pub column: i64,
+    pub definition: String,
+}
+
+pub(super) struct Dependency {
+    pub referencing: i64,
+    pub referencing_column: i64,
+    pub class: i64,
+    pub server: Option<String>,
+    pub database: Option<String>,
+    pub schema: Option<String>,
+    pub entity: String,
+    pub referenced: Option<i64>,
+    pub referenced_column: i64,
+    pub schema_bound: bool,
+    pub caller_dependent: bool,
+}
+
+/// The connection's own session inputs that a statement-level name or a
+/// module's fixed options depend on, observed before and after the reads.
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+pub(super) struct Session {
+    pub user: String,
+    pub default_schema: String,
+    pub ansi_nulls: String,
+    pub quoted_identifier: String,
+}
+
+/// The pbps ledger's newest recorded state, read with the catalog.
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status")]
+pub(super) enum Baseline {
+    Absent,
+    Empty,
+    Recorded { entry: i64, state: String },
+}
+
+pub(super) struct Catalog {
+    pub major: u32,
+    pub session: Session,
+    pub baseline: Baseline,
+    pub schemas: Vec<Schema>,
+    pub principals: Vec<Principal>,
+    pub objects: Vec<Object>,
+    pub modules: BTreeMap<i64, Module>,
+    pub columns: Vec<Column>,
+    pub parameters: Vec<Parameter>,
+    pub types: Vec<Type>,
+    pub synonyms: BTreeMap<i64, String>,
+    pub constraints: BTreeMap<i64, Constraint>,
+    pub dependencies: Vec<Dependency>,
+    /// What each requested `(schema, name)` names in `sys.objects`, matched
+    /// by the engine under the database's collation.
+    pub objects_named: BTreeMap<(String, String), BTreeSet<i64>>,
+    /// The same, in `sys.types`.
+    pub types_named: BTreeMap<(String, String), BTreeSet<i64>>,
+    /// The procedures `sys` holds under each requested name, as the catalog
+    /// spells them: a one-part `EXEC` finds them first.
+    pub system_named: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// The names the scope asks the engine to look up. The engine matches them,
+/// not this code: a name is compared under the database's collation, which
+/// is usually case-insensitive and may ignore accents, and a match folded by
+/// hand would answer differently from the resolution it stands for.
+#[derive(Default)]
+pub(super) struct Lookups {
+    pub objects: BTreeSet<(String, String)>,
+    pub types: BTreeSet<(String, String)>,
+    pub system: BTreeSet<String>,
+}
+
+// `sys.sql_expression_dependencies` needs both: without SELECT on it the read
+// is refused (229), and with SELECT but without VIEW DEFINITION on the
+// database it reads no rows at all, which no answer can tell from no
+// references. Measured on the pinned build (#2141), as a `db_ddladmin`.
+const PERMISSIONS: &str = "SELECT \
+    CONVERT(nvarchar(10), ISNULL(HAS_PERMS_BY_NAME(NULL, N'DATABASE', N'VIEW DEFINITION'), 0)) AS view_definition, \
+    CONVERT(nvarchar(10), ISNULL(HAS_PERMS_BY_NAME(N'sys.sql_expression_dependencies', N'OBJECT', N'SELECT'), 0)) AS dependencies;";
+
+const SESSION: &str = "SELECT \
+    CONVERT(nvarchar(128), USER_NAME()) AS [user], \
+    CONVERT(nvarchar(128), SCHEMA_NAME()) AS default_schema, \
+    CONVERT(nvarchar(10), SESSIONPROPERTY(N'ANSI_NULLS')) AS ansi_nulls, \
+    CONVERT(nvarchar(10), SESSIONPROPERTY(N'QUOTED_IDENTIFIER')) AS quoted_identifier, \
+    CONVERT(nvarchar(10), SERVERPROPERTY(N'ProductMajorVersion')) AS major;";
+
+const SCHEMAS: &str = "SELECT CONVERT(nvarchar(20), schema_id) AS id, \
+    CONVERT(nvarchar(128), name) AS name, CONVERT(nvarchar(20), principal_id) AS owner \
+    FROM sys.schemas;";
+
+const PRINCIPALS: &str = "SELECT CONVERT(nvarchar(20), principal_id) AS id, \
+    CONVERT(nvarchar(128), name) AS name, CONVERT(nvarchar(10), type) AS kind, \
+    CONVERT(nvarchar(128), default_schema_name) AS default_schema, \
+    CONVERT(nvarchar(20), owning_principal_id) AS owner \
+    FROM sys.database_principals;";
+
+const OBJECTS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
+    CONVERT(nvarchar(20), schema_id) AS [schema], CONVERT(nvarchar(128), name) AS name, \
+    CONVERT(nvarchar(10), RTRIM(type)) AS kind, \
+    CONVERT(nvarchar(20), NULLIF(parent_object_id, 0)) AS parent, \
+    CONVERT(nvarchar(20), principal_id) AS owner \
+    FROM sys.objects WHERE is_ms_shipped = 0;";
+
+const MODULES: &str = "SELECT CONVERT(nvarchar(20), m.object_id) AS id, m.definition, \
+    CONVERT(nvarchar(1), m.uses_ansi_nulls) AS ansi_nulls, \
+    CONVERT(nvarchar(1), m.uses_quoted_identifier) AS quoted_identifier, \
+    CONVERT(nvarchar(1), m.is_schema_bound) AS schema_bound, \
+    CONVERT(nvarchar(20), m.execute_as_principal_id) AS execute_as \
+    FROM sys.sql_modules m JOIN sys.objects o ON o.object_id = m.object_id \
+    WHERE o.is_ms_shipped = 0;";
+
+const COLUMNS: &str = "SELECT CONVERT(nvarchar(20), c.object_id) AS object, \
+    CONVERT(nvarchar(20), c.column_id) AS id, CONVERT(nvarchar(128), c.name) AS name, \
+    CONVERT(nvarchar(20), c.user_type_id) AS user_type, \
+    CONVERT(nvarchar(20), c.max_length) AS max_length, \
+    CONVERT(nvarchar(20), c.precision) AS precision, CONVERT(nvarchar(20), c.scale) AS scale, \
+    CONVERT(nvarchar(128), c.collation_name) AS collation, \
+    CONVERT(nvarchar(1), c.is_nullable) AS nullable, CONVERT(nvarchar(1), c.is_identity) AS [identity], \
+    cc.definition AS computed, CONVERT(nvarchar(1), ISNULL(cc.is_persisted, 0)) AS persisted \
+    FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id \
+    LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id = c.column_id \
+    WHERE o.is_ms_shipped = 0;";
+
+const PARAMETERS: &str = "SELECT CONVERT(nvarchar(20), p.object_id) AS object, \
+    CONVERT(nvarchar(20), p.parameter_id) AS id, CONVERT(nvarchar(128), p.name) AS name, \
+    CONVERT(nvarchar(20), p.user_type_id) AS user_type, \
+    CONVERT(nvarchar(20), p.max_length) AS max_length, \
+    CONVERT(nvarchar(20), p.precision) AS precision, CONVERT(nvarchar(20), p.scale) AS scale, \
+    CONVERT(nvarchar(1), p.is_output) AS [output], \
+    CONVERT(nvarchar(1), p.has_default_value) AS has_default, \
+    CONVERT(nvarchar(1), p.is_readonly) AS readonly \
+    FROM sys.parameters p JOIN sys.objects o ON o.object_id = p.object_id \
+    WHERE o.is_ms_shipped = 0;";
+
+const TYPES: &str = "SELECT CONVERT(nvarchar(20), user_type_id) AS id, \
+    CONVERT(nvarchar(20), schema_id) AS [schema], CONVERT(nvarchar(128), name) AS name, \
+    CONVERT(nvarchar(20), system_type_id) AS base, CONVERT(nvarchar(20), max_length) AS max_length, \
+    CONVERT(nvarchar(20), precision) AS precision, CONVERT(nvarchar(20), scale) AS scale, \
+    CONVERT(nvarchar(128), collation_name) AS collation, \
+    CONVERT(nvarchar(1), is_nullable) AS nullable, \
+    CONVERT(nvarchar(1), is_user_defined) AS user_defined, \
+    CONVERT(nvarchar(1), is_table_type) AS table_type \
+    FROM sys.types;";
+
+const SYNONYMS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
+    CONVERT(nvarchar(1035), base_object_name) AS base FROM sys.synonyms;";
+
+const CONSTRAINTS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
+    CONVERT(nvarchar(20), parent_column_id) AS [column], definition FROM sys.default_constraints \
+    UNION ALL SELECT CONVERT(nvarchar(20), object_id), CONVERT(nvarchar(20), parent_column_id), \
+    definition FROM sys.check_constraints;";
+
+const DEPENDENCIES: &str = "SELECT CONVERT(nvarchar(20), referencing_id) AS referencing, \
+    CONVERT(nvarchar(20), referencing_minor_id) AS referencing_column, \
+    CONVERT(nvarchar(20), referenced_class) AS class, \
+    CONVERT(nvarchar(128), referenced_server_name) AS server, \
+    CONVERT(nvarchar(128), referenced_database_name) AS [database], \
+    CONVERT(nvarchar(128), referenced_schema_name) AS [schema], \
+    CONVERT(nvarchar(128), referenced_entity_name) AS entity, \
+    CONVERT(nvarchar(20), referenced_id) AS referenced, \
+    CONVERT(nvarchar(20), referenced_minor_id) AS referenced_column, \
+    CONVERT(nvarchar(1), is_schema_bound_reference) AS schema_bound, \
+    CONVERT(nvarchar(1), is_caller_dependent) AS caller_dependent \
+    FROM sys.sql_expression_dependencies WHERE referencing_class = 1;";
+
+/// Lookups go in chunks, so one statement's text stays bounded however large
+/// the scope is.
+const LOOKUP_CHUNK: usize = 500;
+
+fn values(pairs: &[(String, String)]) -> String {
+    pairs
+        .iter()
+        .map(|(schema, name)| {
+            format!(
+                "({}, {})",
+                crate::ident::literal(schema),
+                crate::ident::literal(name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn object_lookup(pairs: &[(String, String)]) -> String {
+    format!(
+        "SELECT q.s AS requested_schema, q.n AS requested_name, CONVERT(nvarchar(20), o.object_id) AS id \
+         FROM (VALUES {}) AS q(s, n) \
+         JOIN sys.objects o ON o.name = q.n COLLATE DATABASE_DEFAULT \
+         JOIN sys.schemas s ON s.schema_id = o.schema_id AND s.name = q.s COLLATE DATABASE_DEFAULT \
+         WHERE o.is_ms_shipped = 0;",
+        values(pairs)
+    )
+}
+
+fn type_lookup(pairs: &[(String, String)]) -> String {
+    format!(
+        "SELECT q.s AS requested_schema, q.n AS requested_name, CONVERT(nvarchar(20), t.user_type_id) AS id \
+         FROM (VALUES {}) AS q(s, n) \
+         JOIN sys.types t ON t.name = q.n COLLATE DATABASE_DEFAULT \
+         JOIN sys.schemas s ON s.schema_id = t.schema_id AND s.name = q.s COLLATE DATABASE_DEFAULT;",
+        values(pairs)
+    )
+}
+
+// The name is compared under the database's collation, as the `EXEC` of a
+// one-part name inside one of its modules is.
+fn system_lookup(names: &[String]) -> String {
+    format!(
+        "SELECT q.n AS requested_name, CONVERT(nvarchar(128), o.name) AS name \
+         FROM (VALUES {}) AS q(n) \
+         JOIN sys.all_objects o ON o.name = q.n COLLATE DATABASE_DEFAULT \
+         WHERE o.schema_id = SCHEMA_ID(N'sys') AND o.type IN ('P', 'X', 'PC', 'RF');",
+        names
+            .iter()
+            .map(|name| format!("({})", crate::ident::literal(name)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+const LEDGER_PRESENT: &str = "SELECT CONVERT(nvarchar(1), CASE WHEN OBJECT_ID(N'dbo.__pbps_state', N'U') IS NULL THEN 0 ELSE 1 END) AS present;";
+
+const LEDGER_LATEST: &str = "SELECT TOP (1) CONVERT(nvarchar(20), id) AS id, state_json \
+    FROM dbo.__pbps_state ORDER BY id DESC;";
+
+/// One row's columns as text, by name.
+struct Text<'a>(&'a pbps_db::Row);
+
+impl Text<'_> {
+    fn optional(&self, column: &str) -> Result<Option<String>, CaptureError> {
+        self.0
+            .try_get::<&str>(column)
+            .map(|value| value.map(str::to_owned))
+            .map_err(|_| CaptureError::Incomplete)
+    }
+    fn required(&self, column: &str) -> Result<String, CaptureError> {
+        self.optional(column)?.ok_or(CaptureError::Incomplete)
+    }
+    fn number(&self, column: &str) -> Result<i64, CaptureError> {
+        self.required(column)?
+            .parse()
+            .map_err(|_| CaptureError::Incomplete)
+    }
+    fn optional_number(&self, column: &str) -> Result<Option<i64>, CaptureError> {
+        self.optional(column)?
+            .map(|value| value.parse().map_err(|_| CaptureError::Incomplete))
+            .transpose()
+    }
+    fn flag(&self, column: &str) -> Result<bool, CaptureError> {
+        match self.required(column)?.as_str() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            _ => Err(CaptureError::Incomplete),
+        }
+    }
+}
+
+async fn rows(
+    conn: &mut impl QueryConnection,
+    sql: &str,
+) -> Result<Vec<pbps_db::Row>, CaptureError> {
+    conn.query(sql).await.map_err(|_| CaptureError::Read)
+}
+
+async fn session(conn: &mut impl QueryConnection) -> Result<(Session, u32), CaptureError> {
+    let rows = rows(conn, SESSION).await?;
+    let [row] = rows.as_slice() else {
+        return Err(CaptureError::Incomplete);
+    };
+    let row = Text(row);
+    let major = row
+        .required("major")?
+        .parse()
+        .map_err(|_| CaptureError::Version)?;
+    Ok((
+        Session {
+            user: row.required("user")?,
+            default_schema: row.required("default_schema")?,
+            ansi_nulls: row.required("ansi_nulls")?,
+            quoted_identifier: row.required("quoted_identifier")?,
+        },
+        major,
+    ))
+}
+
+/// The permissions without which the dependency catalog reads short, asked
+/// before it is read. A missing one refuses by name.
+async fn qualify(conn: &mut impl QueryConnection) -> Result<(), CaptureError> {
+    let rows = rows(conn, PERMISSIONS).await?;
+    let [row] = rows.as_slice() else {
+        return Err(CaptureError::Incomplete);
+    };
+    let row = Text(row);
+    if row.required("view_definition")? != "1" {
+        return Err(CaptureError::Coverage(super::Uncovered::class(
+            "sys.sql_expression_dependencies",
+            "the capture needs VIEW DEFINITION on the database: without it the dependency catalog reads empty",
+        )));
+    }
+    if row.required("dependencies")? != "1" {
+        return Err(CaptureError::Coverage(super::Uncovered::class(
+            "sys.sql_expression_dependencies",
+            "the capture needs SELECT on sys.sql_expression_dependencies, which only db_owner holds by default",
+        )));
+    }
+    Ok(())
+}
+
+async fn baseline(conn: &mut impl QueryConnection) -> Result<Baseline, CaptureError> {
+    let present = rows(conn, LEDGER_PRESENT).await?;
+    let [present] = present.as_slice() else {
+        return Err(CaptureError::Incomplete);
+    };
+    if !Text(present).flag("present")? {
+        return Ok(Baseline::Absent);
+    }
+    let latest = rows(conn, LEDGER_LATEST).await?;
+    match latest.as_slice() {
+        [] => Ok(Baseline::Empty),
+        [row] => {
+            let row = Text(row);
+            Ok(Baseline::Recorded {
+                entry: row.number("id")?,
+                state: row.required("state_json")?,
+            })
+        }
+        _ => Err(CaptureError::Incomplete),
+    }
+}
+
+/// Every component, in turn, between two observations of the session. A
+/// session input that moved while the components were read refuses: the
+/// reads would then belong to two different sessions.
+pub(super) async fn read(
+    conn: &mut impl QueryConnection,
+    lookups: &Lookups,
+) -> Result<Catalog, CaptureError> {
+    let (session_before, major) = session(conn).await?;
+    qualify(conn).await?;
+
+    let mut schemas = Vec::new();
+    for row in rows(conn, SCHEMAS).await? {
+        let row = Text(&row);
+        schemas.push(Schema {
+            id: row.number("id")?,
+            name: row.required("name")?,
+            owner: row.number("owner")?,
+        });
+    }
+    let mut principals = Vec::new();
+    for row in rows(conn, PRINCIPALS).await? {
+        let row = Text(&row);
+        principals.push(Principal {
+            id: row.number("id")?,
+            name: row.required("name")?,
+            kind: row.required("kind")?,
+            default_schema: row.optional("default_schema")?,
+            owner: row.optional_number("owner")?,
+        });
+    }
+    let mut objects = Vec::new();
+    for row in rows(conn, OBJECTS).await? {
+        let row = Text(&row);
+        objects.push(Object {
+            id: row.number("id")?,
+            schema: row.number("schema")?,
+            name: row.required("name")?,
+            kind: row.required("kind")?,
+            parent: row.optional_number("parent")?,
+            owner: row.optional_number("owner")?,
+        });
+    }
+    let mut modules = BTreeMap::new();
+    for row in rows(conn, MODULES).await? {
+        let row = Text(&row);
+        modules.insert(
+            row.number("id")?,
+            Module {
+                definition: row.optional("definition")?,
+                ansi_nulls: row.flag("ansi_nulls")?,
+                quoted_identifier: row.flag("quoted_identifier")?,
+                schema_bound: row.flag("schema_bound")?,
+                execute_as: row.optional_number("execute_as")?,
+            },
+        );
+    }
+    let mut columns = Vec::new();
+    for row in rows(conn, COLUMNS).await? {
+        let row = Text(&row);
+        columns.push(Column {
+            object: row.number("object")?,
+            id: row.number("id")?,
+            name: row.required("name")?,
+            user_type: row.number("user_type")?,
+            max_length: row.number("max_length")?,
+            precision: row.number("precision")?,
+            scale: row.number("scale")?,
+            collation: row.optional("collation")?,
+            nullable: row.flag("nullable")?,
+            identity: row.flag("identity")?,
+            computed: row.optional("computed")?,
+            persisted: row.flag("persisted")?,
+        });
+    }
+    let mut parameters = Vec::new();
+    for row in rows(conn, PARAMETERS).await? {
+        let row = Text(&row);
+        parameters.push(Parameter {
+            object: row.number("object")?,
+            id: row.number("id")?,
+            name: row.optional("name")?.unwrap_or_default(),
+            user_type: row.number("user_type")?,
+            max_length: row.number("max_length")?,
+            precision: row.number("precision")?,
+            scale: row.number("scale")?,
+            output: row.flag("output")?,
+            has_default: row.flag("has_default")?,
+            readonly: row.flag("readonly")?,
+        });
+    }
+    let mut types = Vec::new();
+    for row in rows(conn, TYPES).await? {
+        let row = Text(&row);
+        types.push(Type {
+            id: row.number("id")?,
+            schema: row.number("schema")?,
+            name: row.required("name")?,
+            base: row.number("base")?,
+            max_length: row.number("max_length")?,
+            precision: row.number("precision")?,
+            scale: row.number("scale")?,
+            collation: row.optional("collation")?,
+            nullable: row.flag("nullable")?,
+            user_defined: row.flag("user_defined")?,
+            table_type: row.flag("table_type")?,
+        });
+    }
+    let mut synonyms = BTreeMap::new();
+    for row in rows(conn, SYNONYMS).await? {
+        let row = Text(&row);
+        synonyms.insert(row.number("id")?, row.required("base")?);
+    }
+    let mut constraints = BTreeMap::new();
+    for row in rows(conn, CONSTRAINTS).await? {
+        let row = Text(&row);
+        constraints.insert(
+            row.number("id")?,
+            Constraint {
+                column: row.number("column")?,
+                definition: row.required("definition")?,
+            },
+        );
+    }
+    let mut dependencies = Vec::new();
+    for row in rows(conn, DEPENDENCIES).await? {
+        let row = Text(&row);
+        dependencies.push(Dependency {
+            referencing: row.number("referencing")?,
+            referencing_column: row.number("referencing_column")?,
+            class: row.number("class")?,
+            server: row.optional("server")?,
+            database: row.optional("database")?,
+            schema: row.optional("schema")?,
+            entity: row.required("entity")?,
+            referenced: row.optional_number("referenced")?,
+            referenced_column: row.number("referenced_column")?,
+            schema_bound: row.flag("schema_bound")?,
+            caller_dependent: row.flag("caller_dependent")?,
+        });
+    }
+    let mut objects_named: BTreeMap<_, BTreeSet<i64>> = lookups
+        .objects
+        .iter()
+        .map(|pair| (pair.clone(), BTreeSet::new()))
+        .collect();
+    let pairs: Vec<_> = lookups.objects.iter().cloned().collect();
+    for chunk in pairs.chunks(LOOKUP_CHUNK) {
+        for row in rows(conn, &object_lookup(chunk)).await? {
+            let row = Text(&row);
+            let key = (
+                row.required("requested_schema")?,
+                row.required("requested_name")?,
+            );
+            objects_named
+                .get_mut(&key)
+                .ok_or(CaptureError::Incomplete)?
+                .insert(row.number("id")?);
+        }
+    }
+    let mut types_named: BTreeMap<_, BTreeSet<i64>> = lookups
+        .types
+        .iter()
+        .map(|pair| (pair.clone(), BTreeSet::new()))
+        .collect();
+    let pairs: Vec<_> = lookups.types.iter().cloned().collect();
+    for chunk in pairs.chunks(LOOKUP_CHUNK) {
+        for row in rows(conn, &type_lookup(chunk)).await? {
+            let row = Text(&row);
+            let key = (
+                row.required("requested_schema")?,
+                row.required("requested_name")?,
+            );
+            types_named
+                .get_mut(&key)
+                .ok_or(CaptureError::Incomplete)?
+                .insert(row.number("id")?);
+        }
+    }
+    let mut system_named: BTreeMap<_, BTreeSet<String>> = lookups
+        .system
+        .iter()
+        .map(|name| (name.clone(), BTreeSet::new()))
+        .collect();
+    let names: Vec<_> = lookups.system.iter().cloned().collect();
+    for chunk in names.chunks(LOOKUP_CHUNK) {
+        for row in rows(conn, &system_lookup(chunk)).await? {
+            let row = Text(&row);
+            system_named
+                .get_mut(&row.required("requested_name")?)
+                .ok_or(CaptureError::Incomplete)?
+                .insert(row.required("name")?);
+        }
+    }
+    let baseline = baseline(conn).await?;
+
+    let (session_after, major_after) = session(conn).await?;
+    if session_after != session_before || major_after != major {
+        return Err(CaptureError::EnvironmentChanged);
+    }
+    Ok(Catalog {
+        major,
+        session: session_before,
+        baseline,
+        schemas,
+        principals,
+        objects,
+        modules,
+        columns,
+        parameters,
+        types,
+        synonyms,
+        constraints,
+        dependencies,
+        objects_named,
+        types_named,
+        system_named,
+    })
+}
