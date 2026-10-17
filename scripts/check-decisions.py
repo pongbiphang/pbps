@@ -67,6 +67,9 @@ TRAILING = re.compile(r"(?:,[ \t]*(?:and)?|[ \t]+and)[ \t]*$")
 # comment or quote marker, at a number. The marker is followed by a space, as
 # a comment's is: `#1186` at the start of a line is an issue, not a comment.
 CONTINUATION = re.compile(r"[ \t]*(?:(?:///|//!|//|#+|--|\*|>)[ \t]+)?(?=\d)")
+# A wrap can also fall inside `, and`: the line ends on the comma and the next
+# begins with `and`, which is then part of the separator.
+CONTINUED_AND = re.compile(r"[ \t]*(?:(?:///|//!|//|#+|--|\*|>)[ \t]+)?and[ \t]+(?=\d)")
 # Where a group can end: punctuation, the end of the line, another and/or.
 GROUP_END = re.compile(r"[ \t]*(?:[,;:.)\]}|*`'\"]|$)|[ \t]+(?:and|or)\b|[ \t]+[(—–-]")
 CITE_NEW = re.compile(r"\bDEC-(\d+)\.(\d+)\b")
@@ -142,7 +145,7 @@ def citation_groups(lines, closed):
     for number, line in enumerate(lines, 1):
         carried, runs_on = runs_on, None
         if carried is not None:
-            start = CONTINUATION.match(line)
+            start = CONTINUATION.match(line) or (carried and CONTINUED_AND.match(line))
             first = start and CITE_ITEM.match(line, start.end())
             if first and _belongs(line, first, carried, closed):
                 items, runs_on = _scan(line, first, closed)

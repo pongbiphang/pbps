@@ -303,6 +303,8 @@ class TheRecord(unittest.TestCase):
             "-- DECISIONS 1, and\n-- 9",
             "the record (DECISIONS 1,\n9).",
             " * DECISIONS 1,\n * 2,\n * 9",
+            "// DECISIONS 1,\n// and 9",
+            "DECISIONS 1, 2,\nand 9.",
         ]:
             errors = run(cited={"src/a.rs": text})
             last = text.count("\n") + 1
@@ -318,6 +320,8 @@ class TheRecord(unittest.TestCase):
             "DECISIONS 2.\n9",
             "DECISIONS 2, 3\n9",
             "DECISIONS 2,\n\n9",
+            "DECISIONS 2 and\nand 9",
+            "DECISIONS 2,\nand 9 rows are rejected",
         ]:
             self.assertEqual(run(cited={"docs/a.md": text}), [], text)
 
