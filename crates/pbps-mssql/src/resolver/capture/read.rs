@@ -229,14 +229,19 @@ pub(super) struct Catalog {
     /// by the type's `user_type_id`. They are the engine's
     /// (`is_ms_shipped = 1`), so the ordinary object read never lists them.
     pub table_type_objects: BTreeMap<i64, BTreeSet<i64>>,
-    /// Filegroups and partition schemes, by `data_space_id`.
-    pub data_spaces: BTreeMap<i64, String>,
+    /// Filegroups and partition schemes, by `data_space_id`, each as what it
+    /// is: a filegroup by name, a scheme with its function, boundaries and
+    /// destinations, since `SPLIT RANGE` or `NEXT USED` moves rows without
+    /// renaming anything.
+    pub data_spaces: BTreeMap<i64, serde_json::Value>,
     /// XML schema collections, by id: schema, name and the schemas it holds.
     /// A typed `xml` column validates against those, so `ALTER XML SCHEMA
     /// COLLECTION ... ADD` changes what it accepts.
     pub xml_collections: BTreeMap<i64, (String, String, String)>,
-    /// Column encryption keys, by id.
-    pub encryption_keys: BTreeMap<i64, String>,
+    /// Column encryption keys, by id, each with its values and the master
+    /// keys they are encrypted under: `ADD VALUE` or `DROP VALUE` changes
+    /// what can unwrap the data without renaming the key.
+    pub encryption_keys: BTreeMap<i64, serde_json::Value>,
     /// Each user-defined table type's structure, by its `user_type_id`.
     pub table_types: BTreeMap<i64, TableType>,
     pub constraints: BTreeMap<i64, Constraint>,
@@ -475,6 +480,9 @@ fn whole_select(view: &str, columns: &[(String, String)]) -> String {
                     ", 126"
                 }
                 "float" | "real" => ", 3",
+                // A variant holds any of those: 126 keeps a date to the
+                // millisecond and a float whole, and leaves the rest as is.
+                "sql_variant" => ", 126",
                 _ => "",
             };
             format!("CONVERT(nvarchar(max), {quoted}{style}) AS {quoted}")
@@ -489,7 +497,36 @@ const TABLE_TYPE_OBJECTS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) 
     JOIN sys.objects o ON o.object_id = tt.type_table_object_id OR o.parent_object_id = tt.type_table_object_id;";
 
 const DATA_SPACES: &str = "SELECT CONVERT(nvarchar(20), data_space_id) AS id, \
-    CONVERT(nvarchar(128), name) AS name FROM sys.data_spaces;";
+    CONVERT(nvarchar(128), name) AS name, CONVERT(nvarchar(10), type) AS type FROM sys.data_spaces;";
+
+const PARTITION_SCHEMES: &str = "SELECT CONVERT(nvarchar(20), s.data_space_id) AS id, \
+    CONVERT(nvarchar(128), f.name) AS [function], CONVERT(nvarchar(10), f.type) AS type, \
+    CONVERT(nvarchar(1), f.boundary_value_on_right) AS on_right, CONVERT(nvarchar(20), f.function_id) AS function_id \
+    FROM sys.partition_schemes s JOIN sys.partition_functions f ON f.function_id = s.function_id;";
+
+const PARTITION_PARAMETERS: &str = "SELECT CONVERT(nvarchar(20), function_id) AS function_id, \
+    CONVERT(nvarchar(20), parameter_id) AS parameter, CONVERT(nvarchar(20), system_type_id) AS system_type, \
+    CONVERT(nvarchar(20), max_length) AS max_length, CONVERT(nvarchar(20), precision) AS precision, \
+    CONVERT(nvarchar(20), scale) AS scale, CONVERT(nvarchar(128), collation_name) AS collation \
+    FROM sys.partition_parameters;";
+
+const PARTITION_VALUES: &str = "SELECT CONVERT(nvarchar(20), function_id) AS function_id, \
+    CONVERT(nvarchar(20), boundary_id) AS boundary, CONVERT(nvarchar(20), parameter_id) AS parameter, \
+    CONVERT(nvarchar(max), value, 126) AS value FROM sys.partition_range_values;";
+
+const PARTITION_DESTINATIONS: &str = "SELECT CONVERT(nvarchar(20), partition_scheme_id) AS id, \
+    CONVERT(nvarchar(20), destination_id) AS destination, CONVERT(nvarchar(20), data_space_id) AS data_space \
+    FROM sys.destination_data_spaces;";
+
+const MASTER_KEYS: &str = "SELECT CONVERT(nvarchar(20), column_master_key_id) AS id, \
+    CONVERT(nvarchar(128), name) AS name, CONVERT(nvarchar(128), key_store_provider_name) AS provider, \
+    CONVERT(nvarchar(4000), key_path) AS path, CONVERT(nvarchar(1), allow_enclave_computations) AS enclave, \
+    CONVERT(nvarchar(max), signature, 1) AS signature FROM sys.column_master_keys;";
+
+const ENCRYPTION_KEY_VALUES: &str = "SELECT CONVERT(nvarchar(20), column_encryption_key_id) AS id, \
+    CONVERT(nvarchar(20), column_master_key_id) AS master, \
+    CONVERT(nvarchar(128), encryption_algorithm_name) AS algorithm, \
+    CONVERT(nvarchar(max), encrypted_value, 1) AS value FROM sys.column_encryption_key_values;";
 
 const XML_COLLECTIONS: &str = "SELECT CONVERT(nvarchar(20), xml_collection_id) AS id, \
     CONVERT(nvarchar(128), SCHEMA_NAME(schema_id)) AS [schema], CONVERT(nvarchar(128), name) AS name, \
@@ -676,6 +713,138 @@ async fn baseline(conn: &mut impl QueryConnection) -> Result<Baseline, CaptureEr
         }
         _ => Err(CaptureError::Incomplete),
     }
+}
+
+/// The data spaces and column encryption keys, each as the definition it
+/// names rather than its name alone.
+async fn data_spaces_and_keys(
+    conn: &mut impl QueryConnection,
+) -> Result<
+    (
+        BTreeMap<i64, serde_json::Value>,
+        BTreeMap<i64, serde_json::Value>,
+    ),
+    CaptureError,
+> {
+    use serde_json::json;
+    let mut names = BTreeMap::new();
+    let mut kinds = BTreeMap::new();
+    for row in rows(conn, DATA_SPACES).await? {
+        let row = Text(&row);
+        let id = row.number("id")?;
+        names.insert(id, row.required("name")?);
+        kinds.insert(id, row.required("type")?);
+    }
+    let mut parameters: BTreeMap<i64, Vec<(i64, serde_json::Value)>> = BTreeMap::new();
+    for row in rows(conn, PARTITION_PARAMETERS).await? {
+        let row = Text(&row);
+        parameters
+            .entry(row.number("function_id")?)
+            .or_default()
+            .push((
+                row.number("parameter")?,
+                json!({
+                    "system_type": row.required("system_type")?,
+                    "max_length": row.required("max_length")?,
+                    "precision": row.required("precision")?,
+                    "scale": row.required("scale")?,
+                    "collation": row.optional("collation")?,
+                }),
+            ));
+    }
+    let mut values: BTreeMap<i64, Vec<(i64, i64, Option<String>)>> = BTreeMap::new();
+    for row in rows(conn, PARTITION_VALUES).await? {
+        let row = Text(&row);
+        values.entry(row.number("function_id")?).or_default().push((
+            row.number("boundary")?,
+            row.number("parameter")?,
+            row.optional("value")?,
+        ));
+    }
+    let mut destinations: BTreeMap<i64, Vec<(i64, i64)>> = BTreeMap::new();
+    for row in rows(conn, PARTITION_DESTINATIONS).await? {
+        let row = Text(&row);
+        destinations
+            .entry(row.number("id")?)
+            .or_default()
+            .push((row.number("destination")?, row.number("data_space")?));
+    }
+    let mut schemes = BTreeMap::new();
+    for row in rows(conn, PARTITION_SCHEMES).await? {
+        let row = Text(&row);
+        let function = row.number("function_id")?;
+        let mut parameters = parameters.remove(&function).unwrap_or_default();
+        parameters.sort_by_key(|(id, _)| *id);
+        let mut boundaries = values.remove(&function).unwrap_or_default();
+        boundaries.sort();
+        let id = row.number("id")?;
+        let mut to = destinations.remove(&id).unwrap_or_default();
+        to.sort();
+        let to = to
+            .into_iter()
+            .map(|(_, space)| names.get(&space).cloned().ok_or(CaptureError::Incomplete))
+            .collect::<Result<Vec<_>, _>>()?;
+        schemes.insert(
+            id,
+            json!({
+                "function": row.required("function")?,
+                "type": row.required("type")?,
+                "boundary_on_right": row.flag("on_right")?,
+                "parameters": parameters.into_iter().map(|(_, p)| p).collect::<Vec<_>>(),
+                "boundaries": boundaries.into_iter().map(|(_, p, v)| json!([p, v])).collect::<Vec<_>>(),
+                "destinations": to,
+            }),
+        );
+    }
+    let spaces = names
+        .iter()
+        .map(|(id, name)| {
+            (
+                *id,
+                json!({"name": name, "type": kinds.get(id), "scheme": schemes.get(id)}),
+            )
+        })
+        .collect();
+
+    let mut masters = BTreeMap::new();
+    for row in rows(conn, MASTER_KEYS).await? {
+        let row = Text(&row);
+        masters.insert(
+            row.number("id")?,
+            json!({
+                "name": row.required("name")?,
+                "provider": row.required("provider")?,
+                "path": row.required("path")?,
+                "enclave": row.flag("enclave")?,
+                "signature": row.optional("signature")?,
+            }),
+        );
+    }
+    let mut key_values: BTreeMap<i64, Vec<serde_json::Value>> = BTreeMap::new();
+    for row in rows(conn, ENCRYPTION_KEY_VALUES).await? {
+        let row = Text(&row);
+        let master = masters
+            .get(&row.number("master")?)
+            .cloned()
+            .ok_or(CaptureError::Incomplete)?;
+        key_values
+            .entry(row.number("id")?)
+            .or_default()
+            .push(json!({
+                "master_key": master,
+                "algorithm": row.required("algorithm")?,
+                "value": row.required("value")?,
+            }));
+    }
+    let mut keys = BTreeMap::new();
+    for row in rows(conn, ENCRYPTION_KEYS).await? {
+        let row = Text(&row);
+        let id = row.number("id")?;
+        let mut held = key_values.remove(&id).unwrap_or_default();
+        held.sort_by_key(|value| value.to_string());
+        keys.insert(id, json!({"name": row.required("name")?, "values": held}));
+    }
+    Ok((spaces, keys))
 }
 
 /// Every component, in turn, between two observations of the session. A
@@ -881,6 +1050,8 @@ pub(super) async fn read(
         }
         whole.insert(view, read);
     }
+    let mut data_spaces = BTreeMap::new();
+    let mut encryption_keys = BTreeMap::new();
     let mut table_type_objects: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
     for row in rows(conn, TABLE_TYPE_OBJECTS).await? {
         let row = Text(&row);
@@ -889,11 +1060,10 @@ pub(super) async fn read(
             .or_default()
             .insert(row.number("id")?);
     }
-    let mut data_spaces = BTreeMap::new();
-    for row in rows(conn, DATA_SPACES).await? {
-        let row = Text(&row);
-        data_spaces.insert(row.number("id")?, row.required("name")?);
-    }
+    data_spaces_and_keys(conn).await.map(|(spaces, keys)| {
+        data_spaces = spaces;
+        encryption_keys = keys;
+    })?;
     let mut xml_collections = BTreeMap::new();
     for row in rows(conn, XML_COLLECTIONS).await? {
         let row = Text(&row);
@@ -905,11 +1075,6 @@ pub(super) async fn read(
                 row.required("definition")?,
             ),
         );
-    }
-    let mut encryption_keys = BTreeMap::new();
-    for row in rows(conn, ENCRYPTION_KEYS).await? {
-        let row = Text(&row);
-        encryption_keys.insert(row.number("id")?, row.required("name")?);
     }
     let mut table_types: BTreeMap<i64, TableType> = BTreeMap::new();
     for row in rows(conn, TABLE_TYPE_COLUMNS).await? {

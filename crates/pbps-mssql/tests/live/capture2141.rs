@@ -1377,3 +1377,80 @@ async fn mssql_a_sequences_declaration_and_an_xml_collections_schemas_are_compar
     );
     db.drop().await;
 }
+
+/// A data space and a column encryption key are compared as what they name,
+/// not by name alone: `SPLIT RANGE` moves a partitioned table's rows without
+/// renaming its scheme, and `ADD VALUE` changes which master key can unwrap
+/// an encrypted column without renaming its key. Each differs.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_partition_scheme_and_an_encryption_key_are_compared_by_definition() {
+    let mut db = TestDb::create("spaces2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE PARTITION FUNCTION pf (int) AS RANGE RIGHT FOR VALUES (10, 20);",
+            "CREATE PARTITION SCHEME ps AS PARTITION pf ALL TO ([PRIMARY]);",
+            "CREATE TABLE app.parted (k int NOT NULL) ON ps (k);",
+            "CREATE COLUMN MASTER KEY cmk_a WITH (KEY_STORE_PROVIDER_NAME = N'MSSQL_CERTIFICATE_STORE', KEY_PATH = N'CurrentUser/My/AAAA');",
+            "CREATE COLUMN MASTER KEY cmk_b WITH (KEY_STORE_PROVIDER_NAME = N'MSSQL_CERTIFICATE_STORE', KEY_PATH = N'CurrentUser/My/BBBB');",
+            "CREATE COLUMN ENCRYPTION KEY cek WITH VALUES (COLUMN_MASTER_KEY = cmk_a, ALGORITHM = 'RSA_OAEP', ENCRYPTED_VALUE = 0x016E000001630075007200720065006E0074007500730065007200);",
+            "CREATE TABLE app.secret (v nvarchar(10) COLLATE Latin1_General_BIN2 \
+             ENCRYPTED WITH (COLUMN_ENCRYPTION_KEY = cek, ENCRYPTION_TYPE = DETERMINISTIC, \
+             ALGORITHM = 'AEAD_AES_256_CBC_HMAC_SHA_256') NULL);",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "parted"), ("app", "secret")]),
+    )
+    .await
+    .expect("capture");
+    let differs = |differences: &[pbps_db::resolver::capture::CaptureDifference],
+                   what: &ObjectIdentity| {
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(what) && d.change == InputChange::Properties)
+    };
+    run(
+        &mut db.conn,
+        &["ALTER PARTITION FUNCTION pf () SPLIT RANGE (30);"],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differs(&differences, &object("app", "parted")),
+        "split: {differences:?}"
+    );
+
+    // A fresh baseline: a SPLIT consumes the scheme's NEXT USED filegroup
+    // (4 destinations become 3, measured), so merging back does not
+    // restore the scheme it replaced.
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "parted"), ("app", "secret")]),
+    )
+    .await
+    .expect("capture");
+    run(
+        &mut db.conn,
+        &["ALTER COLUMN ENCRYPTION KEY cek ADD VALUE (COLUMN_MASTER_KEY = cmk_b, ALGORITHM = 'RSA_OAEP', ENCRYPTED_VALUE = 0x016E000001630075007200720065006E0074007500730065007201);"],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differs(&differences, &column(&object("app", "secret"), "v")),
+        "key value: {differences:?}"
+    );
+    assert!(
+        !differs(&differences, &object("app", "parted")),
+        "the scheme is untouched: {differences:?}"
+    );
+    db.drop().await;
+}

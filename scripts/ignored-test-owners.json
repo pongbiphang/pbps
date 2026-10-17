@@ -886,6 +886,7 @@
         "capture2141::mssql_a_table_types_expressions_call_no_user_function",
         "capture2141::mssql_a_bound_default_or_rule_is_a_binding_and_its_definition_is_compared",
         "capture2141::mssql_a_sequences_declaration_and_an_xml_collections_schemas_are_compared",
+        "capture2141::mssql_a_partition_scheme_and_an_encryption_key_are_compared_by_definition",
         "binding619::schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not",
         "binding619::a_modules_set_options_are_fixed_when_it_is_created",
         "binding619::synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed",

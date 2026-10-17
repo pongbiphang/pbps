@@ -3700,6 +3700,12 @@ column after another, which is why §8 rejected it for the externals file.
   `xml` column's collection is named together with the schemas it holds
   (`XML_SCHEMA_NAMESPACE`), so `ALTER XML SCHEMA COLLECTION … ADD` differs.
   This answers #2150's fourth ready review.
+- **A data space and a column encryption key are named with their
+  definitions.** A partition scheme carries its function, boundaries and
+  destinations, a NEXT USED filegroup included, since `SPLIT RANGE` moves
+  rows without renaming anything. An encryption key carries its values and
+  their master keys. A `sql_variant` is read in style 126, which keeps a
+  date to the millisecond. This answers #2150's fifth ready review.
 - **The typed reads stay.** The dependency classification, the closure,
   the candidates and ownership read them (DEC-2141.1). The whole rows are
   what a capture compares.
