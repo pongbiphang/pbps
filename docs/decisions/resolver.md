@@ -3621,3 +3621,69 @@ Planning does not use it yet (#2143).
 `mssql_a_seal_without_its_runtime_candidates_refuses` and
 `mssql_an_identitys_seed_and_not_for_replication_are_differences`, live;
 and the `resolver::capture` unit tests.
+
+<a id="dec-2153-1"></a>
+
+**DEC-2153.1. The SQL Server capture compares every column a catalog view
+reports, minus a reasoned skip list (#2153, in #2150).** The maintainer
+agreed on 2026-10-18, after #2150's seventh review round. It applies
+§8's rule (DEC-619.4) to the capture, and the capture rule moves to
+`mssql-capture-v2`.
+
+**Why.** From round b on, every finding was one column the capture's
+hand-written projection did not read:
+
+- a key's columns;
+- a CHECK's, trigger's and index's disabled state;
+- an identity's seed;
+- `NOT FOR REPLICATION`;
+- a table type's identity;
+- a unique index's filter.
+
+An unread column compares as unchanged, so an object rebuilt with only that
+column changed recaptured as the same. A hand-written list misses one
+column after another, which is why §8 rejected it for the externals file.
+
+**The rule** (`pbps-mssql/src/resolver/capture/columns.rs`, `whole.rs`):
+
+- **Each view is read whole.** The 17 views the capture's objects come
+  from are `sys.objects`, the module, synonym, constraint, key, foreign-key
+  and trigger views, the three column views, the index views,
+  `sys.parameters` and the two type views. Each is read from its own column
+  list in `sys.all_columns`, and each row is filed under the object, column
+  or type it describes.
+- **Values are read without loss.** A value is converted to text in a style
+  that keeps it whole:
+  - ISO 8601 with milliseconds for a date or time, since the default
+    style keeps a `datetime` only to the minute;
+  - 17 digits for a `float`;
+  - hex for a binary value.
+- **What a rule does with a column.**
+  - **An id is compared as the identity it names:** a schema, principal,
+    object, type, column, index, data space, XML schema collection or
+    column encryption key. A table type's own table object is named by its
+    type.
+  - **Some columns ending in `_id` are compared as reported,** each for a
+    reason. A position (`column_id`, `parameter_id`, `index_column_id`,
+    `constraint_column_id`) is the same on every database of the same
+    shape, and `system_type_id` is an engine constant.
+  - **A few columns are skipped:**
+    - `create_date` and `modify_date`, which differ by construction;
+    - an identity's `last_value`, a status;
+    - each row's own key;
+    - a table type's own table object, read through its columns.
+  - **Any column no rule names is compared as reported**, so a column a
+    later build adds is compared before anyone names it.
+  - **An id column no rule names refuses by name.** Compared raw, it would
+    compare one database's numbering.
+- **The typed reads stay.** The dependency classification, the closure,
+  the candidates and ownership read them (DEC-2141.1). The whole rows are
+  what a capture compares.
+
+**Pinned by** `mssql_every_catalog_column_has_a_rule_or_is_compared` (every
+column the pinned build reports for every view has a rule or may be compared
+as reported) and `mssql_a_column_no_rule_names_is_compared` (a unique
+index's filter and a column's `SPARSE`), live. Each test fails with its part
+of the rule removed. The rebuilt-alike case of
+`mssql_an_identitys_seed_and_not_for_replication_are_differences` fails if
+the dates are compared.

@@ -481,6 +481,8 @@ missed each in turn.
 A three-part or four-part reference refuses by name: the externals file stages
 objects in one database and cannot stand in for another.
 
+The target capture compares objects by the same rule: every column each catalog view reports, minus a reasoned skip list ([DEC-2153.1](decisions/resolver.md#dec-2153-1)).
+
 ## 9. Compatibility on reported facts
 
 `mssql-reported-scope-v1` stays as #611 and #1636 left it:

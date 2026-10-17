@@ -881,6 +881,8 @@
         "capture2141::mssql_a_one_part_type_in_a_body_is_runtime_bound_with_type_candidates",
         "capture2141::mssql_a_seal_without_its_runtime_candidates_refuses",
         "capture2141::mssql_an_identitys_seed_and_not_for_replication_are_differences",
+        "capture2141::mssql_every_catalog_column_has_a_rule_or_is_compared",
+        "capture2141::mssql_a_column_no_rule_names_is_compared",
         "binding619::schema_bound_references_are_held_by_the_engine_and_plain_ones_are_not",
         "binding619::a_modules_set_options_are_fixed_when_it_is_created",
         "binding619::synonyms_and_other_databases_are_named_and_built_ins_are_never_shadowed",

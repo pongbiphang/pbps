@@ -24,10 +24,12 @@
 //! Scratch, separation, the externals comparison and assessment are #2142;
 //! nothing here is wired into planning yet (#2143).
 
+mod columns;
 mod manifest;
 mod ownership;
 mod read;
 mod select;
+mod whole;
 
 pub use manifest::CapturedInputs;
 pub use ownership::RecordedOwnership;
@@ -39,7 +41,7 @@ use std::collections::BTreeSet;
 /// change to what a property means, or to which properties are read, is a
 /// new rule: an old seal then reads as a version difference, never as a
 /// match under different semantics.
-pub const RULE: &str = "mssql-capture-v1";
+pub const RULE: &str = "mssql-capture-v2";
 
 /// The identity classes this capture produces, by the catalog each comes from.
 pub mod class {
@@ -101,6 +103,17 @@ pub struct CandidateSet {
 pub struct CaptureScope {
     pub retained: BTreeSet<ObjectIdentity>,
     pub candidates: BTreeSet<CandidateSet>,
+}
+
+/// The catalog views the capture reads whole (#2153), by name under `sys`.
+pub const WHOLE_VIEWS: &[&str] = columns::VIEWS;
+
+/// Whether the capture knows what to do with `column` of `sys.<view>`: a
+/// rule names it, or it may be compared as the engine reports it. An id
+/// column no rule names is the one it does not, and a capture that meets one
+/// refuses; the coverage test asks this of every column a build reports.
+pub fn classifies(view: &str, column: &str) -> bool {
+    columns::rule(view, column).is_some() || columns::comparable_raw(column)
 }
 
 /// The identity of the object `schema.name` in `sys.objects`.

@@ -195,6 +195,10 @@ pub(super) enum Baseline {
     Recorded { entry: i64, state: String },
 }
 
+/// One row of a view read whole: each column as the engine reports it, as
+/// text, `None` for NULL.
+pub(super) type WholeRow = BTreeMap<String, Option<String>>;
+
 pub(super) struct Catalog {
     pub major: u32,
     pub session: Session,
@@ -218,6 +222,15 @@ pub(super) struct Catalog {
     pub unique_indexes: BTreeMap<i64, BTreeMap<String, Key>>,
     /// Each foreign key, by its object id.
     pub foreign_keys: BTreeMap<i64, ForeignKey>,
+    /// Every row of each view in `columns::VIEWS` that describes something
+    /// this database's own objects or types hold, read whole (#2153).
+    pub whole: BTreeMap<&'static str, Vec<WholeRow>>,
+    /// Filegroups and partition schemes, by `data_space_id`.
+    pub data_spaces: BTreeMap<i64, String>,
+    /// XML schema collections, by id: schema and name.
+    pub xml_collections: BTreeMap<i64, (String, String)>,
+    /// Column encryption keys, by id.
+    pub encryption_keys: BTreeMap<i64, String>,
     /// Each user-defined table type's structure, by its `user_type_id`.
     pub table_types: BTreeMap<i64, TableType>,
     pub constraints: BTreeMap<i64, Constraint>,
@@ -418,6 +431,62 @@ const DEPENDENCIES: &str = "SELECT CONVERT(nvarchar(20), referencing_id) AS refe
     CONVERT(nvarchar(1), is_schema_bound_reference) AS schema_bound, \
     CONVERT(nvarchar(1), is_caller_dependent) AS caller_dependent \
     FROM sys.sql_expression_dependencies WHERE referencing_class = 1;";
+
+/// Which rows of a view describe this database's own objects: those of its
+/// user objects, and of its table types' own table objects, which the engine
+/// marks as its own (`is_ms_shipped = 1`).
+fn whole_filter(view: &str) -> String {
+    const OWN: &str = "(SELECT object_id FROM sys.objects WHERE is_ms_shipped = 0 \
+        UNION ALL SELECT type_table_object_id FROM sys.table_types)";
+    match view {
+        "types" | "table_types" => String::new(),
+        "foreign_key_columns" => format!(" WHERE constraint_object_id IN {OWN}"),
+        "triggers" => " WHERE parent_class = 1 AND is_ms_shipped = 0".to_owned(),
+        _ => format!(" WHERE object_id IN {OWN}"),
+    }
+}
+
+/// Every column of `sys.<view>`, from the engine's own list, so a column a
+/// later build adds is read without anyone naming it.
+fn whole_columns(view: &str) -> String {
+    format!(
+        "SELECT CONVERT(nvarchar(128), name) AS name, CONVERT(nvarchar(128), TYPE_NAME(system_type_id)) AS type \
+         FROM sys.all_columns WHERE object_id = OBJECT_ID(N'sys.{view}') ORDER BY column_id;"
+    )
+}
+
+fn whole_select(view: &str, columns: &[(String, String)]) -> String {
+    let list = columns
+        .iter()
+        .map(|(name, kind)| {
+            let quoted = format!("[{}]", name.replace(']', "]]"));
+            // Each in a style that loses nothing: the default style keeps a
+            // `datetime` to the minute and a `float` to six digits. A binary
+            // value is read as hex.
+            let style = match kind.as_str() {
+                "binary" | "varbinary" | "image" | "timestamp" => ", 1",
+                "datetime" | "datetime2" | "smalldatetime" | "date" | "time" | "datetimeoffset" => {
+                    ", 126"
+                }
+                "float" | "real" => ", 3",
+                _ => "",
+            };
+            format!("CONVERT(nvarchar(max), {quoted}{style}) AS {quoted}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {list} FROM sys.{view}{};", whole_filter(view))
+}
+
+const DATA_SPACES: &str = "SELECT CONVERT(nvarchar(20), data_space_id) AS id, \
+    CONVERT(nvarchar(128), name) AS name FROM sys.data_spaces;";
+
+const XML_COLLECTIONS: &str = "SELECT CONVERT(nvarchar(20), xml_collection_id) AS id, \
+    CONVERT(nvarchar(128), SCHEMA_NAME(schema_id)) AS [schema], CONVERT(nvarchar(128), name) AS name \
+    FROM sys.xml_schema_collections;";
+
+const ENCRYPTION_KEYS: &str = "SELECT CONVERT(nvarchar(20), column_encryption_key_id) AS id, \
+    CONVERT(nvarchar(128), name) AS name FROM sys.column_encryption_keys;";
 
 /// Lookups go in chunks, so one statement's text stays bounded however large
 /// the scope is.
@@ -776,6 +845,49 @@ pub(super) async fn read(
                 row.required("referenced")?,
             ));
     }
+    let mut whole = BTreeMap::new();
+    for &view in super::columns::VIEWS {
+        let mut columns = Vec::new();
+        for row in rows(conn, &whole_columns(view)).await? {
+            let row = Text(&row);
+            columns.push((row.required("name")?, row.required("type")?));
+        }
+        if columns.is_empty() {
+            // A view this build does not have is no view read as empty.
+            return Err(CaptureError::Coverage(super::Uncovered::class(
+                "sys.all_columns",
+                "a catalog view the capture reads whole reports no columns",
+            )));
+        }
+        let mut read = Vec::new();
+        for row in rows(conn, &whole_select(view, &columns)).await? {
+            let row = Text(&row);
+            let mut values = WholeRow::new();
+            for (name, _) in &columns {
+                values.insert(name.clone(), row.optional(name)?);
+            }
+            read.push(values);
+        }
+        whole.insert(view, read);
+    }
+    let mut data_spaces = BTreeMap::new();
+    for row in rows(conn, DATA_SPACES).await? {
+        let row = Text(&row);
+        data_spaces.insert(row.number("id")?, row.required("name")?);
+    }
+    let mut xml_collections = BTreeMap::new();
+    for row in rows(conn, XML_COLLECTIONS).await? {
+        let row = Text(&row);
+        xml_collections.insert(
+            row.number("id")?,
+            (row.required("schema")?, row.required("name")?),
+        );
+    }
+    let mut encryption_keys = BTreeMap::new();
+    for row in rows(conn, ENCRYPTION_KEYS).await? {
+        let row = Text(&row);
+        encryption_keys.insert(row.number("id")?, row.required("name")?);
+    }
     let mut table_types: BTreeMap<i64, TableType> = BTreeMap::new();
     for row in rows(conn, TABLE_TYPE_COLUMNS).await? {
         let row = Text(&row);
@@ -931,6 +1043,10 @@ pub(super) async fn read(
         keys,
         unique_indexes,
         foreign_keys,
+        whole,
+        data_spaces,
+        xml_collections,
+        encryption_keys,
         table_types,
         constraints,
         dependencies,

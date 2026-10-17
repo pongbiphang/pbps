@@ -98,7 +98,10 @@ fn identity(class: &str, name: Vec<String>, signature: Vec<ObjectIdentity>) -> O
     }
 }
 
-struct Index<'a> {
+/// The id lookups the whole views' translation shares (`whole.rs`).
+pub(super) type Lookup<'a> = Index<'a>;
+
+pub(super) struct Index<'a> {
     catalog: &'a Catalog,
     schemas: BTreeMap<i64, &'a str>,
     principals: BTreeMap<i64, &'a str>,
@@ -125,13 +128,26 @@ impl<'a> Index<'a> {
         }
     }
 
+    pub(super) fn schema_identity(&self, id: i64) -> Result<ObjectIdentity, Uncovered> {
+        Ok(identity(
+            class::SCHEMA,
+            vec![self.schema(id)?.into()],
+            Vec::new(),
+        ))
+    }
+
+    /// The identity of the user object with this id, if it is one.
+    pub(super) fn object_by_id(&self, id: i64) -> Option<Result<ObjectIdentity, Uncovered>> {
+        self.objects.get(&id).map(|object| self.object(object))
+    }
+
     fn schema(&self, id: i64) -> Result<&'a str, Uncovered> {
         self.schemas.get(&id).copied().ok_or_else(|| {
             Uncovered::class(class::SCHEMA, "an object's schema is not in the catalog")
         })
     }
 
-    fn principal(&self, id: i64) -> Result<ObjectIdentity, Uncovered> {
+    pub(super) fn principal(&self, id: i64) -> Result<ObjectIdentity, Uncovered> {
         let name = self
             .principals
             .get(&id)
@@ -147,7 +163,7 @@ impl<'a> Index<'a> {
         ))
     }
 
-    fn type_identity(&self, id: i64) -> Result<ObjectIdentity, Uncovered> {
+    pub(super) fn type_identity(&self, id: i64) -> Result<ObjectIdentity, Uncovered> {
         let found = self
             .types
             .get(&id)
@@ -199,6 +215,7 @@ impl<'a> Index<'a> {
 
 struct Builder<'a> {
     index: Index<'a>,
+    whole: super::whole::Whole<'a>,
     pending: VecDeque<i64>,
     seen: BTreeSet<i64>,
     types: BTreeSet<i64>,
@@ -536,7 +553,7 @@ impl Builder<'_> {
         for column in catalog.columns.iter().filter(|c| c.object == id) {
             let column_id = identity(class::COLUMN, vec![column.name.clone()], vec![me.clone()]);
             let target = self.index.type_identity(column.user_type)?;
-            let properties = BTreeMap::from([
+            let mut properties = BTreeMap::from([
                 ("column_id".to_owned(), json!(column.id)),
                 ("type".to_owned(), json!(target)),
                 ("max_length".to_owned(), json!(column.max_length)),
@@ -549,6 +566,7 @@ impl Builder<'_> {
                 ("computed".to_owned(), json!(column.computed)),
                 ("persisted".to_owned(), json!(column.persisted)),
             ]);
+            properties.extend(self.whole.column(id, column.id, &self.index)?);
             let bindings = column_bindings.remove(&column.id).unwrap_or_default();
             self.insert(
                 column_id,
@@ -575,6 +593,7 @@ impl Builder<'_> {
         for child in children {
             self.enqueue(child);
         }
+        properties.extend(self.whole.object(id, &self.index)?);
         self.insert(
             me,
             Input {
@@ -652,7 +671,7 @@ impl Builder<'_> {
                 keys.sort();
                 structure = Some(json!({"columns": columns, "checks": checks, "keys": keys}));
             }
-            let properties = BTreeMap::from([
+            let mut properties = BTreeMap::from([
                 ("structure".to_owned(), json!(structure)),
                 ("base".to_owned(), json!(base)),
                 ("max_length".to_owned(), json!(found.max_length)),
@@ -663,6 +682,7 @@ impl Builder<'_> {
                 ("user_defined".to_owned(), json!(found.user_defined)),
                 ("table_type".to_owned(), json!(found.table_type)),
             ]);
+            properties.extend(self.whole.type_rows(id, &self.index)?);
             self.insert(
                 me,
                 Input {
@@ -678,6 +698,7 @@ impl Builder<'_> {
 pub(super) fn select(catalog: &Catalog, scope: &CaptureScope) -> Result<Selected, Uncovered> {
     let mut builder = Builder {
         index: Index::new(catalog),
+        whole: super::whole::Whole::new(catalog),
         pending: VecDeque::new(),
         seen: BTreeSet::new(),
         types: BTreeSet::new(),

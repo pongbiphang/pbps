@@ -1111,3 +1111,95 @@ async fn mssql_an_identitys_seed_and_not_for_replication_are_differences() {
     );
     db.drop().await;
 }
+
+/// #2153's coverage: every column the pinned build reports for every view
+/// the capture reads whole has a rule or may be compared as reported. A
+/// column a later build adds is compared by default; an id column it adds
+/// fails here, since a raw id would compare one database's numbering.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_every_catalog_column_has_a_rule_or_is_compared() {
+    let mut db = TestDb::create("coverage2141").await;
+    let mut unclassified = Vec::new();
+    for view in capture::WHOLE_VIEWS {
+        let rows = db
+            .conn
+            .query(&format!(
+                "SELECT CONVERT(nvarchar(128), name) AS name FROM sys.all_columns \
+                 WHERE object_id = OBJECT_ID(N'sys.{view}');"
+            ))
+            .await
+            .expect("list the view's columns");
+        assert!(!rows.is_empty(), "sys.{view} reports no columns");
+        for row in rows {
+            let column = row.try_get::<&str>("name").unwrap().unwrap().to_owned();
+            if !capture::classifies(view, &column) {
+                unclassified.push(format!("sys.{view}.{column}"));
+            }
+        }
+    }
+    assert_eq!(unclassified, Vec::<String>::new());
+    db.drop().await;
+}
+
+/// A column the hand-written projection never named is compared all the
+/// same (#2153): a unique index's filter, which round f found, and a
+/// column's `SPARSE`, which no round had.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_column_no_rule_names_is_compared() {
+    let mut db = TestDb::create("unnamed2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE TABLE app.t (a int NULL, b int NULL);",
+            "CREATE UNIQUE INDEX ux_a ON app.t (a) WHERE a IS NOT NULL;",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t")]))
+        .await
+        .expect("capture");
+    let t = object("app", "t");
+    let differs = |differences: &[pbps_db::resolver::capture::CaptureDifference],
+                   what: &ObjectIdentity| {
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(what) && d.change == InputChange::Properties)
+    };
+    run(
+        &mut db.conn,
+        &[
+            "DROP INDEX ux_a ON app.t;",
+            "CREATE UNIQUE INDEX ux_a ON app.t (a);",
+        ],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(differs(&differences, &t), "filter: {differences:?}");
+
+    run(
+        &mut db.conn,
+        &[
+            "DROP INDEX ux_a ON app.t;",
+            "CREATE UNIQUE INDEX ux_a ON app.t (a) WHERE a IS NOT NULL;",
+            "ALTER TABLE app.t ALTER COLUMN b int SPARSE NULL;",
+        ],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differs(&differences, &column(&t, "b")),
+        "sparse: {differences:?}"
+    );
+    assert!(
+        !differs(&differences, &t),
+        "the filter is back: {differences:?}"
+    );
+    db.drop().await;
+}
