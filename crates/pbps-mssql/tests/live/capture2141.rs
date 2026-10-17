@@ -740,6 +740,39 @@ async fn mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_
             .any(|d| d.object.as_ref() == Some(&rows) && d.change == InputChange::Properties),
         "{differences:?}"
     );
+
+    // An identity column's seed is part of the type's shape too.
+    run(
+        &mut db.conn,
+        &[
+            "CREATE TYPE app.counted AS TABLE (id int IDENTITY(1, 1), v int);",
+            "CREATE PROCEDURE app.counts @r app.counted READONLY AS SELECT * FROM @r;",
+        ],
+    )
+    .await;
+    let counted = capture::capture(&mut db.conn, &objects(&[("app", "counts")]))
+        .await
+        .expect("capture");
+    run(
+        &mut db.conn,
+        &[
+            "DROP PROCEDURE app.counts;",
+            "DROP TYPE app.counted;",
+            "CREATE TYPE app.counted AS TABLE (id int IDENTITY(100, 10), v int);",
+            "CREATE PROCEDURE app.counts @r app.counted READONLY AS SELECT * FROM @r;",
+        ],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &counted)
+        .await
+        .expect("recapture");
+    assert!(
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(&user_type("app", "counted"))
+                && d.change == InputChange::Properties),
+        "identity seed: {differences:?}"
+    );
     db.drop().await;
 }
 

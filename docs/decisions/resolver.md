@@ -3596,7 +3596,8 @@ Planning does not use it yet (#2143).
   to show. A set asked and found empty is a required absence; one never
   asked is no answer.
 - **Replication and identity are part of the shape.** An identity's seed,
-  increment and `NOT FOR REPLICATION` are captured, as is `NOT FOR
+  increment and `NOT FOR REPLICATION` are captured, a table type's columns'
+  included, as is `NOT FOR
   REPLICATION` on a CHECK, a foreign key and a trigger. On a CHECK or a
   foreign key it also marks the constraint untrusted (measured), so either
   property shows the change.

@@ -641,6 +641,7 @@ impl Builder<'_> {
                         "collation": column.collation,
                         "nullable": column.nullable,
                         "identity": column.identity,
+                        "identity_spec": column.identity_spec,
                         "computed": column.computed,
                         "default": column.default,
                     }));

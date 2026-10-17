@@ -110,6 +110,8 @@ pub(super) struct TypeColumn {
     pub collation: Option<String>,
     pub nullable: bool,
     pub identity: bool,
+    /// As a table column's: seed, increment and `NOT FOR REPLICATION`.
+    pub identity_spec: Option<(String, String, bool)>,
     pub computed: Option<String>,
     pub default: Option<String>,
 }
@@ -369,9 +371,12 @@ const TABLE_TYPE_COLUMNS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) 
     CONVERT(nvarchar(20), c.precision) AS precision, CONVERT(nvarchar(20), c.scale) AS scale, \
     CONVERT(nvarchar(128), c.collation_name) AS collation, \
     CONVERT(nvarchar(1), c.is_nullable) AS nullable, CONVERT(nvarchar(1), c.is_identity) AS [identity], \
-    cc.definition AS computed, dc.definition AS [default] \
+    cc.definition AS computed, dc.definition AS [default], \
+    CONVERT(nvarchar(40), ic.seed_value) AS seed, CONVERT(nvarchar(40), ic.increment_value) AS increment, \
+    CONVERT(nvarchar(1), ic.is_not_for_replication) AS identity_not_for_replication \
     FROM sys.table_types tt JOIN sys.columns c ON c.object_id = tt.type_table_object_id \
     LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id = c.column_id \
+    LEFT JOIN sys.identity_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id \
     LEFT JOIN sys.default_constraints dc ON dc.object_id = c.default_object_id;";
 
 const TABLE_TYPE_CHECKS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) AS type, ck.definition \
@@ -503,6 +508,20 @@ impl Text<'_> {
             "0" => Ok(false),
             _ => Err(CaptureError::Incomplete),
         }
+    }
+}
+
+/// An identity's seed, increment and `NOT FOR REPLICATION`, or `None` for a
+/// column with no identity; one without the other is incomplete input.
+fn identity_spec(row: &Text<'_>) -> Result<Option<(String, String, bool)>, CaptureError> {
+    match (row.optional("seed")?, row.optional("increment")?) {
+        (Some(seed), Some(increment)) => Ok(Some((
+            seed,
+            increment,
+            row.flag("identity_not_for_replication")?,
+        ))),
+        (None, None) => Ok(None),
+        _ => Err(CaptureError::Incomplete),
     }
 }
 
@@ -649,13 +668,7 @@ pub(super) async fn read(
             collation: row.optional("collation")?,
             nullable: row.flag("nullable")?,
             identity: row.flag("identity")?,
-            identity_spec: match (row.optional("seed")?, row.optional("increment")?) {
-                (Some(seed), Some(increment)) => {
-                    Some((seed, increment, row.flag("identity_not_for_replication")?))
-                }
-                (None, None) => None,
-                _ => return Err(CaptureError::Incomplete),
-            },
+            identity_spec: identity_spec(&row)?,
             computed: row.optional("computed")?,
             persisted: row.flag("persisted")?,
         });
@@ -780,6 +793,7 @@ pub(super) async fn read(
                 collation: row.optional("collation")?,
                 nullable: row.flag("nullable")?,
                 identity: row.flag("identity")?,
+                identity_spec: identity_spec(&row)?,
                 computed: row.optional("computed")?,
                 default: row.optional("default")?,
             });
