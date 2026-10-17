@@ -3589,6 +3589,17 @@ Planning does not use it yet (#2143).
   a disabled trigger or a disabled key index. Each stops enforcing what it
   says, so its disabled (and a CHECK's trusted) state is captured, as a
   foreign key's is.
+- **A seal needs its runtime candidates.** `capture_qualified` refuses, by
+  the module's name, a scope that lacks a set its runtime-bound names need.
+  Sealed so, a later recapture would reuse the short scope, and an object
+  arriving under the omitted name would rebind the module with no difference
+  to show. A set asked and found empty is a required absence; one never
+  asked is no answer.
+- **Replication and identity are part of the shape.** An identity's seed,
+  increment and `NOT FOR REPLICATION` are captured, as is `NOT FOR
+  REPLICATION` on a CHECK, a foreign key and a trigger. On a CHECK or a
+  foreign key it also marks the constraint untrusted (measured), so either
+  property shows the change.
 - **Ownership matches the catalog's spelling.** A declaration spelled
   differently owns nothing, which leaves its record unqualified, never
   another object's.
@@ -3606,5 +3617,6 @@ Planning does not use it yet (#2143).
 `mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured` and
 `mssql_a_checks_disabled_and_untrusted_states_are_differences` and
 `mssql_a_one_part_type_in_a_body_is_runtime_bound_with_type_candidates`,
-live;
+`mssql_a_seal_without_its_runtime_candidates_refuses` and
+`mssql_an_identitys_seed_and_not_for_replication_are_differences`, live;
 and the `resolver::capture` unit tests.

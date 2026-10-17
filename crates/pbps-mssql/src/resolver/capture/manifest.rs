@@ -76,6 +76,25 @@ impl CapturedInputs {
         scope
     }
 
+    /// Refuse a capture whose scope lacks a set its own runtime-bound names
+    /// need. Sealed so, a later recapture would reuse the short scope, and an
+    /// object arriving under the omitted name would rebind the module with no
+    /// difference to show. A set asked and found empty is a required absence;
+    /// one never asked is no answer at all.
+    pub(super) fn require_runtime_candidates(&self) -> Result<(), super::Uncovered> {
+        for (module, names) in &self.runtime {
+            let one = BTreeMap::from([(module.clone(), names.clone())]);
+            let needed = super::select::runtime_candidates(&self.inputs, &one);
+            if !needed.is_subset(&self.scope.candidates) {
+                return Err(super::Uncovered::object(
+                    module,
+                    "a runtime-bound name's candidates are not in the scope; capture under runtime_scope() first",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn compare(&self, current: &Self) -> Vec<CaptureDifference> {
         let whole = |change| CaptureDifference {
             object: None,

@@ -53,6 +53,8 @@ pub(super) struct Column {
     pub collation: Option<String>,
     pub nullable: bool,
     pub identity: bool,
+    /// An identity's seed, increment and `NOT FOR REPLICATION`, as text.
+    pub identity_spec: Option<(String, String, bool)>,
     pub computed: Option<String>,
     pub persisted: bool,
 }
@@ -93,6 +95,7 @@ pub(super) struct ForeignKey {
     pub on_update: String,
     pub disabled: bool,
     pub trusted: bool,
+    pub not_for_replication: bool,
     pub columns: Vec<(i64, String, String)>,
 }
 
@@ -153,6 +156,8 @@ pub(super) struct Constraint {
     /// A CHECK's state, `None` for a DEFAULT.
     pub disabled: Option<bool>,
     pub trusted: Option<bool>,
+    /// A CHECK's `NOT FOR REPLICATION`: replication agents' writes skip it.
+    pub not_for_replication: Option<bool>,
 }
 
 pub(super) struct Dependency {
@@ -203,7 +208,7 @@ pub(super) struct Catalog {
     /// Each DML trigger's state, by its object id: whether it is disabled,
     /// which leaves its text and stops it firing, and whether it runs
     /// instead of its statement.
-    pub triggers: BTreeMap<i64, (bool, bool)>,
+    pub triggers: BTreeMap<i64, (bool, bool, bool)>,
     /// Each key constraint's key, by the constraint's object id.
     pub keys: BTreeMap<i64, Key>,
     /// Each table's unique indexes that are no constraint, by the table's
@@ -283,9 +288,12 @@ const COLUMNS: &str = "SELECT CONVERT(nvarchar(20), c.object_id) AS object, \
     CONVERT(nvarchar(20), c.precision) AS precision, CONVERT(nvarchar(20), c.scale) AS scale, \
     CONVERT(nvarchar(128), c.collation_name) AS collation, \
     CONVERT(nvarchar(1), c.is_nullable) AS nullable, CONVERT(nvarchar(1), c.is_identity) AS [identity], \
-    cc.definition AS computed, CONVERT(nvarchar(1), ISNULL(cc.is_persisted, 0)) AS persisted \
+    cc.definition AS computed, CONVERT(nvarchar(1), ISNULL(cc.is_persisted, 0)) AS persisted, \
+    CONVERT(nvarchar(40), ic.seed_value) AS seed, CONVERT(nvarchar(40), ic.increment_value) AS increment, \
+    CONVERT(nvarchar(1), ic.is_not_for_replication) AS identity_not_for_replication \
     FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id \
     LEFT JOIN sys.computed_columns cc ON cc.object_id = c.object_id AND cc.column_id = c.column_id \
+    LEFT JOIN sys.identity_columns ic ON ic.object_id = c.object_id AND ic.column_id = c.column_id \
     WHERE o.is_ms_shipped = 0;";
 
 const PARAMETERS: &str = "SELECT CONVERT(nvarchar(20), p.object_id) AS object, \
@@ -310,7 +318,8 @@ const TYPES: &str = "SELECT CONVERT(nvarchar(20), user_type_id) AS id, \
     FROM sys.types;";
 
 const TRIGGERS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
-    CONVERT(nvarchar(1), is_disabled) AS disabled, CONVERT(nvarchar(1), is_instead_of_trigger) AS instead_of \
+    CONVERT(nvarchar(1), is_disabled) AS disabled, CONVERT(nvarchar(1), is_instead_of_trigger) AS instead_of, \
+    CONVERT(nvarchar(1), is_not_for_replication) AS not_for_replication \
     FROM sys.triggers WHERE parent_class = 1 AND is_ms_shipped = 0;";
 
 const KEYS: &str = "SELECT CONVERT(nvarchar(20), kc.object_id) AS id, \
@@ -338,7 +347,8 @@ const FOREIGN_KEYS: &str = "SELECT CONVERT(nvarchar(20), fk.object_id) AS id, \
     CONVERT(nvarchar(20), kc.object_id) AS [key], CONVERT(nvarchar(128), i.name) AS [index], \
     CONVERT(nvarchar(60), fk.delete_referential_action_desc) AS on_delete, \
     CONVERT(nvarchar(60), fk.update_referential_action_desc) AS on_update, \
-    CONVERT(nvarchar(1), fk.is_disabled) AS disabled, CONVERT(nvarchar(1), fk.is_not_trusted) AS not_trusted \
+    CONVERT(nvarchar(1), fk.is_disabled) AS disabled, CONVERT(nvarchar(1), fk.is_not_trusted) AS not_trusted, \
+    CONVERT(nvarchar(1), fk.is_not_for_replication) AS not_for_replication \
     FROM sys.foreign_keys fk \
     JOIN sys.indexes i ON i.object_id = fk.referenced_object_id AND i.index_id = fk.key_index_id \
     LEFT JOIN sys.key_constraints kc ON kc.parent_object_id = fk.referenced_object_id \
@@ -383,10 +393,12 @@ const SYNONYMS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
 // text unchanged (`ALTER TABLE ... NOCHECK CONSTRAINT`).
 const CONSTRAINTS: &str = "SELECT CONVERT(nvarchar(20), object_id) AS id, \
     CONVERT(nvarchar(20), parent_column_id) AS [column], definition, \
-    CONVERT(nvarchar(1), NULL) AS disabled, CONVERT(nvarchar(1), NULL) AS not_trusted \
+    CONVERT(nvarchar(1), NULL) AS disabled, CONVERT(nvarchar(1), NULL) AS not_trusted, \
+    CONVERT(nvarchar(1), NULL) AS not_for_replication \
     FROM sys.default_constraints \
     UNION ALL SELECT CONVERT(nvarchar(20), object_id), CONVERT(nvarchar(20), parent_column_id), \
-    definition, CONVERT(nvarchar(1), is_disabled), CONVERT(nvarchar(1), is_not_trusted) \
+    definition, CONVERT(nvarchar(1), is_disabled), CONVERT(nvarchar(1), is_not_trusted), \
+    CONVERT(nvarchar(1), is_not_for_replication) \
     FROM sys.check_constraints;";
 
 const DEPENDENCIES: &str = "SELECT CONVERT(nvarchar(20), referencing_id) AS referencing, \
@@ -637,6 +649,13 @@ pub(super) async fn read(
             collation: row.optional("collation")?,
             nullable: row.flag("nullable")?,
             identity: row.flag("identity")?,
+            identity_spec: match (row.optional("seed")?, row.optional("increment")?) {
+                (Some(seed), Some(increment)) => {
+                    Some((seed, increment, row.flag("identity_not_for_replication")?))
+                }
+                (None, None) => None,
+                _ => return Err(CaptureError::Incomplete),
+            },
             computed: row.optional("computed")?,
             persisted: row.flag("persisted")?,
         });
@@ -679,7 +698,11 @@ pub(super) async fn read(
         let row = Text(&row);
         triggers.insert(
             row.number("id")?,
-            (row.flag("disabled")?, row.flag("instead_of")?),
+            (
+                row.flag("disabled")?,
+                row.flag("instead_of")?,
+                row.flag("not_for_replication")?,
+            ),
         );
     }
     let mut keys: BTreeMap<i64, Key> = BTreeMap::new();
@@ -723,6 +746,7 @@ pub(super) async fn read(
                 on_update: row.required("on_update")?,
                 disabled: row.flag("disabled")?,
                 trusted: !row.flag("not_trusted")?,
+                not_for_replication: row.flag("not_for_replication")?,
                 columns: Vec::new(),
             },
         );
@@ -797,6 +821,7 @@ pub(super) async fn read(
                 definition: row.required("definition")?,
                 disabled: row.optional("disabled")?.map(|v| v == "1"),
                 trusted: row.optional("not_trusted")?.map(|v| v != "1"),
+                not_for_replication: row.optional("not_for_replication")?.map(|v| v == "1"),
             },
         );
     }

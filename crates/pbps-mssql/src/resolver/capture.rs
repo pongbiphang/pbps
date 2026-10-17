@@ -136,6 +136,9 @@ pub async fn capture_qualified(
     recorded: &RecordedOwnership<'_>,
 ) -> Result<(CapturedInputs, pbps_model::resolver::InputManifest), CaptureError> {
     let captured = capture(connection, scope).await?;
+    captured
+        .require_runtime_candidates()
+        .map_err(CaptureError::Coverage)?;
     let ownership = ownership::classify(&captured, recorded).map_err(CaptureError::Coverage)?;
     let manifest = captured
         .seal(key, &ownership)

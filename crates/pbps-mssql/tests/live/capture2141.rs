@@ -957,3 +957,124 @@ async fn mssql_a_one_part_type_in_a_body_is_runtime_bound_with_type_candidates()
     );
     db.drop().await;
 }
+
+/// A seal needs the candidates of every runtime-bound name it holds. Sealed
+/// without them, a later recapture would reuse the short scope, and an
+/// object arriving under the omitted name would rebind the module with no
+/// difference to show: so a scope that lacks them refuses, and one from
+/// `runtime_scope()` seals.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_seal_without_its_runtime_candidates_refuses() {
+    let mut db = TestDb::create("runtimeseal2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE TABLE dbo.price (v int);",
+            "CREATE VIEW app.one_part AS SELECT v FROM price;",
+        ],
+    )
+    .await;
+    let declared = Schema::default();
+    let ids = IdsFile::default();
+    let namespaces = BTreeSet::new();
+    let recorded = capture::RecordedOwnership {
+        schema: &declared,
+        ids: &ids,
+        namespaces: &namespaces,
+    };
+    let key = environment_key();
+    let short = objects(&[("app", "one_part")]);
+    let refused = capture::capture_qualified(&mut db.conn, &short, &key, &recorded).await;
+    assert!(
+        matches!(&refused, Err(CaptureError::Coverage(u)) if u.condition.contains("runtime_scope")
+            && u.object == Some(object("app", "one_part"))),
+        "{:?}",
+        refused.err()
+    );
+    let discovered = capture::capture(&mut db.conn, &short)
+        .await
+        .expect("capture");
+    capture::capture_qualified(&mut db.conn, &discovered.runtime_scope(), &key, &recorded)
+        .await
+        .expect("a scope with the candidates seals");
+    db.drop().await;
+}
+
+/// `app.t` with the given identity seed and the given `NOT FOR REPLICATION`
+/// clause on its CHECK and on `app.r`'s foreign key to it, rebuilt.
+async fn rebuild_replicated(db: &mut TestDb, seed: &str, nfr: &str) {
+    run(
+        &mut db.conn,
+        &["DROP TABLE IF EXISTS app.r;", "DROP TABLE IF EXISTS app.t;"],
+    )
+    .await;
+    run(
+        &mut db.conn,
+        &[
+            &format!(
+                "CREATE TABLE app.t (id int IDENTITY({seed}) NOT NULL CONSTRAINT pk_t PRIMARY KEY, v int, \
+                 CONSTRAINT ck_v CHECK {nfr} (v > 0));"
+            ),
+            &format!(
+                "CREATE TABLE app.r (x int, CONSTRAINT fk_x FOREIGN KEY (x) REFERENCES app.t (id) {nfr});"
+            ),
+        ],
+    )
+    .await;
+}
+
+/// An identity's seed and increment, and `NOT FOR REPLICATION` on an
+/// identity, a CHECK or a foreign key, are each part of the shape: a table
+/// rebuilt with only one of them changed differs.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_an_identitys_seed_and_not_for_replication_are_differences() {
+    let mut db = TestDb::create("replication2141").await;
+    run(&mut db.conn, &["CREATE SCHEMA app;"]).await;
+    rebuild_replicated(&mut db, "1,1", "").await;
+    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t"), ("app", "r")]))
+        .await
+        .expect("capture");
+    let t = object("app", "t");
+    let differs = |differences: &[pbps_db::resolver::capture::CaptureDifference],
+                   what: &ObjectIdentity| {
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(what) && d.change == InputChange::Properties)
+    };
+    rebuild_replicated(&mut db, "100,10", "").await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differs(&differences, &column(&t, "id")),
+        "seed: {differences:?}"
+    );
+
+    rebuild_replicated(&mut db, "1,1", "NOT FOR REPLICATION").await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differs(&differences, &object("app", "ck_v")),
+        "check: {differences:?}"
+    );
+    assert!(
+        differs(&differences, &object("app", "fk_x")),
+        "foreign key: {differences:?}"
+    );
+
+    rebuild_replicated(&mut db, "1,1", "").await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        !differences
+            .iter()
+            .any(|d| d.change == InputChange::Properties),
+        "rebuilt alike: {differences:?}"
+    );
+    db.drop().await;
+}

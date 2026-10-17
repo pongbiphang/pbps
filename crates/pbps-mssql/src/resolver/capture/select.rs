@@ -294,12 +294,17 @@ impl Builder<'_> {
             properties.insert("definition".into(), json!(constraint.definition));
             properties.insert("disabled".into(), json!(constraint.disabled));
             properties.insert("trusted".into(), json!(constraint.trusted));
+            properties.insert(
+                "not_for_replication".into(),
+                json!(constraint.not_for_replication),
+            );
             properties.insert("column".into(), column);
         }
         let mut bindings = BTreeSet::new();
-        if let Some((disabled, instead_of)) = catalog.triggers.get(&id) {
+        if let Some((disabled, instead_of, not_for_replication)) = catalog.triggers.get(&id) {
             properties.insert("disabled".into(), json!(disabled));
             properties.insert("instead_of".into(), json!(instead_of));
+            properties.insert("not_for_replication".into(), json!(not_for_replication));
         }
         if let Some(key) = catalog.keys.get(&id) {
             let mut columns = key.columns.clone();
@@ -384,6 +389,7 @@ impl Builder<'_> {
                     "on_update": foreign.on_update,
                     "disabled": foreign.disabled,
                     "trusted": foreign.trusted,
+                    "not_for_replication": foreign.not_for_replication,
                 }),
             );
         }
@@ -539,6 +545,7 @@ impl Builder<'_> {
                 ("collation".to_owned(), json!(column.collation)),
                 ("nullable".to_owned(), json!(column.nullable)),
                 ("identity".to_owned(), json!(column.identity)),
+                ("identity_spec".to_owned(), json!(column.identity_spec)),
                 ("computed".to_owned(), json!(column.computed)),
                 ("persisted".to_owned(), json!(column.persisted)),
             ]);
