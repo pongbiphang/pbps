@@ -485,6 +485,8 @@
         "type_refs::a_nonnull_composite_with_null_attributes_satisfies_column_not_null",
         "type_refs::a_domain_keeps_a_null_default_while_enum_composite_and_array_null_defaults_are_erased",
         "type_refs::partition_null_defaults_keep_domains_but_erase_enum_and_composite_constants",
+        "type_refs::a_domains_default_populates_a_new_primary_key_without_a_null_projection",
+        "type_refs::a_null_generated_composite_evaluates_no_attribute_domain_check",
         "abrupt_committed_apply_without_caller_success_is_not_replayed",
         "abrupt_staged_ddl_refuses_unrecorded_progress",
         "abrupt_staged_row_write_refuses_unproved_replay",

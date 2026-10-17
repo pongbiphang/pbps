@@ -523,3 +523,117 @@ fn partition_null_defaults_keep_domains_but_erase_enum_and_composite_constants()
         }
     }
 }
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domains_default_populates_a_new_primary_key_without_a_null_projection() {
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "refs_default_key");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app; CREATE DOMAIN app.default_key AS integer DEFAULT 1;
+             CREATE TABLE app.measure (id integer); INSERT INTO app.measure VALUES (1);
+             ALTER TABLE app.measure ADD COLUMN n app.default_key NOT NULL;
+             ALTER TABLE app.measure ADD PRIMARY KEY (n)",
+        );
+        assert_eq!(scalar(db, "SELECT n::bigint FROM app.measure"), 1);
+        on_server(db, "DROP TABLE app.measure");
+        let d = Demo::new("refs-default-key");
+        d.table(&declarations(""));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        on_server(db, "INSERT INTO app.t VALUES (1)");
+        d.table(
+            &declarations("  n: {type: app.default_key, nullable: false}\n")
+                .replace("primary_key: [id]", "primary_key: [n]"),
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = plan(&d, db);
+        succeeds(approved_apply(
+            &d,
+            db,
+            &path,
+            &["--allow", "destructive,not-null,constraint"],
+        ));
+        assert_eq!(scalar(db, "SELECT n::bigint FROM app.t"), 1);
+        succeeds(d.run(&["verify", "--db", db]));
+        let next: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
+        assert!(next.changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_null_generated_composite_evaluates_no_attribute_domain_check() {
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "refs_generated_null");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app;
+                 CREATE TABLE app.calls (n integer);
+                 CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql AS $$
+                 BEGIN INSERT INTO app.calls VALUES (1); RETURN true; END $$;
+                 CREATE DOMAIN app.checked AS integer CHECK (app.seen(VALUE));
+                 CREATE TYPE app.pair AS (n app.checked);
+                 CREATE TABLE app.measure (id integer);
+                 INSERT INTO app.measure VALUES (1), (2);
+                 ALTER TABLE app.measure ADD COLUMN g app.pair
+                     GENERATED ALWAYS AS (NULL::app.pair) STORED",
+        );
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.measure WHERE g IS NOT DISTINCT FROM NULL"
+            ),
+            2
+        );
+        on_server(db, "DROP TABLE app.measure");
+        let d = Demo::new("refs-generated-null");
+        d.table(&declarations(""));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        on_server(db, "INSERT INTO app.t VALUES (1), (2)");
+        let generated =
+            "  g: {type: app.pair, generated: {expression: 'NULL::app.pair', stored: true}}\n";
+        d.table(&declarations(generated));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = plan(&d, db);
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+        succeeds(apply_plan(&d, db, &path, false));
+        succeeds(d.run(&["verify", "--db", db]));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM app.t WHERE g IS NOT DISTINCT FROM NULL"
+            ),
+            2
+        );
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+        let next: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
+        assert!(next.changes.is_empty());
+        d.table(&declarations(&format!(
+            "{generated}  h: {{type: app.pair, default: 'ROW(1)::app.pair'}}\n"
+        )));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let refused = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("app.seen"),
+            "{}",
+            stderr(&refused)
+        );
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+        on_server(db, "SELECT ROW(1)::app.pair");
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 1);
+    }
+}
