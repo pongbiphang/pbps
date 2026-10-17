@@ -6609,12 +6609,16 @@ refusing a valid plan:
   before the retype**, found through the column's uid, since the step spells
   the name the column ends with.
 - **A row update names the columns its guards read**, the cells it leaves
-  alone and its key, so a rename of one goes first. **A row that references
-  its parent through a unique column other than the key, or through several
-  columns, waits for the parent row that holds those values**: a row also
-  goes by each of its unique keys' values (`row_aliases`), which the insert or
-  update creates and the child's reference requires, as the primary key's
-  value does for a single-column reference to it.
+  alone and its key, so a rename of one goes first. Its references are
+  read from the tuple it ends with and the one it starts from, those cells
+  included, and every row's cells include its key, which a payload leaves out.
+  **A row that references its parent through a unique column other than the
+  key, or through several columns, waits for the parent row that holds those
+  values**: a row also goes by each of its unique keys' values
+  (`ObjectKey::RowByUnique`, a key of its own, since a primary key's text can
+  spell anything), which an insert or update creates, a delete or an update
+  that gives the values up ends, and the child's reference requires, as the
+  primary key's value does for a single-column reference to it.
   The update half of #2079 closes with it, so the commutation suites drop
   their `a_row_updated_beside_a_new_column` gap (DEC-1965.1); the insert half
   stays open.

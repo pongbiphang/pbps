@@ -809,6 +809,7 @@ fn column_of(key: &ObjectKey) -> Option<&pbps_model::operation::ColumnKey> {
         | ObjectKey::NotNull(_)
         | ObjectKey::Part { .. }
         | ObjectKey::Row { .. }
+        | ObjectKey::RowByUnique { .. }
         | ObjectKey::Grant { .. } => None,
     }
 }
