@@ -864,3 +864,33 @@ fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
         "a relation no step creates"
     );
 }
+
+/// Names made resolvable between two steps, as a fill's chained shapes are,
+/// count as later for a module compiled before them and not for one after
+/// (#1778).
+#[test]
+fn names_created_between_steps_are_later_only_for_modules_before_them() {
+    let mut reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap()).unwrap();
+    let view = ObjectIdentity {
+        class: "pg_class".into(),
+        name: vec!["app".into(), "v".into()],
+        signature: Vec::new(),
+    };
+    let shape = (Nameable::Type, "ext".to_owned(), "d".to_owned());
+    let later = |reconstruction: &Reconstruction| {
+        reconstruction
+            .later_names(&view)
+            .unwrap()
+            .contains(&(Nameable::Type, "ext", "d"))
+    };
+    assert!(!later(&reconstruction), "nothing is recorded yet");
+    let v = reconstruction
+        .steps
+        .iter()
+        .position(|step| step.declaration == "view app.v")
+        .unwrap();
+    reconstruction.created_before(v, vec![shape.clone()]);
+    assert!(!later(&reconstruction), "created before the view compiled");
+    reconstruction.created_before(v + 1, vec![shape]);
+    assert!(later(&reconstruction), "created after the view compiled");
+}

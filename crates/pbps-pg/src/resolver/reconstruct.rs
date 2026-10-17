@@ -117,6 +117,10 @@ impl Nameable {
     }
 }
 
+/// What a step, or a fill between two steps, makes resolvable: its kind,
+/// schema and name.
+pub type Named = (Nameable, String, String);
+
 #[derive(Debug, Clone)]
 struct Step {
     phase: Phase,
@@ -144,6 +148,9 @@ pub struct Reconstruction {
     /// catalog identity each declared signature names in the target
     /// capture's snapshot: `None` where it names none (#1063, #1124, #1148).
     dropped: BTreeMap<ModuleId, Option<ObjectIdentity>>,
+    /// Names something other than a step made resolvable just before the
+    /// step at each position: a fill's chained shapes (#1778).
+    between: Vec<(usize, Vec<Named>)>,
 }
 
 impl Reconstruction {
@@ -430,6 +437,7 @@ impl Reconstruction {
         Ok(Self {
             steps,
             dropped: BTreeMap::new(),
+            between: Vec::new(),
         })
     }
 
@@ -438,8 +446,9 @@ impl Reconstruction {
     /// to an object of one of these names may have been made before a better
     /// candidate existed. A view is found by its name; a routine by the exact
     /// overload the engine created for its step, since overloads of one name
-    /// are compiled at different steps. `None` for an object no compiled
-    /// module is.
+    /// are compiled at different steps. Names made resolvable between two
+    /// steps (see [`Self::created_before`]) count for every module compiled
+    /// before them. `None` for an object no compiled module is.
     pub fn later_names(
         &self,
         owner: &ObjectIdentity,
@@ -457,13 +466,29 @@ impl Reconstruction {
         Some(
             self.steps[at + 1..]
                 .iter()
-                .flat_map(|step| {
-                    step.names
+                .map(|step| &step.names)
+                .chain(
+                    self.between
+                        .iter()
+                        .filter(|(before, _)| at < *before)
+                        .map(|(_, names)| names),
+                )
+                .flat_map(|names| {
+                    names
                         .iter()
                         .map(|(kind, schema, name)| (*kind, schema.as_str(), name.as_str()))
                 })
                 .collect(),
         )
+    }
+
+    /// Records `names` as made resolvable just before the step at
+    /// `position`, by something no step compiles: a fill's chained shapes,
+    /// created between two parts of the compile (#1778, DEC-1778.2). A module
+    /// compiled earlier may have bound one of these names to another object,
+    /// and [`Self::later_names`] then says so.
+    pub fn created_before(&mut self, position: usize, names: Vec<Named>) {
+        self.between.push((position, names));
     }
 
     /// The catalog identity of the routine compiled for `id`, once the

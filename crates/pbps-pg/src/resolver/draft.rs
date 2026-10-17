@@ -1015,18 +1015,28 @@ fn survey_fill(facts: &Facts, managed: &dyn Fn(&Key) -> bool) -> Fill {
                 (_, Body::Listed(line)) => {
                     How::Not(item.why.clone().unwrap_or_else(|| line.clone()))
                 }
-                (Some(Chain::Names(named)), Body::Sql(sql)) => match facts.relations.get(&named.1)
-                {
-                    Some(relation) if named.0 == "pg_class" => {
-                        after.insert((relation.schema.clone(), relation.name.clone()));
-                        How::Chained(sql.clone())
+                // The chain keeps one managed object it names; the split
+                // waits for every one.
+                (Some(Chain::Names(_)), Body::Sql(sql)) => {
+                    let mut not = None;
+                    for named in folded.shapes(key).filter(|referenced| managed(referenced)) {
+                        match facts.relations.get(&named.1) {
+                            Some(relation) if named.0 == "pg_class" => {
+                                after.insert((relation.schema.clone(), relation.name.clone()));
+                            }
+                            _ => {
+                                not.get_or_insert_with(|| {
+                                    How::Not(format!(
+                                        "its shape names the managed {}, and fill orders a \
+                                         shape only after the managed relations it names",
+                                        described(named)
+                                    ))
+                                });
+                            }
+                        }
                     }
-                    _ => How::Not(format!(
-                        "its shape names the managed {}, and fill orders a shape only after the \
-                         managed relations it names",
-                        described(named)
-                    )),
-                },
+                    not.unwrap_or_else(|| How::Chained(sql.clone()))
+                }
                 (Some(Chain::Through(_)) | None, Body::Sql(sql)) => How::Ahead(sql.clone()),
             };
             let parts = folded

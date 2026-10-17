@@ -382,6 +382,59 @@ pub fn created(before: &Inventory, after: &Inventory) -> Created {
     created
 }
 
+/// What each object that appeared between two inventories makes
+/// resolvable, by kind, schema and name, as the reconstruction's order check
+/// reads a step's: a relation (an index apart), a type, a routine. Carried
+/// objects count too, since a table's row type and array type are names a
+/// binding could take (#1778).
+pub async fn nameables(
+    conn: &mut impl QueryConnection,
+    before: &Inventory,
+    after: &Inventory,
+) -> Result<Vec<super::reconstruct::Named>, DbError> {
+    use super::reconstruct::Nameable;
+    let oids = |wanted: &str| {
+        after
+            .keys()
+            .filter(|key| key.0 == wanted && !before.contains_key(*key))
+            .map(|(_, oid)| oid.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let rows = conn
+        .query(&format!(
+            "SELECT 'c' AS k, c.relkind::text AS sub, n.nspname::text AS s, c.relname::text AS n \
+               FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+              WHERE c.oid = ANY('{{{}}}'::pg_catalog.oid[]) \
+             UNION ALL \
+             SELECT 't', '', n.nspname::text, t.typname::text \
+               FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace \
+              WHERE t.oid = ANY('{{{}}}'::pg_catalog.oid[]) \
+             UNION ALL \
+             SELECT 'p', '', n.nspname::text, p.proname::text \
+               FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+              WHERE p.oid = ANY('{{{}}}'::pg_catalog.oid[])",
+            oids("pg_class"),
+            oids("pg_type"),
+            oids("pg_proc"),
+        ))
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let text = |column: &str| -> Result<String, DbError> {
+                Ok(row.try_get::<&str>(column)?.unwrap_or_default().to_owned())
+            };
+            let kind = match (text("k")?.as_str(), text("sub")?.as_str()) {
+                ("c", "i" | "I") => Nameable::Index,
+                ("c", _) => Nameable::Relation,
+                ("t", _) => Nameable::Type,
+                _ => Nameable::Routine,
+            };
+            Ok((kind, text("s")?, text("n")?))
+        })
+        .collect()
+}
+
 /// The names of the schemas with these OIDs in the connected database.
 pub async fn schema_names(
     conn: &mut impl QueryConnection,

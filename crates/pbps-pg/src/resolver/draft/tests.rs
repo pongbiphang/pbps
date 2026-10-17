@@ -675,3 +675,28 @@ fn an_object_whose_part_the_externals_file_created_is_the_files() {
         held.unfillable
     );
 }
+
+#[test]
+fn a_chained_shape_waits_for_every_managed_relation_it_names() {
+    let mut target = Target::default();
+    let first = target.relation(20300, 'r', "app", "m", &[("id", "integer")]);
+    let second = target.relation(20310, 'r', "app", "n", &[("id", "integer")]);
+    target.managed(&first);
+    target.managed(&second);
+    let chained = target.relation(20320, 'r', "ext", "c", &[("m", "app.m"), ("n", "app.n")]);
+    target.depend(&chained, &key("pg_type", 20301), 'n', true);
+    target.depend(&chained, &key("pg_type", 20311), 'n', true);
+    let reader = target.relation(20330, 'v', "app", "a", &[("m", "app.m")]);
+    target.depend(&reader, &chained, 'n', false);
+    target.managed(&reader);
+    let staging = target.fill().staging(&BTreeSet::new());
+    assert_eq!(staging.filled, BTreeSet::from(["table ext.c".to_owned()]));
+    assert_eq!(
+        staging.chained_after,
+        BTreeSet::from([
+            ("app".to_owned(), "m".to_owned()),
+            ("app".to_owned(), "n".to_owned())
+        ]),
+        "both, not the first the chain kept"
+    );
+}

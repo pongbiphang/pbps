@@ -2208,9 +2208,13 @@ DEC-1778.2).**
   - the deployer's session compiles the rest.
 
   That step can come among the modules: a table whose generated column calls
-  a declared function is created after the function. A declaration scratch
-  compiles before it cannot read a chained shape, and that failure refuses,
-  naming what waits for what. The chained shapes are compared with the target
+  a declared function is created after the function. The split waits for
+  every managed relation a chained shape names. A declaration scratch
+  compiles before the split cannot read a chained shape, and that failure
+  refuses, naming what waits for what. One that compiles there may have
+  bound a name a chained shape then takes (a call that the target casts to a
+  domain, for instance): the order check counts the chained shapes' names
+  as created at the split, and such a binding is unresolved. The chained shapes are compared with the target
   after the compile, before any binding question is answered.
 - **What it does not stage**, it names when the compile fails for want of it:
   - a routine (pbps sends no routine source);

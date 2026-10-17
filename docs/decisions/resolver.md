@@ -3420,7 +3420,13 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
   - the deployer's session compiles the rest.
 
   That step can be among the modules: a table whose generated column calls
-  a declared function follows the function there. Which declarations read a
+  a declared function follows the function there. The split waits for every
+  managed relation the shapes name, not the one the chain keeps. The order
+  check that leaves a binding unresolved when a same-named object came later
+  (`Reconstruction::later_names`) counts the chained shapes' names, read
+  from scratch's catalog after fill, as created at the split. A module
+  compiled before it that bound, say, a routine the target's call casts to a
+  domain instead is then unresolved, never sealed. Which declarations read a
   chained shape only the compile tells, since a new one has no recorded
   dependency. So a declaration scratch compiles before the split, and that
   fails, refuses with a finding naming what waits for what, and the two
@@ -3437,6 +3443,7 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
 `resolver_lifts_a_chain_through_a_table_that_compiles_after_its_function`
 (and its named refusal),
 `resolver_refuses_an_outside_write_fill_sets_off_and_leaves_none`,
+`resolver_leaves_unresolved_a_binding_a_chained_shape_would_take`,
 `resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it`,
 `resolver_fills_the_external_objects_no_externals_file_stages`,
 `resolver_refuses_a_routine_fill_cannot_stage_naming_it` and
@@ -3445,6 +3452,8 @@ copy is not filled over), live; and the `resolver::draft` unit tests
 `fill_stages_what_the_externals_file_lacks_and_leaves_what_it_holds`,
 `a_shape_naming_a_managed_row_type_is_filled_once_the_managed_tables_exist`
 `what_fill_cannot_stage_is_named_with_what_names_it` and
-`an_object_whose_part_the_externals_file_created_is_the_files`, with
+`an_object_whose_part_the_externals_file_created_is_the_files` and
+`a_chained_shape_waits_for_every_managed_relation_it_names`, with
 `reconstruct`'s
-`chained_shapes_wait_for_the_step_that_creates_what_they_name`.
+`chained_shapes_wait_for_the_step_that_creates_what_they_name` and
+`names_created_between_steps_are_later_only_for_modules_before_them`.

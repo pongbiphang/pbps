@@ -658,7 +658,15 @@ impl Run<'_> {
             };
             let before = inventory(setup).await?;
             run_fill(setup, &prepared.staging.chained, outside_writes).await?;
-            let chained = externals::created(&before, &inventory(setup).await?);
+            let after = inventory(setup).await?;
+            // A module compiled before the split may have bound a name these
+            // shapes take, as a routine call one of them now turns into a
+            // cast: the order check sees them as made resolvable here.
+            let names = externals::nameables(setup, &before, &after)
+                .await
+                .map_err(db("the filled objects' names"))?;
+            reconstruction.created_before(split, names);
+            let chained = externals::created(&before, &after);
             let compile = match prepared.compile.as_mut() {
                 Some(compile) => compile,
                 None => &mut *admin,

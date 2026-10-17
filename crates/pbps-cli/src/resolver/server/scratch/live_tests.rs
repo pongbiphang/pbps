@@ -2340,56 +2340,76 @@ async fn resolver_lifts_a_chain_through_an_object_fill_stages() {
     }
 }
 
-/// `chain_target`, with the managed table's generated column calling the
-/// declared function `f`: scratch creates that table after the function,
-/// among the modules, and fill waits for that step. With `calling`, the
-/// managed views call `f` too, so they compile after it.
+/// The body of `f`, the declared function `m`'s generated column calls.
+const GENERATING: &str = "(x integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN x";
+
+/// The target's `f` and `m`, whose generated column calls `f`: scratch
+/// creates `m` after `f`, among the modules.
+fn generating_target() -> Vec<String> {
+    vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        format!("CREATE SCHEMA {EXTERNAL}"),
+        format!("CREATE FUNCTION {MANAGED}.f{GENERATING}"),
+        format!(
+            "CREATE TABLE {MANAGED}.m (id integer, \
+             g integer GENERATED ALWAYS AS ({MANAGED}.f(id)) STORED)"
+        ),
+    ]
+}
+
+/// `schema`, declaring `f` and `m`'s generated column as the target has
+/// them.
+fn generating(mut schema: pbps_model::Schema) -> pbps_model::Schema {
+    schema.modules.insert(
+        format!("{MANAGED}.f(integer)").parse().unwrap(),
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition: GENERATING.into(),
+        },
+    );
+    let mut generated = pbps_model::Column::new("integer".parse().unwrap());
+    generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+        expression: format!("{MANAGED}.f(id)"),
+        stored: true,
+    });
+    schema
+        .tables
+        .get_mut(&format!("{MANAGED}.m").parse().unwrap())
+        .unwrap()
+        .columns
+        .insert("g".into(), generated);
+    schema
+}
+
+/// A plan keeping `a` and adding `b`, both `definition`, beside `f` and
+/// `m`.
+fn generating_inputs(definition: &str) -> Inputs {
+    Inputs::from_pair((
+        generating(declared(&[("a", definition)], &["m"])),
+        generating(declared(&[("a", definition), ("b", definition)], &["m"])),
+    ))
+}
+
+/// `chain_target` over `generating_target`: scratch creates `m` among the
+/// modules, and fill waits for that step. With `calling`, the managed views
+/// call `f` too, so they compile after it.
 async fn after_its_function(calling: bool) -> Result<ResolvedPlan, ProduceError> {
-    let function = "f";
     let filter = if calling {
         format!(" WHERE {MANAGED}.f(id) > 0")
     } else {
         String::new()
     };
-    let body = "(x integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN x";
-    let setup = vec![
-        format!("CREATE SCHEMA {MANAGED}"),
-        format!("CREATE SCHEMA {EXTERNAL}"),
-        format!("CREATE FUNCTION {MANAGED}.{function}{body}"),
-        format!(
-            "CREATE TABLE {MANAGED}.m (id integer, \
-             g integer GENERATED ALWAYS AS ({MANAGED}.{function}(id)) STORED)"
-        ),
+    let mut setup = generating_target();
+    setup.extend([
         format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
         format!("CREATE VIEW {MANAGED}.a AS SELECT id FROM {EXTERNAL}.e{filter}"),
-    ];
-    let with_function = |mut schema: pbps_model::Schema| {
-        schema.modules.insert(
-            format!("{MANAGED}.{function}(integer)").parse().unwrap(),
-            pbps_model::Module {
-                kind: pbps_model::ModuleKind::Function,
-                description: None,
-                definition: body.into(),
-            },
-        );
-        let mut generated = pbps_model::Column::new("integer".parse().unwrap());
-        generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
-            expression: format!("{MANAGED}.{function}(id)"),
-            stored: true,
-        });
-        schema
-            .tables
-            .get_mut(&format!("{MANAGED}.m").parse().unwrap())
-            .unwrap()
-            .columns
-            .insert("g".into(), generated);
-        schema
-    };
+    ]);
     let a = format!("{}{filter}", reading("id", "e"));
     let b = format!("{}{filter}", reading("m", "e"));
     let inputs = Inputs::from_pair((
-        with_function(declared(&[("a", &a)], &["m"])),
-        with_function(declared(&[("a", &a), ("b", &b)], &["m"])),
+        generating(declared(&[("a", &a)], &["m"])),
+        generating(declared(&[("a", &a), ("b", &b)], &["m"])),
     ));
     let key = ProjectKey::new(true);
     let mut target = Fixture::new("PBPS_TEST_PG_DB");
@@ -2398,6 +2418,54 @@ async fn after_its_function(calling: bool) -> Result<ResolvedPlan, ProduceError>
     let result = produce_filled(&scratch.server, &target.on(&target_db), &inputs, &key, None).await;
     target.drop().await;
     result
+}
+
+/// On the target `ext.d(NULL)` casts to the domain `ext.d`, which names
+/// `m`'s row type; scratch compiles the views before fill creates the
+/// domain, and they bind the externals file's `ext.d(text)` instead
+/// (measured on 16 and 18). That binding is unresolved, never sealed.
+/// Negative: without the domain the function is the binding on both.
+async fn shadowed_by_a_chained_shape(domain: bool) -> Result<ResolvedPlan, ProduceError> {
+    let function =
+        format!("CREATE FUNCTION {EXTERNAL}.d(text) RETURNS text LANGUAGE sql RETURN $1");
+    let mut setup = generating_target();
+    setup.push(function.clone());
+    if domain {
+        setup.push(format!("CREATE DOMAIN {EXTERNAL}.d AS {MANAGED}.m"));
+    }
+    let view = format!("SELECT {EXTERNAL}.d(NULL) AS x");
+    setup.push(format!("CREATE VIEW {MANAGED}.a AS {view}"));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &generating_inputs(&view),
+        &key,
+        &format!("CREATE SCHEMA {EXTERNAL};\n{function};"),
+    )
+    .await;
+    target.drop().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_leaves_unresolved_a_binding_a_chained_shape_would_take() {
+    let plan = shadowed_by_a_chained_shape(false)
+        .await
+        .unwrap_or_else(|error| panic!("without the domain: {error}"));
+    plan.evidence.validate(&plan.changes).unwrap();
+    let refused = match shadowed_by_a_chained_shape(true).await {
+        Ok(_) => panic!("a binding the domain would take was sealed"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refused.contains("the declaration was compiled before an object sharing a name it bound"),
+        "{refused}"
+    );
 }
 
 /// Views that call the function compile after it, and after the table, so
