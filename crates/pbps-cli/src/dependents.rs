@@ -1838,6 +1838,7 @@ fn after_the_rebuilds(
     released: &BTreeSet<ColumnRef>,
     deps: &ModuleDeps,
     declared: &pbps_model::Schema,
+    dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let Some(last) = last_function_create(cs) else {
         return Ok(0);
@@ -1902,6 +1903,7 @@ fn after_the_rebuilds(
         })
         .collect();
     let mut schedule = Schedule::new(cs.changes.len());
+    let mut waiting = vec![false; last];
     for (i, p) in cs.changes[..last].iter().enumerate() {
         let (text, columns): (Option<String>, Vec<ColumnRef>) = match &p.change {
             Change::AddCheck { constraint, .. } => {
@@ -1935,12 +1937,15 @@ fn after_the_rebuilds(
                 to_nullable: false,
                 ..
             } => (None, vec![column.clone()]),
+            // Each plain key, also beside an expression key: `column_keys`
+            // is all or nothing, and an index over `(c, f(id))` validates
+            // `c` as much as one over `(c)` does (#2125 review).
             Change::AddIndex { table, index, .. } => (
                 index.holds_expression().then(|| index_text(index)),
                 index
-                    .column_keys()
-                    .into_iter()
-                    .flatten()
+                    .columns
+                    .iter()
+                    .filter_map(|c| c.key.column())
                     .map(|k| table.column(k))
                     .collect(),
             ),
@@ -1990,6 +1995,7 @@ fn after_the_rebuilds(
                             Source::Lexical,
                             OrderReason::Structural,
                         );
+                        waiting[i] = true;
                     }
                 }
             }
@@ -2000,6 +2006,34 @@ fn after_the_rebuilds(
             });
             if *at != i && (columns.contains(column) || reads) {
                 schedule.edge(*at, i, Source::Effect, OrderReason::Structural);
+                waiting[i] = true;
+            }
+        }
+    }
+    // What a delayed addition brings stays ahead of what rests on it: a
+    // literal naming its relation, a foreign key on its unique index, a
+    // replica identity on it ([`rests_on`]). The old pass kept the moved
+    // additions in the order they had; edges from their functions alone may
+    // sink one past another that needs it (#2125 review). Only from an
+    // addition that waits for something, since one that does not keeps its
+    // place ahead of what follows it, and never into a module, so every such
+    // edge runs forward and the graph stays acyclic. What rests on one waits
+    // in turn, so the walk runs in plan order.
+    for earlier in 0..last {
+        if !waiting[earlier] {
+            continue;
+        }
+        for (later, p) in cs.changes.iter().enumerate().take(last).skip(earlier + 1) {
+            let change = &p.change;
+            let module = matches!(
+                change,
+                Change::CreateModule { .. }
+                    | Change::AlterModule { .. }
+                    | Change::DropModule { .. }
+            );
+            if !module && rests_on(change, &cs.changes[earlier].change, dialect) {
+                schedule.edge(earlier, later, Source::Effect, OrderReason::Structural);
+                waiting[later] = true;
             }
         }
     }
@@ -3830,6 +3864,7 @@ mod tests {
             released,
             &ModuleDeps::new(),
             &pbps_model::Schema::default(),
+            pg().as_ref(),
         )
         .unwrap()
     }
@@ -4970,6 +5005,7 @@ mod tests {
             &BTreeSet::new(),
             &ModuleDeps::new(),
             &pbps_model::Schema::default(),
+            pg().as_ref(),
         )
         .unwrap_err();
         assert!(
@@ -5175,7 +5211,14 @@ mod tests {
                 },
             );
         }
-        after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), &declared).unwrap();
+        after_the_rebuilds(
+            &mut cs,
+            &BTreeSet::new(),
+            &ModuleDeps::new(),
+            &declared,
+            pg().as_ref(),
+        )
+        .unwrap();
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
@@ -5527,7 +5570,8 @@ mod tests {
                 &mut cs,
                 &BTreeSet::new(),
                 &deps,
-                &pbps_model::Schema::default()
+                &pbps_model::Schema::default(),
+                pg().as_ref()
             ),
             Ok(1)
         );
@@ -5586,6 +5630,7 @@ mod tests {
                 &BTreeSet::new(),
                 &ModuleDeps::new(),
                 &pbps_model::Schema::default(),
+                pg().as_ref(),
             )
             .unwrap_err();
             assert!(why.contains("`app.t.g`"), "{why}");
@@ -5628,15 +5673,27 @@ mod tests {
             ])
         };
         let mut cs = changes("app.t_1");
-        let why = after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), &declared)
-            .unwrap_err();
+        let why = after_the_rebuilds(
+            &mut cs,
+            &BTreeSet::new(),
+            &ModuleDeps::new(),
+            &declared,
+            pg().as_ref(),
+        )
+        .unwrap_err();
         assert!(why.contains("`app.t.g`"), "{why}");
         assert!(why.contains("`app.v`"), "{why}");
         // Negative: a view over a table that is no partition of it is free to
         // go ahead, and the column follows the function.
         let mut other = changes("app.u_1");
         assert_eq!(
-            after_the_rebuilds(&mut other, &BTreeSet::new(), &ModuleDeps::new(), &declared),
+            after_the_rebuilds(
+                &mut other,
+                &BTreeSet::new(),
+                &ModuleDeps::new(),
+                &declared,
+                pg().as_ref()
+            ),
             Ok(1)
         );
         // Negative: without the declared partition the same plan orders, as
@@ -5647,7 +5704,8 @@ mod tests {
                 &mut unknown,
                 &BTreeSet::new(),
                 &ModuleDeps::new(),
-                &Schema::default()
+                &Schema::default(),
+                pg().as_ref()
             ),
             Ok(1)
         );
@@ -5686,6 +5744,7 @@ mod tests {
                 &BTreeSet::new(),
                 &ModuleDeps::new(),
                 &pbps_model::Schema::default(),
+                pg().as_ref(),
             )
         };
         let why = ordered(insert(&["g"], &[])).unwrap_err();
@@ -6092,6 +6151,7 @@ mod tests {
             &BTreeSet::new(),
             &ModuleDeps::new(),
             &Schema::default(),
+            pg().as_ref(),
         )
         .unwrap();
         assert_eq!(
@@ -6107,6 +6167,7 @@ mod tests {
             &BTreeSet::new(),
             &ModuleDeps::new(),
             &Schema::default(),
+            pg().as_ref(),
         )
         .unwrap();
         assert_eq!((again, &cs), (0, &settled));
@@ -6114,16 +6175,19 @@ mod tests {
 
     /// #2125 review: an addition evaluated over rows waits for every function
     /// its call may reach through the plan's function bodies, a mutually
-    /// recursive pair included, and for the recomputation of a generated
-    /// column its text may read. Negatives: a function the called one does
-    /// not name, and a check reading another column, are not waited for.
+    /// recursive pair included; for the recomputation of a generated column
+    /// its text or a plain key beside an expression key may read; and for a
+    /// delayed addition bringing a relation it names. Negatives: a function
+    /// the called one does not name, a check reading another column, and one
+    /// naming another relation, are not waited for.
     #[test]
     fn an_evaluated_addition_waits_for_what_its_call_reaches_and_the_columns_it_reads() {
         let order = |cs: &ChangeSet| -> Vec<String> {
             cs.changes
                 .iter()
                 .map(|p| {
-                    if let Change::AddCheck { name, .. } = &p.change {
+                    if let Change::AddCheck { name, .. } | Change::AddIndex { name, .. } = &p.change
+                    {
                         name.clone()
                     } else {
                         p.change.subject()
@@ -6138,6 +6202,7 @@ mod tests {
                 &BTreeSet::new(),
                 &ModuleDeps::new(),
                 &Schema::default(),
+                pg().as_ref(),
             )
             .unwrap();
             order(&cs)
@@ -6179,6 +6244,60 @@ mod tests {
                 routine("app.g()", "SELECT 2"),
             ]),
             ["app.f()", "reads_d", "app.g()", "app.t", "reads_c"]
+        );
+        // An index whose plain key is the recomputed column, beside an
+        // expression key calling `f`, follows the recomputation too.
+        let index =
+            |table: &str, name: &str, keys: Vec<pbps_model::IndexColumn>| Change::AddIndex {
+                table: table.parse().unwrap(),
+                name: name.into(),
+                index: Box::new(pbps_model::Index {
+                    columns: keys,
+                    include: Vec::new(),
+                    unique: true,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                }),
+                clustered: false,
+            };
+        let expression = |text: &str| pbps_model::IndexColumn {
+            key: pbps_model::IndexKey::Expression(text.into()),
+            descending: false,
+            opclass: None,
+        };
+        assert_eq!(
+            run(vec![
+                recompute,
+                routine("app.f()", "SELECT 1"),
+                index(
+                    "app.t",
+                    "mixed",
+                    vec![
+                        pbps_model::IndexColumn::column("c"),
+                        expression("app.f(id)")
+                    ]
+                ),
+                routine("app.g()", "SELECT 2"),
+            ]),
+            ["app.f()", "app.g()", "app.t", "mixed"]
+        );
+        // What a delayed addition brings stays ahead of what names it: the
+        // index calling `g` brings `app.ix`, and the check calling only `f`
+        // names it. Negative: a check naming another relation does not wait.
+        let ix = index("app.a", "ix", vec![expression("app.g(k)")]);
+        assert_eq!(
+            run(vec![
+                ix.clone(),
+                check_of("names_ix", "'app.ix'::regclass IS NOT NULL AND app.f() > 0"),
+                check_of(
+                    "names_other",
+                    "'app.other'::regclass IS NOT NULL AND app.f() > 0"
+                ),
+                routine("app.f()", "SELECT 1"),
+                routine("app.g()", "SELECT 2"),
+            ]),
+            ["app.f()", "names_other", "app.g()", "ix", "names_ix"]
         );
     }
 

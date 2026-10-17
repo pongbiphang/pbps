@@ -6306,18 +6306,27 @@ each addition waits for and lets `settle` place it:
   addition is evaluated over rows, so it runs what its function calls in
   turn, and PL/pgSQL creates a mutually recursive pair in either order;
 - an `Effect` edge from a recomputed column's new expression to what
-  validates its values: a `NOT NULL`, a key or index over it, and a check or
-  expression index whose text may read it.
+  validates its values: a `NOT NULL`, a key or index over it (each plain key,
+  also beside an expression key), and a check or expression index whose text
+  may read it;
+- an `Effect` edge from an addition that waits for any of these to each later
+  change resting on what it brings (`rests_on`: a literal naming its
+  relation, a foreign key on its unique index, a replica identity on it),
+  and on from there. The old pass kept the moved additions in their order;
+  these keep what that order protected. They never enter a module, so every
+  one runs forward and no cycle is added.
 
 What waits for nothing keeps the differ's place, as before.
 
 **What changes.** An addition naming only an early function now runs right
 after that function, not after functions it never names. A function created
 later that reads the relation the addition brings (a literal in its body) no
-longer finds it missing. `bootstrap` used to refuse such a plan as "names a
-relation this plan creates later"; the engine builds it
-(`a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused`, whose
-remedy now keeps the reading functions in the first plan).
+longer finds it missing, and a default reading it rests on it and follows it.
+`bootstrap` used to refuse both as "names a relation this plan creates
+later"; the engine builds them. What is still refused is a reader the
+reordering cannot carry: a function created ahead of the one the addition
+waits for (`a_bootstrap_naming_a_relation_its_reordering_moves_later_is_refused`,
+rewritten around such a function, `app.a_reader()`).
 
 **Side by side.** The old pass ran beside the new one over the full local
 gate:
@@ -6333,12 +6342,13 @@ No call changed from accepted to refused or back.
 Pinned by `an_addition_runs_right_after_the_functions_its_text_names`: the
 placement, the two negatives (a function created ahead, no function named)
 and idempotency. `an_evaluated_addition_waits_for_what_its_call_reaches_and_the_columns_it_reads`
-pins the reach through a recursive pair and the check reading a recomputed
-column, with a negative for each.
+pins the reach through a recursive pair, the check and the mixed index
+reading a recomputed column, and the check naming a delayed index, with a
+negative for each.
 
-Only a check or index reading a recomputed column can land later than the
-old pass put it: one naming no function used to stay ahead of the
-recomputation it validates. Every other edge comes from a function create,
+Only a change reading a recomputed column, or resting on a delayed
+addition, can land later than the old pass put it: one naming no function
+used to stay ahead of what it reads. Every other edge comes from a function create,
 all of which the old pass put the addition after.
 
 <a id="dec-1967-2"></a>

@@ -200,8 +200,14 @@ pub(crate) fn schedule(
         // A create that moves rows out of a DEFAULT is not held with the rest
         // (#1763 review).
         split_moving_defaults(&mut cs, declared.schema, dialect);
-        moved += after_the_rebuilds(&mut cs, &releases, declared.module_deps, declared.schema)
-            .map_err(Refusal::module_passes)?;
+        moved += after_the_rebuilds(
+            &mut cs,
+            &releases,
+            declared.module_deps,
+            declared.schema,
+            dialect,
+        )
+        .map_err(Refusal::module_passes)?;
         // A partition's own default after its parent's, wherever the passes
         // above left that (#1588).
         added += after_their_parents_defaults(&mut cs, declared.schema, &ids, dialect)
@@ -488,7 +494,8 @@ mod tests {
         pub(super) fn bootstrap(mut cs: ChangeSet, schema: &Schema, ids: &IdsFile) -> ChangeSet {
             let decisions = take_public_execution(&mut cs);
             split_new_tables(&mut cs, &[ids], &pg()).unwrap();
-            after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema).unwrap();
+            after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema, &pg())
+                .unwrap();
             after_their_parents_defaults(&mut cs, schema, &[ids], &pg()).unwrap();
             settle_public_execution(&mut cs, decisions);
             cs
@@ -499,7 +506,8 @@ mod tests {
             let both = [ids, &IdsFile::default()];
             split_new_tables(&mut cs, &both, &pg()).unwrap();
             split_moving_defaults(&mut cs, schema, &pg());
-            after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema).unwrap();
+            after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema, &pg())
+                .unwrap();
             after_their_parents_defaults(&mut cs, schema, &both, &pg()).unwrap();
             before_its_partitions_indexes(&mut cs, schema, &pg()).unwrap();
             settle_public_execution(&mut cs, decisions);
