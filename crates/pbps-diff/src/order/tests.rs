@@ -3830,7 +3830,7 @@ fn a_parent_row_is_deleted_after_the_incoming_foreign_key_the_plan_drops() {
     assert!(
         run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
             .iter()
-            .any(|v| matches!(v, Violation::StillPresent { .. }))
+            .any(|v| matches!(v, Violation::Edge { .. }))
     );
     // Negative: a key that stands is not waited for.
     let stands = parent_and_child(
@@ -3840,15 +3840,15 @@ fn a_parent_row_is_deleted_after_the_incoming_foreign_key_the_plan_drops() {
         reference(&["pid"], &["id"]),
         vec![delete("p", 1, &[])],
     );
-    let (_, fx, _) = stands.analysed(ModuleEdits::InPlace);
-    assert!(
-        !fx[0]
-            .requires
-            .iter()
-            .any(|r| matches!(r, Requirement::Absent(_))),
-        "{:?}",
-        fx[0].requires
+    let (ops, fx, baseline) = stands.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
     );
+    assert!(g.edges.is_empty(), "{:?}", g.edges);
 }
 
 /// The rows of tables in one cycle of foreign keys keep the order given, when
@@ -3946,4 +3946,56 @@ fn a_row_update_waits_for_the_teardown_of_a_check_that_is_put_back_unchanged() {
     let (ops, fx, baseline) = kept.analysed(ModuleEdits::InPlace);
     assert_eq!(run(&ops, &fx, &baseline, &[0], &none, Checks::ALL), []);
     let _ = (&ops, &fx);
+}
+
+/// The effects the scheduler consumes (`analyse`) read a foreign key the plan
+/// drops and adds again as the baseline's: a parent's delete still waits for
+/// its drop (review of #2120).
+#[test]
+fn a_parent_row_is_deleted_after_a_foreign_key_the_plan_rebuilds() {
+    let none = ModuleDeps::new();
+    let plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![
+            p(Change::DropForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+            }),
+            delete("p", 1, &[]),
+            p(Change::AddForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+                constraint: Box::new(reference(&["pid"], &["id"])),
+            }),
+        ],
+    );
+    let ops = Operations::of_plan(&plan.logical, ModuleEdits::InPlace);
+    let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
+    let owners = PlanOwners::new(names, &plan.before_ids, &plan.after_ids);
+    let (before, after) = (
+        Snapshot {
+            schema: &plan.before,
+            ids: &plan.before_ids,
+        },
+        Snapshot {
+            schema: &plan.after,
+            ids: &plan.after_ids,
+        },
+    );
+    let baseline = Baseline::of(before, &owners);
+    let shadowed =
+        super::shadow::analyse(&ops, &owners, before, after, &pbps_dialect::MinimalDialect);
+    let fx = shadowed.effects;
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0, 2], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
 }

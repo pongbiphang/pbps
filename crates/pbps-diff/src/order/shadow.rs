@@ -41,37 +41,9 @@ pub fn analyse(
     dialect: &dyn Dialect,
 ) -> Shadowed {
     let mut unowned = Vec::new();
-    // A foreign key the plan drops and adds again (a primary-key rebuild
-    // restores the keys that point at it) is absent while the rows between
-    // are written, so it does not order them. Their effects are read from a
-    // baseline without it; the plan's lifetime of the key is not modelled
-    // beyond that (a row before the drop or after the restore is not ordered
-    // by it either, which is narrow, not wrong).
-    let rebuilt = rebuilt_foreign_keys(operations, owners, before);
-    let without = (!rebuilt.is_empty()).then(|| {
-        let mut schema = before.schema.clone();
-        for (table, name) in &rebuilt {
-            if let Some(table) = schema.tables.get_mut(table) {
-                table.foreign_keys.remove(name);
-            }
-        }
-        schema
-    });
     let effects = operations
         .iter()
         .map(|op: &Operation| {
-            let before = match (&without, op.change()) {
-                (
-                    Some(schema),
-                    pbps_model::Change::InsertRow { .. }
-                    | pbps_model::Change::UpdateRow { .. }
-                    | pbps_model::Change::DeleteRow { .. },
-                ) => Snapshot {
-                    schema,
-                    ids: before.ids,
-                },
-                _ => before,
-            };
             let portable = effects(op, owners, before, after);
             let engine = dialect.engine_effects(op, owners, before, after);
             match (portable, engine) {
@@ -84,39 +56,6 @@ pub fn analyse(
         })
         .collect();
     Shadowed { effects, unowned }
-}
-
-/// The baseline's foreign keys, by table and name, that the plan both drops
-/// and adds.
-fn rebuilt_foreign_keys(
-    operations: &Operations,
-    owners: &dyn Owners,
-    before: Snapshot<'_>,
-) -> std::collections::BTreeSet<(pbps_model::TableName, String)> {
-    use pbps_model::Change;
-    let mut dropped = std::collections::BTreeSet::new();
-    let mut added = std::collections::BTreeSet::new();
-    for op in operations.iter() {
-        let (Change::DropForeignKey { table, name } | Change::AddForeignKey { table, name, .. }) =
-            op.change()
-        else {
-            continue;
-        };
-        // Named by the baseline's spelling of the table.
-        let Ok(uid) = owners.table(table, op.origin().spelling()) else {
-            continue;
-        };
-        let Some(base) = before.ids.tables.get(&uid) else {
-            continue;
-        };
-        let set = if matches!(op.change(), Change::DropForeignKey { .. }) {
-            &mut dropped
-        } else {
-            &mut added
-        };
-        set.insert((base.clone(), name.clone()));
-    }
-    dropped.intersection(&added).cloned().collect()
 }
 
 impl Shadowed {

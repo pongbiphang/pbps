@@ -1820,9 +1820,10 @@ impl Cx<'_> {
         })
     }
 
-    /// A foreign key the plan drops or replaces, into this table, is gone
-    /// before the table's rows go: a delete leaves the rows that reference
-    /// them standing otherwise.
+    /// A foreign key into this table that the plan drops, a rebuild's too, is
+    /// gone before the table's rows go: a delete leaves the rows that
+    /// reference them standing otherwise. By the drop's own key, as a row
+    /// waits for a check's (`row_meets_constraints`).
     fn row_inbound_keys_gone(&mut self, owner: &Recorded) {
         let Some((name, _)) = self.base_of(owner) else {
             return;
@@ -1833,33 +1834,17 @@ impl Cx<'_> {
             let Some(other_owner) = self.base_table(other_name) else {
                 continue;
             };
-            let Some((_, will)) = self.final_of(&other_owner) else {
-                continue;
-            };
-            let forward = self
-                .renames_of(other_name, other)
-                .apply(
-                    &Table {
-                        foreign_keys: other.foreign_keys.clone(),
-                        partition_of: other.partition_of.clone(),
-                        ..Table::default()
-                    },
-                    other_name,
-                )
-                .into_owned();
             for (fk_name, fk) in &other.foreign_keys {
-                if fk.references_table == name
-                    && will.foreign_keys.get(fk_name) != forward.foreign_keys.get(fk_name)
-                {
-                    gone.push(Self::part(
-                        &other_owner,
-                        PartKey::ForeignKey(fk_name.clone()),
-                    ));
+                if fk.references_table == name {
+                    gone.push(ObjectKey::Rows {
+                        table: other_owner.clone(),
+                        side: RowSide::Released(PartKey::ForeignKey(fk_name.clone())),
+                    });
                 }
             }
         }
         for key in gone {
-            self.requires(Requirement::Absent(key));
+            self.requires(Requirement::Is(key, Incarnation::Final));
         }
     }
 
