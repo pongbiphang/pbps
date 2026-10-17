@@ -2,7 +2,9 @@
 
 CPU-heavy PostgreSQL capture fixtures use Cargo's `live-test` profile. It inherits `test` and enables basic optimization (`opt-level = 1`)
 while explicitly retaining debug assertions and overflow checks. Ordinary
-`cargo test`, the quick CI suite, and the release profile are unchanged.
+`cargo test` and the quick CI suite keep optimization level 0. The shared
+[test-build debug setting](#test-build-debug-information) retains file/line
+backtraces; the release profile is unchanged.
 
 ## Why this profile exists
 
@@ -257,3 +259,101 @@ saving is 727.98 s against 260.41 s extra build wall, net 467.57 s. CPU remains
 the deciding metric. With the extra dependency variants missing, the 800.23 s
 CPU build premium takes two module executions to amortize; dependency-cache
 reuse is part of this tradeoff.
+
+## Test-build debug information
+
+Measured #2117 on `25d2eeedd678166896c746f4718de1c99448b396`, on the shared
+Intel Core i7-8850H host with Rust 1.99.0, two build jobs and incremental
+compilation enabled. The baseline used Cargo's full debug information; the
+candidate set `CARGO_PROFILE_DEV_DEBUG=line-tables-only`. Both used the same
+absolute target path, initially empty, and a warm registry cache. The target
+was deleted between candidates and after measurement. No two measurement
+builds ran together.
+
+Each candidate ran this command three times: cold, after appending
+`pub const ISSUE_2117_RELINK_PROBE: u8 = 1;` to `crates/pbps-model/src/lib.rs`, then
+after appending a one-line passing test to `crates/pbps-cli/tests/flow.rs`. The
+model probe stayed in place for the leaf run; both probes were then removed.
+The leaf run rebuilt only the `flow` test target. The model run rebuilt 52
+workspace artifacts and no third-party artifacts in either candidate.
+
+```bash
+CARGO_TARGET_DIR=/path/to/empty-target CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=1 \
+  /usr/bin/time -f '%e %U %S %M' \
+  cargo test --locked --workspace --all-targets --no-run --message-format=json \
+  > artifacts.jsonl
+```
+
+| Build | Debug information | Wall | User CPU | System CPU | Max RSS, GiB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Cold | Full | 614.21 s | 1065.53 s | 109.48 s | 2.353 |
+| Cold | Line tables only | 452.09 s | 782.42 s | 74.78 s | 1.573 |
+| Model change | Full | 83.92 s | 115.94 s | 39.22 s | 2.359 |
+| Model change | Line tables only | 69.24 s | 77.70 s | 26.17 s | 1.065 |
+| Leaf change | Full | 11.05 s | 12.64 s | 2.37 s | 1.764 |
+| Leaf change | Line tables only | 6.14 s | 5.97 s | 1.06 s | 0.827 |
+
+RSS is GNU time's maximum process RSS, not aggregate memory across concurrent
+compiler processes. Relink runs include compilation and linking; even the
+isolated leaf measurement is not linker-only RSS. The cold runs started at
+load averages 23.67 and 18.46, respectively. Swap was essentially full, with
+negligible swap traffic during these builds and no OOM kills. These are one
+paired observation per workload on a shared host, not fixed timing gates.
+
+Allocated disk sizes, with hard links counted once, were:
+
+| Debug information | Target state | Total, GiB | `debug/deps`, GiB | `debug/incremental`, GiB | Third-party cache proxy, GiB | Largest test, MiB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Full | Cold | 14.020 | 8.430 | 5.456 | 1.075 | 568.304 |
+| Line tables only | Cold | 6.791 | 3.475 | 3.181 | 0.868 | 215.567 |
+| Full | After both changes | 15.958 | 8.430 | 7.393 | 1.075 | 568.304 |
+| Line tables only | After both changes | 8.658 | 3.475 | 5.048 | 0.868 | 215.567 |
+
+Both cold targets held 43 test executables; the largest was the `pbps` binary's
+test harness. The lanes' long-lived target directories here reach 25–58 GB as
+incremental state and the `live-test` profile accumulate beyond the fresh 14 GiB,
+so the fresh-build reduction ratio is the comparison to apply when rebuilding
+them. Executable sizes are apparent file bytes. The cache proxy removes
+all incremental state and workspace files in `debug/deps`, `debug/.fingerprint`
+and `debug/build`, plus workspace executables outside those directories.
+Cargo's workspace target inventory and artifact records identify those files.
+This approximates `rust-cache`'s third-party-only contents as uncompressed local
+disk usage, not the compressed archive GitHub stores.
+
+Line tables only reduces the post-relink target by 45.7%, incremental state by
+31.7%, the cache proxy by 19.3% and the largest test executable by 62.1%.
+The leaf run's user CPU and maximum RSS fall by 52.8% and 53.1%, respectively.
+These disk and memory savings, with lower measured compilation CPU, justify
+the shared default (DEC-2117.1). Full type and local-variable debug information
+can still be selected locally with `CARGO_PROFILE_DEV_DEBUG=2`.
+
+With the setting in `Cargo.toml` and no profile environment overrides,
+`cargo check --locked --workspace --lib --profile <profile> --message-format=json`
+checked all 12 workspace libraries under each profile, including every artifact
+variant emitted by `test`:
+
+| Profile | Workspace optimization | Debug information, before → after | Debug assertions / overflow checks |
+| --- | ---: | --- | --- |
+| `dev`, `test` | 0 | `2` → `line-tables-only` | true / true |
+| `live-test` | 1 | `2` → `line-tables-only` | true / true |
+| `release` | 3 | `0` → `0` | false / false |
+
+Release artifact profiles were identical before and after. Both SCRAM crates
+retained optimization level 3. The timed cold builds also confirmed unchanged
+optimization, assertions and overflow checks for all 56 workspace artifacts,
+including test harnesses. `test` inherits `dev`, and `live-test` inherits `test`,
+so a single dev setting supplies the shared debug-information default.
+
+A temporary model test ran from Cargo's recorded executable with
+`RUST_BACKTRACE=1` and the exact filter
+`issue_2117_backtrace_has_file_and_line`. It exited 101 as expected; both the
+panic and its stack frame retained the probe's file and line:
+
+```text
+panicked at crates/pbps-model/src/lib.rs:98:55:
+issue-2117 backtrace probe
+   2: pbps_model::issue_2117_backtrace_has_file_and_line
+             at ./crates/pbps-model/src/lib.rs:98:55
+```
+
+The probe was removed, and the original 414 model library tests passed.

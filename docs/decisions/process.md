@@ -1316,3 +1316,17 @@ on the path.
 it recompiles the whole tree for a benefit past this one, and that choice
 belongs to its own decision. The numbers are in
 [CI performance](../CI-PERFORMANCE.md#scram-in-test-builds).
+
+<a id="dec-2117-1"></a>
+
+**DEC-2117.1. Development and test builds retain line tables instead of full
+debug information.** `[profile.dev] debug = "line-tables-only"` is inherited by
+`test` and `live-test`, retaining file/line panic backtraces with less target
+disk usage and relink memory. Workspace optimization levels, debug assertions
+and overflow checks remain as before, including `live-test`'s optimization
+level 1 and the two SCRAM dependencies' level 3; release settings are unchanged.
+The [paired measurements](../CI-PERFORMANCE.md#test-build-debug-information)
+include cold builds, model and leaf relinks, incremental state and a
+third-party cache proxy. Full type and local-variable debugger information is
+an opt-in through `CARGO_PROFILE_DEV_DEBUG=2` rather than a cost paid by every
+test executable.

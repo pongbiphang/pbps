@@ -159,6 +159,10 @@ unsafe_code = "forbid"
 # `_ =>` must not paper over a missing case.
 wildcard_enum_match_arm = "warn"
 
+# Keep file/line backtraces with less disk and relink memory (#2117).
+[profile.dev]
+debug = "line-tables-only"
+
 # CPU-heavy engine fixtures retain test assertions without paying the full
 # unoptimized catalog/crypto cost on each observation (DEC-1208.1).
 [profile.live-test]
