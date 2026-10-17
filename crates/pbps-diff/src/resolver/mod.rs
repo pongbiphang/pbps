@@ -19,10 +19,14 @@ fn part_effects(change: &pbps_model::Change) -> Vec<pbps_model::part_effects::Pa
 
 pub use assess::{Answer, Assessment, assess};
 
-use crate::order::{Baseline, Checks, Schedule, Source, analyse, graph};
+#[cfg(test)]
+use crate::order::Source;
+use crate::order::{Baseline, Checks, Schedule, analyse, graph};
 use pbps_dialect::Dialect;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
-use pbps_model::resolver::{OrderReason, OrderingProof, Surface, SurfaceResolution};
+#[cfg(test)]
+use pbps_model::resolver::OrderReason;
+use pbps_model::resolver::{OrderingProof, Surface, SurfaceResolution};
 use pbps_model::{ChangeSet, IdsFile};
 use std::collections::BTreeSet;
 

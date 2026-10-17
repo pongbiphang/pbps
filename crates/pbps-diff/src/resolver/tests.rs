@@ -1,5 +1,5 @@
 use super::*;
-use pbps_model::resolver::{OrderEdge, OrderReason};
+use pbps_model::resolver::OrderEdge;
 use pbps_model::{Change, PlannedChange};
 
 fn example() -> ChangeSet {
