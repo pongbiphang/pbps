@@ -2956,6 +2956,11 @@ pub struct PlanData {
     risks: Vec<&'static str>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     connected_checks: Vec<engine::ConnectedCheck>,
+    /// Each step a planning rule added, with what it serves and why
+    /// (DEC-1958.3). Reported, never sealed: the saved plan does not carry
+    /// it. Absent when no rule added a step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    origins: Vec<report::StepOrigin>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost: Option<cost::CostReport>,
     /// Selected policy only, outside the saved artifact and its evidence.
@@ -3552,6 +3557,7 @@ fn cmd_plan(
                 roles: report::touched_roles(&names),
                 risks: cs.risks().iter().map(|r| r.as_str()).collect(),
                 connected_checks: Vec::new(),
+                origins: report::origins(&cs),
                 cost: None,
                 resolver_selection: None,
                 resolver_assessment: None,

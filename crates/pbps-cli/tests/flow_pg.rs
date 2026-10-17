@@ -3296,6 +3296,141 @@ fn a_declared_expression_index_is_dropped_and_restored_around_a_function_rebuild
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+/// #1958: the steps `weave` adds around a rebuilt function change nothing the
+/// plan does not intend. On PostgreSQL 16 and 18, a function under a view and
+/// a check is rebuilt: the view is split around it, the check torn down and
+/// restored. Afterwards the view has its declared definition and its grants,
+/// and every table the plan keeps has the rows and the grants it had. The
+/// plan output names each added step's origin, and planning again adds
+/// nothing.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_woven_rebuild_keeps_the_views_definition_and_every_kept_tables_rows_and_grants() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        a_woven_rebuild_keeps_everything_else_on(server, k);
+    }
+}
+
+fn a_woven_rebuild_keeps_everything_else_on(server: &str, k: usize) {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let reader = Role(
+        server.to_owned(),
+        format!("pbps_woven_reader_{}_{k}", std::process::id()),
+    );
+    let own = OwnDatabase::new(server, "woven-equivalence");
+    let connection = own.connection();
+    on_server(connection, &format!("CREATE ROLE {} NOSUPERUSER", reader.1));
+    on_server(
+        connection,
+        &format!(
+            "CREATE SCHEMA app; \
+             CREATE FUNCTION app.f(x integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+                 AS $$ SELECT x $$; \
+             CREATE TABLE app.t (id integer PRIMARY KEY CONSTRAINT ck CHECK (app.f(id) >= 0), \
+                                 n text); \
+             CREATE TABLE app.k (id integer PRIMARY KEY, label text); \
+             CREATE VIEW app.v AS SELECT id, app.f(id) AS y FROM app.t; \
+             INSERT INTO app.t VALUES (1, 'one'), (2, NULL); \
+             INSERT INTO app.k VALUES (7, 'kept'); \
+             GRANT USAGE ON SCHEMA app TO {r}; \
+             GRANT SELECT ON app.v, app.k TO {r}; \
+             GRANT SELECT, UPDATE ON app.t TO {r}",
+            r = reader.1
+        ),
+    );
+    let d = Demo::new("woven-equivalence");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+
+    let rows = "SELECT (SELECT string_agg(id || ':' || coalesce(n, '-'), ',' ORDER BY id) \
+                FROM app.t) || '|' || (SELECT string_agg(id || ':' || label, ',' ORDER BY id) \
+                FROM app.k)";
+    let grants = "SELECT string_agg(relname || '=' || coalesce(relacl::text, '-'), ',' \
+                  ORDER BY relname) FROM pg_class \
+                  WHERE relnamespace = 'app'::regnamespace AND relkind IN ('r', 'v')";
+    let view = "SELECT pg_get_viewdef('app.v'::regclass)";
+    let before = (
+        text_of(connection, rows),
+        text_of(connection, grants),
+        text_of(connection, view),
+    );
+
+    let function = d.dir.join("schema/app.f%28integer%29.function.yml");
+    let text = std::fs::read_to_string(&function).unwrap();
+    std::fs::write(&function, text.replace("SELECT x", "SELECT x + 0")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+
+    // Each added step says where it came from, in both outputs.
+    let human = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+    assert!(
+        human.contains("added by weave: teardown for app.f(integer)"),
+        "{human}"
+    );
+    assert!(
+        human.contains("added by weave: restoration for app.f(integer)"),
+        "{human}"
+    );
+    assert!(
+        human.contains("added by weave: split part for app.v"),
+        "{human}"
+    );
+    let json = succeeds(d.run(&["plan", "--db", connection, "--format", "json"]));
+    let report: serde_json::Value = serde_json::from_str(&stdout(&json)).unwrap();
+    let origins = report["data"]["origins"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{report}"));
+    let roles: Vec<&str> = origins
+        .iter()
+        .map(|o| o["role"].as_str().unwrap())
+        .collect();
+    for role in ["teardown", "restoration", "split part"] {
+        assert!(roles.contains(&role), "{role}: {report}");
+    }
+    assert!(origins.iter().all(|o| o["rule"] == "weave"), "{report}");
+    assert!(
+        origins
+            .iter()
+            .all(|o| o["step"].as_u64().unwrap() < report["data"]["changes"].as_u64().unwrap()),
+        "{report}"
+    );
+
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    // The plan file seals no origin.
+    let sealed = std::fs::read_to_string(&plan).unwrap();
+    assert!(!sealed.contains("weave"), "{sealed}");
+    let mut allow = Vec::new();
+    for risk in report["data"]["risks"].as_array().unwrap() {
+        allow.push("--allow");
+        allow.push(risk.as_str().unwrap());
+    }
+    succeeds(approved_apply(&d, connection, &plan, &allow));
+
+    let after = (
+        text_of(connection, rows),
+        text_of(connection, grants),
+        text_of(connection, view),
+    );
+    assert_eq!(before, after, "on server {k}");
+    on_server(
+        connection,
+        "DO $$ BEGIN IF (SELECT count(*) FROM pg_constraint \
+         WHERE conrelid = 'app.t'::regclass AND conname = 'ck') <> 1 \
+         THEN RAISE EXCEPTION 'ck was not restored'; END IF; END $$",
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    // Planning the woven plan again adds nothing.
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn module_dependents_are_dropped_and_restored_around_the_rebuild_or_refused_by_name() {

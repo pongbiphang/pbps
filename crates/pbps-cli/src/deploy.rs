@@ -6622,6 +6622,7 @@ pub fn cmd_plan_db(
         roles: crate::report::touched_roles(&names),
         risks: cs.risks().iter().map(|risk| risk.as_str()).collect(),
         connected_checks,
+        origins: crate::report::origins(&cs),
         cost: Some(cost),
         resolver_selection,
         resolver_assessment,
