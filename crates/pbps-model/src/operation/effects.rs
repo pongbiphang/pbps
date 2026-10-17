@@ -840,10 +840,13 @@ impl Cx<'_> {
                     }
                 }
                 self.row_meets_constraints(&owner, table, &written);
-                let cells: Vec<(&str, &Value)> =
+                // A row's payload leaves its key column to `key`.
+                let key_value = Value::Text(key.0.clone());
+                let mut cells: Vec<(&str, &Value)> =
                     row.columns().map(|(c, v)| (c.as_str(), v)).collect();
+                cells.push((key_column.as_str(), &key_value));
                 self.row_references(&owner, &cells, true);
-                self.row_aliases(&owner, &cells, None);
+                self.row_aliases(&owner, &cells, None, false);
                 for (c, v) in &cells {
                     if v.is_null() {
                         self.row_needs_nullable(&owner, table, c);
@@ -908,23 +911,30 @@ impl Cx<'_> {
                     }
                     let _ = from;
                 }
-                self.row_references(&owner, &cells, true);
-                // The values it holds once it has run: the cells it sets and
-                // those it leaves alone.
-                let mut now = cells.clone();
-                now.extend(unchanged.iter().filter_map(|(c, cell)| match cell {
-                    crate::Cell::Value(v) => Some((c.as_str(), v)),
-                    crate::Cell::Default(_) => None,
-                }));
-                self.row_aliases(&owner, &now, Some(&written));
+                // The tuples it ends with and starts from: the cells it sets
+                // or sets from, those it leaves alone, and its key.
+                let key_value = Value::Text(key.0.clone());
+                let kept: Vec<(&str, &Value)> = unchanged
+                    .iter()
+                    .filter_map(|(c, cell)| match cell {
+                        crate::Cell::Value(v) => Some((c.as_str(), v)),
+                        crate::Cell::Default(_) => None,
+                    })
+                    .chain([(key_column.as_str(), &key_value)])
+                    .collect();
+                let now: Vec<(&str, &Value)> = cells.iter().chain(&kept).copied().collect();
+                self.row_references(&owner, &now, true);
+                self.row_aliases(&owner, &now, Some(&written), false);
                 let old: Vec<(&str, &Value)> = columns
                     .iter()
                     .filter_map(|(c, (from, _))| match from {
                         crate::Cell::Value(v) => Some((c.as_str(), v)),
                         crate::Cell::Default(_) => None,
                     })
+                    .chain(kept.iter().copied())
                     .collect();
                 self.row_references(&owner, &old, false);
+                self.row_aliases(&owner, &old, Some(&written), true);
                 // The row must stand; its values change, its identity does
                 // not, so a lookup of it by another row waits for nothing
                 // here.
@@ -934,19 +944,25 @@ impl Cx<'_> {
                 });
             }
             Change::DeleteRow {
-                table, key, row, ..
+                table,
+                key_column,
+                key,
+                row,
+                ..
             } => {
                 let owner = self.table(table)?;
                 self.row_basics(&owner, table, key);
                 let written: Vec<&str> = row.keys().map(String::as_str).collect();
                 self.row_writes(table, &owner, &written);
-                let mut cells: Vec<(&str, &Value)> = Vec::new();
+                let key_value = Value::Text(key.0.clone());
+                let mut cells: Vec<(&str, &Value)> = vec![(key_column.as_str(), &key_value)];
                 for (c, cell) in row {
                     if let crate::Cell::Value(v) = cell {
                         cells.push((c.as_str(), v));
                     }
                 }
                 self.row_references(&owner, &cells, false);
+                self.row_aliases(&owner, &cells, None, true);
                 self.row_blockers_gone(&owner);
             }
             Change::SetDataMode { table, .. } | Change::SetEnsureKeys { table, .. } => {
@@ -1728,9 +1744,10 @@ impl Cx<'_> {
             pairs.sort();
             let (columns, values): (Vec<&String>, Vec<Option<String>>) = pairs.into_iter().unzip();
             if let Some(values) = values.into_iter().collect::<Option<Vec<_>>>() {
-                wanted.push(ObjectKey::Row {
+                wanted.push(ObjectKey::RowByUnique {
                     table: parent,
-                    key: alias_key(&columns, &values),
+                    columns: columns.into_iter().cloned().collect(),
+                    values,
                 });
             }
         }
@@ -1742,14 +1759,20 @@ impl Cx<'_> {
     /// The keys a row also goes by: each unique key of its table other than
     /// a single-column primary key, which names the row itself. A foreign
     /// key over one of them names the row by those values, so the row that
-    /// holds them creates the name (`cells` says what it holds).
+    /// holds them creates the name and the row that gives them up ends it
+    /// (`cells` says what it holds, `ends` which side it is).
     fn row_aliases(
         &mut self,
         owner: &Recorded,
         cells: &[(&str, &Value)],
         changed: Option<&[&str]>,
+        ends: bool,
     ) {
-        let Some((_, table)) = self.final_of(owner) else {
+        let Some((_, table)) = (if ends {
+            self.base_of(owner)
+        } else {
+            self.final_of(owner)
+        }) else {
             return;
         };
         let mut keys: Vec<Vec<String>> = Vec::new();
@@ -1793,16 +1816,25 @@ impl Cx<'_> {
             if let Some(values) = values {
                 let refs: Vec<&String> = columns.iter().collect();
                 made.push(Resource::Object(
-                    ObjectKey::Row {
+                    ObjectKey::RowByUnique {
                         table: owner.clone(),
-                        key: alias_key(&refs, &values),
+                        columns: refs.iter().map(|c| (*c).clone()).collect(),
+                        values,
                     },
-                    Incarnation::Final,
+                    if ends {
+                        Incarnation::Base
+                    } else {
+                        Incarnation::Final
+                    },
                 ));
             }
         }
         for r in made {
-            self.creates(r);
+            if ends {
+                self.removes(r);
+            } else {
+                self.creates(r);
+            }
         }
     }
 
@@ -1819,18 +1851,6 @@ fn cell_text(value: &Value) -> Option<String> {
         Value::Bool(b) => Some(b.to_string()),
         Value::Null => None,
     }
-}
-
-/// The name a row goes by through a unique key: its columns, sorted, and the
-/// values it holds in them. It cannot be a primary key's text, which holds no
-/// such prefix.
-fn alias_key(columns: &[&String], values: &[String]) -> RowKey {
-    let columns: Vec<&str> = columns.iter().map(|c| c.as_str()).collect();
-    RowKey(format!(
-        "unique({})=({})",
-        columns.join(","),
-        values.join(",")
-    ))
 }
 
 /// Every named part a table holds, as keys' parts.
@@ -1957,7 +1977,7 @@ pub fn baseline_keys(before: Snapshot<'_>, owners: &dyn Owners) -> BTreeSet<Obje
 /// Whether the baseline model can say if it holds `key` at all.
 pub fn holds_unknown(key: &ObjectKey) -> bool {
     match key {
-        ObjectKey::Row { .. } | ObjectKey::Grant { .. } => true,
+        ObjectKey::Row { .. } | ObjectKey::RowByUnique { .. } | ObjectKey::Grant { .. } => true,
         ObjectKey::Column(ColumnKey::Partition { .. })
         | ObjectKey::NotNull(ColumnKey::Partition { .. }) => true,
         ObjectKey::Table(_)

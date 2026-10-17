@@ -2964,3 +2964,310 @@ fn a_child_row_waits_for_the_parent_row_a_unique_or_composite_reference_names() 
     let (ops, fx, baseline) = free.analysed(ModuleEdits::InPlace);
     assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
 }
+
+/// A retype of a column a foreign key stands over, through the differ, whose
+/// result the test build's observer judges: a key the plan keeps is recorded
+/// as a dependent that stands, never failed (DEC-1954.6; review of #2120).
+#[test]
+fn a_retype_beside_a_foreign_key_the_plan_keeps_is_recorded_and_not_refused() {
+    let mut parent = table_with(&["id"]);
+    parent.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    });
+    let mut child = table_with(&["pid"]);
+    child.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: vec!["pid".into()],
+            references_table: t("p"),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut before = Schema::default();
+    before.tables.insert(t("p"), parent.clone());
+    before.tables.insert(t("c"), child.clone());
+    let mut after = Schema::default();
+    parent
+        .columns
+        .insert("id".into(), Column::new("bigint".parse().unwrap()));
+    child
+        .columns
+        .insert("pid".into(), Column::new("bigint".parse().unwrap()));
+    after.tables.insert(t("p"), parent);
+    after.tables.insert(t("c"), child);
+    let ids = Plan::ids(&["p", "c"], &[("p", "id"), ("c", "pid")]);
+    let plan = crate::diff(
+        crate::Side {
+            schema: &before,
+            ids: &ids,
+        },
+        crate::Side {
+            schema: &after,
+            ids: &ids,
+        },
+        &pbps_dialect::MinimalDialect,
+        &pbps_model::Hints::default(),
+    )
+    .unwrap();
+    assert!(
+        plan.changes
+            .iter()
+            .any(|p| matches!(p.change, Change::AlterColumnType { .. })),
+        "{plan:?}"
+    );
+    assert!(
+        !plan
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, Change::DropForeignKey { .. })),
+        "{plan:?}"
+    );
+}
+
+fn plain_row(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
+    p(Change::InsertRow {
+        table: t(table),
+        key_column: "id".into(),
+        identity_key: false,
+        key: RowKey::from(key.to_string().as_str()),
+        // A real payload leaves the key column to `key`.
+        row: cells
+            .iter()
+            .map(|(c, v)| ((*c).to_owned(), Value::Int(*v)))
+            .collect::<Row>(),
+        defaults: Default::default(),
+        types: Default::default(),
+    })
+}
+
+fn reference(columns: &[&str], references: &[&str]) -> ForeignKey {
+    ForeignKey {
+        columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+        references_table: t("p"),
+        references_columns: references.iter().map(|c| (*c).to_owned()).collect(),
+        on_delete: ReferentialAction::default(),
+        on_update: ReferentialAction::default(),
+    }
+}
+
+/// `p` and `c`, the columns and unique keys given, `c` holding the foreign key
+/// `fk`, both standing in both states, and the ids of every column named.
+fn parent_and_child(
+    parent_columns: &[&str],
+    unique: &[&str],
+    child_columns: &[&str],
+    fk: ForeignKey,
+    logical: Vec<PlannedChange>,
+) -> Plan {
+    let mut parent = table_with(parent_columns);
+    parent.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    });
+    if !unique.is_empty() {
+        parent.unique.insert(
+            "u".into(),
+            pbps_model::UniqueConstraint {
+                columns: unique.iter().map(|c| (*c).to_owned()).collect(),
+                storage_parameters: Default::default(),
+            },
+        );
+    }
+    let mut child = table_with(child_columns);
+    child.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    });
+    child.foreign_keys.insert("fk".into(), fk);
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    for schema in [&mut before, &mut after] {
+        schema.tables.insert(t("p"), parent.clone());
+        schema.tables.insert(t("c"), child.clone());
+    }
+    let mut columns: Vec<(&str, &str)> = parent_columns.iter().map(|c| ("p", *c)).collect();
+    columns.extend(child_columns.iter().map(|c| ("c", *c)));
+    let ids = Plan::ids(&["p", "c"], &columns);
+    Plan {
+        logical,
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    }
+}
+
+/// Rows keyed by `id` carry no `id` cell, so a reference over the key column
+/// itself is read from the key (review of #2120).
+#[test]
+fn a_child_row_sharing_its_parents_primary_key_waits_for_the_parent_row() {
+    let none = ModuleDeps::new();
+    let plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id"],
+        reference(&["id"], &["id"]),
+        vec![plain_row("c", 1, &[]), plain_row("p", 1, &[])],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// An update that sets one component of a composite reference resolves the
+/// tuple it ends with, the cell it leaves alone included (review of #2120).
+#[test]
+fn a_child_update_of_one_component_of_a_composite_reference_waits_for_the_new_tuple() {
+    let none = ModuleDeps::new();
+    let update = p(Change::UpdateRow {
+        table: t("c"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        columns: [(
+            "pa".to_owned(),
+            (
+                pbps_model::Cell::Value(Value::Int(1)),
+                pbps_model::Cell::Value(Value::Int(3)),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: [("pb".to_owned(), pbps_model::Cell::Value(Value::Int(2)))]
+            .into_iter()
+            .collect(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    });
+    let plan = parent_and_child(
+        &["id", "a", "b"],
+        &["a", "b"],
+        &["id", "pa", "pb"],
+        reference(&["pa", "pb"], &["a", "b"]),
+        vec![update, plain_row("p", 1, &[("a", 3), ("b", 2)])],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+fn delete(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
+    p(Change::DeleteRow {
+        table: t(table),
+        key_column: "id".into(),
+        key: RowKey::from(key.to_string().as_str()),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+        row: cells
+            .iter()
+            .map(|(c, v)| ((*c).to_owned(), pbps_model::Cell::Value(Value::Int(*v))))
+            .collect(),
+        dropped: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: None,
+    })
+}
+
+/// The row that held the referenced values goes after the rows that name
+/// them, as the row keyed by them does (review of #2120).
+#[test]
+fn a_parent_row_deleted_with_the_child_that_names_its_unique_value_goes_last() {
+    let none = ModuleDeps::new();
+    let plan = parent_and_child(
+        &["id", "code"],
+        &["code"],
+        &["id", "pcode"],
+        reference(&["pcode"], &["code"]),
+        vec![
+            delete("p", 1, &[("code", 9)]),
+            delete("c", 1, &[("pcode", 9)]),
+        ],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// A primary key's text can spell anything, so the name a unique key gives a
+/// row is a key of its own, not another text (review of #2120).
+#[test]
+fn a_primary_key_that_spells_a_unique_key_name_is_not_that_name() {
+    let none = ModuleDeps::new();
+    let lookalike = p(Change::InsertRow {
+        table: t("p"),
+        key_column: "id".into(),
+        identity_key: false,
+        // What an alias spelled as text would read for `code = 5`.
+        key: RowKey::from("unique(code)=(5)"),
+        row: [("code".to_owned(), Value::Int(7))]
+            .into_iter()
+            .collect::<Row>(),
+        defaults: Default::default(),
+        types: Default::default(),
+    });
+    let plan = parent_and_child(
+        &["id", "code"],
+        &["code"],
+        &["id", "pcode"],
+        reference(&["pcode"], &["code"]),
+        vec![plain_row("c", 1, &[("pcode", 5)]), lookalike],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+}
+
+/// A parent row that gives up a unique value ends the name the child's row
+/// holds it by, so the child goes first (review of #2120).
+#[test]
+fn a_parent_update_giving_up_a_unique_value_follows_the_child_row_that_names_it() {
+    let none = ModuleDeps::new();
+    let update = p(Change::UpdateRow {
+        table: t("p"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        columns: [(
+            "code".to_owned(),
+            (
+                pbps_model::Cell::Value(Value::Int(9)),
+                pbps_model::Cell::Value(Value::Int(10)),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    });
+    let plan = parent_and_child(
+        &["id", "code"],
+        &["code"],
+        &["id", "pcode"],
+        reference(&["pcode"], &["code"]),
+        vec![update, delete("c", 1, &[("pcode", 9)])],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}

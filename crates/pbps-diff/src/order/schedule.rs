@@ -571,7 +571,10 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
             Because::Writes(_) => OrderReason::Data,
             // Two writes of one object are a question of which instance
             // stands; two writes of values or rows, of which values do.
-            Because::WriteWrite(Resource::Object(ObjectKey::Row { .. }, _))
+            Because::WriteWrite(Resource::Object(
+                ObjectKey::Row { .. } | ObjectKey::RowByUnique { .. },
+                _,
+            ))
             | Because::WriteWrite(Resource::Column(_)) => OrderReason::Data,
             Because::WriteWrite(Resource::Object(
                 ObjectKey::Table(_)
@@ -594,7 +597,7 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
 /// What depending on an object is, by the kind of object.
 fn of_key(key: &ObjectKey) -> OrderReason {
     match key {
-        ObjectKey::Row { .. } => OrderReason::Data,
+        ObjectKey::Row { .. } | ObjectKey::RowByUnique { .. } => OrderReason::Data,
         ObjectKey::Grant { .. } | ObjectKey::Role(_) => OrderReason::Authorization,
         ObjectKey::Table(_)
         | ObjectKey::Column(_)

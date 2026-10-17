@@ -310,6 +310,15 @@ pub enum ObjectKey {
         table: Recorded,
         key: RowKey,
     },
+    /// A row by the values it holds in a unique key of its table other than
+    /// a single-column primary key: what a foreign key over those columns
+    /// names. Its own variant, since no text a key can hold is not a key
+    /// (DEC-1968.2). The columns are sorted, the values in their order.
+    RowByUnique {
+        table: Recorded,
+        columns: Vec<String>,
+        values: Vec<String>,
+    },
     /// A grantee's permissions on one target, by the names the change
     /// carries: roles and targets of grants are spelled where the grant runs.
     Grant {
