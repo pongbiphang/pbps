@@ -461,14 +461,19 @@ impl Run<'_> {
         let opening_catalog = target_catalog.clone();
         // What the externals file lacks is filled from the target (#1778,
         // DEC-1778.2); which of it the file holds is known once it has run.
-        let fill = draft::fill(target, binding.desired, binding.base)
-            .await
-            .map_err(|error| match error {
-                draft::Error::Declaration(reason) => Error::Binding(reason),
-                error @ (draft::Error::AbsentSchema(_) | draft::Error::Read { .. }) => {
-                    Error::Read(format!("the externals to fill: {error}"))
-                }
-            })?;
+        let fill = draft::fill(
+            target,
+            binding.desired,
+            binding.base,
+            &request.write_path_extras,
+        )
+        .await
+        .map_err(|error| match error {
+            draft::Error::Declaration(reason) => Error::Binding(reason),
+            error @ (draft::Error::AbsentSchema(_) | draft::Error::Read { .. }) => {
+                Error::Read(format!("the externals to fill: {error}"))
+            }
+        })?;
         let mut prepared = match provisioning {
             Provisioning::RunOwned => {
                 self.run_owned(
@@ -1562,6 +1567,16 @@ async fn run_fill(
         .await
         .map_err(read("the fill's transaction"))?;
     let outcome = async {
+        // Both reads render under the same settings: a chained fill runs on
+        // a session the compile pinned to the target's zone, which the
+        // second read's reset drops, and a role's `VALID UNTIL` would then
+        // read as changed.
+        if checked {
+            session
+                .execute("RESET ALL")
+                .await
+                .map_err(read("the fill session's settings"))?;
+        }
         let before = if checked {
             externals::shared_state(session)
                 .await

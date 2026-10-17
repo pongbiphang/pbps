@@ -1660,6 +1660,8 @@
         "resolver::server::scratch::live_tests::resolver_lifts_a_chain_through_a_table_that_compiles_after_its_function",
         "resolver::server::scratch::live_tests::resolver_leaves_unresolved_a_binding_a_chained_shape_would_take",
         "resolver::server::scratch::live_tests::resolver_leaves_unresolved_a_generated_column_a_chained_shape_would_take",
+        "resolver::server::scratch::live_tests::resolver_reads_a_roles_expiry_alike_around_a_chained_fill",
+        "resolver::server::scratch::live_tests::resolver_fills_what_a_routine_declared_through_the_extras_needs",
         "resolver::server::scratch::live_tests::resolver_resolves_a_call_named_like_a_chained_sequence",
         "resolver::server::scratch::live_tests::resolver_compiles_after_a_chained_fill_under_the_deployers_settings",
         "resolver::server::scratch::live_tests::resolver_refuses_an_outside_write_fill_sets_off_and_leaves_none",

@@ -3407,7 +3407,14 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
 - **The file's outside-write rule holds for fill.** Something the file
   created, such as an event trigger, runs on fill's statements too. So fill
   runs in a `REPEATABLE READ` transaction with the same shared-state reads,
-  and a write outside the scratch database is rolled back and refused.
+  and a write outside the scratch database is rolled back and refused. Both
+  reads come after a `RESET ALL`: a chained fill runs on a session the
+  compile pinned to the target's zone, and a role's `VALID UNTIL` would
+  otherwise render differently in the two.
+- **The managed routines are found with the run's write path.** Fill looks
+  up a declared routine's signature with the request's write-path extras,
+  as the run's other lookups of the managed routines do, so a type named
+  through an extra schema is found and filled.
 - **An object one of whose parts the file created is not filled.** A file
   that stages an owned sequence alone keeps it, and fill does not create
   the table that carries it again. An extension's members are its parts, so
@@ -3464,6 +3471,8 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
 `resolver_leaves_unresolved_a_generated_column_a_chained_shape_would_take`,
 `resolver_resolves_a_call_named_like_a_chained_sequence`,
 `resolver_compiles_after_a_chained_fill_under_the_deployers_settings`,
+`resolver_reads_a_roles_expiry_alike_around_a_chained_fill`,
+`resolver_fills_what_a_routine_declared_through_the_extras_needs`,
 `resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it`,
 `resolver_fills_the_external_objects_no_externals_file_stages`,
 `resolver_refuses_a_routine_fill_cannot_stage_naming_it` and

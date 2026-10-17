@@ -996,16 +996,19 @@ impl Fill {
 
 /// What fill stages for the managed set of `desired` and `base`, read from
 /// the connected target: the objects a draft stages without `--schema`.
+/// A declared routine's signature is looked up on the write path with
+/// `extras`, as the run's other lookups of the managed routines are.
 pub async fn fill(
     conn: &mut impl QueryConnection,
     desired: &pbps_model::Schema,
     base: &pbps_model::Schema,
+    extras: &[String],
 ) -> Result<Fill, Error> {
     let managed = [
         super::capture::Managed::from_schema(desired),
         super::capture::Managed::from_schema(base),
     ];
-    let dialect = crate::Postgres::with_write_path_extras(Vec::new());
+    let dialect = crate::Postgres::with_write_path_extras(extras.to_vec());
     let mut signatures = Vec::new();
     for schema in [desired, base] {
         for (id, module) in &schema.modules {

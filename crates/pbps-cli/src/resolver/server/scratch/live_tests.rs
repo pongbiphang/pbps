@@ -1927,6 +1927,37 @@ async fn produce_filled(
     .await
 }
 
+/// `produce_filled`, with write-path extras.
+async fn produce_with_extras(
+    scratch: &str,
+    target: &str,
+    inputs: &Inputs,
+    key: &ProjectKey,
+    extras: &[String],
+) -> Result<ResolvedPlan, ProduceError> {
+    let mut planning = Conn::connect(Driver::Postgres, target).await.unwrap();
+    let identity = pbps_pg::resolver::scratch::cluster_identity(&mut planning)
+        .await
+        .unwrap();
+    super::produce(
+        Driver::Postgres,
+        scratch,
+        target,
+        &identity,
+        &inputs.binding(),
+        inputs.base(),
+        inputs.desired(),
+        &inputs.hints,
+        extras,
+        &key.project,
+        Some(ENVIRONMENT),
+        &Standard::default(),
+        None,
+        &super::Provenance::server(),
+    )
+    .await
+}
+
 /// `produce_staged`, with `sql` run on the target after the externals file was
 /// compared with it and before the opening capture.
 async fn produce_staged_then(
@@ -2620,6 +2651,119 @@ async fn resolver_resolves_a_call_named_like_a_chained_sequence() {
     assert!(
         refused.contains("the declaration was compiled before an object sharing a name it bound"),
         "{refused}"
+    );
+}
+
+/// A chained fill in the supplied layout runs on a session the compile
+/// pinned to the target's zone. Its outside-write check reads the cluster's
+/// roles before and after, and a role's `VALID UNTIL` renders in the zone of
+/// each read: both read under the same settings, and a cluster holding such
+/// a role resolves the plan. The zone is one scratch's server does not
+/// have.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_reads_a_roles_expiry_alike_around_a_chained_fill() {
+    let role = "pbps_expiring_1778";
+    let filter = format!(" WHERE {MANAGED}.f(id) > 0");
+    let a = format!("{}{filter}", reading("id", "e"));
+    let b = format!("{}{filter}", reading("m", "e"));
+    let inputs = Inputs::from_pair((
+        generating(declared(&[("a", &a)], &["m"])),
+        generating(declared(&[("a", &a), ("b", &b)], &["m"])),
+    ));
+    let key = ProjectKey::new(true);
+    for server in SERVERS {
+        let mut setup = generating_target();
+        setup.extend([
+            format!("CREATE TABLE {EXTERNAL}.e (id integer, m {MANAGED}.m)"),
+            format!("CREATE VIEW {MANAGED}.a AS {a}"),
+            "DO $$BEGIN EXECUTE pg_catalog.format('ALTER DATABASE %I SET TimeZone = %L', \
+             pg_catalog.current_database(), 'Pacific/Kiritimati'); END$$"
+                .into(),
+        ]);
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &setup).await;
+        let mut cluster = Conn::connect(Driver::Postgres, &fixture.server)
+            .await
+            .unwrap();
+        cluster
+            .execute(&format!(
+                "CREATE ROLE {role} VALID UNTIL '2100-01-01 00:00:00+00'"
+            ))
+            .await
+            .unwrap();
+        let (login, scratch_db) = fixture.confined().await;
+        let result = produce_filled(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            None,
+        )
+        .await;
+        let _ = cluster
+            .execute(&format!("DROP ROLE IF EXISTS {role}"))
+            .await;
+        fixture.drop().await;
+        assert_staged(result, "e", server);
+    }
+}
+
+/// A managed routine declared as `g(status)`, where `status` is an enum in
+/// the write path's extra schema `shared`, is found on the target with that
+/// path, so fill stages the enum it needs. Negative: the enum is what fill
+/// adds; nothing else creates it.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_fills_what_a_routine_declared_through_the_extras_needs() {
+    let body = "(s status) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1";
+    let setup = vec![
+        format!("CREATE SCHEMA {MANAGED}"),
+        "CREATE SCHEMA shared".to_owned(),
+        "CREATE TYPE shared.status AS ENUM ('a', 'b')".to_owned(),
+        format!(
+            "CREATE FUNCTION {MANAGED}.g(s shared.status) RETURNS integer \
+             LANGUAGE sql IMMUTABLE RETURN 1"
+        ),
+    ];
+    let with_g = |mut schema: pbps_model::Schema| {
+        schema.modules.insert(
+            format!("{MANAGED}.g(status)").parse().unwrap(),
+            pbps_model::Module {
+                kind: pbps_model::ModuleKind::Function,
+                description: None,
+                definition: body.into(),
+            },
+        );
+        schema
+    };
+    let inputs = Inputs::from_pair((
+        with_g(declared(&[], &[])),
+        with_g(declared(&[("b", "SELECT 1 AS x")], &[])),
+    ));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_with_extras(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &["shared".to_owned()],
+    )
+    .await;
+    target.drop().await;
+    let plan = result.unwrap_or_else(|error| panic!("{error}"));
+    plan.evidence.validate(&plan.changes).unwrap();
+    assert!(
+        plan.evidence
+            .before()
+            .scope()
+            .retained
+            .iter()
+            .any(|object| object.name == ["shared", "status"]),
+        "the enum fill staged is sealed"
     );
 }
 
