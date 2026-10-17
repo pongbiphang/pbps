@@ -55,9 +55,10 @@ pub mod uid;
 pub mod zone;
 
 pub use change::{
-    CellAfter, Change, ChangeSet, ColumnField, ColumnPromise, DetachedKind, DetachedName, Dropped,
-    IndexPart, ModuleAfter, NumberingKind, Part, PartAfter, PartChange, PartDefinition,
-    PermissionChange, PlannedChange, Presence, PublicAccess, RiskClass, RoutineOrigin, RowAfter,
+    AddedRole, CellAfter, Change, ChangeSet, ColumnField, ColumnPromise, DetachedKind,
+    DetachedName, Dropped, IndexPart, ModuleAfter, NumberingKind, Part, PartAfter, PartChange,
+    PartDefinition, PermissionChange, PlannedChange, Presence, Provenance, PublicAccess, RiskClass,
+    RoutineOrigin, RowAfter,
 };
 pub use data::{
     Cell, DataMode, DataScope, DataScopes, ObservedRow, ObservedRows, ObservedTable, Row,

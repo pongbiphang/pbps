@@ -2777,7 +2777,7 @@ impl Change {
 
 /// A change together with the risks that have been determined for it, and the
 /// execution strategy it is to be carried out with.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedChange {
     #[serde(flatten)]
     pub change: Change,
@@ -2800,6 +2800,61 @@ pub struct PlannedChange {
     /// can be suppressed, a risk class is what the gate reads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<crate::finding::Finding>,
+
+    /// Where a step a planning rule added came from, for the plan output
+    /// (#1776, DEC-1958.3). Never sealed: the saved plan does not carry it,
+    /// and two plans that differ only here are the same plan.
+    #[serde(skip)]
+    pub provenance: Option<Provenance>,
+}
+
+/// Equal on everything the plan file seals, which leaves out the provenance
+/// (DEC-1958.3): a plan read back from its file has none, and is still the
+/// plan that was written.
+impl PartialEq for PlannedChange {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructured, so a field added later has to be placed here.
+        let PlannedChange {
+            change,
+            risks,
+            strategy,
+            findings,
+            provenance: _,
+        } = self;
+        *change == other.change
+            && *risks == other.risks
+            && *strategy == other.strategy
+            && *findings == other.findings
+    }
+}
+
+/// What a step a planning rule added is to the logical change it serves. No
+/// whole step: a rule cannot add a logical change of its own (#1776).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddedRole {
+    SplitPart,
+    Teardown,
+    Restoration,
+}
+
+impl AddedRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AddedRole::SplitPart => "split part",
+            AddedRole::Teardown => "teardown",
+            AddedRole::Restoration => "restoration",
+        }
+    }
+}
+
+/// The origin of a step a planning rule added: the rule, what the step is to
+/// its logical change, that change's subject, and why it was added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Provenance {
+    pub rule: &'static str,
+    pub role: AddedRole,
+    pub source: String,
+    pub reason: String,
 }
 
 impl PlannedChange {
@@ -2812,6 +2867,7 @@ impl PlannedChange {
             risks,
             strategy: Strategy::default(),
             findings: Vec::new(),
+            provenance: None,
         }
     }
 

@@ -165,6 +165,13 @@
             "$ref": "#/$defs/ConnectedCheck"
           }
         },
+        "origins": {
+          "description": "Each step a planning rule added, with what it serves and why\n(DEC-1958.3). Reported, never sealed: the saved plan does not carry\nit. Absent when no rule added a step.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StepOrigin"
+          }
+        },
         "cost": {
           "anyOf": [
             {
@@ -229,6 +236,40 @@
         "engine",
         "status",
         "message"
+      ]
+    },
+    "StepOrigin": {
+      "description": "A step a planning rule added, for `plan --format json` (DEC-1958.3).",
+      "type": "object",
+      "properties": {
+        "step": {
+          "description": "The step's position in the plan, from 0.",
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "rule": {
+          "description": "The rule that added it.",
+          "type": "string"
+        },
+        "role": {
+          "description": "`split part`, `teardown` or `restoration`.",
+          "type": "string"
+        },
+        "source": {
+          "description": "The subject of the logical change it serves.",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "step",
+        "rule",
+        "role",
+        "source",
+        "reason"
       ]
     },
     "CostReport": {
@@ -2271,6 +2312,6 @@
       "type": "object"
     }
   },
-  "x-pbps-schema-version": 49,
+  "x-pbps-schema-version": 50,
   "x-pbps-tool-version": "0.0.0"
 }

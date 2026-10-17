@@ -72,6 +72,7 @@ fn boundary(changes: &[PlannedChange], i: usize) -> At {
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
+use pbps_diff::order::expand::{self, Added, Addition, Anchor, Expansion, Order, Rewrite, expand};
 use pbps_diff::order::{Schedule, Source};
 use pbps_model::resolver::OrderReason;
 use pbps_model::{
@@ -399,24 +400,13 @@ fn edits_in_place(parts: &[PartEffect<'_>], holds: &Holds, _: &Partitions) -> bo
     })
 }
 
-/// Replaces one change that edits this dependent in place with its removal
-/// and its restoration, side by side, so each half can be put on its own side
-/// of the module: a view's `AlterModule` is one step that drops and creates,
-/// and a default changed from one expression to another is one statement.
+/// The removal and the restoration one change that edits a dependent in place
+/// is made of, so each half can be put on its own side of the module: a
+/// view's `AlterModule` is one step that drops and creates, and a default
+/// changed from one expression to another is one statement.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn split_in_place_edit(
-    changes: &mut Vec<PlannedChange>,
-    holds: &Holds,
-    partitions: &Partitions,
-    dialect: &dyn Dialect,
-    sources: &Sources<'_>,
-) -> Result<(), String> {
-    let view = sources.project(changes)?;
-    let parts = projected_parts(changes);
-    let Some(i) = find(&view, &parts, holds, partitions, edits_in_place) else {
-        return Ok(());
-    };
-    let (removal, restoration) = match changes[i].change.clone() {
+fn in_place_parts(change: &Change) -> Option<(Change, Change)> {
+    Some(match change.clone() {
         Change::AlterModule { id, module } => (
             Change::DropModule {
                 id: id.clone(),
@@ -471,13 +461,8 @@ fn split_in_place_edit(
                 fallback,
             },
         ),
-        _ => return Ok(()),
-    };
-    changes.splice(
-        i..=i,
-        [planned(removal, dialect), planned(restoration, dialect)],
-    );
-    Ok(())
+        _ => return None,
+    })
 }
 
 fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
@@ -917,6 +902,11 @@ fn attached_at(changes: &[PlannedChange], holds: &Holds) -> Option<usize> {
 /// `found` is each dropped module's dependents in `modules::dependents`'
 /// order, deepest first; the removals go in that order and the restorations
 /// in its reverse, which is DECISIONS 311's topological order.
+///
+/// The refusals come first. The steps are added by the rule driver, one
+/// obligation at a time, with [`Weave`] as its expansion: nothing here moves
+/// a change itself, `settle` does, over the edges each rewrite states
+/// (DEC-1958.2).
 fn weave(
     cs: &mut ChangeSet,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
@@ -1000,164 +990,423 @@ fn weave(
     }
 
     let before = cs.changes.len();
-    for (root, _) in &roots {
-        let Some(deps) = found.get(root) else {
-            continue;
+    let weave = Weave {
+        roots: roots.iter().map(|(root, _)| root.clone()).collect(),
+        found,
+        declared,
+        sources,
+        dialect,
+        partitions,
+    };
+    *cs = expand(std::mem::take(cs), &weave, expand::FACTOR)?.changes;
+    let added = cs.changes.len() - before;
+    // A rebuild woven in here carries the index's declared parameters in its
+    // `CREATE`, as the differ's own do (#1483 review). The parameter change
+    // it subsumes is removed after the driver, which cannot remove a logical
+    // change (DEC-1958.4).
+    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut cs.changes, |p| &p.change);
+    Ok(added)
+}
+
+/// [`weave`] as an expansion (#1958): for each dependent of each module the
+/// plan drops, the steps that put it on the right side of the drop, one
+/// obligation at a time in `found`'s order.
+struct Weave<'a> {
+    /// The modules the plan dropped before any rewrite: a split leaves a
+    /// dependent view's drop behind, which is not a root of its own.
+    roots: Vec<ModuleId>,
+    found: &'a BTreeMap<ModuleId, Vec<Dependent>>,
+    declared: &'a Schema,
+    sources: Sources<'a>,
+    dialect: &'a dyn Dialect,
+    partitions: Partitions,
+}
+
+/// What a dependent of a dropped module still needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Need {
+    /// One change edits it in place, which cannot be on both sides.
+    Split { root: ModuleId, k: usize },
+    /// Gone before the module's drop.
+    Removed { root: ModuleId, k: usize },
+    /// Back after the module's create.
+    Restored { root: ModuleId, k: usize },
+}
+
+/// A need, with the dependent named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Named {
+    need: Need,
+    described: String,
+}
+
+impl std::fmt::Display for Named {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.need {
+            Need::Split { root, .. } => write!(
+                f,
+                "{} is edited in one step and has to be split around `{root}`",
+                self.described
+            ),
+            Need::Removed { root, .. } => {
+                write!(
+                    f,
+                    "{} has to be gone before `{root}` is dropped",
+                    self.described
+                )
+            }
+            Need::Restored { root, .. } => write!(
+                f,
+                "{} has to come back after `{root}` is created",
+                self.described
+            ),
+        }
+    }
+}
+
+impl Weave<'_> {
+    /// The dependents of `root`, in the order they are answered: a
+    /// partitioned parent's index last, so that it is restored first. Each
+    /// restoration is placed right after the module's create, ahead of the
+    /// ones placed before it. Built after a partition's own index of its
+    /// shape, it would take that as its clone (DEC-1688.1, #1745 review).
+    /// Nothing depends on an index, so their drops may go in any order.
+    fn ordered(&self, root: &ModuleId) -> Vec<(usize, &Dependent)> {
+        let Some(deps) = self.found.get(root) else {
+            return Vec::new();
         };
-        // A partitioned parent's index last, so that it is restored first:
-        // each restoration is placed right after the module's create, ahead
-        // of the ones placed before it. Built after a partition's own index
-        // of its shape, it would take that as its clone (DEC-1688.1, #1745
-        // review). Nothing depends on an index, so their drops may go in any
-        // order.
-        let parents_index = |d: &&Dependent| {
+        let parents_index = |d: &Dependent| {
             matches!(&d.holds, Holds::TablePart { table, part: Part::Index(_) }
-                if !partitions.of_parent(table).is_empty())
+                if !self.partitions.of_parent(table).is_empty())
         };
-        let deps = deps
-            .iter()
-            .filter(|d| !parents_index(d))
-            .chain(deps.iter().filter(parents_index));
-        for d in deps {
-            // Placed by the drop, after this loop: see `after_its_release`.
-            if is_generated(&d.holds) {
-                continue;
+        deps.iter()
+            .enumerate()
+            .filter(|(_, d)| !parents_index(d))
+            .chain(deps.iter().enumerate().filter(|(_, d)| parents_index(d)))
+            .collect()
+    }
+
+    fn dependent(&self, root: &ModuleId, k: usize) -> Result<&Dependent, String> {
+        self.found
+            .get(root)
+            .and_then(|deps| deps.get(k))
+            .ok_or_else(|| format!("`{root}` has no dependent {k}"))
+    }
+
+    /// The first thing `d` still needs around `root`, as the plan stands.
+    fn need(
+        &self,
+        changes: &[PlannedChange],
+        root: &ModuleId,
+        k: usize,
+        d: &Dependent,
+    ) -> Result<Option<Need>, String> {
+        let view = self.sources.project(changes)?;
+        let parts = projected_parts(changes);
+        let partitions = &self.partitions;
+        if find(&view, &parts, &d.holds, partitions, edits_in_place)
+            .is_some_and(|i| in_place_parts(&changes[i].change).is_some())
+        {
+            return Ok(Some(Need::Split {
+                root: root.clone(),
+                k,
+            }));
+        }
+        let Some(at) = span(changes, root) else {
+            return Ok(None);
+        };
+        if attached_at(changes, &d.holds).is_some_and(|i| i < at.drop_at) {
+            return Ok(None);
+        }
+        // Taken away with its table or column before the module goes:
+        // already removed, and nothing to put back, since the declarations
+        // no longer have its owner.
+        if find(&view, &parts, &d.holds, partitions, removes_with_its_owner)
+            .is_some_and(|i| i < at.drop_at)
+        {
+            return Ok(None);
+        }
+        let removed_at = match find(&view, &parts, &d.holds, partitions, removes) {
+            Some(i) if i < at.drop_at => i,
+            Some(_) | None => {
+                return Ok(Some(Need::Removed {
+                    root: root.clone(),
+                    k,
+                }));
             }
-            split_in_place_edit(&mut cs.changes, &d.holds, &partitions, dialect, &sources)?;
-            let view = sources.project(&cs.changes)?;
-            let parts = projected_parts(&cs.changes);
-            let Some(at) = span(&cs.changes, root) else {
-                continue;
-            };
-            if attached_at(&cs.changes, &d.holds).is_some_and(|i| i < at.drop_at) {
-                continue;
-            }
-            // Removed before the module's drop: moved there if the plan
-            // removes it later, synthesized there if it does not remove it.
-            // Taken away with its table or column before the module goes:
-            // already removed, and nothing to put back, since the
-            // declarations no longer have its owner. A removal synthesized
-            // here would name an object that is gone by then.
-            if find(&view, &parts, &d.holds, &partitions, removes_with_its_owner)
-                .is_some_and(|i| i < at.drop_at)
-            {
-                continue;
-            }
-            let removal = find(&view, &parts, &d.holds, &partitions, removes);
-            let removed_at = match removal {
-                Some(i) if i < at.drop_at => i,
-                Some(i) => {
-                    let mut moved = cs.changes[i].clone();
-                    respell_at(&mut moved, &d.holds, &view, At::Before(at.drop_at), dialect)?;
-                    cs.changes.remove(i);
-                    cs.changes.insert(at.drop_at, moved);
-                    at.drop_at
+        };
+        // Its owner dropped by this plan, even after the module: then what
+        // the declarations hold under the same name is the part of a new
+        // table or column, created with it, and not this dependent kept.
+        if find(&view, &parts, &d.holds, partitions, removes_with_its_owner).is_some() {
+            return Ok(None);
+        }
+        let Some(kept) = as_declared(&view, d) else {
+            return Ok(None);
+        };
+        if !kept.managed(self.declared) {
+            return Ok(None);
+        }
+        let after = at.create_at.unwrap_or(removed_at);
+        match find(&view, &parts, &d.holds, partitions, restores) {
+            Some(j) if j > after => Ok(None),
+            Some(_) | None => Ok(Some(Need::Restored {
+                root: root.clone(),
+                k,
+            })),
+        }
+    }
+}
+
+impl Expansion for Weave<'_> {
+    type Obligation = Named;
+
+    fn rule(&self) -> &'static str {
+        "weave"
+    }
+
+    fn unmet(&self, changes: &[PlannedChange]) -> Result<Vec<Named>, String> {
+        let mut out = Vec::new();
+        for root in &self.roots {
+            for (k, d) in self.ordered(root) {
+                // Placed by the drop's edges: see `order`.
+                if is_generated(&d.holds) {
+                    continue;
                 }
-                None => {
-                    // Named as it is where it goes: before the module's drop,
-                    // after any rename the plan makes ahead of that.
-                    let here = Dependent {
+                if let Some(need) = self.need(changes, root, k, d)? {
+                    out.push(Named {
+                        need,
                         described: d.described.clone(),
-                        holds: named_at(&view, At::Before(at.drop_at), &d.holds).ok_or_else(
-                            || format!("{}: physical source is unavailable", d.described),
-                        )?,
-                    };
-                    let final_name = as_declared(&view, d).unwrap_or_else(|| here.clone());
-                    let change = removal_of(
-                        &final_name,
-                        declared,
-                        default_location(&view, &d.holds, At::Before(at.drop_at)),
-                    )?;
-                    let mut added = planned(change, dialect);
-                    respell(&mut added, &here.holds, dialect);
-                    cs.changes.insert(at.drop_at, added);
-                    at.drop_at
+                    });
                 }
-            };
-            // Its owner dropped by this plan, even after the module: then
-            // what the declarations hold under the same name is the part of a
-            // new table or column, created with it, and not this dependent
-            // kept. The old one is removed before the drop above; the new one
-            // is its own creation's business.
-            let view = sources.project(&cs.changes)?;
-            let parts = projected_parts(&cs.changes);
-            if find(&view, &parts, &d.holds, &partitions, removes_with_its_owner).is_some() {
-                continue;
             }
-            let Some(kept) = as_declared(&view, d) else {
-                continue;
-            };
-            if !kept.managed(declared) {
-                continue;
+        }
+        Ok(out)
+    }
+
+    fn expand(&self, changes: &[PlannedChange], named: &Named) -> Result<Rewrite, String> {
+        let partitions = &self.partitions;
+        let dialect = self.dialect;
+        let view = self.sources.project(changes)?;
+        let parts = projected_parts(changes);
+        match &named.need {
+            Need::Split { root, k } => {
+                let d = self.dependent(root, *k)?;
+                let at = find(&view, &parts, &d.holds, partitions, edits_in_place)
+                    .ok_or_else(|| format!("{named}: nothing edits it in place"))?;
+                let (removal, restoration) = in_place_parts(&changes[at].change)
+                    .ok_or_else(|| format!("{named}: its edit does not split"))?;
+                Ok(Rewrite::Split {
+                    at,
+                    parts: Box::new([planned(removal, dialect), planned(restoration, dialect)]),
+                    reason: format!("{} depends on `{root}`", d.described),
+                })
             }
-            // Kept by the declarations: back after the module's create, or
-            // anywhere after its own removal when the module is gone for good.
-            let Some(at) = span(&cs.changes, root) else {
-                continue;
-            };
-            let after = at.create_at.unwrap_or(removed_at);
-            let restoration = find(&view, &parts, &d.holds, &partitions, restores);
-            match restoration {
-                Some(j) if j > after => {}
-                Some(j) => {
-                    let mut moved = cs.changes[j].clone();
-                    respell_at(
-                        &mut moved,
-                        &d.holds,
-                        &view,
-                        boundary(&cs.changes, after + 1),
-                        dialect,
-                    )?;
-                    cs.changes.remove(j);
-                    // `after` moved down by one if the restoration was above it.
-                    let after = if j < after { after - 1 } else { after };
-                    cs.changes.insert(after + 1, moved);
+            Need::Removed { root, k } => {
+                let d = self.dependent(root, *k)?;
+                let at = span(changes, root).ok_or_else(|| format!("{named}: no drop"))?;
+                let reason = format!("{} depends on `{root}`, which this plan drops", d.described);
+                match find(&view, &parts, &d.holds, partitions, removes) {
+                    // Moved to the module's drop, ahead of everything from
+                    // the drop to where the plan had it, and written with the
+                    // names in force there (DEC-1958.2).
+                    Some(i) => {
+                        let mut moved = changes[i].clone();
+                        respell_at(&mut moved, &d.holds, &view, At::Before(at.drop_at), dialect)?;
+                        Ok(Rewrite::Add {
+                            added: Vec::new(),
+                            respelled: vec![(i, moved)],
+                            edges: (at.drop_at..i)
+                                .map(|c| catalog(expand::Step::Plan(i), expand::Step::Plan(c)))
+                                .collect(),
+                        })
+                    }
+                    None => {
+                        // Named as it is where it goes: before the module's
+                        // drop, after any rename the plan makes ahead of that.
+                        let here = Dependent {
+                            described: d.described.clone(),
+                            holds: named_at(&view, At::Before(at.drop_at), &d.holds).ok_or_else(
+                                || format!("{}: physical source is unavailable", d.described),
+                            )?,
+                        };
+                        let final_name = as_declared(&view, d).unwrap_or_else(|| here.clone());
+                        let change = removal_of(
+                            &final_name,
+                            self.declared,
+                            default_location(&view, &d.holds, At::Before(at.drop_at)),
+                        )?;
+                        let mut added = planned(change, dialect);
+                        respell(&mut added, &here.holds, dialect);
+                        Ok(Rewrite::Add {
+                            added: vec![Added::Teardown(Addition {
+                                of: at.drop_at,
+                                change: added,
+                                anchor: Anchor::Before(at.drop_at),
+                                reason,
+                            })],
+                            respelled: Vec::new(),
+                            edges: vec![catalog(
+                                expand::Step::Added(0),
+                                expand::Step::Plan(at.drop_at),
+                            )],
+                        })
+                    }
                 }
-                None if at.create_at.is_some() => {
-                    let at = boundary(&cs.changes, after + 1);
-                    let here = named_at(&view, at, &d.holds).ok_or_else(|| {
-                        format!("{}: physical source is unavailable", d.described)
-                    })?;
-                    let change =
-                        restoration_of(&kept, declared, default_location(&view, &d.holds, at))?;
-                    let mut added = planned(change, dialect);
-                    respell(&mut added, &here, dialect);
-                    cs.changes.insert(after + 1, added);
-                }
-                None => {
-                    return Err(format!(
+            }
+            Need::Restored { root, k } => {
+                let d = self.dependent(root, *k)?;
+                let at = span(changes, root).ok_or_else(|| format!("{named}: no drop"))?;
+                let removed_at = find(&view, &parts, &d.holds, partitions, removes)
+                    .ok_or_else(|| format!("{named}: it is not removed"))?;
+                let after = at.create_at.unwrap_or(removed_at);
+                let kept = as_declared(&view, d)
+                    .ok_or_else(|| format!("{named}: the declarations do not keep it"))?;
+                match find(&view, &parts, &d.holds, partitions, restores) {
+                    // Moved to right after the module's create, behind
+                    // everything from where the plan had it to the create.
+                    Some(j) => {
+                        let mut moved = changes[j].clone();
+                        respell_at(
+                            &mut moved,
+                            &d.holds,
+                            &view,
+                            boundary(changes, after + 1),
+                            dialect,
+                        )?;
+                        Ok(Rewrite::Add {
+                            added: Vec::new(),
+                            respelled: vec![(j, moved)],
+                            edges: (j + 1..=after)
+                                .map(|c| restoring(expand::Step::Plan(c), expand::Step::Plan(j)))
+                                .collect(),
+                        })
+                    }
+                    None if at.create_at.is_some() => {
+                        let here_at = boundary(changes, after + 1);
+                        let here = named_at(&view, here_at, &d.holds).ok_or_else(|| {
+                            format!("{}: physical source is unavailable", d.described)
+                        })?;
+                        let change = restoration_of(
+                            &kept,
+                            self.declared,
+                            default_location(&view, &d.holds, here_at),
+                        )?;
+                        let mut added = planned(change, dialect);
+                        respell(&mut added, &here, dialect);
+                        Ok(Rewrite::Add {
+                            added: vec![Added::Restoration(Addition {
+                                of: after,
+                                change: added,
+                                anchor: Anchor::After(after),
+                                reason: format!(
+                                    "{} depends on `{root}`, which this plan rebuilds",
+                                    d.described
+                                ),
+                            })],
+                            respelled: Vec::new(),
+                            edges: vec![restoring(
+                                expand::Step::Plan(after),
+                                expand::Step::Added(0),
+                            )],
+                        })
+                    }
+                    None => Err(format!(
                         "`{root}` is dropped by this plan, and {} depends on it and is kept by \
                          the declarations. Remove the dependency from its declaration, or keep \
                          `{root}`, and plan again.",
                         d.described
-                    ));
+                    )),
                 }
             }
         }
     }
-    // A dependent module's drop can itself move after its own releases, so
-    // repeated until nothing moves: each pass only moves a drop later, after
-    // something it depends on, and the drops form no cycle, so the passes end.
-    for _ in 0..=roots.len() {
-        let mut moved = false;
-        for (root, _) in &roots {
-            moved |= after_its_release(
-                cs,
-                root,
-                found.get(root).map_or(&[][..], Vec::as_slice),
-                &partitions,
-                &sources,
-            )?;
+
+    /// A module's drop after what releases its generated-column dependents:
+    /// the expression change that stops calling it, or the drop of the column
+    /// or its table (DEC-1168.1), and after the drop of a module that depends
+    /// on it, which may itself follow its own releases. An edge from each, so
+    /// `settle` sinks the drop to right after the last (DEC-1958.2), with the
+    /// removals and restorations the rewrites placed held around it.
+    ///
+    /// The drop moves, not the release. A release keeps the place the differ
+    /// gave it, after the column additions, renames, retypes and relaxations
+    /// its new expression may need, which a release moved up to the module's
+    /// drop would run ahead of. What the drop leaves behind is a function
+    /// whose own body reads a column the plan drops or retypes before the
+    /// release, which only the engine can tell and refuses inside the
+    /// transaction. A module rebuilt in place is already after both.
+    fn order(&self, changes: &[PlannedChange]) -> Result<Vec<Order>, String> {
+        let view = self.sources.project(changes)?;
+        let parts = projected_parts(changes);
+        let partitions = &self.partitions;
+        let mut edges = Vec::new();
+        for root in &self.roots {
+            let Some(at) = span(changes, root) else {
+                continue;
+            };
+            for d in self.found.get(root).map_or(&[][..], Vec::as_slice) {
+                let release = match &d.holds {
+                    Holds::TablePart {
+                        part: Part::Generated(_),
+                        ..
+                    } => find(&view, &parts, &d.holds, partitions, removes).or_else(|| {
+                        find(&view, &parts, &d.holds, partitions, removes_with_its_owner)
+                    }),
+                    Holds::Module(_) => find(&view, &parts, &d.holds, partitions, removes),
+                    Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
+                };
+                if let Some(i) = release.filter(|i| *i != at.drop_at) {
+                    edges.push(catalog(
+                        expand::Step::Plan(i),
+                        expand::Step::Plan(at.drop_at),
+                    ));
+                }
+                if is_generated(&d.holds) {
+                    continue;
+                }
+                // What the rewrites established, re-derived, so a drop that
+                // sinks after a release takes its restorations with it and
+                // never passes a removal (#1958 review). Only edges the order
+                // already runs forward: they hold it, never reverse it.
+                if let Some(i) =
+                    find(&view, &parts, &d.holds, partitions, removes).filter(|i| *i < at.drop_at)
+                {
+                    edges.push(catalog(
+                        expand::Step::Plan(i),
+                        expand::Step::Plan(at.drop_at),
+                    ));
+                }
+                if let Some(create) = at.create_at
+                    && let Some(j) =
+                        find(&view, &parts, &d.holds, partitions, restores).filter(|j| *j > create)
+                {
+                    edges.push(restoring(expand::Step::Plan(create), expand::Step::Plan(j)));
+                }
+            }
         }
-        if !moved {
-            break;
-        }
+        Ok(edges)
     }
-    let added = cs.changes.len() - before;
-    // A rebuild woven in here carries the index's declared parameters in its
-    // `CREATE`, as the differ's own do (#1483 review).
-    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut cs.changes, |p| &p.change);
-    Ok(added)
+}
+
+/// What the catalog says depends on what, with the order it sets.
+fn catalog(before: expand::Step, after: expand::Step) -> Order {
+    Order {
+        before,
+        after,
+        source: Source::Catalog,
+        reason: OrderReason::Structural,
+    }
+}
+
+/// A restoration after what it is restored around.
+fn restoring(before: expand::Step, after: expand::Step) -> Order {
+    Order {
+        before,
+        after,
+        source: Source::Catalog,
+        reason: OrderReason::Restoration,
+    }
 }
 
 fn is_generated(holds: &Holds) -> bool {
@@ -1168,56 +1417,6 @@ fn is_generated(holds: &Holds) -> bool {
             ..
         }
     )
-}
-
-/// Moves a module's drop after what releases its generated-column dependents:
-/// the expression change that stops calling it, or the drop of the column or
-/// its table (DEC-1168.1).
-///
-/// The drop moves, not the release. A release keeps the place the differ gave
-/// it, after the column additions, renames, retypes and relaxations its new
-/// expression may need, which a release moved up to the module's drop would
-/// run ahead of. What the drop leaves behind is a function whose own body
-/// reads a column the plan drops or retypes before the release, which only
-/// the engine can tell and refuses inside the transaction. A module rebuilt in
-/// place is already after both.
-///
-/// A module that depends on this one, dropped by the plan, counts as well:
-/// its own drop may have moved after its own releases, and this drop has to
-/// stay behind it. Returns whether the drop moved.
-fn after_its_release(
-    cs: &mut ChangeSet,
-    root: &ModuleId,
-    deps: &[Dependent],
-    partitions: &Partitions,
-    sources: &Sources<'_>,
-) -> Result<bool, String> {
-    let view = sources.project(&cs.changes)?;
-    let parts = projected_parts(&cs.changes);
-    let Some(at) = span(&cs.changes, root) else {
-        return Ok(false);
-    };
-    let latest = deps
-        .iter()
-        .filter_map(|d| match &d.holds {
-            Holds::TablePart {
-                part: Part::Generated(_),
-                ..
-            } => find(&view, &parts, &d.holds, partitions, removes)
-                .or_else(|| find(&view, &parts, &d.holds, partitions, removes_with_its_owner)),
-            Holds::Module(_) => find(&view, &parts, &d.holds, partitions, removes),
-            Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
-        })
-        .filter(|i| *i > at.drop_at)
-        .max();
-    let Some(i) = latest else {
-        return Ok(false);
-    };
-    // Removing the drop shifts what it follows up by one, so inserting at its
-    // old index puts the drop right after it.
-    let drop = cs.changes.remove(at.drop_at);
-    cs.changes.insert(i, drop);
-    Ok(true)
 }
 
 /// The columns whose default a row this plan writes takes: an insert that
@@ -6637,6 +6836,51 @@ mod tests {
         for p in &cs.changes {
             assert_eq!(p.risks, pg().change_risks(&p.change), "{:?}", p.change);
         }
+    }
+
+    /// A function rebuilt in place sinks after the expression change that
+    /// releases its generated column, and the check it restores goes with
+    /// it: the final order keeps each restoration after the rebuild, so the
+    /// check never runs against the function's drop (#1958 review).
+    #[test]
+    fn a_rebuild_sunk_after_a_release_keeps_its_restorations_after_it() {
+        let (s, _) = declared();
+        let ids = IdsFile::default();
+        let mut cs = plan(vec![
+            alter(&s, "app.f(integer)"),
+            Change::AlterColumnExpression {
+                uid: "c_d4e5f6".parse().unwrap(),
+                column: TableName::new("app", "t").column("g"),
+                from: "app.f(id)".into(),
+                to: "id * 2".into(),
+            },
+        ]);
+        let found = BTreeMap::from([(
+            id("app.f(integer)"),
+            vec![
+                part(Part::Check("ck".into()), "constraint ck on table app.t"),
+                part(
+                    Part::Generated("g".into()),
+                    "generation expression for column g of table app.t",
+                ),
+            ],
+        )]);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        let order = rendered(&cs);
+        let at = |needle: &str| order.iter().position(|c| c.starts_with(needle)).unwrap();
+        assert!(
+            at("drop check ck") < at("alter app.f(integer)"),
+            "{order:?}"
+        );
+        assert!(
+            at("AlterColumnExpression") < at("alter app.f(integer)"),
+            "{order:?}"
+        );
+        assert!(at("alter app.f(integer)") < at("add check ck"), "{order:?}");
+        // And the woven plan is a fixed point.
+        let again = rendered(&cs);
+        weave(&mut cs, &found, &s, &[&ids], pg().as_ref()).unwrap();
+        assert_eq!(rendered(&cs), again);
     }
 
     /// A chain of views over a rebuilt view: dropped deepest first, created

@@ -555,6 +555,7 @@
         "a_view_kept_on_a_function_dropped_for_good_refuses_the_plan_by_name",
         "a_view_over_a_view_edited_off_a_dropped_function_is_rebuilt",
         "a_view_rebuild_restates_a_declared_roles_grant_and_the_role_still_reads_it",
+        "a_woven_rebuild_keeps_the_views_definition_and_every_kept_tables_rows_and_grants",
         "additions_calling_a_rebuilt_function_are_created_after_it",
         "an_action_that_cannot_write_is_not_in_the_closure",
         "an_expression_change_releases_a_generated_column_from_a_dropped_function",

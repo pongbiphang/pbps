@@ -122,8 +122,13 @@ Then, in this order:
     (DECISIONS 311, DEC-942.1). A partition's part is released by its
     parent's drop of the column, `DROP DEFAULT` or new generation
     expression, and named through its parent's column rename (DEC-1699.1).
-    `after_its_release` then moves a function's
-    drop after what releases its generated columns (DEC-1168.1).
+    It is the first expansion of the rule driver (`order::expand`, #1958):
+    each dependent's split, removal and restoration is an obligation, met by
+    a rewrite that adds steps at an anchor and states `Catalog` edges, and
+    `settle` orders the plan after each rewrite (DEC-1958.2). Each added
+    step's origin is reported in the plan output, not sealed (DEC-1958.3).
+    A function's drop then goes after what releases its generated columns,
+    by an edge from each release, settled once (DEC-1168.1, DEC-1958.2).
     `release_generated_inputs` then moves the retype or drop of a column a
     generated column reads after the expression change that stops reading it,
     and what needs the retype after it, by edges from the catalog and the
@@ -404,9 +409,9 @@ one class and the dependents a class cannot see.
 | Pair | Kind | Order now | Verdict |
 |---|---|---|---|
 | Dependent module → its table, column or retyped column | fixed | class 0 first. P: rebuilt around a retype from the catalog | ✓ DECISIONS 311; `to_rebuild` |
-| Catalog dependents of a dropped or rebuilt module | engine | `weave` | ✓ DECISIONS 311, DEC-942.1 |
+| Catalog dependents of a dropped or rebuilt module | engine | `weave`, an expansion: added steps and `Catalog` edges, settled after each rewrite | ✓ DECISIONS 311, DEC-942.1, DEC-1958.2 |
 | `DropModule` → `DropModule` of a module it names | fixed | `drop_rank`, deepest first inside class 0, from the base's lexed names | ✓ DECISIONS 311, 315 |
-| Generated column's release (expression change, column or table drop) → drop of the function it calls | engine | `after_its_release`, after the drops of dependent modules too | ✓ DEC-1168.1 |
+| Generated column's release (expression change, column or table drop) → drop of the function it calls | engine | a `Catalog` edge from each release, and from the drops of dependent modules, to the drop | ✓ DEC-1168.1, DEC-1958.2 |
 | An identity given up → its column's nullability relaxed | fixed | rank −3 before −1. Measured on 16 and 18, `DROP NOT NULL` on an identity column is refused ("is an identity column") | ✓ DEC-1889.1 |
 | Function drop moved after its release ← a column its own body reads, dropped or retyped earlier | content | the drop stays after the release | ⧗ #1350 |
 | Foreign key → the key it references | fixed | rank inside class 2 | ✓ |

@@ -6380,3 +6380,139 @@ which checks:
 - the cycle refusal.
 
 #1998 item 11 (the verifier's effect for this pair) is in #1968's slice, S7a.
+
+<a id="dec-1958-1"></a>
+
+**DEC-1958.1. The rule driver allows two rewrites per operation the plan
+asks for: its own changes, and one per obligation it states before any
+rewrite. Exhausting that refuses the plan, naming the budget, the factor and
+the size.** (#1958, S6b of #1776)
+
+The budget is a backstop, not a measure of progress. Each rewrite must
+already discharge the obligation it names, or the plan is refused. What the
+budget catches is a rule whose rewrites keep stating new obligations.
+
+The obligations are counted with the plan's changes because a rule's work
+does not scale with the changes alone. A plan of one rebuilt function can
+leave dozens of dependents to tear down and restore. A budget counted from
+that one change would refuse a valid plan. The count is fixed before the
+first rewrite. A budget recounted as steps are added grows with each rewrite
+and would never run out.
+
+`weave` meets each obligation in one rewrite and states no new ones, so it
+spends at most one rewrite per obligation. The factor of two leaves room
+without letting a rule that does not converge run long. Pinned by
+`a_budget_below_what_the_plan_needs_refuses_it_naming_the_budget_and_the_size`.
+
+<a id="dec-1958-2"></a>
+
+**DEC-1958.2. `weave` is an expansion: it adds teardowns and restorations at
+an anchor and states edges, and `settle` orders the plan after each rewrite.
+A removal the plan already has is hoisted to the module's drop, not the drop
+sunk to it. The `after_its_release` fixpoint is replaced by edges.**
+(#1958, S6b of #1776)
+
+Each dependent of a dropped module is up to three obligations, met in
+`found`'s order (deepest first, a partitioned parent's index last):
+
+| Obligation | When | What the rewrite does |
+|---|---|---|
+| Split | A view's `AlterModule`, or a default changed between two expressions | Splits the change in place into its removal and restoration, two split parts of the change |
+| Removed | The dependent is not gone before the module's drop | See the removal cases below |
+| Restored | The dependent is kept and not back after the module's create | See the restoration cases below |
+
+A **Removed** obligation is met in one of two ways:
+- the plan's own later removal is respelled with the names in force at the
+  drop, and given an edge to every step from the drop to where it was;
+- or a teardown is added before the drop, with an edge to it.
+
+A **Restored** obligation is met in one of two ways:
+- the plan's own earlier restoration is respelled for its new place, and
+  given an edge from every step between it and the create;
+- or a restoration is added after the create, with an edge from it.
+
+The edges are `Catalog` edges.
+
+The stretch edges keep weave's placement. With an edge from the removal to
+the drop alone, the `Sink` tie-break (DEC-1956.2) would move the drop down to
+the removal. Each step it then passed would run with the module gone, against
+an order the differ chose. The removal comes up instead: a drop needs less in
+place than what the differ ordered around it.
+
+The `after_its_release` fixpoint moved the drop of a module after what
+releases its generated columns, and after the drop of a module that depends
+on it. It is now one `Catalog` edge from each release to the drop, re-derived
+from the finished plan and settled once. Under `Sink` that is the old
+placement. The edges are transitive, so no fixpoint is needed.
+
+The same final schedule re-derives what the rewrites placed: an edge from
+each removal to the drop and from the create to each restoration, wherever
+the order already runs them forward. A function rebuilt in place that sinks
+after a release then takes its restorations with it, rather than leaving a
+restored check ahead of the rebuild (review of #2145). The differ's class
+order puts an in-place rebuild (class 14) after the alterations that release
+a generated column, so no plan measured here sinks one. The edges hold the
+order for a release that comes later, and the driver checks the obligations
+again after this schedule and refuses a plan it leaves unmet. Pinned by
+`a_rebuild_sunk_after_a_release_keeps_its_restorations_after_it` and
+`a_final_order_that_unmeets_an_obligation_is_refused`.
+
+**Kept as it was:** the refusals that come before any rewrite: an unmanaged
+or unrepresentable dependent, and a rebuild while a partition is detached.
+
+**Side by side.** The old pass ran beside the new one in a throwaway build,
+over the workspace tests and the live PostgreSQL suite. All 825 calls gave
+the same plan, so the same SQL and checksum. 27 of those calls added steps.
+None of the calls differed, so there is no difference to list.
+
+<a id="dec-1958-3"></a>
+
+**DEC-1958.3. A step a rule adds carries its origin on the `PlannedChange`
+for the plan output, never sealed. The JSON plan output gains an optional
+`origins` list, and the schema set advances to 50. The wire version stays
+1.** (#1958, S6b of #1776)
+
+An origin has four parts:
+- the rule;
+- the step's role (split part, teardown or restoration);
+- the subject of the logical change it serves;
+- the reason.
+
+It lives in a `#[serde(skip)]` field of `PlannedChange`, so it travels
+through every pass that moves the change after `weave`. A table keyed by
+position would be lost to the first reorder.
+
+`PlannedChange`'s equality leaves the origin out. A plan read back from its
+file has none, and is still the plan that was written. The saved-plan format
+and its checksum are unchanged.
+
+The output:
+- **Human:** each added step shows a line `added by <rule>: <role> of
+  <source> — <reason>` under it.
+- **JSON:** `PlanData.origins` lists each added step with its position. The
+  field is optional and new, which SPEC §9.8 allows without a wire-version
+  bump. It changes the published envelope schema, so the schema set
+  advances.
+
+#1945's UI types do not read `PlanData`, so the UI contract needs nothing.
+
+`explain` renders a saved plan, so it shows no origin. Origins reach it after
+#1945.
+
+<a id="dec-1958-4"></a>
+
+**DEC-1958.4. `drop_parameter_changes_of_rebuilt_indexes` stays after the
+expansion, as a named subsumption outside its contract.** (#1958, S6b of
+#1776)
+
+An index rebuild that `weave` adds carries the index's declared parameters in
+its `CREATE`, as the differ's own rebuilds do (#1483 review). So the separate
+`SetIndexStorageParameters` change has nothing left to do, and is removed.
+
+That removal deletes a logical change, which an expansion cannot do. So it
+runs after the driver, as before. The parameter change is subsumed by the
+rebuild, not lost: the rebuilt index has the declared parameters.
+
+Stopping the differ from emitting the change would need the differ to know
+which indexes the catalog will make `weave` rebuild. That knowledge exists
+only after the catalog read.

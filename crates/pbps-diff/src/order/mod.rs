@@ -23,6 +23,7 @@ pub mod commute;
 #[cfg(any(test, debug_assertions))]
 pub(crate) mod compare;
 pub mod edges;
+pub mod expand;
 pub mod schedule;
 pub mod shadow;
 pub mod slots;
@@ -35,6 +36,8 @@ pub use verify::{Violation, verify};
 
 #[cfg(test)]
 mod benchmark;
+#[cfg(test)]
+mod expand_tests;
 #[cfg(test)]
 mod schedule_tests;
 #[cfg(test)]

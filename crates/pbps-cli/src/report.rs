@@ -786,6 +786,17 @@ pub fn changes(cs: &ChangeSet) -> String {
             )
         };
         out.push_str(&format!("    {}{}\n", Escaped(&describe(&p.change)), risks));
+        // A step a planning rule added says which, and for what (#1776,
+        // DEC-1958.3). A plan read back from its file has none to say.
+        if let Some(o) = &p.provenance {
+            out.push_str(&format!(
+                "      added by {}: {} for {} — {}\n",
+                o.rule,
+                o.role.as_str(),
+                Escaped(&o.source),
+                Escaped(&o.reason)
+            ));
+        }
         // The analyzers' findings, under the change they are about, at the
         // severity the project chose (ADR-0008).
         for f in &p.findings {
@@ -798,6 +809,38 @@ pub fn changes(cs: &ChangeSet) -> String {
         }
     }
     out
+}
+
+/// A step a planning rule added, for `plan --format json` (DEC-1958.3).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+pub struct StepOrigin {
+    /// The step's position in the plan, from 0.
+    pub step: usize,
+    /// The rule that added it.
+    pub rule: String,
+    /// `split part`, `teardown` or `restoration`.
+    pub role: String,
+    /// The subject of the logical change it serves.
+    pub source: String,
+    pub reason: String,
+}
+
+/// The origin of each step a planning rule added, in plan order.
+pub fn origins(cs: &ChangeSet) -> Vec<StepOrigin> {
+    cs.changes
+        .iter()
+        .enumerate()
+        .filter_map(|(step, p)| {
+            let o = p.provenance.as_ref()?;
+            Some(StepOrigin {
+                step,
+                rule: o.rule.to_owned(),
+                role: o.role.as_str().to_owned(),
+                source: o.source.clone(),
+                reason: o.reason.clone(),
+            })
+        })
+        .collect()
 }
 
 /// A drift report as prose.
@@ -1359,6 +1402,43 @@ fn numbering_source(source: &pbps_model::ValueSource) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A step a rule added names its origin under it, escaped like every
+    /// other text out of the plan; a step without one, as every step of a
+    /// plan read back from its file, shows none (DEC-1958.3).
+    #[test]
+    fn an_added_step_names_its_origin_and_a_plain_one_names_none() {
+        use pbps_model::{AddedRole, Change, ChangeSet, PlannedChange, Provenance};
+        let drop = || {
+            PlannedChange::new(Change::DropCheck {
+                table: "app.t".parse().unwrap(),
+                name: "ck".into(),
+            })
+        };
+        let mut added = drop();
+        added.provenance = Some(Provenance {
+            rule: "weave",
+            role: AddedRole::Teardown,
+            source: "app.f(integer)".into(),
+            reason: "ck depends on it\n    + forged line".into(),
+        });
+        let cs = ChangeSet {
+            changes: vec![drop(), added],
+        };
+        let text = super::changes(&cs);
+        assert_eq!(text.matches("added by").count(), 1, "{text}");
+        assert!(
+            text.contains("      added by weave: teardown for app.f(integer) — ck depends on it"),
+            "{text}"
+        );
+        assert!(!text.contains("\n    + forged line"), "{text}");
+        let origins = super::origins(&cs);
+        assert_eq!(origins.len(), 1);
+        assert_eq!(origins[0].step, 1);
+        assert_eq!(origins[0].role, "teardown");
+        // Not part of what the plan is: equal with or without it.
+        assert_eq!(cs.changes[0], cs.changes[1]);
+    }
+
     /// A partition is described by its parent and the rows it takes, not by
     /// the columns it has none of (#1170); an ordinary table by its columns.
     #[test]
