@@ -130,6 +130,9 @@ struct Step {
     /// What this step makes resolvable, for the order check: its kind,
     /// schema and name.
     names: Vec<(Nameable, String, String)>,
+    /// The columns whose generated expressions this step compiles: a
+    /// table's, in its `CREATE TABLE`.
+    generated: Vec<String>,
     /// The module this step compiles, if it is one.
     module: Option<ModuleId>,
     /// The routine the engine created for this step, as the capture names
@@ -221,6 +224,12 @@ impl Reconstruction {
                         }
                     }
                     let declaration = format!("table {name}");
+                    let generated_columns: Vec<String> = bare
+                        .columns
+                        .iter()
+                        .filter(|(_, spec)| matches!(spec.value_source, ValueSource::Generated(_)))
+                        .map(|(column, _)| column.clone())
+                        .collect();
                     steps.push(step(
                         dialect,
                         Phase::Tables,
@@ -235,6 +244,9 @@ impl Reconstruction {
                         relation(&name.schema, &name.name),
                         None,
                     )?);
+                    if let Some(step) = steps.last_mut() {
+                        step.generated = generated_columns;
+                    }
                     for (key, constraint) in keys {
                         foreign.insert(steps.len());
                         steps.push(step(
@@ -463,23 +475,50 @@ impl Reconstruction {
                 }),
                 _ => false,
             })?;
-        Some(
-            self.steps[at + 1..]
-                .iter()
-                .map(|step| &step.names)
-                .chain(
-                    self.between
-                        .iter()
-                        .filter(|(before, _)| at < *before)
-                        .map(|(_, names)| names),
-                )
-                .flat_map(|names| {
-                    names
-                        .iter()
-                        .map(|(kind, schema, name)| (*kind, schema.as_str(), name.as_str()))
-                })
-                .collect(),
-        )
+        Some(self.names_after(at))
+    }
+
+    /// The names made resolvable after the step at `at`: by every later
+    /// step, and between steps after it.
+    fn names_after(&self, at: usize) -> std::collections::BTreeSet<(Nameable, &str, &str)> {
+        self.steps[at + 1..]
+            .iter()
+            .map(|step| &step.names)
+            .chain(
+                self.between
+                    .iter()
+                    .filter(|(before, _)| at < *before)
+                    .map(|(_, names)| names),
+            )
+            .flat_map(|names| {
+                names
+                    .iter()
+                    .map(|(kind, schema, name)| (*kind, schema.as_str(), name.as_str()))
+            })
+            .collect()
+    }
+
+    /// [`Self::later_names`] for the generated expression of `column` on the
+    /// table `schema.table`, which compiles in that table's own step: a
+    /// table whose expression calls a declared function is created among the
+    /// modules, so later modules, and a fill's chained shapes, may come
+    /// after it (#1778). `None` where no step compiles that expression, as
+    /// for a plain default, which compiles after every module.
+    pub fn later_names_generated(
+        &self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> Option<std::collections::BTreeSet<(Nameable, &str, &str)>> {
+        let at = self.steps.iter().position(|step| {
+            step.module.is_none()
+                && step.generated.iter().any(|generated| generated == column)
+                && step
+                    .names
+                    .iter()
+                    .any(|(kind, s, n)| *kind == Nameable::Relation && s == schema && n == table)
+        })?;
+        Some(self.names_after(at))
     }
 
     /// Records `names` as made resolvable just before the step at
@@ -969,6 +1008,7 @@ fn step(
         declaration: declaration.to_owned(),
         statements,
         names,
+        generated: Vec::new(),
         module,
         created: None,
     })

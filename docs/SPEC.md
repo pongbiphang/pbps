@@ -2219,7 +2219,10 @@ DEC-1778.2).**
   refuses, naming what waits for what. One that compiles there may have
   bound a name a chained shape then takes (a call that the target casts to a
   domain, for instance): the order check counts the chained shapes' names
-  as created at the split, and such a binding is unresolved. The chained shapes are compared with the target
+  as created at the split, and such a binding is unresolved. A generated
+  column's expression compiles with its table, so the check reads it from
+  that table's step. A sequence has no row type, so it takes no call or
+  cast. The chained shapes are compared with the target
   after the compile, before any binding question is answered.
 - **What it does not stage**, it names when the compile fails for want of it:
   - a routine (pbps sends no routine source);

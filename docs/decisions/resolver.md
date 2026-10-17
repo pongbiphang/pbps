@@ -3434,7 +3434,16 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
   (`Reconstruction::later_names`) counts the chained shapes' names, read
   from scratch's catalog after fill, as created at the split. A module
   compiled before it that bound, say, a routine the target's call casts to a
-  domain instead is then unresolved, never sealed. Which declarations read a
+  domain instead is then unresolved, never sealed.
+  - A generated column's expression compiles in its table's `CREATE TABLE`,
+    which can come before the split. So the check finds that step from the
+    column and counts what came after it: later modules too, since a table
+    whose expression calls a declared function is created among them. A
+    plain default, a check or an index expression compiles after every
+    module, so it keeps the rule it had.
+  - Filled names are classified as the step names are. A sequence, like an
+    index, has no row type (measured on 16 and 18), so it shadows only a
+    relation. Which declarations read a
   chained shape only the compile tells, since a new one has no recorded
   dependency. So a declaration scratch compiles before the split, and that
   fails, refuses with a finding naming what waits for what, and the two
@@ -3452,6 +3461,8 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
 (and its named refusal),
 `resolver_refuses_an_outside_write_fill_sets_off_and_leaves_none`,
 `resolver_leaves_unresolved_a_binding_a_chained_shape_would_take`,
+`resolver_leaves_unresolved_a_generated_column_a_chained_shape_would_take`,
+`resolver_resolves_a_call_named_like_a_chained_sequence`,
 `resolver_compiles_after_a_chained_fill_under_the_deployers_settings`,
 `resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it`,
 `resolver_fills_the_external_objects_no_externals_file_stages`,
@@ -3468,4 +3479,5 @@ copy is not filled over), live; and the `resolver::draft` unit tests
 `an_extension_whose_member_the_externals_file_created_is_the_files`, with
 `reconstruct`'s
 `chained_shapes_wait_for_the_step_that_creates_what_they_name` and
-`names_created_between_steps_are_later_only_for_modules_before_them`.
+`names_created_between_steps_are_later_only_for_modules_before_them` and
+`a_generated_columns_later_names_follow_its_tables_step`.

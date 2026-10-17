@@ -2481,6 +2481,148 @@ async fn resolver_compiles_after_a_chained_fill_under_the_deployers_settings() {
     }
 }
 
+/// A managed table `t`, created before the split, whose generated column
+/// reads `ext.d(NULL)`: on the target a cast to the domain `ext.d` over
+/// `m`'s row type, and on scratch, compiled before fill creates that domain,
+/// a call to the externals file's `ext.d(text)`. The expression
+/// compiles with its table, not as a module, and it is unresolved, never
+/// sealed. Negative: without the domain the function is the binding on
+/// both.
+async fn generated_before_a_chained_shape(domain: bool) -> Result<ResolvedPlan, ProduceError> {
+    let function = format!(
+        "CREATE FUNCTION {EXTERNAL}.d(text) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1"
+    );
+    let expression = format!("{EXTERNAL}.d(NULL) IS NULL");
+    let mut setup = generating_target();
+    setup.push(function.clone());
+    if domain {
+        setup.push(format!("CREATE DOMAIN {EXTERNAL}.d AS {MANAGED}.m"));
+    }
+    setup.extend([
+        format!(
+            "CREATE TABLE {MANAGED}.t (id integer, \
+             g boolean GENERATED ALWAYS AS ({expression}) STORED)"
+        ),
+        format!("CREATE VIEW {MANAGED}.a AS SELECT id FROM {MANAGED}.t"),
+    ]);
+    let with_t = |mut schema: pbps_model::Schema| {
+        let mut generated = pbps_model::Column::new("boolean".parse().unwrap());
+        generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+            expression: expression.clone(),
+            stored: true,
+        });
+        schema
+            .tables
+            .get_mut(&format!("{MANAGED}.t").parse().unwrap())
+            .unwrap()
+            .columns
+            .insert("g".into(), generated);
+        generating(schema)
+    };
+    let a = format!("SELECT id FROM {MANAGED}.t");
+    let inputs = Inputs::from_pair((
+        with_t(declared(&[("a", &a)], &["m", "t"])),
+        with_t(declared(&[("a", &a), ("b", &a)], &["m", "t"])),
+    ));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &format!("CREATE SCHEMA {EXTERNAL};\n{function};"),
+    )
+    .await;
+    target.drop().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_leaves_unresolved_a_generated_column_a_chained_shape_would_take() {
+    let plan = generated_before_a_chained_shape(false)
+        .await
+        .unwrap_or_else(|error| panic!("without the domain: {error}"));
+    plan.evidence.validate(&plan.changes).unwrap();
+    let refused = match generated_before_a_chained_shape(true).await {
+        Ok(_) => panic!("a generated binding the domain would take was sealed"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refused.contains("the declaration was compiled before an object sharing a name it bound"),
+        "{refused}"
+    );
+}
+
+/// A chained table's identity column creates the sequence
+/// `ext.e_id_seq`, which has no row type, so it takes no call: a view
+/// compiled before the split, calling the externals file's
+/// `ext.e_id_seq(text)`, binds it on both sides and is resolved. Negative:
+/// a chained shape with a row type of that name leaves the call
+/// unresolved.
+async fn calling_a_chained_sequences_name(sequence: bool) -> Result<ResolvedPlan, ProduceError> {
+    let function = format!(
+        "CREATE FUNCTION {EXTERNAL}.e_id_seq(text) RETURNS integer LANGUAGE sql IMMUTABLE RETURN 1"
+    );
+    let mut setup = generating_target();
+    setup.push(function.clone());
+    setup.push(if sequence {
+        format!(
+            "CREATE TABLE {EXTERNAL}.e (id integer GENERATED ALWAYS AS IDENTITY, m {MANAGED}.m)"
+        )
+    } else {
+        format!("CREATE TABLE {EXTERNAL}.e_id_seq (m {MANAGED}.m)")
+    });
+    let reader = if sequence { "e" } else { "e_id_seq" };
+    let call = format!("SELECT {EXTERNAL}.e_id_seq(NULL) AS v");
+    let read = format!("SELECT 1 AS v FROM {EXTERNAL}.{reader} WHERE {MANAGED}.f(1) > 0");
+    setup.extend([
+        format!("CREATE VIEW {MANAGED}.a AS {call}"),
+        format!("CREATE VIEW {MANAGED}.c AS {read}"),
+    ]);
+    let inputs = Inputs::from_pair((
+        generating(declared(&[("a", &call), ("c", &read)], &["m"])),
+        generating(declared(
+            &[("a", &call), ("b", &call), ("c", &read)],
+            &["m"],
+        )),
+    ));
+    let key = ProjectKey::new(true);
+    let mut target = Fixture::new("PBPS_TEST_PG_DB");
+    let scratch = Fixture::new(SCRATCH_SERVER);
+    let target_db = staging_target(&mut target, &setup).await;
+    let result = produce_staged(
+        &scratch.server,
+        &target.on(&target_db),
+        &inputs,
+        &key,
+        &format!("CREATE SCHEMA {EXTERNAL};\n{function};"),
+    )
+    .await;
+    target.drop().await;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_resolves_a_call_named_like_a_chained_sequence() {
+    let plan = calling_a_chained_sequences_name(true)
+        .await
+        .unwrap_or_else(|error| panic!("a sequence: {error}"));
+    plan.evidence.validate(&plan.changes).unwrap();
+    let refused = match calling_a_chained_sequences_name(false).await {
+        Ok(_) => panic!("a call a row type would take was sealed"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        refused.contains("the declaration was compiled before an object sharing a name it bound"),
+        "{refused}"
+    );
+}
+
 /// On the target `ext.d(NULL)` casts to the domain `ext.d`, which names
 /// `m`'s row type; scratch compiles the views before fill creates the
 /// domain, and they bind the externals file's `ext.d(text)` instead

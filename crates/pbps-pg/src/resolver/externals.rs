@@ -384,7 +384,8 @@ pub fn created(before: &Inventory, after: &Inventory) -> Created {
 
 /// What each object that appeared between two inventories makes
 /// resolvable, by kind, schema and name, as the reconstruction's order check
-/// reads a step's: a relation (an index apart), a type, a routine. Carried
+/// reads a step's: a relation (an index or a sequence, which have no row
+/// type, apart), a type, a routine. Carried
 /// objects count too, since a table's row type and array type are names a
 /// binding could take (#1778).
 pub async fn nameables(
@@ -425,7 +426,9 @@ pub async fn nameables(
                 Ok(row.try_get::<&str>(column)?.unwrap_or_default().to_owned())
             };
             let kind = match (text("k")?.as_str(), text("sub")?.as_str()) {
-                ("c", "i" | "I") => Nameable::Index,
+                // A sequence has no row type either (measured on 16 and
+                // 18), so it takes only a relation's binding, as an index.
+                ("c", "i" | "I" | "S") => Nameable::Index,
                 ("c", _) => Nameable::Relation,
                 ("t", _) => Nameable::Type,
                 _ => Nameable::Routine,
