@@ -130,3 +130,60 @@ Merge-group run 38839823549 gives the room each shard had:
 Even several times slower on a runner, neither sample makes its shard the
 longest. A pair added past the cap is a recorded change: it replaces one or
 raises the cap, and then this table is re-measured.
+
+## SCRAM in test builds
+
+Every PostgreSQL connection authenticates with SCRAM-SHA-256: 4096 rounds of
+HMAC-SHA-256. Unoptimized, that cost about 100 ms of CPU per connection, and a
+`flow_pg` case opens about 15 of them (#2113). `Cargo.toml` therefore optimizes
+two dependencies under `profile.dev.package` (`opt-level = 3`):
+`postgres-protocol`, which holds the loop and the generic `hmac` code compiled
+into it, and `sha2 0.11`, which holds the block compression. `test` and
+`live-test` inherit `dev`, so both pick them up; `release` does not.
+
+Which crates matter was measured, not read off the dependency tree: with the
+two optimized, adding `hmac`, `digest`, `block-buffer`, `crypto-common`,
+`hybrid-array`, `cpufeatures`, `stringprep`, `base64` or `rand` changed nothing,
+while leaving out `postgres-protocol` or `sha2` kept most of the cost.
+`sha2 0.10` is the plan checksum, not on this path.
+
+Same host (Intel i9-14900F, shared, load average 5 to 14), the same pinned
+PostgreSQL 18 digest in a private container, `pg_hba` switched between
+`scram-sha-256` and `trust` on the host lines. The 19 cases are the
+`flow_pg` `through_the_cli` tests that need only `PBPS_TEST_PG_DB`, run with
+`--test-threads=1` from the test binary, so compilation is not in the figures.
+CPU is user time of the test process and its children; wall time moves with
+the neighbours' load, user time much less.
+
+| Workload | Before | After | Trust, for reference |
+| --- | ---: | ---: | ---: |
+| One `plan --db`, user CPU, 10 interleaved runs | 0.126 s | 0.021 s | 0.017 s |
+| 19 `flow_pg` cases, user CPU | 124.3 s, 75.2 s | 20.7 s, 20.6 s | 16.1 s |
+| 19 `flow_pg` cases, wall | 282.2 s, 156.0 s | 107.0 s, 106.2 s | 104.6 s |
+
+Two runs are listed where two were made. The two "before" runs differ because
+the first ran at load 12 on 12 cores; the "after" runs do not.
+
+The cost of the extra optimization, cold target directories, `cargo test
+--workspace --all-targets --no-run`:
+
+| Build | Wall | User CPU |
+| --- | ---: | ---: |
+| Without | 209.5 s | 1542.5 s |
+| With the two crates | 215.2 s | 1481.2 s |
+
+The workspace figures differ by less than the host's noise. Isolated, the
+closure of `postgres-protocol` costs 4.3 s more user CPU (12.2 s to 16.6 s) and
+0.9 s more wall.
+
+Workspace crates keep `opt-level = 0` (`1` under `live-test`), debug
+assertions and overflow checks. Cargo's `compiler-artifact` records for the
+`test`, `dev` and `live-test` profiles show it, and a `--release` check shows
+the release profile with its own settings only:
+
+```bash
+cargo check --profile test -p pbps-cli --bin pbps --message-format json
+```
+
+Optimizing every dependency (`profile.dev.package."*"`, `opt-level = 1`) was
+measured as a comparison and is not adopted (DEC-2113.1).
