@@ -6619,8 +6619,13 @@ a valid plan:
   update requires the parent's written side, and a child's delete or update
   requires the parent's held side, so a parent's rows come first and a
   child's rows leave first. A delete also waits for a foreign key into its
-  table that the plan drops or replaces. A foreign key counts if it stands throughout, compared
-  through the plan's renames as the differ compares. The first design named
+  table that the plan drops or replaces, and a row written waits for
+  whatever the plan takes away from its table, a check, key or index, by the
+  name and whatever its text: a check the resolver rebinds is torn down and
+  put back around the rows (`RowSide::Released`, a key per part, so two drops
+  are not ordered by it). A foreign key counts if it
+  stands throughout, compared through the plan's renames as the differ
+  compares. The first design named
   the row a reference needs by its key, unique-key or default value; each
   value the effects could not read (a literal default of some type, a
   payload's key column, a tuple, a renamed or retyped key) was an order the

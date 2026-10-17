@@ -706,6 +706,7 @@ impl Cx<'_> {
                     && let Some(old) = from
                 {
                     self.requires_key_unreferenced(&owner, &old.columns);
+                    self.releases_constraint(&owner, PartKey::PrimaryKey);
                 }
                 if let Some(new) = to {
                     self.requires_valid_data(&owner);
@@ -724,9 +725,10 @@ impl Cx<'_> {
                     self.requires_column(table, c, false);
                 }
             }
-            Change::DropUnique { table, .. } => {
+            Change::DropUnique { table, name } => {
                 let owner = self.table(table)?;
-                self.exists(ObjectKey::Table(owner));
+                self.exists(ObjectKey::Table(owner.clone()));
+                self.releases_constraint(&owner, PartKey::Unique(name.clone()));
             }
             Change::AddForeignKey {
                 table, constraint, ..
@@ -760,6 +762,7 @@ impl Cx<'_> {
             Change::DropForeignKey { table, name } => {
                 let owner = self.table(table)?;
                 self.exists(ObjectKey::Table(owner.clone()));
+                self.releases_constraint(&owner, PartKey::ForeignKey(name.clone()));
                 // The key it references stands until the foreign key is
                 // gone.
                 if let Some((_, own)) = self.base_of(&owner)
@@ -779,9 +782,15 @@ impl Cx<'_> {
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.requires_valid_data(&owner);
             }
-            Change::DropCheck { table, .. } | Change::DropIndex { table, .. } => {
+            Change::DropCheck { table, name } => {
                 let owner = self.table(table)?;
-                self.exists(ObjectKey::Table(owner));
+                self.exists(ObjectKey::Table(owner.clone()));
+                self.releases_constraint(&owner, PartKey::Check(name.clone()));
+            }
+            Change::DropIndex { table, name } => {
+                let owner = self.table(table)?;
+                self.exists(ObjectKey::Table(owner.clone()));
+                self.releases_constraint(&owner, PartKey::Index(name.clone()));
             }
             Change::AddIndex { table, index, .. } => {
                 let owner = self.table(table)?;
@@ -1543,6 +1552,18 @@ impl Cx<'_> {
 
     // Rows.
 
+    /// A constraint the plan takes away is released: a row written after it
+    /// meets none of it (`row_meets_constraints`).
+    fn releases_constraint(&mut self, owner: &Recorded, part: PartKey) {
+        self.creates(Resource::Object(
+            ObjectKey::Rows {
+                table: owner.clone(),
+                side: RowSide::Released(part),
+            },
+            Incarnation::Final,
+        ));
+    }
+
     fn row_basics(&mut self, owner: &Recorded, table: &TableName, _key: &RowKey) {
         let _ = table;
         self.exists(ObjectKey::Table(owner.clone()));
@@ -1570,6 +1591,31 @@ impl Cx<'_> {
         else {
             return;
         };
+        // Whatever the plan takes away goes before a row is written, by its
+        // name and whatever its text: a check the resolver rebinds is torn
+        // down and put back around the rows (DEC-1968.2).
+        let mut parts_held: Vec<PartKey> = Vec::new();
+        if was.primary_key.is_some() {
+            parts_held.push(PartKey::PrimaryKey);
+        }
+        parts_held.extend(was.checks.keys().cloned().map(PartKey::Check));
+        parts_held.extend(was.unique.keys().cloned().map(PartKey::Unique));
+        parts_held.extend(was.foreign_keys.keys().cloned().map(PartKey::ForeignKey));
+        parts_held.extend(
+            was.indexes
+                .iter()
+                .filter(|(_, i)| i.unique || i.filter.is_some())
+                .map(|(n, _)| PartKey::Index(n.clone())),
+        );
+        for part in parts_held {
+            self.requires(Requirement::Is(
+                ObjectKey::Rows {
+                    table: owner.clone(),
+                    side: RowSide::Released(part),
+                },
+                Incarnation::Final,
+            ));
+        }
         // Only the parts compared below, and what `apply` looks a partition's
         // columns up by: the whole table would bring its reference rows into
         // every row step's copy.
