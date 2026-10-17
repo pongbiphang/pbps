@@ -8,7 +8,7 @@
 //! about a table it half-created. Every check here is a rule of the engine, not a
 //! matter of taste — style opinions belong in `fmt`, not in an error.
 
-use pbps_dialect::DialectError;
+use pbps_dialect::{Dialect as _, DialectError};
 use pbps_model::{
     GrantTarget, Module, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema, Table,
     TableName, Value,
@@ -901,6 +901,21 @@ pub(crate) fn table_sources(
                 "check constraint `{n}` has an empty expression"
             )));
         }
+        // Measured on 17.0: 1764, "Computed Column 'c' in table 't' is invalid
+        // for use in 'CHECK CONSTRAINT' because it is not persisted" — the
+        // CHECK half of the rule 8183 states for NOT NULL above (#1438's
+        // measurement, #1450). `may_name` over-approximates: a false yes asks
+        // for `persisted: true` on a column the check does not read, which
+        // costs storage and refuses nothing valid.
+        for (column, computed) in &table.computed {
+            if !computed.persisted && crate::Mssql.may_name(&c.expression, column) {
+                errs.push(invalid(format!(
+                    "check constraint `{n}` reads the computed column `{column}`, which is not \
+                     `persisted`, and SQL Server holds a CHECK over a persisted computed column \
+                     only; declare `{column}` with `persisted: true`"
+                )));
+            }
+        }
     }
 
     for (n, idx) in &table.indexes {
@@ -1217,6 +1232,54 @@ mod tests {
             },
         );
         assert_eq!(messages(&table(&name, &t)), "");
+    }
+
+    /// #1450: SQL Server refuses a CHECK over a non-persisted computed column
+    /// (1764), and validation used to let it through to fail at apply.
+    #[test]
+    fn a_check_over_a_computed_column_needs_it_persisted() {
+        let computed = |persisted: bool| pbps_model::ComputedColumn {
+            expression: "a * 2".into(),
+            persisted,
+            not_null: false,
+        };
+        let check = |expression: &str| pbps_model::CheckConstraint {
+            expression: expression.into(),
+        };
+        let found = |t: &Table| {
+            super::table(&"dbo.t".parse().unwrap(), t)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+        };
+        let mut table = Table::default();
+        table
+            .columns
+            .insert("a".into(), Column::new("int".parse().unwrap()).not_null());
+        table.computed.insert("c".into(), computed(false));
+        table.computed.insert("p".into(), computed(true));
+
+        // Over the persisted one, over a plain column, and naming the
+        // non-persisted one only inside a literal: all accepted.
+        for accepted in ["p > 0", "[p] > 0", "a > 0", "a <> LEN('c')"] {
+            let mut t = table.clone();
+            t.checks.insert("ck".into(), check(accepted));
+            assert!(found(&t).is_empty(), "{accepted}: {:?}", found(&t));
+        }
+        // Over the non-persisted one, however it is spelled.
+        for refused in ["c > 0", "[c] > 0", "C > 0", "a + c > 0"] {
+            let mut t = table.clone();
+            t.checks.insert("ck".into(), check(refused));
+            let messages = found(&t);
+            assert!(
+                messages.iter().any(|m| m.contains(
+                    "check constraint `ck` reads the computed column `c`, which is not `persisted`"
+                ) && m.contains("declare `c` with `persisted: true`")),
+                "{refused}: {messages:?}"
+            );
+            // Named once, for the column it reads, not for `p`.
+            assert_eq!(messages.len(), 1, "{refused}: {messages:?}");
+        }
     }
 
     /// A computed column needs a name of its own and an expression; `not_null`
