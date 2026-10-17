@@ -6618,7 +6618,11 @@ refusing a valid plan:
   (`ObjectKey::RowByUnique`, a key of its own, since a primary key's text can
   spell anything), which an insert or update creates, a delete or an update
   that gives the values up ends, and the child's reference requires, as the
-  primary key's value does for a single-column reference to it.
+  primary key's value does for a single-column reference to it. Only a key
+  that stands throughout names a row, and a foreign key stands when it is the
+  same one through the plan's renames, as the differ compares them: a key the
+  plan rebuilds is absent while rows move, and names would otherwise swap in
+  a cycle.
   The update half of #2079 closes with it, so the commutation suites drop
   their `a_row_updated_beside_a_new_column` gap (DEC-1965.1); the insert half
   stays open.

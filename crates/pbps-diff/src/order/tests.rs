@@ -3271,3 +3271,139 @@ fn a_parent_update_giving_up_a_unique_value_follows_the_child_row_that_names_it(
     );
     assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
 }
+
+/// Two rows swap the values of a unique index the plan rebuilds around them
+/// (its INCLUDE list changes): the index is absent while they move, so no
+/// name changes hands and the effects find no cycle (review of #2120).
+#[test]
+fn rows_swapping_the_values_of_a_rebuilt_unique_index_draw_no_cycle() {
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod};
+    let index = |include: &[&str]| Index {
+        columns: vec![IndexColumn {
+            key: IndexKey::Column("code".into()),
+            descending: false,
+            opclass: None,
+        }],
+        include: include.iter().map(|c| (*c).to_owned()).collect(),
+        unique: true,
+        filter: None,
+        method: IndexMethod::Btree,
+        storage_parameters: Default::default(),
+    };
+    let swap = |key: i64, from: i64, to: i64| {
+        p(Change::UpdateRow {
+            table: t("t"),
+            key_column: "id".into(),
+            key: RowKey::from(key.to_string().as_str()),
+            columns: [(
+                "code".to_owned(),
+                (
+                    pbps_model::Cell::Value(Value::Int(from)),
+                    pbps_model::Cell::Value(Value::Int(to)),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            unchanged: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+            key_type: Default::default(),
+        })
+    };
+    let table = |include: &[&str]| {
+        let mut table = table_with(&["id", "code", "x"]);
+        table.indexes.insert("ix".into(), index(include));
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table(&[]));
+    after.tables.insert(t("t"), table(&["x"]));
+    let ids = Plan::ids(&["t"], &[("t", "id"), ("t", "code"), ("t", "x")]);
+    let plan = Plan {
+        logical: vec![
+            p(Change::DropIndex {
+                table: t("t"),
+                name: "ix".into(),
+            }),
+            swap(1, 1, 2),
+            swap(2, 2, 1),
+            p(Change::AddIndex {
+                table: t("t"),
+                name: "ix".into(),
+                index: Box::new(index(&["x"])),
+                clustered: false,
+            }),
+        ],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
+}
+
+/// A retained foreign key whose parent table the plan renames still stands,
+/// so a child row waits for the parent row (review of #2120).
+#[test]
+fn a_foreign_key_into_a_renamed_table_still_orders_the_rows() {
+    let none = ModuleDeps::new();
+    let moved = uid(UidKind::Table, "p");
+    let mut plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        Vec::new(),
+    );
+    // After the plan the parent is `q`, and the child's key names it.
+    let mut parent = plan.after.tables.remove(&t("p")).unwrap();
+    parent.foreign_keys.clear();
+    plan.after.tables.insert(t("q"), parent);
+    plan.after
+        .tables
+        .get_mut(&t("c"))
+        .unwrap()
+        .foreign_keys
+        .get_mut("fk")
+        .unwrap()
+        .references_table = t("q");
+    plan.after_ids.tables.insert(moved.clone(), t("q"));
+    plan.after_ids
+        .columns
+        .insert(uid(UidKind::Column, "p.id"), t("q").column("id"));
+    let row = |table: &str, key: i64, cells: &[(&str, i64)]| {
+        let mut row = plain_row(table, key, cells);
+        if let Change::InsertRow { table: name, .. } = &mut row.change {
+            *name = t(table);
+        }
+        row
+    };
+    plan.logical = vec![
+        p(Change::RenameTable {
+            uid: moved,
+            from: t("p"),
+            to: t("q"),
+            defaults: Vec::new(),
+        }),
+        row("c", 1, &[("pid", 1)]),
+        row("q", 1, &[]),
+    ];
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let early = run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL);
+    assert!(
+        early.iter().any(|v| matches!(v, Violation::Edge { .. })),
+        "{early:?}"
+    );
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 2, 1], &none, Checks::ALL),
+        []
+    );
+}
