@@ -1039,3 +1039,54 @@ and the checks unbound unless each of them re-read the identity too.
 
 This entry says nothing about transaction pooling in front of one cluster;
 that was not measured, and this decision does not cover it.
+
+<a id="dec-2151-1"></a>
+
+**DEC-2151.1. PostgreSQL is supported from 16, the lowest release CI
+qualifies, and an older server is refused by name where the connection opens
+(#2151).** Until now pbps stated no minimum and checked none, so a command on
+an older server failed partway through a read with an error that named a
+query rather than the server. Measured on 2026-10-17:
+- 10.21 failed on `unrecognized configuration parameter "jit"`, and past that
+  on `syntax error at or near "MATERIALIZED"`;
+- 14.24 failed on `column con.confdelsetcols does not exist` (measured on
+  #1446);
+- 15 had never been run.
+
+The maintainer set the floor at 16 (2026-10-17). It is the lowest release
+that CI's `compatibility` matrix and live suites qualify, and a release
+nothing qualifies is not one pbps can claim. The rule is that the minimum is
+the lowest release CI qualifies, so lowering it starts with that release's CI
+cell. #2152 does that for 15.
+
+The check runs once, in `pbps-db`'s PostgreSQL connect path, right after the
+handshake and before anything else is asked of the session. Every command
+and every resolver session opens its connection there, so each one refuses
+before any read. It reads `SHOW server_version_num`, as `fresh_zone` reads
+`TimeZone`. A value that is absent or not a number is an error, never a
+release that passes.
+
+The refusal is `DbError::UnsupportedServer`, a connection failure in the same
+sense as `WrongSession`: the server answered, and pbps cannot work with it.
+It is reported where that one is: `status` and `verify` give
+`environment.unreachable`, and `doctor` gives an unreachable environment.
+Each carries the message `PostgreSQL 15.19 is not supported; pbps needs
+PostgreSQL 16 or later`. The version in the message is composed from the
+number rather than taken from the server's `server_version` text, so the
+message is this tool's own words, as a refusal has to be (DECISIONS 455).
+
+Rejected:
+- **A separate `environment.unsupported` finding.** Measured on 15.19 and
+  10.21, the message already says what to fix. A new finding id would add a
+  routing rule to every command that reports connection failures, for a case
+  whose owner is the same: whoever runs the environment.
+- **Guarding each newer catalog column** (#1448's `jit` guard, closed in
+  favour of this). Each guard only moved the failure to the next column a
+  release lacks; it did not make an old server supported.
+
+Pinned by `a_release_older_than_the_minimum_is_refused_by_name`,
+`an_unreadable_server_version_is_an_error_not_a_pass` and
+`a_server_version_number_is_named_as_its_release` in
+`crates/pbps-db/src/postgres.rs`. Measured by hand on 15.19 and 10.21 with
+`pull`, `plan --db` and `doctor` (comment on #2151); no CI job has a pre-16
+server.

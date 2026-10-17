@@ -10,7 +10,9 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 and PostgreSQL supported through the CLI. SQL Server uses `tiberius` 0.13.0
 with rustls and aws-lc-rs; PostgreSQL's rustls configuration selects the same
 provider. The test and clippy bar is in AGENTS.md's "Taking an issue"; counts
-change too often to record here. The copy-pastable pipelines SPEC 14.1 lists
+change too often to record here. PostgreSQL is supported from 16, the lowest
+release CI qualifies; an older server is refused by name when the connection
+opens (#2151, DEC-2151.1), and 15 is #2152. The copy-pastable pipelines SPEC 14.1 lists
 as P1 are in [CI.md](CI.md).
 
 First-run: `init` (`--env` / `--from` / `--url-env`), with staged validation

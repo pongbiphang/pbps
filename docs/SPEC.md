@@ -3,7 +3,7 @@
 > Status: living specification; Phases 0-5 are built, supporting SQL Server and PostgreSQL
 > Language: Rust
 > Position: declarative database schema version control and deployment
-> Supported dialects: SQL Server and PostgreSQL
+> Supported dialects: SQL Server and PostgreSQL (16 or later: the lowest release CI qualifies; an older server is refused by name when the connection opens, DEC-2151.1)
 > Partially delivered: engine-assisted planning — PostgreSQL planning with the resolver, its sealed evidence, its offline `explain` and its transactional apply (#616) are built; staged resolved apply and SQL Server (#619–#621) are planned (§9.3.2; ADR-0016)
 > Partially delivered: resolver environment discovery — read-only `doctor` discovery, resolver selection, the Docker and server scratch runs and compatibility qualification are built; the remaining stages are planned (§9.3.3; [delivery tracking](RESOLVER-DELIVERY.md))
 

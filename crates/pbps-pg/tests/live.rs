@@ -329,6 +329,7 @@ async fn a_refused_socket_names_the_address_it_could_not_reach() {
         | DbError::Context { .. }
         | DbError::Refused(_)
         | DbError::WrongSession { .. }
+        | DbError::UnsupportedServer { .. }
         | DbError::BadRow(_) => panic!("a refused socket is not {error:?}"),
     }
 }
@@ -422,6 +423,7 @@ async fn a_dropped_connection_times_out_rather_than_reading_as_a_typo() {
         | DbError::Context { .. }
         | DbError::Refused(_)
         | DbError::WrongSession { .. }
+        | DbError::UnsupportedServer { .. }
         | DbError::BadRow(_) => panic!("a dropped SYN is not {error:?}"),
     }
     let waited = started.elapsed();
@@ -463,6 +465,7 @@ async fn a_smaller_connect_timeout_gives_up_sooner_than_the_ceiling() {
         | DbError::Context { .. }
         | DbError::Refused(_)
         | DbError::WrongSession { .. }
+        | DbError::UnsupportedServer { .. }
         | DbError::BadRow(_) => panic!("a dropped SYN is not {error:?}"),
     }
     let waited = started.elapsed();
@@ -720,6 +723,7 @@ async fn a_session_the_connection_string_excludes_is_refused() {
             | DbError::Driver { .. }
             | DbError::Context { .. }
             | DbError::Refused(_)
+            | DbError::UnsupportedServer { .. }
             | DbError::BadRow(_) => panic!("a session mismatch is not {error:?}"),
         }
         // Reached, not unreachable: the message must not read as a network
@@ -2737,6 +2741,7 @@ fn sqlstate(e: &DbError) -> &str {
         | DbError::ConnectTimeout { .. }
         | DbError::Refused(_)
         | DbError::WrongSession { .. }
+        | DbError::UnsupportedServer { .. }
         | DbError::BadRow(_)) => panic!("not a refusal from the server: {other:?}"),
     }
 }
@@ -11802,6 +11807,7 @@ async fn a_ledger_never_initialized_an_empty_one_and_an_unreachable_database_sta
         | DbError::Context { .. }
         | DbError::Refused(_)
         | DbError::WrongSession { .. }
+        | DbError::UnsupportedServer { .. }
         | DbError::BadRow(_)) => {
             panic!("a database that is not there is refused by the server: {other:?}")
         }

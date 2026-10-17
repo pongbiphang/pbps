@@ -156,6 +156,22 @@ pub enum DbError {
         found: &'static str,
     },
 
+    /// The server answered, and is a release older than pbps supports
+    /// (DEC-2151.1). Refused where the connection opens, before any read, so a
+    /// command on an old server says why instead of failing partway through a
+    /// catalog query on a column that release does not have.
+    ///
+    /// A connection failure like [`DbError::WrongSession`], and reported where
+    /// that one is: the server answered, and is not one this tool can work
+    /// with. `found` is composed from `server_version_num`, never the server's
+    /// own `server_version` text, so the message is this tool's words only.
+    #[error("{engine} {found} is not supported; pbps needs {engine} {minimum} or later")]
+    UnsupportedServer {
+        engine: &'static str,
+        found: String,
+        minimum: &'static str,
+    },
+
     /// A catalog row did not have the shape the query promised — a bug in the
     /// introspection SQL, not bad data in the database.
     #[error("unexpected row shape: {0}")]
@@ -198,6 +214,7 @@ impl DbError {
             | DbError::Connect { .. }
             | DbError::ConnectTimeout { .. }
             | DbError::WrongSession { .. }
+            | DbError::UnsupportedServer { .. }
             | DbError::BadRow(_)
             // A tool-composed refusal never carries a server code — a real
             // one belongs on the `Driver` it was read from, never invented
@@ -310,6 +327,7 @@ pub(crate) async fn open_socket(
             | DbError::Context { .. }
             | DbError::Refused(_)
             | DbError::WrongSession { .. }
+            | DbError::UnsupportedServer { .. }
             | DbError::BadRow(_)) => error,
         })
 }
