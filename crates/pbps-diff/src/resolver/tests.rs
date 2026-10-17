@@ -1399,6 +1399,69 @@ mod generated_surface_coverage {
         .unwrap()
     }
 
+    /// A check whose binding changes with an unchanged text is torn down and put
+    /// back around the rows the plan writes (review of #2120): an update that
+    /// the old binding refuses meets neither (a new overload, a row update).
+    #[test]
+    fn a_rebound_check_is_torn_down_before_the_row_the_plan_updates() {
+        use pbps_model::{DataMode, PrimaryKey, Row, RowKey, TableData, Value};
+        let t: pbps_model::TableName = "app.t".parse().unwrap();
+        let table = |n: i64| {
+            let mut table = Table::default();
+            table
+                .columns
+                .insert("id".into(), Column::new("int".parse().unwrap()).not_null());
+            table
+                .columns
+                .insert("n".into(), Column::new("int".parse().unwrap()));
+            table.primary_key = Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            });
+            table.checks.insert(
+                "ck".into(),
+                pbps_model::CheckConstraint {
+                    expression: "n > app.f(1)".into(),
+                },
+            );
+            table.data = Some(TableData {
+                mode: DataMode::Exact,
+                rows: [(
+                    RowKey::from("1"),
+                    [("n".to_owned(), Value::Int(n))]
+                        .into_iter()
+                        .collect::<Row>(),
+                )]
+                .into_iter()
+                .collect(),
+            });
+            table
+        };
+        let mut base = Schema::default();
+        base.tables.insert(t.clone(), table(11));
+        let mut desired = Schema::default();
+        desired.tables.insert(t.clone(), table(1));
+        let observation = SurfaceResolution {
+            surface: Surface::Check {
+                table: t.clone(),
+                name: "ck".into(),
+            },
+            current: Some(bound("pg_constraint", "app.t.ck", &[], "f_old")),
+            desired: Some(bound("pg_constraint", "app.t.ck", &[], "f_new")),
+        };
+        let ordered = sided(&base, &desired, &[observation]);
+        let drop = at(&ordered, &|c| matches!(c, Change::DropCheck { .. }));
+        let update = at(&ordered, &|c| matches!(c, Change::UpdateRow { .. }));
+        let add = at(&ordered, &|c| matches!(c, Change::AddCheck { .. }));
+        assert!(
+            drop < update && update < add,
+            "{:?}",
+            ordered.changes.changes
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
     fn at(ordered: &Ordered, f: &dyn Fn(&Change) -> bool) -> usize {
         ordered
             .changes

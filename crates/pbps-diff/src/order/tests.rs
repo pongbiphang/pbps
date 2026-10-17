@@ -3910,3 +3910,40 @@ fn the_rows_of_tables_in_a_cycle_of_foreign_keys_keep_their_relative_order() {
             .any(|v| matches!(v, Violation::Edge { .. }))
     );
 }
+
+/// A check the plan tears down and puts back unchanged (the resolver does,
+/// when its binding changes) is gone before a row is written, and back after
+/// (review of #2120).
+#[test]
+fn a_row_update_waits_for_the_teardown_of_a_check_that_is_put_back_unchanged() {
+    let none = ModuleDeps::new();
+    let mut plan = checked("n > 0", "n > 0", pbps_model::Cell::Value(Value::Int(6)));
+    plan.logical.push(p(Change::DropCheck {
+        table: t("t"),
+        name: "ck".into(),
+    }));
+    plan.logical.push(p(Change::AddCheck {
+        table: t("t"),
+        name: "ck".into(),
+        constraint: pbps_model::CheckConstraint {
+            expression: "n > 0".into(),
+        },
+    }));
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    // The update first meets the old check.
+    let early = run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL);
+    assert!(
+        early.iter().any(|v| matches!(v, Violation::Edge { .. })),
+        "{early:?}"
+    );
+    // Drop, update, add: the row is written while no check stands.
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[1, 0, 2], &none, Checks::ALL),
+        []
+    );
+    // Negative: a plan that takes nothing away puts no obligation on a row.
+    let kept = checked("n > 0", "n > 0", pbps_model::Cell::Value(Value::Int(7)));
+    let (ops, fx, baseline) = kept.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0], &none, Checks::ALL), []);
+    let _ = (&ops, &fx);
+}

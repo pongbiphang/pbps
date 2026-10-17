@@ -239,7 +239,7 @@ requirement is common to all of them, so it is listed once,
 | `DropRole` | 0 | P: performed by hand (ADR-0010 §3). S: no members, no owned objects | Removes the role | removes |
 | `RenameTable` | 1 | The target name free | The table's new name | Exists, rewrites |
 | `RenameRole` | 1 | P: performed by hand. S: the target name free | The role's new name | Exists, rewrites |
-| `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }` | 2 | A foreign key on a key is dropped before the key | Frees names; releases columns for a rename, drop or retype | Exists, Is, removes |
+| `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }` | 2 | A foreign key on a key is dropped before the key | Frees names; releases columns for a rename, drop or retype; is gone before a row of its table is written (DEC-1968.2) | Exists, Is, creates, removes |
 | `DropComputedColumn` | 2 (2, 4) | S: the indexes, uniques and checks over it gone (4922); a check by its text, lexed | Removes a computed column, frees its name and releases the columns and functions it reads (DEC-1174.1) | Exists, removes |
 | `RenameColumn` | 3 | The target name free. S: no check and no filtered index naming the column (DECISIONS 474) | The column's new name. P: dependents' text follows the rename | Exists, rewrites |
 | `Revoke` | 4 | The target exists (a revoke on an object the plan drops is not emitted) | Removes a permission | Exists, rewrites |

@@ -329,10 +329,15 @@ pub enum ObjectKey {
 }
 
 /// Which side of a table's rows a [`ObjectKey::Rows`] is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RowSide {
     Written,
     Held,
+    /// Made by the drop of one check, key or index of the table: what the
+    /// plan takes away is gone before a row is written, whether or not its
+    /// text changed (a rebound check is torn down and put back). One key per
+    /// part, so that two drops are not ordered by it.
+    Released(PartKey),
 }
 
 /// Which instance of an object: the baseline's or the plan's.
