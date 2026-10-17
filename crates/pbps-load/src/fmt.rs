@@ -959,53 +959,220 @@ mod tests {
         values
     }
 
-    #[test]
-    fn every_scalar_context_keeps_its_exact_text_and_format() {
-        let base = crate::load_table_str(
-            Path::new("t.yml"),
-            "table: app.t\ncolumns:\n  id: {type: varchar(100), nullable: false}\n  v: {type: varchar(100)}\n  g: {type: int, generated: {expression: '1', stored: true}}\ncomputed:\n  c: {expression: '1'}\nprimary_key: [id]\nchecks: {ck: '1 = 1'}\nindexes:\n  ix: {columns: [v], where: v IS NOT NULL}\ndata:\n  mode: exact\n  rows:\n    row: {v: text}\n",
-        )
-        .unwrap();
-        let positions = [
-            (
-                "table description",
-                (|t: &mut Table, s: &str| t.description = Some(s.into())) as fn(&mut Table, &str),
-            ),
-            ("column description", |t: &mut Table, s: &str| {
-                t.columns["v"].description = Some(s.into())
-            }),
-            ("default", |t: &mut Table, s: &str| {
-                t.columns["v"].value_source = pbps_model::ValueSource::Default(s.into())
-            }),
-            ("deprecated", |t: &mut Table, s: &str| {
-                t.columns["v"].deprecated = Some(s.into())
-            }),
-            ("check", |t: &mut Table, s: &str| {
-                t.checks.get_mut("ck").unwrap().expression = s.into()
-            }),
-            ("filter", |t: &mut Table, s: &str| {
-                t.indexes.get_mut("ix").unwrap().filter = Some(s.into())
-            }),
-            ("generated", |t: &mut Table, s: &str| {
-                match &mut t.columns["g"].value_source {
-                    pbps_model::ValueSource::Generated(generated) => {
-                        generated.expression = s.into()
-                    }
+    // scalar()/needs_quotes() inspect only their scalar, with no width,
+    // neighbour-dependent style or per-declaration state. Each context gets a
+    // permutation of the same corpus. Distinct values in the nine positions
+    // prevent a field mix-up from comparing equal, while one declaration pays
+    // for its surrounding names/types only once (issue #2116).
+    fn scalar_batch(base: &crate::LoadedTable, cases: &[String]) -> String {
+        let make = |cases: &[String]| {
+            let mut expected = base.clone();
+            for i in 0..cases.len() {
+                let text = |offset: usize| &cases[(i + offset) % cases.len()];
+                let key = i.to_string();
+                let mut column = base.table.columns["v"].clone();
+                column.description = Some(text(0).as_str().into());
+                column.value_source = pbps_model::ValueSource::Default(text(1).clone());
+                column.deprecated = Some(text(2).as_str().into());
+                expected.table.columns.insert(key.clone(), column);
+                let mut generated = base.table.columns["g"].clone();
+                match &mut generated.value_source {
+                    pbps_model::ValueSource::Generated(g) => g.expression = text(3).clone(),
                     pbps_model::ValueSource::None
                     | pbps_model::ValueSource::Default(_)
                     | pbps_model::ValueSource::Identity(_)
                     | pbps_model::ValueSource::Sequence(_) => panic!("generated fixture"),
                 }
+                expected.table.columns.insert(format!("+{i}"), generated);
+                let mut check = base.table.checks["ck"].clone();
+                check.expression = text(4).clone();
+                expected.table.checks.insert(key.clone(), check);
+                let mut index = base.table.indexes["ix"].clone();
+                index.filter = Some(text(5).clone());
+                expected.table.indexes.insert(key, index);
+                let mut computed = base.table.computed["c"].clone();
+                computed.expression = text(6).clone();
+                expected.table.computed.insert(format!("-{i}"), computed);
+                let mut row = base
+                    .table
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .rows
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                row.0
+                    .insert("v".into(), pbps_model::Value::Text(text(8).clone()));
+                assert!(
+                    expected
+                        .table
+                        .data
+                        .as_mut()
+                        .unwrap()
+                        .rows
+                        .insert(text(7).as_str().into(), row)
+                        .is_none()
+                );
+            }
+            expected
+        };
+        let expected = make(cases);
+        let out = render(&expected.name, &expected.table, &[], None);
+        if cases == ["no", "plain_name"] {
+            // Both spellings must survive together, even though both load as
+            // strings when unnecessarily quoted. Model equality alone misses it.
+            assert!(
+                out.contains("default: \"no\"\n"),
+                "quoted neighbour no: {out}"
+            );
+            assert!(
+                out.contains("default: plain_name\n"),
+                "bare neighbour plain_name: {out}"
+            );
+        }
+        let back = crate::load_table_str(Path::new("t.yml"), &out).unwrap_or_else(|error| {
+            for text in cases {
+                round_trip_loaded(
+                    &make(std::slice::from_ref(text)),
+                    &format!("scalar contexts: {text:?}"),
+                );
+            }
+            panic!("only the combined scalar batch failed: {cases:?}: {error:?}");
+        });
+        for i in 0..cases.len() {
+            let text = |offset: usize| &cases[(i + offset) % cases.len()];
+            let key = i.to_string();
+            let a = &expected.table.columns[&key];
+            let b = back.table.columns.get(&key).unwrap_or_else(|| {
+                panic!(
+                    "missing column for description {:?}, default {:?}, deprecated {:?}",
+                    text(0),
+                    text(1),
+                    text(2)
+                )
+            });
+            assert_eq!(
+                a.description,
+                b.description,
+                "column description: {:?}",
+                text(0)
+            );
+            assert_eq!(a.value_source, b.value_source, "default: {:?}", text(1));
+            assert_eq!(a.deprecated, b.deprecated, "deprecated: {:?}", text(2));
+            assert_eq!(
+                expected.table.columns.get(&format!("+{i}")),
+                back.table.columns.get(&format!("+{i}")),
+                "generated: {:?}",
+                text(3)
+            );
+            assert_eq!(
+                expected.table.checks.get(&key),
+                back.table.checks.get(&key),
+                "check: {:?}",
+                text(4)
+            );
+            assert_eq!(
+                expected.table.indexes.get(&key),
+                back.table.indexes.get(&key),
+                "filter: {:?}",
+                text(5)
+            );
+            assert_eq!(
+                expected.table.computed.get(&format!("-{i}")),
+                back.table.computed.get(&format!("-{i}")),
+                "computed: {:?}",
+                text(6)
+            );
+            let key = text(7).as_str().into();
+            assert_eq!(
+                expected.table.data.as_ref().unwrap().rows.get(&key),
+                back.table
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.rows.get(&key)),
+                "row key: {:?}, cell: {:?}",
+                text(7),
+                text(8)
+            );
+        }
+        assert_eq!(expected, back, "scalar batch surrounding fields");
+        let out2 = render(&back.name, &back.table, &[], None);
+        if out != out2 {
+            for text in cases {
+                round_trip_loaded(
+                    &make(std::slice::from_ref(text)),
+                    &format!("scalar contexts: {text:?}"),
+                );
+            }
+            assert_eq!(out, out2, "scalar batch {cases:?} is not idempotent");
+        }
+        out
+    }
+
+    // Duplicate row keys must start another batch rather than overwrite a case.
+    fn unique_batches(cases: &[String]) -> Vec<&[String]> {
+        let mut batches = Vec::new();
+        let mut start = 0;
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, text) in cases.iter().enumerate() {
+            if i - start == 512 || seen.contains(text) {
+                batches.push(&cases[start..i]);
+                start = i;
+                seen.clear();
+            }
+            seen.insert(text);
+        }
+        if start < cases.len() {
+            batches.push(&cases[start..]);
+        }
+        batches
+    }
+
+    #[test]
+    fn every_scalar_context_keeps_its_exact_text_and_format() {
+        let base = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: app.t\ncolumns:\n  id: {type: varchar(100), nullable: false}\n  v: {type: varchar(100)}\n  g: {type: int, generated: {expression: '1', stored: true}}\ncomputed:\n  c: {expression: '1'}\nprimary_key: [id]\nchecks: {ck: '1 = 1'}\nindexes:\n  ix: {columns: [v], where: v IS NOT NULL}\ndata:\n  mode: exact\n  rows:\n    row: {v: text}\n",
+        ).unwrap();
+        scalar_batch(&base, &["no".into(), "plain_name".into()]);
+        // Keep each original single-field shape beside its unchanged fields.
+        // Corpus permutations below cover the spelling in every context; these
+        // controls also catch a field accidentally nested under another field.
+        type Position = (&'static str, fn(&mut Table));
+        let positions: [Position; 9] = [
+            ("column description", |t| {
+                t.columns["v"].description = Some("no".into())
             }),
-            ("computed", |t: &mut Table, s: &str| {
-                t.computed.get_mut("c").unwrap().expression = s.into()
+            ("default", |t| {
+                t.columns["v"].value_source = pbps_model::ValueSource::Default("no".into())
             }),
-            ("row key", |t: &mut Table, s: &str| {
+            ("deprecated", |t| {
+                t.columns["v"].deprecated = Some("no".into())
+            }),
+            ("check", |t| {
+                t.checks.get_mut("ck").unwrap().expression = "no".into()
+            }),
+            ("filter", |t| {
+                t.indexes.get_mut("ix").unwrap().filter = Some("no".into())
+            }),
+            ("generated", |t| {
+                if let pbps_model::ValueSource::Generated(g) = &mut t.columns["g"].value_source {
+                    g.expression = "no".into();
+                } else {
+                    panic!("generated fixture");
+                }
+            }),
+            ("computed", |t| {
+                t.computed.get_mut("c").unwrap().expression = "no".into()
+            }),
+            ("row key", |t| {
                 let rows = &mut t.data.as_mut().unwrap().rows;
                 let (_, row) = rows.pop_first().unwrap();
-                rows.insert(s.into(), row);
+                rows.insert("no".into(), row);
             }),
-            ("cell", |t: &mut Table, s: &str| {
+            ("cell", |t| {
                 t.data
                     .as_mut()
                     .unwrap()
@@ -1014,15 +1181,41 @@ mod tests {
                     .next()
                     .unwrap()
                     .0
-                    .insert("v".into(), pbps_model::Value::Text(s.into()));
+                    .insert("v".into(), pbps_model::Value::Text("no".into()));
             }),
         ];
-        for s in scalar_corpus() {
-            for (position, set) in positions {
-                let mut expected = base.clone();
-                set(&mut expected.table, &s);
-                round_trip_loaded(&expected, &format!("{position}: {s:?}"));
-            }
+        for (position, set) in positions {
+            let mut isolated = base.clone();
+            set(&mut isolated.table);
+            round_trip_loaded(&isolated, &format!("isolated {position}: no"));
+        }
+        let corpus = scalar_corpus();
+        assert_eq!(corpus.len(), 1761);
+        let batches = unique_batches(&corpus);
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).sum::<usize>(),
+            corpus.len()
+        );
+        for batch in batches {
+            assert!(
+                batch.len() >= 9,
+                "context permutations need distinct values"
+            );
+            scalar_batch(&base, batch);
+        }
+        // A description cannot repeat in one table. The other contexts above
+        // retain the full fixture; this one needs only its surrounding mapping.
+        let mut description = crate::load_table_str(
+            Path::new("t.yml"),
+            "table: app.t\ncolumns: {id: {type: int}}\n",
+        )
+        .unwrap();
+        let mut full = base.clone();
+        full.table.description = Some("no".into());
+        round_trip_loaded(&full, "table description beside every other context");
+        for s in corpus {
+            description.table.description = Some(s.as_str().into());
+            round_trip_loaded(&description, &format!("table description: {s:?}"));
             let module = Module {
                 kind: pbps_model::ModuleKind::View,
                 description: Some(s.as_str().into()),
@@ -1404,26 +1597,115 @@ indexes:
                 }
             }
         }
-        for text in cases {
-            // The loader owns string keys as well as untagged data cells;
-            // exercise all three positions through a whole declaration.
-            // Dots are not representable in a column identity. They remain
-            // valid row keys and cells, so keep testing those positions.
-            let name =
-                if !text.is_empty() && text != "id" && pbps_model::check_segment(&text).is_ok() {
+        assert_eq!(cases.len(), 6129);
+        // As scalar_batch documents, scalar() has no neighbour-dependent state.
+        // Every spelling still occupies its original three contexts; duplicate
+        // keys start a new batch so no earlier case can be overwritten.
+        let make = |cases: &[String]| {
+            let mut expected = base.clone();
+            expected.table.data.as_mut().unwrap().rows.clear();
+            for text in cases {
+                // Dots remain valid row keys/cells but cannot name a column.
+                let name = if !text.is_empty()
+                    && text != "id"
+                    && pbps_model::check_segment(text).is_ok()
+                {
                     text.clone()
                 } else {
                     "v".into()
                 };
-            let mut expected = base.clone();
-            let column = expected.table.columns.shift_remove("v").unwrap();
-            expected.table.columns.insert(name.clone(), column);
-            let rows = &mut expected.table.data.as_mut().unwrap().rows;
-            let (_, mut row) = rows.pop_first().unwrap();
-            row.0.clear();
-            row.0.insert(name, pbps_model::Value::Text(text.clone()));
-            rows.insert(text.clone().into(), row);
-            round_trip_loaded(&expected, &format!("numeric spelling: {text:?}"));
+                expected
+                    .table
+                    .columns
+                    .insert(name.clone(), base.table.columns["v"].clone());
+                let mut row = base
+                    .table
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .rows
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                row.0.clear();
+                row.0.insert(name, pbps_model::Value::Text(text.clone()));
+                assert!(
+                    expected
+                        .table
+                        .data
+                        .as_mut()
+                        .unwrap()
+                        .rows
+                        .insert(text.clone().into(), row)
+                        .is_none()
+                );
+            }
+            expected
+        };
+        let neighbours = make(&["0x1f".into(), "plain_name".into()]);
+        let out = render(&neighbours.name, &neighbours.table, &[], None);
+        assert!(
+            out.contains("    \"0x1f\": {\"0x1f\": \"0x1f\"}"),
+            "quoted numeric neighbour 0x1f: {out}"
+        );
+        assert!(
+            out.contains("    plain_name: {plain_name: plain_name}"),
+            "bare numeric neighbour plain_name: {out}"
+        );
+        round_trip_loaded(&neighbours, "numeric neighbours 0x1f / plain_name");
+        let batches = unique_batches(&cases);
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).sum::<usize>(),
+            cases.len()
+        );
+        for batch in batches {
+            let expected = make(batch);
+            let out = render(&expected.name, &expected.table, &[], None);
+            let back = crate::load_table_str(Path::new("t.yml"), &out).unwrap_or_else(|error| {
+                for text in batch {
+                    round_trip_loaded(
+                        &make(std::slice::from_ref(text)),
+                        &format!("numeric spelling: {text:?}"),
+                    );
+                }
+                panic!("only the combined numeric batch failed: {batch:?}: {error:?}");
+            });
+            for text in batch {
+                let key = text.as_str().into();
+                assert_eq!(
+                    expected.table.data.as_ref().unwrap().rows.get(&key),
+                    back.table
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.rows.get(&key)),
+                    "numeric spelling: {text:?}"
+                );
+                let name = if !text.is_empty()
+                    && text != "id"
+                    && pbps_model::check_segment(text).is_ok()
+                {
+                    text.as_str()
+                } else {
+                    "v"
+                };
+                assert_eq!(
+                    expected.table.columns.get(name),
+                    back.table.columns.get(name),
+                    "numeric column: {text:?}"
+                );
+            }
+            assert_eq!(expected, back, "numeric batch surrounding fields");
+            let out2 = render(&back.name, &back.table, &[], None);
+            if out != out2 {
+                for text in batch {
+                    round_trip_loaded(
+                        &make(std::slice::from_ref(text)),
+                        &format!("numeric spelling: {text:?}"),
+                    );
+                }
+                assert_eq!(out, out2, "numeric batch {batch:?} is not idempotent");
+            }
         }
     }
 
