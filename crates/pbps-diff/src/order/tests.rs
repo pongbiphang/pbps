@@ -3570,3 +3570,86 @@ fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
     );
     assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
 }
+
+/// `SET c = DEFAULT` with a literal default sets the value the default spells,
+/// so a child that names it waits for the update (review of #2120).
+#[test]
+fn a_parent_update_to_a_literal_default_is_the_row_a_child_names() {
+    let none = ModuleDeps::new();
+    let update = p(Change::UpdateRow {
+        table: t("p"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        columns: [(
+            "code".to_owned(),
+            (
+                pbps_model::Cell::Value(Value::Int(9)),
+                pbps_model::Cell::Default("5".into()),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    });
+    let mut plan = parent_and_child(
+        &["id", "code"],
+        &["code"],
+        &["id", "pcode"],
+        reference(&["pcode"], &["code"]),
+        vec![plain_row("c", 1, &[("pcode", 5)]), update],
+    );
+    for schema in [&mut plan.before, &mut plan.after] {
+        schema
+            .tables
+            .get_mut(&t("p"))
+            .unwrap()
+            .columns
+            .get_mut("code")
+            .unwrap()
+            .value_source = pbps_model::ValueSource::Default("5".into());
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// A parent row deleted while it held a literal default as its unique value
+/// still ends the name its child holds it by.
+#[test]
+fn a_parent_row_deleted_holding_a_literal_default_goes_after_the_child_that_names_it() {
+    let none = ModuleDeps::new();
+    let parent = p(Change::DeleteRow {
+        table: t("p"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+        row: [("code".to_owned(), pbps_model::Cell::Default("5".into()))]
+            .into_iter()
+            .collect(),
+        dropped: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: None,
+    });
+    let plan = parent_and_child(
+        &["id", "code"],
+        &["code"],
+        &["id", "pcode"],
+        reference(&["pcode"], &["code"]),
+        vec![parent, delete("c", 1, &[("pcode", 5)])],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}

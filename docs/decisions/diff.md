@@ -6623,8 +6623,8 @@ refusing a valid plan:
   same one through the plan's renames, as the differ compares them: a key the
   plan rebuilds is absent while rows move, and names would otherwise swap in
   a cycle. A key over a column the plan retypes is taken for rebuilt, as SQL
-  Server rebuilds it, and a column a row omits takes a literal default as its
-  value.
+  Server rebuilds it, and a column a row omits or sets to its default takes a
+  literal default as its value.
   The update half of #2079 closes with it, so the commutation suites drop
   their `a_row_updated_beside_a_new_column` gap (DEC-1965.1); the insert half
   stays open.

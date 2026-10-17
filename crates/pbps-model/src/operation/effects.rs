@@ -921,6 +921,24 @@ impl Cx<'_> {
                 }
                 // The tuples it ends with and starts from: the cells it sets
                 // or sets from, those it leaves alone, and its key.
+                // A cell that is the column's default is its value when the
+                // default is a literal, as for an insert that omits it.
+                let literal = |cell: &crate::Cell| match cell {
+                    crate::Cell::Default(expression) => literal_value(expression),
+                    crate::Cell::Value(_) => None,
+                };
+                let set_to: Vec<(&str, Value)> = columns
+                    .iter()
+                    .filter_map(|(c, (_, to))| Some((c.as_str(), literal(to)?)))
+                    .collect();
+                let set_from: Vec<(&str, Value)> = columns
+                    .iter()
+                    .filter_map(|(c, (from, _))| Some((c.as_str(), literal(from)?)))
+                    .collect();
+                let held: Vec<(&str, Value)> = unchanged
+                    .iter()
+                    .filter_map(|(c, cell)| Some((c.as_str(), literal(cell)?)))
+                    .collect();
                 let key_value = Value::Text(key.0.clone());
                 let kept: Vec<(&str, &Value)> = unchanged
                     .iter()
@@ -928,9 +946,15 @@ impl Cx<'_> {
                         crate::Cell::Value(v) => Some((c.as_str(), v)),
                         crate::Cell::Default(_) => None,
                     })
+                    .chain(held.iter().map(|(c, v)| (*c, v)))
                     .chain([(key_column.as_str(), &key_value)])
                     .collect();
-                let now: Vec<(&str, &Value)> = cells.iter().chain(&kept).copied().collect();
+                let now: Vec<(&str, &Value)> = cells
+                    .iter()
+                    .copied()
+                    .chain(set_to.iter().map(|(c, v)| (*c, v)))
+                    .chain(kept.iter().copied())
+                    .collect();
                 self.row_references(&owner, &now, true);
                 self.row_aliases(&owner, &now, Some(&written), false);
                 let old: Vec<(&str, &Value)> = columns
@@ -939,6 +963,7 @@ impl Cx<'_> {
                         crate::Cell::Value(v) => Some((c.as_str(), v)),
                         crate::Cell::Default(_) => None,
                     })
+                    .chain(set_from.iter().map(|(c, v)| (*c, v)))
                     .chain(kept.iter().copied())
                     .collect();
                 self.row_references(&owner, &old, false);
@@ -963,12 +988,24 @@ impl Cx<'_> {
                 let written: Vec<&str> = row.keys().map(String::as_str).collect();
                 self.row_writes(table, &owner, &written);
                 let key_value = Value::Text(key.0.clone());
+                // A cell the row held as the column's default is its value
+                // when the default is a literal.
+                let literals: Vec<(&str, Value)> = row
+                    .iter()
+                    .filter_map(|(c, cell)| match cell {
+                        crate::Cell::Default(expression) => {
+                            Some((c.as_str(), literal_value(expression)?))
+                        }
+                        crate::Cell::Value(_) => None,
+                    })
+                    .collect();
                 let mut cells: Vec<(&str, &Value)> = vec![(key_column.as_str(), &key_value)];
                 for (c, cell) in row {
                     if let crate::Cell::Value(v) = cell {
                         cells.push((c.as_str(), v));
                     }
                 }
+                cells.extend(literals.iter().map(|(c, v)| (*c, v)));
                 self.row_references(&owner, &cells, false);
                 self.row_aliases(&owner, &cells, None, true);
                 self.row_blockers_gone(&owner);
