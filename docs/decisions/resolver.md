@@ -3419,7 +3419,11 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
   from a new one, and the comparison refuses. The refusal names fill and
   its remedy: write the object in the externals file as the target has it,
   and the file holds it. It is a rare, detectable combination with a named
-  remedy, so the plan is refused rather than fill's scope narrowed.
+  remedy, so the plan is refused rather than fill's scope narrowed. Every
+  refusal of the comparison names who created the object, fill or the file:
+  a difference, an identity the target does not have (a member renamed in
+  place), and a kind the comparison cannot read (an extension's
+  foreign-data wrapper), each with fill's own remedy.
 - **An extension never waits.** An extension's script runs code of its
   own, an event trigger among it, and creates operators, casts and other
   names. Ahead of everything both are covered: the outside-write check is

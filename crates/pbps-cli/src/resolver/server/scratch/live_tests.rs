@@ -3358,58 +3358,79 @@ async fn resolver_stages_a_cast_and_an_operator_over_external_types_in_the_exter
 
 /// Fill installs the extension the target's current view needs, from the
 /// target's dependencies, whether or not the desired view still does. The
-/// target's member was altered in place, which a new extension cannot
-/// reproduce, so the comparison refuses, naming fill and the remedy. With
-/// the remedy written in the externals file (the extension and the change),
-/// the file holds it, fill leaves it, and the plan resolves.
+/// target's member was changed in place (made `VOLATILE`, or renamed),
+/// which a new extension cannot reproduce, so the comparison refuses,
+/// naming fill and the remedy. With the remedy written in the externals file
+/// (the extension and the change), the file holds it, fill leaves it, and
+/// the plan resolves.
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn resolver_names_fills_altered_extension_member_and_its_remedy() {
-    let call = format!("SELECT {EXTERNAL}.soundex('pbps') AS r");
     let done = "SELECT 'done'::text AS r";
-    let setup = vec![
-        format!("CREATE SCHEMA {MANAGED}"),
-        format!("CREATE SCHEMA {EXTERNAL}"),
-        format!("CREATE EXTENSION fuzzystrmatch SCHEMA {EXTERNAL}"),
-        format!("ALTER FUNCTION {EXTERNAL}.soundex(text) VOLATILE"),
-        format!("CREATE VIEW {MANAGED}.a AS {call}"),
+    let cases = [
+        (
+            "VOLATILE",
+            "soundex",
+            format!(
+                "fill created function {EXTERNAL}.soundex(text), which differs from the target's \
+                 in provolatile; the target's was changed after it was created"
+            ),
+        ),
+        (
+            "RENAME TO soundex_renamed",
+            "soundex_renamed",
+            format!(
+                "fill created function {EXTERNAL}.soundex(text), which the target does not have: \
+                 the target's was changed after it was created"
+            ),
+        ),
     ];
-    let inputs = Inputs::from_pair((
-        declared(&[("a", &call)], &[]),
-        declared(&[("a", done)], &[]),
-    ));
-    let key = ProjectKey::new(true);
-    let remedy = format!(
-        "CREATE SCHEMA {EXTERNAL};\nCREATE EXTENSION fuzzystrmatch SCHEMA {EXTERNAL};\n\
-         ALTER FUNCTION {EXTERNAL}.soundex(text) VOLATILE;"
-    );
-    for externals in [None, Some(remedy.as_str())] {
-        let mut target = Fixture::new("PBPS_TEST_PG_DB");
-        let scratch = Fixture::new(SCRATCH_SERVER);
-        let target_db = staging_target(&mut target, &setup).await;
-        let result = produce_filled(
-            &scratch.server,
-            &target.on(&target_db),
-            &inputs,
-            &key,
-            externals,
-        )
-        .await;
-        target.drop().await;
-        match externals {
-            None => {
-                let refused = externals_refusal(result);
-                assert!(
-                    refused.contains(&format!(
-                        "fill created function {EXTERNAL}.soundex(text), which differs from the \
-                         target's in provolatile; the target's was changed after it was created"
-                    )) && refused.contains("in the externals file as the target has it"),
-                    "{refused}"
-                );
-            }
-            Some(_) => {
-                let plan = result.unwrap_or_else(|error| panic!("with the remedy: {error}"));
-                plan.evidence.validate(&plan.changes).unwrap();
+    for (change, called, named) in cases {
+        let call = format!("SELECT {EXTERNAL}.{called}('pbps') AS r");
+        let altered = format!("ALTER FUNCTION {EXTERNAL}.soundex(text) {change}");
+        let setup = vec![
+            format!("CREATE SCHEMA {MANAGED}"),
+            format!("CREATE SCHEMA {EXTERNAL}"),
+            format!("CREATE EXTENSION fuzzystrmatch SCHEMA {EXTERNAL}"),
+            altered.clone(),
+            format!("CREATE VIEW {MANAGED}.a AS {call}"),
+        ];
+        let inputs = Inputs::from_pair((
+            declared(&[("a", &call)], &[]),
+            declared(&[("a", done)], &[]),
+        ));
+        let key = ProjectKey::new(true);
+        let remedy = format!(
+            "CREATE SCHEMA {EXTERNAL};\nCREATE EXTENSION fuzzystrmatch SCHEMA {EXTERNAL};\n\
+             {altered};"
+        );
+        for externals in [None, Some(remedy.as_str())] {
+            let mut target = Fixture::new("PBPS_TEST_PG_DB");
+            let scratch = Fixture::new(SCRATCH_SERVER);
+            let target_db = staging_target(&mut target, &setup).await;
+            let result = produce_filled(
+                &scratch.server,
+                &target.on(&target_db),
+                &inputs,
+                &key,
+                externals,
+            )
+            .await;
+            target.drop().await;
+            match externals {
+                None => {
+                    let refused = externals_refusal(result);
+                    assert!(
+                        refused.contains(&named)
+                            && refused.contains("in the externals file as the target has it"),
+                        "{change}: {refused}"
+                    );
+                }
+                Some(_) => {
+                    let plan =
+                        result.unwrap_or_else(|error| panic!("{change}, with the remedy: {error}"));
+                    plan.evidence.validate(&plan.changes).unwrap();
+                }
             }
         }
     }
@@ -3478,26 +3499,33 @@ async fn resolver_refuses_an_extension_with_a_member_no_capture_identifies() {
         format!("CREATE EXTENSION postgres_fdw SCHEMA {EXTERNAL}"),
         format!("CREATE VIEW {MANAGED}.a AS {call}"),
     ];
-    let mut target = Fixture::new("PBPS_TEST_PG_DB");
-    let scratch = Fixture::new(SCRATCH_SERVER);
-    let target_db = staging_target(&mut target, &setup).await;
     let inputs = staging_inputs(&call, &call, &[]);
     let key = ProjectKey::new(true);
-    let result = produce_staged(
-        &scratch.server,
-        &target.on(&target_db),
-        &inputs,
-        &key,
-        &externals,
-    )
-    .await;
-    target.drop().await;
-    let refused = externals_refusal(result);
-    assert!(
-        refused.contains("foreign-data wrapper postgres_fdw")
-            && refused.contains("no plan can seal its extension"),
-        "{refused}"
-    );
+    // Written in the externals file, and filled from the target's
+    // dependencies when there is none: each refusal names who created it.
+    for (externals, who) in [
+        (Some(externals.as_str()), "the externals file"),
+        (None, "fill"),
+    ] {
+        let mut target = Fixture::new("PBPS_TEST_PG_DB");
+        let scratch = Fixture::new(SCRATCH_SERVER);
+        let target_db = staging_target(&mut target, &setup).await;
+        let result = produce_filled(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+            externals,
+        )
+        .await;
+        target.drop().await;
+        let refused = externals_refusal(result);
+        assert!(
+            refused.contains(&format!("{who} created foreign-data wrapper postgres_fdw"))
+                && refused.contains("no plan can seal its extension"),
+            "{who}: {refused}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -143,6 +143,11 @@ pub async fn compare(
                 Some(identity) => {
                     resolved.insert(identity, object.described.clone());
                 }
+                None if filled.contains(&object.described) => refused.push(format!(
+                    "fill created {}, which the comparison with the target does not cover; \
+                     select no resolver and keep ADR-0013's conservative rebuild",
+                    object.described
+                )),
                 None => refused.push(format!(
                     "the externals file created {}, which the comparison with the target does not \
                      cover; leave it out of the externals file",
@@ -160,6 +165,12 @@ pub async fn compare(
                 Some(identity) => {
                     resolved.insert(identity, object.described.clone());
                 }
+                None if filled.contains(&object.described) => refused.push(format!(
+                    "fill created {}, an extension's member the comparison with the target \
+                     cannot read, so no plan can seal its extension; select no resolver and \
+                     keep ADR-0013's conservative rebuild",
+                    object.described
+                )),
                 None => refused.push(format!(
                     "the externals file created {}, an extension's member the comparison with the \
                      target cannot read, so no plan can seal its extension; leave the \
@@ -206,10 +217,20 @@ pub async fn compare(
     let mut findings: Vec<String> = absent
         .iter()
         .map(|identity| {
-            format!(
-                "the externals file created {}, which the target does not have",
-                resolved[identity]
-            )
+            let described = &resolved[identity];
+            if filled.contains(described) {
+                // Fill created it as the target's dependencies name it; the
+                // target holds it under another identity now, as a member
+                // renamed after its extension was installed.
+                format!(
+                    "fill created {described}, which the target does not have: the target's was \
+                     changed after it was created, which fill cannot reproduce: write it in the \
+                     externals file as the target has it (an extension's member with its \
+                     extension and the change), and fill leaves it to the file"
+                )
+            } else {
+                format!("the externals file created {described}, which the target does not have")
+            }
         })
         .collect();
     let compared: BTreeSet<ObjectIdentity> = resolved.keys().cloned().collect();
