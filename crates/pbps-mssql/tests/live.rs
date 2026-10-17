@@ -1654,6 +1654,103 @@ async fn pull_reports_the_source_default_once_when_character_columns_exist() {
     }
 }
 
+/// #1438: a column the reader leaves out took nothing with it, so a key,
+/// index, check or foreign key over it was declared and the pulled table then
+/// failed validation. Measured here with an alias-typed column, which every
+/// reader that can see the table also sees as one; the check's columns are the
+/// engine's resolution, so `[m]` is the column and a literal `'m'` is not.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn an_object_over_a_left_out_column_is_left_out_with_it() {
+    let mut db = TestDb::create("left_out1438").await;
+    // Its own batch: a batch is compiled before any of it runs.
+    db.conn
+        .execute("CREATE TYPE dbo.money_t FROM decimal(10, 2) NULL;")
+        .await
+        .expect("create an alias type");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.ch (id int NOT NULL PRIMARY KEY, a int NOT NULL, m decimal(10, 2) NULL, CONSTRAINT uq_ch_m UNIQUE (m));
+             CREATE TABLE dbo.t (
+                 id int NOT NULL CONSTRAINT pk_t PRIMARY KEY,
+                 a int NOT NULL,
+                 m dbo.money_t,
+                 CONSTRAINT uq_t_a_m UNIQUE (a, m),
+                 CONSTRAINT ck_m CHECK ([m] > 0),
+                 CONSTRAINT ck_a CHECK (a <> LEN('m')),
+                 CONSTRAINT fk_t_ch FOREIGN KEY (m) REFERENCES dbo.ch (m)
+             );
+             CREATE INDEX ix_a_with_m ON dbo.t (a) INCLUDE (m);
+             CREATE INDEX ix_a ON dbo.t (a);
+             CREATE TABLE dbo.u (
+                 id int NOT NULL CONSTRAINT pk_u PRIMARY KEY NONCLUSTERED,
+                 v dbo.money_t,
+                 CONSTRAINT uq_u_v UNIQUE CLUSTERED (v)
+             );
+             ALTER TABLE dbo.ch ADD CONSTRAINT fk_ch_t FOREIGN KEY (a, m) REFERENCES dbo.t (a, m);",
+        )
+        .await
+        .expect("create objects over an alias-typed column");
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect objects over a left-out column");
+    db.drop().await;
+
+    let table = |name: &str| &pulled.schema.tables[&TableName::new("dbo", name)];
+    for name in ["t", "u", "ch"] {
+        let errors = pbps_mssql::validate::table(&TableName::new("dbo", name), table(name));
+        assert!(errors.is_empty(), "{name}: {errors:?}");
+    }
+    let t = table("t");
+    assert_eq!(t.columns.keys().collect::<Vec<_>>(), ["id", "a"]);
+    assert_eq!(t.primary_key.as_ref().unwrap().columns, ["id"]);
+    assert!(t.unique.is_empty(), "{:?}", t.unique);
+    assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_a"]);
+    assert_eq!(t.checks.keys().collect::<Vec<_>>(), ["ck_a"]);
+    assert!(t.foreign_keys.is_empty(), "{:?}", t.foreign_keys);
+    let u = table("u");
+    assert!(u.primary_key.is_none() && u.unique.is_empty(), "{u:?}");
+    assert!(table("ch").foreign_keys.is_empty());
+    for (on, detail) in [
+        (
+            "t",
+            "index `ix_a_with_m` is over column `m`, which was left out",
+        ),
+        (
+            "t",
+            "unique constraint `uq_t_a_m` is over column `m`, which was left out",
+        ),
+        (
+            "t",
+            "check constraint `ck_m` is over column `m`, which was left out",
+        ),
+        (
+            "t",
+            "foreign key `fk_t_ch` is over column `m`, which was left out",
+        ),
+        (
+            "u",
+            "unique constraint `uq_u_v` is over column `v`, which was left out",
+        ),
+        (
+            "u",
+            "primary key `pk_u` is nonclustered beside the clustered index `uq_u_v`",
+        ),
+        (
+            "ch",
+            "foreign key `fk_ch_t` references key `uq_t_a_m` of dbo.t",
+        ),
+    ] {
+        assert!(
+            pulled.limitations.iter().any(|l| {
+                l.target.object_name() == TableName::new("dbo", on) && l.detail.contains(detail)
+            }),
+            "{detail}: {:?}",
+            pulled.limitations
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn omitted_character_columns_do_not_request_a_bootstrap_collation() {
