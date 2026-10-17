@@ -93,8 +93,9 @@ DEC-1545.1); a staged plan attaches a range or list partition without the
 scan, through a CHECK it validates first (#1638, DEC-1638.1). A standing parent's columns change, recursed into every partition
 (#1687, DEC-1687.1), and its indexes (#1688, DEC-1688.1), keys, checks and
 foreign keys (#1689, DEC-1689.1) are added and dropped, and it is renamed
-(#1690, DEC-1690.1). Attaching as the DEFAULT partition (#1639) stays refused
-by name. `partitions: external` hands a parent's partitions to another tool:
+(#1690, DEC-1690.1). A table is attached as the DEFAULT partition too, and
+its rows another partition takes are refused before any statement (#1639,
+DEC-1639.1). `partitions: external` hands a parent's partitions to another tool:
 pbps manages the parent alone, refuses a partition holding anything of its
 own, and `pull` declares it on pg_partman's parents and on each
 `--partitions-external` (#1533, DEC-1533.1).

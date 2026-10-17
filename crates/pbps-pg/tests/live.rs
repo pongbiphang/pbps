@@ -7987,6 +7987,216 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
     }
 }
 
+/// The pre-flight of an attach as the DEFAULT partition agrees with the
+/// engine (#1639): the table's rows another partition takes are counted, a
+/// NULL key among them only where a list takes NULL, with the partitions the
+/// plan creates or attaches beside it and without one it detaches first; and
+/// a DEFAULT the parent keeps is counted, one the plan detaches is not. The
+/// engine refuses the attach while a counted row is there, and takes it once
+/// none is. On 16 and 18.
+#[tokio::test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+async fn a_default_attach_counts_the_rows_another_partition_takes() {
+    use pbps_model::{BoundDatum as D, Change, PartitionBound as B};
+
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("the PostgreSQL 16 fixture");
+    for connection in [conn_str(), old] {
+        let database = format!("pbps_test_part1639_{}", std::process::id());
+        let mut admin = Conn::connect(Driver::Postgres, &connection).await.unwrap();
+        admin
+            .execute(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
+            .await
+            .expect("clear a database left by an earlier run");
+        admin
+            .execute(&format!("CREATE DATABASE {database}"))
+            .await
+            .expect("create the database");
+        let own = connection.replace("dbname=pbps_test", &format!("dbname={database}"));
+        assert_ne!(
+            own, connection,
+            "the fixture names its database `pbps_test`"
+        );
+        let mut conn = Conn::connect(Driver::Postgres, &own).await.unwrap();
+        let s = emit_schema("part1639");
+        fresh(&mut conn, &s).await;
+        conn.execute(&format!(
+            "CREATE TABLE {s}.m (a integer, b text) PARTITION BY RANGE (a);
+             CREATE TABLE {s}.m1 PARTITION OF {s}.m FOR VALUES FROM (0) TO (10);
+             CREATE TABLE {s}.m2 PARTITION OF {s}.m FOR VALUES FROM (10) TO (20);
+             CREATE TABLE {s}.t (a integer, b text);
+             INSERT INTO {s}.t VALUES (25, 'x'), (NULL, 'x'), (-5, 'x'), (5, 'in m1'),
+               (15, 'in m2'), (35, 'in the new m3');
+             CREATE TABLE {s}.l (k text, b text) PARTITION BY LIST (k);
+             CREATE TABLE {s}.l1 PARTITION OF {s}.l FOR VALUES IN ('a', 'b');
+             CREATE TABLE {s}.l2 PARTITION OF {s}.l FOR VALUES IN (NULL);
+             CREATE TABLE {s}.u (k text, b text);
+             INSERT INTO {s}.u VALUES ('a', 'in l1'), (NULL, 'in l2'), ('z', 'x');"
+        ))
+        .await
+        .expect("the tables");
+        let pg = Postgres::new();
+        let name = |t: &str| TableName::new(&s, t);
+        let attach = |table: &str, parent: &str| Change::AttachPartition {
+            uid: "t_aaaaaa".parse().unwrap(),
+            table: name(table),
+            parent: name(parent),
+            bound: B::Default,
+            key: Vec::new(),
+            shape: Box::default(),
+        };
+        let plan = |changes: Vec<Change>| pbps_model::ChangeSet {
+            changes: changes
+                .into_iter()
+                .map(pbps_model::PlannedChange::new)
+                .collect(),
+        };
+        let probes = |set: &pbps_model::ChangeSet| {
+            let found = pg.fixture_preflight(set);
+            assert!(found.unchecked.is_empty(), "{:?}", found.unchecked);
+            found.probes
+        };
+        let rows = |probes: &[pbps_dialect::Probe]| {
+            let probe = probes
+                .iter()
+                .find(|p| p.description.contains("that another partition of"))
+                .unwrap_or_else(|| panic!("no rows probe: {probes:?}"))
+                .clone();
+            probe.sql
+        };
+        let standing = |probes: &[pbps_dialect::Probe]| {
+            let probe = probes
+                .iter()
+                .find(|p| p.description.contains("neither detaches nor drops"))
+                .unwrap_or_else(|| panic!("no DEFAULT probe: {probes:?}"))
+                .clone();
+            probe.sql
+        };
+
+        // Alone: the rows of m1 and m2, and not the NULL key, which a range
+        // never takes.
+        let alone = plan(vec![attach("t", "m")]);
+        assert_eq!(probes(&alone).len(), 4, "{:?}", probes(&alone));
+        assert_eq!(counted(&mut conn, &rows(&probes(&alone))).await, 2);
+        // A range the plan creates beside it counts its rows too.
+        let m3 = Change::CreateTable {
+            uid: "t_bbbbbb".parse().unwrap(),
+            name: name("m3"),
+            table: Box::new(pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: name("m"),
+                    bound: B::Range {
+                        from: vec![D::Value("30".into())],
+                        to: vec![D::Value("40".into())],
+                    },
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            }),
+            beside_default: None,
+            moves_at_most: None,
+        };
+        let created = plan(vec![attach("t", "m"), m3]);
+        assert_eq!(counted(&mut conn, &rows(&probes(&created))).await, 3);
+        // A partition the plan detaches first takes none of them.
+        let detach = |table: &str, parent: &str| Change::DetachPartition {
+            uid: "t_cccccc".parse().unwrap(),
+            table: name(table),
+            parent: name(parent),
+            names: Vec::new(),
+            shape: Box::default(),
+        };
+        let detached = plan(vec![detach("m2", "m"), attach("t", "m")]);
+        assert_eq!(counted(&mut conn, &rows(&probes(&detached))).await, 1);
+        // A list that takes NULL claims the NULL key.
+        let listed = plan(vec![attach("u", "l")]);
+        assert_eq!(counted(&mut conn, &rows(&probes(&listed))).await, 2);
+
+        // No DEFAULT yet; one the parent keeps is counted, and one the plan
+        // detaches first is not.
+        assert_eq!(counted(&mut conn, &standing(&probes(&alone))).await, 0);
+        conn.execute(&format!(
+            "CREATE TABLE {s}.m_rest PARTITION OF {s}.m DEFAULT"
+        ))
+        .await
+        .expect("a DEFAULT partition");
+        assert_eq!(counted(&mut conn, &standing(&probes(&alone))).await, 1);
+        let replaced = plan(vec![detach("m_rest", "m"), attach("t", "m")]);
+        assert_eq!(counted(&mut conn, &standing(&probes(&replaced))).await, 0);
+        let sql = |change: &Change| -> String {
+            pg.emit(change, Default::default())
+                .expect("emit")
+                .into_iter()
+                .map(|statement| statement.sql)
+                .collect()
+        };
+        let refused = conn
+            .execute(&sql(&attach("t", "m")))
+            .await
+            .expect_err("a second DEFAULT");
+        assert!(
+            format!("{refused:?}").contains("conflicts with existing default partition"),
+            "{refused:?}"
+        );
+        conn.execute(&format!("DROP TABLE {s}.m_rest"))
+            .await
+            .expect("the DEFAULT dropped");
+        assert_eq!(counted(&mut conn, &standing(&probes(&alone))).await, 0);
+
+        // The engine agrees with the count, for a range and for a list.
+        for (table, parent, cleared) in [
+            (
+                "t",
+                "m",
+                format!("DELETE FROM {s}.t WHERE a BETWEEN 0 AND 19"),
+            ),
+            (
+                "u",
+                "l",
+                format!("DELETE FROM {s}.u WHERE k IS NULL OR k = 'a'"),
+            ),
+        ] {
+            let attach = attach(table, parent);
+            let refused = conn
+                .execute(&sql(&attach))
+                .await
+                .expect_err("rows another partition takes");
+            assert!(
+                format!("{refused:?}").contains("violated by some row"),
+                "{table}: {refused:?}"
+            );
+            conn.execute(&cleared).await.expect("the rows cleared");
+            let rows = rows(&probes(&plan(vec![attach.clone()])));
+            assert_eq!(counted(&mut conn, &rows).await, 0, "{table}");
+            conn.execute(&sql(&attach))
+                .await
+                .expect("attached once none is counted");
+        }
+        // Routed through the parent: a key no range takes, and a NULL one.
+        conn.execute(&format!(
+            "INSERT INTO {s}.m VALUES (500, 'routed'), (NULL, 'routed')"
+        ))
+        .await
+        .expect("rows through the parent");
+        assert_eq!(
+            counted(
+                &mut conn,
+                &format!(
+                    "SELECT count(*)::int FROM {s}.m WHERE tableoid = '{s}.t'::regclass \
+                     AND b = 'routed'"
+                )
+            )
+            .await,
+            2
+        );
+
+        drop(conn);
+        admin
+            .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .expect("drop the database");
+    }
+}
+
 /// A detach locks the parent before it renames anything on the partition,
 /// the order every query on the tree takes them in (#1544). The other order
 /// deadlocks against a reader that holds the parent and has not reached the
