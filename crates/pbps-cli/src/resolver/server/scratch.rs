@@ -1543,6 +1543,23 @@ fn identities(created: &externals::Created) -> BTreeSet<(String, String)> {
         .collect()
 }
 
+/// Resets every setting of `session` for a shared-state read, then pins its
+/// path empty again, as every pbps session's is (DEC-1564.1). The pin is the
+/// session's, not the transaction's: `pbps-db` sets it with a plain `SET`,
+/// which `RESET ALL` clears, and what runs on the session after the commit
+/// (the backend check's `::text`, the compile) relies on it, where a type the
+/// script or fill created may be named `text`. A rollback restores the pin
+/// with the rest.
+async fn reset_settings(session: &mut Conn, which: &str) -> Result<(), Error> {
+    for statement in ["RESET ALL", "SET search_path = ''"] {
+        session
+            .execute(statement)
+            .await
+            .map_err(|error| Error::Read(format!("{which}'s settings: {error}")))?;
+    }
+    Ok(())
+}
+
 /// Sends fill's statements on `session` in one `REPEATABLE READ`
 /// transaction, under the empty path every pbps session pins (#1778). pbps
 /// renders them from the target's catalog, so a refusal is the target's
@@ -1572,10 +1589,7 @@ async fn run_fill(
         // second read's reset drops, and a role's `VALID UNTIL` would then
         // read as changed.
         if checked {
-            session
-                .execute("RESET ALL")
-                .await
-                .map_err(read("the fill session's settings"))?;
+            reset_settings(session, "the fill session").await?;
         }
         let before = if checked {
             externals::shared_state(session)
@@ -1598,14 +1612,7 @@ async fn run_fill(
         if !checked {
             return Ok(());
         }
-        session
-            .execute("RESET ALL")
-            .await
-            .map_err(read("the fill session's settings"))?;
-        session
-            .execute("SELECT pg_catalog.set_config('search_path', '', true)")
-            .await
-            .map_err(read("the fill session's path"))?;
+        reset_settings(session, "the fill session").await?;
         let after = externals::shared_state(session)
             .await
             .map_err(read("the cluster's shared state"))?;
@@ -1637,7 +1644,11 @@ async fn run_fill(
     session
         .execute("COMMIT")
         .await
-        .map_err(read("the fill's transaction"))
+        .map_err(read("the fill's transaction"))?;
+    // A `SET` an event trigger made on fill's statements outlasts the
+    // commit, as the externals file's own do, and what runs next on this
+    // session must not inherit it; the role is left as it is.
+    reset_settings(session, "the fill session").await
 }
 
 /// Every object in the scratch database initdb did not create.
@@ -1706,18 +1717,12 @@ async fn run_externals(
         // read. Every setting is reset rather than the ones known to matter,
         // so one no one listed cannot refuse a valid externals file. The path is
         // pinned again, empty as every pbps session's (DEC-1564.1), since a
-        // type the script creates may be named `text`.
+        // type the script creates may be named `text`: for the session, not
+        // the transaction, as what runs after the commit relies on it too.
         if !checked {
             return Ok(());
         }
-        session
-            .execute("RESET ALL")
-            .await
-            .map_err(read("the externals file session's settings"))?;
-        session
-            .execute("SELECT pg_catalog.set_config('search_path', '', true)")
-            .await
-            .map_err(read("the externals file session's path"))?;
+        reset_settings(session, "the externals file session").await?;
         let after = externals::shared_state(session)
             .await
             .map_err(read("the cluster's shared state"))?;
@@ -1749,11 +1754,16 @@ async fn run_externals(
         .await
         .map_err(read("the externals file's transaction"))?;
     // Its `SET`s outlast the transaction; the supplied layout compiles on
-    // this same session next.
+    // this same session next. The discard clears the empty path too, which
+    // is pinned again.
     session
         .execute("DISCARD ALL")
         .await
         .map_err(read("the externals file session's settings"))?;
+    session
+        .execute("SET search_path = ''")
+        .await
+        .map_err(read("the externals file session's path"))?;
     Ok(())
 }
 

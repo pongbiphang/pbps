@@ -2767,6 +2767,68 @@ async fn resolver_fills_what_a_routine_declared_through_the_extras_needs() {
     );
 }
 
+/// The outside-write check resets the session's settings, and `pbps-db`
+/// pins the empty path with a plain `SET`, which the reset clears. A supplied
+/// login whose own default path is `public, pg_catalog` would then resolve
+/// the backend check's `::text` to the enum `public.text` that fill, or the
+/// externals file, created: the path is pinned again for the session, and
+/// the plan resolves either way.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_keeps_the_empty_path_after_the_outside_write_check() {
+    let enum_type = "CREATE TYPE public.text AS ENUM ('a')";
+    let a = "SELECT 'a'::public.text AS x";
+    let inputs = Inputs::from_pair((
+        declared(&[("a", a)], &[]),
+        declared(&[("a", a), ("b", a)], &[]),
+    ));
+    let key = ProjectKey::new(true);
+    for (externals, server) in
+        [None, Some(format!("{enum_type};"))]
+            .into_iter()
+            .flat_map(|externals| {
+                SERVERS
+                    .iter()
+                    .map(move |&server| (externals.clone(), server))
+            })
+    {
+        let setup = vec![
+            format!("CREATE SCHEMA {MANAGED}"),
+            enum_type.to_owned(),
+            format!("CREATE VIEW {MANAGED}.a AS {a}"),
+        ];
+        let mut fixture = Fixture::new(server);
+        let target_db = staging_target(&mut fixture, &setup).await;
+        let (login, scratch_db) = fixture.confined().await;
+        let mut cluster = Conn::connect(Driver::Postgres, &fixture.server)
+            .await
+            .unwrap();
+        cluster
+            .execute(&format!(
+                "ALTER ROLE {} SET search_path = public, pg_catalog",
+                login.0
+            ))
+            .await
+            .unwrap();
+        let result = produce_filled(
+            &fixture.as_login(&scratch_db, &login),
+            &fixture.on(&target_db),
+            &inputs,
+            &key,
+            externals.as_deref(),
+        )
+        .await;
+        fixture.drop().await;
+        let context = if externals.is_some() {
+            "the file"
+        } else {
+            "fill"
+        };
+        let plan = result.unwrap_or_else(|error| panic!("{server}, {context}: {error}"));
+        plan.evidence.validate(&plan.changes).unwrap();
+    }
+}
+
 /// On the target `ext.d(NULL)` casts to the domain `ext.d`, which names
 /// `m`'s row type; scratch compiles the views before fill creates the
 /// domain, and they bind the externals file's `ext.d(text)` instead

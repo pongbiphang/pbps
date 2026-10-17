@@ -3411,6 +3411,15 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
   reads come after a `RESET ALL`: a chained fill runs on a session the
   compile pinned to the target's zone, and a role's `VALID UNTIL` would
   otherwise render differently in the two.
+- **A reset leaves the session's empty path pinned.** `pbps-db` pins the
+  empty path with a plain `SET`, which `RESET ALL` and `DISCARD ALL`
+  clear, and what runs on the session after the commit relies on it: the
+  backend check's `::text`, the compile, the cleanup reads. A type fill or
+  the file created may be named `text`. So every reset, in fill and after
+  the externals file's discard, pins the path again for the session, not
+  the transaction. Fill also resets its session after the commit, as the
+  file's discard does, so a `SET` an event trigger made there reaches
+  nothing that runs next; it leaves the role as it is.
 - **The managed routines are found with the run's write path.** Fill looks
   up a declared routine's signature with the request's write-path extras,
   as the run's other lookups of the managed routines do, so a type named
@@ -3472,6 +3481,7 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
 `resolver_resolves_a_call_named_like_a_chained_sequence`,
 `resolver_compiles_after_a_chained_fill_under_the_deployers_settings`,
 `resolver_reads_a_roles_expiry_alike_around_a_chained_fill`,
+`resolver_keeps_the_empty_path_after_the_outside_write_check`,
 `resolver_fills_what_a_routine_declared_through_the_extras_needs`,
 `resolver_refuses_a_chain_through_an_object_the_externals_file_holds_naming_it`,
 `resolver_fills_the_external_objects_no_externals_file_stages`,
