@@ -6619,7 +6619,9 @@ a valid plan:
   update requires the parent's written side, and a child's delete or update
   requires the parent's held side, so a parent's rows come first and a
   child's rows leave first. A delete also waits for a foreign key into its
-  table that the plan drops or replaces, and a row written waits for
+  table that the plan drops, a rebuild's too (the baseline `analyse` reads is
+  no longer one without the keys the plan drops and adds again: the differ
+  puts a parent's rows first around a rebuild, so rows need no exemption), and a row written waits for
   whatever the plan takes away from its table, a check, key or index, by the
   name and whatever its text: a check the resolver rebinds is torn down and
   put back around the rows (`RowSide::Released`, a key per part, so two drops
