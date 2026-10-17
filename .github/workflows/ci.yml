@@ -135,6 +135,10 @@ jobs:
       # is the only place it is caught (DEC-671.1).
       - run: python3 scripts/check_decisions_test.py
       - run: python3 scripts/check-decisions.py
+      # A name or a plan text that is used raw must not reach a message a
+      # person reads (#2084); the compiler cannot see that last step.
+      - run: python3 scripts/check_raw_in_messages_test.py
+      - run: python3 scripts/check-raw-in-messages.py
       # The checker `ci-gate` runs on its own `needs` (#637).
       - run: python3 scripts/check_gate_needs_test.py
       - run: python3 scripts/ci_gate_verdict_test.py
