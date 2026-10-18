@@ -452,7 +452,11 @@ indexes:
   `columns:` and not among them: `{expression: "a * 2"}`, with `persisted:
   true` for a stored value and `not_null: true` for `PERSISTED NOT NULL`. It
   has no type, nullability or default to declare: the engine infers them. An
-  index, unique constraint or check may be over one. A primary or foreign key
+  index or unique constraint may be over one, and a check over a `persisted`
+  one: SQL Server refuses a check over one that is not (1764). Which column a
+  name in a check binds to is the engine's to say, so `validate` notes each
+  check that may read one rather than refusing it, and `plan --dev` asks the
+  engine (#1450). A primary or foreign key
   may not yet (#1419). Created at the end of its table, a computed column is
   changed by a drop and an add, never in place. PostgreSQL refuses
   `computed:`: its form is `generated:` (DEC-1174.1).

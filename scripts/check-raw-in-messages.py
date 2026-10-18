@@ -99,8 +99,9 @@ ALLOWED = {
         "until #2084 step 5",
     ),
     "crates/pbps-mssql/src/validate.rs": (
-        12,
-        "validation sentences feed whole-escaped DialectError fields "
+        13,
+        "validation sentences feed whole-escaped DialectError fields, and the "
+        "#1450 declaration note the whole-escaped `dialect.not-checked` note, "
         "until #2084 step 5",
     ),
     "crates/pbps-pg/src/lib.rs": (
