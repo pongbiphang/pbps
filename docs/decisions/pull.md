@@ -806,14 +806,18 @@ just become `partitions: external` (DEC-1533.1). The scope then reads the
 partition as one of the parent's external partitions, the baseline records
 the handover, and the partition is never dropped.
 
-The check is narrow on purpose. It asks only about the partitions the scope
-leaves external that a table tombstone in the working file names. For those
-alone, the baseline reads the latest ledger entry:
-- refused by name: the recorded state still holds the partition;
-- allowed: the recorded state does not hold it (an old tombstone), or the
-  ledger is empty;
-- refused: the ledger cannot be read, since then it cannot say the partition
-  is not held.
+The check is narrow on purpose. The baseline reads the latest ledger entry
+only while a table tombstone is in the working file and the scope leaves some
+partition external. It matches each tombstone to the recorded state by uid,
+not by the tombstone's name: an intent can rename the table before it drops
+it, and the tombstone then carries a name the database and the recorded state
+do not have (#2172 review). The outcomes:
+- refused by name: the recorded state still holds the tombstoned uid, under a
+  name the scope leaves external;
+- allowed: the recorded state does not hold the uid (an old tombstone, even
+  when a new table reused its name), or the ledger is empty;
+- refused: the ledger cannot be read, since then nothing can say which
+  partition an intent names.
 
 The remedy is to drop or detach the partition with a plan first. A plan
 refuses to drop a partition while it makes the partitions external
@@ -835,5 +839,6 @@ in `crates/pbps-cli/tests/flow_pg.rs` (16 and 18). It covers the refusal, the
 scope's own refusal without the intent, and the baseline that goes once a
 plan has dropped the partition. Also pinned by
 `a_baseline_refuses_handing_over_only_a_held_partition_a_drop_intent_names`
-in `crates/pbps-cli/src/deploy.rs`, which covers which partitions are asked
-about, an old tombstone and an empty ledger.
+in `crates/pbps-cli/src/deploy.rs`, which covers a rename before the drop,
+a column's tombstone, an old tombstone whose name was reused, an empty ledger
+and an unreadable one.
