@@ -1695,6 +1695,7 @@ pub(crate) fn data_problems(
              deployment succeeds and the application breaks afterwards. There is nothing pbps \
              can safely do to the sequence (ADR-0013 section 2). Declare the rows by a natural \
              key, or place them outside pbps and adopt them with `pbps baseline`.",
+            // raw: whole-message escaped until #2084 step 5
             crate::emit::owned_sequence(name, key, sequence).raw()
         )));
     }

@@ -309,7 +309,9 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: crate::types::DIALECT,
             message: format!(
                 "{table} is a partition of {parent}, which SQL Server's model does not hold",
+                // raw: whole-message escaped until #2084 step 5
                 table = table.raw(),
+                // raw: whole-message escaped until #2084 step 5
                 parent = parent.raw()
             ),
         }),
@@ -471,6 +473,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             feature: format!(
                 "a replica identity on `{table}`, which is PostgreSQL's",
+                // raw: whole-message escaped until #2084 step 5
                 table = table.raw()
             ),
         }),
@@ -478,6 +481,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             feature: format!(
                 "storage parameters on `{table}`, which are PostgreSQL's",
+                // raw: whole-message escaped until #2084 step 5
                 table = table.raw()
             ),
         }),
@@ -487,6 +491,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                 dialect: crate::types::DIALECT,
                 message: format!(
                     "{table} is a partition, which SQL Server's model does not hold",
+                    // raw: whole-message escaped until #2084 step 5
                     table = table.raw()
                 ),
             })
@@ -495,6 +500,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             feature: format!(
                 "an unlogged `{table}`, which is PostgreSQL's",
+                // raw: whole-message escaped until #2084 step 5
                 table = table.raw()
             ),
         }),
@@ -502,6 +508,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             feature: format!(
                 "index storage parameters on `{table}`, which are PostgreSQL's",
+                // raw: whole-message escaped until #2084 step 5
                 table = table.raw()
             ),
         }),
@@ -627,6 +634,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                     message: format!(
                         "column `{column}` has type `{ty}`, which SQL Server refuses to name in \
                          ALTER COLUMN; its nullability cannot be changed",
+                        // raw: whole-message escaped until #2084 step 5
                         column = column.raw()
                     ),
                 });
@@ -672,6 +680,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             message: format!(
                 "{column} is a generated column, which this model holds for PostgreSQL only",
+                // raw: whole-message escaped until #2084 step 5
                 column = column.raw()
             ),
         }),
@@ -683,6 +692,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             message: format!(
                 "{column}: a change to its identity has no ALTER on SQL Server, and this model \
                  changes one on PostgreSQL only",
+                // raw: whole-message escaped until #2084 step 5
                 column = column.raw()
             ),
         }),
@@ -1098,6 +1108,7 @@ fn update_row(
             dialect: DIALECT,
             message: format!(
                 "{table}: a row update with no changed column",
+                // raw: whole-message escaped until #2084 step 5
                 table = table.raw()
             ),
         });
@@ -1786,6 +1797,7 @@ fn create_index(
             message: format!(
                 "index `{name}` on `{table}` is the clustered index, which can have neither \
                  INCLUDE columns nor a WHERE filter",
+                // raw: whole-message escaped until #2084 step 5
                 table = table.raw()
             ),
         });
@@ -1905,6 +1917,7 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     if table.columns.is_empty() {
         return Err(DialectError::Invalid {
             dialect: DIALECT,
+            // raw: whole-message escaped until #2084 step 5
             message: format!("table `{name}` has no columns", name = name.raw()),
         });
     }
