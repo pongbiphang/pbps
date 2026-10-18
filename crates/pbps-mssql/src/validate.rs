@@ -497,7 +497,9 @@ pub(crate) fn checks_over_computed_columns(schema: &pbps_model::Schema) -> Vec<S
                          `{column}`, which is not `persisted`; SQL Server refuses a CHECK over \
                          one (1764). If it does read it, declare `{column}` with \
                          `persisted: true`; `plan --dev` asks the engine before anything runs",
-                        name = name.shown()
+                        // Raw: `validate` escapes the whole note once, as it
+                        // does every declaration note.
+                        name = name.raw()
                     ));
                 }
             }
@@ -1332,6 +1334,20 @@ mod tests {
                 .declaration_notes(&with("len > 0"))
                 .iter()
                 .any(|n| n.contains("may read the computed column `len`"))
+        );
+        // The table's name is left raw, for `validate`'s one escaping pass: a
+        // backslash in it is one backslash in the note, not an escaped one.
+        let mut odd = pbps_model::Schema::default();
+        odd.tables.insert(
+            TableName::new("dbo", "a\\b"),
+            with("len > 0").tables.into_values().next().unwrap(),
+        );
+        assert!(
+            checks_over_computed_columns(&odd)
+                .iter()
+                .any(|n| n.starts_with("dbo.a\\b: check constraint `ck`")),
+            "{:?}",
+            checks_over_computed_columns(&odd)
         );
         // None over a persisted one, a plain column, or a literal.
         for expression in ["p > 0", "a > 0", "a <> 'len'"] {
