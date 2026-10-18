@@ -1773,7 +1773,11 @@ pub(crate) fn load_quiet(
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "no declarations directory"),
         }]);
     }
-    pbps_load::load_schema_dir(&dir)
+    let mut loaded = pbps_load::load_schema_dir(&dir)?;
+    // Both the quiet planning path and the ordinary loader compare this side.
+    // The marker has no declaration spelling, so validation can ignore it.
+    dialect_for(project.config.dialect).implied_grants(&mut loaded.schema);
+    Ok(loaded)
 }
 
 /// Every routine identity in the dialect's own spelling of its argument types.
@@ -4091,6 +4095,42 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_loaders_imply_serial_access_only_for_postgres() {
+        use pbps_model::Permission;
+        let stage = adopt::Stage::new("serial-load").unwrap();
+        std::fs::create_dir(stage.path().join("schema")).unwrap();
+        std::fs::write(
+            stage.path().join("schema/t.yml"),
+            "table: app.t\ncolumns:\n  id: {type: serial}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            stage.path().join("schema/r.yml"),
+            "role: writer\ngrants:\n  schema::app: [usage]\n  app.t: [insert]\n",
+        )
+        .unwrap();
+        let config = stage.path().join("pbps.yml");
+        for engine in ["postgres", "mssql"] {
+            std::fs::write(&config, format!("dialect: {engine}\n")).unwrap();
+            let project = Project::load(&config).unwrap();
+            let dialect = dialect(&project).unwrap();
+            for loaded in [
+                load_quiet(&project).unwrap(),
+                load(&project, dialect.as_ref()).unwrap(),
+            ] {
+                let held = &loaded.schema.roles["writer"].grants[&"app.t".parse().unwrap()];
+                assert_eq!(
+                    held.contains(&Permission::SerialSequences),
+                    engine == "postgres"
+                );
+                if engine == "postgres" {
+                    assert!(declaration_problems(&loaded, dialect.as_ref()).is_empty());
+                }
+            }
+        }
+    }
 
     /// Offline, a foreign key between a column with no collation and one
     /// naming a collation is not refused: it is valid exactly when the named

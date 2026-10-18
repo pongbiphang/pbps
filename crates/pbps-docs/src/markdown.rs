@@ -86,12 +86,13 @@ fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
         if let Some(d) = &role.description {
             let _ = writeln!(s, "{}\n", d.raw());
         }
-        if role.grants.is_empty() {
+        let grants: Vec<_> = role.declarable_grants().collect();
+        if grants.is_empty() {
             s.push_str("No grants.\n");
             continue;
         }
         s.push_str("| Granted on | Permissions |\n|---|---|\n");
-        for (target, permissions) in &role.grants {
+        for (target, permissions) in grants {
             let list: Vec<&str> = permissions.iter().map(|p| p.as_str()).collect();
             let _ = writeln!(s, "| `{target}` | {} |", list.join(", "));
         }

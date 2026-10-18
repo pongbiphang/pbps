@@ -1043,3 +1043,48 @@ therefore keeps its same-name comparison while observed. Pairs are kept
 as a vector rather than a destination-keyed map: ambiguous observations
 must not silently overwrite one another. Staged admission still permits
 exactly one logical change (DEC-1950.1).
+
+<a id="dec-1892-1"></a>
+
+**DEC-1892.1. A declared PostgreSQL INSERT implies USAGE on every sequence
+the table's serial columns own.** Option A, chosen by the maintainer on
+2026-10-19. Measured on PostgreSQL 18: INSERT on the table alone fails with
+`permission denied for sequence t_id_seq`; granting USAGE on its sequence
+makes the insert succeed. USAGE permits `nextval` and `currval`, but `setval`
+still needs UPDATE. The ACL entry is `role=U/grantor`. A serial's dependency
+on its table is `pg_depend.deptype = 'a'`; an identity's is `'i'`, and needs
+no such grant. PostgreSQL has no schema-level INSERT covering its tables,
+and validation already refuses that declaration.
+
+The engine-generated sequence name need not be in the declaration, so the
+implication is recorded per table as the internal `SerialSequences`
+permission, serialized as `serial-sequences`. It is appended to the model's
+permission order but excluded from its declarable words: YAML cannot spell
+it. Only PostgreSQL derives it on current and historical declarations.
+Live reads instead require the role's plain INSERT and plain USAGE on
+every serial-owned sequence in a non-empty set. Other sequence privileges,
+partial sets and USAGE without INSERT remain reported limitations. Grant
+options, PUBLIC, the owner/default ACL zero point and grantor-specific
+revocability retain their existing meaning. Pull and documentation omit the
+marker; the ledger retains the access read back from the database.
+
+The existing Grant and Revoke changes carry the marker. Their statements
+find auto-dependent sequences through the table at execution time, so
+renames and generated names require no guess. Being pbps's own catalog read, the
+block runs on the empty `search_path` with every operator qualified, so an
+operator a schema user created cannot be chosen over the built-in one
+(DEC-1564.1); `pbps_sql_calls_no_operator_a_schema_user_could_add` pins it. Adding a serial column or
+converting a column to serial re-grants the marker even when it was already
+held: a table-level set comparison alone cannot see a newly created
+sequence. The ordinary grant order follows those creations, with no new
+change kind or sort class. Only declared roles receive this access. That
+re-grant is a second logical change beside the column's, so such a plan is
+not one `--staged` admits (DEC-1950.1).
+
+This covers INSERT, not `UPDATE ... SET col = DEFAULT`; calling `nextval`
+without INSERT requires explicit sequence grants, tracked by #2199. The
+first plan after upgrade proposes the missing grants where both the older
+record and the live database lack USAGE. Where USAGE was already granted
+by hand, the live read carries the marker while an older recorded state
+lacks it: that difference is drift, resolved through the ordinary baseline
+path, never by inventing access in an old record.

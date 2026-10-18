@@ -2159,6 +2159,101 @@ fn permission_list(
         .join(", "))
 }
 
+fn serial_sequence_permission(
+    role: &str,
+    target: &GrantTarget,
+    revoke: bool,
+) -> Result<String, DialectError> {
+    let GrantTarget::Object(table) = target else {
+        return Err(invalid(
+            "serial-sequences requires a table target".to_owned(),
+        ));
+    };
+    // Names are resolved when this statement runs: a rename may have carried
+    // the sequence, and a column added earlier in this plan owns a new one.
+    // Identity sequences have deptype 'i' and need no such grant (DEC-1892.1).
+    // pbps's own catalog read, so it runs on the empty path with every
+    // operator qualified: on the table's schema's path, an exact-match
+    // operator a schema user created there is chosen over the built-in one
+    // reached through a cast (DEC-1564.1).
+    let (action, direction) = if revoke {
+        ("REVOKE", "FROM")
+    } else {
+        ("GRANT", "TO")
+    };
+    let body = format!(
+        "DECLARE
+    pbps_sequence record;
+BEGIN
+    FOR pbps_sequence IN
+        SELECT n.nspname, s.relname
+          FROM pg_catalog.pg_depend d
+          JOIN pg_catalog.pg_class s ON s.oid OPERATOR(pg_catalog.=) d.objid
+               AND s.relkind OPERATOR(pg_catalog.=) 'S'
+          JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) s.relnamespace
+         WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid
+           AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid
+           AND d.refobjid OPERATOR(pg_catalog.=) {}::pg_catalog.regclass::pg_catalog.oid
+           AND d.refobjsubid OPERATOR(pg_catalog.>) 0
+           AND d.deptype OPERATOR(pg_catalog.=) 'a'
+         ORDER BY n.nspname, s.relname
+    LOOP
+        EXECUTE pg_catalog.format('{action} USAGE ON SEQUENCE %I.%I {direction} %I',
+            pbps_sequence.nspname, pbps_sequence.relname, {});
+    END LOOP;
+END",
+        literal(&qualified(table)?),
+        literal(role),
+    );
+    let tag = dollar_tag(&body);
+    Ok(format!("DO {tag}\n{body}\n{tag};"))
+}
+
+fn grant_statements(
+    pg: &Postgres,
+    role: &str,
+    target: &GrantTarget,
+    permissions: &BTreeSet<Permission>,
+    revoke: bool,
+) -> Result<Vec<Statement>, DialectError> {
+    let mut ordinary = permissions.clone();
+    let serial = ordinary.remove(&Permission::SerialSequences);
+    let mut statements = Vec::new();
+    if !ordinary.is_empty() || !serial {
+        // A REVOKE selects its grantor per privilege (DECISIONS 518).
+        // The marker is emitted separately and never becomes a table word.
+        permission_list(&ordinary, target)?;
+        let sets: Vec<_> = if revoke {
+            ordinary.iter().map(|p| BTreeSet::from([*p])).collect()
+        } else {
+            vec![ordinary]
+        };
+        for set in sets {
+            let (action, direction) = if revoke {
+                ("REVOKE", "FROM")
+            } else {
+                ("GRANT", "TO")
+            };
+            statements.push(scoped(
+                pg,
+                target.schema(),
+                &format!(
+                    "{action} {} ON {} {direction} {};",
+                    permission_list(&set, target)?,
+                    securable(target, &set)?,
+                    quote(role)?,
+                ),
+            )?);
+        }
+    }
+    if serial {
+        statements.push(Statement::new(serial_sequence_permission(
+            role, target, revoke,
+        )?));
+    }
+    Ok(statements)
+}
+
 /// The engine's spelling of `p`, or `Unsupported` for a word the model holds
 /// for the other engine (ADR-0010 §6).
 ///
@@ -2184,6 +2279,11 @@ pub(crate) fn permission_sql(p: Permission) -> Result<&'static str, DialectError
         Permission::Truncate => "TRUNCATE",
         Permission::Trigger => "TRIGGER",
         Permission::Maintain => "MAINTAIN",
+        Permission::SerialSequences => {
+            return Err(invalid(
+                "serial-sequences is emitted through the table's owned sequences".to_owned(),
+            ));
+        }
         Permission::Alter | Permission::ViewDefinition => {
             return Err(DialectError::Unsupported {
                 dialect: DIALECT,
@@ -3555,16 +3655,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             role,
             target,
             permissions,
-        } => Ok(vec![scoped(
-            pg,
-            target.schema(),
-            &format!(
-                "GRANT {} ON {} TO {};",
-                permission_list(permissions, target)?,
-                securable(target, permissions)?,
-                quote(role)?
-            ),
-        )?]),
+        } => grant_statements(pg, role, target, permissions, false),
         // One privilege per statement, unlike `GRANT` above. A `REVOKE`
         // removes only what the one grantor PostgreSQL selects for it put
         // there, and that selection is made once for the whole statement:
@@ -3580,28 +3671,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             role,
             target,
             permissions,
-        } => {
-            // `permission_list` still guards the empty set: `REVOKE ON t`
-            // with nothing to revoke is a syntax error, and an empty loop
-            // would emit no statement rather than say so.
-            permission_list(permissions, target)?;
-            permissions
-                .iter()
-                .map(|permission| {
-                    let one = core::iter::once(*permission).collect();
-                    scoped(
-                        pg,
-                        target.schema(),
-                        &format!(
-                            "REVOKE {} ON {} FROM {};",
-                            permission_list(&one, target)?,
-                            securable(target, &one)?,
-                            quote(role)?
-                        ),
-                    )
-                })
-                .collect()
-        }
+        } => grant_statements(pg, role, target, permissions, true),
 
         // `PUBLIC` is written bare, and that is the whole point of the
         // variant: it is SQL's keyword for every principal at once, and
@@ -6933,6 +7003,99 @@ mod tests {
             assert!(e.to_string().contains("SQL Server"), "{e}");
             assert!(!sql_of(&pg, &plain).is_empty(), "{plain:?}");
         }
+    }
+
+    /// A derived serial marker is granted on the sequences the table owns,
+    /// found when the statement runs, and never as a table word.
+    #[test]
+    fn serial_markers_render_owned_sequence_usage_beside_ordinary_permissions() {
+        let pg = Postgres::new();
+        for revoke in [false, true] {
+            for mixed in [false, true] {
+                let mut permissions = BTreeSet::from([Permission::SerialSequences]);
+                if mixed {
+                    permissions.extend([Permission::Select, Permission::Insert]);
+                }
+                let target = GrantTarget::Object(TableName::new("app", "t'$pbps$"));
+                let role = "writer '$pbps$".to_owned();
+                let change = if revoke {
+                    Change::Revoke {
+                        role,
+                        target,
+                        permissions,
+                    }
+                } else {
+                    Change::Grant {
+                        role,
+                        target,
+                        permissions,
+                    }
+                };
+                let emitted = pg.emit(&change, Strategy::default()).unwrap();
+                assert_eq!(
+                    emitted.len(),
+                    if mixed { if revoke { 3 } else { 2 } } else { 1 }
+                );
+                let sql = emitted
+                    .iter()
+                    .map(|s| s.sql.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                for needle in [
+                    "DO $pbps1$",
+                    "pg_catalog.pg_depend",
+                    "d.refclassid",
+                    "d.refobjsubid OPERATOR(pg_catalog.>) 0",
+                    "d.deptype OPERATOR(pg_catalog.=) 'a'",
+                    "s.relkind OPERATOR(pg_catalog.=) 'S'",
+                    "%I.%I",
+                    "writer ''$pbps$",
+                ] {
+                    assert!(sql.contains(needle), "{needle}: {sql}");
+                }
+                assert!(
+                    sql.contains(if revoke {
+                        "REVOKE USAGE ON SEQUENCE"
+                    } else {
+                        "GRANT USAGE ON SEQUENCE"
+                    }),
+                    "{sql}"
+                );
+                assert!(!sql.contains("USAGE ON TABLE"), "{sql}");
+                assert!(!sql.contains("serial-sequences"), "{sql}");
+                assert!(!sql.contains("deptype = 'i'"), "{sql}");
+                // The catalog read runs on the empty path, with no bare
+                // operator a schema user could shadow (DEC-1564.1).
+                let block = emitted.last().unwrap().sql.as_str();
+                assert!(block.starts_with("DO "), "{block}");
+                assert!(!block.contains("search_path"), "{block}");
+                assert!(!block.contains(" = ") && !block.contains(" > "), "{block}");
+                assert_eq!(sql.contains(" ON TABLE "), mixed);
+            }
+        }
+        assert!(
+            pg.emit(
+                &Change::Grant {
+                    role: "writer".into(),
+                    target: GrantTarget::Schema("app".into()),
+                    permissions: [Permission::SerialSequences].into(),
+                },
+                Strategy::default()
+            )
+            .is_err()
+        );
+        let ordinary = pg
+            .emit(
+                &Change::Grant {
+                    role: "writer".into(),
+                    target: GrantTarget::Schema("app".into()),
+                    permissions: [Permission::Usage].into(),
+                },
+                Strategy::default(),
+            )
+            .unwrap();
+        assert_eq!(ordinary.len(), 1);
+        assert!(ordinary[0].sql.contains("USAGE ON SCHEMA"));
     }
 
     /// The class is written out, and which one it is comes off the

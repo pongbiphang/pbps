@@ -46,6 +46,21 @@ pub struct Role {
     pub grants: BTreeMap<GrantTarget, BTreeSet<Permission>>,
 }
 
+impl Role {
+    /// The grants a declaration can spell. Derived permissions belong to the
+    /// recorded state, never to YAML or the data catalogue (DEC-1892.1).
+    pub fn declarable_grants(&self) -> impl Iterator<Item = (&GrantTarget, BTreeSet<Permission>)> {
+        self.grants.iter().filter_map(|(target, permissions)| {
+            let declared: BTreeSet<_> = permissions
+                .iter()
+                .copied()
+                .filter(|p| *p != Permission::SerialSequences)
+                .collect();
+            (!declared.is_empty()).then_some((target, declared))
+        })
+    }
+}
+
 /// What a grant applies to.
 ///
 /// Written as `dbo.customer` for an object, `app.f(integer,text)` for a
@@ -176,6 +191,10 @@ pub enum Permission {
     Truncate,
     Trigger,
     Maintain,
+    /// USAGE on every sequence the table's `serial` columns own
+    /// (`pg_depend.deptype = 'a'`). Derived, never declared (#1892,
+    /// DEC-1892.1): engine-neutral data that only PostgreSQL derives.
+    SerialSequences,
 }
 
 impl Permission {
@@ -195,9 +214,11 @@ impl Permission {
             Permission::Truncate => "truncate",
             Permission::Trigger => "trigger",
             Permission::Maintain => "maintain",
+            Permission::SerialSequences => "serial-sequences",
         }
     }
 
+    /// Declarable words only: the loader must never accept a derived marker.
     pub const ALL: [Permission; 13] = [
         Permission::Select,
         Permission::Insert,
@@ -237,6 +258,32 @@ impl FromStr for Permission {
                 let all: Vec<_> = Permission::ALL.iter().map(|p| p.as_str()).collect();
                 format!("unknown permission `{s}`; available: {}", all.join(", "))
             })
+    }
+}
+
+/// Adds the sequence access implied by a declared INSERT on a serial table.
+/// Only declarations pass here: inferring access from a live INSERT would
+/// hide the very missing sequence privilege the comparison must find.
+pub fn implied_serial_grants(schema: &mut crate::Schema) {
+    let serial_tables: BTreeSet<_> = schema
+        .tables
+        .iter()
+        .filter(|(_, table)| {
+            table
+                .columns
+                .values()
+                .any(|column| matches!(column.value_source, crate::ValueSource::Sequence(_)))
+        })
+        .map(|(name, _)| name)
+        .collect();
+    for role in schema.roles.values_mut() {
+        for (target, permissions) in &mut role.grants {
+            if matches!(target, GrantTarget::Object(table) if serial_tables.contains(table))
+                && permissions.contains(&Permission::Insert)
+            {
+                permissions.insert(Permission::SerialSequences);
+            }
+        }
     }
 }
 
@@ -374,6 +421,86 @@ mod tests {
         assert!(json.contains("\"view-definition\""), "{json}");
         let back: Role = serde_json::from_str(&json).unwrap();
         assert_eq!(back, role);
+    }
+
+    #[test]
+    fn serial_sequence_access_is_derived_only_for_insert_on_a_serial_table() {
+        use crate::{Column, Identity, OwnedSequence, Schema, Table, ValueSource};
+        for (source, permission, expected) in [
+            (
+                ValueSource::Sequence(OwnedSequence::serial()),
+                Permission::Insert,
+                true,
+            ),
+            (
+                ValueSource::Sequence(OwnedSequence::serial()),
+                Permission::Select,
+                false,
+            ),
+            (
+                ValueSource::Identity(Identity::new(1, 1)),
+                Permission::Insert,
+                false,
+            ),
+            (ValueSource::None, Permission::Insert, false),
+        ] {
+            let name = TableName::new("app", "t");
+            let mut column = Column::new("integer".parse().unwrap());
+            column.value_source = source;
+            let mut table = Table::default();
+            table.columns.insert("id".into(), column);
+            let target = GrantTarget::Object(name.clone());
+            let mut schema = Schema::default();
+            schema.tables.insert(name, table);
+            schema.roles.insert(
+                "writer".into(),
+                Role {
+                    grants: [
+                        (target.clone(), [permission].into()),
+                        (
+                            GrantTarget::Schema("app".into()),
+                            [Permission::Insert].into(),
+                        ),
+                        (
+                            GrantTarget::Object(TableName::new("app", "absent")),
+                            [Permission::Insert].into(),
+                        ),
+                    ]
+                    .into(),
+                    ..Role::default()
+                },
+            );
+            implied_serial_grants(&mut schema);
+            let once = schema.clone();
+            implied_serial_grants(&mut schema);
+            assert_eq!(schema, once, "derivation is idempotent");
+            let role = &schema.roles["writer"];
+            assert_eq!(
+                role.grants[&target].contains(&Permission::SerialSequences),
+                expected
+            );
+            assert!(role.grants[&target].contains(&permission));
+            for (other, held) in &role.grants {
+                if other != &target {
+                    assert!(!held.contains(&Permission::SerialSequences));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_serial_marker_round_trips_in_state_but_has_no_declaration_word() {
+        assert!(!Permission::ALL.contains(&Permission::SerialSequences));
+        for word in ["serial-sequences", "SERIAL SEQUENCES", "serial_sequences"] {
+            assert!(word.parse::<Permission>().is_err(), "{word}");
+        }
+        let json = serde_json::to_string(&Permission::SerialSequences).unwrap();
+        assert_eq!(json, "\"serial-sequences\"");
+        assert_eq!(
+            serde_json::from_str::<Permission>(&json).unwrap(),
+            Permission::SerialSequences
+        );
+        assert_eq!("USAGE".parse::<Permission>().unwrap(), Permission::Usage);
     }
 
     #[test]

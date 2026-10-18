@@ -352,6 +352,10 @@ fn load_from_git(
         );
     }
 
+    // This baseline is declarations, unlike a snapshot: it gets the same
+    // implied grants as the current files (DEC-1892.1).
+    dialect.implied_grants(&mut schema);
+
     // The identity file must come from the same revision: using the current one as
     // the baseline would hide renames. Under that revision's own path, for the
     // reason `paths_at` gives.

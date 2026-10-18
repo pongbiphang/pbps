@@ -905,6 +905,42 @@ mod tests {
     /// table nobody declares is not one the declarations may name, so the
     /// next plan must not propose revoking it.
     #[test]
+    fn a_serial_marker_has_the_scope_of_its_owning_table() {
+        use pbps_model::{Permission, Role};
+        let mut live = schema(&["dbo.customer", "dbo.other"]);
+        live.roles.insert(
+            "writer".into(),
+            Role {
+                grants: [
+                    (
+                        "dbo.customer".parse().unwrap(),
+                        [Permission::SerialSequences].into(),
+                    ),
+                    (
+                        "dbo.other".parse().unwrap(),
+                        [Permission::SerialSequences].into(),
+                    ),
+                ]
+                .into(),
+                ..Role::default()
+            },
+        );
+        let mut recorded = ids(&[("t_aaaaaa", "dbo.customer")]);
+        recorded
+            .roles
+            .insert("r_aaaaaa".parse().unwrap(), "writer".into());
+        let scoped = scope(&live, &recorded, &BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(
+            scoped.schema.roles["writer"].grants,
+            [(
+                "dbo.customer".parse().unwrap(),
+                [Permission::SerialSequences].into()
+            )]
+            .into()
+        );
+    }
+
+    #[test]
     fn roles_are_scoped_by_the_ids_file_and_their_grants_by_the_managed_set() {
         let mut live = schema(&["dbo.customer", "dbo.other"]);
         let mut reader = pbps_model::Role::default();

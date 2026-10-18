@@ -111,6 +111,10 @@ use crate::schema::Schema;
 /// Bumped to 26 for row-security flags and policies (DEC-1172.2). Versions
 /// 6 to 25 stay readable: earlier readers excluded every such table.
 ///
+/// Bumped to 27 for the derived `serial-sequences` permission (DEC-1892.1),
+/// which a recorded role can hold. Versions 6 to 26 stay readable: they hold
+/// none, and a read that lacks it is the drift the next plan corrects.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -129,7 +133,7 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 26;
+pub const CURRENT_VERSION: u32 = 27;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -611,7 +615,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 26);
+        assert_eq!(CURRENT_VERSION, 27);
     }
 
     fn schema_with(ty: &str) -> Schema {

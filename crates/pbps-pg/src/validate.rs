@@ -649,7 +649,10 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
         // on any target — the engine's parser stops at the word before it
         // looks at the target — and left out of the kind check below, which
         // would otherwise report the same grant twice.
-        for p in permissions.iter().filter(|p| !has_permission(**p)) {
+        for p in permissions
+            .iter()
+            .filter(|p| **p != Permission::SerialSequences && !has_permission(**p))
+        {
             errs.push(invalid(format!(
                 "role `{name}`: `{}` on `{target}` is not a permission PostgreSQL has; it is SQL \
                  Server's (ADR-0010 section 6), and this engine takes {}",

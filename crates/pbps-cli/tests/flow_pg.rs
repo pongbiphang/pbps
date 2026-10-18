@@ -2332,6 +2332,96 @@ fn a_new_column_calling_a_function_that_reads_it_is_refused_by_name() {
     }
 }
 
+/// INSERT carries its serial sequences' USAGE through apply and through a
+/// later column addition, without making explicit sequence access declarable.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn declared_insert_grants_serial_usage_and_keeps_it_on_new_sequences() {
+    struct Role(String, String);
+    impl Drop for Role {
+        fn drop(&mut self) {
+            let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {}", self.1));
+        }
+    }
+    let server = server();
+    let role = Role(
+        server.clone(),
+        format!("pbps_serial_writer_{}", std::process::id()),
+    );
+    on_server(&server, &format!("CREATE ROLE {} NOSUPERUSER", role.1));
+    let own = OwnDatabase::new(&server, "serial-usage");
+    let connection = own.connection();
+    on_server(connection, "CREATE SCHEMA app");
+    let d = Demo::new("serial-usage");
+    let table = "table: app.t\ncolumns:\n  id: {type: serial}\n  payload: {type: text}\n\
+                 primary_key: {name: t_pkey, columns: [id]}\n";
+    d.table(table);
+    std::fs::write(
+        d.dir.join("schema/writer.yml"),
+        format!(
+            "role: {}\ngrants:\n  schema::app: [usage]\n  app.t: [insert]\n",
+            role.1
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "empty database"]));
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    on_server(
+        connection,
+        &format!(
+            "SET ROLE {}; INSERT INTO app.t (payload) VALUES ('first'); RESET ROLE",
+            role.1
+        ),
+    );
+    assert!(stdout(&succeeds(d.run(&["plan", "--db", connection]))).contains("No changes"));
+
+    let pulled = Demo::new("serial-usage-pull");
+    let output = succeeds(pulled.run(&["pull", "--db", connection]));
+    assert!(
+        !stderr(&output).contains("on sequence"),
+        "{}",
+        stderr(&output)
+    );
+    let written =
+        std::fs::read_to_string(pulled.dir.join(format!("schema/roles/{}.yml", role.1))).unwrap();
+    assert!(written.contains("insert"), "{written}");
+    assert!(!written.contains("serial-sequences"), "{written}");
+    on_server(
+        connection,
+        &format!("GRANT SELECT ON SEQUENCE app.t_id_seq TO {}", role.1),
+    );
+    let beyond = succeeds(pulled.run(&["pull", "--db", connection, "--force"]));
+    assert!(
+        stderr(&beyond).contains("SELECT on sequence"),
+        "{}",
+        stderr(&beyond)
+    );
+    on_server(
+        connection,
+        &format!("REVOKE SELECT ON SEQUENCE app.t_id_seq FROM {}", role.1),
+    );
+
+    d.table(&table.replace("  payload:", "  other: {type: serial}\n  payload:"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    on_server(
+        connection,
+        &format!(
+            "SET ROLE {}; INSERT INTO app.t (payload) VALUES ('second'); RESET ROLE",
+            role.1
+        ),
+    );
+    assert_eq!(scalar(connection, "SELECT count(*)::bigint FROM app.t"), 2);
+    succeeds(d.run(&["verify", "--db", connection]));
+    assert!(stdout(&succeeds(d.run(&["plan", "--db", connection]))).contains("No changes"));
+}
+
 /// A connected plan's base is a read, which knows the name the engine
 /// generated for a `serial`'s sequence: a declaration naming another one
 /// renames it, gated as `rename` (#1889). The same name a git baseline
@@ -26219,8 +26309,8 @@ fn trap_operators(schema: &str) -> String {
 /// the managed schema, the path an apply's batches carry. A pull, a connected
 /// plan with its probes, an apply that drops a key the declaration never
 /// named, deletes a declared row a child could still reference, and updates
-/// and deletes rows by a `varchar` key, and `doctor` all run without
-/// springing one. On 16 and 18. Before, the apply's key lookup compared
+/// and deletes rows by a `varchar` key, grants a declared INSERT's serial
+/// sequence USAGE (#1892), and `doctor` all run without springing one. On 16 and 18. Before, the apply's key lookup compared
 /// `conrelid` with a `regclass` on `app`'s path and the trap there refused
 /// the plan, and a row write's `"k" = E'a'` called the `varchar` trap.
 #[test]
@@ -26258,6 +26348,17 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
         let coded = "table: app.v\ncolumns:\n  k: {type: varchar(10), nullable: false}\n  \
                      n: {type: integer}\nprimary_key: {columns: [k]}\ndata:\n  mode: exact\n  rows:\n";
         write("v", &format!("{coded}    a: {{n: 1}}\n    b: {{n: 2}}\n"));
+        // A serial whose sequence a declared INSERT grants USAGE on: the
+        // grant's catalog read is pbps's own (#1892).
+        write(
+            "s",
+            "table: app.s\ncolumns:\n  id: {type: serial}\nprimary_key: {columns: [id]}\n",
+        );
+        let writer = format!("pbps_trap_writer_{}", std::process::id());
+        on_server(
+            connection,
+            &format!("DROP ROLE IF EXISTS {writer}; CREATE ROLE {writer}"),
+        );
         succeeds(d.run(&["plan"]));
         d.commit();
         succeeds(d.run(&["bootstrap", "--db", connection]));
@@ -26292,6 +26393,11 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
         // deletes row `b` by their `varchar` key.
         write("k", &keyed(70, "replica_identity: primary_key\n"));
         write("v", &format!("{coded}    a: {{n: 5}}\n"));
+        std::fs::write(
+            d.dir.join(format!("schema/{writer}.yml")),
+            format!("role: {writer}\ngrants:\n  schema::app: [usage]\n  app.s: [insert]\n"),
+        )
+        .unwrap();
         write(
             "p",
             &format!(
@@ -26338,6 +26444,13 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
             "{version}: row a updated and row b deleted by their key"
         );
         clean("doctor", d.run(&["doctor", "--db", connection]));
+        on_server(
+            connection,
+            &format!(
+                "SET ROLE {writer}; INSERT INTO app.s DEFAULT VALUES; RESET ROLE; \
+                 DROP OWNED BY {writer}; DROP ROLE {writer}"
+            ),
+        );
     }
 }
 

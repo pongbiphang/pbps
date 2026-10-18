@@ -97,6 +97,50 @@ mod tests {
     }
 
     #[test]
+    fn prose_documents_declared_permissions_without_serial_markers_or_empty_grants() {
+        use pbps_model::{Permission, Role};
+        let mut schema = Schema::default();
+        schema.roles.insert(
+            "writer".into(),
+            Role {
+                grants: [
+                    (
+                        "app.t".parse().unwrap(),
+                        [Permission::Insert, Permission::SerialSequences].into(),
+                    ),
+                    (
+                        "app.hidden".parse().unwrap(),
+                        [Permission::SerialSequences].into(),
+                    ),
+                    ("schema::app".parse().unwrap(), [Permission::Usage].into()),
+                ]
+                .into(),
+                ..Role::default()
+            },
+        );
+        schema.roles.insert(
+            "pending".into(),
+            Role {
+                grants: [(
+                    "app.hidden".parse().unwrap(),
+                    [Permission::SerialSequences].into(),
+                )]
+                .into(),
+                ..Role::default()
+            },
+        );
+        for format in [Format::Markdown, Format::Html] {
+            let out = render(&schema, &IdsFile::default(), format, "Schema");
+            for kept in ["insert", "usage", "app.t", "No grants."] {
+                assert!(out.contains(kept), "{out}");
+            }
+            for hidden in ["serial-sequences", "app.hidden"] {
+                assert!(!out.contains(hidden), "{out}");
+            }
+        }
+    }
+
+    #[test]
     fn roles_are_documented_in_every_prose_format() {
         use pbps_model::{Permission, Role};
         let mut schema = Schema::default();
