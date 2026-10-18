@@ -1530,7 +1530,9 @@ pub fn is_regular_identifier_continue(ch: char) -> bool {
 /// Cycles cannot be ordered, and the tool does not pretend otherwise: the
 /// members of one are emitted in name order, which is deterministic, and the
 /// engine has the last word inside the plan's transaction. (A genuine cycle
-/// between views is not creatable by any order.)
+/// between views is not creatable by any order.) Only a cycle the scan reads
+/// gets here: one the `depends_on:` declarations close is refused before any
+/// plan by [`check_dependency_cycles`] (#2083).
 ///
 /// One edge the scan cannot supply: between the overloads of one routine name,
 /// which the scan cannot tell apart, only `depends_on:` orders (DECISIONS 212).
@@ -1766,6 +1768,92 @@ pub fn check_dependencies(schema: &crate::schema::Schema, deps: &ModuleDeps) -> 
         }
     }
     problems
+}
+
+/// Every set of modules whose `depends_on:` lists close a cycle: each member
+/// asks to be created after another, so no order honours them all (#2083,
+/// DEC-2083.1). A cycle of views is creatable in no order at all; one of
+/// routines that call each other may be, but the declarations still ask for
+/// two orders at once, and the scheduler would keep one and break the other
+/// without saying which. Refused by name, as a rename cycle is (DEC-1966.1),
+/// rather than planned in name order with the engine left to object.
+///
+/// Each cycle's members in id order. A module listing itself is a cycle of
+/// one: the differ refuses it with the rest, since an offline plan asks
+/// none of `validate`'s questions first (#2189 review), and `validate`
+/// leaves it to [`check_dependencies`]' more specific finding. An
+/// undeclared target closes nothing: only declared modules are walked.
+pub fn dependency_cycles(schema: &crate::schema::Schema, deps: &ModuleDeps) -> Vec<Vec<ModuleId>> {
+    let after = |id: &ModuleId| -> Vec<&ModuleId> {
+        deps.get(id)
+            .into_iter()
+            .flatten()
+            .filter(|t| schema.modules.contains_key(*t))
+            .collect()
+    };
+    // What each module waits for, transitively. Quadratic in the declared
+    // modules, which a schema holds hundreds of, not millions; the cycles
+    // are then the modules that wait for each other.
+    let reach: BTreeMap<&ModuleId, BTreeSet<&ModuleId>> = deps
+        .keys()
+        .filter(|id| schema.modules.contains_key(*id))
+        .map(|start| {
+            let mut seen = BTreeSet::new();
+            let mut todo = after(start);
+            while let Some(next) = todo.pop() {
+                if seen.insert(next) {
+                    todo.extend(after(next));
+                }
+            }
+            (start, seen)
+        })
+        .collect();
+    let mut placed: BTreeSet<&ModuleId> = BTreeSet::new();
+    let mut cycles = Vec::new();
+    for (id, waits) in &reach {
+        if placed.contains(id) || !waits.contains(id) {
+            continue;
+        }
+        let cycle: BTreeSet<&ModuleId> = waits
+            .iter()
+            .copied()
+            .filter(|other| reach.get(other).is_some_and(|w| w.contains(id)))
+            .collect();
+        placed.extend(cycle.iter().copied());
+        cycles.push(cycle.into_iter().cloned().collect());
+    }
+    cycles
+}
+
+/// The refusal for one of [`dependency_cycles`], in the words `validate` and
+/// the differ both use.
+pub fn dependency_cycle_problem(cycle: &[ModuleId]) -> String {
+    if let [only] = cycle {
+        return format!(
+            "`{}` lists itself in `depends_on`: it would be created after itself, which no \
+             order does. Remove it from the list",
+            only.shown()
+        );
+    }
+    format!(
+        "the `depends_on` declarations of {} close a cycle: each asks to be created after \
+         another of them, and no order honours them all. Remove the one that does not hold",
+        cycle
+            .iter()
+            .map(|m| format!("`{}`", m.shown()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// [`dependency_cycles`], as `validate`'s findings: all but a module listing
+/// itself, which [`check_dependencies`] already names.
+pub fn check_dependency_cycles(schema: &crate::schema::Schema, deps: &ModuleDeps) -> Vec<String> {
+    dependency_cycles(schema, deps)
+        .iter()
+        .filter(|c| c.len() > 1)
+        .map(|c| dependency_cycle_problem(c))
+        .collect()
 }
 
 #[cfg(test)]
@@ -3294,6 +3382,46 @@ mod tests {
 
         deps.insert(id("dbo.b"), [id("dbo.b")].into_iter().collect());
         assert!(check_dependencies(&schema, &deps)[0].contains("lists itself"));
+    }
+
+    #[test]
+    fn a_depends_on_cycle_is_refused_with_every_member_named() {
+        let mut schema = Schema::default();
+        for name in ["dbo.a", "dbo.b", "dbo.c", "dbo.d"] {
+            schema.modules.insert(id(name), view("SELECT 1"));
+        }
+        let mut deps = ModuleDeps::default();
+        deps.insert(id("dbo.a"), [id("dbo.c")].into());
+        deps.insert(id("dbo.b"), [id("dbo.a")].into());
+        deps.insert(id("dbo.c"), [id("dbo.b")].into());
+        // `d` waits on the cycle without being in it.
+        deps.insert(id("dbo.d"), [id("dbo.a")].into());
+        let problems = check_dependency_cycles(&schema, &deps);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("`dbo.a`, `dbo.b`, `dbo.c` close a cycle"),
+            "{problems:?}"
+        );
+        assert!(!problems[0].contains("dbo.d"), "{problems:?}");
+
+        // A module listing itself is a cycle of one to the differ, which an
+        // offline plan meets first (#2189 review); `validate` leaves it to
+        // `check_dependencies`' own finding.
+        deps.insert(id("dbo.a"), [id("dbo.a")].into());
+        assert_eq!(dependency_cycles(&schema, &deps), vec![vec![id("dbo.a")]]);
+        assert_eq!(
+            check_dependency_cycles(&schema, &deps),
+            Vec::<String>::new()
+        );
+
+        // Negatives: the same chain without the edge that closes it, and an
+        // undeclared target, which `check_dependencies` names and which
+        // closes nothing here.
+        deps.insert(id("dbo.a"), [id("dbo.typo")].into());
+        assert_eq!(
+            dependency_cycles(&schema, &deps),
+            Vec::<Vec<ModuleId>>::new()
+        );
     }
 
     /// A view under a trigger's identity would read as if the table meant

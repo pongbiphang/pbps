@@ -296,6 +296,14 @@ pub enum DiffError {
         renames: Vec<(TableName, TableName)>,
     },
 
+    /// `depends_on:` declarations that close a cycle (#2083, DEC-2083.1):
+    /// no order honours them all, and planning the members in name order
+    /// would break one without saying which. Refused here as well as by
+    /// `validate`, because an offline plan does not ask `validate`'s
+    /// questions first.
+    #[error("{}", pbps_model::module::dependency_cycle_problem(modules))]
+    DependsOnCycle { modules: Vec<ModuleId> },
+
     /// Owned sequences renamed into each other's names, in a cycle (#1930
     /// review). As for tables and columns, no order of the renames is one
     /// the engine performs, and the temporary name is the deployer's to
@@ -597,7 +605,11 @@ pub(crate) fn diff_partial_rebuilding(
     read_back: Option<&Schema>,
 ) -> Diffed {
     let mut changes = Vec::new();
-    let mut errs = Vec::new();
+    let mut errs: Vec<DiffError> =
+        pbps_model::module::dependency_cycles(declared.schema, &hints.module_deps)
+            .into_iter()
+            .map(|modules| DiffError::DependsOnCycle { modules })
+            .collect();
 
     let base_tables = &base.ids.tables;
     let declared_tables = &declared.ids.tables;
