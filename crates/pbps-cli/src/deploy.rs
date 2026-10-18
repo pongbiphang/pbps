@@ -5215,13 +5215,14 @@ fn tables_a_drop_intent_names(ids: &IdsFile) -> Vec<&pbps_model::Uid> {
 /// intent names while the recorded state still holds it (#1852, DEC-1852.1).
 /// Recorded so, the partition is never dropped, and no later plan takes it
 /// back. Matched by uid: a tombstone the recorded state no longer holds is an
-/// old one. The partition left external is found by its parent's uid and
-/// its bound, never by its own name: an intent can rename it, any number of
-/// times, and the database can have any of those names (#2172 review). One
-/// parent's bounds never overlap, so the bound is one partition. An empty
-/// ledger holds nothing. A ledger that cannot be read cannot say which
-/// partition an intent names, so the baseline is refused while any is left
-/// external.
+/// old one. Refused by its parent, matched by uid too, while the scope leaves
+/// any partition of that parent external: which of them the held one now is
+/// cannot be told, since it can have been renamed, rebound or reattached by
+/// hand, and pbps records no identity for a table that outlives that (#2172
+/// review, #2177). Where one has the recorded parent and bound it is named.
+/// An empty ledger holds nothing. A ledger that cannot be read cannot say
+/// which partition an intent names, so the baseline is refused while any is
+/// left external.
 fn refuse_handing_over_held_partitions(
     dropped: &[&pbps_model::Uid],
     working: &IdsFile,
@@ -5245,23 +5246,44 @@ fn refuse_handing_over_held_partitions(
                         .find(|(_, held)| **held == of.parent)
                         .map(|(parent, _)| parent)?;
                     let parent = working.tables.get(parent)?;
-                    scoped
+                    let siblings: Vec<(&TableName, &pbps_model::PartitionOf)> = scoped
                         .external
                         .iter()
-                        .find(|(_, live)| live.parent == *parent && live.bound == of.bound)
-                        .map(|(live, _)| (name, live))
-                })
-                .map(|(name, live)| {
-                    let was = if name == live {
-                        String::new()
-                    } else {
-                        format!(", recorded as {}", name.shown())
-                    };
-                    format!(
-                        "{} is named by a drop intent and held by the recorded state (entry #{}{was}); \
-                         this baseline would leave it to its external parent undropped",
-                        live.shown(),
-                        previous.id
+                        .filter(|(_, live)| live.parent == *parent)
+                        .collect();
+                    if siblings.is_empty() {
+                        return None;
+                    }
+                    let entry = previous.id;
+                    Some(
+                        match siblings.iter().find(|(_, live)| live.bound == of.bound) {
+                            Some((live, _)) => {
+                                let was = if name == *live {
+                                    String::new()
+                                } else {
+                                    format!(", recorded as {}", name.shown())
+                                };
+                                format!(
+                                    "{} is named by a drop intent and held by the recorded state \
+                                     (entry #{entry}{was}); this baseline would leave it to its \
+                                     external parent undropped",
+                                    live.shown()
+                                )
+                            }
+                            None => format!(
+                                "{} is named by a drop intent and held by the recorded state \
+                                 (entry #{entry}) as a partition of {}, whose partitions this \
+                                 baseline would leave external ({}); none has its bound, and \
+                                 which of them it is now cannot be told",
+                                name.shown(),
+                                parent.shown(),
+                                siblings
+                                    .iter()
+                                    .map(|(live, _)| live.shown().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        },
                     )
                 })
                 .collect()
@@ -5284,7 +5306,8 @@ fn refuse_handing_over_held_partitions(
     bail!(
         "`{label}` holds {} partition(s) this baseline would hand over:\n  {}\n\
          A drop intent leaves a partition out of the identity file before it is dropped. \
-         Drop or detach it with a plan first, then baseline (DEC-1852.1).",
+         Drop or detach it with a plan first, then baseline; if it is already gone from the \
+         database, revert the drop intent so the baseline records it missing (DEC-1852.1).",
         lines.len(),
         lines.join("\n  ")
     );
@@ -11090,8 +11113,40 @@ mod tests {
             ),
             "{e}"
         );
-        // Dropped by hand already: no partition left external has its bound.
-        refuse(Ok(Some(entry(&uid, "ev_a", year(2024), &parent)))).expect("already dropped");
+        // Rebound, or dropped by hand, while another partition of the parent
+        // is left external: none has the recorded bound, so which it is cannot
+        // be told, and the parent refuses it (#2177).
+        let e = refuse(Ok(Some(entry(&uid, "ev_a", year(2024), &parent))))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains(
+                "app.ev_a is named by a drop intent and held by the recorded state (entry #3) as \
+                 a partition of app.ev, whose partitions this baseline would leave external \
+                 (app.ev_2026, app.ev_b); none has its bound"
+            ) && e.contains("revert the drop intent"),
+            "{e}"
+        );
+        // No partition of its parent is left external: nothing to hand over,
+        // whatever another parent's are.
+        let mut elsewhere = scoped.clone();
+        elsewhere.external = [(
+            t("other_1"),
+            PartitionOf {
+                parent: t("other"),
+                bound: year(2025),
+                columns: Default::default(),
+            },
+        )]
+        .into();
+        super::refuse_handing_over_held_partitions(
+            &dropped,
+            &working,
+            &elsewhere,
+            Ok(Some(entry(&uid, "ev_a", year(2025), &parent))),
+            "prod",
+        )
+        .expect("another parent's partitions");
         // The parent the recorded state names is another table that had the
         // same name.
         let other_parent = Uid::derived(UidKind::Table, "app.ev", 1);

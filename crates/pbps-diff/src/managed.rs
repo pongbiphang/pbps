@@ -35,8 +35,9 @@ pub struct Scoped {
     /// another tool's to create and drop, held as the parent makes them and
     /// compared not at all. Kept apart from [`Scoped::unmanaged`], whose
     /// policy is about tables nobody declared a reason to leave alone. Each
-    /// with its parent and bound as the database has them, which say which
-    /// partition it is whatever it is named (#1852).
+    /// with its parent and bound as the database has them: a baseline refuses
+    /// a parent's handover by them, and names the partition they match
+    /// (#1852, DEC-1852.1).
     pub external: BTreeMap<TableName, PartitionOf>,
 
     /// Tables the identity file names that the database does not have.
