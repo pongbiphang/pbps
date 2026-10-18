@@ -378,9 +378,10 @@ impl Cx<'_> {
                 uid, table, name, ..
             } => {
                 let owner = self.table(table)?;
-                self.exists(ObjectKey::Table(owner));
+                self.exists(ObjectKey::Table(owner.clone()));
                 let column = ColumnKey::Recorded(Recorded(uid.clone()));
                 self.creates(Resource::Column(ObjectKey::Column(column.clone())));
+                self.appends_a_column(owner);
                 let _ = name;
             }
             Change::DropColumn { uid, column } => {
@@ -542,6 +543,10 @@ impl Cx<'_> {
                 self.exists(ObjectKey::Table(owner.clone()));
                 if let Change::DropComputedColumn { name, .. } = op.change() {
                     self.requires_computed_dependents_gone(&owner, name);
+                } else {
+                    // A computed column takes its place among the columns as
+                    // an ordinary one does.
+                    self.appends_a_column(owner);
                 }
             }
             Change::SetColumnDeprecated { uid, column, .. } => {
@@ -1598,6 +1603,15 @@ impl Cx<'_> {
         self.exists(ObjectKey::Table(owner.clone()));
     }
 
+    /// A column added to `owner` goes after the ones before it in the plan:
+    /// the engine appends it, so their order is the table's (#2080).
+    fn appends_a_column(&mut self, owner: Recorded) {
+        self.rewrites(Resource::Object(
+            ObjectKey::ColumnOrder(owner),
+            Incarnation::Final,
+        ));
+    }
+
     fn row_writes(&mut self, table: &TableName, owner: &Recorded, written: &[&str]) {
         self.rewrites(Resource::Column(ObjectKey::Table(owner.clone())));
         for c in written {
@@ -2023,6 +2037,8 @@ pub fn baseline_keys(before: Snapshot<'_>, owners: &dyn Owners) -> BTreeSet<Obje
 pub fn holds_unknown(key: &ObjectKey) -> bool {
     match key {
         ObjectKey::Row { .. } | ObjectKey::Rows { .. } | ObjectKey::Grant { .. } => true,
+        // Never required, only written: nothing asks the baseline about it.
+        ObjectKey::ColumnOrder(_) => true,
         ObjectKey::Column(ColumnKey::Partition { .. })
         | ObjectKey::NotNull(ColumnKey::Partition { .. }) => true,
         ObjectKey::Table(_)

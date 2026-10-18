@@ -587,6 +587,10 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
                 | ObjectKey::Grant { .. },
                 _,
             )) => OrderReason::Identity,
+            // The order of a table's columns is its shape.
+            Because::WriteWrite(Resource::Object(ObjectKey::ColumnOrder(_), _)) => {
+                OrderReason::Structural
+            }
             // One address passes from the baseline's instance to the plan's.
             Because::Replaces(_) => OrderReason::Identity,
             Because::Declared => OrderReason::Structural,
@@ -604,6 +608,7 @@ fn of_key(key: &ObjectKey) -> OrderReason {
         | ObjectKey::Default(_)
         | ObjectKey::Module(_)
         | ObjectKey::NotNull(_)
+        | ObjectKey::ColumnOrder(_)
         | ObjectKey::Part { .. } => OrderReason::Structural,
     }
 }

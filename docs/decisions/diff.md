@@ -6716,3 +6716,36 @@ Pinned by `a_table_a_publication_lists_is_refused_unlogged_by_name` in
 all-tables, unpublished and listed-after-the-plan cases on 16 and 18, and by
 `a_table_made_unlogged_is_refused_by_the_publication_that_lists_it` in
 `crates/pbps-cli/src/deploy.rs`.
+
+<a id="dec-2080-1"></a>
+
+**DEC-2080.1. Columns added to one table go in their declared order, and the
+effects keep that order as two writes of the table's column order.** (#2080,
+a run deferral of #1776)
+
+The engine appends each column it adds, so the order of a table's
+`AddColumn`s is the table's column order: what a pull writes, what
+`SELECT *` returns, and what a positional `INSERT` binds to. Nothing decided
+it. The differ's sort key tied every `AddColumn` of one table on its subject,
+the table, and the change's rendering broke the tie, which begins with the
+column's random uid. So two plans of the same declarations could add the
+columns in different orders, as #1965's commutation suite found on SQL
+Server.
+
+- **The differ** ranks a table's `AddColumn`s by the column's position in the
+  declared table, after the subject and before the rendering. A generated
+  column still goes later, at (9, 2), because the engine refuses its
+  expression before its inputs exist (DEC-1168.1); among themselves the
+  generated ones keep their declared order too. A computed column comes after
+  every ordinary one (9, 3), in name order, which is the order of the
+  `computed:` section's map.
+- **The effects** give each table a key of its own, `ObjectKey::ColumnOrder`,
+  which `AddColumn` and `AddComputedColumn` rewrite and nothing requires. Two
+  writes of one resource are ordered by the plan's order (DEC-1954.1), so the
+  verifier refuses a swap; since no step reads the key, it orders nothing
+  else. A rewrite of the table itself would have ordered every step that
+  requires the table.
+
+The commutation suites drop their `two_columns_added_to_one_table` pair,
+listed with this issue as a gap and as a uid-order difference: the effects
+now order it, so it is no longer a pair they call independent.

@@ -320,6 +320,12 @@ pub enum ObjectKey {
         table: Recorded,
         side: RowSide,
     },
+    /// The order of a table's columns, which a pull writes, `SELECT *`
+    /// returns and a positional `INSERT` binds to. Each column added is
+    /// appended to it, so two additions to one table are two writes of it,
+    /// kept in the plan's order; nothing else reads or writes it, so it orders
+    /// nothing else (#2080).
+    ColumnOrder(Recorded),
     /// A grantee's permissions on one target, by the names the change
     /// carries: roles and targets of grants are spelled where the grant runs.
     Grant {

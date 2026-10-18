@@ -79,40 +79,6 @@ data:
 "#,
     },
     Scenario {
-        name: "two_columns_added_to_one_table",
-        pair: ["AddColumn", "AddColumn"],
-        gap: Some(2080),
-        uid_order: Some(2080),
-        base: r#"
-table: app.t
-columns:
-  id: {type: integer, nullable: false}
-  a: {type: integer}
-  b: {type: integer}
-primary_key: [id]
-data:
-  mode: exact
-  rows:
-    1: {a: 1, b: 2}
-    2: {a: 3, b: 4}
-"#,
-        desired: r#"
-table: app.t
-columns:
-  id: {type: integer, nullable: false}
-  a: {type: integer}
-  b: {type: integer}
-  c: {type: integer}
-  d: {type: text}
-primary_key: [id]
-data:
-  mode: exact
-  rows:
-    1: {a: 1, b: 2}
-    2: {a: 3, b: 4}
-"#,
-    },
-    Scenario {
         name: "an_index_and_a_check_dropped_from_one_table",
         pair: ["DropIndex", "DropCheck"],
         gap: None,

@@ -810,6 +810,7 @@ fn column_of(key: &ObjectKey) -> Option<&pbps_model::operation::ColumnKey> {
         | ObjectKey::Part { .. }
         | ObjectKey::Row { .. }
         | ObjectKey::Rows { .. }
+        | ObjectKey::ColumnOrder(_)
         | ObjectKey::Grant { .. } => None,
     }
 }

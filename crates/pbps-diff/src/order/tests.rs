@@ -2959,6 +2959,68 @@ fn a_row_insert_waits_for_a_new_column_its_postcondition_reads() {
     assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
 }
 
+/// `c` and `d` added to `t`, and, when `apart`, `d` to `u` instead (#2080).
+fn two_added_columns(apart: bool) -> Plan {
+    let other = if apart { "u" } else { "t" };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    for name in ["t", "u"] {
+        before.tables.insert(t(name), table_with(&["id"]));
+    }
+    after.tables.insert(t("t"), table_with(&["id", "c"]));
+    after.tables.insert(t("u"), table_with(&["id"]));
+    after
+        .tables
+        .get_mut(&t(other))
+        .unwrap()
+        .columns
+        .insert("d".into(), Column::new(int()));
+    let add = |table: &str, name: &str| {
+        p(Change::AddColumn {
+            uid: uid(UidKind::Column, &format!("{table}.{name}")),
+            table: t(table),
+            name: name.into(),
+            column: Box::new(Column::new(int())),
+        })
+    };
+    let base = [("t", "id"), ("u", "id")];
+    Plan {
+        logical: vec![add("t", "c"), add(other, "d")],
+        before,
+        after,
+        before_ids: Plan::ids(&["t", "u"], &base),
+        after_ids: Plan::ids(
+            &["t", "u"],
+            &[&base[..], &[("t", "c"), (other, "d")]].concat(),
+        ),
+    }
+}
+
+/// Two columns added to one table are two writes of its column order, which
+/// the engine appends to, so the plan's order between them is kept: swapped,
+/// the table ends with `d, c` (#2080). Added to two tables, they are free.
+#[test]
+fn two_columns_added_to_one_table_keep_the_plans_order() {
+    let none = ModuleDeps::new();
+    let together = two_added_columns(false);
+    let (ops, fx, baseline) = together.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    let swapped = run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL);
+    assert!(
+        swapped.iter().any(|v| matches!(
+            v,
+            Violation::Edge { edge, .. } if matches!(
+                &edge.because,
+                Because::WriteWrite(Resource::Object(ObjectKey::ColumnOrder(_), _))
+            )
+        )),
+        "{swapped:?}"
+    );
+    // Negative: one column on each of two tables.
+    let apart = two_added_columns(true);
+    let (ops, fx, baseline) = apart.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
 /// A parent `p` and a child `c` whose foreign key stands throughout, over the
 /// columns given, and the two rows the plan inserts, the child's first.
 fn rows_across(
