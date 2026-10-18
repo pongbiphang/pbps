@@ -866,6 +866,7 @@ impl Cx<'_> {
                     }
                 }
                 self.row_meets_constraints(&owner, table, &written);
+                self.row_leaves_no_required_column(&owner, table, &written);
                 self.row_parents(&owner, true, false);
                 self.row_cycle(&owner);
                 for (c, v) in row.columns() {
@@ -1610,6 +1611,86 @@ impl Cx<'_> {
             ObjectKey::ColumnOrder(owner),
             Incarnation::Final,
         ));
+    }
+
+    /// An inserted row writes no value into a baseline column the row and
+    /// its defaults leave out, so such a column that is `NOT NULL` with
+    /// nothing to fill it, no default, identity, sequence or generation,
+    /// refuses the row while its NOT NULL stands: the insert waits for that
+    /// NOT NULL to go, with the column's drop or its relaxation (#2086). Only
+    /// the baseline's columns, as `row_meets_constraints` reads them: a NOT
+    /// NULL column the plan adds with nothing to fill it is one the row has
+    /// to write in any order. Nor one the plan gives something to fill it:
+    /// the engine fills it once that change runs.
+    fn row_leaves_no_required_column(
+        &mut self,
+        owner: &Recorded,
+        table: &TableName,
+        written: &[&str],
+    ) {
+        let Some((base_name, was)) = self.base_of(owner) else {
+            return;
+        };
+        // A trigger on the table may fill the column before the row is
+        // checked, and whether it does is the engine's to say: the release
+        // pass lets a drop pass the insert there (`Dependence::base_required`,
+        // #1397), so no requirement is stated (#2175 review). Only a trigger
+        // that stands at the insert: one declared under the same id at both
+        // ends, on a table the plan neither renames nor replaces. The differ
+        // changes such a trigger's text in one step, so it stands throughout,
+        // and what its new text fills is the engine's to say too. A trigger
+        // under a new id, a renamed table's among them, is dropped before
+        // the rows and created after them. Only a declared trigger is seen
+        // here; an undeclared one is the catalog's, which the effects do not
+        // read.
+        let stands = |id: &crate::ModuleId| {
+            matches!(id, crate::ModuleId::Trigger { on, .. }
+                if on.schema == base_name.schema && on.name == base_name.name)
+        };
+        if self
+            .final_of(owner)
+            .is_some_and(|(final_name, _)| final_name == base_name)
+            && self.before.schema.modules.iter().any(|(id, was)| {
+                stands(id)
+                    && self
+                        .after
+                        .schema
+                        .modules
+                        .get(id)
+                        .is_some_and(|will| will.kind == was.kind)
+            })
+        {
+            return;
+        }
+        let written: Vec<ColumnKey> = written
+            .iter()
+            .filter_map(|c| self.column(&table.column(*c)).ok())
+            .collect();
+        // A column the plan gives a numbering source, a default or a
+        // generation is filled by the engine once that change has run,
+        // which the insert follows already (#2175 review): only a column
+        // left with nothing to fill it needs its NOT NULL gone.
+        let filled_at_the_end: Vec<ColumnKey> = self
+            .final_of(owner)
+            .map(|(final_name, will)| {
+                will.columns
+                    .iter()
+                    .filter(|(_, c)| !matches!(c.value_source, crate::ValueSource::None))
+                    .filter_map(|(n, _)| self.final_column(&final_name.column(n.as_str())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (name, column) in &was.columns {
+            if column.nullable || !matches!(column.value_source, crate::ValueSource::None) {
+                continue;
+            }
+            if let Some(key) = self.base_column(&base_name.column(name.as_str()))
+                && !written.contains(&key)
+                && !filled_at_the_end.contains(&key)
+            {
+                self.requires(Requirement::Absent(Self::not_null(key)));
+            }
+        }
     }
 
     fn row_writes(&mut self, table: &TableName, owner: &Recorded, written: &[&str]) {

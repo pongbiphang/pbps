@@ -3021,6 +3021,123 @@ fn two_columns_added_to_one_table_keep_the_plans_order() {
     assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
 }
 
+/// `t(id, a)` with `a` dropped, and a row inserted that writes `id` alone;
+/// `a` is NOT NULL with no default when `required`, otherwise nullable
+/// (#2086).
+fn insert_beside_a_dropped_column(required: bool) -> Plan {
+    let mut was = table_with(&["id", "a"]);
+    was.columns.get_mut("a").unwrap().nullable = !required;
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), was);
+    after.tables.insert(t("t"), table_with(&["id"]));
+    Plan {
+        logical: vec![
+            p(Change::DropColumn {
+                uid: uid(UidKind::Column, "t.a"),
+                column: t("t").column("a"),
+            }),
+            p(Change::InsertRow {
+                table: t("t"),
+                key_column: "id".into(),
+                identity_key: false,
+                key: RowKey::from("3"),
+                row: Row::default(),
+                defaults: Default::default(),
+                types: Default::default(),
+            }),
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(&["t"], &[("t", "id"), ("t", "a")]),
+        after_ids: Plan::ids(&["t"], &[("t", "id")]),
+    }
+}
+
+/// While a NOT NULL column with no default stands, the engine refuses a row
+/// inserted without it, so the insert waits for the column's drop. A
+/// nullable column lets the row in, in either order (#2086).
+#[test]
+fn a_row_insert_waits_for_the_drop_of_a_not_null_column_it_leaves_out() {
+    let none = ModuleDeps::new();
+    let required = insert_beside_a_dropped_column(true);
+    let (ops, fx, baseline) = required.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    let early = run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL);
+    assert!(
+        early.iter().any(|v| matches!(
+            v,
+            Violation::Edge { edge, .. } if matches!(
+                &edge.because,
+                Because::Frees(ObjectKey::NotNull(_))
+            )
+        )),
+        "{early:?}"
+    );
+    // Negative: a nullable column lets the row in while it stands.
+    let free = insert_beside_a_dropped_column(false);
+    let (ops, fx, baseline) = free.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+    // Negative: a NOT NULL column the plan keeps and gives an identity is
+    // filled by the engine once the identity is on, so the insert does not
+    // wait for its NOT NULL to go (#2175 review).
+    let mut numbered = insert_beside_a_dropped_column(true);
+    numbered.logical.remove(0);
+    let mut kept = table_with(&["id", "a"]);
+    let a = kept.columns.get_mut("a").unwrap();
+    a.nullable = false;
+    a.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity::new(1, 1));
+    numbered.after.tables.insert(t("t"), kept);
+    numbered.after_ids = numbered.before_ids.clone();
+    let (_, fx, _) = numbered.analysed(ModuleEdits::InPlace);
+    assert!(
+        !fx[0]
+            .requires
+            .iter()
+            .any(|r| matches!(r, Requirement::Absent(ObjectKey::NotNull(_)))),
+        "{:?}",
+        fx[0].requires
+    );
+    // Negative: a table with a trigger the plan keeps, which may fill the
+    // column before the row is checked: the engine says whether it does
+    // (#2175 review).
+    let trigger = (
+        ModuleId::Trigger {
+            on: t("t"),
+            name: "fill".into(),
+        },
+        Module {
+            kind: ModuleKind::Trigger,
+            definition: "BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()".into(),
+            description: None,
+        },
+    );
+    let mut triggered = insert_beside_a_dropped_column(true);
+    for side in [&mut triggered.before, &mut triggered.after] {
+        side.modules.insert(trigger.0.clone(), trigger.1.clone());
+    }
+    let (ops, fx, baseline) = triggered.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+    // So does one whose text or description the plan changes: it is changed
+    // in one step and stands throughout (#2175 review).
+    let mut rewritten = insert_beside_a_dropped_column(true);
+    rewritten
+        .before
+        .modules
+        .insert(trigger.0.clone(), trigger.1.clone());
+    let mut new_text = trigger.1.clone();
+    new_text.definition = "BEFORE INSERT  ON t FOR EACH ROW EXECUTE FUNCTION g()".into();
+    new_text.description = Some("fills a".into());
+    rewritten.after.modules.insert(trigger.0.clone(), new_text);
+    let (ops, fx, baseline) = rewritten.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+    // But a trigger the plan drops may be gone when the row is written, so
+    // the insert still waits (#2175 review).
+    let mut dropped = insert_beside_a_dropped_column(true);
+    dropped.before.modules.insert(trigger.0, trigger.1);
+    let (ops, fx, baseline) = dropped.analysed(ModuleEdits::InPlace);
+    assert_ne!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
 /// A parent `p` and a child `c` whose foreign key stands throughout, over the
 /// columns given, and the two rows the plan inserts, the child's first.
 fn rows_across(
