@@ -12108,7 +12108,7 @@ fn arriving_overloads_rebind_unchanged_callers_in_the_approved_plan() {
         .iter()
         .filter_map(|p| {
             if let pbps_model::Change::AlterModule { id, .. } = &p.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -12421,9 +12421,9 @@ fn a_plan_saved_before_a_grammar_upgrade_is_refused_after_the_transfer() {
         .iter()
         .filter_map(|p| {
             if let pbps_model::Change::CreateModule { id, .. } = &p.change {
-                Some(format!("create {id}"))
+                Some(format!("create {id}", id = id.shown()))
             } else if let pbps_model::Change::AlterModule { id, .. } = &p.change {
-                Some(format!("alter {id}"))
+                Some(format!("alter {id}", id = id.shown()))
             } else {
                 None
             }
@@ -14686,7 +14686,9 @@ fn adopt_constraint_trigger_modules(connection: &str, d: &Demo) {
             pbps_model::ModuleId::Trigger { on, name } => {
                 format!("{}.{name}\non: {on}", on.schema, on = on.raw())
             }
-            pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Routine(_) => id.to_string(),
+            pbps_model::ModuleId::Named(_) | pbps_model::ModuleId::Routine(_) => {
+                id.raw().to_string()
+            }
         };
         std::fs::write(
             d.dir.join(format!("schema/adopted-{index}.yml")),
@@ -15665,7 +15667,7 @@ fn a_dropped_function_is_not_reported_as_carried_by_a_column_rename() {
             pbps_model::Change::DropModule {
                 kind: pbps_model::ModuleKind::Function,
                 id: pbps_model::ModuleId::Routine(r),
-            } if r.to_string() == "app.reads(integer)"
+            } if r.raw().to_string() == "app.reads(integer)"
         )),
         "{kinds:#?}"
     );

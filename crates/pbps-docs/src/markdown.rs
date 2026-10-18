@@ -61,7 +61,7 @@ fn modules_section(s: &mut String, modules: &BTreeMap<ModuleId, Module>) {
     }
     s.push_str("\n## Views, procedures, functions and triggers\n");
     for (name, m) in modules {
-        let _ = writeln!(s, "\n### `{name}`\n");
+        let _ = writeln!(s, "\n### `{name}`\n", name = name.raw());
         let on = name
             .attached_to()
             .map(|t| format!(" on `{t}`", t = t.raw()))

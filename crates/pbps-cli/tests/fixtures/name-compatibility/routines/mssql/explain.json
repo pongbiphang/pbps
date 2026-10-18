@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.0.0",
+  "command": "explain",
+  "result": "ok",
+  "findings": [],
+  "data": {
+    "applyable": true,
+    "dialect": "mssql",
+    "created_at": "2026-10-18T00:00:00Z",
+    "baseline": "routine/module master fixture",
+    "mode": "transactional",
+    "checksum": "fece81b8960e5429dab93edc0dc3eb2876ede8bb49a417a013ab47118617fdcc",
+    "change_count": 2,
+    "table_count": 0,
+    "module_count": 2,
+    "role_count": 0,
+    "risks": [],
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum fece81b8960e5429dab93edc0dc3eb2876ede8bb49a417a013ab47118617fdcc",
+    "probes": [],
+    "unchecked": [],
+    "statement_count": 2
+  }
+}

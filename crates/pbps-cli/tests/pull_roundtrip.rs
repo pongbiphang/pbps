@@ -241,15 +241,17 @@ fn what_pull_writes_for_a_module_reads_back_as_the_same_module() {
             pulled.public_execute.contains(id),
         );
         let loaded = pbps_load::load_module_str(Path::new("pulled.yml"), &yaml)
-            .unwrap_or_else(|e| panic!("{id}: pulled YAML does not parse: {e:?}"));
+            .unwrap_or_else(|e| panic!("{id}: pulled YAML does not parse: {e:?}", id = id.shown()));
         // The identity too, not only the body: a trigger's file writes
         // `trigger: dbo.tr_customer` beside `on: dbo.customer`, and the two
         // have to fold back into the one identity the catalog gave
         // (ADR-0009 §1).
         assert_eq!(&loaded.id, id);
         assert_eq!(
-            &loaded.module, module,
-            "{id}: the pulled declaration is lossy\n---\n{yaml}"
+            &loaded.module,
+            module,
+            "{id}: the pulled declaration is lossy\n---\n{yaml}",
+            id = id.shown()
         );
     }
 }

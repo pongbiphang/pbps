@@ -107,7 +107,7 @@ pub fn named(assessment: &Assessment) -> String {
 fn describe(surface: &pbps_model::resolver::Surface) -> String {
     use pbps_model::resolver::Surface;
     match surface {
-        Surface::Module(id) => id.to_string(),
+        Surface::Module(id) => id.shown().to_string(),
         Surface::Default(column) => format!("the default of {column}", column = column.shown()),
         Surface::Check { table, name } => format!("check {name} on {table}", table = table.shown()),
         Surface::Index { table, name } => format!("index {name} on {table}", table = table.shown()),

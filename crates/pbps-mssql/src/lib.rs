@@ -782,7 +782,7 @@ mod tests {
         // Negative: a column type is still spelled the way the catalog does,
         // and one the catalogue lacks is still refused.
         let arg: pbps_model::RoutineArg = "INTEGER".parse().unwrap();
-        assert_eq!(Mssql.normalize_routine_arg(&arg).unwrap().as_str(), "int");
+        assert_eq!(Mssql.normalize_routine_arg(&arg).unwrap().raw(), "int");
         assert!(
             Mssql
                 .normalize_routine_arg(&"jsonb".parse().unwrap())

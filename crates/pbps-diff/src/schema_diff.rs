@@ -20881,7 +20881,7 @@ mod tests {
             assert!(
                 cs.changes.iter().any(|p| matches!(
                     &p.change,
-                    Change::DropModule { id, .. } if id.to_string() == "dbo.f(integer)"
+                    Change::DropModule { id, .. } if id.raw().to_string() == "dbo.f(integer)"
                 )),
                 "{:?}",
                 kinds(&base, &declared)
@@ -21323,7 +21323,7 @@ mod tests {
                         origin,
                     } = &p.change
                     {
-                        Some((routine.to_string(), *access, *origin))
+                        Some((routine.raw().to_string(), *access, *origin))
                     } else {
                         None
                     }
@@ -21406,7 +21406,8 @@ mod tests {
                             before,
                             Some(Change::CreateModule { id: ModuleId::Routine(r), .. }) if r == routine
                         ),
-                        "{routine} is not settled right after its own CREATE: {:?}",
+                        "{} is not settled right after its own CREATE: {:?}",
+                        routine.shown(),
                         kinds(&cs)
                     );
                 }

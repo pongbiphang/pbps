@@ -116,8 +116,8 @@ fn modules_section(s: &mut String, modules: &BTreeMap<ModuleId, Module>) {
         let _ = writeln!(
             s,
             "<h3 id=\"{}\">{}</h3>",
-            esc(&name.to_string()),
-            esc(&name.to_string())
+            esc(&name.raw().to_string()),
+            esc(&name.raw().to_string())
         );
         let on = name
             .attached_to()

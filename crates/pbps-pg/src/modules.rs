@@ -136,7 +136,7 @@ impl Rebuild {
              is a drop and a create (ADR-0009 section 3), and the catalog holds things for this object \
              that a `CREATE` would not put back:\n{}\nDeclare them, or undo them, and plan again. \
              Proceeding would report success while quietly changing who may use this object.",
-            self.id,
+            self.id.shown(),
             items.join("\n")
         ))
     }
@@ -324,7 +324,8 @@ async fn serialize(
             Some(on) => on.schema.clone(),
             None => {
                 return Ok(Serialized::Not(format!(
-                    "`{id}` does not say which table it is on, so there is no lock to take"
+                    "`{id}` does not say which table it is on, so there is no lock to take",
+                    id = id.shown()
                 )));
             }
         },
@@ -368,7 +369,8 @@ async fn serialize(
             // this arm cannot reach the `else` below.
             let Some(on) = id.attached_to() else {
                 return Ok(Serialized::Not(format!(
-                    "`{id}` does not say which table it is on, so there is no lock to take"
+                    "`{id}` does not say which table it is on, so there is no lock to take",
+                    id = id.shown()
                 )));
             };
             conn.execute(&format!(
@@ -660,7 +662,8 @@ async fn locked_what_the_reads_describe(
          destroy whatever stands under it -- an object no plan approved over. Run the deploy \
          again once the other session has finished.",
         held = locks.object,
-        how_it_moved = locks.how_it_moved
+        how_it_moved = locks.how_it_moved,
+        id = id.shown()
     )))
 }
 
@@ -1479,7 +1482,8 @@ fn not_in_the_catalog(id: &ModuleId) -> DbError {
          it would destroy.\nAn answer of \"nothing\" here would mean \"nothing is attached to \
          it\", which is what lets a rebuild go ahead -- so a module that is not there is \
          refused instead. If the plan means to create it, it is not being rebuilt and this \
-         question does not apply."
+         question does not apply.",
+        id = id.shown()
     ))
 }
 
@@ -1503,7 +1507,7 @@ fn one_quoted(ident: &str) -> String {
 fn signature(id: &ModuleId) -> String {
     id.args().map_or_else(String::new, |args| {
         args.iter()
-            .map(pbps_model::RoutineArg::as_str)
+            .map(pbps_model::RoutineArg::raw)
             .collect::<Vec<_>>()
             .join(",")
     })
@@ -1786,7 +1790,8 @@ pub async fn dependents(
         if let Some(dependent) = found.get_mut(&node) {
             dependent.holds = Holds::Unrepresentable(format!(
                 "depended on by `{id}` as well as depending on it, which is a cycle a rebuild \
-                 has no order to drop"
+                 has no order to drop",
+                id = id.shown()
             ));
         }
     }
@@ -2241,7 +2246,8 @@ fn the_engine_broke_a_tie(id: &ModuleId, e: DbError) -> DbError {
                  held: the engine broke the tie and rolled this side back whole.\n\
                  Nothing was changed. Run the deploy again once the other session has \
                  finished -- most often it is a `pull` or a `status`, which opens every view in \
-                 the database to read its definition back."
+                 the database to read its definition back.",
+            id = id.shown()
         )),
         _ => e,
     }
@@ -2272,7 +2278,8 @@ pub fn unmanaged_refusal(
                 "- {} -- a generated column, whose expression no statement can take off and put \
                  back around the rebuild; a plan that changes the expression so it no longer \
                  calls `{id}` releases it",
-                d.described
+                d.described,
+                id = id.shown()
             ),
             Holds::Module(_) | Holds::TablePart { .. } => {
                 format!("- {} -- this project does not declare it", d.described)
@@ -2288,7 +2295,8 @@ pub fn unmanaged_refusal(
          put them back:\n{}\nThe plan names every object it drops, or it does not drop \
          (SPEC 14.3), so `DROP ... CASCADE` is not offered. Declare them, or remove the \
          dependency, and plan again.",
-        blocked.join("\n")
+        blocked.join("\n"),
+        id = id.shown()
     ))
 }
 
@@ -2379,7 +2387,10 @@ pub fn callers_report(id: &ModuleId, callers: &[ModuleId]) -> Option<String> {
     if callers.is_empty() {
         return None;
     }
-    let named: Vec<String> = callers.iter().map(|c| format!("- {c}")).collect();
+    let named: Vec<String> = callers
+        .iter()
+        .map(|c| format!("- {c}", c = c.shown()))
+        .collect();
     Some(format!(
         "`{id}` is being rebuilt or removed, and these declared modules mention its name. The \
          catalog records a dependency only for a body it parsed at creation time -- measured, a \
@@ -2387,7 +2398,8 @@ pub fn callers_report(id: &ModuleId, callers: &[ModuleId]) -> Option<String> {
          nothing -- so this is a scan, and a name is not an identity where routines overload. It \
          is reported and not refused; check each and, where the call has to be reordered, say so \
          with `depends_on:`:\n{}",
-        named.join("\n")
+        named.join("\n"),
+        id = id.shown()
     ))
 }
 
@@ -2568,6 +2580,19 @@ mod tests {
 
     fn id(s: &str) -> ModuleId {
         s.parse().expect("a module id parses")
+    }
+
+    #[test]
+    fn routine_lookup_signature_keeps_the_catalogs_raw_argument_spelling() {
+        let part = "x\n\\\u{200b}";
+        let argument = format!("s.\"{part}\"");
+        let id: ModuleId = format!("app.f({argument},integer)").parse().unwrap();
+        assert_eq!(signature(&id), format!("{argument},integer"));
+        assert_ne!(signature(&id), "s.\"x\\n\\\\\\u{200b}\",integer");
+        assert_ne!(
+            signature(&id),
+            signature(&"app.f(text,integer)".parse().unwrap())
+        );
     }
 
     #[test]

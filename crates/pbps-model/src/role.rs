@@ -87,7 +87,7 @@ impl fmt::Display for GrantTarget {
         match self {
             // raw until #2084 step 3 (RoleName): this Display is also serialization.
             GrantTarget::Object(o) => o.raw().fmt(f),
-            GrantTarget::Routine(r) => r.fmt(f),
+            GrantTarget::Routine(r) => r.raw().fmt(f),
             GrantTarget::Schema(s) => write!(f, "schema::{s}"),
         }
     }
@@ -291,7 +291,8 @@ pub fn check(schema: &crate::schema::Schema) -> Vec<String> {
                         "role `{name}`: grants on `{routine}`, which the declarations do not \
                          have; declare the routine with that signature, or grant on \
                          `schema::{}` if it is outside pbps",
-                        routine.name.schema
+                        routine.name.schema,
+                        routine = routine.shown()
                     ));
                 }
                 GrantTarget::Object(_) | GrantTarget::Routine(_) | GrantTarget::Schema(_) => {}

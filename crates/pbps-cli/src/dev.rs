@@ -455,7 +455,8 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
                     .modules
                     .get(id)
                     .map(|m| m.definition.trim())
-                    .unwrap_or("(absent)")
+                    .unwrap_or("(absent)"),
+                id = id.shown()
             )),
             // The other half of a check's drop+add pair: not a second finding.
             Change::DropCheck { .. } => {}

@@ -93,7 +93,8 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                 errs.push(invalid(format!(
                     "role `{name}`: `{r}` names an argument list; SQL Server identifies a routine \
                      by name alone, so grant on `{}` instead",
-                    r.name.raw()
+                    r.name.raw(),
+                    r = r.raw()
                 )));
                 vec![&r.name.schema, &r.name.name]
             }
@@ -385,7 +386,7 @@ pub fn module(id: &ModuleId, module: &Module) -> Vec<DialectError> {
     // thing for the whole-schema check; this one catches a module that
     // reached the emitter another way — a saved plan, a state snapshot.
     if let Some(args) = id.args() {
-        let spelled: Vec<String> = args.iter().map(ToString::to_string).collect();
+        let spelled: Vec<String> = args.iter().map(|arg| arg.raw().to_owned()).collect();
         errs.push(invalid(format!(
             "{} `{name}` is declared with the argument list `({})`; SQL Server identifies a {} by \
              name alone",

@@ -1577,7 +1577,7 @@ pub(crate) fn cannot_become(from: &ColumnType, to: &ColumnType, value: &str) -> 
 /// design: a spelling this catalogue does not know is the engine's to judge,
 /// and the text goes back unchanged.
 pub fn routine_arg(arg: &RoutineArg) -> RoutineArg {
-    let (element, array) = peel_array(arg.as_str());
+    let (element, array) = peel_array(arg.raw());
     let canonical = identity_element(element);
     let spelled = if array && !canonical.ends_with("[]") {
         format!("{canonical}[]")
@@ -1607,7 +1607,7 @@ pub fn routine_arg(arg: &RoutineArg) -> RoutineArg {
 /// dimension — so a run of identifier bytes over the limit is a name over
 /// it, whatever it is a name of.
 pub(crate) fn overlong_name(arg: &RoutineArg) -> Option<String> {
-    let mut rest = arg.as_str();
+    let mut rest = arg.raw();
     while !rest.is_empty() {
         if rest.starts_with('"') {
             let Some(end) = quoted_len(rest) else {
@@ -1645,7 +1645,7 @@ pub(crate) fn overlong_name(arg: &RoutineArg) -> Option<String> {
 /// precision)` still creates `mq.b(double precision)`. The engine does not
 /// offer that reading, so neither may the gate.
 pub(crate) fn catalogued(arg: &RoutineArg) -> bool {
-    let (element, _) = peel_array(arg.as_str());
+    let (element, _) = peel_array(arg.raw());
     folded(element).is_some() || folded(&without_modifier(element)).is_some()
 }
 
@@ -2240,7 +2240,7 @@ mod tests {
 
     fn arg(s: &str) -> String {
         let declared: pbps_model::RoutineArg = s.parse().expect("a routine argument parses");
-        routine_arg(&declared).as_str().to_owned()
+        routine_arg(&declared).raw().to_owned()
     }
 
     /// An array normalizes as its element, aliases expanded and modifiers

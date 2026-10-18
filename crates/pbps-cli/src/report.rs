@@ -270,6 +270,27 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
 mod batch_tests {
     use super::*;
 
+    #[test]
+    fn module_counts_distinguish_raw_names_from_their_display_spelling() {
+        let id: pbps_model::ModuleId = "app.x\n\\\u{200b}(integer)".parse().unwrap();
+        let escaped: pbps_model::ModuleId = id.shown().to_string().parse().unwrap();
+        let changes: Vec<_> = [id.clone(), id, escaped]
+            .into_iter()
+            .map(|id| {
+                pbps_model::PlannedChange::new(Change::DropModule {
+                    id,
+                    kind: pbps_model::ModuleKind::Function,
+                })
+            })
+            .collect();
+        let ids = pbps_model::IdsFile::default();
+        let names = PlanNames::of(&changes, &ids).unwrap();
+        assert_eq!(touched(&names), (0, 2));
+        // Neither rendering choice is allowed to collapse distinct identities.
+        let changes = &changes[..2];
+        assert_eq!(touched(&PlanNames::of(changes, &ids).unwrap()), (0, 1));
+    }
+
     #[cfg(unix)]
     #[test]
     fn standalone_remedy_commands_round_trip_raw_table_and_column_names() {
@@ -765,7 +786,7 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
     for (i, p) in names.changes().iter().enumerate() {
         match (p.change.module_id(), p.change.table()) {
             (Some(m), _) => {
-                modules.insert(m.to_string());
+                modules.insert(m.raw().to_string());
             }
             (None, Some(table)) => {
                 let holder = match names.holder(table, At::Before(i)) {
@@ -1455,7 +1476,10 @@ pub fn describe(c: &Change) -> String {
             routine,
             access: pbps_model::PublicAccess::Revoked,
             ..
-        } => format!("- revoke execute on {routine} from PUBLIC"),
+        } => format!(
+            "- revoke execute on {routine} from PUBLIC",
+            routine = routine.raw()
+        ),
         // A statement of its own, because the engine's default is not
         // something to take on trust (DECISIONS 517) — and worth a reader's
         // eye either way: it says this routine stays runnable by every
@@ -1464,7 +1488,10 @@ pub fn describe(c: &Change) -> String {
             routine,
             access: pbps_model::PublicAccess::Kept,
             ..
-        } => format!("+ grant execute on {routine} to PUBLIC (declared)"),
+        } => format!(
+            "+ grant execute on {routine} to PUBLIC (declared)",
+            routine = routine.raw()
+        ),
     }
 }
 

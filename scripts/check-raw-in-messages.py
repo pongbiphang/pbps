@@ -3,8 +3,8 @@
 
 A name or a free text that can come from an artifact has no `Display`: it is
 used as text only through `.shown()`, which escapes it, or `.raw()`, which does
-not (`pbps_model::Text`, `TableName`/`ObjectName` and `ColumnRef` today; the
-remaining name types follow in #2084). The compiler forces that choice but cannot
+not (`pbps_model::Text`, `TableName`/`ObjectName`, `ColumnRef`, `RoutineArg`,
+`RoutineId` and `ModuleId` today; the remaining name types follow in #2084). The compiler forces that choice but cannot
 stop `.raw()` being the one chosen for a message, and an unescaped line break in
 a message starts a line the tool never wrote. This is the one hole the types
 leave, so this check closes it.
@@ -78,13 +78,13 @@ ALLOWED = {
     # adapters and fixture builders are counted too, so a new raw message in
     # those files cannot hide behind their non-message uses.
     "crates/pbps-cli/src/report.rs": (
-        22,
+        24,
         "Canonical shell arguments and describe() names stay raw: the latter is "
         "the JSON `risks[].changes` text too and the report escapes it whole; "
         "#2084 step 5 removes that cover",
     ),
     "crates/pbps-cli/src/explain/resolver.rs": (
-        5,
+        6,
         "surface() becomes shared JSON/Text and is escaped once when rendered; "
         "#2084 step 5 removes the shared-sentence boundary",
     ),
@@ -99,9 +99,10 @@ ALLOWED = {
         "until #2084 step 5",
     ),
     "crates/pbps-mssql/src/validate.rs": (
-        13,
-        "validation sentences feed whole-escaped DialectError fields, and the "
-        "#1450 declaration note the whole-escaped `dialect.not-checked` note, "
+        14,
+        "validation sentences, including the #2084 routine-argument refusal, "
+        "feed whole-escaped DialectError fields; the #1450 declaration note "
+        "feeds the whole-escaped `dialect.not-checked` note "
         "until #2084 step 5",
     ),
     "crates/pbps-pg/src/lib.rs": (
@@ -131,8 +132,13 @@ ALLOWED = {
     ),
     "crates/pbps-model/src/module.rs": (
         2,
-        "raw routine/trigger serialization bridges until #2084 step 1b; "
+        "raw routine/trigger adapters for canonical serialization; "
         "#2084 step 5 must retain their canonical serialized spelling",
+    ),
+    "crates/pbps-pg/src/resolver/reconstruct.rs": (
+        1,
+        "builds a dropped routine signature as SQL; its names and arguments "
+        "remain raw after #2084 step 5",
     ),
     "crates/pbps-diff/src/identity.rs": (
         1,
@@ -144,12 +150,17 @@ ALLOWED = {
         "builds fixture SQL, whose identifiers remain raw after #2084 step 5",
     ),
     "crates/pbps-pg/tests/live.rs": (
-        1,
+        3,
         "builds a routine's fixture SQL; SQL remains raw after #2084 step 5",
     ),
     "crates/pbps-cli/tests/flow_pg.rs": (
         1,
         "writes a trigger's fixture YAML; serialization remains raw after #2084 step 5",
+    ),
+    "crates/pbps-cli/src/dependents.rs": (
+        3,
+        "Provenance.reason is shared plan JSON and escaped whole by report::changes "
+        "until #2084 step 5",
     ),
     "crates/pbps-cli/src/adopt.rs": (
         3,

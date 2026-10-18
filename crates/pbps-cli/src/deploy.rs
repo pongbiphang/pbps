@@ -295,9 +295,9 @@ fn refuse_occupied_names(
                     ModuleId::Routine(_) | ModuleId::Trigger { .. } => scoped
                         .unmanaged_modules
                         .contains(id)
-                        .then(|| format!("{} `{id}`", module.kind)),
+                        .then(|| format!("{} `{id}`", module.kind, id = id.shown())),
                 };
-                (format!("{} `{id}`", module.kind), occupant)
+                (format!("{} `{id}`", module.kind, id = id.shown()), occupant)
             }
             _ => continue,
         };
@@ -3072,7 +3072,7 @@ fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
     }
     for id in schema.modules.keys() {
         out.entry(id.schema().to_owned())
-            .or_insert_with(|| format!("the schema of `{id}`"));
+            .or_insert_with(|| format!("the schema of `{id}`", id = id.shown()));
     }
     // A history is created in its own schema, spelled as declared, and read
     // back as the database spells it (#1176, #1501 review).
@@ -3641,7 +3641,7 @@ pub(crate) fn unmanaged_objects(
             scoped
                 .unmanaged_modules
                 .iter()
-                .map(|id| pbps_model::escape::Escaped(&id.to_string()).to_string()),
+                .map(|id| id.shown().to_string()),
         )
         // A role is a principal rather than an object, so it has no
         // `TableName` to be listed under and needs its own spelling — but the
@@ -4334,7 +4334,7 @@ fn refuse_pinned_movement(
         |id: &pbps_model::ModuleId| touched_modules.contains(id),
         |_: &pbps_model::ModuleId, was: &pbps_model::Module, now: &pbps_model::Module| was == now,
         &mut moved,
-        ToString::to_string,
+        |id| id.shown().to_string(),
     );
     // A module the plan names is held to the definition the plan wrote, not
     // exempted. `CREATE OR ALTER` reports success and says nothing about what
@@ -4365,15 +4365,18 @@ fn refuse_pinned_movement(
             (pbps_model::ModuleAfter::Standing(wrote), Some(now))
                 if dialect.module_matches_declaration(wrote, now) => {}
             (pbps_model::ModuleAfter::Standing(_), Some(_)) => moved.push(format!(
-                "{name} does not hold the definition this plan wrote"
+                "{name} does not hold the definition this plan wrote",
+                name = name.shown()
             )),
-            (pbps_model::ModuleAfter::Standing(_), None) => {
-                moved.push(format!("{name} is not there, and this plan writes it"))
-            }
+            (pbps_model::ModuleAfter::Standing(_), None) => moved.push(format!(
+                "{name} is not there, and this plan writes it",
+                name = name.shown()
+            )),
             (pbps_model::ModuleAfter::Gone, None) => {}
-            (pbps_model::ModuleAfter::Gone, Some(_)) => {
-                moved.push(format!("{name} is still there, and this plan drops it"))
-            }
+            (pbps_model::ModuleAfter::Gone, Some(_)) => moved.push(format!(
+                "{name} is still there, and this plan drops it",
+                name = name.shown()
+            )),
         }
     }
 
@@ -5589,7 +5592,7 @@ pub fn cmd_bootstrap(
                             .schema
                             .modules
                             .keys()
-                            .map(ToString::to_string),
+                            .map(|id| id.shown().to_string()),
                     )
                     .chain(existing_roles)
                     .chain(existing.limitations.iter().cloned())
@@ -6333,7 +6336,7 @@ pub fn cmd_plan_db(
                 // planning again without the resolver would drop its answer
                 // (#1516).
                 if resolution.is_some() {
-                    let names: Vec<String> = also.iter().map(ToString::to_string).collect();
+                    let names: Vec<String> = also.iter().map(|id| id.shown().to_string()).collect();
                     bail!(
                         "the resolver's plan drops a module that {} depend(s) on, and its \
                          evidence does not cover rebuilding them; declare the dependency, or \
@@ -8412,10 +8415,12 @@ fn refuse_unmet_public_execution(
         let open = after.public_execute.contains(&id);
         match access {
             pbps_model::PublicAccess::Kept if !open => unmet.push(format!(
-                "`{routine}` is not executable by PUBLIC, which this plan declared it would stay"
+                "`{routine}` is not executable by PUBLIC, which this plan declared it would stay",
+                routine = routine.shown()
             )),
             pbps_model::PublicAccess::Revoked if open => unmet.push(format!(
-                "`{routine}` is executable by PUBLIC, which this plan closed"
+                "`{routine}` is executable by PUBLIC, which this plan closed",
+                routine = routine.shown()
             )),
             pbps_model::PublicAccess::Kept | pbps_model::PublicAccess::Revoked => {}
         }

@@ -96,14 +96,29 @@ pub type ObjectName = TableName;
 /// not either. Inside them nothing is touched, which is the whole reason this
 /// is not a [`ColumnType`]: `"char"` is a type whose case the engine keeps,
 /// and lowercasing it would name a different type.
+///
+/// ```compile_fail,E0277
+/// let name: pbps_model::RoutineArg = "integer".parse().unwrap();
+/// let _ = format!("{}", name);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let name: pbps_model::RoutineArg = "integer".parse().unwrap();
+/// let _ = name.to_string();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RoutineArg(String);
 
 impl RoutineArg {
-    /// The spelling, unchanged.
+    /// The canonical spelling for SQL, parsing and identity comparisons.
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub fn raw(&self) -> &str {
         &self.0
+    }
+
+    /// The argument text for a person, escaped exactly once.
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        crate::escape::Escaped(&self.0)
     }
 }
 
@@ -446,12 +461,6 @@ pub fn decode_unicode_escapes(inner: &str, escape: char) -> Option<String> {
     Some(out)
 }
 
-impl fmt::Display for RoutineArg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 /// The identity of a routine: its qualified name **and** its argument types.
 ///
 /// The types are normalized for *routine identity*, which is not column
@@ -459,6 +468,16 @@ impl fmt::Display for RoutineArg {
 /// routine, so `f(varchar(10))` and `f(varchar(20))` are one function
 /// (ADR-0009 §1, measured). `Dialect::normalize_routine_arg` is the hook that
 /// does it; the model only holds the result.
+///
+/// ```compile_fail,E0277
+/// let name: pbps_model::RoutineId = "app.f(integer)".parse().unwrap();
+/// let _ = format!("{}", name);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let name: pbps_model::RoutineId = "app.f(integer)".parse().unwrap();
+/// let _ = name.to_string();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RoutineId {
     pub name: ObjectName,
@@ -472,17 +491,45 @@ impl RoutineId {
     pub fn new(name: ObjectName, args: Vec<RoutineArg>) -> Self {
         Self { name, args }
     }
+
+    /// The signature for SQL, serialization and identity keys.
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        RawRoutineId(self)
+    }
+
+    /// The signature for a person, with its name and arguments escaped once.
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        ShownRoutineId(self)
+    }
 }
 
-impl fmt::Display for RoutineId {
+#[derive(Clone, Copy)]
+struct RawRoutineId<'a>(&'a RoutineId);
+
+impl fmt::Display for RawRoutineId<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Raw interim serialization bridge until #2084 step 1b types routine text.
-        write!(f, "{}(", self.name.raw())?;
-        for (i, a) in self.args.iter().enumerate() {
+        write!(f, "{}(", self.0.name.raw())?;
+        for (i, a) in self.0.args.iter().enumerate() {
             if i > 0 {
                 f.write_str(",")?;
             }
-            write!(f, "{a}")?;
+            f.write_str(a.raw())?;
+        }
+        f.write_str(")")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ShownRoutineId<'a>(&'a RoutineId);
+
+impl fmt::Display for ShownRoutineId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}(", self.0.name.shown())?;
+        for (i, a) in self.0.args.iter().enumerate() {
+            if i > 0 {
+                f.write_str(",")?;
+            }
+            a.shown().fmt(f)?;
         }
         f.write_str(")")
     }
@@ -514,6 +561,16 @@ impl fmt::Display for RoutineId {
 /// The string form — the JSON map key, and what a message shows — is
 /// `app.v`, `app.f(integer,text)` and `app.orders.audit`. Each shape is
 /// unambiguous: parentheses mean a routine, three dotted parts mean a trigger.
+///
+/// ```compile_fail,E0277
+/// let name: pbps_model::ModuleId = "app.v".parse().unwrap();
+/// let _ = format!("{}", name);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let name: pbps_model::ModuleId = "app.v".parse().unwrap();
+/// let _ = name.to_string();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ModuleId {
     /// A view: one name, one namespace with tables.
@@ -530,6 +587,16 @@ pub enum ModuleId {
 }
 
 impl ModuleId {
+    /// The canonical identity for SQL, serialization and keys.
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        RawModuleId(self)
+    }
+
+    /// The identity for a person, with every name part escaped once.
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        ShownModuleId(self)
+    }
+
     /// The schema this module lives in.
     pub fn schema(&self) -> &str {
         match self {
@@ -619,13 +686,30 @@ pub enum ModuleIdError {
     },
 }
 
-impl fmt::Display for ModuleId {
+#[derive(Clone, Copy)]
+struct RawModuleId<'a>(&'a ModuleId);
+
+impl fmt::Display for RawModuleId<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+        match self.0 {
             ModuleId::Named(n) => n.raw().fmt(f),
-            ModuleId::Routine(r) => r.fmt(f),
-            // Raw interim serialization bridge until #2084 step 1b.
+            ModuleId::Routine(r) => r.raw().fmt(f),
             ModuleId::Trigger { on, name } => write!(f, "{}.{name}", on.raw()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ShownModuleId<'a>(&'a ModuleId);
+
+impl fmt::Display for ShownModuleId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            ModuleId::Named(n) => n.shown().fmt(f),
+            ModuleId::Routine(r) => r.shown().fmt(f),
+            ModuleId::Trigger { on, name } => {
+                write!(f, "{}.{}", on.shown(), crate::escape::Escaped(name))
+            }
         }
     }
 }
@@ -637,7 +721,7 @@ impl fmt::Display for ModuleId {
 /// comma in it, and `integer,text` is two without. Only nesting depth tells
 /// them apart, so a plain `split(',')` turned `app.f(decimal(10,2))` into
 /// `decimal(10` and `2)` — a valid declaration that would not parse back out
-/// of the JSON map key its own `Display` had written (PITFALLS: a round trip
+/// of the JSON map key its raw adapter had written (PITFALLS: a round trip
 /// tested only on the simple case).
 ///
 /// `None` if the brackets do not balance, which the caller reports as a
@@ -651,7 +735,7 @@ impl fmt::Display for ModuleId {
 /// created with that name, and a comma inside `[…]` is inside the argument
 /// too. Splitting on either produced two halves that each fail
 /// `RoutineArg`'s own balance check, so `app.f(s."a,b")` was a valid
-/// declaration its own `Display` could write and nothing could read back.
+/// declaration its raw adapter could write and nothing could read back.
 ///
 /// The states are exactly the ones [`RoutineArg::from_str`] tracks, and they
 /// are here rather than shared with it because that one is folding text as it
@@ -776,7 +860,7 @@ impl TryFrom<String> for ModuleId {
 
 impl From<ModuleId> for String {
     fn from(id: ModuleId) -> String {
-        id.to_string()
+        id.raw().to_string()
     }
 }
 
@@ -784,7 +868,7 @@ impl From<ModuleId> for String {
 // string like every other name in this model.
 impl serde::Serialize for ModuleId {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(self)
+        s.collect_str(&self.raw())
     }
 }
 
@@ -816,7 +900,7 @@ impl FromStr for RoutineId {
 // one string, `app.f(integer,text)`, read back through the shape rule above.
 impl serde::Serialize for RoutineId {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.collect_str(self)
+        s.collect_str(&self.raw())
     }
 }
 
@@ -1631,21 +1715,24 @@ pub fn check_names(schema: &crate::schema::Schema) -> Vec<String> {
                     problems.push(format!(
                         "trigger `{id}` is on `{on}`, which is not declared here as a table or a \
                          view",
+                        id = id.shown(),
                         on = on.shown()
                     ));
                 }
             }
             (ModuleKind::Trigger, _) => problems.push(format!(
-                "trigger `{id}` does not say which table it is on (`on:`)"
+                "trigger `{id}` does not say which table it is on (`on:`)",
+                id = id.shown()
             )),
             (kind, ModuleId::Trigger { on, .. }) => problems.push(format!(
                 "`{id}` is a {kind} and cannot be `on: {on}`; only a trigger names a table",
+                id = id.shown(),
                 on = on.shown()
             )),
             (_, ModuleId::Named(_) | ModuleId::Routine(_)) => {}
         }
         if module.definition.trim().is_empty() {
-            problems.push(format!("`{id}` has an empty definition"));
+            problems.push(format!("`{id}` has an empty definition", id = id.shown()));
         }
     }
     problems
@@ -1664,11 +1751,16 @@ pub fn check_dependencies(schema: &crate::schema::Schema, deps: &ModuleDeps) -> 
     for (name, on) in deps {
         for target in on {
             if target == name {
-                problems.push(format!("`{name}` lists itself in `depends_on`"));
+                problems.push(format!(
+                    "`{name}` lists itself in `depends_on`",
+                    name = name.shown()
+                ));
             } else if !schema.modules.contains_key(target) {
                 problems.push(format!(
                     "`{name}` depends on `{target}`, which is not a declared module; the ordering \
-                     it asks for would silently not happen"
+                     it asks for would silently not happen",
+                    name = name.shown(),
+                    target = target.shown()
                 ));
             }
         }
@@ -1680,6 +1772,61 @@ pub fn check_dependencies(schema: &crate::schema::Schema, deps: &ModuleDeps) -> 
 mod tests {
     use super::*;
     use crate::schema::{Schema, Table};
+
+    #[test]
+    fn routine_and_module_parts_are_shown_once_without_changing_identity_bytes() {
+        let part = "a\nb\r\u{1b}[31m\u{9b}\\\u{200b}";
+        let shown = r"a\nb\r\u{1b}[31m\u{9b}\\\u{200b}";
+        let arg: RoutineArg = format!("s.\"{part}\"[]").parse().unwrap();
+        assert_eq!(arg.raw(), format!("s.\"{part}\"[]"));
+        assert_eq!(arg.shown().to_string(), format!("s.\"{shown}\"[]"));
+        let routine = RoutineId::new(
+            ObjectName::new(part, part),
+            vec![arg, "numeric(10,2)".parse().unwrap()],
+        );
+        let raw = format!("{part}.{part}(s.\"{part}\"[],numeric(10,2))");
+        let escaped = format!("{shown}.{shown}(s.\"{shown}\"[],numeric(10,2))");
+        // GrantTarget keeps its raw serialization bridge until step 3.
+        assert_eq!(
+            serde_json::to_string(&crate::GrantTarget::Routine(routine.clone())).unwrap(),
+            serde_json::to_string(&raw).unwrap()
+        );
+        assert_eq!(routine.raw().to_string(), raw);
+        assert_eq!(routine.shown().to_string(), escaped);
+        assert_eq!(
+            serde_json::to_string(&routine).unwrap(),
+            serde_json::to_string(&raw).unwrap()
+        );
+        for (id, raw, escaped) in [
+            (
+                ModuleId::Named(ObjectName::new(part, part)),
+                format!("{part}.{part}"),
+                format!("{shown}.{shown}"),
+            ),
+            (ModuleId::Routine(routine), raw, escaped),
+            (
+                ModuleId::Trigger {
+                    on: ObjectName::new(part, part),
+                    name: part.into(),
+                },
+                format!("{part}.{part}.{part}"),
+                format!("{shown}.{shown}.{shown}"),
+            ),
+        ] {
+            assert_eq!(id.raw().to_string(), raw);
+            assert_eq!(id.shown().to_string(), escaped);
+            assert_ne!(raw, escaped);
+            let json = serde_json::to_string(&id).unwrap();
+            assert_eq!(json, serde_json::to_string(&raw).unwrap());
+            assert_eq!(serde_json::from_str::<ModuleId>(&json).unwrap(), id);
+        }
+        let ordinary: ModuleId = "名前.ünï(\"Ätype\",integer[])".parse().unwrap();
+        assert_eq!(
+            ordinary.shown().to_string(),
+            "名前.ünï(\"Ätype\",integer[])"
+        );
+        assert_eq!(ordinary.raw().to_string(), ordinary.shown().to_string());
+    }
 
     /// A bad argument type is named once: inside the error's own text, not
     /// again as its source, which a chain renderer would print twice (#1018).
@@ -2547,13 +2694,13 @@ mod tests {
     #[test]
     fn a_comma_inside_a_modifier_does_not_separate_arguments() {
         let one: ModuleId = "app.f(decimal(10, 2))".parse().unwrap();
-        assert_eq!(one.args().unwrap().len(), 1, "{one}");
+        assert_eq!(one.args().unwrap().len(), 1, "{}", one.shown());
         let three: ModuleId = "app.f(decimal(10, 2),text,numeric(38, 10))"
             .parse()
             .unwrap();
-        assert_eq!(three.args().unwrap().len(), 3, "{three}");
+        assert_eq!(three.args().unwrap().len(), 3, "{}", three.shown());
         // Spacing is layout, not identity: the compact spelling a human might
-        // type is the same routine as the one `Display` writes.
+        // type is the same routine as the raw adapter writes.
         assert_eq!("app.f(decimal(10,2))".parse::<ModuleId>().unwrap(), one);
 
         // Unbalanced is refused rather than guessed at. A silent split here
@@ -2590,7 +2737,7 @@ mod tests {
             "app.orders.audit",
         ] {
             let parsed: ModuleId = spelling.parse().unwrap();
-            assert_eq!(parsed.to_string(), spelling);
+            assert_eq!(parsed.raw().to_string(), spelling);
             assert_eq!(
                 serde_json::from_str::<ModuleId>(&serde_json::to_string(&parsed).unwrap()).unwrap(),
                 parsed,
@@ -2642,7 +2789,11 @@ mod tests {
             "s.\"Odd Name\"[]",
         ] {
             let arg: RoutineArg = spelling.parse().expect(spelling);
-            assert_eq!(arg.to_string(), spelling, "{spelling} did not survive");
+            assert_eq!(
+                arg.raw().to_string(),
+                spelling,
+                "{spelling} did not survive"
+            );
         }
     }
 
@@ -2704,7 +2855,11 @@ mod tests {
             ("\"a\"\"b\"", "\"a\"\"b\""),
         ] {
             assert_eq!(
-                written.parse::<RoutineArg>().expect(written).to_string(),
+                written
+                    .parse::<RoutineArg>()
+                    .expect(written)
+                    .raw()
+                    .to_string(),
                 canonical,
                 "{written}"
             );
@@ -2715,7 +2870,7 @@ mod tests {
             "a quoted type name keeps its case, and these are two types"
         );
         assert_ne!(
-            "Ätype".parse::<RoutineArg>().unwrap().as_str(),
+            "Ätype".parse::<RoutineArg>().unwrap().raw(),
             "ätype",
             "a fold that changes a byte the engine leaves alone names another type"
         );
@@ -2838,7 +2993,7 @@ mod tests {
             assert_eq!(
                 good.parse::<RoutineArg>()
                     .unwrap_or_else(|e| panic!("{good}: {e}"))
-                    .as_str(),
+                    .raw(),
                 good
             );
         }
@@ -2875,7 +3030,7 @@ mod tests {
             ),
         ] {
             let id: ModuleId = spelled.parse().unwrap_or_else(|e| panic!("{spelled}: {e}"));
-            assert_eq!(id.to_string(), canonical, "{spelled}");
+            assert_eq!(id.raw().to_string(), canonical, "{spelled}");
         }
         // A quote that is not an escape clause is still not an argument.
         for malformed in ["app.f(a'b)", "app.f('x')", "app.f(app.U&\"x\" UESCAPE ',)"] {
@@ -2890,7 +3045,7 @@ mod tests {
     fn an_argument_list_of_one_non_ascii_byte_is_not_empty() {
         let one: ModuleId = "app.f(\u{a0})".parse().expect("a module id");
         assert_eq!(one.args().map(<[RoutineArg]>::len), Some(1));
-        assert_eq!(one.to_string(), "app.f(\u{a0})");
+        assert_eq!(one.raw().to_string(), "app.f(\u{a0})");
         let none: ModuleId = "app.f( \t )".parse().expect("a module id");
         assert_eq!(none.args().map(<[RoutineArg]>::len), Some(0));
     }
@@ -2908,7 +3063,7 @@ mod tests {
             "app.f(\"a,b\"[],\"c\"\"d\")",
         ] {
             let parsed: ModuleId = spelling.parse().unwrap();
-            assert_eq!(parsed.to_string(), spelling);
+            assert_eq!(parsed.raw().to_string(), spelling);
             assert_eq!(
                 serde_json::from_str::<ModuleId>(&serde_json::to_string(&parsed).unwrap()).unwrap(),
                 parsed,

@@ -102,7 +102,7 @@ pub fn module_path(
     let stem = match id {
         pbps_model::ModuleId::Named(n) => n.name.clone(),
         pbps_model::ModuleId::Routine(r) => {
-            let spelled: Vec<String> = r.args.iter().map(ToString::to_string).collect();
+            let spelled: Vec<String> = r.args.iter().map(|arg| arg.raw().to_owned()).collect();
             format!("{}({})", r.name.name, spelled.join(","))
         }
         // The table's own name only: its schema is `name.schema`, which the
@@ -114,7 +114,8 @@ pub fn module_path(
     if path.parent() != Some(directory) {
         bail!(
             "generated declaration path for `{id}` escaped `{}`",
-            directory.display()
+            directory.display(),
+            id = id.shown()
         );
     }
     Ok(path)
@@ -187,7 +188,7 @@ pub fn paths_of(
     }
     for (id, module) in &schema.modules {
         out.push((
-            format!("{id} ({})", module.kind.as_str()),
+            format!("{id} ({})", module.kind.as_str(), id = id.shown()),
             module_path(directory, id, module.kind)?,
         ));
     }

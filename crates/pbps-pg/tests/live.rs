@@ -128,7 +128,7 @@ async fn the_pull_keeps_project_ledger_names_beside_the_real_ledger() {
             .schema
             .modules
             .keys()
-            .any(|id| id.to_string().contains("ledger185_trigger")),
+            .any(|id| id.raw().to_string().contains("ledger185_trigger")),
         "{:?}",
         pulled.schema.modules
     );
@@ -14784,10 +14784,16 @@ async fn a_module_of_every_kind_survives_the_round_trip_as_the_same_object() {
     );
     for (id, m) in &first {
         assert_eq!(
-            m.kind, declared.modules[id].kind,
-            "`{id}` came back as another kind"
+            m.kind,
+            declared.modules[id].kind,
+            "`{id}` came back as another kind",
+            id = id.shown()
         );
-        assert!(!m.definition.trim().is_empty(), "`{id}` came back empty");
+        assert!(
+            !m.definition.trim().is_empty(),
+            "`{id}` came back empty",
+            id = id.shown()
+        );
     }
 
     // Re-applied from the read-back, which is what `bootstrap` does with a
@@ -14818,7 +14824,7 @@ async fn a_module_of_every_kind_survives_the_round_trip_as_the_same_object() {
         {
             conn.execute(&stmt.sql)
                 .await
-                .unwrap_or_else(|e| panic!("dropping `{id}`:\n{}\n{e}", stmt.sql));
+                .unwrap_or_else(|e| panic!("dropping `{id}`:\n{}\n{e}", stmt.sql, id = id.shown()));
         }
     }
     apply(
@@ -14957,7 +14963,9 @@ async fn two_overloads_of_one_name_are_two_objects_and_each_drop_names_one() {
     let left = our_modules(&pull(&mut conn).await, &s);
     drop_schema(&mut conn, &s).await;
     assert_eq!(
-        left.keys().map(ToString::to_string).collect::<Vec<_>>(),
+        left.keys()
+            .map(|id| id.raw().to_string())
+            .collect::<Vec<_>>(),
         vec![format!("{s}.f(text)")],
         "the drop with a signature took the wrong object, or both"
     );
@@ -15003,7 +15011,7 @@ async fn read_a_rebuild(
             }
             Err(e) => {
                 rollback(conn).await;
-                assert!(deadlocked(&e), "{id}: {e}");
+                assert!(deadlocked(&e), "{id}: {e}", id = id.shown());
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
@@ -15125,7 +15133,8 @@ async fn a_callers_routine_lock_savepoint_is_the_one_rolled_back_to(
     assert_eq!(
         number(conn, &format!("SELECT count(*)::int FROM {table}")).await,
         1,
-        "{id}: the rollback reached the read's own marker, not the caller's"
+        "{id}: the rollback reached the read's own marker, not the caller's",
+        id = id.shown()
     );
 
     // Without a caller savepoint, there is nothing of that name left to end.
@@ -15323,13 +15332,18 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
                 rebuild.refusal(),
                 None,
                 "`{id}` carries nothing and must not refuse: {:?}",
-                rebuild.carries
+                rebuild.carries,
+                id = id.shown()
             ),
             Some(needle) => {
                 let refusal = rebuild
                     .refusal()
-                    .unwrap_or_else(|| panic!("`{id}` must refuse, and did not"));
-                assert!(refusal.contains(needle), "`{id}`: {refusal}");
+                    .unwrap_or_else(|| panic!("`{id}` must refuse, and did not", id = id.shown()));
+                assert!(
+                    refusal.contains(needle),
+                    "`{id}`: {refusal}",
+                    id = id.shown()
+                );
             }
         }
     }
@@ -15509,10 +15523,13 @@ async fn each_kind_says_what_serialized_its_read_or_that_nothing_did() {
         let rebuild = read_a_rebuild(&mut conn, &id, kind, &pbps_model::ChangeSet::default()).await;
         match &rebuild.serialized {
             pbps_pg::modules::Serialized::By(what) => {
-                assert!(what.contains(expected), "{id}: {what}");
+                assert!(what.contains(expected), "{id}: {what}", id = id.shown());
             }
             pbps_pg::modules::Serialized::Not(why) => {
-                panic!("{id} was not serialized, and this account can: {why}")
+                panic!(
+                    "{id} was not serialized, and this account can: {why}",
+                    id = id.shown()
+                )
             }
         }
     }
@@ -16968,7 +16985,7 @@ async fn a_caller_only_a_name_scan_can_see_is_reported_and_the_engine_never_saw_
     let by_name = pbps_pg::modules::callers_by_name(&declared, &dep_f);
     assert_eq!(by_name, vec![caller.clone()]);
     let report = pbps_pg::modules::callers_report(&dep_f, &by_name).expect("a report");
-    assert!(report.contains(&caller.to_string()), "{report}");
+    assert!(report.contains(&caller.shown().to_string()), "{report}");
     assert!(
         !report.to_lowercase().contains("cannot be rebuilt"),
         "a name match is reported, not refused: {report}"
@@ -17243,7 +17260,8 @@ async fn native_routine_symbols_do_not_report_callers_or_trigger_rebuilds() {
     for id in &arriving {
         assert!(
             pbps_pg::modules::callers_by_name(&declared, id).is_empty(),
-            "{id}"
+            "{id}",
+            id = id.shown()
         );
     }
     let rebound =
@@ -17350,7 +17368,7 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
         .iter()
         .filter_map(|p| {
             if let pbps_model::Change::PublicExecution { routine, .. } = &p.change {
-                Some(routine.to_string())
+                Some(routine.raw().to_string())
             } else {
                 None
             }
@@ -17358,7 +17376,7 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
         .collect();
     assert_eq!(
         closed,
-        [shadow.to_string(), caller.to_string()]
+        [shadow.raw().to_string(), caller.raw().to_string()]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>(),
         "{cs:#?}"
@@ -17483,7 +17501,9 @@ async fn a_module_shaped_object_the_model_does_not_hold_is_named_and_the_pull_st
     drop_schema(&mut conn, &s).await;
 
     assert_eq!(
-        ours.keys().map(ToString::to_string).collect::<Vec<_>>(),
+        ours.keys()
+            .map(|id| id.raw().to_string())
+            .collect::<Vec<_>>(),
         vec![format!("{s}.ordinary")],
         "only the kind the model holds is in the pull"
     );
@@ -17577,18 +17597,27 @@ async fn views_with_nondefault_options_are_named_and_default_options_stay_plain(
 
     for (name, _) in defaults {
         let id = format!("app.{name}").parse().unwrap();
-        assert!(pulled.schema.modules.contains_key(&id), "{id}");
+        assert!(
+            pulled.schema.modules.contains_key(&id),
+            "{id}",
+            id = id.shown()
+        );
         assert!(
             !pulled
                 .limitations
                 .iter()
                 .any(|l| l.target.matches_module(&id)),
-            "{id}"
+            "{id}",
+            id = id.shown()
         );
     }
     for (name, options) in unsupported {
         let id = format!("app.{name}").parse().unwrap();
-        assert!(!pulled.schema.modules.contains_key(&id), "{id}");
+        assert!(
+            !pulled.schema.modules.contains_key(&id),
+            "{id}",
+            id = id.shown()
+        );
         let limitation = pulled
             .limitations
             .iter()
@@ -18245,7 +18274,7 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
             let arg: pbps_model::RoutineArg = d.parse().expect("a routine argument");
             pbps_dialect::Dialect::normalize_routine_arg(&pg, &arg)
                 .expect("normalize")
-                .as_str()
+                .raw()
                 .to_owned()
         })
         .collect();
@@ -18290,7 +18319,7 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
     assert_eq!(
         pbps_dialect::Dialect::normalize_routine_arg(&pg, &ascii_only)
             .expect("normalize")
-            .as_str(),
+            .raw(),
         "\"Ätype\"",
         "and so does the dialect, quoting the name as the engine does"
     );
@@ -18323,14 +18352,17 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
     let kept: pbps_model::RoutineArg = format!("{s}.a\u{a0}b").parse().expect("a routine argument");
     let kept_folded = pbps_dialect::Dialect::normalize_routine_arg(&pg, &kept).expect("normalize");
     assert_eq!(
-        kept_folded.as_str(),
+        kept_folded.raw(),
         format!("{s}.\"a\u{a0}b\""),
         "the fold leaves the byte alone, and quotes the name as the engine does"
     );
     assert_eq!(
         text(
             &mut conn,
-            &format!("SELECT '{s}.nbsp({kept_folded})'::regprocedure::text")
+            &format!(
+                "SELECT '{s}.nbsp({kept_folded})'::regprocedure::text",
+                kept_folded = kept_folded.raw()
+            )
         )
         .await,
         identity,
@@ -18352,7 +18384,10 @@ async fn a_declared_argument_and_the_identity_the_engine_writes_are_one_key() {
     assert_eq!(
         text(
             &mut conn,
-            &format!("SELECT '{s}.nbsp_array({kept_folded})'::regprocedure::text")
+            &format!(
+                "SELECT '{s}.nbsp_array({kept_folded})'::regprocedure::text",
+                kept_folded = kept_folded.raw()
+            )
         )
         .await,
         format!("{s}.nbsp_array({s}.\"a\u{a0}array\")"),
@@ -18747,7 +18782,7 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
     let triggers: Vec<String> = modules
         .keys()
         .filter(|id| matches!(id, pbps_model::ModuleId::Trigger { .. }))
-        .map(ToString::to_string)
+        .map(|id| id.raw().to_string())
         .collect();
     assert_eq!(
         triggers,
@@ -18906,7 +18941,8 @@ async fn a_routine_that_takes_or_returns_the_views_row_type_is_a_dependent_of_th
         let id: pbps_model::ModuleId = id.parse().expect("a module id");
         assert!(
             holds.contains(&pbps_pg::modules::Holds::Module(id.clone())),
-            "{id} is not held as itself in {holds:?}"
+            "{id} is not held as itself in {holds:?}",
+            id = id.shown()
         );
     }
 
@@ -19005,7 +19041,7 @@ async fn a_view_named_by_a_reserved_word_is_created_after_the_view_it_selects_fr
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -19053,7 +19089,7 @@ async fn a_view_over_an_array_of_a_routine_is_created_after_the_routine() {
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -19167,7 +19203,7 @@ async fn a_bare_name_means_the_first_schema_of_the_path_that_has_it() {
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -19217,7 +19253,7 @@ async fn a_quote_inside_a_name_is_read_as_part_of_it() {
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -19270,7 +19306,7 @@ async fn a_uescape_clause_does_not_order_the_view_that_holds_it() {
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -19322,7 +19358,7 @@ async fn a_bare_name_in_another_schema_is_not_an_edge() {
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -19375,7 +19411,7 @@ async fn a_bodys_dollar_tags_are_not_the_name_of_a_module() {
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -19430,7 +19466,7 @@ async fn a_view_named_by_a_unicode_escape_is_created_after_the_view_it_names() {
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -19493,7 +19529,7 @@ async fn a_name_inside_an_escape_string_does_not_order_the_view_that_holds_it() 
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -19547,7 +19583,7 @@ async fn a_literals_prefix_and_a_non_ascii_byte_are_not_names_the_order_is_decid
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -28784,7 +28820,7 @@ async fn a_least_privilege_role_can_read_the_roles_the_acls_and_the_drop_blocker
         .schema
         .modules
         .keys()
-        .map(ToString::to_string)
+        .map(|id| id.raw().to_string())
         .collect();
     assert!(
         modules.contains(&"app.archive(integer)".to_owned()),

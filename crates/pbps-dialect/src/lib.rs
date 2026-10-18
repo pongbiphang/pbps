@@ -2724,7 +2724,7 @@ pub trait Dialect {
     ///
     /// A dialect whose identities are not column types overrides it.
     fn normalize_routine_arg(&self, arg: &RoutineArg) -> Result<RoutineArg, DialectError> {
-        let Ok(ty) = arg.as_str().parse::<ColumnType>() else {
+        let Ok(ty) = arg.raw().parse::<ColumnType>() else {
             return Ok(arg.clone());
         };
         // A schema-qualified name reads as a type reference since #1523, which
@@ -3145,7 +3145,9 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
                     "`{first}` and `{id}` are both declared as `{name}`; {} keeps them in one \
                      namespace per schema, so it can hold only one of them",
                     dialect.name(),
-                    name = name.shown()
+                    name = name.shown(),
+                    id = id.shown(),
+                    first = first.shown()
                 ));
             }
             if schema.tables.contains_key(&name) {
@@ -3166,7 +3168,8 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
                      name it `{}` instead",
                     dialect.name(),
                     module.kind,
-                    id.object_name().shown()
+                    id.object_name().shown(),
+                    id = id.shown()
                 ));
             }
             // The mirror image. Where the kind overloads, the engine identifies
@@ -3179,7 +3182,8 @@ pub fn check_module_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<String>
                     "`{id}` is declared without an argument list, but {} identifies a {} by its \
                      argument types: name it `{id}()` if it takes none, or list the types",
                     dialect.name(),
-                    module.kind
+                    module.kind,
+                    id = id.shown()
                 ));
             }
             ModuleId::Routine(_) | ModuleId::Named(_) | ModuleId::Trigger { .. } => {}
@@ -3609,7 +3613,8 @@ pub fn check_partition_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec<S
                      `{id}`, which {} clones onto every partition under that name; name it \
                      otherwise",
                     dialect.name(),
-                    name = name.shown()
+                    name = name.shown(),
+                    id = id.shown()
                 ));
             }
             if dialect.declares_a_constraint(module) {
@@ -3623,7 +3628,8 @@ pub fn check_partition_triggers(schema: &Schema, dialect: &dyn Dialect) -> Vec<S
                              constraint trigger `{id}`, whose clone on every partition is a \
                              constraint under that name on {}; name it otherwise",
                             dialect.name(),
-                            name = name.shown()
+                            name = name.shown(),
+                            id = id.shown()
                         ));
                     }
                 }
@@ -3725,7 +3731,7 @@ pub fn check_index_names_with_sources(
         if dialect.shares_namespace_with_tables(module.kind) {
             claimed.insert(
                 id.object_name(),
-                unclaimed(format!("{} `{id}`", module.kind)),
+                unclaimed(format!("{} `{id}`", module.kind, id = id.shown())),
             );
         }
     }
@@ -4095,7 +4101,7 @@ pub fn check_constraint_names(schema: &Schema, dialect: &dyn Dialect) -> Vec<Str
             claimed.insert(
                 id.object_name(),
                 Claim {
-                    descriptor: format!("{} `{id}`", module.kind),
+                    descriptor: format!("{} `{id}`", module.kind, id = id.shown()),
                     constraint_of: None,
                 },
             );
@@ -4900,7 +4906,7 @@ mod tests {
         /// both. Text in, text out — the argument of a routine identity is not
         /// a column type (ADR-0009 §1).
         fn normalize_routine_arg(&self, arg: &RoutineArg) -> Result<RoutineArg, DialectError> {
-            let s = arg.as_str();
+            let s = arg.raw();
             let base = s.split('(').next().unwrap_or(s).trim();
             base.parse().map_err(|_| DialectError::Unsupported {
                 dialect: "overloading",

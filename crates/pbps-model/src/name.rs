@@ -274,7 +274,7 @@ mod tests {
             serde_json::to_string(&column).unwrap(),
             serde_json::to_string(&format!("{part}.{part}.{part}")).unwrap()
         );
-        // The outer name types keep their raw interim serialization bridges.
+        // Module and grant identities serialize the same raw qualified spelling.
         for (id, expected) in [
             (
                 crate::ModuleId::Named(table.clone()),

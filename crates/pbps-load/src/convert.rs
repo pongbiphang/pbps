@@ -1316,7 +1316,7 @@ pub fn convert_module(src: &SourceFile, dto: ModuleDto) -> Result<LoadedModule, 
             errs.push(LoadError::semantic(
                 src,
                 to_span(&name_value.defined),
-                format!("`{other}` is not a trigger name"),
+                format!("`{other}` is not a trigger name", other = other.shown()),
                 "a trigger is named `schema.trigger`, with its table in `on:`",
             ));
             None

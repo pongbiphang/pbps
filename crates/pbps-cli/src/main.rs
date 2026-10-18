@@ -1832,7 +1832,10 @@ pub(crate) fn routine_ids_as_the_dialect_spells_them(
             problems.push(format!(
                 "`{first}` and `{id}` are one object to {}, which identifies a routine by \
                  argument type and discards the modifiers: both are `{key}`",
-                dialect.name()
+                dialect.name(),
+                first = first.shown(),
+                id = id.shown(),
+                key = key.shown()
             ));
             continue;
         }
@@ -1993,7 +1996,10 @@ fn declaration_problems_with_sources(
     }
     for (name, module) in &schema.modules {
         for e in dialect.validate_module(name, module) {
-            out.push(("dialect.rejected", format!("{name}: {e}")));
+            out.push((
+                "dialect.rejected",
+                format!("{name}: {e}", name = name.shown()),
+            ));
         }
     }
     // Two problems only the whole schema can see: a module named after a
@@ -3823,7 +3829,7 @@ fn public_execution_decisions_match_their_modules(
                  `pbps plan --db`.",
                 first + 1,
                 index + 1,
-                pbps_model::escape::Escaped(&routine.to_string())
+                routine.shown()
             );
         }
         let derived = origin_of(routine);
@@ -3834,7 +3840,7 @@ fn public_execution_decisions_match_their_modules(
                  The artifact was edited or produced by a broken planner; regenerate it with \
                  `pbps plan --db`.",
                 index + 1,
-                pbps_model::escape::Escaped(&routine.to_string()),
+                routine.shown(),
                 match origin {
                     RoutineOrigin::Created => "created",
                     RoutineOrigin::Rebuilt => "rebuilt",
@@ -3858,7 +3864,7 @@ fn public_execution_decisions_match_their_modules(
     let silent: Vec<String> = owed
         .into_iter()
         .filter(|routine| !decided.contains_key(routine))
-        .map(|routine| pbps_model::escape::Escaped(&routine.to_string()).to_string())
+        .map(|routine| routine.shown().to_string())
         .collect();
     if !silent.is_empty() {
         bail!(

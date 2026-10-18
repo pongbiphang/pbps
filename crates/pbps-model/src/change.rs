@@ -1302,12 +1302,12 @@ impl Change {
             // once, so grouping by it would put every such revoke in the plan
             // under one heading; grouping by the routine puts each beside the
             // `CreateModule` that made it, which is the change it belongs to.
-            Change::PublicExecution { routine, .. } => routine.to_string(),
+            Change::PublicExecution { routine, .. } => routine.raw().to_string(),
             // A module says its whole identity: `app.f(integer,text)` and
             // `app.f(text)` are two objects, and a label that showed `app.f`
             // for both would group two changes as one.
             other => match other.module_id() {
-                Some(id) => id.to_string(),
+                Some(id) => id.raw().to_string(),
                 None => other
                     .table()
                     .map(|name| name.raw().to_string())
@@ -3478,6 +3478,50 @@ mod tests {
     /// that spans both — what is this called in the namespace the engine
     /// keeps it in (ADR-0009 §1).
     #[test]
+    fn module_and_public_execution_subjects_match_the_raw_identity_on_both_sides() {
+        let part = "x\n\\\u{200b}";
+        let routine: RoutineId = format!("app.{part}(s.\"{part}\")").parse().unwrap();
+        for id in [
+            ModuleId::Named(TableName::new("app", part)),
+            ModuleId::Routine(routine.clone()),
+            ModuleId::Trigger {
+                on: TableName::new("app", part),
+                name: part.into(),
+            },
+        ] {
+            let raw = id.raw().to_string();
+            let shown = id.shown().to_string();
+            let created = Change::CreateModule {
+                id: id.clone(),
+                module: Box::new(a_view()),
+            };
+            let altered = Change::AlterModule {
+                id: id.clone(),
+                module: Box::new(a_view()),
+            };
+            let dropped = Change::DropModule {
+                id,
+                kind: crate::ModuleKind::View,
+            };
+            for change in [created, altered, dropped] {
+                assert_eq!(change.subject(), raw);
+                assert_ne!(change.subject(), shown);
+            }
+        }
+        let change = Change::PublicExecution {
+            routine: routine.clone(),
+            access: crate::PublicAccess::Revoked,
+            origin: RoutineOrigin::Created,
+        };
+        assert_eq!(change.subject(), routine.raw().to_string());
+        assert_eq!(
+            change.subject(),
+            ModuleId::Routine(routine.clone()).raw().to_string()
+        );
+        assert_ne!(change.subject(), routine.shown().to_string());
+    }
+
+    #[test]
     fn a_module_change_reports_its_own_identity_and_no_table() {
         let c = Change::CreateModule {
             id: "dbo.active_customer".parse().unwrap(),
@@ -3485,7 +3529,7 @@ mod tests {
         };
         assert!(c.table().is_none());
         assert_eq!(
-            c.module_id().map(ToString::to_string).as_deref(),
+            c.module_id().map(|id| id.raw().to_string()).as_deref(),
             Some("dbo.active_customer")
         );
         assert_eq!(c.object().unwrap().raw().to_string(), "dbo.active_customer");

@@ -454,7 +454,7 @@ fn explicit_module_dependencies_and_ordinary_orders_survive_resolution() {
         .changes
         .iter()
         .filter_map(|p| p.change.module_id())
-        .map(ToString::to_string)
+        .map(|id| id.raw().to_string())
         .collect();
     assert_eq!(modules, ["app.vz", "app.va"]);
     let before = crate::diff(

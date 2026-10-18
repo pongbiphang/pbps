@@ -273,7 +273,7 @@ fn collect_schema_dir(
             }
             LoadedFile::Module(m) => {
                 if let Some(first) = seen_modules.get(&m.id) {
-                    errs.push(already(&path, &format!("`{}`", m.id), first));
+                    errs.push(already(&path, &format!("`{}`", m.id.shown()), first));
                     continue;
                 }
                 seen_modules.insert(m.id.clone(), path);
@@ -891,7 +891,7 @@ indexes:
     #[test]
     fn the_leading_key_decides_the_kind_and_the_name() {
         let m = load_module(A_VIEW);
-        assert_eq!(m.id.to_string(), "dbo.active_customer");
+        assert_eq!(m.id.raw().to_string(), "dbo.active_customer");
         assert_eq!(m.module.kind, pbps_model::ModuleKind::View);
         assert_eq!(
             m.module.definition.trim(),
@@ -932,7 +932,7 @@ indexes:
                 name: "audit".to_owned()
             }
         );
-        assert_eq!(m.id.to_string(), "app.orders.audit");
+        assert_eq!(m.id.raw().to_string(), "app.orders.audit");
         assert_eq!(m.id.attached_to().unwrap().raw().to_string(), "app.orders");
     }
 
@@ -964,16 +964,19 @@ indexes:
         };
         assert_eq!(r.name.raw().to_string(), "app.f");
         assert_eq!(
-            r.args.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            r.args
+                .iter()
+                .map(|arg| arg.raw().to_owned())
+                .collect::<Vec<_>>(),
             ["int", "text"]
         );
-        assert_eq!(m.id.to_string(), "app.f(int,text)");
+        assert_eq!(m.id.raw().to_string(), "app.f(int,text)");
 
         // And one that takes nothing keeps its parentheses: `app.g()` is a
         // routine, `app.g` is a name in the table namespace.
         let none = load_module("function: app.g()\ndefinition: () RETURNS int AS $$ SELECT 1 $$\n");
         assert!(matches!(none.id, pbps_model::ModuleId::Routine(_)));
-        assert_eq!(none.id.to_string(), "app.g()");
+        assert_eq!(none.id.raw().to_string(), "app.g()");
     }
 
     /// The one line that keeps the engine's default `EXECUTE` to `PUBLIC`
