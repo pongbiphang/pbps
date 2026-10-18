@@ -124,7 +124,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             c.ty,
             if c.nullable { "yes" } else { "no" },
             match &c.value_source {
-                pbps_model::ValueSource::Default(text) => format!("`{text}`"),
+                pbps_model::ValueSource::Default(text) => code_cell(text),
                 pbps_model::ValueSource::None
                 | pbps_model::ValueSource::Identity(_)
                 | pbps_model::ValueSource::Sequence(_)
@@ -332,6 +332,43 @@ mod tests {
         let mut s = Schema::default();
         s.tables.insert(TableName::new("dbo", "customer"), t);
         s
+    }
+
+    #[test]
+    fn a_default_stays_inside_its_cell() {
+        // A `|` ends a cell even inside a code span, a line break ends the
+        // row, and a backtick ends a one-backtick span (#1873).
+        let mut s = documented();
+        let t = s
+            .tables
+            .get_mut(&TableName::new("dbo", "customer"))
+            .unwrap();
+        for (name, default) in [
+            ("a_pipe", "'a|b'"),
+            ("a_break", "CASE WHEN 1 = 1\nTHEN 'x'\r\nEND"),
+            ("a_tick", "'x`y'"),
+            ("z_after", "0"),
+        ] {
+            let mut c = Column::new(ty("nvarchar(10)"));
+            c.value_source = pbps_model::ValueSource::Default(default.into());
+            t.columns.insert(name.into(), c);
+        }
+        let out = render(&s, &IdsFile::default(), "Schema");
+        for row in [
+            "| `a_pipe` | `nvarchar(10)` | yes | `'a\\|b'` | — |\n",
+            "| `a_break` | `nvarchar(10)` | yes | `CASE WHEN 1 = 1 THEN 'x' END` | — |\n",
+            "| `a_tick` | `nvarchar(10)` | yes | ``'x`y'`` | — |\n",
+            "| `z_after` | `nvarchar(10)` | yes | `0` | — |\n",
+        ] {
+            assert!(out.contains(row), "{row}{out}");
+        }
+        // Each row keeps its five cells: no unescaped `|` beyond its six.
+        for line in out
+            .lines()
+            .filter(|l| l.starts_with("| `a_") || l.starts_with("| `z_"))
+        {
+            assert_eq!(line.replace("\\|", "").matches('|').count(), 6, "{line}");
+        }
     }
 
     #[test]
