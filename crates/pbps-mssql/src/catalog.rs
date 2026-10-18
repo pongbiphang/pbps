@@ -10,8 +10,9 @@ use pbps_db::{Conn, DbError, FromColumn, Row};
 use pbps_model::{ObservedRows, RowScope, Schema, TableName};
 
 use crate::introspect::{
-    IndexKind, Pulled, RawCatalog, RawCheck, RawCheckColumn, RawColumn, RawForeignKeyColumn,
-    RawIndexColumn, RawKeyColumn, RawModule, RawObjectDependency, RawTable, Securable, assemble,
+    ColumnReader, IndexKind, Pulled, RawCatalog, RawCheck, RawCheckColumn, RawColumn,
+    RawForeignKeyColumn, RawIndexColumn, RawKeyColumn, RawModule, RawObjectDependency,
+    RawReadColumn, RawTable, Securable, assemble,
 };
 
 /// `is_ms_shipped = 0` drops the system tables; the name list drops this tool's
@@ -272,6 +273,54 @@ SELECT DISTINCT cc.object_id AS constraint_object_id, r.referenced_minor_name AS
    AND r.referenced_id = cc.parent_object_id
    AND r.referenced_minor_id > 0
  ORDER BY constraint_object_id, column_name;
+END TRY
+BEGIN CATCH
+    DECLARE @error nvarchar(2048) = ERROR_MESSAGE();
+    RAISERROR(N'%s', 16, 1, @error);
+END CATCH;";
+
+/// The columns of its own table each computed column and each filtered
+/// index reads (#2147, #2148), read the way `CHECK_COLUMNS` reads a check's,
+/// under the managed-schema grant: `sys.sql_expression_dependencies` keeps the
+/// two apart by class, but answers nothing without database `VIEW
+/// DEFINITION` (#1644).
+///
+/// The function reports both readers by one minor id, a computed column's
+/// `column_id` or a filtered index's `index_id`, with nothing else to tell
+/// them apart (measured on 2025), and the two often coincide. Where the id is
+/// only one of them, the engine's resolution answers alone. Where it is both,
+/// each resolved column is given to whichever reader's stored definition
+/// names it bracketed, as the engine stores every column reference; a string
+/// literal that happens to hold `[m]` gives it to both, which at worst leaves
+/// out one that does not read it. A three-part reference to another database
+/// keeps that database's id, which a fresh database can reuse, so it is not
+/// one.
+const READ_COLUMNS: &str = "\
+BEGIN TRY
+WITH r AS (
+SELECT t.object_id, e.referencing_minor_id AS minor_id, e.referenced_minor_name AS column_name,
+       N'[' + REPLACE(e.referenced_minor_name, N']', N']]') + N']' AS bracketed
+  FROM sys.tables t
+ CROSS APPLY sys.dm_sql_referenced_entities(
+       QUOTENAME(SCHEMA_NAME(t.schema_id)) + N'.' + QUOTENAME(t.name), N'OBJECT') e
+ WHERE t.is_ms_shipped = 0
+   AND e.referenced_id = t.object_id AND e.referenced_minor_id > 0
+   AND e.referenced_database_name IS NULL
+)
+SELECT r.object_id, N'C' AS reader, cc.name AS reader_name, r.column_name
+  FROM r
+  JOIN sys.computed_columns cc ON cc.object_id = r.object_id AND cc.column_id = r.minor_id
+  LEFT JOIN sys.indexes i
+    ON i.object_id = r.object_id AND i.index_id = r.minor_id AND i.has_filter = 1
+ WHERE i.index_id IS NULL OR CHARINDEX(r.bracketed, cc.definition) > 0
+UNION
+SELECT r.object_id, N'F', i.name, r.column_name
+  FROM r
+  JOIN sys.indexes i
+    ON i.object_id = r.object_id AND i.index_id = r.minor_id AND i.has_filter = 1
+  LEFT JOIN sys.computed_columns cc ON cc.object_id = r.object_id AND cc.column_id = r.minor_id
+ WHERE cc.column_id IS NULL OR CHARINDEX(r.bracketed, i.filter_definition) > 0
+ ORDER BY object_id, reader, reader_name, column_name;
 END TRY
 BEGIN CATCH
     DECLARE @error nvarchar(2048) = ERROR_MESSAGE();
@@ -570,6 +619,23 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     for row in conn.query(CHECK_COLUMNS).await? {
         raw.check_columns.push(RawCheckColumn {
             constraint_object_id: get(&row, "constraint_object_id")?,
+            column: get::<&str>(&row, "column_name")?.to_owned(),
+        });
+    }
+
+    for row in conn.query(READ_COLUMNS).await? {
+        raw.read_columns.push(RawReadColumn {
+            object_id: get(&row, "object_id")?,
+            reader: match get::<&str>(&row, "reader")? {
+                "C" => ColumnReader::Computed,
+                "F" => ColumnReader::Filter,
+                other => {
+                    return Err(DbError::Refused(format!(
+                        "the column read named an unknown reader `{other}`"
+                    )));
+                }
+            },
+            name: get::<&str>(&row, "reader_name")?.to_owned(),
             column: get::<&str>(&row, "column_name")?.to_owned(),
         });
     }

@@ -8,8 +8,9 @@
 use std::path::Path;
 
 use pbps_mssql::introspect::{
-    IndexKind, ModuleKind, RawCatalog, RawCheck, RawCheckColumn, RawColumn, RawForeignKeyColumn,
-    RawIndexColumn, RawKeyColumn, RawModule, RawTable, assemble,
+    ColumnReader, IndexKind, ModuleKind, RawCatalog, RawCheck, RawCheckColumn, RawColumn,
+    RawForeignKeyColumn, RawIndexColumn, RawKeyColumn, RawModule, RawReadColumn, RawTable,
+    assemble,
 };
 
 /// A catalog exercising every construct the model can express.
@@ -111,6 +112,14 @@ fn full_catalog() -> RawCatalog {
         check_columns: vec![RawCheckColumn {
             constraint_object_id: 12,
             column: "price".into(),
+        }],
+        // What the engine reports the filter reads (#2148): a kept column,
+        // so the index stays.
+        read_columns: vec![RawReadColumn {
+            object_id: 1,
+            reader: ColumnReader::Filter,
+            name: "ix_customer_email".into(),
+            column: "email".into(),
         }],
         index_columns: vec![
             RawIndexColumn {
