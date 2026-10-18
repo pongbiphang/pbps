@@ -286,6 +286,11 @@ fn no_such_image(error: &str) -> bool {
     error.contains("no such image") || error.contains("image not known")
 }
 
+/// The label naming the process that starts a scratch container.
+pub(super) fn process_label() -> String {
+    format!("pbps.resolver.process={}", std::process::id())
+}
+
 /// The `docker run` that starts the scratch server.
 fn run_args(name: &str, password: &str, image: &str) -> Vec<String> {
     [
@@ -299,6 +304,11 @@ fn run_args(name: &str, password: &str, image: &str) -> Vec<String> {
         name,
         "--label",
         "pbps.resolver=scratch",
+        // Which process started it. Another pbps on the same host labels its
+        // scratch containers the same way, so this is what tells a leftover's
+        // owner, and what lets the live tests count only their own (#2095).
+        "--label",
+        &process_label(),
         "--env",
         &format!("POSTGRES_PASSWORD={password}"),
         // An omitted host port: Docker and Podman both pick a free one, on
@@ -445,6 +455,19 @@ mod tests {
         assert_eq!(after("--pull"), "never");
         assert_eq!(after("--publish"), "127.0.0.1::5432");
         assert_eq!(after("--name"), "pbps-scratch-0");
+        let labels: Vec<&str> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--label")
+            .map(|(i, _)| args[i + 1].as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "pbps.resolver=scratch".to_owned(),
+                format!("pbps.resolver.process={}", std::process::id())
+            ]
+        );
         assert_eq!(args.last().map(String::as_str), Some("postgres:18"));
         // Negative: no other pull policy, and no second publish.
         assert_eq!(args.iter().filter(|a| a.starts_with("--pull")).count(), 1);
