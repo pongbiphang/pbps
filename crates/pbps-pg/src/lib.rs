@@ -511,8 +511,18 @@ fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
             keys.push(format!("unique constraint `{name}`"));
         }
     }
+    // A unique index's key may be an expression over the column, such as
+    // `(id + 0)`, which wraps onto a value a row holds as surely as the
+    // column itself (#2014). The model does not parse expressions, so one
+    // that names the column, by the rules `impact::mentions` reads a stored
+    // body with, counts: at worst a cycle beside an expression that only
+    // spells the column's name otherwise is refused, naming the index.
     for (name, index) in &table.indexes {
-        if index.unique && index.columns.iter().any(|c| c.key.column() == Some(column)) {
+        let over_column = |key: &pbps_model::IndexKey| match key {
+            pbps_model::IndexKey::Column(c) => c == column,
+            pbps_model::IndexKey::Expression(text) => crate::impact::mentions(text, column),
+        };
+        if index.unique && index.columns.iter().any(|c| over_column(&c.key)) {
             keys.push(format!("unique index `{name}`"));
         }
     }
@@ -6075,7 +6085,10 @@ mod tests {
     /// A sequence that cycles hands out, once it wraps, a number a row
     /// already holds, so on a column under a primary key, a unique
     /// constraint or a unique index it is refused, naming the key (#1921,
-    /// DEC-1921.1). The same sequence on a column under no key is accepted.
+    /// DEC-1921.1), and under a unique index whose expression names the
+    /// column (#2014). The same sequence on a column under no key is
+    /// accepted, and beside a non-unique expression index, a unique one over
+    /// another column, or a literal that spells the name.
     #[test]
     fn a_cycling_sequence_under_a_key_is_refused_naming_the_key() {
         let t: TableName = "app.t".parse().unwrap();
@@ -6142,6 +6155,43 @@ mod tests {
                     .any(|m| m.contains("unique constraint `t_id_v`")),
                 "{kind}: {refused:?}"
             );
+
+            // A unique expression index over the column wraps onto a held
+            // value too (#2014); a non-unique one, and a unique one over
+            // another column's expression, refuse nothing.
+            let expression = |unique, text: &str| pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Expression(text.into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            };
+            let mut over = table.clone();
+            over.indexes
+                .insert("t_id_expr".into(), expression(true, "(id + 0)"));
+            let refused = found(&over);
+            assert!(
+                refused
+                    .iter()
+                    .any(|m| m.contains("unique index `t_id_expr`")),
+                "{kind}: {refused:?}"
+            );
+            for (unique, text) in [(false, "(id + 0)"), (true, "(v + 0)"), (true, "('id')")] {
+                let mut other = table.clone();
+                other
+                    .indexes
+                    .insert("t_expr".into(), expression(unique, text));
+                assert_eq!(
+                    found(&other),
+                    Vec::<String>::new(),
+                    "{kind}: {unique} {text}"
+                );
+            }
         }
     }
 

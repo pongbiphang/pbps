@@ -2222,8 +2222,14 @@ MINVALUE`, against the bounds the declaration sets rather than the type's),
 and a cache below 2. **A cycle under a key is refused,** naming the primary
 key, unique constraint or unique index: measured, once a cycling sequence
 wraps, the next insert fails as a duplicate key, so on a key a cycle only
-trades "reached maximum value" for a later and less clear failure. On a
-column under no key it is accepted. SQL Server's `IDENTITY` has only a seed
+trades "reached maximum value" for a later and less clear failure. A unique
+index whose key is an expression naming the column, such as `(id + 0)`, is
+such a key too (measured on 18: the wrap fails on it as a duplicate key).
+The model does not parse expressions, so an expression counts where it
+names the column by the rules a stored body is read with (literals and
+comments are not names); at worst an expression that only spells the
+column's name in another role refuses the cycle, naming the index (#2014).
+On a column under no key it is accepted. SQL Server's `IDENTITY` has only a seed
 and an increment, and refuses every option by name.
 
 **Changed in place.** A create, an added column and a source put on write
