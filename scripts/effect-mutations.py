@@ -16,6 +16,9 @@ With `--audit` it runs the commutation suite's audit instead
 `PBPS_TEST_DB` as the live scripts set them): whether a scenario on the
 engine holds the dependency each effect states.
 
+It first runs the same commands unmutated, and stops if they fail: a test
+that fails for another reason would read as every mutation caught.
+
 Exits 0 when every mutation fails a test (under `--audit`, every one but
 those `UNSHOWABLE` lists, and none of those), 1 otherwise, and 2 when an
 anchor is missing or the mutated crate does not compile: a patch that matches
@@ -30,7 +33,7 @@ import sys
 EFFECTS = pathlib.Path("crates/pbps-model/src/operation/effects.rs")
 TESTS = [["cargo", "test", "-p", "pbps-diff", "--lib", "order::tests"]]
 AUDIT = [
-    ["cargo", "test", "-p", crate, "--test", "live", "--", "--ignored",
+    ["cargo", "test", "-p", crate, "--test", "live", "--", "--ignored", "--nocapture",
      "pairs_the_effects_call_independent_commute_on_the_engine"]
     for crate in ("pbps-pg", "pbps-mssql")
 ]
@@ -145,6 +148,19 @@ def main(args):
         if original.count(text) != 1:
             print(f"anchor for {name!r} occurs {original.count(text)} times")
             return 2
+    # The same commands on the file as it stands first: a failure here is the
+    # environment's or the build's (a database not started, a connection
+    # variable unset), and would read as every mutation caught.
+    baseline = [subprocess.run(c, capture_output=True, text=True, env=env)
+                for c in commands]
+    if any(o.returncode != 0 for o in baseline):
+        print("the unmutated run fails; nothing below would mean anything:")
+        print("".join(o.stdout + o.stderr for o in baseline)[-4000:])
+        return 2
+    if commands is AUDIT and not all("commutation audit" in o.stderr + o.stdout
+                                     for o in baseline):
+        print("the unmutated run did not audit: is PBPS_COMMUTE_ALL read?")
+        return 2
     survived, broken = [], []
     try:
         for name, text, replacement in chosen:
