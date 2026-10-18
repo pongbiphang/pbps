@@ -496,7 +496,8 @@ pub(crate) fn checks_over_computed_columns(schema: &pbps_model::Schema) -> Vec<S
                         "{name}: check constraint `{check}` may read the computed column \
                          `{column}`, which is not `persisted`; SQL Server refuses a CHECK over \
                          one (1764). If it does read it, declare `{column}` with \
-                         `persisted: true`; `plan --dev` asks the engine before anything runs"
+                         `persisted: true`; `plan --dev` asks the engine before anything runs",
+                        name = name.shown()
                     ));
                 }
             }
