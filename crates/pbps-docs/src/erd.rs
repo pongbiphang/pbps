@@ -38,8 +38,13 @@ fn entity(name: &TableName) -> String {
 /// Escape `#` too, or a literal `#34;` in a name becomes a quote. The colon
 /// must not activate its global `style`/`classDef` preprocessing (DEC-1799.1).
 fn alias(name: &TableName) -> String {
+    label(&name.raw().to_string())
+}
+
+/// `text` as Mermaid label text, by the codes [`alias`] uses.
+fn label(text: &str) -> String {
     let mut label = String::new();
-    for c in name.raw().to_string().chars() {
+    for c in text.chars() {
         if c.is_control()
             || matches!(
                 c,
@@ -52,6 +57,72 @@ fn alias(name: &TableName) -> String {
         }
     }
     label
+}
+
+/// `text` inside a quoted Mermaid string: a `"` would end the string, a line
+/// ending the statement, and `#` would start an entity code. Measured with
+/// Mermaid 11.12.0, a raw `"` in a relationship label stops the whole diagram
+/// parsing (#1874). The rest is kept as written, so an ordinary name reads in
+/// the source as it is.
+fn quoted(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if c.is_control() || c == '"' || c == '#' {
+            let _ = write!(out, "#{};", u32::from(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A column name as a Mermaid attribute name, which is one token. Mermaid's
+/// lexer takes a name only as a run of ASCII letters, digits and `_`, or
+/// characters from U+00C0 to U+FFFF, not starting with a digit, and reads
+/// `PK`, `FK` and `UK` as key markers first, in any case, wherever a word
+/// boundary follows them. Measured with Mermaid 11.12.0: a space, a leading
+/// digit, `pk`, `pk-x` and `x~y` each stop the whole diagram parsing (#1874).
+/// A name that is such a token is kept as it is. In any other, each character
+/// outside that set becomes `_<hex>_`, and a `_` goes in front where the result
+/// would start with a digit or a key marker. Two names may then share a token,
+/// which Mermaid allows within an entity; the readable name goes in the
+/// attribute's comment wherever the token differs.
+fn attr_name(name: &str) -> String {
+    let word =
+        |c: char| c == '_' || c.is_ascii_alphanumeric() || ('\u{C0}'..='\u{FFFF}').contains(&c);
+    let mut token = String::new();
+    for c in name.chars() {
+        if word(c) {
+            token.push(c);
+        } else {
+            let _ = write!(token, "_{:x}_", u32::from(c));
+        }
+    }
+    let marker = token.get(..2).is_some_and(|head| {
+        ["pk", "fk", "uk"]
+            .iter()
+            .any(|m| head.eq_ignore_ascii_case(m))
+            && !token[2..]
+                .chars()
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphanumeric())
+    });
+    if token.is_empty() || token.starts_with(|c: char| c.is_ascii_digit()) || marker {
+        token.insert(0, '_');
+    }
+    token
+}
+
+/// The attribute's quoted comment: the readable name where the token differs
+/// from it, then the description.
+fn attr_comment(name: &str, token: &str, description: Option<&str>) -> String {
+    let description = description.map(|d| d.replace('"', "'"));
+    match (token != name, description) {
+        (false, None) => String::new(),
+        (false, Some(d)) => format!(" \"{d}\""),
+        (true, None) => format!(" \"{}\"", label(name)),
+        (true, Some(d)) => format!(" \"{} — {d}\"", label(name)),
+    }
 }
 
 /// Mermaid attribute types must be single tokens: `decimal(18, 2)` would end
@@ -77,24 +148,22 @@ pub fn render(schema: &Schema) -> String {
             // The key marker is what makes the diagram readable at a glance;
             // Mermaid only has PK and FK.
             let key = key_marker(table, col_name);
-            let comment = col
-                .description
-                .as_ref()
-                .map(pbps_model::Text::raw)
-                .map(|d| format!(" \"{}\"", d.replace('"', "'")))
-                .unwrap_or_default();
+            let token = attr_name(col_name);
+            let description = col.description.as_ref().map(|d| d.raw().to_string());
+            let comment = attr_comment(col_name, &token, description.as_deref());
             let _ = writeln!(
                 s,
-                "        {} {}{key}{comment}",
+                "        {} {token}{key}{comment}",
                 attr_type(&col.ty.to_string()),
-                col_name
             );
         }
         // A SQL Server computed column has no type in the model: the engine
         // infers it (DEC-1174.1). `computed` stands in its place.
         for col_name in table.computed.keys() {
             let key = key_marker(table, col_name);
-            let _ = writeln!(s, "        computed {col_name}{key}");
+            let token = attr_name(col_name);
+            let comment = attr_comment(col_name, &token, None);
+            let _ = writeln!(s, "        computed {token}{key}{comment}");
         }
         s.push_str("    }\n");
     }
@@ -122,7 +191,7 @@ pub fn render(schema: &Schema) -> String {
                 "    {} {left}--|| {} : \"{}\"",
                 entity(name),
                 entity(&fk.references_table),
-                fk_name
+                quoted(fk_name)
             );
         }
     }
@@ -345,6 +414,72 @@ mod tests {
 
     /// A parameterised type would end the Mermaid attribute early and break the
     /// whole diagram, not just one row.
+    #[test]
+    fn a_column_name_is_one_mermaid_token_and_keeps_its_readable_name() {
+        // Each of these stopped the whole diagram parsing in Mermaid 11.12.0
+        // when written raw (#1874); each token below parses there, PK and FK
+        // markers following it included.
+        for (name, token) in [
+            ("gross total", "gross_20_total"),
+            ("1x", "_1x"),
+            ("pk", "_pk"),
+            ("Uk", "_Uk"),
+            ("pk-x", "pk_2d_x"),
+            ("x~y", "x_7e_y"),
+            ("a\"b", "a_22_b"),
+        ] {
+            assert_eq!(attr_name(name), token, "{name}");
+        }
+        // Plain words are kept: a marker inside a word is no marker.
+        for name in ["id", "pk_id", "pkx", "_a", "名前", "fk2"] {
+            assert_eq!(attr_name(name), name);
+        }
+
+        let mut t = Table::default();
+        let mut c = Column::new(ty("int"));
+        c.description = Some("the \"sum\"".into());
+        t.columns.insert("gross total".into(), c);
+        t.columns.insert("id".into(), Column::new(ty("int")));
+        t.computed.insert(
+            "net #34; total".into(),
+            ComputedColumn {
+                expression: "[a] - [b]".into(),
+                persisted: false,
+                not_null: true,
+            },
+        );
+        t.primary_key = Some(PrimaryKey {
+            name: None,
+            columns: vec!["gross total".into()],
+            storage_parameters: Default::default(),
+        });
+        let mut s = Schema::default();
+        s.tables.insert(TableName::new("dbo", "t"), t);
+        let out = render(&s);
+        for line in [
+            "        int gross_20_total PK \"gross total — the 'sum'\"\n",
+            "        int id\n",
+            "        computed net_20__23_34_3b__20_total \"net #35;34; total\"\n",
+        ] {
+            assert!(out.contains(line), "{line}{out}");
+        }
+    }
+
+    #[test]
+    fn a_foreign_key_name_cannot_end_its_quoted_label() {
+        let mut s = two_table_schema(false);
+        let t = s
+            .tables
+            .values_mut()
+            .find(|t| !t.foreign_keys.is_empty())
+            .unwrap();
+        let fk = t.foreign_keys.pop_first().unwrap().1;
+        t.foreign_keys.insert("fk \"a\" #1".into(), fk);
+        let out = render(&s);
+        assert!(out.contains(" : \"fk #34;a#34; #35;1\"\n"), "{out}");
+        assert_eq!(quoted("fk_order"), "fk_order");
+    }
+
     #[test]
     fn parameterised_types_are_flattened_into_one_token() {
         assert_eq!(attr_type("decimal(18, 2)"), "decimal_18_2");

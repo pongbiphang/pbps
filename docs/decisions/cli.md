@@ -1497,3 +1497,43 @@ Other builder formatting remains accepted without bookkeeping. This bounded
 check does not trace locals or unlisted helpers, and does not inspect
 SQL-generated RAISE/THROW messages or shared probe/offline descriptions; those
 remain outside #2123. Typed error data and `ByHand.statement` remain data.
+
+<a id="dec-1874-1"></a>
+
+**DEC-1874.1. `pbps docs` writes a column name as one Mermaid token, and
+keeps the readable name in the attribute's comment (#1874).**
+Identifier validation accepts column names that Mermaid's `erDiagram` lexer
+cannot read as an attribute name. That lexer takes a name only as a run of
+ASCII letters, digits and `_`, or of characters from U+00C0 to U+FFFF, and
+not one that starts with a digit. Before that, it reads `PK`, `FK` and `UK`
+as key markers, in any case, wherever a word boundary follows them.
+Measured with Mermaid 11.12.0, each of these stops the whole diagram
+parsing: a space, a leading digit, `pk`, `pk-x` and `x~y`. So does a `"` in a
+relationship label. The diagram embedded in the Markdown output goes with
+it.
+
+The rules:
+- **A name that is already such a token is kept as written,** so ordinary
+  names read in the source as they always did. Escaping every name the way
+  entity identifiers are (DEC-1799.1) would double each `_` in every
+  attribute.
+- **Any other name has each character outside that set written as
+  `_<hex>_`.** A `_` goes in front where the result would start with a digit
+  or a key marker. The readable name then goes first in the attribute's
+  quoted comment, before the description, in the entity codes that table
+  aliases use.
+- **Two names may share a token.** Mermaid keys nothing on an attribute
+  name, and the comment tells them apart.
+- **A foreign key's label is quoted text, not a token.** It keeps its
+  characters, apart from `"`, `#` and control characters, which become
+  entity codes.
+
+In the Markdown tables, column and computed-column labels go through
+`code_cell` (#1873). That keeps a `|` or a backtick inside its cell.
+
+Pinned by:
+- `a_column_name_is_one_mermaid_token_and_keeps_its_readable_name`;
+- `a_foreign_key_name_cannot_end_its_quoted_label` in
+  `crates/pbps-docs/src/erd.rs`;
+- `a_column_name_stays_inside_its_cell` in
+  `crates/pbps-docs/src/markdown.rs`.
