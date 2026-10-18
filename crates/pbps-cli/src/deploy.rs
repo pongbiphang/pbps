@@ -1119,13 +1119,16 @@ pub(crate) fn refuse_published_unlogged(
     let mut lines = Vec::new();
     for (declared, stored) in made_unlogged {
         for found in naming.iter().filter(|n| n.table == *stored) {
+            // The statement is shown runnable, its identifiers quoted; the
+            // escaping that follows only makes a control character visible.
+            let remove = found.drop_statement().map_or_else(
+                || "remove it from that publication".to_owned(),
+                |statement| format!("remove it there (`{}`)", Escaped(&statement)),
+            );
             lines.push(format!(
-                "{} is listed by the publication `{}`; remove it there (`ALTER PUBLICATION \
-                 {} DROP TABLE {}`), or keep the table logged",
+                "{} is listed by the publication `{}`; {remove}, or keep the table logged",
                 declared.shown(),
                 Escaped(&found.publication),
-                Escaped(&found.publication),
-                stored.shown()
             ));
         }
     }
@@ -10833,7 +10836,7 @@ mod tests {
         let e = refused(vec![switch("app.t", true)], &[listing("app.t")]).unwrap_err();
         assert!(
             e.contains("app.t is listed by the publication `pub_x`")
-                && e.contains("ALTER PUBLICATION pub_x DROP TABLE app.t")
+                && e.contains(r#"ALTER PUBLICATION "pub_x" DROP TABLE "app"."t";"#)
                 && e.contains("DEC-1489.1"),
             "{e}"
         );
@@ -10846,7 +10849,7 @@ mod tests {
         .unwrap_err();
         assert!(
             e.contains("app.t2 is listed by the publication `pub_x`")
-                && e.contains("ALTER PUBLICATION pub_x DROP TABLE app.t`"),
+                && e.contains(r#"ALTER PUBLICATION "pub_x" DROP TABLE "app"."t";`"#),
             "{e}"
         );
         // Negative: made logged, another table listed, or nothing listed.

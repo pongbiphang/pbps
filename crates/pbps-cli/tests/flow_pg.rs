@@ -7949,12 +7949,23 @@ fn a_table_a_publication_lists_is_refused_unlogged_by_name() {
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(
         stderr(&o).contains("app.t is listed by the publication `pub_t`")
-            && stderr(&o).contains("ALTER PUBLICATION pub_t DROP TABLE app.t")
+            && stderr(&o).contains(r#"ALTER PUBLICATION "pub_t" DROP TABLE "app"."t";"#)
             && stderr(&o).contains("DEC-1489.1"),
         "{}",
         stderr(&o)
     );
     assert!(!unlogged("app.t"));
+    // The remedy as shown is a statement that runs, and the plan then goes.
+    let said = stderr(&o);
+    let statement = said
+        .split("remove it there (`")
+        .nth(1)
+        .and_then(|rest| rest.split("`)").next())
+        .unwrap_or_else(|| panic!("no statement in {said}"))
+        .to_owned();
+    on_server(&connection, &statement);
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    on_server(&connection, "ALTER PUBLICATION pub_t ADD TABLE app.t");
     std::fs::write(d.dir.join("schema/app.t.yml"), original).unwrap();
 
     // Published only through its schema, or by `FOR ALL TABLES`, or not at
