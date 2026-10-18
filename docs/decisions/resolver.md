@@ -3738,6 +3738,18 @@ column after another, which is why §8 rejected it for the externals file.
   or a type by schema and name, or a schema or principal. Any other
   refuses, rather than being sealed as asked yet never read. This answers
   #2150's ninth ready review.
+- **Every dependency class a module can report binds.**
+  - **Class 7, an index,** binds its table, whose properties hold the index.
+  - **Class 10, an XML schema collection,** binds the collection with the
+    schemas it holds.
+  - **Class 21, a partition function through `$PARTITION`,** binds the
+    function with its parameters and boundaries. A partition function has
+    no schema, so its schema-less name is no runtime-bound name (measured).
+- **Settings without a name of their own.** A full-text catalog is compared
+  with its accent sensitivity and default flag. A full-text index's system
+  stoplist (`0`) and no stoplist (`NULL`) stay distinct. Two partition
+  schemes sharing a function each carry the whole function. This answers
+  #2150's tenth ready review.
 - **The typed reads stay.** The dependency classification, the closure,
   the candidates and ownership read them (DEC-2141.1). The whole rows are
   what a capture compares.

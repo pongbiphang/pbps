@@ -551,7 +551,9 @@ impl Builder<'_> {
                     .insert(RuntimeName::Call(dependency.entity.clone()));
                 continue;
             }
-            if dependency.schema.is_none() && !dependency.schema_bound {
+            // A partition function has no schema: its one-part name is the
+            // whole name, bound by id (class 21, measured on #2141).
+            if dependency.schema.is_none() && !dependency.schema_bound && dependency.class != 21 {
                 // Its id is what the name resolves to now, by class.
                 let name = match dependency.class {
                     1 => RuntimeName::Object(dependency.entity.clone()),
@@ -606,6 +608,73 @@ impl Builder<'_> {
                     },
                 },
                 6 => self.type_ref(referenced)?,
+                // An index is part of its table's properties: the table is
+                // what the reference binds.
+                7 => {
+                    let found = self
+                        .index
+                        .objects
+                        .get(&referenced)
+                        .copied()
+                        .ok_or_else(|| {
+                            Uncovered::object(
+                                &me,
+                                "a referenced index's table is not in the catalog",
+                            )
+                        })?;
+                    self.enqueue(referenced);
+                    self.index.object(found)?
+                }
+                10 => {
+                    let (schema, name, definition) = catalog
+                        .xml_collections
+                        .get(&referenced)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Uncovered::object(
+                                &me,
+                                "a referenced XML schema collection is not in the catalog",
+                            )
+                        })?;
+                    let target = identity(class::XML_COLLECTION, vec![schema, name], Vec::new());
+                    self.result
+                        .inputs
+                        .entry(target.clone())
+                        .or_insert_with(|| Input {
+                            properties: BTreeMap::from([(
+                                "definition".to_owned(),
+                                json!(definition),
+                            )]),
+                            bindings: BTreeSet::new(),
+                        });
+                    target
+                }
+                21 => {
+                    let function = catalog
+                        .partition_functions
+                        .get(&referenced)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Uncovered::object(
+                                &me,
+                                "a referenced partition function is not in the catalog",
+                            )
+                        })?;
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| Uncovered::object(&me, "a partition function has no name"))?
+                        .to_owned();
+                    let target = identity(class::PARTITION_FUNCTION, vec![name], Vec::new());
+                    self.result
+                        .inputs
+                        .entry(target.clone())
+                        .or_insert_with(|| Input {
+                            properties: BTreeMap::from([("definition".to_owned(), function)]),
+                            bindings: BTreeSet::new(),
+                        });
+                    target
+                }
                 _ => {
                     return Err(Uncovered::object(
                         &me,

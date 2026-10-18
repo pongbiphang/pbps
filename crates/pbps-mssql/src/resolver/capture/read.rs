@@ -246,6 +246,9 @@ pub(super) struct Catalog {
     /// A typed `xml` column validates against those, so `ALTER XML SCHEMA
     /// COLLECTION ... ADD` changes what it accepts.
     pub xml_collections: BTreeMap<i64, (String, String, String)>,
+    /// Partition functions, by id, each with its parameter types and
+    /// boundaries: a module calling `$PARTITION` binds one (class 21).
+    pub partition_functions: BTreeMap<i64, serde_json::Value>,
     /// Column encryption keys, by id, each with its values and the master
     /// keys they are encrypted under: `ADD VALUE` or `DROP VALUE` changes
     /// what can unwrap the data without renaming the key.
@@ -523,6 +526,10 @@ const FULLTEXT_NAMES: &[(&str, &str)] = &[
 /// each row's members as text.
 const FULLTEXT_MEMBERS: &[(&str, &str)] = &[
     (
+        "catalog",
+        "SELECT CONVERT(nvarchar(20), fulltext_catalog_id) AS id, CONVERT(nvarchar(4000), CONCAT(N'accent_sensitivity:', is_accent_sensitivity_on, N';default:', is_default)) AS member FROM sys.fulltext_catalogs;",
+    ),
+    (
         "stoplist",
         "SELECT CONVERT(nvarchar(20), stoplist_id) AS id, CONVERT(nvarchar(4000), CONCAT(language_id, N':', stopword)) AS member FROM sys.fulltext_stopwords;",
     ),
@@ -538,10 +545,12 @@ const NUMBERED: &str = "SELECT DISTINCT CONVERT(nvarchar(20), object_id) AS id \
 const DATA_SPACES: &str = "SELECT CONVERT(nvarchar(20), data_space_id) AS id, \
     CONVERT(nvarchar(128), name) AS name, CONVERT(nvarchar(10), type) AS type FROM sys.data_spaces;";
 
-const PARTITION_SCHEMES: &str = "SELECT CONVERT(nvarchar(20), s.data_space_id) AS id, \
-    CONVERT(nvarchar(128), f.name) AS [function], CONVERT(nvarchar(10), f.type) AS type, \
-    CONVERT(nvarchar(1), f.boundary_value_on_right) AS on_right, CONVERT(nvarchar(20), f.function_id) AS function_id \
-    FROM sys.partition_schemes s JOIN sys.partition_functions f ON f.function_id = s.function_id;";
+const PARTITION_FUNCTIONS: &str = "SELECT CONVERT(nvarchar(20), function_id) AS function_id, \
+    CONVERT(nvarchar(128), name) AS name, CONVERT(nvarchar(10), type) AS type, \
+    CONVERT(nvarchar(1), boundary_value_on_right) AS on_right FROM sys.partition_functions;";
+
+const PARTITION_SCHEMES: &str = "SELECT CONVERT(nvarchar(20), data_space_id) AS id, \
+    CONVERT(nvarchar(20), function_id) AS function_id FROM sys.partition_schemes;";
 
 const PARTITION_PARAMETERS: &str = "SELECT CONVERT(nvarchar(20), function_id) AS function_id, \
     CONVERT(nvarchar(20), parameter_id) AS parameter, CONVERT(nvarchar(20), system_type_id) AS system_type, \
@@ -762,6 +771,7 @@ async fn data_spaces_and_keys(
     (
         BTreeMap<i64, serde_json::Value>,
         BTreeMap<i64, serde_json::Value>,
+        BTreeMap<i64, serde_json::Value>,
     ),
     CaptureError,
 > {
@@ -808,14 +818,33 @@ async fn data_spaces_and_keys(
             .or_default()
             .push((row.number("destination")?, row.number("data_space")?));
     }
-    let mut schemes = BTreeMap::new();
-    for row in rows(conn, PARTITION_SCHEMES).await? {
+    // Each function whole first: two schemes may share one.
+    let mut functions = BTreeMap::new();
+    for row in rows(conn, PARTITION_FUNCTIONS).await? {
         let row = Text(&row);
         let function = row.number("function_id")?;
         let mut parameters = parameters.remove(&function).unwrap_or_default();
         parameters.sort_by_key(|(id, _)| *id);
         let mut boundaries = values.remove(&function).unwrap_or_default();
         boundaries.sort();
+        functions.insert(
+            function,
+            json!({
+                "name": row.required("name")?,
+                "type": row.required("type")?,
+                "boundary_on_right": row.flag("on_right")?,
+                "parameters": parameters.into_iter().map(|(_, p)| p).collect::<Vec<_>>(),
+                "boundaries": boundaries.into_iter().map(|(_, p, v)| json!([p, v])).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    let mut schemes = BTreeMap::new();
+    for row in rows(conn, PARTITION_SCHEMES).await? {
+        let row = Text(&row);
+        let function = functions
+            .get(&row.number("function_id")?)
+            .cloned()
+            .ok_or(CaptureError::Incomplete)?;
         let id = row.number("id")?;
         let mut to = destinations.remove(&id).unwrap_or_default();
         to.sort();
@@ -823,17 +852,7 @@ async fn data_spaces_and_keys(
             .into_iter()
             .map(|(_, space)| names.get(&space).cloned().ok_or(CaptureError::Incomplete))
             .collect::<Result<Vec<_>, _>>()?;
-        schemes.insert(
-            id,
-            json!({
-                "function": row.required("function")?,
-                "type": row.required("type")?,
-                "boundary_on_right": row.flag("on_right")?,
-                "parameters": parameters.into_iter().map(|(_, p)| p).collect::<Vec<_>>(),
-                "boundaries": boundaries.into_iter().map(|(_, p, v)| json!([p, v])).collect::<Vec<_>>(),
-                "destinations": to,
-            }),
-        );
+        schemes.insert(id, json!({"function": function, "destinations": to}));
     }
     let spaces = names
         .iter()
@@ -883,7 +902,7 @@ async fn data_spaces_and_keys(
         held.sort_by_key(|value| value.to_string());
         keys.insert(id, json!({"name": row.required("name")?, "values": held}));
     }
-    Ok((spaces, keys))
+    Ok((spaces, keys, functions))
 }
 
 /// A full-text catalog, stoplist or property list as compared: its name and
@@ -1097,6 +1116,7 @@ pub(super) async fn read(
     }
     let mut data_spaces = BTreeMap::new();
     let mut encryption_keys = BTreeMap::new();
+    let mut partition_functions = BTreeMap::new();
     let mut fulltext = BTreeMap::new();
     let mut members: BTreeMap<(&str, i64), BTreeSet<String>> = BTreeMap::new();
     for &(kind, sql) in FULLTEXT_MEMBERS {
@@ -1130,10 +1150,13 @@ pub(super) async fn read(
             .or_default()
             .insert(row.number("id")?);
     }
-    data_spaces_and_keys(conn).await.map(|(spaces, keys)| {
-        data_spaces = spaces;
-        encryption_keys = keys;
-    })?;
+    data_spaces_and_keys(conn)
+        .await
+        .map(|(spaces, keys, functions)| {
+            data_spaces = spaces;
+            encryption_keys = keys;
+            partition_functions = functions;
+        })?;
     let mut xml_collections = BTreeMap::new();
     for row in rows(conn, XML_COLLECTIONS).await? {
         let row = Text(&row);
@@ -1306,6 +1329,7 @@ pub(super) async fn read(
         numbered,
         table_type_objects,
         data_spaces,
+        partition_functions,
         xml_collections,
         encryption_keys,
         table_types,

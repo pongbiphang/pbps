@@ -59,6 +59,12 @@ pub mod class {
     /// A type, by schema and name: a user type in its own schema, a system
     /// type in `sys`.
     pub const TYPE: &str = "sys.types";
+    /// An XML schema collection, by schema and name, as a module's typed
+    /// `xml` variable binds it.
+    pub const XML_COLLECTION: &str = "sys.xml_schema_collections";
+    /// A partition function, by name (it has no schema), as `$PARTITION`
+    /// binds it.
+    pub const PARTITION_FUNCTION: &str = "sys.partition_functions";
 }
 
 /// Which name a candidate set asks about.

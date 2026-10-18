@@ -1706,3 +1706,64 @@ async fn mssql_a_numbered_procedure_group_refuses_by_name() {
     );
     db.drop().await;
 }
+
+/// A module binds a partition function through `$PARTITION` (class 21, no
+/// schema) and an XML schema collection through a typed variable (class 10):
+/// each is a binding to its definition, so a `SPLIT RANGE` or an `ADD`
+/// differs, rather than the module being refused.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_modules_partition_function_and_xml_collection_are_bindings() {
+    let mut db = TestDb::create("classes2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE PARTITION FUNCTION pf (int) AS RANGE RIGHT FOR VALUES (10);",
+            "CREATE XML SCHEMA COLLECTION app.xs AS N'<xsd:schema xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><xsd:element name=\"a\" type=\"xsd:int\"/></xsd:schema>';",
+            "CREATE FUNCTION app.part_of(@k int) RETURNS int AS BEGIN RETURN $PARTITION.pf(@k) END;",
+            "CREATE PROCEDURE app.typed_xml AS BEGIN DECLARE @x xml(app.xs); SELECT @x; END;",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(
+        &mut db.conn,
+        &objects(&[("app", "part_of"), ("app", "typed_xml")]),
+    )
+    .await
+    .expect("a module binding either is captured");
+    let function = ObjectIdentity {
+        class: class::PARTITION_FUNCTION.into(),
+        name: vec!["pf".into()],
+        signature: Vec::new(),
+    };
+    let collection = ObjectIdentity {
+        class: class::XML_COLLECTION.into(),
+        name: vec!["app".into(), "xs".into()],
+        signature: Vec::new(),
+    };
+    assert!(bound(&sealed, &object("app", "part_of")).contains(&function));
+    assert!(bound(&sealed, &object("app", "typed_xml")).contains(&collection));
+    let differs = |differences: &[pbps_db::resolver::capture::CaptureDifference],
+                   what: &ObjectIdentity| {
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(what) && d.change == InputChange::Properties)
+    };
+    run(
+        &mut db.conn,
+        &["ALTER PARTITION FUNCTION pf () SPLIT RANGE (20);"],
+    )
+    .await;
+    run(
+        &mut db.conn,
+        &["ALTER XML SCHEMA COLLECTION app.xs ADD N'<xsd:schema xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"urn:b\"><xsd:element name=\"b\" type=\"xsd:int\"/></xsd:schema>';"],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(differs(&differences, &function), "split: {differences:?}");
+    assert!(differs(&differences, &collection), "add: {differences:?}");
+    db.drop().await;
+}

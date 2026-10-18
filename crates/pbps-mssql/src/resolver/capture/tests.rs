@@ -91,6 +91,7 @@ fn catalog() -> Catalog {
         fulltext: BTreeMap::new(),
         numbered: BTreeSet::new(),
         data_spaces: BTreeMap::new(),
+        partition_functions: BTreeMap::new(),
         xml_collections: BTreeMap::new(),
         encryption_keys: BTreeMap::new(),
         keys: BTreeMap::new(),
@@ -276,7 +277,7 @@ fn every_refusal_names_its_reason() {
 
     let mut unknown = catalog();
     let mut row = reference(Some("dbo"), "x", Some(PRICE));
-    row.class = 10;
+    row.class = 99;
     unknown.dependencies.push(row);
     assert_eq!(
         condition(&unknown),
@@ -426,6 +427,28 @@ fn a_retained_identity_the_capture_cannot_look_up_refuses() {
             "a retained identity is of a class or shape the capture does not look up"
         ),
     }
+}
+
+#[test]
+fn the_system_stoplist_and_no_stoplist_differ() {
+    let with = |stoplist: Option<&str>| {
+        let mut catalog = catalog();
+        catalog.whole.insert(
+            "fulltext_indexes",
+            vec![super::read::WholeRow::from([
+                ("object_id".to_owned(), Some(PRICE.to_string())),
+                ("stoplist_id".to_owned(), stoplist.map(str::to_owned)),
+            ])],
+        );
+        let mut scope = scope();
+        scope.retained.insert(object("dbo", "price"));
+        catalog
+            .objects_named
+            .insert(("dbo".into(), "price".into()), BTreeSet::from([PRICE]));
+        captured(catalog, scope).inputs[&object("dbo", "price")].properties["sys.fulltext_indexes"]
+            .clone()
+    };
+    assert_ne!(with(Some("0")), with(None), "SYSTEM and OFF");
 }
 
 #[test]

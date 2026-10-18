@@ -338,6 +338,9 @@ impl<'a> Whole<'a> {
                     ),
                 },
                 Rule::FullText(kind) => match id {
+                    // A stoplist's 0 is the system one, and NULL is none
+                    // (`STOPLIST = OFF`): two different indexes.
+                    0 if kind == "stoplist" => json!({"system": true}),
                     0 => Value::Null,
                     _ => json!(
                         self.catalog
