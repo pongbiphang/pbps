@@ -6878,3 +6878,38 @@ Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
 (`crates/pbps-cli/tests/flow_pg.rs`) and
 `a_generated_columns_inputs_leave_out_its_own_column`
 (`crates/pbps-pg/tests/live.rs`).
+
+<a id="dec-1986-1"></a>
+
+**DEC-1986.1. A connected PostgreSQL plan settles the handover of an identity
+sequence's catalog name with the effects, delaying the new holder and its
+consumers while keeping other steps in their relative order.** (#1986.)
+An identity's backing sequence goes with `DROP IDENTITY`, whether the column
+then has no source or takes an owned sequence under another name. The differ
+cannot order a creation taking that name: the engine named the sequence,
+and may since have renamed it. Measured on PostgreSQL 16 and 18, dropping
+the identity first lets a table take that name; creating the table first is
+refused. The existing connected `order_carried_moves` only accepted table
+renames passing one another, so it refused this valid plan.
+
+The same pass reads the existing slots' `Catalog` handover edges. Only a
+numbering change that actually gives up an identity and frees the catalog
+occupant admits a creation to the additional route. A kept or retuned
+identity frees nothing. The owners' table and column renames are replayed
+before matching, as in `name_clashes`; no generated sequence name is guessed.
+The portable and dialect effect edges join the handovers in `settle`, so a
+creation delayed past its consumers carries them after it. Other operations
+keep their relative order through `Keep`; unknown owners, a cycle or a
+reversed kept order retain the original order and refusal. The existing
+rename-only route is unchanged, and the final name replay must still find
+fewer clashes. Both existing calls run it, before and after module passes.
+
+A new rank would encode a catalog fact in the offline differ. Another hoist
+or reorder pass would duplicate the handover mechanism and could undo the
+existing order. Neither is needed. Pinned by
+`an_identity_release_precedes_the_relation_claiming_its_catalog_name`,
+`settling_an_identity_handover_preserves_the_claims_dependents`, and the CLI
+live flows `an_identity_release_hands_its_catalog_name_to_a_new_table_on_both_servers`
+and `an_identity_conversion_hands_its_catalog_name_to_a_new_table_on_both_servers`.
+The live flows check the original and renamed backing names, kept and
+retuned negatives, apply, row preservation, verify and an empty next plan.

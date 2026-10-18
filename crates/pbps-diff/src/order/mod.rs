@@ -15,10 +15,11 @@
 //! - [`commute`]: a pair the facts call independent, and a second order that
 //!   swaps it, for the live suites that check the facts against an engine.
 //!
-//! The effects order nothing in a release build but the resolver's plan:
-//! `settle` orders there only over the edges its callers state (the generated-
-//! and computed-column releases) and the resolver's, which are the effects, the
-//! name slots and its evidence (DEC-1956.3, DEC-1968.2).
+//! In a release build the effects order the resolver's plan and the connected
+//! PostgreSQL handover of an identity sequence's name (DEC-1986.1). Other
+//! callers settle only the edges they state, such as the generated- and
+//! computed-column releases (DEC-1956.3). The resolver combines the effects,
+//! name slots and its evidence (DEC-1968.2).
 
 pub mod commute;
 pub mod edges;

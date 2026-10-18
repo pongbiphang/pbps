@@ -2703,6 +2703,143 @@ fn a_serial_turned_identity_frees_its_name_for_a_new_table() {
     assert_eq!(scalar(connection, "SELECT max(id)::bigint FROM app.w"), 2);
 }
 
+/// The backing name is a catalog fact: even after ALTER SEQUENCE renamed it,
+/// giving up the identity frees it before a table claims it (DEC-1986.1).
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_identity_release_hands_its_catalog_name_to_a_new_table_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        for renamed in [false, true] {
+            identity_name_handover(server, &format!("release-{k}-{renamed}"), renamed, false);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn an_identity_conversion_hands_its_catalog_name_to_a_new_table_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        identity_name_handover(server, &format!("convert-{k}"), true, true);
+    }
+}
+
+fn identity_name_handover(server: &str, slug: &str, renamed: bool, converted: bool) {
+    let own = OwnDatabase::new(server, &format!("identity-name-{slug}"));
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t (id integer GENERATED ALWAYS AS IDENTITY); \
+         INSERT INTO app.t DEFAULT VALUES",
+    );
+    let name = if renamed { "counter" } else { "t_id_seq" };
+    if renamed {
+        on_server(connection, "ALTER SEQUENCE app.t_id_seq RENAME TO counter");
+    }
+    let d = Demo::new(&format!("identity-name-{slug}"));
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    let source = d.dir.join("schema/app.t.yml");
+    let original = std::fs::read_to_string(&source).unwrap();
+    assert!(original.contains("identity:"), "{original}");
+    let holder = d.dir.join(format!("schema/app.{name}.yml"));
+    std::fs::write(
+        &holder,
+        format!(
+            "table: app.{name}\ncolumns:\n  n: {{type: integer}}\n\
+                 indexes:\n  ix_claim: {{columns: [n]}}\n"
+        ),
+    )
+    .unwrap();
+    let plan = d.dir.join("handover.json");
+
+    // A kept or retuned identity does not release its sequence. The renamed
+    // case passes declaration validation and reaches the catalog refusal.
+    for start in [1, 5] {
+        std::fs::write(
+            &source,
+            format!(
+                "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false, \
+                     identity: [{start}, 1]}}\n"
+            ),
+        )
+        .unwrap();
+        let offline = d.run(&["plan"]);
+        if renamed {
+            succeeds(offline);
+        }
+        d.commit();
+        let refused = d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]);
+        assert_ne!(code(&refused), 0, "{}", stdout(&refused));
+        let message = format!("{}{}", stdout(&refused), stderr(&refused));
+        assert!(
+            message.contains("sequence") && message.contains(name),
+            "{message}"
+        );
+        assert!(!plan.exists(), "a refusal writes no saved plan");
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.t'::regclass \
+             AND attname = 'id' AND attidentity = 'a'"
+            ),
+            1
+        );
+    }
+    let column = if converted {
+        "{type: serial, sequence: {name: replacement}}"
+    } else {
+        "{type: integer, nullable: false}"
+    };
+    std::fs::write(&source, format!("table: app.t\ncolumns:\n  id: {column}\n")).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let sql = d.dir.join("handover.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(sql).unwrap();
+    let release = script
+        .find("DROP IDENTITY")
+        .expect("the plan gives up the identity");
+    let claim = script
+        .find(&format!("CREATE TABLE \"app\".\"{name}\""))
+        .expect("the plan creates the new holder");
+    assert!(release < claim, "{script}");
+    assert!(claim < script.find("CREATE INDEX").unwrap(), "{script}");
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "numbering"],
+    ));
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*) FROM pg_class WHERE oid = 'app.{name}'::regclass AND relkind = 'r'"
+            )
+        ),
+        1
+    );
+    assert_eq!(scalar(connection, "SELECT id::bigint FROM app.t"), 1);
+    if converted {
+        on_server(connection, "INSERT INTO app.t DEFAULT VALUES");
+        assert_eq!(scalar(connection, "SELECT max(id)::bigint FROM app.t"), 2);
+    } else {
+        assert!(try_on_server(connection, "INSERT INTO app.t DEFAULT VALUES").is_err());
+    }
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
 /// A connected plan that puts an identity and a `serial` on a table's two
 /// columns, which hold rows: the identity is gated as `numbering` and the
 /// `serial` is not, the apply holds the result it planned, `verify` agrees,

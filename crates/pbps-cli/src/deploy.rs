@@ -465,7 +465,9 @@ pub(crate) fn refuse_uninventoried_occupants(
 /// in it: a release build computes no other edge, and a table rename meets
 /// another only through the names both see, which the edges and the replay
 /// hold. Anything else between them, a cycle, or names that cannot be read
-/// keep the order, and [`refuse_uninventoried_occupants`] refuses it.
+/// keep the order, and [`refuse_uninventoried_occupants`] refuses it. A
+/// creation taking an identity sequence's catalog name also follows its
+/// release, with the effects holding its dependents after it (DEC-1986.1).
 pub(crate) fn order_carried_moves(
     cs: &mut pbps_model::ChangeSet,
     occupants: &[pbps_pg::catalog::NameOccupant],
@@ -474,16 +476,16 @@ pub(crate) fn order_carried_moves(
     dialect: &dyn pbps_dialect::Dialect,
 ) {
     let clashes = name_clashes(&cs.changes, occupants, relations);
-    if !clashes.iter().any(|(at, _)| at.is_some()) {
+    if clashes.is_empty() {
         return;
     }
     let facts = occupant_slots(occupants);
-    let Ok(schedule) =
+    let Ok(mut schedule) =
         pbps_diff::order::slots::handovers(&cs.changes, sides.0, sides.1, dialect, &facts)
     else {
         return;
     };
-    let Ok(settled) = schedule.settle(cs.clone()) else {
+    let Ok(mut settled) = schedule.settle(cs.clone()) else {
         return;
     };
     let renames: Vec<bool> = cs
@@ -492,7 +494,114 @@ pub(crate) fn order_carried_moves(
         .map(|p| matches!(p.change, pbps_model::Change::RenameTable { .. }))
         .collect();
     if !only_crossed_by(&settled.sequence, &renames) {
-        return;
+        use pbps_diff::order::{Baseline, Checks, Schedule, analyse, graph};
+        use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+        use pbps_model::{Change, ValueSource};
+
+        // Slot occupants may leave at any numbering change. Here only an
+        // identity actually given up frees its sequence: a retune keeps it.
+        // Follow the owner's names as the existing replay does, rather than
+        // guessing the sequence's name from its table and column.
+        let mut present = Occupant::all(occupants);
+        let releases: Vec<bool> = cs
+            .changes
+            .iter()
+            .map(|p| {
+                let releases = matches!(
+                    &p.change,
+                    Change::AlterColumnNumbering {
+                        from: ValueSource::Identity(_), to, ..
+                    } if !matches!(to, ValueSource::Identity(_))
+                ) && present
+                    .iter()
+                    .any(|o| o.found.kind == "sequence" && o.freed_by(&p.change));
+                present.retain(|o| !o.freed_by(&p.change));
+                for o in &mut present {
+                    if let Change::RenameTable { from, to, .. } = &p.change {
+                        o.moved(from, to);
+                    }
+                    if let Change::RenameColumn {
+                        table, from, to, ..
+                    } = &p.change
+                    {
+                        o.column_renamed(table, from, to);
+                    }
+                }
+                releases
+            })
+            .collect();
+        let mut moving = vec![false; cs.changes.len()];
+        for edge in schedule.constraints() {
+            if edge.source == pbps_diff::order::Source::Catalog
+                && releases[edge.before]
+                && !relation_names_created(&cs.changes[edge.after].change).is_empty()
+            {
+                moving[edge.after] = true;
+            }
+        }
+        if !moving.iter().any(|&moves| moves) {
+            return;
+        }
+        let Ok(names) = pbps_model::plan_names::PlanNames::of(&cs.changes, sides.1.ids) else {
+            return;
+        };
+        let owners = PlanOwners::new(names, sides.0.ids, sides.1.ids);
+        let operations = Operations::of_plan(&cs.changes, ModuleEdits::Rebuilt);
+        let before = Snapshot {
+            schema: sides.0.schema,
+            ids: sides.0.ids,
+        };
+        let after = Snapshot {
+            schema: sides.1.schema,
+            ids: sides.1.ids,
+        };
+        let effects = analyse(&operations, &owners, before, after, dialect);
+        if !effects.unowned.is_empty() {
+            return;
+        }
+        let graph = graph(
+            operations.as_slice(),
+            &effects.effects,
+            &Baseline::of(before, &owners),
+            &pbps_model::ModuleDeps::new(),
+            Checks::ALL,
+        );
+        let effects = Schedule::of_graph(&graph, operations.as_slice());
+        // A delayed creation carries its consumers with it. Other steps
+        // retain their relative order: this is not permission to reorder
+        // the rest of the plan using an incomplete set of catalog facts.
+        loop {
+            let mut changed = false;
+            for edge in effects.constraints() {
+                if moving[edge.before] && !moving[edge.after] {
+                    moving[edge.after] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut previous = None;
+        for (at, &moves) in moving.iter().enumerate() {
+            if !moves {
+                if let Some(previous) = previous {
+                    schedule.keep(
+                        previous,
+                        at,
+                        "only the identity name's new holder and its dependents may move".into(),
+                    );
+                }
+                previous = Some(at);
+            }
+        }
+        for edge in effects.constraints() {
+            schedule.edge(edge.before, edge.after, edge.source, edge.reason);
+        }
+        let Ok(ordered) = schedule.settle(cs.clone()) else {
+            return;
+        };
+        settled = ordered;
     }
     if name_clashes(&settled.changes.changes, occupants, relations).len() < clashes.len() {
         *cs = settled.changes;
@@ -12033,6 +12142,210 @@ mod tests {
             &pbps_pg::Postgres::new(),
         );
         cs
+    }
+
+    struct IdentityHandover {
+        before: Schema,
+        before_ids: IdsFile,
+        after: Schema,
+        after_ids: IdsFile,
+        changes: pbps_model::ChangeSet,
+        occupants: Vec<pbps_pg::catalog::NameOccupant>,
+    }
+
+    impl IdentityHandover {
+        fn new(to: pbps_model::ValueSource) -> Self {
+            use pbps_model::{Change, ColumnRef, PlannedChange, Table, Uid, UidKind};
+            let owner = TableName::new("app", "t");
+            // The catalog name differs from the engine's original spelling.
+            let claimed = TableName::new("app", "counter");
+            let table_id = Uid::derived(UidKind::Table, "owner", 0);
+            let column_id = Uid::derived(UidKind::Column, "owner.id", 0);
+            let claimed_id = Uid::derived(UidKind::Table, "claim", 0);
+            let mut before = Schema::default();
+            let table: Table = serde_json::from_str(
+                r#"{"columns":{"id":{"type":"integer","nullable":false,"identity":[1,1]}}}"#,
+            )
+            .unwrap();
+            let from = table.columns["id"].value_source.clone();
+            let ty = table.columns["id"].ty.clone();
+            before.tables.insert(owner.clone(), table);
+            let column = ColumnRef::new(owner.clone(), "id");
+            let mut before_ids = IdsFile::default();
+            before_ids.tables.insert(table_id, owner.clone());
+            before_ids.columns.insert(column_id.clone(), column.clone());
+            let mut after = before.clone();
+            after
+                .tables
+                .get_mut(&owner)
+                .unwrap()
+                .columns
+                .get_mut("id")
+                .unwrap()
+                .value_source = to.clone();
+            let created: Table =
+                serde_json::from_str(r#"{"columns":{"n":{"type":"integer","nullable":true}}}"#)
+                    .unwrap();
+            after.tables.insert(claimed.clone(), created.clone());
+            let mut after_ids = before_ids.clone();
+            after_ids.tables.insert(claimed_id.clone(), claimed.clone());
+            after_ids.columns.insert(
+                Uid::derived(UidKind::Column, "claim.n", 0),
+                ColumnRef::new(claimed.clone(), "n"),
+            );
+            Self {
+                before,
+                before_ids,
+                after,
+                after_ids,
+                changes: pbps_model::ChangeSet {
+                    changes: vec![
+                        PlannedChange::new(Change::CreateTable {
+                            uid: claimed_id,
+                            name: claimed.clone(),
+                            table: Box::new(created),
+                            beside_default: None,
+                            moves_at_most: None,
+                        }),
+                        PlannedChange::new(Change::AlterColumnNumbering {
+                            uid: column_id,
+                            column,
+                            ty,
+                            from,
+                            to,
+                        }),
+                    ],
+                },
+                occupants: vec![pbps_pg::catalog::NameOccupant {
+                    name: claimed,
+                    kind: "sequence",
+                    owner: Some(owner),
+                    owner_column: Some("id".into()),
+                }],
+            }
+        }
+
+        fn order(&mut self) {
+            order_carried_moves(
+                &mut self.changes,
+                &self.occupants,
+                &[],
+                (
+                    pbps_diff::Side {
+                        schema: &self.before,
+                        ids: &self.before_ids,
+                    },
+                    pbps_diff::Side {
+                        schema: &self.after,
+                        ids: &self.after_ids,
+                    },
+                ),
+                &pbps_pg::Postgres::new(),
+            );
+        }
+
+        fn refused(&self) -> bool {
+            refuse_uninventoried_occupants(&self.changes, &self.occupants, &[], "prod").is_err()
+        }
+    }
+
+    #[test]
+    fn an_identity_release_precedes_the_relation_claiming_its_catalog_name() {
+        use pbps_model::{Identity, OwnedSequence, ValueSource};
+        for to in [
+            ValueSource::None,
+            ValueSource::Sequence(OwnedSequence {
+                name: Some("new_counter".into()),
+                ..OwnedSequence::serial()
+            }),
+        ] {
+            let mut plan = IdentityHandover::new(to);
+            assert!(plan.refused());
+            let original = plan.changes.changes.clone();
+            plan.order();
+            assert_eq!(
+                plan.changes.changes,
+                vec![original[1].clone(), original[0].clone()]
+            );
+            assert!(!plan.refused());
+            let ordered = plan.changes.clone();
+            plan.order();
+            assert_eq!(plan.changes, ordered, "settling again changes nothing");
+        }
+
+        // Keeping or retuning the identity gives up no sequence, even though
+        // the generic slot analysis considers a numbering change a release.
+        for identity in [Identity::new(1, 1), Identity::new(5, 2)] {
+            let mut plan = IdentityHandover::new(ValueSource::Identity(identity));
+            let original = plan.changes.clone();
+            plan.order();
+            assert_eq!(plan.changes, original);
+            assert!(plan.refused());
+        }
+        for wrong_owner in [None, Some(TableName::new("app", "another"))] {
+            let mut plan = IdentityHandover::new(ValueSource::None);
+            plan.occupants[0].owner = wrong_owner;
+            let original = plan.changes.clone();
+            plan.order();
+            assert_eq!(plan.changes, original);
+            assert!(plan.refused());
+        }
+        let mut plan = IdentityHandover::new(ValueSource::None);
+        plan.occupants.clear();
+        let original = plan.changes.clone();
+        plan.order();
+        assert_eq!(
+            plan.changes, original,
+            "no catalog fact, no guessed handover"
+        );
+    }
+
+    #[test]
+    fn settling_an_identity_handover_preserves_the_claims_dependents() {
+        use pbps_model::{Change, ColumnRef, PlannedChange, Uid, UidKind, ValueSource};
+        let mut plan = IdentityHandover::new(ValueSource::None);
+        let claimed = TableName::new("app", "counter");
+        let uid = Uid::derived(UidKind::Column, "claim.extra", 0);
+        let column: pbps_model::Column =
+            serde_json::from_str(r#"{"type":"integer","nullable":true}"#).unwrap();
+        plan.after
+            .tables
+            .get_mut(&claimed)
+            .unwrap()
+            .columns
+            .insert("extra".into(), column.clone());
+        plan.after_ids
+            .columns
+            .insert(uid.clone(), ColumnRef::new(claimed.clone(), "extra"));
+        plan.changes.changes.insert(
+            1,
+            PlannedChange::new(Change::AddColumn {
+                uid,
+                table: claimed,
+                name: "extra".into(),
+                column: Box::new(column),
+            }),
+        );
+        let original = plan.changes.changes.clone();
+        plan.order();
+        assert_eq!(
+            plan.changes.changes,
+            vec![
+                original[2].clone(),
+                original[0].clone(),
+                original[1].clone()
+            ]
+        );
+        assert!(!plan.refused());
+
+        // A column the operations cannot own is unknown, not independent.
+        let mut unowned = IdentityHandover::new(ValueSource::None);
+        unowned.after_ids.tables.retain(|_, name| name.name != "t");
+        unowned.before_ids.tables.clear();
+        let original = unowned.changes.clone();
+        unowned.order();
+        assert_eq!(unowned.changes, original);
+        assert!(unowned.refused());
     }
 
     /// #1767, #1957: a move whose carried sequence lands on a name a rename of
