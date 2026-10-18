@@ -216,6 +216,45 @@ class BuilderMessages(unittest.TestCase):
             path=BUILDER,
         ), [])
 
+    def test_a_nested_constructor_does_not_hide_a_trailing_error_message(self):
+        for path in guard.SQL_BUILDERS:
+            for text in [
+                'Err(DbError::Refused("already shown".into())'
+                '.context(format!("bad {}", n.raw())))',
+                'Err(pbps_db::DbError /* type */ :: Refused("already shown".into())'
+                '.context(format!("bad {}", n.raw())))',
+                'Err(DialectError::ByHand { why: "shown".into(), '
+                'statement: format!("ALTER TABLE {}", quote(sql.raw())) }'
+                '.to_string() + &format!("bad {}", n.raw()))',
+            ]:
+                with self.subTest(path=path, text=text):
+                    self.assertEqual(len(run(text, path=path)), 1)
+                    self.assertEqual(run(text.replace('n.raw()', 'n.shown()'), path=path), [])
+        text = (
+            'Err(DbError::Refused(format!("{}",\n    inner.raw(),\n))'
+            '.context(format!("{}",\n    outer.raw(),\n)))'
+        )
+        errors = run(text, path=BUILDER)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(errors[0].startswith(f'{BUILDER}:2:'), errors)
+        self.assertTrue(errors[1].startswith(f'{BUILDER}:4:'), errors)
+
+    def test_typed_tuple_wrappers_preserve_sql_but_check_nested_prose(self):
+        payload = (
+            'DialectError::ByHand { why: format!("bad {}", n.shown()), '
+            'statement: format!("ALTER TABLE {}", quote(n.raw())) }'
+        )
+        for path in guard.SQL_BUILDERS:
+            for wrap in [
+                'RowsError::Dialect({})',
+                'Err(RowsError::Dialect({}))',
+                'Err(pbps_db::RowsError /* type */ :: /* variant */ r#Dialect({}))',
+            ]:
+                text = wrap.format(payload)
+                with self.subTest(path=path, text=text):
+                    self.assertEqual(run(text, path=path), [])
+                    self.assertEqual(len(run(text.replace('n.shown()', 'n.raw()'), path=path)), 1)
+
     def test_every_message_macro_and_error_attribute_is_checked_in_builders(self):
         for macro in guard.MACROS:
             if macro == 'format':

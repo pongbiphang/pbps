@@ -334,15 +334,21 @@ def error_ranges(code, opened, end, name):
     """The prose arguments or fields of a recognized error constructor.
 
     Typed fields (a table, a source error) and ByHand's statement are data,
-    not prose. A constructor directly inside Err is checked on its own so
-    the outer wrapper cannot turn those data fields back into messages.
+    not prose. Typed wrappers delegate to their nested constructors so they
+    cannot turn data fields back into messages. Err still checks any suffix
+    after a nested constructor: a method there may add diagnostic context.
     """
     if code[opened] == "(":
+        if re.sub(r"\s+|r#", "", name) == "RowsError::Dialect":
+            return []
         start = opened + 1
         while start < end and code[start].isspace():
             start += 1
-        if name == "Err" and ERROR_CALL.match(code, start):
-            return []
+        nested = ERROR_CALL.match(code, start) if name == "Err" else None
+        if nested:
+            nested_end = closing(code, nested.end() - 1)
+            if nested_end is not None:
+                return [(nested_end + 1, end)]
         return [(opened, end)]
     ranges, depth, start = [], 0, opened + 1
     for i in range(opened + 1, end + 1):
