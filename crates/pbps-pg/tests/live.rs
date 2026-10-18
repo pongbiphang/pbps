@@ -7359,6 +7359,48 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         let alone_probes = pg.fixture_preflight(&alone_step).probes;
         assert_eq!(alone_probes.len(), 1, "{alone_probes:#?}");
         assert_eq!(counted(&mut conn, &alone_probes[0].sql).await, 1);
+        // A key between columns of two collations of their own: the engine
+        // compares it through the key's operator under the referenced
+        // column's collation, and so does the count. A bare `=` between them
+        // was refused, measured on 16 and 18, `could not determine which
+        // collation to use for string hashing`, and the probe went unchecked
+        // (#1551).
+        conn.execute(&format!(
+            "CREATE TABLE {s}.lp (code text COLLATE \"POSIX\" PRIMARY KEY)
+                 PARTITION BY LIST (code);
+             CREATE TABLE {s}.lp_a PARTITION OF {s}.lp FOR VALUES IN ('a');
+             CREATE TABLE {s}.lp_b PARTITION OF {s}.lp FOR VALUES IN ('b');
+             CREATE TABLE {s}.lc (code text COLLATE \"C\" REFERENCES {s}.lp (code));
+             INSERT INTO {s}.lp VALUES ('a'), ('b');
+             INSERT INTO {s}.lc VALUES ('a');"
+        ))
+        .await
+        .expect("the collated list tree");
+        let with_lp = read(&pbps_pg::catalog::introspect(&mut conn).await.expect("pull"));
+        let lp_ids = mint_moving(&with_lp, &aref_ids);
+        let mut no_a = with_lp.clone();
+        no_a.tables.remove(&t("lp_a"));
+        let lp_intent = [Intent::DropTable {
+            table: t("lp_a"),
+            reason: "gone".parse().unwrap(),
+        }];
+        let lp_step = plan(
+            &with_lp,
+            &lp_ids,
+            &no_a,
+            &mint_moving_and(&no_a, &lp_ids, &lp_intent),
+        );
+        let lp_probes = pg.fixture_preflight(&lp_step).probes;
+        assert_eq!(lp_probes.len(), 1, "{lp_probes:#?}");
+        assert_eq!(counted(&mut conn, &lp_probes[0].sql).await, 1);
+        // Negative: without the referencing row, none.
+        in_a_transaction(&mut conn).await;
+        conn.execute(&format!("DELETE FROM {s}.lc")).await.unwrap();
+        assert_eq!(counted(&mut conn, &lp_probes[0].sql).await, 0);
+        rollback(&mut conn).await;
+        conn.execute(&format!("DROP TABLE {s}.lc, {s}.lp"))
+            .await
+            .unwrap();
         // The same for a move out of the DEFAULT: a row referencing a moved
         // row from a partition the plan drops first is gone by the move, so
         // it counts none, and the move goes (#1763 review).

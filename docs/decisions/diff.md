@@ -6516,3 +6516,44 @@ rebuild, not lost: the rebuilt index has the declared parameters.
 Stopping the differ from emitting the change would need the differ to know
 which indexes the catalog will make `weave` rebuild. That knowledge exists
 only after the catalog read.
+
+<a id="dec-1553-1"></a>
+
+**DEC-1553.1. A partition's drop or detach waits for the row updates and
+deletes of a table with a foreign key to its parent, where it passes nothing
+that may need it done.** (#1553, after S6a of #1776)
+
+The engine refuses to detach a partition while a row references one of its
+rows through a foreign key to the parent, and a partition's drop detaches it
+first. The class order runs both in class 6, before the row updates and
+deletes of classes 11 and 12. So a revision that deletes or repoints the
+referencing rows and drops the partition was refused, by the pre-flight and,
+in that order, by the engine. The remedy was two revisions.
+
+`after_the_rows_that_leave`, in `schedule`, adds an edge from each update or
+delete of a table with a declared foreign key to the parent to the drop or
+detach, and `settle` sinks the drop to right after the last of them. Every
+such row change is waited for, not only the ones that move a reference: which
+rows reference the partition is their content. A row change that keeps its
+reference is counted by the pre-flight wherever the drop runs.
+
+The drop is held only where every change between it and that last row change
+is one it may pass: a row deleted anywhere; a row written, or a column
+changed, in a table other than the parent and the partition; another table's
+drop. A partition created or attached over the range, a rename taking a name
+the drop frees, a numbering source naming a sequence, a row written into the
+parent, which may land in the range: any of them in the stretch keeps the
+class order. That is the issue's condition, that no partition created over
+the range has to follow the drop, read as a list of what may be passed rather
+than as an overlap of bounds. A plan it does not reorder is refused by the
+pre-flight as before, so the narrow list costs a second revision, never a
+wrong apply.
+
+The pre-flight counts the referencing rows as they will be when the detach
+runs, as the delete probe does (`plan_moves`): a row the plan deletes or
+updates away first is left out, one it puts onto the partition is added. The
+count is the delete probe's (`counting_expression`), so a key is compared
+through its own operator under the referenced column's collation. The probe's
+bare `=` was refused between two column collations, measured on 16 and 18
+(`could not determine which collation to use for string hashing`), and the
+probe went unchecked (#1551).

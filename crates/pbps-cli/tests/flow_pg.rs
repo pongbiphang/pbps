@@ -27953,3 +27953,116 @@ fn a_partitions_own_foreign_keys_change_through_the_cli() {
     assert_eq!(holds("SELECT to_regclass('app.ev_2026') IS NULL"), 1);
     assert_eq!(scalar(&conn, "SELECT count(*) FROM app.ev"), 1);
 }
+
+/// A revision that deletes or repoints the declared rows referencing a
+/// partition and drops that partition applies through the CLI (#1553): the
+/// drop runs after the row changes, and the pre-flight counts each row as it
+/// will be, so the deleted one and the repointed one are not counted. The
+/// next plan is empty. Negative: with a referencing row kept, the pre-flight
+/// still refuses the drop by name, and nothing changes.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partitions_drop_follows_the_row_changes_that_stop_referencing_it() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "part-rows-1553");
+    let conn = own.connection().to_owned();
+    on_server(&conn, "CREATE SCHEMA app");
+    let d = Demo::new("part-rows-1553");
+    let tree = |partitions: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!(
+                "table: app.ev\ncolumns:\n  id: {{type: integer, nullable: false}}\n\
+                 primary_key: [id]\npartition_by: [id]\npartitions:\n{partitions}"
+            ),
+        )
+        .unwrap();
+    };
+    let ev_1 = "  ev_1: {from: [1], to: [10]}\n";
+    let ev_2 = "  ev_2: {from: [10], to: [20]}\n";
+    let referencing = |data: &str| {
+        std::fs::write(
+            d.dir.join("schema/app.r.yml"),
+            format!(
+                "table: app.r\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+                 ev_id: {{type: integer}}\nprimary_key: [id]\nforeign_keys:\n  r_ev:\n    \
+                 columns: [ev_id]\n    references: app.ev(id)\n{data}"
+            ),
+        )
+        .unwrap();
+    };
+    tree(&format!("{ev_1}{ev_2}"));
+    referencing("");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", &conn]));
+    on_server(
+        &conn,
+        "INSERT INTO app.ev VALUES (5), (6), (15); \
+         INSERT INTO app.r VALUES (1, 5), (2, 15), (3, 6)",
+    );
+    let applied = |name: &str, allow: &[&str]| {
+        let plan = d.dir.join(name);
+        succeeds(d.run(&["plan", "--db", &conn, "--out", plan.to_str().unwrap()]));
+        let o = approved_apply(&d, &conn, &plan, allow);
+        (plan, o)
+    };
+    referencing(
+        "data:\n  mode: exact\n  rows:\n    1: {ev_id: 5}\n    2: {ev_id: 15}\n    \
+         3: {ev_id: 6}\n",
+    );
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(applied("adopt.json", &[]).1);
+
+    // Row 1 deleted and row 3 repointed, ev_1 dropped, in one revision; the
+    // negative first: row 3 kept on ev_1, which the pre-flight still counts.
+    let allow = ["--allow", "destructive,data-update,data-delete"];
+    tree(ev_2);
+    succeeds(d.run(&["drop-table", "app.ev_1", "--reason", "retired"]));
+    referencing("data:\n  mode: exact\n  rows:\n    2: {ev_id: 15}\n    3: {ev_id: 6}\n");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let (_, o) = applied("kept.json", &allow);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        said.contains("1 rows that reference app.ev_1 through a foreign key to app.ev")
+            && said.contains("nothing has been changed"),
+        "{said}"
+    );
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM app.r"), 3);
+    assert_eq!(
+        scalar(
+            &conn,
+            "SELECT (to_regclass('app.ev_1') IS NOT NULL)::int::int8"
+        ),
+        1
+    );
+
+    referencing("data:\n  mode: exact\n  rows:\n    2: {ev_id: 15}\n    3: {ev_id: 15}\n");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let (plan, o) = applied("leave.json", &allow);
+    succeeds(o);
+    // The drop runs after the row changes that stop referencing it.
+    let text = std::fs::read_to_string(&plan).unwrap();
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle} not in the plan: {text}"))
+    };
+    assert!(at("\"delete_row\"") < at("\"drop_table\""), "{text}");
+    assert!(at("\"update_row\"") < at("\"drop_table\""), "{text}");
+    succeeds(d.run(&["verify", "--db", &conn]));
+    let next = succeeds(d.run(&["plan", "--db", &conn]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+    assert_eq!(
+        scalar(&conn, "SELECT (to_regclass('app.ev_1') IS NULL)::int::int8"),
+        1
+    );
+    assert_eq!(
+        scalar(&conn, "SELECT count(*) FROM app.r WHERE ev_id = 15"),
+        2
+    );
+    assert_eq!(scalar(&conn, "SELECT count(*) FROM app.r"), 2);
+}

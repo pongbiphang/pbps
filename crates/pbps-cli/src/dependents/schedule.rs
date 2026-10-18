@@ -27,9 +27,9 @@ use pbps_model::{Change, ChangeSet, ModuleDeps, ModuleId, Schema};
 use pbps_pg::modules::Dependent;
 
 use super::{
-    Sources, after_the_rebuilds, after_their_parents_defaults, before_its_partitions_indexes,
-    dropped_modules, released, settle_public_execution, split_moving_defaults, split_new_tables,
-    standing_partitions, take_public_execution, weave,
+    Sources, after_the_rebuilds, after_the_rows_that_leave, after_their_parents_defaults,
+    before_its_partitions_indexes, dropped_modules, released, settle_public_execution,
+    split_moving_defaults, split_new_tables, standing_partitions, take_public_execution, weave,
 };
 
 /// What the declarations and the baseline say. None of it needs a database, so
@@ -210,6 +210,9 @@ pub(crate) fn schedule(
         // take (#1745 review).
         before_its_partitions_indexes(&mut cs, declared.schema, dialect)
             .map_err(Refusal::module_passes)?;
+        // And a partition's drop after the rows that stop referencing it
+        // (#1553).
+        after_the_rows_that_leave(&mut cs, declared.schema).map_err(Refusal::module_passes)?;
         settle_public_execution(&mut cs, decisions);
     }
     // The differ sorted the role drops before it could know who holds whom;

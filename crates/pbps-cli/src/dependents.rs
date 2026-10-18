@@ -1849,6 +1849,119 @@ fn before_its_partitions_indexes(
     Ok(())
 }
 
+/// A partition's drop or detach after the row changes that may stop
+/// referencing it (#1553, DEC-1553.1).
+///
+/// The engine refuses to detach a partition while a row references one of
+/// its rows through a foreign key to its parent, and the drop detaches it
+/// first. The differ puts both in class 6, ahead of the row updates and
+/// deletes of classes 11 and 12, so a revision that deletes or repoints the
+/// referencing rows and drops the partition was refused: by the pre-flight,
+/// and by the engine in that order too. An edge from each update or delete
+/// of a table with a foreign key to the parent puts the drop after them, and
+/// `settle` sinks it there and moves nothing else.
+///
+/// Which rows stop referencing the partition is their content, not the
+/// change's kind, so every update and delete of such a table is waited for:
+/// one that leaves its reference in place is counted by the pre-flight
+/// either way.
+///
+/// Only where the drop passes nothing that may need it done first
+/// ([`passable_by_a_leaving_partition`]). A partition created or attached
+/// over its range, a name it frees taken again, a row written into its
+/// parent: any of them in the stretch keeps the class order, and the
+/// pre-flight refuses the referencing rows by name, as before.
+fn after_the_rows_that_leave(cs: &mut ChangeSet, declared: &Schema) -> Result<(), String> {
+    let referencing = |parent: &TableName| -> BTreeSet<&TableName> {
+        declared
+            .tables
+            .iter()
+            .filter(|(_, t)| {
+                t.foreign_keys
+                    .values()
+                    .any(|key| key.references_table == *parent)
+            })
+            .map(|(name, _)| name)
+            .collect()
+    };
+    let mut schedule = Schedule::new(cs.changes.len());
+    let mut held = false;
+    for (d, p) in cs.changes.iter().enumerate() {
+        let (partition, parent) = if let Change::DropTable {
+            name,
+            detach_from: Some(parent),
+            ..
+        }
+        | Change::DetachPartition {
+            table: name,
+            parent,
+            ..
+        } = &p.change
+        {
+            (name, parent)
+        } else {
+            continue;
+        };
+        let from = referencing(parent);
+        let leaving: Vec<usize> = (d + 1..cs.changes.len())
+            .filter(|&k| {
+                matches!(
+                    &cs.changes[k].change,
+                    Change::UpdateRow { table, .. } | Change::DeleteRow { table, .. }
+                        if from.contains(table)
+                )
+            })
+            .collect();
+        let Some(&last) = leaving.last() else {
+            continue;
+        };
+        if !cs.changes[d + 1..last]
+            .iter()
+            .all(|q| passable_by_a_leaving_partition(&q.change, partition, parent))
+        {
+            continue;
+        }
+        for k in leaving {
+            schedule.edge(k, d, Source::Effect, OrderReason::Data);
+        }
+        held = true;
+    }
+    if !held {
+        return Ok(());
+    }
+    let settled = schedule
+        .settle(cs.clone())
+        .map_err(|refusal| refusal.describe(cs))?;
+    *cs = settled.changes;
+    Ok(())
+}
+
+/// Whether a partition's drop or detach may be carried past `c`
+/// ([`after_the_rows_that_leave`]): a change that neither needs it done nor
+/// is undone by it. A row deleted anywhere, a row written or a column changed
+/// in a table other than its parent and itself, and another table's drop. A
+/// row written into the parent may land in its range, a create or an attach
+/// may take its range or a name it frees, and a numbering source names a
+/// sequence: none of them is passed.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn passable_by_a_leaving_partition(c: &Change, partition: &TableName, parent: &TableName) -> bool {
+    let other = |table: &TableName| table != partition && table != parent;
+    match c {
+        Change::DeleteRow { .. } => true,
+        Change::InsertRow { table, .. }
+        | Change::UpdateRow { table, .. }
+        | Change::AddColumn { table, .. }
+        | Change::SetStorageParameters { table, .. } => other(table),
+        Change::DropTable { name, .. } => other(name),
+        Change::AlterColumnType { column, .. }
+        | Change::AlterColumnNullability { column, .. }
+        | Change::AlterColumnDefault { column, .. }
+        | Change::AlterColumnExpression { column, .. }
+        | Change::SetColumnDeprecated { column, .. } => other(&column.table),
+        _ => false,
+    }
+}
+
 /// Whether `later` must stay after `earlier`, among the changes
 /// [`before_its_partitions_indexes`] may move: a literal in its text that
 /// may name a relation `earlier` brings ([`relation_literal`]), a foreign
@@ -6348,6 +6461,150 @@ mod tests {
         )
         .unwrap();
         assert_eq!((again, &cs), (0, &settled));
+    }
+
+    /// A partition's drop or detach goes after the updates and deletes of a
+    /// table with a foreign key to its parent, which may stop referencing it
+    /// (#1553): the drop sinks to right after the last of them, and nothing
+    /// else moves. Not where it would pass a change that may need it done: a
+    /// partition created over its range, or a row written into its parent.
+    /// Nor with no such table, or no row change of one.
+    #[test]
+    // A test rendering: every other change prints as itself.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    fn a_partitions_drop_goes_after_the_rows_that_stop_referencing_it() {
+        let ev = TableName::new("app", "ev");
+        let ev_2025 = TableName::new("app", "ev_2025");
+        let r = TableName::new("app", "r");
+        let zz = TableName::new("app", "zz");
+        let mut s = Schema::default();
+        s.tables.insert(ev.clone(), Table::default());
+        s.tables.insert(
+            ev_2025.clone(),
+            Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: ev.clone(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            },
+        );
+        let mut referencing = Table::default();
+        referencing.foreign_keys.insert(
+            "r_ev".into(),
+            pbps_model::ForeignKey {
+                columns: vec!["ev_id".into()],
+                references_table: ev.clone(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+        s.tables.insert(r.clone(), referencing);
+        s.tables.insert(zz.clone(), Table::default());
+        let drop = Change::DropTable {
+            uid: Uid::derived(UidKind::Table, "app.ev_2025", 0),
+            name: ev_2025.clone(),
+            detach_from: Some(ev.clone()),
+        };
+        let detach = Change::DetachPartition {
+            uid: Uid::derived(UidKind::Table, "app.ev_2025", 0),
+            table: ev_2025.clone(),
+            parent: ev.clone(),
+            names: Vec::new(),
+            shape: Box::default(),
+        };
+        let delete = |table: &TableName, key: &str| Change::DeleteRow {
+            table: table.clone(),
+            key_column: "id".into(),
+            key: pbps_model::RowKey::from(key),
+            cause: pbps_model::change::DeleteCause::Undeclared,
+            row: BTreeMap::new(),
+            dropped: BTreeMap::new(),
+            types: BTreeMap::new(),
+            after_types: BTreeMap::new(),
+            key_type: None,
+        };
+        let update = |table: &TableName| Change::UpdateRow {
+            table: table.clone(),
+            key_column: "id".into(),
+            key: pbps_model::RowKey::from("2"),
+            columns: BTreeMap::new(),
+            unchanged: BTreeMap::new(),
+            types: BTreeMap::new(),
+            after_types: BTreeMap::new(),
+            key_type: None,
+        };
+        let insert = |table: &TableName| Change::InsertRow {
+            table: table.clone(),
+            key_column: "id".into(),
+            identity_key: false,
+            key: pbps_model::RowKey::from("3"),
+            row: pbps_model::Row::default(),
+            defaults: BTreeMap::new(),
+            types: BTreeMap::new(),
+        };
+        let order = |cs: &ChangeSet| -> Vec<String> {
+            cs.changes
+                .iter()
+                .map(|p| match &p.change {
+                    Change::DropTable { .. } => "drop".to_owned(),
+                    Change::DetachPartition { .. } => "detach".to_owned(),
+                    Change::DeleteRow { table, .. } => format!("delete {}", table.name),
+                    Change::UpdateRow { table, .. } => format!("update {}", table.name),
+                    Change::InsertRow { table, .. } => format!("insert {}", table.name),
+                    other => other.subject(),
+                })
+                .collect()
+        };
+        // The drop and the detach alike, past another table's row and up to
+        // the last row change of the referencing table.
+        for (leaving, named) in [(drop.clone(), "drop"), (detach, "detach")] {
+            let mut cs = plan(vec![
+                leaving,
+                update(&r),
+                insert(&zz),
+                delete(&r, "1"),
+                delete(&zz, "1"),
+            ]);
+            after_the_rows_that_leave(&mut cs, &s).unwrap();
+            assert_eq!(
+                order(&cs),
+                ["update r", "insert zz", "delete r", named, "delete zz"]
+            );
+            // Settled again, nothing moves.
+            let settled = cs.clone();
+            after_the_rows_that_leave(&mut cs, &s).unwrap();
+            assert_eq!(cs, settled);
+        }
+        // Negative: a partition created between them, or a row written into
+        // the parent, is not passed; the class order stands.
+        let create = Change::CreateTable {
+            uid: Uid::derived(UidKind::Table, "app.ev_new", 0),
+            name: TableName::new("app", "ev_new"),
+            table: Box::default(),
+            beside_default: None,
+            moves_at_most: None,
+        };
+        for between in [create, insert(&ev)] {
+            let mut cs = plan(vec![drop.clone(), between, delete(&r, "1")]);
+            let before = cs.clone();
+            after_the_rows_that_leave(&mut cs, &s).unwrap();
+            assert_eq!(cs, before);
+        }
+        // Negative: only another table's rows change, so nothing waits.
+        let mut cs = plan(vec![drop.clone(), delete(&zz, "1")]);
+        let before = cs.clone();
+        after_the_rows_that_leave(&mut cs, &s).unwrap();
+        assert_eq!(cs, before);
+        // Negative: with no foreign key to the parent, the referencing
+        // table's rows are anyone's.
+        s.tables.get_mut(&r).unwrap().foreign_keys.clear();
+        let mut cs = plan(vec![drop, delete(&r, "1")]);
+        let before = cs.clone();
+        after_the_rows_that_leave(&mut cs, &s).unwrap();
+        assert_eq!(cs, before);
     }
 
     /// A parent's new index goes ahead of every partition index it could take

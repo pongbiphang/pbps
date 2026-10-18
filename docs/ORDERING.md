@@ -154,6 +154,11 @@ Then, in this order:
     parent's new index to each partition index it could take, so that index
     sinks to right after the parent's, with what rests on it (DEC-1688.1,
     DEC-1967.2).
+  - `after_the_rows_that_leave` settles an edge from each row update or
+    delete of a table with a foreign key to a partitioned parent to the
+    drop or detach of a partition of it, so the drop runs after the rows
+    that may stop referencing it, where it passes nothing that may need it
+    done (DEC-1553.1).
 - **On SQL Server**, a retype or recollation drops and re-adds the keys,
   indexes and checks over the column, through `retype_dependents` and
   `recollate_dependents` (#1175, DECISIONS 515). `CREATE OR ALTER` means a
@@ -475,6 +480,7 @@ and update (SPEC §4.6).
 | Parent row → child row (insert, update) | fixed | data rank inside class 11 | ✓ |
 | Child `DeleteRow` → parent `DeleteRow` | fixed | the data rank, negated inside class 12 | ✓ |
 | Row update moving a reference away → `DeleteRow` of the old parent | fixed | class 11 before 12 | ✓ |
+| `UpdateRow` or `DeleteRow` of a table with a foreign key to a partitioned parent → `DropTable` or `DetachPartition` of a partition of it | fixed | an edge from each, settled by `after_the_rows_that_leave`, where the drop passes only rows, other tables' column changes and drops; otherwise class 6 before 11, refused by the pre-flight. P: the pre-flight counts each referencing row as it will be when the detach runs | ✓ DEC-1553.1 |
 | `InsertRow` or `UpdateRow` into a table a partitioned parent's foreign key references, or `AttachPartition` under that table → `AttachPartition` under the parent, which validates the key over the rows it brings | fixed | (11, 1), at the parent's data rank: with attaches in the plan, the data order covers their parents too (`supply_order`) | ✓ DEC-1545.1 |
 | `AttachPartition` → `InsertRow` or `UpdateRow` into a table referencing its parent, and `AddForeignKey` into the parent | fixed | class 7 before 11 and 13; at (11, 1), the referencing table ranks after every table the parent references. P: the parent's rows counted with the attached table's | ✓ DEC-1545.1 |
 | `InsertRow` or `UpdateRow` taking a value another row holds under a UNIQUE elsewhere → `DeleteRow` of that row | content | the write first (class 11 before 12): it is refused inside the transaction, loudly. Deleting first could cascade a moving child away silently | ✓ by design, SPEC §4.6 |
