@@ -17,9 +17,17 @@ are the ones that build a message or an error for a person; `assert!` and
 `panic!` report a bug in the tool, and almost all of theirs are tests. `.raw()` anywhere else -
 a SQL bind, a map key, a comparison, a hash - is not this check's business.
 
-The allowlist is by path, because what makes a `.raw()` right is what the file
-is for. Each entry says why, and an entry whose file is gone, or which a count
-shows is no longer needed, fails, so the list cannot go stale unread.
+SQL builders accept `format!` outside diagnostic sinks: `invalid`, `Err` and
+`DbError`/`DialectError`/`RowsError` constructors. Their message macros and error
+attributes are checked too. An existing whole-message escaping boundary needs
+a comment containing `#2084 step 5` on the raw reference's line or the line
+above it. SQL-generated RAISE/THROW messages and shared probe/offline descriptions
+are outside this bounded check (#2123); this does not trace text through locals
+or unlisted helpers.
+
+The other exemptions remain by path and, for known holes, count. Each entry
+says why, and an entry whose file is gone, or whose count is no longer needed,
+fails, so the list cannot go stale unread.
 """
 
 import re
@@ -42,6 +50,16 @@ ERROR_ATTR = re.compile(r"#\s*\[\s*error\s*\(")
 RAW = re.compile(r"\.\s*(?:r#)?raw\s*\(|::\s*(?:r#)?raw\b")
 # The opening of a raw string, `r#"`; its prefix cannot follow an identifier.
 RAW_STRING = re.compile(r"(?:br|cr|r)(#*)\"")
+ERROR_CALL = re.compile(
+    r"\b(?:\w+\s*::\s*)*(invalid|Err|(?:DbError|DialectError|RowsError)"
+    r"\s*::\s*(?:r#)?[A-Z]\w*)\s*(?:::\s*<|[(\{])"
+)
+MESSAGE_FIELDS = {"message", "feature", "part", "detail", "why"}
+SQL_BUILDERS = {
+    f"crates/pbps-{engine}/src/{module}.rs"
+    for engine in ("pg", "mssql")
+    for module in ("emit", "preflight", "rows", "catalog")
+}
 
 # path -> (count, why). `count` is how many `.raw()` in a message the file may
 # hold: None for a file that builds SQL or a document and so holds them by its
@@ -50,8 +68,8 @@ RAW_STRING = re.compile(r"(?:br|cr|r)(#*)\"")
 ALLOWED = {
     # The SQL builders. A name or a text is quoted through the dialect into a
     # statement, a probe or a row bind, and a `format!` is how the statement
-    # is put together. What these files print for a person goes through
-    # `.shown()`, which the types make the only other choice.
+    # is put together. Only formatting outside the bounded diagnostic sinks
+    # is exempt; an error's raw operands need a per-site step-5 comment.
     "crates/pbps-pg/src/emit.rs": (None, "builds PostgreSQL statements from raw names"),
     "crates/pbps-pg/src/preflight.rs": (None, "builds PostgreSQL probe SQL from raw names"),
     "crates/pbps-pg/src/rows.rs": (None, "builds PostgreSQL row reads and writes from raw names"),
@@ -200,7 +218,7 @@ ALLOWED = {
 }
 
 
-def mask(src):
+def mask(src, markers=None):
     """`src` with comments, strings and character literals blanked.
 
     Newlines stay, so offsets and line numbers still point into `src`. What a
@@ -215,13 +233,23 @@ def mask(src):
             if out[k] != "\n":
                 out[k] = " "
 
+    def comment(start, end):
+        # Read markers only from comments, never from a quoted example. A
+        # file-level note must not authorize a distant diagnostic.
+        if markers is not None:
+            first = src.count("\n", 0, start) + 1
+            for offset, text in enumerate(src[start:end].split("\n")):
+                if "#2084 step 5" in text:
+                    markers.add(first + offset)
+        blank(start, end)
+
     i = 0
     while i < n:
         c = src[i]
         if src.startswith("//", i):
             j = src.find("\n", i)
             j = n if j < 0 else j
-            blank(i, j)
+            comment(i, j)
             i = j
         elif src.startswith("/*", i):
             depth, j = 1, i + 2
@@ -232,7 +260,7 @@ def mask(src):
                     depth, j = depth - 1, j + 2
                 else:
                     j += 1
-            blank(i, j)
+            comment(i, j)
             i = j
         elif c in "rbc" and not (i and (src[i - 1].isalnum() or src[i - 1] == "_")) and (
             opening := RAW_STRING.match(src, i)
@@ -302,21 +330,134 @@ def message_start(code, opened, end, name):
     return end
 
 
-def hits(src):
+def error_opening(code, match):
+    """Find the call after optional type arguments, including nested types."""
+    opened = match.end() - 1
+    if code[opened] != "<":
+        return opened
+    depth, i = 1, opened + 1
+    while i < len(code):
+        c = code[i]
+        if c in "([{":
+            # Array lengths and const arguments can contain angle operators.
+            end = closing(code, i)
+            if end is None:
+                return None
+            i = end
+        elif c == "<":
+            depth += 1
+        elif c == ">" and code[i - 1] != "-":  # not a function type's arrow
+            depth -= 1
+            if depth == 0:
+                i += 1
+                while i < len(code) and code[i].isspace():
+                    i += 1
+                return i if i < len(code) and code[i] in "({" else None
+        elif c == ";":
+            return None
+        i += 1
+    return None
+
+
+def err_ranges(code, start, stop):
+    """Read an Err's value through groups and the tail of a block.
+
+    Local statements are not the returned prose. Their named diagnostic sinks
+    are checked separately; tracing text through locals remains out of scope.
+    """
+    pending, ranges = [(start, stop)], []
+    while pending:
+        start, stop = pending.pop()
+        while start < stop and code[start].isspace():
+            start += 1
+        if start == stop:
+            continue
+        if code[start] in "({":
+            end = closing(code, start)
+            if end is not None and end < stop:
+                tail = start + 1
+                if code[start] == "{":
+                    i = tail
+                    while i < end:
+                        if code[i] in "([{":
+                            i = closing(code, i)
+                        elif code[i] == ";":
+                            tail = i + 1
+                        i += 1
+                pending.extend([(tail, end), (end + 1, stop)])
+                continue
+        nested = ERROR_CALL.match(code, start)
+        opened = error_opening(code, nested) if nested else None
+        end = closing(code, opened) if opened is not None else None
+        # The nested constructor checks its own fields, but a suffix can add
+        # context whose raw operands are still part of this Err's message.
+        ranges.append((end + 1 if end is not None else start, stop))
+    return ranges
+
+
+def error_ranges(code, opened, end, name):
+    """The prose arguments or fields of a recognized error constructor.
+
+    Typed fields (a table, a source error) and ByHand's statement are data,
+    not prose. Typed wrappers delegate to their nested constructors so they
+    cannot turn data fields back into messages. Err still checks any suffix
+    after a nested constructor: a method there may add diagnostic context.
+    """
+    if code[opened] == "(":
+        if re.sub(r"\s+|r#", "", name) == "RowsError::Dialect":
+            return []
+        if name == "Err":
+            return err_ranges(code, opened + 1, end)
+        return [(opened, end)]
+    ranges, depth, start = [], 0, opened + 1
+    for i in range(opened + 1, end + 1):
+        c = code[i]
+        # A generic argument's comma does not start the next struct field.
+        next_field = c == "," and depth == 0 and re.match(
+            r"\s*(?:(?:r#)?\w+\s*:(?!:)|\.\.)", code[i + 1:end]
+        )
+        if i == end or next_field:
+            field = re.match(r"\s*(?:r#)?(\w+)\s*:(?!:)", code[start:i])
+            if field and field[1] in MESSAGE_FIELDS:
+                ranges.append((start + field.end(), i))
+            start = i + 1
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+    return ranges
+
+
+def hits(src, builder=False):
     """([(line, macro)] for each `.raw()` in a message, [line] for each call
     this could not find the end of)."""
-    code = mask(src)
+    markers = set() if builder else None
+    code = mask(src, markers)
     line = lambda at: code.count("\n", 0, at) + 1
-    calls = [(m.end() - 1, m[1] + "!") for m in MACRO_CALL.finditer(code)]
-    calls += [(m.end() - 1, "#[error]") for m in ERROR_ATTR.finditer(code)]
+    calls = [(m.end() - 1, m[1] + "!", False) for m in MACRO_CALL.finditer(code)]
+    calls += [(m.end() - 1, "#[error]", False) for m in ERROR_ATTR.finditer(code)]
+    if builder:
+        for m in ERROR_CALL.finditer(code):
+            opened = error_opening(code, m)
+            if opened is not None:
+                calls.append((opened, m[1], True))
     found, lost = {}, []
-    for opened, name in calls:
+    for opened, name, error in calls:
         end = closing(code, opened)
         if end is None:
             lost.append(line(opened))
             continue
-        for raw in RAW.finditer(code, message_start(code, opened, end, name), end):
-            found.setdefault(raw.start(), name)
+        if builder and name == "format!":
+            continue
+        ranges = error_ranges(code, opened, end, name) if error else [
+            (message_start(code, opened, end, name), end)
+        ]
+        for start, stop in ranges:
+            for raw in RAW.finditer(code, start, stop):
+                n = line(raw.start())
+                if builder and (n in markers or n - 1 in markers):
+                    continue
+                found.setdefault(raw.start(), name)
     return [(line(at), name) for at, name in sorted(found.items())], lost
 
 
@@ -333,11 +474,12 @@ def check(files, allowed=ALLOWED):
             errors.append(f"{path}: the count is None or a positive number, not {count!r}")
             unusable.add(path)
     for path, text in sorted(files.items()):
-        found, lost = hits(text)
+        builder = path in SQL_BUILDERS
+        found, lost = hits(text, builder=builder)
         # A call whose end is not found is a call whose arguments were not
         # read: that is not a clean file, whatever the file is for.
-        errors.extend(f"{path}:{n}: cannot find the end of this macro call" for n in lost)
-        if path in allowed:
+        errors.extend(f"{path}:{n}: cannot find the end of this call" for n in lost)
+        if path in allowed and not builder:
             count = allowed[path][0]
             if count is not None and path not in unusable and len(found) != count:
                 where = ", ".join(str(n) for n, _ in found) or "none"
@@ -348,11 +490,15 @@ def check(files, allowed=ALLOWED):
                 )
             continue
         for n, name in found:
+            advice = (
+                "SQL-builder exemptions cover formatting outside diagnostic sinks (#2123)"
+                if builder else
+                "If this file builds SQL or a document, add it to ALLOWED in "
+                "scripts/check-raw-in-messages.py with the reason (#2084)"
+            )
             errors.append(
                 f"{path}:{n}: `.raw()` inside {name}: a message a person reads "
-                f"prints it unescaped; use `.shown()`. If this file builds SQL or "
-                f"a document, add it to ALLOWED in scripts/check-raw-in-messages.py "
-                f"with the reason (#2084)"
+                f"prints it unescaped; use `.shown()`. {advice}"
             )
     return errors
 

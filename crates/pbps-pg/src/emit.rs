@@ -905,6 +905,7 @@ fn numbering(
         if let ValueSource::Generated(_) = source {
             return Err(invalid(format!(
                 "{column}: a generated column has no numbering source to change",
+                // raw: whole-message escaped until #2084 step 5
                 column = column.raw()
             )));
         }
@@ -2700,6 +2701,7 @@ fn the_body_declares_the_identity(
              engine the emitter writes `CREATE FUNCTION {}` and the declaration writes everything \
              after the name, so the list is the body's -- and **measured**, the engine requires \
              one: `CREATE FUNCTION f RETURNS int ...` is a syntax error",
+            // raw: whole-message escaped until #2084 step 5
             id.object_name().raw(),
             // raw: whole-message escaped until #2084 step 5.
             id = id.raw()
@@ -2840,6 +2842,7 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                          definition naming another table creates the trigger there, under this \
                          key, and the next plan cannot find it",
                         id.name(),
+                        // raw: whole-message escaped until #2084 step 5
                         on = on.raw(),
                         // raw: whole-message escaped until #2084 step 5.
                         id = id.raw()
@@ -2850,6 +2853,7 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                          created on, and it has to be the `{on}` this identity names -- so a \
                          definition whose target cannot be read is refused rather than created \
                          somewhere this key does not point",
+                        // raw: whole-message escaped until #2084 step 5
                         on = on.raw(),
                         // raw: whole-message escaped until #2084 step 5.
                         id = id.raw()
@@ -3012,6 +3016,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             column,
             collation: Some(collation),
             ..
+            // raw: whole-message escaped until #2084 step 5
         } => Err(no_column_collation(&column.raw().to_string(), collation)),
 
         Change::AlterColumnType {
@@ -3260,6 +3265,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             dialect: crate::types::DIALECT,
             message: format!(
                 "{} is a computed column, which this model holds for SQL Server only",
+                // raw: whole-message escaped until #2084 step 5
                 table.column(name).raw()
             ),
         }),
@@ -3785,6 +3791,7 @@ fn no_clustered_layout(table: &TableName) -> DialectError {
     invalid(format!(
         "`{table}`: a clustered or nonclustered layout is SQL Server's; PostgreSQL has no \
          clustered index to create",
+        // raw: whole-message escaped until #2084 step 5
         table = table.raw()
     ))
 }
@@ -4445,6 +4452,7 @@ fn create_table(
     if table.columns.is_empty() {
         return Err(invalid(format!(
             "table `{name}` has no columns",
+            // raw: whole-message escaped until #2084 step 5
             name = name.raw()
         )));
     }
@@ -5135,6 +5143,7 @@ fn insert_row(
              the apply succeeds, the plan verifies clean, and the next insert from anywhere else \
              fails on the primary key (ADR-0013 section 2). Declare the rows by a natural key, or place \
              them outside pbps and adopt them with `pbps baseline`.",
+            // raw: whole-message escaped until #2084 step 5
             table = table.raw()
         )));
     }
@@ -5248,6 +5257,7 @@ fn update_row(
     if sets.is_empty() {
         return Err(invalid(format!(
             "{table}: a row update with no changed column",
+            // raw: whole-message escaped until #2084 step 5
             table = table.raw()
         )));
     }

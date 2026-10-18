@@ -1479,3 +1479,21 @@ byte-identical. Commands embedded in prose still take raw names through
 `shell_arg`, with a placeholder when no safe argument can be offered. Escaping
 a whole mixed sentence would double escape its errors, and a second human
 override would give one diagnostic two competing representations.
+
+<a id="dec-2123-1"></a>
+
+**DEC-2123.1. SQL-builder exemptions stop at recognized error sinks, with
+step-5 exceptions beside each raw reference.** The eight emit, preflight, rows
+and catalog files build SQL with `format!`, but also build diagnostics. Their
+message macros, error attributes, `invalid`/`Err` payloads and the prose fields
+of `DbError`, `DialectError` and `RowsError` constructors are checked. A raw
+operand that must remain raw behind whole-message escaping carries a comment
+containing `#2084 step 5` on its line or the line above. Per-file counts would
+make concurrent name-type migrations edit the same script entries for new raw
+operands; local comments let each migration carry its own justification.
+Comments are read as comments, so a string containing a marker cannot authorize
+a diagnostic.
+Other builder formatting remains accepted without bookkeeping. This bounded
+check does not trace locals or unlisted helpers, and does not inspect
+SQL-generated RAISE/THROW messages or shared probe/offline descriptions; those
+remain outside #2123. Typed error data and `ByHand.statement` remain data.

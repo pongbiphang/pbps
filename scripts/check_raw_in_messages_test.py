@@ -123,11 +123,14 @@ class WhatItRefuses(unittest.TestCase):
 
 
 class WhatItAccepts(unittest.TestCase):
-    def test_the_same_call_in_an_allowlisted_builder_is_accepted(self):
-        self.assertEqual(run(BAIL, path=BUILDER), [])
+    def test_a_message_macro_in_a_builder_is_still_refused(self):
+        self.assertEqual(len(run(BAIL, path=BUILDER)), 1)
 
-    def test_the_real_allowlist_accepts_it_in_each_builder_it_names(self):
-        unbounded = {p: v for p, v in guard.ALLOWED.items() if v[0] is None}
+    def test_serializers_keep_their_document_exemption(self):
+        unbounded = {
+            p: v for p, v in guard.ALLOWED.items()
+            if v[0] is None and p not in guard.SQL_BUILDERS
+        }
         self.assertTrue(unbounded)
         self.assertEqual(guard.check({p: BAIL for p in unbounded}, unbounded), [])
 
@@ -163,6 +166,226 @@ class WhatItAccepts(unittest.TestCase):
 
     def test_a_struct_update_in_a_message_is_not_a_raw_call(self):
         self.assertEqual(lines('format!("{:?}", S { a: 1, ..raw })'), [])
+
+
+class BuilderMessages(unittest.TestCase):
+    def test_sql_formatting_is_accepted_in_all_eight_builders_without_counts(self):
+        self.assertEqual(len(guard.SQL_BUILDERS), 8)
+        sql = 'let sql = format!("ALTER TABLE {} ADD {}", quote(t.raw()), quote(c.raw()));'
+        for path in guard.SQL_BUILDERS:
+            with self.subTest(path=path):
+                self.assertEqual(guard.ALLOWED[path][0], None)
+                self.assertEqual(run(sql, path=path), [])
+                self.assertEqual(run(sql + sql, path=path), [])
+
+    def test_error_payloads_are_refused_in_each_builder(self):
+        for path in guard.SQL_BUILDERS:
+            for text in [
+                'invalid(format!("bad {}", n.raw()))',
+                'DbError::BadRow(format!("bad {}", n.raw()))',
+                'Err(format!("bad {}", n.raw()))',
+                'Err(no_column_collation(&n.raw().to_string(), collation))',
+                'Err(DbError::Refused(format!("bad {}", n.raw())))',
+                'DialectError::Invalid { dialect: DIALECT, message: format!("bad {}", n.raw()) }',
+                'RowsError::Unreadable { table: t.clone(), why: format!("bad {}", n.raw()) }',
+            ]:
+                with self.subTest(path=path, text=text):
+                    self.assertEqual(len(run(text, path=path)), 1)
+                    self.assertEqual(run(text.replace('.raw()', '.shown()'), path=path), [])
+
+    def test_message_fields_are_checked_without_exempting_the_whole_error_type(self):
+        for constructor, field in [
+            ('DbError::Context', 'message'),
+            ('DialectError::Unsupported', 'feature'),
+            ('DialectError::NotBuilt', 'part'),
+            ('DialectError::BadTypeArity', 'detail'),
+            ('DialectError::ByHand', 'why'),
+        ]:
+            text = f'{constructor} {{ {field}: format!("{{}}", n.raw()) }}'
+            self.assertEqual(len(run(text, path=BUILDER)), 1, text)
+
+    def test_typed_error_fields_and_by_hand_sql_are_not_prose(self):
+        for prefix in ['', 'Err(', 'Err(pbps_dialect::']:
+            text = prefix + (
+                'DialectError::ByHand { why: format!("bad {}", n.shown()), '
+                'statement: format!("ALTER TABLE {}", quote(n.raw())) }'
+            ) + (')' if prefix else '')
+            self.assertEqual(run(text, path=BUILDER), [], text)
+        self.assertEqual(run(
+            'RowsError::BadValue { table: t.clone(), text: n.raw().to_owned(), kind: "text" }',
+            path=BUILDER,
+        ), [])
+
+    def test_a_nested_constructor_does_not_hide_a_trailing_error_message(self):
+        for path in guard.SQL_BUILDERS:
+            for text in [
+                'Err(DbError::Refused("already shown".into())'
+                '.context(format!("bad {}", n.raw())))',
+                'Err(pbps_db::DbError /* type */ :: Refused("already shown".into())'
+                '.context(format!("bad {}", n.raw())))',
+                'Err(DialectError::ByHand { why: "shown".into(), '
+                'statement: format!("ALTER TABLE {}", quote(sql.raw())) }'
+                '.to_string() + &format!("bad {}", n.raw()))',
+            ]:
+                with self.subTest(path=path, text=text):
+                    self.assertEqual(len(run(text, path=path)), 1)
+                    self.assertEqual(run(text.replace('n.raw()', 'n.shown()'), path=path), [])
+        text = (
+            'Err(DbError::Refused(format!("{}",\n    inner.raw(),\n))'
+            '.context(format!("{}",\n    outer.raw(),\n)))'
+        )
+        errors = run(text, path=BUILDER)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(errors[0].startswith(f'{BUILDER}:2:'), errors)
+        self.assertTrue(errors[1].startswith(f'{BUILDER}:4:'), errors)
+
+    def test_typed_tuple_wrappers_preserve_sql_but_check_nested_prose(self):
+        payload = (
+            'DialectError::ByHand { why: format!("bad {}", n.shown()), '
+            'statement: format!("ALTER TABLE {}", quote(n.raw())) }'
+        )
+        for path in guard.SQL_BUILDERS:
+            for wrap in [
+                'RowsError::Dialect({})',
+                'Err(RowsError::Dialect({}))',
+                'Err(pbps_db::RowsError /* type */ :: /* variant */ r#Dialect({}))',
+            ]:
+                text = wrap.format(payload)
+                with self.subTest(path=path, text=text):
+                    self.assertEqual(run(text, path=path), [])
+                    self.assertEqual(len(run(text.replace('n.shown()', 'n.raw()'), path=path)), 1)
+
+    def test_turbofish_error_payloads_are_checked(self):
+        for path in guard.SQL_BUILDERS:
+            for text in [
+                'Err::<_, DialectError>(no_column_collation(&n.raw().to_string(), collation))',
+                'std::result::Result::Err::<_, String>(format!("bad {}", n.raw()))',
+                'Err /* call */ :: /* types */ <Vec<Result<fn(u8) -> u16, [u8; 2]>>, '
+                'DialectError>(invalid(format!("bad {}", n.raw())))',
+            ]:
+                with self.subTest(path=path, text=text):
+                    self.assertEqual(len(run(text, path=path)), 1)
+                    self.assertEqual(run(text.replace('n.raw()', 'n.shown()'), path=path), [])
+        # Naming the generic constructor without calling it is not a sink.
+        self.assertEqual(run('let make = Err::<String, DialectError>;', path=BUILDER), [])
+        text = (
+            'Err::<_, RowsError>(RowsError::Dialect(DialectError::ByHand { '
+            'why: format!("bad {}", n.shown()), '
+            'statement: format!("ALTER TABLE {}", quote(sql.raw())) }))'
+        )
+        self.assertEqual(run(text, path=BUILDER), [])
+        self.assertEqual(len(run(text.replace('n.shown()', 'n.raw()'), path=BUILDER)), 1)
+
+    def test_grouped_errors_preserve_sql_but_check_prose(self):
+        payload = (
+            'DialectError::ByHand { why: format!("bad {}", n.shown()), '
+            'statement: format!("ALTER TABLE {}", quote(sql.raw())) }'
+        )
+        block = (
+            '{ let statement = format!("ALTER TABLE {}", quote(sql.raw())); '
+            'DialectError::ByHand { dialect: DIALECT, '
+            'why: format!("bad {}", n.shown()), statement } }'
+        )
+        for path in guard.SQL_BUILDERS:
+            for text in [
+                f'Err((({payload})))',
+                f'Err({{ {payload} }})',
+                f'Err(({block}))',
+                f'Err::<_, DialectError>({block})',
+            ]:
+                with self.subTest(path=path, text=text):
+                    self.assertEqual(run(text, path=path), [])
+                    self.assertEqual(len(run(text.replace('n.shown()', 'n.raw()'), path=path)), 1)
+        text = f'Err(({payload}).to_string() + &format!("bad {{}}", extra.raw()))'
+        self.assertEqual(len(run(text, path=BUILDER)), 1)
+        self.assertEqual(run(text.replace('extra.raw()', 'extra.shown()'), path=BUILDER), [])
+        text = (
+            'Err({ let statement = format!("ALTER TABLE {}", quote(sql.raw())); '
+            'no_column_collation(&n.raw().to_string(), collation) })'
+        )
+        self.assertEqual(len(run(text, path=BUILDER)), 1)
+        text = f'Err({{ let _ = invalid(format!("bad {{}}", extra.raw())); {payload} }})'
+        self.assertEqual(len(run(text, path=BUILDER)), 1)
+
+    def test_every_message_macro_and_error_attribute_is_checked_in_builders(self):
+        for macro in guard.MACROS:
+            if macro == 'format':
+                continue
+            args = 'ok, ' if macro == 'ensure' else 'out, ' if macro in ('write', 'writeln') else ''
+            self.assertEqual(len(run(f'{macro}!({args}"{{}}", n.raw())', path=BUILDER)), 1)
+        self.assertEqual(len(run('#[error("{}", .0.raw())]', path=BUILDER)), 1)
+        self.assertEqual(run('ensure!(a.raw() == b.raw(), "{}", n.shown())', path=BUILDER), [])
+
+    def test_a_diagnostic_nested_inside_sql_is_not_exempted_with_the_sql(self):
+        for diagnostic in ['invalid(format!("bad {}", n.raw()))', 'bail!("bad {}", n.raw())']:
+            text = 'format!("SELECT {}", quote(t.raw()), ' + diagnostic + ')'
+            self.assertEqual(len(run(text, path=BUILDER)), 1, text)
+
+    def test_token_separators_and_function_path_adapters_are_checked(self):
+        for text in [
+            'crate::invalid /* call */ (format!("{}", n. /* bytes */ r#raw()))',
+            'pbps_db::DbError /* type */ :: /* variant */ BadRow(format!("{:?}", xs.map(Text::raw)))',
+            'Err(DialectError::Invalid { message: format!("{}", f::<A, B>(n.raw())) })',
+            'Err(DialectError::Invalid { message: f::<A, B>(n.raw()), dialect: DIALECT })',
+            'invalid(format! { "{}", n.raw() })',
+            'invalid(format! [ "{}", n.raw() ])',
+        ]:
+            self.assertEqual(len(run(text, path=BUILDER)), 1, text)
+
+    def test_multiline_errors_report_each_raw_reference_once_on_its_line(self):
+        text = 'Err(invalid(\n    format!("{} {}",\n        a.raw(),\n        b.raw(),\n    ),\n));'
+        errors = run(text, path=BUILDER)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(errors[0].startswith(f'{BUILDER}:3:'), errors)
+        self.assertTrue(errors[1].startswith(f'{BUILDER}:4:'), errors)
+
+    def test_a_comment_at_the_raw_site_preserves_whole_message_escaping(self):
+        for text in [
+            'invalid(format!("{}", n.raw())) // raw: whole-message escaped until #2084 step 5',
+            'invalid(format!("{}",\n    // raw: whole-message escaped until #2084 step 5\n    n.raw(),\n))',
+            'invalid(format!("{}", /* raw until #2084 step 5 */ n.raw()))',
+        ]:
+            self.assertEqual(run(text, path=BUILDER), [], text)
+            self.assertEqual(len(run(text.replace('#2084 step 5', 'no exception'), path=BUILDER)), 1)
+
+    def test_a_marker_is_local_to_its_reference(self):
+        text = (
+            'invalid(format!("{} {}",\n'
+            '    a.raw(), // raw until #2084 step 5\n'
+            '\n'
+            '    b.raw(),\n'
+            '))'
+        )
+        (error,) = run(text, path=BUILDER)
+        self.assertTrue(error.startswith(f'{BUILDER}:4:'), error)
+
+    def test_a_file_note_or_quoted_marker_does_not_authorize_a_diagnostic(self):
+        for text in [
+            '// raw until #2084 step 5\n\ninvalid(format!("{}", n.raw()))',
+            'invalid(format!("#2084 step 5 {}", n.raw()))',
+            'let note = "// #2084 step 5";\ninvalid(format!("{}", n.raw()))',
+        ]:
+            self.assertEqual(len(run(text, path=BUILDER)), 1, text)
+        self.assertEqual(len(run('bail!("{}", n.raw()); // #2084 step 5')), 1)
+
+    def test_unclosed_errors_and_sql_formats_are_not_clean(self):
+        for text in ['invalid(format!("{}", n.shown())', 'DbError::BadRow("bad"',
+                     'DialectError::Invalid { message: "bad"', 'format!("SELECT {}", n.raw()']:
+            errors = run(text, path=BUILDER)
+            self.assertTrue(any('cannot find the end' in error for error in errors), text)
+
+    def test_strings_comments_and_unlisted_helpers_are_not_sinks(self):
+        for text in [
+            'let text = r#"invalid(format!("{}", n.raw()))"#;',
+            '// DbError::BadRow(format!("{}", n.raw()))',
+            '/* invalid(format!("{}", n.raw())) */',
+            'not_invalid(format!("{}", n.raw()))',
+            'Probe::new(format!("rows of {}", n.raw()), sql)',
+            'refuse(format!("row {} changed", n.raw()))',
+            'format!("THROW 50000, {}, 1", literal(&format!("row {} changed", n.raw())))',
+            'out.push(format!("offline {}", n.raw()))',
+        ]:
+            self.assertEqual(run(text, path=BUILDER), [], text)
 
 
 class WhatItDoesNotMistake(unittest.TestCase):
