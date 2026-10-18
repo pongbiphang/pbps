@@ -5202,50 +5202,73 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 }
 
 /// `pbps baseline` — take the database as it stands as the new starting point.
-/// Refuses a baseline that would hand to another tool a partition the
-/// recorded state holds (#1852, DEC-1852.1). A pending drop intent takes the
-/// partition's uid out of the working identity file before anything runs, so
-/// under a parent the declarations now make `partitions: external` the scope
-/// reads it as one of the parent's external partitions. Recorded so, it is
-/// never dropped, and no later plan takes it back. Whatever the working file
-/// says, a partition the recorded state holds is dropped or detached by a
-/// plan before the parent's partitions become external.
-fn refuse_handing_over_held_partitions(
-    previous: &pbps_db::LedgerEntry,
-    scoped: &pbps_diff::Scoped,
-    label: &str,
-) -> anyhow::Result<()> {
-    let held: BTreeSet<&TableName> = previous.snapshot.ids.tables.values().collect();
-    let lines: Vec<String> = scoped
+/// The partitions the scope leaves to an external parent that a table drop
+/// intent in the working identity file names (#1852): the only ones a
+/// baseline could hand over while the recorded state still holds them.
+fn partitions_a_drop_intent_names<'s>(
+    ids: &IdsFile,
+    scoped: &'s pbps_diff::Scoped,
+) -> Vec<&'s TableName> {
+    let named: BTreeSet<String> = ids
+        .tombstones
+        .iter()
+        .filter(|(uid, _)| uid.kind() == pbps_model::UidKind::Table)
+        .map(|(_, t)| t.was.clone())
+        .collect();
+    scoped
         .external
         .iter()
-        .filter(|name| held.contains(name))
-        .map(|name| {
-            let parent = previous
-                .snapshot
-                .schema
-                .tables
-                .get(name)
-                .and_then(|t| t.partition_of.as_ref())
-                .map_or_else(
-                    || "its external parent".to_owned(),
-                    |of| format!("the external parent {}", of.parent.shown()),
-                );
-            format!(
-                "{} is held by the recorded state (entry #{}), and this baseline would leave it \
-                 to {parent}'s other tool undropped",
-                name.shown(),
-                previous.id
-            )
-        })
-        .collect();
+        .filter(|name| named.contains(&name.raw().to_string()))
+        .collect()
+}
+
+/// Refuses a baseline that would hand to another tool a partition a drop
+/// intent names while the recorded state still holds it (#1852, DEC-1852.1).
+/// Recorded so, the partition is never dropped, and no later plan takes it
+/// back. A recorded state that no longer holds it leaves an old tombstone,
+/// and the baseline goes; an empty ledger holds nothing. A ledger that cannot
+/// be read cannot say the partition is not held, so it is refused as held.
+fn refuse_handing_over_held_partitions(
+    named: &[&TableName],
+    previous: Result<Option<pbps_db::LedgerEntry>, pbps_db::LedgerError>,
+    label: &str,
+) -> anyhow::Result<()> {
+    let lines: Vec<String> = match &previous {
+        Ok(None) => return Ok(()),
+        Ok(Some(previous)) => {
+            let held: BTreeSet<&TableName> = previous.snapshot.ids.tables.values().collect();
+            named
+                .iter()
+                .filter(|name| held.contains(*name))
+                .map(|name| {
+                    format!(
+                        "{} is named by a drop intent and held by the recorded state (entry \
+                         #{}); this baseline would leave it to its external parent undropped",
+                        name.shown(),
+                        previous.id
+                    )
+                })
+                .collect()
+        }
+        Err(e) => named
+            .iter()
+            .map(|name| {
+                format!(
+                    "{} is named by a drop intent, and whether the recorded state holds it \
+                     cannot be read ({e}); this baseline could leave it to its external parent \
+                     undropped",
+                    name.shown()
+                )
+            })
+            .collect(),
+    };
     if lines.is_empty() {
         return Ok(());
     }
     bail!(
         "`{label}` holds {} partition(s) this baseline would hand over:\n  {}\n\
-         A pending drop intent leaves a partition out of the identity file before it is \
-         dropped. Drop or detach it with a plan first, then baseline (DEC-1852.1).",
+         A drop intent leaves a partition out of the identity file before it is dropped. \
+         Drop or detach it with a plan first, then baseline (DEC-1852.1).",
         lines.len(),
         lines.join("\n  ")
     );
@@ -5279,11 +5302,15 @@ pub fn cmd_baseline(
             .await?;
             report_missing(&scoped);
             refuse_unexpressible(&scoped, &target.label, "baseline again")?;
-            // The working identity file may already lack a partition a pending
-            // drop intent names, and the scope then reads it as one of its
-            // external parent's (#1852). What the recorded state holds decides.
-            if let Some(previous) = crate::engine::latest(&mut conn).await? {
-                refuse_handing_over_held_partitions(&previous, &scoped, &target.label)?;
+            // A partition a drop intent names is out of the working identity
+            // file before it is dropped, and the scope then reads it as one of
+            // its external parent's (#1852). Asked only of such a partition,
+            // so a baseline that is the remedy for an unreadable ledger, or a
+            // deliberate handover with no intent, never reads the ledger here.
+            let named = partitions_a_drop_intent_names(&ids, &scoped);
+            if !named.is_empty() {
+                let previous = crate::engine::latest(&mut conn).await;
+                refuse_handing_over_held_partitions(&named, previous, &target.label)?;
             }
 
             // What the database holds, as `snapshot` records it (#1600, #1606).
@@ -10927,6 +10954,104 @@ mod tests {
         refused(vec![switch("app.t", false)], &[listing("app.t")]).expect("made logged");
         refused(vec![switch("app.t", true)], &[listing("app.other")]).expect("another table");
         refused(vec![switch("app.t", true)], &[]).expect("unpublished");
+    }
+
+    /// #1852: only a partition a drop intent names is asked about, and the
+    /// recorded state decides whether it is still held.
+    #[test]
+    fn a_baseline_refuses_handing_over_only_a_held_partition_a_drop_intent_names() {
+        let name = TableName::new("app", "ev_2025");
+        let uid = pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.ev_2025", 0);
+        let tombstoned = |was: &str| {
+            let mut ids = IdsFile::default();
+            ids.tombstones.insert(
+                uid.clone(),
+                pbps_model::Tombstone {
+                    was: was.into(),
+                    dropped_at: "2026-10-18".into(),
+                    reason: "retired".into(),
+                    operator: "o".into(),
+                },
+            );
+            ids
+        };
+        // The scope's own reading: a pure partition of a managed parent whose
+        // partitions are external, which the working file does not hold.
+        let parent = TableName::new("app", "ev");
+        let mut live = pbps_model::Schema::default();
+        live.tables.insert(
+            parent.clone(),
+            pbps_model::Table {
+                partition_by: Some(pbps_model::PartitionBy {
+                    external: false,
+                    columns: vec!["ts".into()],
+                    strategy: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        live.tables.insert(
+            name.clone(),
+            pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: parent.clone(),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            },
+        );
+        let mut working = IdsFile::default();
+        working.tables.insert(
+            pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.ev", 0),
+            parent.clone(),
+        );
+        let scoped = pbps_diff::scope(
+            &live,
+            &working,
+            &Default::default(),
+            &[parent.clone()].into(),
+        );
+        assert_eq!(scoped.external, std::slice::from_ref(&name));
+        // Named only by a tombstone of that table, and only among the external.
+        assert_eq!(
+            super::partitions_a_drop_intent_names(&tombstoned("app.ev_2025"), &scoped),
+            [&name]
+        );
+        assert!(
+            super::partitions_a_drop_intent_names(&tombstoned("app.other"), &scoped).is_empty()
+        );
+        assert!(super::partitions_a_drop_intent_names(&IdsFile::default(), &scoped).is_empty());
+
+        let entry = |holds: bool| {
+            let mut ids = IdsFile::default();
+            if holds {
+                ids.tables.insert(uid.clone(), name.clone());
+            }
+            pbps_db::LedgerEntry {
+                id: 3,
+                applied_at: "2026-10-18T06:00:00.000".into(),
+                snapshot: pbps_model::StateSnapshot::new(
+                    pbps_model::StateKind::Baseline,
+                    pbps_model::Schema::default(),
+                    ids,
+                    "o",
+                ),
+            }
+        };
+        let refuse =
+            |previous| super::refuse_handing_over_held_partitions(&[&name], previous, "prod");
+        let e = refuse(Ok(Some(entry(true)))).unwrap_err().to_string();
+        assert!(
+            e.contains(
+                "app.ev_2025 is named by a drop intent and held by the recorded state (entry #3)"
+            ) && e.contains("DEC-1852.1"),
+            "{e}"
+        );
+        // An old tombstone: the recorded state no longer holds it.
+        refuse(Ok(Some(entry(false)))).expect("not held");
+        // The first baseline: nothing recorded holds it.
+        refuse(Ok(None)).expect("empty ledger");
     }
 
     #[test]

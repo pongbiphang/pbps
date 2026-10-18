@@ -797,31 +797,43 @@ Tests: `external_partitions_are_a_setting_on_the_parent_alone`
 
 <a id="dec-1852-1"></a>
 
-**DEC-1852.1. A baseline does not hand another tool a partition the recorded
-state holds; the ledger decides, not the working identity file (#1852).**
-`pbps baseline` scopes its read with the working identity file. A pending
+**DEC-1852.1. A baseline does not hand another tool a partition that a drop
+intent names while the recorded state still holds it (#1852).**
+`pbps baseline` scopes its read with the working identity file. A
 `drop-table` intent removes the table's uid from that file before anything
 runs. Consider a partition pbps holds under a parent whose declaration has
 just become `partitions: external` (DEC-1533.1). The scope then reads the
 partition as one of the parent's external partitions, the baseline records
-the handover, and the partition is never dropped. From then on every plan
-leaves it to the other tool.
+the handover, and the partition is never dropped.
 
-Before recording, the baseline therefore also reads the latest ledger entry.
-It refuses, by name, any partition the scope would leave external that the
-recorded state still holds, and says to drop or detach it with a plan first.
-Without a drop intent the scope already refuses the same partition as held
-twice (#1833), and a plan refuses to make the partitions external while it
-drops one (DEC-1533.1). So the order is a plan that drops the partition with
-the parent's partitions still declared, then the parent made external, then
-the baseline. An empty ledger, the first baseline, has nothing to hand over.
-An unreadable ledger is an error.
+The check is narrow on purpose. It asks only about the partitions the scope
+leaves external that a table tombstone in the working file names. For those
+alone, the baseline reads the latest ledger entry:
+- refused by name: the recorded state still holds the partition;
+- allowed: the recorded state does not hold it (an old tombstone), or the
+  ledger is empty;
+- refused: the ledger cannot be read, since then it cannot say the partition
+  is not held.
 
-This narrows only the handover. Any other table a pending drop intent names
-still leaves the managed set at a baseline, as SPEC §1.3 gives `baseline`.
+The remedy is to drop or detach the partition with a plan first. A plan
+refuses to drop a partition while it makes the partitions external
+(DEC-1533.1), so that plan keeps the parent's partitions declared.
+
+Reading the ledger for every baseline was the first draft, and the live suite
+refused it twice:
+- a deliberate handover, `pull --partitions-external` in a new project over a
+  database whose recorded state holds the partitions (#1533), names no drop
+  intent, and is the move SPEC §1.3 gives `baseline`;
+- `baseline` is the named remedy for a ledger entry this build cannot read,
+  so it must not stop on one when nothing asks.
+
+Without a drop intent, a partition pbps holds under an external parent is
+still refused by the scope itself, as two owners (#1833).
 
 Pinned by `a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names`
-in `crates/pbps-cli/tests/flow_pg.rs`, on 16 and 18. It covers the refusal,
-the scope's own refusal without the intent, and the baseline that goes once a
-plan has dropped the partition.
-
+in `crates/pbps-cli/tests/flow_pg.rs` (16 and 18). It covers the refusal, the
+scope's own refusal without the intent, and the baseline that goes once a
+plan has dropped the partition. Also pinned by
+`a_baseline_refuses_handing_over_only_a_held_partition_a_drop_intent_names`
+in `crates/pbps-cli/src/deploy.rs`, which covers which partitions are asked
+about, an old tombstone and an empty ledger.

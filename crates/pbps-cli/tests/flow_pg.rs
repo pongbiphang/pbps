@@ -8340,8 +8340,8 @@ fn a_baseline_does_not_hand_over_a_held_partition_on(server: &str, k: usize) {
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(
         stderr(&o).contains(
-            "app.ev_2025 is held by the recorded state (entry #1), and this baseline would \
-             leave it to the external parent app.ev's other tool undropped"
+            "app.ev_2025 is named by a drop intent and held by the recorded state (entry #1); \
+             this baseline would leave it to its external parent undropped"
         ) && stderr(&o).contains("DEC-1852.1"),
         "{}",
         stderr(&o)
