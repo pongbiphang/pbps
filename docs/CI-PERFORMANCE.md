@@ -473,3 +473,55 @@ establish CI payback. Ordinary workspace gains changed direction;
 The microcase improvement therefore does not justify this profile change.
 The manifest, release settings and DEC-2113.1's override scope remain as they
 were.
+
+## Ledger trust growth comparison
+
+The ledger-trust integration regression (#2166, DEC-2166.1) uses the ordinary
+`test` profile. Unchanged-source checks at 10,000 login roles ranged from
+0.25 to 1.07 seconds with nearby host CPU samples between 28% and 99%.
+PostgreSQL's main SQL execution accounted for about 71–96% of the timer;
+role creation and removal were outside it, and the catalog observations found
+no persistent crowd or heap growth. The reported 2.1-second failure under
+heavier load is classified as the same host-contention shape.
+
+The regression measures each privilege case three times at 1,000 roles and
+three times at 10,000 roles, keeping the same crowd, database and connection
+through the samples at each size. Each sample checks the expected 0/n/n named
+roles. Only the check is timed; crowd creation and removal are excluded, and
+removal precedes the correctness and timing assertions. The minimum at 10,000
+roles must take less than 25 times the minimum at 1,000. A transient load spike
+inflates an individual sample, while a quadratic editor walk inflates every
+sample. The concurrent-owner, killed-owner and dropped-guard cleanup tests
+remain in the full integration suite.
+
+The measurements below use Rust 1.99.0, two Cargo build jobs and the pinned
+PostgreSQL 18.6 fixture on a shared 12-logical-CPU host. Each cell is the
+minimum of three samples in seconds. CPU is a nearby five-second sample,
+not an instantaneous reading; other issue lanes supplied background load.
+
+| Variant | Case | 1,000 roles | 10,000 roles | Growth | Host CPU |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Production | No grant | .033665498 | .231180409 | 6.87× | 31.3% |
+| Production | TRIGGER to PUBLIC | .036212794 | .258285257 | 7.13× | 31.3% |
+| Production | UPDATE to PUBLIC | .045759995 | .227589361 | 4.97× | 31.3% |
+| Trigger shortcut removed | TRIGGER to PUBLIC | .243209617 | 9.987414583 | 41.07× | 67.0% |
+| Sequence shortcut removed | UPDATE to PUBLIC | .160671190 | 9.911997676 | 61.69× | 37.5% |
+
+Each deliberately quadratic control removes only its own hashed self-editor
+shortcut in `crates/pbps-pg/src/state.rs`, preserving the membership walk and
+correctness. Remove `(l.oid, e.oid) IN (...) OR` from `TRIGGER_EDITOR` for the
+trigger control, or `(d.objid, e.oid) IN (...) OR` from the sequence branch for
+the sequence control. Restore each before testing the other. All 18 correctness
+assertions passed before each control's growth assertion failed; restoring
+production SQL byte-for-byte passed the positive run.
+
+The 25× multiplier leaves 3.51× passing margin above the positive maximum of
+7.13× and 1.64× / 2.47× rejection margins below the trigger / sequence controls.
+The earlier single-sample calibration and two complete PG wrapper runs also
+passed their positive comparisons under load; those observations motivated
+the growth comparison, while the table above qualifies the final estimator.
+
+Run with the fixture connection variables and
+`cargo test -p pbps-pg --test live -- --ignored --exact
+the_ledger_trust_check_stays_linear_in_the_clusters_roles --nocapture`.
+Both local wrappers and CI continue to select the ordinary `test` profile.

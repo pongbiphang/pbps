@@ -1330,3 +1330,24 @@ include cold builds, model and leaf relinks, incremental state and a
 third-party cache proxy. Full type and local-variable debugger information is
 an opt-in through `CARGO_PROFILE_DEV_DEBUG=2` rather than a cost paid by every
 test executable.
+
+<a id="dec-2166-1"></a>
+
+**DEC-2166.1. The ledger-trust performance regression compares growth in one
+run instead of an absolute duration.** The ordinary `test` profile checks
+1,000 and 10,000 cluster login roles, separately for no grant, `TRIGGER` to
+`PUBLIC`, and sequence `UPDATE` to `PUBLIC`. Both sizes retain the expected
+0/n/n named roles for each sample and the crowd guard; creation and removal
+stay outside the timers, and removal precedes the assertions. Each case runs
+three times on the same crowd at each size. The minimum at 10,000 roles must
+take less than 25 times the minimum at 1,000: a transient load spike inflates
+an individual sample, while a quadratic editor walk inflates every sample.
+
+Unchanged-source observations put the same check between 0.25 and 1.07 seconds
+as host CPU ranged from 28% to 99%. The reported 2.1-second outlier under
+heavier load has the same host-contention shape. Most measured time was in
+PostgreSQL, so changing the Rust build profile would not address that cause.
+The multiplier leaves room for shared-host variation while still rejecting
+each dense quadratic editor walk independently. The positive measurements and
+shortcut-removal controls are recorded in
+[CI performance](../CI-PERFORMANCE.md#ledger-trust-growth-comparison).
