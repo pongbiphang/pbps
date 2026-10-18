@@ -5492,12 +5492,10 @@ pub async fn check_type_pins(
     Ok(())
 }
 
-/// Refuse implicit fill code before adding reference columns over existing rows.
+/// Refuse unsafe input paths before adding reference columns, regardless of row presence.
 pub async fn check_added_type_paths(
     conn: &mut Conn,
     changes: &ChangeSet,
-    ids: &IdsFile,
-    stored: &IdsFile,
     trusted: &BTreeSet<String>,
     within_transaction: bool,
 ) -> anyhow::Result<()> {
@@ -5508,7 +5506,7 @@ pub async fn check_added_type_paths(
             } else {
                 pbps_pg::pins::Within::OwnTransaction
             };
-            pbps_pg::type_refs::check_added(conn, changes, ids, stored, trusted, within).await?;
+            pbps_pg::type_refs::check_added(conn, within, changes, trusted).await?;
         }
         Driver::Mssql => {}
     }

@@ -1,9 +1,10 @@
-//! May `ADD COLUMN` over existing rows run this type's input path? (#1523, PR
+//! May `ADD COLUMN` run this type's input path? (#1523, PR
 //! C1; the design is #2046, layer 1.)
 //!
-//! `ALTER TABLE … ADD COLUMN c some_domain` runs the domain's CHECK constraints
-//! and DEFAULT once per existing row, as the deploying role (measured on 16 and
-//! 18, #1523). Whoever wrote those expressions, or the functions they call,
+//! `ALTER TABLE … ADD COLUMN c some_domain` can run the domain's CHECK constraints
+//! and DEFAULT as the deploying role, even without rows for a fast default
+//! (measured on 16 and 18, DEC-1523.4). Whoever wrote those expressions, or the
+//! functions they call,
 //! therefore runs code with the deployer's privileges. This module reads what is
 //! needed to judge that before plan probes and apply statements (DEC-1523.1).
 //!
@@ -305,13 +306,13 @@ pub enum Unreadable {
 }
 
 impl InputPath {
-    /// Whether the input path may be run by `ADD COLUMN` over existing rows.
+    /// Whether the input path may be run by `ADD COLUMN`.
     #[must_use]
     pub fn is_admitted(&self) -> bool {
         matches!(self, Self::Admitted(_))
     }
 
-    /// Why a plan cannot add a column of this type to a table that holds rows,
+    /// Why a plan cannot add a column of this type regardless of row presence,
     /// or `None` when it can. Each refusal says which case it is.
     #[must_use]
     pub fn refusal(&self, reference: &TypeRef) -> Option<String> {
@@ -328,9 +329,10 @@ impl InputPath {
                     lines.push(format!("and {} more", reasons.len() - SHOWN));
                 }
                 format!(
-                    "adding a column of the type `{name}` to a table that holds rows runs the \
-                     type's CHECK and DEFAULT expressions for each row as the deploying role, \
-                     and that code is not all trusted: {}",
+                    "adding a column of the type `{name}` requires built-in code and trusted \
+                     owners regardless of row presence: {}. To admit an untrusted owner, \
+                     list the named role in `trusted_roles` in `pbps.yml`; user-written \
+                     routines remain refused",
                     lines.join("; ")
                 )
             }
@@ -340,7 +342,7 @@ impl InputPath {
                 quoted(roles)
             ),
             Self::Unreadable(Unreadable::Failed(why)) => format!(
-                "the code the type `{name}` runs for each row could not be determined ({why}); \
+                "the code the type `{name}` runs could not be determined ({why}); \
                  this is not a type that runs no code"
             ),
         })

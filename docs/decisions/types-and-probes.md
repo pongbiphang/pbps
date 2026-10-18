@@ -2480,3 +2480,7 @@ pre-flight cannot prove them (SPEC §7.5).
 <a id="dec-1523-1"></a>
 
 **DEC-1523.1. PostgreSQL columns reference existing enums, domains and standalone composites, scalar or array.** pbps manages no type lifecycle and refuses retypes, row data and partition keys over references. Measured on 16 and 18, ADD COLUMN evaluates domain CHECKs on NULL but no attributes, elements or bounds of a NULL container. Its gate judges evaluated code and its owners, excluding code-free enums; `trusted_roles` extends owner trust only (#2046).
+
+<a id="dec-1523-4"></a>
+
+**DEC-1523.4. Added reference columns are checked regardless of row presence.** Measured on 16 and 18, ADD COLUMN evaluates a non-volatile domain default even on an empty table and stores its value in `attmissingval`. Planning, apply, staged steps and resume therefore validate the input path without an emptiness exemption. An empty table whose added column has no default anywhere would run no type code, but the gate refuses it anyway for one rule independent of row presence; `trusted_roles` admits an untrusted owner when the input code is built in.

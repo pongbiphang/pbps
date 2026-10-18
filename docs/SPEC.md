@@ -162,6 +162,8 @@ target: the finding is then `doctor.partition-runway` with the `pbps plan` remed
 `trusted_roles: [platform_owner]` adds PostgreSQL roles trusted to own evaluated
 type CHECKs and defaults; it never admits user functions. The plan records the
 list and apply refuses a changed list or missing role (DEC-1523.1).
+Every added referenced-type column is checked regardless of row presence:
+fast defaults evaluate even on empty tables (DEC-1523.4).
 
 The `policies:` block selects built-in rules and their severities and records
 suppressions — a rule id, a reason and an optional expiry — with parameters

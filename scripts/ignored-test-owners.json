@@ -486,6 +486,8 @@
         "type_refs::a_domain_keeps_a_null_default_while_enum_composite_and_array_null_defaults_are_erased",
         "type_refs::partition_null_defaults_keep_domains_but_erase_enum_and_composite_constants",
         "type_refs::a_domains_default_populates_a_new_primary_key_without_a_null_projection",
+        "type_refs::fast_domain_defaults_evaluate_on_empty_tables_and_require_trusted_owners",
+        "type_refs::a_domain_default_backfills_foreign_keys_but_a_column_default_overrides_it",
         "type_refs::a_null_generated_composite_evaluates_no_attribute_domain_check",
         "type_refs::routine_overloads_and_relations_have_distinct_dependency_identities",
         "type_refs::domain_coercions_keep_null_defaults_on_enum_columns_and_partition_overrides",

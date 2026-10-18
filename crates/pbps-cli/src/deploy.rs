@@ -6895,15 +6895,8 @@ pub fn cmd_plan_db(
             )?;
         }
         crate::engine::require_transactional_rebuilds(conn.driver(), &cs, staged)?;
-        crate::engine::check_added_type_paths(
-            &mut conn,
-            &cs,
-            &resolved.ids,
-            &recorded_ids,
-            &project.config.trusted_roles,
-            false,
-        )
-        .await?;
+        crate::engine::check_added_type_paths(&mut conn, &cs, &project.config.trusted_roles, false)
+            .await?;
         conn.begin(&dialect.transaction_framing(&pin_zone(&conn)))
             .await?;
         let checks = async {
@@ -7260,15 +7253,8 @@ pub fn cmd_plan_db(
         )?;
         let baseline = pbps_model::state_checksum(&pinned, &recorded_ids);
         let cost = crate::engine::operational_cost(&mut conn, &cs, &resolved.ids).await;
-        crate::engine::check_added_type_paths(
-            &mut conn,
-            &cs,
-            &resolved.ids,
-            &recorded_ids,
-            &project.config.trusted_roles,
-            false,
-        )
-        .await?;
+        crate::engine::check_added_type_paths(&mut conn, &cs, &project.config.trusted_roles, false)
+            .await?;
         let type_pins = crate::engine::seal_type_pins(
             &mut conn,
             &[&entry.snapshot.schema, &loaded.schema],
@@ -8142,15 +8128,8 @@ async fn apply_under_lock(
         if let Some(resolved) = resolved {
             resolved.before_statements(conn).await?;
         }
-        crate::engine::check_added_type_paths(
-            conn,
-            &plan.changes,
-            &plan.ids,
-            &recorded_ids,
-            &plan.trusted_roles,
-            true,
-        )
-        .await?;
+        crate::engine::check_added_type_paths(conn, &plan.changes, &plan.trusted_roles, true)
+            .await?;
         execute_statements(conn, statements, &data_guard).await?;
         crate::engine::check_module_rebuilds(conn, &plan.changes, true).await?;
         crate::engine::refuse_unsafe_definers(
@@ -8669,15 +8648,8 @@ async fn apply_staged_under_lock(
             crate::pins::Check::BeforeStep { step: i + 1, total },
         )
         .await?;
-        crate::engine::check_added_type_paths(
-            conn,
-            &plan.changes,
-            &plan.ids,
-            &entry.snapshot.ids,
-            &plan.trusted_roles,
-            false,
-        )
-        .await?;
+        crate::engine::check_added_type_paths(conn, &plan.changes, &plan.trusted_roles, false)
+            .await?;
         let executed = if stmt.row_write.is_some() {
             // A staged row is still one atomic statement. Hold its trigger
             // locks through the write, then commit before the checkpoint;
@@ -9348,15 +9320,7 @@ async fn preflight(
     // caller that gets the old bug back, and this function is the one whose
     // answers depend on it.
     pin_session(conn, dialect).await?;
-    crate::engine::check_added_type_paths(
-        conn,
-        &plan.changes,
-        &plan.ids,
-        stored_ids,
-        &plan.trusted_roles,
-        false,
-    )
-    .await?;
+    crate::engine::check_added_type_paths(conn, &plan.changes, &plan.trusted_roles, false).await?;
     drop_preflight(conn, dialect, &plan.changes, &plan.ids, stored, stored_ids).await?;
     // Asked again, as the edition is below: a table outside the declarations
     // can gain a key to the parent between the plan and this apply, and the

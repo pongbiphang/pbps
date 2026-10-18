@@ -334,12 +334,53 @@ fn a_user_domain_check_is_never_evaluated_by_planning_an_add_over_rows() {
             db,
             "CREATE DOMAIN app.trap AS integer CHECK (app.seen(VALUE))",
         );
-        // Empty tables do not evaluate a fill and need no input-code gate.
+        // No DEFAULT means this empty table runs no CHECK, but admission uses
+        // one rule regardless of row presence (DEC-1523.4).
         on_server(db, "TRUNCATE app.t");
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("app.seen(integer)")
+                && stderr(&out).contains("not built into PostgreSQL")
+                && stderr(&out).contains("trusted_roles")
+                && stderr(&out).contains("user-written routines remain refused"),
+            "{}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+
+        // Owner trust is the remedy when the CHECK itself is built in.
+        let role = UntrustedRole::new(&server, "empty_check");
+        on_server(
+            db,
+            &format!(
+                "DROP DOMAIN app.trap;
+                 CREATE DOMAIN app.trap AS integer CHECK (VALUE > 0);
+                 ALTER DOMAIN app.trap OWNER TO {}",
+                role.name
+            ),
+        );
+        let out = d.run(&["plan", "--db", db]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains(&role.name)
+                && stderr(&out).contains("trusted_roles")
+                && stderr(&out).contains("pbps.yml"),
+            "{}{}",
+            stdout(&out),
+            stderr(&out)
+        );
+        std::fs::write(
+            d.dir.join("pbps.yml"),
+            format!("dialect: postgres\ntrusted_roles: [{}]\n", role.name),
+        )
+        .unwrap();
         let path = plan(&d, db);
         succeeds(apply_plan(&d, db, &path, false));
         succeeds(d.run(&["verify", "--db", db]));
         assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
+        drop(own);
     }
 }
 
@@ -585,6 +626,203 @@ fn a_domains_default_populates_a_new_primary_key_without_a_null_projection() {
         let next: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
         assert!(next.changes.is_empty());
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn fast_domain_defaults_evaluate_on_empty_tables_and_require_trusted_owners() {
+    for server in servers() {
+        let role = UntrustedRole::new(&server, "empty_default");
+        for user_function in [false, true] {
+            let own = OwnDatabase::new(&server, "refs_empty_default");
+            let db = own.connection();
+            let default = if user_function {
+                "app.evil()"
+            } else {
+                "pg_catalog.abs(-7)"
+            };
+            on_server(
+                db,
+                &format!(
+                    "CREATE SCHEMA app; CREATE SEQUENCE app.runs;
+                 CREATE FUNCTION app.evil() RETURNS integer LANGUAGE plpgsql IMMUTABLE AS $$
+                 BEGIN PERFORM nextval('app.runs'); RETURN 1; END $$;
+                 CREATE DOMAIN app.trap AS integer DEFAULT {default};
+                 ALTER FUNCTION app.evil() OWNER TO {owner};
+                 ALTER DOMAIN app.trap OWNER TO {owner};
+                 GRANT USAGE ON SCHEMA app TO {owner};
+                 CREATE TABLE app.measure (id integer);
+                 ALTER TABLE app.measure ADD COLUMN value app.trap",
+                    owner = role.name
+                ),
+            );
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.measure"), 0);
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM pg_catalog.pg_attribute WHERE attrelid = 'app.measure'::regclass AND attname = 'value' AND atthasmissing"
+                ),
+                1,
+                "the fast default is stored even without rows"
+            );
+            assert_eq!(
+                scalar(db, "SELECT is_called::integer::bigint FROM app.runs"),
+                i64::from(user_function),
+                "the immutable default runs as the deployer before any row exists"
+            );
+            on_server(
+                db,
+                "DROP TABLE app.measure; ALTER SEQUENCE app.runs RESTART WITH 1",
+            );
+
+            let d = Demo::new("refs-empty-default");
+            d.keyed(db);
+            d.table(&declarations(""));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", db]));
+            d.table(&declarations("  value: {type: app.trap}\n"));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let refused = d.run(&["plan", "--db", db]);
+            assert_ne!(
+                code(&refused),
+                0,
+                "the empty-table plan admitted an untrusted domain default"
+            );
+            let reason = if user_function {
+                "not built into PostgreSQL"
+            } else {
+                &role.name
+            };
+            assert!(
+                stderr(&refused).contains(reason),
+                "{}{}",
+                stdout(&refused),
+                stderr(&refused)
+            );
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.t"), 0);
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*) FROM pg_catalog.pg_attribute WHERE attrelid = 'app.t'::regclass AND attname = 'value' AND NOT attisdropped"
+                ),
+                0
+            );
+            assert_eq!(
+                scalar(db, "SELECT is_called::integer::bigint FROM app.runs"),
+                0
+            );
+            if user_function {
+                continue;
+            }
+
+            let config = d.dir.join("pbps.yml");
+            let mut trusted = std::fs::read_to_string(&config).unwrap();
+            trusted.push_str(&format!("\ntrusted_roles: [{}]\n", role.name));
+            std::fs::write(config, trusted).unwrap();
+            let path = plan(&d, db);
+            succeeds(approved_apply(&d, db, &path, &[]));
+            succeeds(d.run(&["verify", "--db", db]));
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.t"), 0);
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT (attmissingval::text = '{7}')::integer::bigint FROM pg_catalog.pg_attribute WHERE attrelid = 'app.t'::regclass AND attname = 'value'"
+                ),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_domain_default_backfills_foreign_keys_but_a_column_default_overrides_it() {
+    for server in servers() {
+        for explicit_default in [false, true] {
+            let own = OwnDatabase::new(&server, "refs_default_fk");
+            let db = own.connection();
+            on_server(
+                db,
+                "CREATE SCHEMA app; CREATE DOMAIN app.parent_id AS integer DEFAULT 1",
+            );
+            let d = Demo::new("refs-default-fk");
+            d.table(&declarations(""));
+            let parent = "table: app.parent\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: [id]\ndata:\n  mode: exact\n  rows:\n";
+            let parent_path = d.dir.join("schema/app.parent.yml");
+            std::fs::write(&parent_path, format!("{parent}    1: {{}}\n    2: {{}}\n")).unwrap();
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&["bootstrap", "--db", db]));
+            on_server(db, "INSERT INTO app.t VALUES (10)");
+
+            // Measure the two fills in the statement order: the domain's
+            // own DEFAULT references the deleted row, while an explicit
+            // column DEFAULT selects the survivor. Each connection drops
+            // its transaction so the measurement leaves the fixture intact.
+            let default = if explicit_default { " DEFAULT 2" } else { "" };
+            let measured = try_on_server(
+                db,
+                &format!(
+                    "BEGIN; ALTER TABLE app.t ADD COLUMN pid app.parent_id{default};
+                         DELETE FROM app.parent WHERE id = 1;
+                         ALTER TABLE app.t ADD CONSTRAINT fk_parent
+                         FOREIGN KEY (pid) REFERENCES app.parent(id); ROLLBACK"
+                ),
+            );
+            if explicit_default {
+                measured.expect("the column DEFAULT selects the surviving parent");
+            } else {
+                let error = measured.expect_err("the domain DEFAULT selects the deleted parent");
+                assert!(error.contains("foreign key"), "{error}");
+            }
+            assert_eq!(scalar(db, "SELECT count(*) FROM app.parent"), 2);
+
+            d.table(&format!(
+                    "{}foreign_keys:\n  fk_parent:\n    columns: [pid]\n    references: app.parent(id)\n",
+                    declarations(&format!(
+                        "  pid: {{type: app.parent_id{}}}\n",
+                        if explicit_default { ", default: '2'" } else { "" }
+                    ))
+                ));
+            std::fs::write(&parent_path, format!("{parent}    2: {{}}\n")).unwrap();
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let path = d.dir.join("domain-default-fk.plan.json");
+            let planned = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+            succeeds(planned);
+            let applied = approved_apply(&d, db, &path, &["--allow", "data-delete,constraint"]);
+            if explicit_default {
+                succeeds(applied);
+                assert_eq!(scalar(db, "SELECT pid::bigint FROM app.t"), 2);
+                succeeds(d.run(&["verify", "--db", db]));
+            } else {
+                assert_ne!(
+                    code(&applied),
+                    0,
+                    "{}{}",
+                    stdout(&applied),
+                    stderr(&applied)
+                );
+                assert!(
+                    stderr(&applied).contains("cannot evaluate")
+                        && stderr(&applied).contains("nothing has been changed"),
+                    "{}{}",
+                    stdout(&applied),
+                    stderr(&applied)
+                );
+                assert_eq!(scalar(db, "SELECT count(*) FROM app.parent"), 2);
+                assert_eq!(
+                    scalar(
+                        db,
+                        "SELECT count(*) FROM pg_catalog.pg_attribute WHERE attrelid = 'app.t'::regclass AND attname = 'pid' AND NOT attisdropped"
+                    ),
+                    0
+                );
+            }
+        }
     }
 }
 

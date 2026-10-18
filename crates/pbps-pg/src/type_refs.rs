@@ -292,45 +292,20 @@ fn fill(column: &Column) -> Fill {
     }
 }
 
-/// Checking for rows reads no values through a user-defined type.
+/// Fast defaults evaluate even on empty tables, so every addition is checked (DEC-1523.4).
 pub async fn check_added(
     conn: &mut Conn,
-    changes: &ChangeSet,
-    ids: &pbps_model::IdsFile,
-    stored_ids: &pbps_model::IdsFile,
-    trusted: &BTreeSet<String>,
     within: Within,
+    changes: &ChangeSet,
+    trusted: &BTreeSet<String>,
 ) -> Result<(), DbError> {
     for planned in &changes.changes {
-        let Change::AddColumn { table, column, .. } = &planned.change else {
+        let Change::AddColumn { column, .. } = &planned.change else {
             continue;
         };
         let Some(reference) = column.ty.type_ref() else {
             continue;
         };
-        // A renamed table is still addressed under its stored identity before DDL.
-        let uid = ids.table_uid(table).ok_or_else(|| {
-            failed(format!(
-                "plan has no table identity for `{table}`",
-                table = table.shown()
-            ))
-        })?;
-        let stored = stored_ids.tables.get(uid);
-        let Some(stored) = stored else { continue };
-        let sql = format!(
-            "SELECT EXISTS (SELECT FROM {}.{} LIMIT 1) AS holds_rows",
-            crate::quote(&stored.schema).map_err(|e| failed(e.to_string()))?,
-            crate::quote(&stored.name).map_err(|e| failed(e.to_string()))?
-        );
-        let rows = conn.query(&sql).await?;
-        let holds_rows = rows
-            .first()
-            .ok_or_else(|| failed("the row-presence read returned no row"))?
-            .try_get::<bool>("holds_rows")?
-            .ok_or_else(|| failed("row presence was NULL"))?;
-        if !holds_rows {
-            continue;
-        }
         let types = read(conn, within, std::slice::from_ref(reference)).await?;
         let own_default = !matches!(column.value_source, pbps_model::ValueSource::None);
         let added =
