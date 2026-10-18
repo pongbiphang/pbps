@@ -2075,6 +2075,11 @@ fn declaration_problems_with_sources(
     for problem in pbps_model::module::check_dependencies(schema, &loaded.hints.module_deps) {
         out.push(("schema.unknown-dependency", problem));
     }
+    // And `depends_on:` lists that close a cycle: no order honours them,
+    // and the plan would break one without saying which (#2083).
+    for problem in pbps_model::module::check_dependency_cycles(schema, &loaded.hints.module_deps) {
+        out.push(("schema.dependency-cycle", problem));
+    }
     // Reference data (ADR-0004). Model rules, not engine rules — a row's
     // key is its identity in every dialect — so they come from the model
     // rather than from `validate_table`.

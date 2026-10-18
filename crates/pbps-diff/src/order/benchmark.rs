@@ -153,13 +153,11 @@ fn chain(size: usize) -> Shape {
 }
 
 /// The chain with one more declaration closing it: the first view reads the
-/// last. No order satisfies it. The pipeline plans a cycle's members in name
-/// order (`pbps_model::module::creation_order`), and is timed doing so; the
-/// effects are measured on the chain's own plan under the cycle's
-/// declarations, where the verifier must find the one declaration that
-/// order breaks. (The test build's observer refuses the name order itself,
-/// #2083. A rename ring is no such shape: the differ refuses every rename
-/// cycle, DEC-1966.1.)
+/// last. No order satisfies it, and the differ refuses it by name (#2083,
+/// DEC-2083.1), as it refuses every rename cycle (DEC-1966.1); it is timed
+/// doing so. The effects are measured on the chain's own plan under the
+/// cycle's declarations, where the verifier must find the one declaration
+/// that order breaks.
 fn cycle(size: usize) -> Shape {
     let chain = chain(size);
     let mut declared = chain.declared.clone();
@@ -227,8 +225,21 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
         None,
     );
     let pipeline = started.elapsed();
-    assert!(
-        planned.errors.is_empty(),
+    // A declared cycle is refused by name, every member in it (#2083,
+    // DEC-2083.1); the differ still builds the rest, so it is timed as
+    // itself all the same.
+    let refused: Vec<&crate::DiffError> = planned
+        .errors
+        .iter()
+        .filter(|e| {
+            !matches!(e, crate::DiffError::DependsOnCycle { modules }
+                if shape.planned_with.is_some() && modules.len() == shape.declared.len())
+        })
+        .collect();
+    assert!(refused.is_empty(), "{}: {:?}", shape.name, refused);
+    assert_eq!(
+        planned.errors.len(),
+        usize::from(shape.planned_with.is_some()),
         "{}: {:?}",
         shape.name,
         planned.errors

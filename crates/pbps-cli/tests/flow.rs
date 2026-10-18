@@ -7723,6 +7723,45 @@ fn bootstrap_honours_declared_module_dependencies() {
     assert!(first < second, "dependency order was discarded:\n{sql}");
 }
 
+/// `depends_on:` lists that close a cycle ask for two orders at once, and a
+/// plan in name order would break one without saying which: refused by name
+/// before anything is planned (#2083, DEC-2083.1). The same views with the
+/// cycle opened plan.
+#[test]
+fn a_depends_on_cycle_is_refused_before_planning() {
+    let d = Demo::new("depcycle");
+    d.table(ONE_COLUMN);
+    for (name, on) in [("a", "c"), ("b", "a"), ("c", "b")] {
+        d.module(
+            &format!("dbo.{name}.yml"),
+            &format!(
+                "view: dbo.{name}\ndepends_on: [dbo.{on}]\ndefinition: |-\n  SELECT id FROM dbo.t\n"
+            ),
+        );
+    }
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`dbo.a`, `dbo.b`, `dbo.c` close a cycle"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(
+        !d.dir.join("plans").exists()
+            || std::fs::read_dir(d.dir.join("plans"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
+
+    d.module(
+        "dbo.a.yml",
+        "view: dbo.a\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+}
+
 /// Bootstrap builds what the identity file knows; a declared role (or
 /// table) it does not know would be skipped silently, and the empty state
 /// recorded as the whole one. Refused by name, with `pbps plan` as the

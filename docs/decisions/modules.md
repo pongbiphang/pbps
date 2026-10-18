@@ -1898,3 +1898,34 @@ and the live
 (`crates/pbps-cli/tests/flow_pg.rs`) and
 `key_name_holders_name_each_holder_its_owner_and_its_kind`
 (`crates/pbps-pg/tests/live.rs`).
+
+<a id="dec-2083-1"></a>
+
+**DEC-2083.1. `depends_on:` declarations that close a cycle are refused by
+name, before anything is planned.** Each member asks to be created after
+another, so no order honours them all. A cycle of views is creatable in no
+order; routines that call each other may be creatable in any, but the
+declarations still ask for two orders at once. Planned in name order, as a
+cycle the identifier scan reads still is, the plan broke one of them
+without saying which. The debug-build verifier then reported that
+`depends_on:` as broken and panicked. Run as a plan-time refusal, it would
+have refused the plan anyway, with less to go on.
+
+Refused like a rename cycle (DEC-1966.1). The cycle is named: every module
+in it, and the remedy is to remove the declaration that does not hold.
+`validate` reports it as `schema.dependency-cycle`, which `plan --db`
+refuses before planning. The differ refuses it too, since an offline plan
+does not ask `validate`'s questions first.
+
+The alternative was to keep name order and have the verifier skip declared
+edges inside a cycle. It plans what the declarations contradict and leaves
+the engine to object mid-apply. A self-reference is still
+`check_dependencies`' finding. A target that is not declared closes
+nothing, since only declared modules are walked.
+
+Pinned by `a_depends_on_cycle_is_refused_with_every_member_named`
+(`crates/pbps-model/src/module.rs`) and
+`a_depends_on_cycle_is_refused_before_planning`
+(`crates/pbps-cli/tests/flow.rs`). A broken acyclic declaration is still the
+verifier's: `a_broken_depends_on_is_refused_as_declared`
+(`crates/pbps-diff/src/order/tests.rs`).
