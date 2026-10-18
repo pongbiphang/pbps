@@ -130,6 +130,17 @@
           "type": "boolean",
           "default": false
         },
+        "row_security": {
+          "description": "PostgreSQL's independent ENABLE and FORCE row-security flags.",
+          "$ref": "#/$defs/RowSecurityDto"
+        },
+        "row_policies": {
+          "description": "Table-local PostgreSQL policies, including policies on a disabled table.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RowPolicyDto"
+          }
+        },
         "partition_by": {
           "description": "A PostgreSQL partitioned parent's key columns: `[ts]` for RANGE, or\n`{list: [k]}` or `{hash: [a, b]}` (#1632).",
           "anyOf": [
@@ -776,6 +787,131 @@
           ],
           "additionalProperties": false
         }
+      ]
+    },
+    "RowSecurityDto": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "forced": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "RowPolicyDto": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "$ref": "#/$defs/PolicyCommandDto"
+        },
+        "restrictive": {
+          "type": "boolean",
+          "default": false
+        },
+        "to": {
+          "$ref": "#/$defs/PolicyRolesDto"
+        },
+        "using": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "with_check": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "command": {
+                "enum": [
+                  "select",
+                  "delete"
+                ]
+              }
+            },
+            "required": [
+              "command"
+            ]
+          },
+          "then": {
+            "properties": {
+              "with_check": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "command": {
+                "const": "insert"
+              }
+            },
+            "required": [
+              "command"
+            ]
+          },
+          "then": {
+            "properties": {
+              "using": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "PolicyCommandDto": {
+      "type": "string",
+      "enum": [
+        "all",
+        "select",
+        "insert",
+        "update",
+        "delete"
+      ]
+    },
+    "PolicyRolesDto": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PolicyPublicDto"
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "not": {
+              "enum": [
+                "public",
+                "current_user",
+                "session_user",
+                "current_role"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "PolicyPublicDto": {
+      "type": "string",
+      "enum": [
+        "public"
       ]
     },
     "PartitionByDto": {
@@ -1481,6 +1617,6 @@
       ]
     }
   },
-  "x-pbps-schema-version": 50,
+  "x-pbps-schema-version": 51,
   "x-pbps-tool-version": "0.0.0"
 }

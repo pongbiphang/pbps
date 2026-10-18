@@ -27,6 +27,8 @@ pub(crate) struct Fields<'a> {
     pub(crate) replica_identity: &'a Option<ReplicaIdentity>,
     pub(crate) storage_parameters: &'a BTreeMap<String, String>,
     pub(crate) unlogged: bool,
+    pub(crate) row_security: &'a pbps_model::RowSecurity,
+    pub(crate) row_policies: &'a BTreeMap<String, pbps_model::RowPolicy>,
     pub(crate) system_time: &'a Option<SystemTime>,
     pub(crate) partition_by: &'a Option<PartitionBy>,
     pub(crate) partition_of: &'a Option<PartitionOf>,
@@ -50,6 +52,8 @@ impl<'a> Fields<'a> {
             replica_identity,
             storage_parameters,
             unlogged,
+            row_security,
+            row_policies,
             system_time,
             partition_by,
             partition_of,
@@ -67,6 +71,8 @@ impl<'a> Fields<'a> {
             replica_identity,
             storage_parameters,
             unlogged: *unlogged,
+            row_security,
+            row_policies,
             system_time,
             partition_by,
             partition_of,
@@ -224,6 +230,14 @@ pub(crate) fn table(
                 )
             }
         });
+    }
+    if !expected.row_security.accepts(&now.row_security)
+        || !expected.row_policies.accepts(&now.row_policies)
+    {
+        moved.push(format!(
+            "{} row-security flags or policies changed, and no change of this plan sets them",
+            name.shown()
+        ));
     }
     if !expected
         .storage

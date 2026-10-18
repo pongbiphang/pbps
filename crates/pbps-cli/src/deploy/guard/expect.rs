@@ -140,6 +140,8 @@ impl<'a> Implied<'a> {
 }
 
 pub(crate) struct Expected<'a> {
+    pub(super) row_security: Req<&'a pbps_model::RowSecurity>,
+    pub(super) row_policies: Req<&'a BTreeMap<String, pbps_model::RowPolicy>>,
     pub(super) identity: Req<Option<&'a ReplicaIdentity>>,
     pub(super) storage: Req<Cow<'a, Storage>>,
     pub(super) persistence: Req<bool>,
@@ -554,6 +556,8 @@ impl<'a> TableChanges<'a> {
             }
         }
         Expected {
+            row_security: Req::Keep(&was.row_security),
+            row_policies: Req::Keep(&was.row_policies),
             identity,
             storage,
             persistence,

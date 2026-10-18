@@ -456,10 +456,12 @@ all unchanged. As with ADR-0009, the dialect-agnostic crates hold.
   not its object ACL, by
   [`a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it`](../crates/pbps-pg/tests/live.rs).
   This protects that rebuild; it does not make column grants declarable.
-- **Row-level security, `SET ROLE` chaining, `pg_hba.conf`, `CONNECT` and
-  database-level privileges remain outside the declaration model** — the first
-  is a policy engine of its own, the rest are cluster or connection concerns.
-  A diagnostic or preflight check is not support for managing those policies.
+- **Row-level security is represented by table flags and policies** (#1172
+  PR A, DEC-1172.1). Loading and formatting are available; catalog adoption
+  and deployment await the later PRs of #1172, and planning and saved-plan
+  replay refuse non-default RLS state meanwhile. `SET ROLE` chaining,
+  `pg_hba.conf`, `CONNECT` and database-level privileges remain outside the
+  declaration model as cluster or connection concerns.
 - **Sequence, type, domain and foreign-data-wrapper grants remain unmodelled.**
   [`a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost`](../crates/pbps-pg/tests/live.rs)
   measures reporting for sequence, type and procedural-language grants, plus

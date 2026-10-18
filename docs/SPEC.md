@@ -293,6 +293,16 @@ indexes:
   may not reference an unlogged one; SQL Server refuses the key (DEC-1443.1).
   A table a publication lists by name cannot be made unlogged, and the switch
   is refused naming the publication (DEC-1489.1).
+- **`row_security: {enabled, forced}` and `row_policies:` declare PostgreSQL
+  row-security state** (DEC-1172.1). Each policy has `command:`
+  (`all`, the default, `select`, `insert`, `update`, `delete`), `restrictive:`
+  (false by default), `to:` (a role list or scalar `public`, the default),
+  and optional `using:` and `with_check:` expressions kept verbatim. An
+  omitted WITH CHECK remains distinct from one equal to USING. A policy
+  has no uid. `data:` with either flag or any policy, and RLS on partition
+  trees, are refused. SQL Server refuses non-default flags or a nonempty
+  policy map. PR A supplies the model and format; planning and saved-plan
+  replay refuse RLS until #1172's later PRs land.
 - **`system_time:` gives a SQL Server table its `PERIOD FOR SYSTEM_TIME`**:
   `period: [start, end]` names two `datetime2` columns, not nullable, and
   `hidden: true` hides both. Under `versioning:` it gives the table system

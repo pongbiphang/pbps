@@ -14,7 +14,7 @@
 //! intent would make the same state compare unequal depending on whether an
 //! annotation happened to be present.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
 
@@ -135,6 +135,11 @@ impl Schema {
 }
 
 impl Table {
+    /// Disabled policies and FORCE without ENABLE are state too (DEC-1172.1).
+    pub fn has_row_security(&self) -> bool {
+        !self.row_security.is_default() || !self.row_policies.is_empty()
+    }
+
     /// The columns whose `pg_attrdef` row this declaration holds an
     /// expression for: a column's default or generation expression, and a
     /// partition's own default on its parent's column (#1578). One list, so
@@ -482,6 +487,16 @@ pub struct Table {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unlogged: bool,
 
+    /// PostgreSQL's independent ENABLE and FORCE flags (DEC-1172.1).
+    /// Older readers excluded every table with either flag or a policy, so
+    /// absent fields truthfully mean disabled security and no policies.
+    #[serde(default, skip_serializing_if = "RowSecurity::is_default")]
+    pub row_security: RowSecurity,
+
+    /// Policies have their own table-local namespace and no data identity.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub row_policies: BTreeMap<String, RowPolicy>,
+
     /// SQL Server's `PERIOD FOR SYSTEM_TIME` and system versioning (#1176,
     /// DEC-1176.1). `None` is an ordinary table, which every table an older
     /// reader recorded was: it left a temporal one out as a limitation.
@@ -514,6 +529,108 @@ pub struct Table {
     /// existed describes a table that declares no rows, not a broken file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<TableData>,
+}
+
+/// FORCE is meaningful state even while row security is disabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowSecurity {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub forced: bool,
+}
+
+impl RowSecurity {
+    pub fn is_default(&self) -> bool {
+        !self.enabled && !self.forced
+    }
+}
+
+/// A policy's name belongs to its table's map, not its definition.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowPolicy {
+    #[serde(default)]
+    pub command: PolicyCommand,
+    #[serde(default)]
+    pub restrictive: bool,
+    #[serde(default)]
+    pub to: PolicyRoles,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub using: Option<crate::Text>,
+    /// None must never be manufactured from USING: the catalog distinguishes
+    /// omission from an explicitly equal expression (DEC-1172.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub with_check: Option<crate::Text>,
+}
+
+impl RowPolicy {
+    /// Shared by YAML conversion and validation of programmatically built state.
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.with_check.is_some()
+            && matches!(self.command, PolicyCommand::Select | PolicyCommand::Delete)
+        {
+            problems.push("WITH CHECK cannot be applied to SELECT or DELETE".to_owned());
+        }
+        if self.using.is_some() && self.command == PolicyCommand::Insert {
+            problems.push("only WITH CHECK expression allowed for INSERT".to_owned());
+        }
+        if let PolicyRoles::Roles(roles) = &self.to {
+            if roles.is_empty() {
+                problems
+                    .push("`to` must name at least one role, or be the scalar `public`".to_owned());
+            }
+            for role in roles {
+                match role.as_str() {
+                    // PostgreSQL otherwise discards the named roles beside
+                    // PUBLIC. Uppercase "PUBLIC" is a distinct legal role.
+                    "public" => problems.push(
+                        "`public` cannot appear in a role list; use the scalar `to: public`"
+                            .to_owned(),
+                    ),
+                    "current_user" | "session_user" | "current_role" => problems.push(format!(
+                        "`{role}` is a session-dependent target; name a role explicitly"
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        problems
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyCommand {
+    #[default]
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+impl PolicyCommand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Select => "select",
+            Self::Insert => "insert",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// PUBLIC is a target, never a sentinel role name (ADR-0010 §5).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PolicyRoles {
+    #[default]
+    Public,
+    Roles(BTreeSet<String>),
 }
 
 /// `PARTITION BY RANGE | LIST | HASH (…)` over plain columns (#1170,

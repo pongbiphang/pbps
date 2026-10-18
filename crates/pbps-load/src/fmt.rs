@@ -411,6 +411,35 @@ pub fn render_partitioned(
         }
     }
 
+    if !table.row_security.is_default() {
+        let _ = writeln!(
+            s,
+            "\nrow_security: {{enabled: {}, forced: {}}}",
+            table.row_security.enabled, table.row_security.forced
+        );
+    }
+    if !table.row_policies.is_empty() {
+        s.push_str("\nrow_policies:\n");
+        for (name, policy) in &table.row_policies {
+            let _ = writeln!(s, "  {}:", scalar(name));
+            let _ = writeln!(s, "    command: {}", policy.command.as_str());
+            let _ = writeln!(s, "    restrictive: {}", policy.restrictive);
+            match &policy.to {
+                pbps_model::PolicyRoles::Public => s.push_str("    to: public\n"),
+                pbps_model::PolicyRoles::Roles(roles) => {
+                    let roles: Vec<_> = roles.iter().cloned().collect();
+                    let _ = writeln!(s, "    to: {}", seq(&roles));
+                }
+            }
+            if let Some(expression) = &policy.using {
+                let _ = writeln!(s, "    using: {}", scalar(expression.raw()));
+            }
+            if let Some(expression) = &policy.with_check {
+                let _ = writeln!(s, "    with_check: {}", scalar(expression.raw()));
+            }
+        }
+    }
+
     // Last, and after the constraints, because it is the only block that is
     // about the table's contents rather than its shape — and on a lookup table
     // it is much the longest.

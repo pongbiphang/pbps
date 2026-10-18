@@ -439,6 +439,53 @@ pub(crate) fn convert_for_diagnostics(
 
     let indexes = convert_indexes(src, dto.indexes, &mut errs);
 
+    let row_security = pbps_model::RowSecurity {
+        enabled: dto.row_security.enabled,
+        forced: dto.row_security.forced,
+    };
+    let row_policies: std::collections::BTreeMap<_, _> = dto
+        .row_policies
+        .into_iter()
+        .map(|(name, p)| {
+            use crate::dto::{PolicyCommandDto as Command, PolicyRolesDto as Roles};
+            let policy = pbps_model::RowPolicy {
+                command: match p.command {
+                    Command::All => pbps_model::PolicyCommand::All,
+                    Command::Select => pbps_model::PolicyCommand::Select,
+                    Command::Insert => pbps_model::PolicyCommand::Insert,
+                    Command::Update => pbps_model::PolicyCommand::Update,
+                    Command::Delete => pbps_model::PolicyCommand::Delete,
+                },
+                restrictive: p.restrictive,
+                to: match p.to {
+                    Roles::Public(_) => pbps_model::PolicyRoles::Public,
+                    Roles::Roles(roles) => {
+                        pbps_model::PolicyRoles::Roles(roles.into_iter().collect())
+                    }
+                },
+                using: p.using.map(pbps_model::Text::from),
+                with_check: p.with_check.map(pbps_model::Text::from),
+            };
+            for problem in policy.problems() {
+                errs.push(LoadError::semantic(
+                    src,
+                    to_span(&dto.table.defined),
+                    format!("row policy `{name}`: {problem}"),
+                    problem,
+                ));
+            }
+            (name, policy)
+        })
+        .collect();
+    if dto.data.is_some() && (!row_security.is_default() || !row_policies.is_empty()) {
+        errs.push(LoadError::semantic(
+            src,
+            to_span(&dto.table.defined),
+            "`data:` cannot be declared with row-security flags or policies, including disabled policies",
+            "row-security policies can filter reference-data reads and writes",
+        ));
+    }
+
     let data = match dto.data {
         Some(d) => match convert_data(src, d) {
             Ok(d) => Some(d),
@@ -817,6 +864,8 @@ pub(crate) fn convert_for_diagnostics(
                     }),
                     storage_parameters,
                     unlogged: dto.unlogged,
+                    row_security,
+                    row_policies,
                     system_time,
                     partition_by,
                     partition_of: None,

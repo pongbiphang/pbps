@@ -1020,6 +1020,16 @@ impl Dialect for Postgres {
             storage_parameters: partition.storage_parameters.clone(),
             ..Table::default()
         });
+        // This entry point validates a partition's own fields without going
+        // through validate_table_sources. A programmatic child must not lose
+        // the same RLS refusal that its YAML shape already enforces.
+        if partition.has_row_security() {
+            found.push(DialectError::Invalid {
+                dialect: types::DIALECT,
+                message: "row-security flags and policies on a partition tree are not supported"
+                    .to_owned(),
+            });
+        }
         let own = partition.checks.keys().map(|name| ("check", name)).chain(
             partition
                 .foreign_keys
@@ -1161,6 +1171,42 @@ impl Dialect for Postgres {
         // its checks and indexes are held to them by `validate_partition`.
         if table.partition_of.is_none() {
             found.extend(validate::table_structure(table));
+        }
+        if table.has_row_security() {
+            let invalid = |message| DialectError::Invalid {
+                dialect: types::DIALECT,
+                message,
+            };
+            if table.data.is_some() {
+                found.push(invalid(
+                    "`data:` cannot be declared with row-security flags or policies, including disabled policies"
+                        .to_owned(),
+                ));
+            }
+            if table.partition_by.is_some() || table.partition_of.is_some() {
+                found.push(invalid(
+                    "row-security flags and policies on a partition tree are not supported"
+                        .to_owned(),
+                ));
+            }
+            for (policy_name, policy) in &table.row_policies {
+                found.extend(
+                    policy
+                        .problems()
+                        .into_iter()
+                        .map(|problem| invalid(format!("row policy `{policy_name}`: {problem}"))),
+                );
+                if let Err(error) = self.quote_ident(policy_name) {
+                    found.push(error);
+                }
+                if let pbps_model::PolicyRoles::Roles(roles) = &policy.to {
+                    for role in roles {
+                        if let Err(error) = self.quote_ident(role) {
+                            found.push(error);
+                        }
+                    }
+                }
+            }
         }
         // SQL Server's computed columns (#1174). PostgreSQL's are generated
         // columns, which declare their type (DEC-1168.1).

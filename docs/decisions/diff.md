@@ -6793,3 +6793,32 @@ Pinned by the 15 pins from
 (`crates/pbps-diff/src/order/tests.rs`), and the `HELD` lists in
 `crates/pbps-pg/tests/support/commutation.rs` and
 `crates/pbps-mssql/tests/support/commutation.rs`.
+
+<a id="dec-1172-1"></a>
+
+**DEC-1172.1. Row-security flags and policies are table state, with PUBLIC a
+dedicated target and predicate text kept as authored.** (#1172 PR A.)
+`row_security: {enabled, forced}` holds the two flags independently;
+`row_policies:` holds policies by table-local name, without uids (ADR-0002).
+A policy holds its command, restrictive mode, target and optional USING and
+WITH CHECK. Omitted WITH CHECK stays absent even when PostgreSQL would use
+USING in its place. Expressions are authored strings, never parsed. The
+model's target is `PolicyRoles::Public` or a set of role names: lowercase
+`public` in a list is refused because PostgreSQL discards the other roles,
+while uppercase `PUBLIC` remains a legal named role. Omitted `to` is Public,
+as CREATE POLICY without TO is. Session-dependent targets are refused.
+The separate role/grant format is unchanged.
+
+The loader refuses WITH CHECK on SELECT or DELETE, USING on INSERT, an empty
+role list, and `data:` beside either flag or any policy, including disabled
+policies. PostgreSQL refuses RLS on a partition tree; SQL Server refuses
+non-default flags and nonempty policy maps. Explicit no-op keys erase to the
+default, as `unlogged: false` does.
+
+PR A represents and formats this state but does not execute it. Until the
+later PRs of #1172 supply planning, the common differ refuses either input
+with flags or policies, and saved-plan validation refuses every operation
+carrying such a table shape (create, attach or detach). Both refusals name
+that delivery boundary. Catalog exclusions remain until PR B. Declared
+expression tracking, create-only change kinds, emission, dependent refusals
+and filtered-probe wrapping belong to PR C.
