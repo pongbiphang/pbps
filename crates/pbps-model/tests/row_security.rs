@@ -90,7 +90,7 @@ fn row_security_state_changes_the_checksum_but_default_fields_keep_old_bytes() {
         .insert("p".into(), RowPolicy::default());
     assert_ne!(state_checksum(&schema, &ids), checksum);
     let snap = StateSnapshot::new(StateKind::Apply, schema, ids, "test");
-    assert_eq!(snap.version, 26);
+    assert_eq!(snap.version, pbps_model::state::CURRENT_VERSION);
     let json = serde_json::to_string(&snap).unwrap();
     assert_eq!(StateSnapshot::from_json(&json).unwrap(), snap);
 }
@@ -123,6 +123,7 @@ fn row_security_absence_in_legacy_states_is_disabled_without_policies() {
         );
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
-    state.version = 27;
+    // A version newer than this build's is refused, not read partially.
+    state.version = pbps_model::state::CURRENT_VERSION + 1;
     assert!(StateSnapshot::from_json(&serde_json::to_string(&state).unwrap()).is_err());
 }
