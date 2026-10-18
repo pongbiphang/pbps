@@ -8296,7 +8296,53 @@ fn a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names() {
     let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
     for (k, server) in [old_server, server()].iter().enumerate() {
         a_baseline_does_not_hand_over_a_held_partition_on(server, k);
+        a_baseline_does_not_hand_over_a_partition_renamed_first_on(server, k);
     }
+}
+
+/// The intent renames the partition before dropping it, and the database is
+/// renamed ahead of the baseline: the recorded state still has the old name,
+/// the database and the intent the new one. The baseline is still refused by
+/// the name the database has (#1852 review).
+fn a_baseline_does_not_hand_over_a_partition_renamed_first_on(server: &str, k: usize) {
+    let db = OwnDatabase::new(server, "handover-1852-renamed");
+    let connection = db.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+    );
+    let d = Demo::new(&format!("handover-1852-renamed-{k}"));
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let held = text.find("\npartitions:\n").unwrap();
+
+    std::fs::write(&path, text.replace("  ev_2025:", "  ev_old:")).unwrap();
+    succeeds(d.run(&["rename-table", "app.ev_2025", "app.ev_old"]));
+    d.commit();
+    std::fs::write(&path, format!("{}\npartitions: external\n", &text[..held])).unwrap();
+    succeeds(d.run(&["drop-table", "app.ev_old", "--reason", "retired"]));
+    d.commit();
+    on_server(&connection, "ALTER TABLE app.ev_2025 RENAME TO ev_old");
+    let o = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains(
+            "app.ev_old is named by a drop intent and held by the recorded state (entry #1)"
+        ),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        scalar(&connection, "SELECT count(*) FROM public.__pbps_state"),
+        1,
+        "the refused baseline recorded an entry"
+    );
 }
 
 fn a_baseline_does_not_hand_over_a_held_partition_on(server: &str, k: usize) {
