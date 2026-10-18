@@ -2756,6 +2756,110 @@ fn a_numbering_change_applies_behind_its_gate_and_verifies() {
     );
 }
 
+/// A conversion between an identity and an owned sequence that counts the
+/// same way carries the old counter (DEC-1889.1). An exhausted one leaves no
+/// number past it, and the pre-flight refuses the plan before its first
+/// statement rather than letting `setval` fail inside it (#2005). The
+/// negative cases: the same counter not yet called continues at itself and
+/// applies, and a conversion counting the other way carries nothing. On 16
+/// and 18.
+#[test]
+#[ignore = "needs both live PostgreSQL versions; see scripts/live-tests-pg.sh"]
+fn a_conversion_past_an_exhausted_counter_is_refused_before_apply() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [("18", server()), ("16", old)] {
+        let slug = format!("exhausted_{version}");
+        let own = OwnDatabase::new(&server, &slug);
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app; \
+             CREATE TABLE app.t (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY); \
+             CREATE TABLE app.u (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY)",
+        );
+        let d = Demo::new(&slug);
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let exhaust = |table: &str, called: bool| {
+            on_server(
+                connection,
+                &format!(
+                    "SELECT pg_catalog.setval(pg_catalog.pg_get_serial_sequence('app.{table}', \
+                     'id'), 9223372036854775807, {called})"
+                ),
+            );
+        };
+        exhaust("t", true);
+        exhaust("u", true);
+        let declare = |table: &str, sequence: &str| {
+            std::fs::write(
+                d.dir.join(format!("schema/app.{table}.yml")),
+                format!(
+                    "table: app.{table}\ncolumns:\n  id:\n    type: bigserial\n{sequence}\
+                     primary_key: {{name: {table}_pkey, columns: [id]}}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let identity = |table: &str| {
+            text_of(
+                connection,
+                &format!(
+                    "SELECT attidentity::text FROM pg_catalog.pg_attribute \
+                     WHERE attrelid = 'app.{table}'::pg_catalog.regclass AND attname = 'id'"
+                ),
+            )
+        };
+        let apply = || {
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let plan = d.dir.join("plan.json");
+            succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+            approved_apply(&d, connection, &plan, &["--allow", "numbering"])
+        };
+
+        declare("t", "");
+        let refused = apply();
+        let said = format!("{}{}", stdout(&refused), stderr(&refused));
+        assert!(
+            code(&refused) != 0
+                && said.contains("the counter app.t.id's old source carries past the bound"),
+            "{version}: {said}"
+        );
+        assert_eq!(identity("t"), "a", "{version}: nothing ran");
+
+        // Not yet called, the counter is the next number itself.
+        exhaust("t", false);
+        let applied = apply();
+        assert_eq!(
+            code(&applied),
+            0,
+            "{version}: {}{}",
+            stdout(&applied),
+            stderr(&applied)
+        );
+        assert_eq!(identity("t"), "", "{version}");
+
+        // Counting down, the new sequence starts from its own start.
+        declare("u", "    sequence: {start: -1, increment: -1}\n");
+        let applied = apply();
+        assert_eq!(
+            code(&applied),
+            0,
+            "{version}: {}{}",
+            stdout(&applied),
+            stderr(&applied)
+        );
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(
+            stdout(&next).contains("No changes"),
+            "{version}: {}",
+            stdout(&next)
+        );
+    }
+}
+
 /// A staged apply checkpoints after every statement, and reads what it has
 /// done so far. A `serial` table, and a `serial` added to a table holding
 /// rows, are each one statement with their sequence and its ownership, so
