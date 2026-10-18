@@ -592,10 +592,18 @@ def workflow_runs(source, job, platform=None):
     tail = source[match.end():]
     following = re.search(r"^  [\w-]+:\s*$", tail, re.M)
     body = tail[:following.start()] if following else tail
+    # A block scalar's lines are its text, not mapping entries: they run on
+    # while indented past the column of the key that opened it.
+    block = None
     for line in body.splitlines():
-        key = re.match(r"\s*(?:-\s+)?(?:(['\"])([\w-]+)\1|([\w-]+))(\s*):(?:\s|$)", line)
-        require(not (key and (key[2] or key[3]) in AUDITED_KEYS and (key[1] or key[4])),
+        if block is not None:
+            if not line.strip() or len(line) - len(line.lstrip(" ")) > block: continue
+            block = None
+        key = re.match(r"(\s*(?:-\s+)?)(?:(['\"])([\w-]+)\2|([\w-]+))(\s*):(?:\s|$)", line)
+        if not key: continue
+        require(not ((key[3] or key[4]) in AUDITED_KEYS and (key[2] or key[5])),
                 f"an alternate spelling of a key needs an explicit audit: {job}: {line.strip()}")
+        if re.search(r":\s*[|>][-+0-9]*\s*(?:#.*)?$", line): block = len(key[1])
     if platform is not None:
         runner = re.search(r"^    runs-on: ([\w-]+)\s*$", body, re.M)
         prefix = {"linux": "ubuntu-", "win32": "windows-", "darwin": "macos-"}[platform]

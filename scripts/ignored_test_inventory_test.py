@@ -173,7 +173,9 @@ class Ownership(unittest.TestCase):
                          WORKFLOW.replace("    steps:", "    strategy :\n      matrix:\n        x: [a]\n    steps:"),
                          WORKFLOW.replace("    steps:", matrix.replace("      matrix:", "      'matrix':") + "    steps:"),
                          WORKFLOW.replace("    steps:", matrix + "        'include': []\n    steps:"),
-                         WORKFLOW.replace("    runs-on:", "    runs-on :")):
+                         WORKFLOW.replace("    runs-on:", "    runs-on :"),
+                         # A key after a block scalar ends is read again.
+                         WORKFLOW.replace("      - run:", "      - name: |\n          text\n        'if': false\n        run:")):
             with self.subTest(workflow=workflow):
                 self.workflow.write_text(workflow)
                 with self.assertRaisesRegex(audit.InventoryError, "an alternate spelling of a key needs an explicit audit"):
@@ -182,7 +184,11 @@ class Ownership(unittest.TestCase):
         # the audit does not read pass as before.
         for workflow in (WORKFLOW.replace("    steps:", "    continue-on-error: false\n    steps:"),
                          WORKFLOW.replace("      - run:", "      - name: 'a: b'\n        run:"),
-                         WORKFLOW.replace("    steps:", "    'timeout-minutes' : 5\n    steps:")):
+                         WORKFLOW.replace("    steps:", "    'timeout-minutes' : 5\n    steps:"),
+                         # A block scalar's text is not a key, whatever it spells.
+                         WORKFLOW.replace("      - run: cargo test -p demo --lib -- --ignored",
+                                          "      - run: |\n          cat > out.yml <<'EOF'\n          \"run\" : value\n"
+                                          "          'continue-on-error': x\n          EOF\n          cargo test -p demo --lib -- --ignored")):
             with self.subTest(workflow=workflow):
                 self.workflow.write_text(workflow)
                 self.assertEqual(self.check(), 1)
