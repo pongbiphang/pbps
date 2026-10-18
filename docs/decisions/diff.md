@@ -6862,9 +6862,11 @@ that drops the trigger, or rewrites it (on PostgreSQL a `DROP` and a
 pass the row, and the engine refused the row mid-apply.
 
 The catalog now also says which inputs only a trigger fills
-(`Dependence::filled_by_trigger`). Those count as required where the plan
-drops or rewrites any trigger on the table, and the plan is refused by name
-as for an input nothing fills. Any trigger counts, not only the one that
+(`Dependence::filled_by_trigger`). Those count as required for a row the
+plan inserts after a change that drops or rewrites any trigger on the table,
+and the plan is refused by name as for an input nothing fills. A trigger
+rewritten after the row, where the differ puts a module change, still fills
+it. Any trigger counts, not only the one that
 would fill: which trigger fills which column is the trigger's code, which
 the pass does not read. A plan that only creates a trigger changes nothing:
 the input was already required without one.
