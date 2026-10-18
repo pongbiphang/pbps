@@ -14,6 +14,10 @@
         "type": "string"
       }
     },
+    "pin_type_routines": {
+      "description": "Review and pin user-written routines on referenced type input paths (DEC-2181.2).",
+      "type": "boolean"
+    },
     "schema_dir": {
       "type": "string",
       "pattern": "^(?!(?:\\.\\.?(?:[/\\\\]+|$))*$)",

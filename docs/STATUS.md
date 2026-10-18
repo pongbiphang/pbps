@@ -13,6 +13,8 @@ arrive with #1173. Policy predicate binding proof remains #595's named
 limitation. RLS partition trees and reference data beside RLS remain refused.
 PR D retains the complete round-trip/enforcement matrix and final documentation.
 
+Referenced PostgreSQL types use potential-path eligibility and opt-in reviewed routine source pins (DEC-2181.1–3).
+
 **Phases 0-5 complete** (0, 1, 2, 3, 3.1, 3.5, 4 and 5), with SQL Server
 and PostgreSQL supported through the CLI. SQL Server uses `tiberius` 0.13.0
 with rustls and aws-lc-rs; PostgreSQL's rustls configuration selects the same

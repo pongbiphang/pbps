@@ -301,6 +301,10 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub trusted_roles: std::collections::BTreeSet<String>,
 
+    /// Review and pin user-written routines on referenced type input paths (DEC-2181.2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pin_type_routines: bool,
+
     // The schema carries the lexical half of the #739 rule, so an editor
     // refuses what `Config::parse` refuses: an empty path, or one made only
     // of `.` and `..`. Both separators count, as they do on Windows; a
@@ -997,5 +1001,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod type_routine_tests {
+    use super::*;
+
+    #[test]
+    fn type_routine_review_is_an_explicit_boolean_opt_in() {
+        let parse = |extra: &str| {
+            Config::parse(
+                &format!("dialect: postgres\n{extra}"),
+                Path::new("pbps.yml"),
+            )
+        };
+        assert!(!parse("").unwrap().pin_type_routines);
+        assert!(
+            !parse("pin_type_routines: false\n")
+                .unwrap()
+                .pin_type_routines
+        );
+        assert!(
+            parse("pin_type_routines: true\n")
+                .unwrap()
+                .pin_type_routines
+        );
+        assert!(parse("pin_type_routines: 7\n").is_err());
     }
 }

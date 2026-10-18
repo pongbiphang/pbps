@@ -64,7 +64,7 @@ pub const SCHEMA_VERSION: u32 = 53;
 // 50: a plan's `origins`, the steps a planning rule added (issue #1958).
 // 51: a table's `row_security:` and `row_policies:` (issue #1172 PR A).
 // 52: created-table row-security operations (issue #1172 PR C).
-// 53: PostgreSQL user-type references and trusted_roles (issue #1523).
+// 53: PostgreSQL type references, trusted_roles and reviewed input-path routines (#1523, #2181).
 // 26: index, key and unique-constraint `storage_parameters` (issue #1442).
 // 25: a table's `storage_parameters:` (issue #1441).
 // 24: a table's `replica_identity:` (issue #1444).
@@ -621,7 +621,8 @@ mod tests {
     /// plan's resolver selection, and stays closed so `pbps.yml` refuses a
     /// misspelt key; so do the server entry's `standard:` types within it
     /// (#1708). `Discovery`'s two maps accept new keys whose values are
-    /// `Observation`s, and nothing else.
+    /// `Observation`s, and nothing else. `TypeRoutine` retains the saved
+    /// plan's closed source-record shape (DEC-2181.2).
     #[test]
     fn only_the_named_envelope_objects_constrain_unnamed_properties() {
         let constrained = constrained_objects(&schema(SchemaKind::Envelope));
@@ -636,6 +637,7 @@ mod tests {
                 "ResolverProfile/oneOf/0",
                 "ResolverProfile/oneOf/1",
                 "ScratchStandard",
+                "TypeRoutine",
             ]
         );
     }

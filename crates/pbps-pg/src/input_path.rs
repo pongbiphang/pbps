@@ -278,6 +278,8 @@ pub struct RoutineReason {
     pub owner: pbps_model::RoleName,
     pub why: Why,
     pub used_by: Use,
+    /// The implementation function, including operator support functions.
+    pub oid: Oid,
 }
 
 /// A type on the input path that a role which is not trusted can change.
@@ -312,7 +314,7 @@ impl InputPath {
         matches!(self, Self::Admitted(_))
     }
 
-    /// Why a plan cannot add a column of this type regardless of row presence,
+    /// Why this potential input path requires refusal, regardless of row presence,
     /// or `None` when it can. Each refusal says which case it is.
     #[must_use]
     pub fn refusal(&self, reference: &TypeRef) -> Option<String> {
@@ -329,10 +331,10 @@ impl InputPath {
                     lines.push(format!("and {} more", reasons.len() - SHOWN));
                 }
                 format!(
-                    "adding a column of the type `{name}` requires built-in code and trusted \
+                    "the potential input path of type `{name}` requires eligible code and trusted \
                      owners regardless of row presence: {}. To admit an untrusted owner, \
                      list the named role in `trusted_roles` in `pbps.yml`; user-written \
-                     routines remain refused",
+                     routines require pin_type_routines: true, source review and pins",
                     lines.join("; ")
                 )
             }
@@ -1204,6 +1206,7 @@ async fn unadmitted_routines(
                 continue;
             }
             out.push(RoutineReason {
+                oid: *oid,
                 kind: RoutineKind::Function,
                 identity: row.identity.clone(),
                 runs: None,
@@ -1223,6 +1226,7 @@ async fn unadmitted_routines(
         let runs = function(row.code)?;
         for used_by in uses {
             out.push(RoutineReason {
+                oid: row.code,
                 kind: RoutineKind::Operator,
                 identity: row.identity.clone(),
                 runs: Some(runs.identity.clone()),
@@ -1253,6 +1257,7 @@ async fn unadmitted_routines(
         let runs = function(*support)?;
         for used_by in uses {
             out.push(RoutineReason {
+                oid: *support,
                 kind: RoutineKind::Operator,
                 identity: row.identity.clone(),
                 runs: Some(runs.identity.clone()),
@@ -1478,6 +1483,7 @@ mod tests {
 
     fn user_function() -> RoutineReason {
         RoutineReason {
+            oid: 16384,
             kind: RoutineKind::Function,
             identity: "app.is_positive(integer)".to_owned(),
             runs: None,

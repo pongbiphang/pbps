@@ -61,16 +61,13 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
         succeeds(d.run(&["plan"]));
         d.commit();
         let script = d.dir.join("bootstrap.sql");
-        succeeds(d.run(&["bootstrap", "--sql", script.to_str().unwrap()]));
+        let offline = d.run(&["bootstrap", "--sql", script.to_str().unwrap()]);
+        assert_ne!(code(&offline), 0);
+        assert!(stderr(&offline).contains("offline bootstrap cannot validate"));
+        succeeds(d.run(&["bootstrap", "--db", db, "--sql", script.to_str().unwrap()]));
         let sql = std::fs::read_to_string(&script).unwrap();
-        assert!(
-            sql.find("DO $pbps$").unwrap() < sql.find("CREATE TABLE").unwrap(),
-            "{sql}"
-        );
+        assert!(sql.find("DO $pbps$").unwrap() < sql.find("CREATE TABLE").unwrap());
         assert!(sql.contains("\"app\".\"mood\"[]"), "{sql}");
-        on_server(db, &sql);
-        // The script builds the declarations; baseline adopts the resulting table.
-        succeeds(d.run(&["baseline", "--db", db, "--reason", "adopt script"]));
         succeeds(d.run(&["verify", "--db", db]));
         let path = plan(&d, db);
         let saved: pbps_model::SavedPlan =
@@ -121,9 +118,14 @@ fn missing_and_shell_types_refuse_before_bootstrap_creates_a_ledger_or_table() {
             );
         }
         let script = d.dir.join("missing.sql");
-        succeeds(d.run(&["bootstrap", "--sql", script.to_str().unwrap()]));
-        let err = try_on_server(db, &std::fs::read_to_string(script).unwrap()).unwrap_err();
-        assert!(err.contains("app.missing"), "{err}");
+        let out = d.run(&["bootstrap", "--sql", script.to_str().unwrap()]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("offline bootstrap cannot validate"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(!script.exists());
         assert_eq!(
             scalar(
                 db,
@@ -343,7 +345,7 @@ fn a_user_domain_check_is_never_evaluated_by_planning_an_add_over_rows() {
             stderr(&out).contains("app.seen(integer)")
                 && stderr(&out).contains("not built into PostgreSQL")
                 && stderr(&out).contains("trusted_roles")
-                && stderr(&out).contains("user-written routines remain refused"),
+                && stderr(&out).contains("source review and pins"),
             "{}{}",
             stdout(&out),
             stderr(&out)
@@ -457,6 +459,7 @@ fn a_domain_keeps_a_null_default_while_enum_composite_and_array_null_defaults_ar
         on_server(db, "CREATE FUNCTION app.never(integer) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'nested CHECK ran'; END $$;
             CREATE DOMAIN app.trap AS integer CHECK (app.never(VALUE));
             CREATE TYPE app.pair AS (v app.trap); CREATE DOMAIN app.holder AS app.pair");
+        opt_in(&d, db, true);
         d.table(&declarations("  value: {type: app.value, default: 'NULL'}\n  holder: {type: app.holder, default: 'NULL'}\n"));
         succeeds(d.run(&["plan"]));
         d.commit();
@@ -865,6 +868,7 @@ fn a_null_generated_composite_evaluates_no_attribute_domain_check() {
         d.table(&declarations(generated));
         succeeds(d.run(&["plan"]));
         d.commit();
+        opt_in(&d, db, true);
         let path = plan(&d, db);
         assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
         succeeds(apply_plan(&d, db, &path, false));
@@ -880,6 +884,7 @@ fn a_null_generated_composite_evaluates_no_attribute_domain_check() {
         let next: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
         assert!(next.changes.is_empty());
+        opt_in(&d, db, false);
         d.table(&declarations(&format!(
             "{generated}  h: {{type: app.pair, default: 'ROW(1)::app.pair'}}\n"
         )));
@@ -934,7 +939,11 @@ fn routine_overloads_and_relations_have_distinct_dependency_identities() {
             on_server(db, "DROP FUNCTION app.f(integer); DROP TABLE app.f");
             let d = Demo::new(&format!("refs-identity-{managed}"));
             d.keyed(db);
-            d.table(&declarations("  value: {type: app.value}\n"));
+            d.table(&declarations(if managed == "dependency" {
+                "  value: {type: app.value}\n"
+            } else {
+                ""
+            }));
             let other = if managed == "relation" {
                 "table: app.f\ncolumns:\n  id: {type: integer}\n".to_owned()
             } else {
@@ -974,6 +983,14 @@ fn routine_overloads_and_relations_have_distinct_dependency_identities() {
                 );
             } else {
                 succeeds(bootstrap);
+                // The reference now needs a reviewed plan; the unrelated
+                // overload/relation must still not count as its dependency.
+                opt_in(&d, db, true);
+                d.table(&declarations("  value: {type: app.value}\n"));
+                succeeds(d.run(&["plan"]));
+                d.commit();
+                let reviewed = plan(&d, db);
+                succeeds(apply_plan(&d, db, &reviewed, false));
                 succeeds(d.run(&["verify", "--db", db]));
                 let next: pbps_model::SavedPlan =
                     serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
@@ -1159,6 +1176,7 @@ fn empty_array_defaults_evaluate_no_element_domain_check() {
             d.table(&table(&columns, &overrides));
             succeeds(d.run(&["plan"]));
             d.commit();
+            opt_in(&d, db, true);
             let path = plan(&d, db);
             succeeds(apply_plan(&d, db, &path, false));
             on_server(
@@ -1189,6 +1207,7 @@ fn empty_array_defaults_evaluate_no_element_domain_check() {
                 serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
             assert!(next.changes.is_empty(), "{expr}: {:?}", next.changes);
         }
+        opt_in(&d, db, false);
         for expr in ["ARRAY['x']::app.checked[]", "'{x}'::app.checked[]"] {
             let extra = format!(
                 "{columns}  refused: {{type: 'app.checked[]', default: {}}}\n",
@@ -1283,6 +1302,7 @@ fn stored_generated_empty_arrays_evaluate_no_element_domain_check() {
         d.table(&declarations(generated));
         succeeds(d.run(&["plan"]));
         d.commit();
+        opt_in(&d, db, true);
         let path = plan(&d, db);
         assert_eq!(scalar(db, "SELECT count(*)::bigint FROM app.calls"), 0);
         succeeds(apply_plan(&d, db, &path, false));
@@ -1297,6 +1317,7 @@ fn stored_generated_empty_arrays_evaluate_no_element_domain_check() {
         let next: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(plan(&d, db)).unwrap()).unwrap();
         assert!(next.changes.is_empty());
+        opt_in(&d, db, false);
         d.table(&declarations(&format!(
             "{generated}  refused: {{type: 'app.checked[]', generated: {{expression: \"'{{x}}'::app.checked[]\", stored: true}}}}\n"
         )));
@@ -1397,19 +1418,11 @@ fn empty_arrays_still_evaluate_outer_domain_checks_and_keep_array_type_ownership
             "{}",
             stderr(&out)
         );
-        assert!(
-            !stderr(&out)
-                .split("error:")
-                .last()
-                .unwrap()
-                .contains("app.element_seen"),
-            "{}",
-            stderr(&out)
-        );
         let config = d.dir.join("pbps.yml");
         let mut trusted = std::fs::read_to_string(&config).unwrap();
         trusted.push_str(&format!("trusted_roles: [{}]\n", role.name));
         std::fs::write(config, trusted).unwrap();
+        opt_in(&d, db, true);
         let path = plan(&d, db);
         succeeds(apply_plan(&d, db, &path, false));
         assert_eq!(
@@ -1586,6 +1599,762 @@ fn polymorphic_index_defaults_survive_multiple_domain_layers() {
         assert_ne!(code(&out), 0);
         assert!(
             stderr(&out).contains("record_image_ops"),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+/// The setting belongs to the review policy, not to the measured fill shape.
+fn opt_in(d: &Demo, db: &str, enabled: bool) {
+    if !std::fs::read_to_string(d.dir.join("pbps.yml"))
+        .unwrap()
+        .contains("environments:")
+    {
+        d.keyed(db);
+    }
+    let path = d.dir.join("pbps.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let text = text
+        .lines()
+        .filter(|line| !line.starts_with("pin_type_routines:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path, format!("{text}\npin_type_routines: {enabled}\n")).unwrap();
+}
+
+fn refused_plan(d: &Demo, db: &str, message: &str) {
+    let out = d.run(&["plan", "--db", db]);
+    assert_ne!(code(&out), 0, "{}", stdout(&out));
+    assert!(stderr(&out).contains(message), "{}", stderr(&out));
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn potential_type_paths_are_checked_even_without_an_added_column() {
+    for server in servers() {
+        let role = UntrustedRole::new(&server, "potential");
+        let own = OwnDatabase::new(&server, "potential");
+        let db = own.connection();
+        on_server(
+            db,
+            &format!(
+                "CREATE SCHEMA app; CREATE DOMAIN app.checked AS integer CHECK (VALUE > 0); ALTER DOMAIN app.checked OWNER TO {}; CREATE TABLE app.t (id integer PRIMARY KEY, n app.checked)",
+                role.name
+            ),
+        );
+        let d = Demo::new("potential");
+        d.table(&declarations("  n: {type: app.checked}\n"));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "existing table"]));
+        // No changes at all: eligibility belongs to the referenced type.
+        opt_in(&d, db, true);
+        refused_plan(&d, db, "trusted_roles");
+        on_server(db, "ALTER DOMAIN app.checked OWNER TO CURRENT_USER");
+        let path = plan(&d, db);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(saved.changes.is_empty());
+        on_server(
+            db,
+            &format!(
+                "CREATE TYPE app.free AS ENUM ('ok'); ALTER TYPE app.free OWNER TO {}",
+                role.name
+            ),
+        );
+        d.table(&declarations(
+            "  n: {type: app.checked}\n  free: {type: app.free}\n",
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let admitted = plan(&d, db);
+        succeeds(apply_plan(&d, db, &admitted, false));
+    }
+}
+
+fn root_demo(db: &str, slug: &str, root: &str) -> Demo {
+    on_server(
+        db,
+        &format!(
+            "CREATE SCHEMA app; CREATE SEQUENCE app.calls; {root}; CREATE DOMAIN app.checked AS varchar CHECK (app.root(VALUE))"
+        ),
+    );
+    let d = Demo::new(slug);
+    d.keyed(db);
+    d.table(&declarations(""));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", db]));
+    on_server(db, "INSERT INTO app.t VALUES (1)");
+    d.table(&declarations(
+        "  n: {type: app.checked, default: \"'X'\"}\n",
+    ));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    d
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn any_language_roots_require_source_review_and_the_saved_opt_in() {
+    for server in servers() {
+        for (index, body) in [
+            "LANGUAGE plpgsql AS $$ BEGIN RETURN lower($1) = 'x'; END $$",
+            "LANGUAGE sql AS $$ SELECT lower($1) = 'x' $$",
+            "LANGUAGE sql RETURN lower($1) = 'x'",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let own = OwnDatabase::new(&server, &format!("review_{index}"));
+            let db = own.connection();
+            let d = root_demo(
+                db,
+                "source-review",
+                &format!("CREATE FUNCTION app.root(varchar) RETURNS boolean {body}"),
+            );
+            refused_plan(&d, db, "pin_type_routines");
+            opt_in(&d, db, true);
+            let path = plan(&d, db);
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved.type_routines.len(), 1);
+            assert!(saved.type_routine_pins.is_some());
+            let source = &saved.type_routines[0].definition;
+            assert!(source.contains("lower"), "{source}");
+            for format in ["text", "json"] {
+                let mut args = vec!["explain", "--plan", path.to_str().unwrap()];
+                if format == "json" {
+                    args.extend(["--format", "json"]);
+                }
+                let out = d.run(&args);
+                assert_eq!(code(&out), 0, "{}", stderr(&out));
+                assert!(stdout(&out).contains("lower"));
+                assert!(stdout(&out).contains("whatever they call"));
+            }
+            opt_in(&d, db, false);
+            let changed = apply_plan(&d, db, &path, false);
+            assert_ne!(code(&changed), 0);
+            assert!(
+                stderr(&changed).contains("pin_type_routines changed"),
+                "{}",
+                stderr(&changed)
+            );
+            opt_in(&d, db, true);
+            succeeds(apply_plan(&d, db, &path, false));
+            succeeds(d.run(&["verify", "--db", db]));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn superuser_owned_root_replacements_are_pinned_separately_from_replaceable_callees() {
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "root_pin");
+        let db = own.connection();
+        let d = root_demo(
+            db,
+            "root-pin",
+            "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RETURN true; END $$",
+        );
+        opt_in(&d, db, true);
+        let path = plan(&d, db);
+        on_server(
+            db,
+            "CREATE OR REPLACE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM 1; RETURN true; END $$",
+        );
+        let out = apply_plan(&d, db, &path, false);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("reviewed type routines changed"),
+            "{}",
+            stderr(&out)
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_attribute WHERE attrelid='app.t'::regclass AND attname='n' AND NOT attisdropped"
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_unchanged_opaque_root_has_a_changed_callee_refused_before_any_statement() {
+    for server in servers() {
+        for staged in [false, true] {
+            let role = UntrustedRole::new(&server, "callee");
+            let own = OwnDatabase::new(&server, "callee_pins");
+            let db = own.connection();
+            let d = root_demo(
+                db,
+                "callee-pin",
+                "CREATE FUNCTION app.leaf(varchar) RETURNS boolean LANGUAGE sql AS $$ SELECT true $$; CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RETURN app.leaf($1); END $$",
+            );
+            on_server(
+                db,
+                &format!(
+                    "GRANT USAGE ON SCHEMA app TO {}; ALTER FUNCTION app.leaf(varchar) OWNER TO {}",
+                    role.name, role.name
+                ),
+            );
+            opt_in(&d, db, true);
+            let path = d.dir.join("callee.json");
+            let mut args = vec!["plan", "--db", db, "--out", path.to_str().unwrap()];
+            if staged {
+                args.push("--staged");
+            }
+            succeeds(d.run(&args));
+            let before = text_scalar(
+                db,
+                "SELECT pg_get_functiondef('app.root(varchar)'::regprocedure)",
+            );
+            on_server(
+                db,
+                "CREATE OR REPLACE FUNCTION app.leaf(varchar) RETURNS boolean LANGUAGE sql AS $$ SELECT length($1) >= 0 $$",
+            );
+            assert_eq!(
+                before,
+                text_scalar(
+                    db,
+                    "SELECT pg_get_functiondef('app.root(varchar)'::regprocedure)"
+                )
+            );
+            let out = apply_plan(&d, db, &path, staged);
+            assert_ne!(code(&out), 0);
+            assert!(
+                stderr(&out).contains("pinned routines changed"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_attribute WHERE attrelid='app.t'::regclass AND attname='n' AND NOT attisdropped"
+                ),
+                0
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn a_scoped_path_overload_created_during_a_statement_is_detected_before_commit() {
+    for server in servers() {
+        let role = UntrustedRole::new(&server, "overload");
+        let own = OwnDatabase::new(&server, "scoped_overload");
+        let db = own.connection();
+        let d = root_demo(
+            db,
+            "scoped-overload",
+            "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RETURN lower($1) = 'x'; END $$",
+        );
+        opt_in(&d, db, true);
+        let path = plan(&d, db);
+        // The event trigger is superuser-held: its new overload appears after
+        // the pre-statement check and is replaceable by an ordinary role.
+        on_server(
+            db,
+            &format!(
+                r#"GRANT USAGE ON SCHEMA app TO {role};
+            CREATE FUNCTION app.redirect() RETURNS event_trigger LANGUAGE plpgsql AS $outer$
+            BEGIN
+              IF TG_TAG = 'ALTER TABLE' THEN
+                EXECUTE 'CREATE FUNCTION app.lower(varchar) RETURNS text LANGUAGE plpgsql AS $inner$ BEGIN PERFORM nextval(''app.calls''); RETURN ''x''; END $inner$';
+                EXECUTE 'ALTER FUNCTION app.lower(varchar) OWNER TO {role}';
+              END IF;
+            END $outer$;
+            CREATE EVENT TRIGGER redirect ON ddl_command_start EXECUTE FUNCTION app.redirect()"#,
+                role = role.name
+            ),
+        );
+        let root = text_scalar(
+            db,
+            "SELECT pg_get_functiondef('app.root(varchar)'::regprocedure)",
+        );
+        let out = apply_plan(&d, db, &path, false);
+        assert_ne!(code(&out), 0);
+        assert!(stderr(&out).contains("DEC-319.1"), "{}", stderr(&out));
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            1
+        );
+        assert_eq!(
+            root,
+            text_scalar(
+                db,
+                "SELECT pg_get_functiondef('app.root(varchar)'::regprocedure)"
+            )
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_attribute WHERE attrelid='app.t'::regclass AND attname='n' AND NOT attisdropped"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_proc WHERE pronamespace='app'::regnamespace AND proname='lower'"
+            ),
+            0
+        );
+    }
+}
+
+fn text_scalar(db: &str, sql: &str) -> String {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, db)
+            .await
+            .unwrap();
+        conn.query(sql).await.unwrap()[0]
+            .try_get_at::<&str>(0)
+            .unwrap()
+            .unwrap()
+            .to_owned()
+    })
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn staged_transactional_steps_rollback_changed_roots_and_concurrent_indexes_detect_them_after_commit()
+ {
+    for server in servers() {
+        for online in [false, true] {
+            let own = OwnDatabase::new(&server, "staged_root");
+            let db = own.connection();
+            let original = "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN RETURN true; END $$";
+            let d = root_demo(db, "staged-root", original);
+            opt_in(&d, db, true);
+            let initial = plan(&d, db);
+            succeeds(apply_plan(&d, db, &initial, false));
+            d.table(&format!(
+                "{}strategy: {{online: {online}}}\nindexes:\n  ix_n: {{columns: [n]}}\n",
+                declarations("  n: {type: app.checked, default: \"'X'\"}\n")
+            ));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let path = d.dir.join("staged.json");
+            succeeds(d.run(&[
+                "plan",
+                "--db",
+                db,
+                "--out",
+                path.to_str().unwrap(),
+                "--staged",
+            ]));
+            on_server(
+                db,
+                r#"CREATE FUNCTION app.replace_root() RETURNS event_trigger LANGUAGE plpgsql AS $outer$
+                BEGIN
+                  IF TG_TAG = 'CREATE INDEX' THEN
+                    EXECUTE 'CREATE OR REPLACE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $inner$ BEGIN PERFORM nextval(''app.calls''); RETURN true; END $inner$';
+                  END IF;
+                END $outer$;
+                CREATE EVENT TRIGGER replace_root ON ddl_command_start EXECUTE FUNCTION app.replace_root()"#,
+            );
+            let out = apply_plan(&d, db, &path, true);
+            assert_ne!(code(&out), 0);
+            assert!(
+                stderr(&out).contains("reviewed type routines changed"),
+                "{}",
+                stderr(&out)
+            );
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT count(*)::bigint FROM pg_class WHERE oid=to_regclass('app.ix_n')"
+                ),
+                i64::from(online)
+            );
+            if online {
+                assert!(stderr(&out).contains("committed"), "{}", stderr(&out));
+                let checksum = plan_checksum(&path);
+                let resume = || {
+                    d.run(&[
+                        "apply",
+                        "--db",
+                        db,
+                        "--plan",
+                        path.to_str().unwrap(),
+                        "--checksum",
+                        &checksum,
+                        "--staged",
+                        "--resume",
+                    ])
+                };
+                let refused = resume();
+                assert_ne!(code(&refused), 0);
+                assert!(
+                    stderr(&refused).contains("reviewed type routines changed"),
+                    "{}",
+                    stderr(&refused)
+                );
+                on_server(
+                    db,
+                    &original.replacen("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION", 1),
+                );
+                succeeds(resume());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn immediate_bootstrap_requires_reviewed_plans_for_user_written_type_roots() {
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "bootstrap_review");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app; CREATE FUNCTION app.root(integer) RETURNS boolean LANGUAGE sql AS $$ SELECT true $$; CREATE DOMAIN app.checked AS integer CHECK(app.root(VALUE))",
+        );
+        let d = Demo::new("bootstrap-review");
+        opt_in(&d, db, true);
+        d.table(&declarations("  n: {type: app.checked}\n"));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let out = d.run(&["bootstrap", "--db", db]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("immediate bootstrap cannot run type routines"),
+            "{}",
+            stderr(&out)
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_class WHERE oid=to_regclass('app.t')"
+            ),
+            0
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn reviewed_domain_defaults_execute_at_ddl_time_but_sql_running_builtins_stay_refused() {
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "default_review");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app; CREATE SEQUENCE app.calls; CREATE FUNCTION app.fill() RETURNS integer LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('app.calls'); RETURN 7; END $$; CREATE DOMAIN app.checked AS integer DEFAULT app.fill()",
+        );
+        let d = Demo::new("default-review");
+        d.keyed(db);
+        d.table(&declarations(""));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", db]));
+        // Even without rows, ADD COLUMN evaluates this non-volatile expression
+        // once. Mark the fixture IMMUTABLE to exercise fast-default evaluation.
+        on_server(db, "ALTER FUNCTION app.fill() IMMUTABLE");
+        d.table(&declarations("  n: {type: app.checked}\n"));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        refused_plan(&d, db, "pin_type_routines");
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            0
+        );
+        opt_in(&d, db, true);
+        let path = plan(&d, db);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.type_routines[0].name, "fill");
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            0
+        );
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            1
+        );
+        on_server(
+            db,
+            "CREATE DOMAIN app.sql_trap AS varchar CHECK (pg_catalog.query_to_xml('SELECT 1',true,false,'') IS NOT NULL)",
+        );
+        d.table(&declarations(
+            "  n: {type: app.checked}\n  trap: {type: app.sql_trap}\n",
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        refused_plan(&d, db, "runs SQL or code named by its arguments");
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn set_default_and_create_parse_nested_domain_literals_while_stored_values_do_not_recheck() {
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "definition_input");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app; CREATE SEQUENCE app.calls;
+            CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$;
+            CREATE DOMAIN app.checked AS integer CHECK(app.seen(VALUE));
+            CREATE TYPE app.pair AS (n app.checked)");
+        for sql in [
+            "CREATE TABLE app.m (n app.pair DEFAULT '(1)')",
+            "ALTER TABLE app.m ALTER COLUMN n SET DEFAULT '(2)'",
+            "CREATE TABLE app.a (n app.checked[] DEFAULT '{1}')",
+            "ALTER TABLE app.a ALTER COLUMN n SET DEFAULT '{2}'",
+        ] {
+            on_server(db, "SELECT setval('app.calls',1,false)");
+            on_server(db, sql);
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT last_value::bigint FROM app.calls WHERE is_called"
+                ),
+                1,
+                "{sql}"
+            );
+        }
+        on_server(
+            db,
+            "CREATE TABLE app.stored (n app.checked); INSERT INTO app.stored VALUES (1),(2)",
+        );
+        for sql in [
+            "UPDATE app.stored SET n=n",
+            "ALTER TABLE app.stored ADD CHECK (n>0)",
+            "CREATE INDEX direct ON app.stored(n)",
+        ] {
+            on_server(db, "SELECT setval('app.calls',1,false)");
+            on_server(db, sql);
+            assert_eq!(
+                scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+                0,
+                "{sql}"
+            );
+        }
+        for sql in [
+            "ALTER TABLE app.stored ADD CHECK ((n::integer)::app.checked>0)",
+            "CREATE INDEX recast ON app.stored(((n::integer)::app.checked))",
+        ] {
+            on_server(db, "SELECT setval('app.calls',1,false)");
+            on_server(db, sql);
+            assert_eq!(
+                scalar(
+                    db,
+                    "SELECT last_value::bigint FROM app.calls WHERE is_called"
+                ),
+                2,
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn generated_expression_replacement_rechecks_domains_on_18_and_is_refused_on_16() {
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "expression_input");
+        let db = own.connection();
+        on_server(db, "CREATE SCHEMA app; CREATE SEQUENCE app.calls;
+            CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$;
+            CREATE DOMAIN app.checked AS integer CHECK(app.seen(VALUE));
+            CREATE TABLE app.t (id integer PRIMARY KEY, n app.checked GENERATED ALWAYS AS (id*2) STORED);
+            INSERT INTO app.t (id) VALUES (1),(2)");
+        let major = scalar(db, "SELECT current_setting('server_version_num')::bigint") / 10000;
+        on_server(db, "SELECT setval('app.calls',1,false)");
+        let measured = try_on_server(
+            db,
+            "ALTER TABLE app.t ALTER COLUMN n SET EXPRESSION AS (id*3)",
+        );
+        if major == 16 {
+            assert!(measured.is_err());
+            assert_eq!(
+                scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+                0
+            );
+        } else {
+            measured.unwrap();
+            assert_eq!(scalar(db, "SELECT last_value::bigint FROM app.calls"), 2);
+        }
+        let d = Demo::new("expression-input");
+        d.keyed(db);
+        d.table(&declarations(&format!(
+            "  n: {{type: app.checked, generated: {{expression: 'id*{}', stored: true}}}}\n",
+            if major == 16 { 2 } else { 3 }
+        )));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "generated fixture"]));
+        d.table(&declarations(
+            "  n: {type: app.checked, generated: {expression: 'id*4', stored: true}}\n",
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        on_server(db, "SELECT setval('app.calls',1,false)");
+        refused_plan(&d, db, "pin_type_routines");
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            0
+        );
+        opt_in(&d, db, true);
+        if major == 16 {
+            refused_plan(&d, db, "PostgreSQL 17");
+        } else {
+            let path = plan(&d, db);
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(
+                saved
+                    .changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, pbps_model::Change::AlterColumnExpression { .. }))
+            );
+            assert!(
+                !saved
+                    .changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, pbps_model::Change::AddColumn { .. }))
+            );
+            succeeds(approved_apply(&d, db, &path, &["--allow", "narrowing"]));
+            assert_eq!(scalar(db, "SELECT last_value::bigint FROM app.calls"), 2);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn existing_type_eligibility_covers_metadata_scans_rebuilds_and_baseline_only_references() {
+    for server in servers() {
+        let role = UntrustedRole::new(&server, "all_operations");
+        for case in [
+            "default",
+            "drop-default",
+            "not-null",
+            "check",
+            "index",
+            "rename",
+            "drop",
+            "create",
+        ] {
+            let own = OwnDatabase::new(&server, "operation_eligibility");
+            let db = own.connection();
+            on_server(
+                db,
+                &format!(
+                    "CREATE SCHEMA app; CREATE DOMAIN app.checked AS integer CHECK(VALUE>0); ALTER DOMAIN app.checked OWNER TO {}; CREATE TABLE app.t(id integer PRIMARY KEY,n app.checked DEFAULT 7); INSERT INTO app.t VALUES(1,7)",
+                    role.name
+                ),
+            );
+            let d = Demo::new("operation-eligibility");
+            d.table(&declarations("  n: {type: app.checked, default: '7'}\n"));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&["baseline", "--db", db, "--reason", "existing column"]));
+            match case {
+                "default"=>d.table(&declarations("  n: {type: app.checked, default: '8'}\n")),
+                "drop-default"=>d.table(&declarations("  n: {type: app.checked}\n")),
+                "not-null"=>d.table(&declarations("  n: {type: app.checked, default: '7', nullable: false}\n")),
+                "check"=>d.table(&format!("{}checks:\n  positive: '(n::integer)::app.checked > 0'\n",declarations("  n: {type: app.checked, default: '7'}\n"))),
+                "index"=>d.table(&format!("{}indexes:\n  recast:\n    keys:\n      - expression: '(n::integer)::app.checked'\n",declarations("  n: {type: app.checked, default: '7'}\n"))),
+                "rename"=>{ d.table(&declarations("  renamed: {type: app.checked, default: '7'}\n"));succeeds(d.run(&["rename","app.t.n","renamed"])); },
+                "drop"=>{d.table(&declarations(""));succeeds(d.run(&["drop","app.t.n","--reason","no longer needed"]));},
+                "create"=>std::fs::write(d.dir.join("schema/new.yml"),"table: app.new\ncolumns:\n  n: {type: app.checked}\n").unwrap(),
+                _=>unreachable!(),
+            }
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            refused_plan(&d, db, "trusted_roles");
+            let config = d.dir.join("pbps.yml");
+            let text = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(config, format!("{text}trusted_roles: [{}]\n", role.name)).unwrap();
+            let path = plan(&d, db);
+            let saved: pbps_model::SavedPlan =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert!(
+                !saved
+                    .changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, pbps_model::Change::AddColumn { .. })),
+                "{case}"
+            );
+            succeeds(approved_apply(
+                &d,
+                db,
+                &path,
+                &[
+                    "--allow",
+                    "constraint",
+                    "--allow",
+                    "not-null",
+                    "--allow",
+                    "narrowing",
+                    "--allow",
+                    "rename",
+                    "--allow",
+                    "destructive",
+                ],
+            ));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn an_existing_reference_cannot_be_unpinned_from_a_saved_default_change() {
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "baseline_pin");
+        let db = own.connection();
+        on_server(
+            db,
+            "CREATE SCHEMA app; CREATE DOMAIN app.checked AS varchar CHECK(length(VALUE)>0); CREATE TABLE app.t(id integer PRIMARY KEY,n app.checked DEFAULT 'X')",
+        );
+        let d = Demo::new("baseline-pin");
+        d.table(&declarations(
+            "  n: {type: app.checked, default: \"'X'\"}\n",
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", db, "--reason", "existing reference"]));
+        d.table(&declarations(
+            "  n: {type: app.checked, default: \"'Y'\"}\n",
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let path = plan(&d, db);
+        let mut saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            saved
+                .changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::AlterColumnDefault { .. }))
+        );
+        assert!(
+            !saved
+                .changes
+                .changes
+                .iter()
+                .any(|p| matches!(p.change, pbps_model::Change::AddColumn { .. }))
+        );
+        saved.type_pins.clear();
+        std::fs::write(&path, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
+        let out = apply_plan(&d, db, &path, false);
+        assert_ne!(code(&out), 0, "{}", stdout(&out));
+        assert!(
+            stderr(&out).contains("no type pin for `app.checked`"),
             "{}",
             stderr(&out)
         );

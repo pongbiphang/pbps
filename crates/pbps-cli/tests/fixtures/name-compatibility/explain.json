@@ -21,7 +21,7 @@
     "created_at": "2026-10-17T00:00:00Z",
     "baseline": "hostile-name master fixture",
     "mode": "transactional",
-    "checksum": "0f02cbdbef8ddfa5d9006ddc6dd9f23b840deda37077318c6b5d749247749577",
+    "checksum": "5ca64ba7f57b1c4af157f3fc362764453f47d632b4c4c9a96b3cc024ad32bcd9",
     "change_count": 3,
     "table_count": 1,
     "module_count": 0,
@@ -42,7 +42,7 @@
         ]
       }
     ],
-    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 0f02cbdbef8ddfa5d9006ddc6dd9f23b840deda37077318c6b5d749247749577 --allow destructive,not-null",
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 5ca64ba7f57b1c4af157f3fc362764453f47d632b4c4c9a96b3cc024ad32bcd9 --allow destructive,not-null",
     "probes": [
       "existing NULLs in app.name\nline\r\u001b[31m\\‮名前.name\nline\r\u001b[31m\\‮名前1, which NOT NULL would reject"
     ],

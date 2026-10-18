@@ -3020,6 +3020,10 @@ pub struct PlanData {
     risks: Vec<&'static str>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     connected_checks: Vec<engine::ConnectedCheck>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    type_routines: Vec<pbps_model::TypeRoutine>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    type_routine_approval: Option<String>,
     /// Each step a planning rule added, with what it serves and why
     /// (DEC-1958.3). Reported, never sealed: the saved plan does not carry
     /// it. Absent when no rule added a step.
@@ -3632,6 +3636,8 @@ fn cmd_plan(
                 roles: report::touched_roles(&names),
                 risks: cs.risks().iter().map(|r| r.as_str()).collect(),
                 connected_checks: Vec::new(),
+                type_routines: Vec::new(),
+                type_routine_approval: None,
                 origins: report::origins(&cs),
                 cost: None,
                 resolver_selection: None,

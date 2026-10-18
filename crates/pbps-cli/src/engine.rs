@@ -5456,9 +5456,14 @@ pub async fn seal_type_pins(
     schemas: &[&Schema],
     changes: &ChangeSet,
     trusted: &BTreeSet<String>,
+    pin_routines: bool,
 ) -> anyhow::Result<Vec<pbps_model::TypePin>> {
     match conn.driver() {
-        Driver::Postgres => Ok(pbps_pg::type_refs::seal(conn, schemas, changes, trusted).await?),
+        Driver::Postgres => {
+            let pins = pbps_pg::type_refs::seal(conn, schemas, changes, trusted).await?;
+            type_input_routines(conn, &pins, trusted, pin_routines, false).await?;
+            Ok(pins)
+        }
         Driver::Mssql if trusted.is_empty() => Ok(Vec::new()),
         Driver::Mssql => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
     }
@@ -5469,10 +5474,22 @@ pub async fn check_type_pins(
     conn: &mut Conn,
     plan: &pbps_model::SavedPlan,
     trusted: &BTreeSet<String>,
+    required: &BTreeSet<pbps_model::TypeRef>,
     within_transaction: bool,
 ) -> anyhow::Result<()> {
     if &plan.trusted_roles != trusted {
         anyhow::bail!("trusted_roles changed since planning; plan again against the database");
+    }
+    for reference in required {
+        if !plan
+            .type_pins
+            .iter()
+            .any(|pin| pin.schema == reference.schema() && pin.name == reference.name())
+        {
+            anyhow::bail!(
+                "plan has no type pin for `{reference}`; plan again against the database"
+            );
+        }
     }
     match conn.driver() {
         Driver::Postgres => {
@@ -5492,25 +5509,39 @@ pub async fn check_type_pins(
     Ok(())
 }
 
-/// Refuse unsafe input paths before adding reference columns, regardless of row presence.
-pub async fn check_added_type_paths(
+/// Read the potential path of every pinned type, including unchanged columns.
+pub async fn type_input_routines(
     conn: &mut Conn,
-    changes: &ChangeSet,
+    pins: &[pbps_model::TypePin],
     trusted: &BTreeSet<String>,
-    within_transaction: bool,
-) -> anyhow::Result<()> {
+    pin_routines: bool,
+    inside: bool,
+) -> anyhow::Result<BTreeSet<i64>> {
     match conn.driver() {
         Driver::Postgres => {
-            let within = if within_transaction {
+            let references = pins
+                .iter()
+                .map(|p| pbps_model::TypeRef::new(&p.schema, &p.name))
+                .collect::<Result<Vec<_>, _>>()?;
+            let within = if inside {
                 pbps_pg::pins::Within::CallersTransaction
             } else {
                 pbps_pg::pins::Within::OwnTransaction
             };
-            pbps_pg::type_refs::check_added(conn, within, changes, trusted).await?;
+            Ok(
+                pbps_pg::type_refs::input_routines(
+                    conn,
+                    within,
+                    &references,
+                    trusted,
+                    pin_routines,
+                )
+                .await?,
+            )
         }
-        Driver::Mssql => {}
+        Driver::Mssql if !pin_routines && pins.is_empty() => Ok(BTreeSet::new()),
+        Driver::Mssql => anyhow::bail!("pin_type_routines is supported only on PostgreSQL"),
     }
-    Ok(())
 }
 
 /// Assert offline type prerequisites before bootstrap creates any object.
@@ -5534,6 +5565,7 @@ pub async fn recheck_type_prerequisites(
     conn: &mut Conn,
     expected: &[pbps_model::TypePin],
     changes: &ChangeSet,
+    trusted: &BTreeSet<String>,
     inside: bool,
 ) -> anyhow::Result<()> {
     match conn.driver() {
@@ -5544,9 +5576,15 @@ pub async fn recheck_type_prerequisites(
                 pbps_pg::pins::Within::OwnTransaction
             };
             pbps_pg::type_refs::check(conn, within, expected, changes).await?;
+            type_input_routines(conn, expected, trusted, false, inside).await?;
         }
         Driver::Mssql if expected.is_empty() => {}
         Driver::Mssql => anyhow::bail!("SQL Server does not support type references"),
     }
     Ok(())
+}
+
+/// Column references in a recorded or declared schema.
+pub fn type_references(schema: &Schema) -> BTreeSet<pbps_model::TypeRef> {
+    pbps_pg::type_refs::references(&[schema], &ChangeSet::default())
 }

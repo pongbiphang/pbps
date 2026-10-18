@@ -1,5 +1,4 @@
-//! Name spellings captured on master 1c3db445 before #2084 step 1a.
-//! Format versions and dependent checksums track the current plan and state formats.
+//! Captured on master 1c3db445 before #2084 step 1a changed name formatting.
 //! Byte comparisons pin field order as well as values and approved checksums.
 
 use pbps_dialect::Dialect;

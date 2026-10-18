@@ -1943,3 +1943,10 @@ Pinned by `a_depends_on_cycle_is_refused_with_every_member_named`
 (`crates/pbps-cli/tests/flow.rs`). A broken acyclic declaration is still the
 verifier's: `a_broken_depends_on_is_refused_as_declared`
 (`crates/pbps-diff/src/order/tests.rs`).
+
+
+<a id="dec-2181-3"></a>
+
+**DEC-2181.3. Review opaque roots; rely on DEC-319.1 for their callees.** Do not enumerate callees or require a function-level `search_path`: PL/pgSQL and string SQL have no complete catalog dependency closure on PostgreSQL 16 and 18. Review approves the shown routine, whatever it calls as those routines stand at plan time, and SQL built from data which pbps cannot show. Sessions use DEC-1564.1's empty path, but inside an emitted statement's scoped `search_path`, an unqualified call can resolve to a routine created during apply. DEC-319.1's broad pins detect that and roll back before COMMIT in transactional apply, or detect it after a nontransactional staged step: detection, not prevention. Measured on 16 and 18, an unchanged opaque root's replaced callee is refused before statements, and a newly created scoped-path overload can execute before the closing pin check rolls back the statement.
+
+Pinned by `an_unchanged_opaque_root_has_a_changed_callee_refused_before_any_statement` and `a_scoped_path_overload_created_during_a_statement_is_detected_before_commit`, live on 16 and 18.

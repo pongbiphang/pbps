@@ -160,10 +160,12 @@ target: the finding is then `doctor.partition-runway` with the `pbps plan` remed
 (#2036). A count of partitions has no calendar or type to leave.
 
 `trusted_roles: [platform_owner]` adds PostgreSQL roles trusted to own evaluated
-type CHECKs and defaults; it never admits user functions. The plan records the
+type CHECKs and defaults; it extends owner trust only. The plan records the
 list and apply refuses a changed list or missing role (DEC-1523.1).
-Every added referenced-type column is checked regardless of row presence:
-fast defaults evaluate even on empty tables (DEC-1523.4).
+Every referenced type must have an eligible potential input path, independent
+of change kind, fill or row presence (DEC-2181.1). `pin_type_routines: true`
+admits user-written roots only through a saved plan showing their complete
+source and pinning them; apply refuses a changed setting (DEC-2181.2–3).
 
 The `policies:` block selects built-in rules and their severities and records
 suppressions — a rule id, a reason and an optional expiry — with parameters

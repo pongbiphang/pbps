@@ -29,14 +29,32 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
             }
             Change::AddColumn { column, .. } => types.push(&column.ty),
             Change::AlterColumnType { from, to, .. } => types.extend([from, to]),
-            Change::AlterColumnNullability { ty, .. } => types.push(ty),
+            Change::AlterColumnNullability { ty, .. } | Change::AlterColumnNumbering { ty, .. } => {
+                types.push(ty)
+            }
+            Change::InsertRow { types: carried, .. } => types.extend(carried.values()),
+            Change::UpdateRow {
+                types: before,
+                after_types,
+                key_type,
+                ..
+            }
+            | Change::DeleteRow {
+                types: before,
+                after_types,
+                key_type,
+                ..
+            } => {
+                types.extend(before.values());
+                types.extend(after_types.values());
+                types.extend(key_type);
+            }
             Change::DropTable { .. }
             | Change::RenameTable { .. }
             | Change::DropColumn { .. }
             | Change::RenameColumn { .. }
             | Change::AlterColumnDefault { .. }
             | Change::AlterColumnExpression { .. }
-            | Change::AlterColumnNumbering { .. }
             | Change::AddComputedColumn { .. }
             | Change::DropComputedColumn { .. }
             | Change::SetColumnDeprecated { .. }
@@ -55,9 +73,6 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
             | Change::DropCheck { .. }
             | Change::AddIndex { .. }
             | Change::DropIndex { .. }
-            | Change::InsertRow { .. }
-            | Change::UpdateRow { .. }
-            | Change::DeleteRow { .. }
             | Change::SetDataMode { .. }
             | Change::SetEnsureKeys { .. }
             | Change::CreateModule { .. }
@@ -292,39 +307,48 @@ fn fill(column: &Column) -> Fill {
     }
 }
 
-/// Fast defaults evaluate even on empty tables, so every addition is checked (DEC-1523.4).
-pub async fn check_added(
+/// Potential input paths, independent of the change kind or fill (DEC-2181.1).
+/// Both construction and the declared type's own DEFAULT must be eligible.
+pub async fn input_routines(
     conn: &mut Conn,
     within: Within,
-    changes: &ChangeSet,
+    references: &[TypeRef],
     trusted: &BTreeSet<String>,
-) -> Result<(), DbError> {
-    for planned in &changes.changes {
-        let Change::AddColumn { column, .. } = &planned.change else {
-            continue;
-        };
-        let Some(reference) = column.ty.type_ref() else {
-            continue;
-        };
-        let types = read(conn, within, std::slice::from_ref(reference)).await?;
-        let own_default = !matches!(column.value_source, pbps_model::ValueSource::None);
-        let added =
-            crate::input_path::Added::new(&types[0], own_default).array(column.ty.is_array());
-        let added = match fill(column) {
-            Fill::Null => added.null_fill(),
-            Fill::EmptyArray => added.empty_array_fill(),
-            Fill::Constructs => added,
-        };
-        let trusted: Vec<_> = trusted.iter().cloned().collect();
-        let answers = crate::input_path::read(conn, within, &trusted, &[added]).await;
-        let answer = answers
-            .first()
-            .ok_or_else(|| failed("the input-path read returned no answer"))?;
-        if let Some(why) = answer.refusal(reference) {
+    pin_routines: bool,
+) -> Result<BTreeSet<i64>, DbError> {
+    use crate::input_path::{Added, InputPath, Reason, Why};
+    let types = read(conn, within, references).await?;
+    let added: Vec<_> = types
+        .iter()
+        .flat_map(|ty| [Added::new(ty, true), Added::new(ty, false)])
+        .collect();
+    let roles: Vec<_> = trusted.iter().cloned().collect();
+    let answers = crate::input_path::read(conn, within, &roles, &added).await;
+    if answers.len() != added.len() {
+        return Err(failed("the input-path read returned an incomplete answer"));
+    }
+    let mut roots = BTreeSet::new();
+    for (index, mut answer) in answers.into_iter().enumerate() {
+        if let InputPath::Refused(reasons) = &mut answer {
+            reasons.retain(|reason| {
+                if let Reason::Routine(routine) = reason
+                    && routine.why == Why::NotBuiltin
+                    && pin_routines
+                {
+                    roots.insert(routine.oid);
+                    return false;
+                }
+                true
+            });
+            if reasons.is_empty() {
+                continue;
+            }
+        }
+        if let Some(why) = answer.refusal(&references[index / 2]) {
             return Err(failed(why));
         }
     }
-    Ok(())
+    Ok(roots)
 }
 
 /// Offline reconstruction asserts prerequisites before it creates any object.

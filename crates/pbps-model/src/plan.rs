@@ -257,7 +257,8 @@ use crate::zone::SessionZone;
 /// which a `Grant` or `Revoke` can carry and an older build cannot read: it
 /// should refuse the plan as a newer one, not as malformed.
 /// 45 adds created-table policy and row-security operations (DEC-1172.2).
-/// Version 46 admits user-type references and pins their prerequisites (DEC-1523.2).
+/// Version 46 admits user-type references and pins their prerequisites (DEC-1523.2),
+/// including reviewed input-path routine sources and pins (DEC-2181.2).
 pub const CURRENT_VERSION: u32 = 46;
 
 /// Where a plan came from. Database provenance permits apply in principle;
@@ -438,9 +439,31 @@ pub struct SavedPlan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_pins: Vec<TypePin>,
 
+    /// Review and pin user-written roots on referenced types' potential input paths.
+    /// Omit false to preserve historical bytes; true remains checksum-pinned.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pin_type_routines: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_routines: Vec<TypeRoutine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_routine_pins: Option<RoutinePins>,
+
     /// The project roles trusted when the input-path gate admitted this plan.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub trusted_roles: std::collections::BTreeSet<String>,
+}
+
+/// Complete catalog source of a reviewed input-path root (DEC-2181.2).
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
+pub struct TypeRoutine {
+    pub oid: i64,
+    pub schema: String,
+    pub name: String,
+    pub arguments: Vec<String>,
+    pub definition: String,
 }
 
 /// A referenced type's identity and unkeyed canonical-definition digest.
@@ -511,6 +534,9 @@ impl SavedPlan {
             data: BTreeMap::new(),
             routine_pins: None,
             type_pins: Vec::new(),
+            pin_type_routines: false,
+            type_routines: Vec::new(),
+            type_routine_pins: None,
             trusted_roles: Default::default(),
         }
     }
@@ -1052,6 +1078,50 @@ mod tests {
         let back: SavedPlan = serde_json::from_value(json).unwrap();
         assert_eq!(back.mode, PlanMode::Transactional);
     }
+    #[test]
+    fn reviewed_source_opt_in_and_pins_are_part_of_the_approved_checksum() {
+        let mut plan = plan_over(ChangeSet::default());
+        assert!(
+            serde_json::to_value(&plan)
+                .unwrap()
+                .get("pin_type_routines")
+                .is_none()
+        );
+        let before = plan.checksum();
+        plan.pin_type_routines = true;
+        assert_eq!(
+            serde_json::to_value(&plan).unwrap()["pin_type_routines"],
+            true
+        );
+        assert_ne!(before, plan.checksum());
+        let before = plan.checksum();
+        plan.type_routines.push(TypeRoutine {
+            oid: 40001,
+            schema: "app".into(),
+            name: "checked".into(),
+            arguments: vec!["integer".into()],
+            definition:
+                "CREATE FUNCTION app.checked(integer) RETURNS boolean LANGUAGE sql RETURN true"
+                    .into(),
+        });
+        assert_ne!(before, plan.checksum());
+        let before = plan.checksum();
+        plan.type_routine_pins = Some(RoutinePins {
+            key_id: "key".into(),
+            server_version: "180006".into(),
+            schemas: Vec::new(),
+        });
+        assert_ne!(before, plan.checksum());
+        let json = serde_json::to_string(&plan).unwrap();
+        assert_eq!(serde_json::from_str::<SavedPlan>(&json).unwrap(), plan);
+        assert!(
+            serde_json::from_str::<SavedPlan>(
+                &json.replace("\"oid\":40001", "\"oid\":40001,\"unknown\":0")
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn type_pins_and_declared_trust_survive_serialization_and_change_the_approved_checksum() {
         let mut plan = plan_over(ChangeSet::default());

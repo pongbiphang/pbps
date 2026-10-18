@@ -51,6 +51,10 @@ pub struct Explanation {
     /// The checksum `apply` will re-compute and refuse a mismatch on.
     pub checksum: String,
     pub change_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_routines: Vec<pbps_model::TypeRoutine>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_routine_approval: Option<String>,
     pub table_count: usize,
     /// Counted apart from tables: `Change::table()` returns a module's own name
     /// for a module change, so folding them together called a one-view plan
@@ -394,8 +398,20 @@ fn explain(
         )
     };
 
-    let preflight = dialect.preflight(&names);
+    let mut preflight = dialect.preflight(&names);
+    if !plan.type_routines.is_empty() {
+        for probe in preflight.probes.drain(..) {
+            preflight.unchecked.push(pbps_dialect::Unchecked {
+                description: probe.description,
+                reason: "requires reviewed type routines; checked only during apply (DEC-2181.2)"
+                    .to_owned(),
+            });
+        }
+    }
     Ok(Explanation {
+        type_routines: plan.type_routines.clone(),
+        type_routine_approval: (!plan.type_routines.is_empty())
+            .then(|| crate::pins::TYPE_ROUTINE_APPROVAL.to_owned()),
         applyable,
         dialect: plan.dialect.clone(),
         created_at: plan.created_at.clone(),
@@ -604,6 +620,7 @@ fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
 /// the literals below; none comes from a value.
 fn render(plan: &SavedPlan, e: &Explanation) -> String {
     let mut out = String::from("Plan\n");
+    out.push_str(&crate::pins::reviewed_sources(&plan.type_routines));
     out.push_str(&format!(
         "  origin      {}\n",
         match plan.origin {

@@ -27,10 +27,12 @@ const RULE: &str = "pbps/external-routine-pin/v1";
 pub enum Check {
     /// Under the lock, before the pre-flight probes, with no transaction open.
     BeforeProbes,
-    /// Inside the apply transaction, before its first statement.
+    /// Inside the apply transaction, before a statement.
     BeforeStatements,
     /// Inside the apply transaction, after the read-back and before `record`.
     BeforeRecording,
+    /// After recording, still inside the transaction, before COMMIT.
+    BeforeCommit,
     /// A staged step, before its statement runs. No transaction is open.
     BeforeStep { step: usize, total: usize },
     /// A staged step, after its statement committed and before its checkpoint.
@@ -46,9 +48,10 @@ pub enum Check {
 impl Check {
     fn within(self) -> pbps_pg::pins::Within {
         match self {
-            Check::BeforeStatements | Check::BeforeRecording | Check::BeforeStepCommits { .. } => {
-                pbps_pg::pins::Within::CallersTransaction
-            }
+            Check::BeforeStatements
+            | Check::BeforeRecording
+            | Check::BeforeCommit
+            | Check::BeforeStepCommits { .. } => pbps_pg::pins::Within::CallersTransaction,
             Check::BeforeProbes
             | Check::BeforeStep { .. }
             | Check::AfterStep { .. }
@@ -59,8 +62,9 @@ impl Check {
     fn when(self) -> String {
         match self {
             Check::BeforeProbes => "before the pre-flight probes".to_owned(),
-            Check::BeforeStatements => "before the first statement".to_owned(),
+            Check::BeforeStatements => "before a statement".to_owned(),
             Check::BeforeRecording => "after the statements, before recording".to_owned(),
+            Check::BeforeCommit => "before COMMIT".to_owned(),
             Check::BeforeStep { step, total } => format!("before statement {step} of {total}"),
             Check::AfterStep { step, total } => {
                 format!("after statement {step} of {total} committed")
@@ -70,6 +74,26 @@ impl Check {
                 format!("after statement {step} of {total} ran, before it committed")
             }
         }
+    }
+}
+
+/// The recorded scope, independent of the saved plan's optional pin fields.
+pub struct Managed {
+    pub modules: BTreeSet<ModuleId>,
+    pub references: BTreeSet<pbps_model::TypeRef>,
+}
+
+/// The approved artifact and its environment, borrowed at execution boundaries.
+pub struct Approved<'a> {
+    pub project: &'a Project,
+    pub target: &'a Target,
+    pub plan: &'a pbps_model::SavedPlan,
+    pub managed: &'a Managed,
+}
+
+impl Approved<'_> {
+    pub async fn check(&self, conn: &mut Conn, at: Check) -> anyhow::Result<()> {
+        check(conn, self.project, self.target, self.plan, self.managed, at).await
     }
 }
 
@@ -123,16 +147,18 @@ pub async fn check(
     project: &Project,
     target: &Target,
     plan: &pbps_model::SavedPlan,
-    managed: &BTreeSet<ModuleId>,
+    managed: &Managed,
     at: Check,
 ) -> anyhow::Result<()> {
     crate::engine::check_type_pins(
         conn,
         plan,
         &project.config.trusted_roles,
+        &managed.references,
         matches!(at.within(), pbps_pg::pins::Within::CallersTransaction),
     )
     .await?;
+    check_selected(conn, project, target, plan, at).await?;
     let pins = plan.routine_pins.as_ref();
     if conn.driver() != Driver::Postgres {
         return Ok(());
@@ -145,7 +171,7 @@ pub async fn check(
                 at.when()
             )
         })?;
-    let now = unmanaged_by_schema(read.routines, managed);
+    let now = unmanaged_by_schema(read.routines, &managed.modules);
     let refuse = |what: String| -> anyhow::Error {
         anyhow::anyhow!(
             "{what}, found {} on `{}`.\nA routine this plan can run was changed after the plan \
@@ -198,6 +224,105 @@ pub async fn check(
         "pinned routines changed in {}",
         changed.join(", ")
     )))
+}
+
+/// Seal reviewed roots with the same canonical catalog rows and HMAC as
+/// DEC-319.1, including roots excluded from that rule's broad replaceable set.
+pub async fn seal_selected(
+    conn: &mut Conn,
+    project: &Project,
+    target: &Target,
+    types: &[pbps_model::TypePin],
+) -> anyhow::Result<(Vec<pbps_model::TypeRoutine>, Option<RoutinePins>)> {
+    let roots = crate::engine::type_input_routines(
+        conn,
+        types,
+        &project.config.trusted_roles,
+        project.config.pin_type_routines,
+        false,
+    )
+    .await?;
+    if roots.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let (read, sources) = pbps_pg::pins::selected(
+        conn,
+        pbps_pg::pins::Within::OwnTransaction,
+        &roots.into_iter().collect::<Vec<_>>(),
+    )
+    .await?;
+    let key = key(project, target).map_err(anyhow::Error::msg)?;
+    let pins = RoutinePins {
+        key_id: key.id().as_str().to_owned(),
+        server_version: read.server_version,
+        schemas: digests(&key, &unmanaged_by_schema(read.routines, &BTreeSet::new())),
+    };
+    Ok((sources, Some(pins)))
+}
+
+async fn check_selected(
+    conn: &mut Conn,
+    project: &Project,
+    target: &Target,
+    plan: &pbps_model::SavedPlan,
+    at: Check,
+) -> anyhow::Result<()> {
+    if project.config.pin_type_routines != plan.pin_type_routines {
+        bail!("pin_type_routines changed since planning; plan again against the database");
+    }
+    let roots = crate::engine::type_input_routines(
+        conn,
+        &plan.type_pins,
+        &project.config.trusted_roles,
+        plan.pin_type_routines,
+        matches!(at.within(), pbps_pg::pins::Within::CallersTransaction),
+    )
+    .await?;
+    let expected: BTreeSet<_> = plan.type_routines.iter().map(|r| r.oid).collect();
+    if roots != expected || expected.len() != plan.type_routines.len() {
+        bail!("the referenced types' reviewed routine set changed; plan again (DEC-2181.2)");
+    }
+    let Some(pins) = &plan.type_routine_pins else {
+        if roots.is_empty() {
+            return Ok(());
+        }
+        bail!("the plan has no reviewed type routine pins; plan again");
+    };
+    let (read, sources) =
+        pbps_pg::pins::selected(conn, at.within(), &roots.into_iter().collect::<Vec<_>>()).await?;
+    let key = key(project, target).map_err(anyhow::Error::msg)?;
+    let now = digests(&key, &unmanaged_by_schema(read.routines, &BTreeSet::new()));
+    if pins.key_id != key.id().as_str()
+        || pins.server_version != read.server_version
+        || pins.schemas != now
+        || sources != plan.type_routines
+    {
+        bail!(
+            "reviewed type routines changed, found {} on `{}`; plan again (DEC-2181.2)",
+            at.when(),
+            target.label
+        );
+    }
+    Ok(())
+}
+
+/// Full sources are review data; terminal rendering escapes control characters.
+pub const TYPE_ROUTINE_APPROVAL: &str = "Approving this plan approves the shown routines, whatever they call as those routines stand at plan time, and any SQL they build from data that pbps cannot show.";
+
+pub fn reviewed_sources(routines: &[pbps_model::TypeRoutine]) -> String {
+    if routines.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "{TYPE_ROUTINE_APPROVAL}\nPlan-time probes requiring these routines are unchecked until source review; apply checks them.\n"
+    );
+    for routine in routines {
+        out.push_str(&format!(
+            "{}\n",
+            pbps_model::escape::Escaped(&routine.definition)
+        ));
+    }
+    out
 }
 
 /// Each schema's routines that the plan does not manage, as the canonical

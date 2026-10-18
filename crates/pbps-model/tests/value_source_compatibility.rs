@@ -84,8 +84,8 @@ fn artifacts() -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
         ChangeSet { changes },
         ids.clone(),
     );
-    // These bytes pin the historical value-source wire layout. Later envelope
-    // formats must not silently change the fixture's versions or checksums.
+    // These bytes pin the historical value-source wire layout. A later plan
+    // format must not silently change the fixture's version or checksum.
     plan.version = 36;
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids.clone(), "fixture");
     // Pin this historical envelope as the plan above is pinned. Adding
