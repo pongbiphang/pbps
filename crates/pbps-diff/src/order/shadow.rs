@@ -41,37 +41,9 @@ pub fn analyse(
     dialect: &dyn Dialect,
 ) -> Shadowed {
     let mut unowned = Vec::new();
-    // A foreign key the plan drops and adds again (a primary-key rebuild
-    // restores the keys that point at it) is absent while the rows between
-    // are written, so it does not order them. Their effects are read from a
-    // baseline without it; the plan's lifetime of the key is not modelled
-    // beyond that (a row before the drop or after the restore is not ordered
-    // by it either, which is narrow, not wrong).
-    let rebuilt = rebuilt_foreign_keys(operations, owners, before);
-    let without = (!rebuilt.is_empty()).then(|| {
-        let mut schema = before.schema.clone();
-        for (table, name) in &rebuilt {
-            if let Some(table) = schema.tables.get_mut(table) {
-                table.foreign_keys.remove(name);
-            }
-        }
-        schema
-    });
     let effects = operations
         .iter()
         .map(|op: &Operation| {
-            let before = match (&without, op.change()) {
-                (
-                    Some(schema),
-                    pbps_model::Change::InsertRow { .. }
-                    | pbps_model::Change::UpdateRow { .. }
-                    | pbps_model::Change::DeleteRow { .. },
-                ) => Snapshot {
-                    schema,
-                    ids: before.ids,
-                },
-                _ => before,
-            };
             let portable = effects(op, owners, before, after);
             let engine = dialect.engine_effects(op, owners, before, after);
             match (portable, engine) {
@@ -84,39 +56,6 @@ pub fn analyse(
         })
         .collect();
     Shadowed { effects, unowned }
-}
-
-/// The baseline's foreign keys, by table and name, that the plan both drops
-/// and adds.
-fn rebuilt_foreign_keys(
-    operations: &Operations,
-    owners: &dyn Owners,
-    before: Snapshot<'_>,
-) -> std::collections::BTreeSet<(pbps_model::TableName, String)> {
-    use pbps_model::Change;
-    let mut dropped = std::collections::BTreeSet::new();
-    let mut added = std::collections::BTreeSet::new();
-    for op in operations.iter() {
-        let (Change::DropForeignKey { table, name } | Change::AddForeignKey { table, name, .. }) =
-            op.change()
-        else {
-            continue;
-        };
-        // Named by the baseline's spelling of the table.
-        let Ok(uid) = owners.table(table, op.origin().spelling()) else {
-            continue;
-        };
-        let Some(base) = before.ids.tables.get(&uid) else {
-            continue;
-        };
-        let set = if matches!(op.change(), Change::DropForeignKey { .. }) {
-            &mut dropped
-        } else {
-            &mut added
-        };
-        set.insert((base.clone(), name.clone()));
-    }
-    dropped.intersection(&added).cloned().collect()
 }
 
 impl Shadowed {
@@ -563,73 +502,4 @@ fn sink(operations: &Operations, lines: &[String], fail: bool) {
         }
         None => {}
     }
-}
-
-/// Classifies the resolver graph's constraints against the effects' edges,
-/// over the steps in the order the graph numbered them. Written to the
-/// `PBPS_ORDER_SHADOW` file only; it never fails a test.
-#[cfg(any(test, debug_assertions))]
-pub(crate) fn observe_constraints(
-    base: crate::Side<'_>,
-    desired: crate::Side<'_>,
-    dialect: &dyn Dialect,
-    hints: &pbps_model::Hints,
-    logical: &pbps_model::ChangeSet,
-    operations: &Operations,
-    constraints: &std::collections::BTreeSet<pbps_model::resolver::OrderEdge>,
-) {
-    use pbps_model::operation::PlanOwners;
-    use pbps_model::plan_names::PlanNames;
-    if std::env::var_os("PBPS_ORDER_SHADOW").is_none() {
-        return;
-    }
-    let Ok(names) = PlanNames::of(&logical.changes, desired.ids) else {
-        return;
-    };
-    let owners = PlanOwners::new(names, base.ids, desired.ids);
-    let before = Snapshot {
-        schema: base.schema,
-        ids: base.ids,
-    };
-    let after = Snapshot {
-        schema: desired.schema,
-        ids: desired.ids,
-    };
-    let baseline = Baseline::of(before, &owners);
-    let shadowed = analyse(operations, &owners, before, after, dialect);
-    let g = graph(
-        operations.as_slice(),
-        &shadowed.effects,
-        &baseline,
-        &hints.module_deps,
-        Checks::ALL,
-    );
-    let (classified, added) =
-        super::compare::classify(operations, constraints, &g, &shadowed.effects);
-    let ops = operations.as_slice();
-    let name = |i: usize| {
-        let mut text = format!("{}:{:?}", ops[i].id(), ops[i].change());
-        clip(&mut text, 330);
-        text
-    };
-    let mut lines = Vec::new();
-    for c in &classified {
-        lines.push(format!(
-            "cmp {:?} {:?} | {} -> {} | {}",
-            c.class,
-            c.edge.reason,
-            name(c.edge.before),
-            name(c.edge.after),
-            c.why
-        ));
-    }
-    for (a, b, because) in &added {
-        lines.push(format!(
-            "added {:?} | {} -> {}",
-            because,
-            name(*a),
-            name(*b)
-        ));
-    }
-    sink(operations, &lines, false);
 }

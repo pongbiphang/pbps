@@ -391,37 +391,28 @@ fn assert_explained(d: &Demo, artifact: &std::path::Path) {
         "    unaffected  module app.f(numeric)",
         "    rebuilt     module app.h(numeric)",
         "  order",
-        "    #1 create_module app.f(integer) before #2 public_execution app.f(integer) (restoration)",
+        "    #1 create_module app.f(integer) before #2 public_execution app.f(integer) (structural)",
         "    #1 create_module app.f(integer) before #4 create_module app.v (binding)",
         "    #1 create_module app.f(integer) before #7 create_module app.h(numeric) (binding)",
-        "    #1 create_module app.f(integer) before #13 alter_column_default app.t (binding)",
-        "    #1 create_module app.f(integer) before #14 add_check app.t (binding)",
+        "    #1 create_module app.f(integer) before #11 add_check app.t (binding)",
+        "    #1 create_module app.f(integer) before #14 alter_column_default app.t (binding)",
         "    #1 create_module app.f(integer) before #15 add_index app.t (binding)",
-        "    #2 public_execution app.f(integer) before #13 alter_column_default app.t (authorization)",
-        "    #2 public_execution app.f(integer) before #14 add_check app.t (authorization)",
+        "    #2 public_execution app.f(integer) before #11 add_check app.t (authorization)",
+        "    #2 public_execution app.f(integer) before #14 alter_column_default app.t (authorization)",
         "    #2 public_execution app.f(integer) before #15 add_index app.t (authorization)",
         "    #3 drop_module app.v before #4 create_module app.v (identity)",
-        "    #3 drop_module app.v before #4 create_module app.v (restoration)",
         "    #5 drop_module app.w before #6 drop_module app.h(numeric) (binding)",
         "    #5 drop_module app.w before #9 create_module app.w (identity)",
-        "    #5 drop_module app.w before #9 create_module app.w (restoration)",
         "    #6 drop_module app.h(numeric) before #7 create_module app.h(numeric) (identity)",
-        "    #6 drop_module app.h(numeric) before #7 create_module app.h(numeric) (restoration)",
-        "    #7 create_module app.h(numeric) before #8 public_execution app.h(numeric) (restoration)",
+        "    #7 create_module app.h(numeric) before #8 public_execution app.h(numeric) (structural)",
         "    #7 create_module app.h(numeric) before #9 create_module app.w (binding)",
-        "    #10 drop_check app.t before #12 alter_column_default app.t (binding)",
+        "    #10 drop_check app.t before #11 add_check app.t (identity)",
         "    #10 drop_check app.t before #13 alter_column_default app.t (binding)",
-        "    #10 drop_check app.t before #13 alter_column_default app.t (restoration)",
-        "    #10 drop_check app.t before #14 add_check app.t (restoration)",
-        "    #10 drop_check app.t before #15 add_index app.t (restoration)",
-        "    #11 drop_index app.t before #12 alter_column_default app.t (binding)",
-        "    #11 drop_index app.t before #13 alter_column_default app.t (binding)",
-        "    #11 drop_index app.t before #13 alter_column_default app.t (restoration)",
-        "    #11 drop_index app.t before #14 add_check app.t (restoration)",
-        "    #11 drop_index app.t before #15 add_index app.t (restoration)",
-        "    #12 alter_column_default app.t before #13 alter_column_default app.t (restoration)",
-        "    #12 alter_column_default app.t before #14 add_check app.t (restoration)",
-        "    #12 alter_column_default app.t before #15 add_index app.t (restoration)",
+        "    #10 drop_check app.t before #14 alter_column_default app.t (binding)",
+        "    #12 drop_index app.t before #13 alter_column_default app.t (binding)",
+        "    #12 drop_index app.t before #14 alter_column_default app.t (binding)",
+        "    #12 drop_index app.t before #15 add_index app.t (identity)",
+        "    #13 alter_column_default app.t before #14 alter_column_default app.t (identity)",
     ];
     assert_eq!(
         format!("  surfaces\n{block}"),
@@ -493,8 +484,9 @@ fn country(rows: &str) -> String {
 /// Each surface the arriving overload captures is created again after it,
 /// so the engine binds it there, and the view over the rebuilt routine is
 /// dropped before it and created after: the statements in the one order the
-/// published SQL has. Each statement is scoped to its schema's write path
-/// on its own.
+/// published SQL has. The check, the index and the default share a table and
+/// nothing else, so each is dropped and put back beside itself (DEC-1968.2).
+/// Each statement is scoped to its schema's write path on its own.
 fn assert_exact_order(script: &str) {
     let statements: Vec<String> = script
         .split("SET search_path = '';")
@@ -515,10 +507,10 @@ fn assert_exact_order(script: &str) {
         r#"GRANT EXECUTE ON ROUTINE "app"."h"(numeric) TO PUBLIC"#,
         r#"CREATE VIEW "app"."w" AS SELECT app.h(2) AS y"#,
         r#"ALTER TABLE "app"."t" DROP CONSTRAINT "ck""#,
+        r#"ALTER TABLE "app"."t" ADD CONSTRAINT "ck" CHECK (c > app.f(1) )"#,
         r#"DROP INDEX "app"."ix""#,
         r#"ALTER TABLE "app"."t" ALTER COLUMN "c" DROP DEFAULT"#,
         r#"ALTER TABLE "app"."t" ALTER COLUMN "c" SET DEFAULT app.f(1)"#,
-        r#"ALTER TABLE "app"."t" ADD CONSTRAINT "ck" CHECK (c > app.f(1) )"#,
         r#"CREATE INDEX "ix" ON "app"."t" ("c" ASC) WHERE (c > app.f(1) )"#,
     ];
     assert_eq!(statements, expected, "{script}");

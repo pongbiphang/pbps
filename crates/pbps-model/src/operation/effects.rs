@@ -48,11 +48,11 @@ use std::collections::BTreeSet;
 
 use super::{
     ColumnKey, Definition, Incarnation, ObjectKey, Operation, OwnerError, Owners, PartKey,
-    Recorded, Spelling, Transition,
+    Recorded, RowSide, Spelling, Transition,
 };
 use crate::{
     Change, ColumnRef, GrantTarget, IdsFile, IndexKey, ReplicaIdentity, RowKey, Schema, Table,
-    TableName, Value, ValueSource,
+    TableName, ValueSource,
 };
 
 /// A thing a step makes, ends or rewrites.
@@ -433,6 +433,11 @@ impl Cx<'_> {
                 if self.default_goes(&owner, &key) {
                     self.requires(Requirement::Absent(ObjectKey::Default(key)));
                 }
+                // A foreign key the plan drops, over the column or into it,
+                // goes first: the engine refuses a retype that leaves the
+                // key's two sides incompatible. One that stands throughout is
+                // no order (it is rebuilt or kept by the engine).
+                self.requires_foreign_keys_over_column_gone(&owner, uid);
             }
             Change::AlterColumnNullability {
                 uid,
@@ -623,6 +628,7 @@ impl Cx<'_> {
                 parent,
                 column,
                 to,
+                fallback,
                 ..
             } => {
                 self.exists(ObjectKey::Table(Recorded(uid.clone())));
@@ -643,6 +649,22 @@ impl Cx<'_> {
                 // (DEC-1954.9).
                 if to.is_some() {
                     self.after_parent(parent, column, ParentAttribute::Default);
+                }
+                // A partition declares no column: its entry is spelled by its
+                // parent's column, so the parent's rename moves the name this
+                // step uses. A release (nothing own, nothing to fall back
+                // to) takes the old default off under the name it was set
+                // under, and runs before the rename (DEC-1699.1); anything
+                // that sets one is spelled by the name the column ends with.
+                // The release reads the base incarnation, not `Exists`, so
+                // that the parent's retype does not order it (DEC-1168.1).
+                if let Ok(uid) = self.owners.column(&parent.column(column), self.spelling) {
+                    let key = ObjectKey::Column(ColumnKey::Recorded(Recorded(uid)));
+                    if to.is_none() && fallback.is_none() {
+                        self.requires(Requirement::Is(key, Incarnation::Base));
+                    } else {
+                        self.exists(key);
+                    }
                 }
             }
             Change::SetPartitionNotNull {
@@ -684,6 +706,7 @@ impl Cx<'_> {
                     && let Some(old) = from
                 {
                     self.requires_key_unreferenced(&owner, &old.columns);
+                    self.releases_constraint(&owner, PartKey::PrimaryKey);
                 }
                 if let Some(new) = to {
                     self.requires_valid_data(&owner);
@@ -702,9 +725,10 @@ impl Cx<'_> {
                     self.requires_column(table, c, false);
                 }
             }
-            Change::DropUnique { table, .. } => {
+            Change::DropUnique { table, name } => {
                 let owner = self.table(table)?;
-                self.exists(ObjectKey::Table(owner));
+                self.exists(ObjectKey::Table(owner.clone()));
+                self.releases_constraint(&owner, PartKey::Unique(name.clone()));
             }
             Change::AddForeignKey {
                 table, constraint, ..
@@ -738,6 +762,7 @@ impl Cx<'_> {
             Change::DropForeignKey { table, name } => {
                 let owner = self.table(table)?;
                 self.exists(ObjectKey::Table(owner.clone()));
+                self.releases_constraint(&owner, PartKey::ForeignKey(name.clone()));
                 // The key it references stands until the foreign key is
                 // gone.
                 if let Some((_, own)) = self.base_of(&owner)
@@ -757,9 +782,15 @@ impl Cx<'_> {
                 self.exists(ObjectKey::Table(owner.clone()));
                 self.requires_valid_data(&owner);
             }
-            Change::DropCheck { table, .. } | Change::DropIndex { table, .. } => {
+            Change::DropCheck { table, name } => {
                 let owner = self.table(table)?;
-                self.exists(ObjectKey::Table(owner));
+                self.exists(ObjectKey::Table(owner.clone()));
+                self.releases_constraint(&owner, PartKey::Check(name.clone()));
+            }
+            Change::DropIndex { table, name } => {
+                let owner = self.table(table)?;
+                self.exists(ObjectKey::Table(owner.clone()));
+                self.releases_constraint(&owner, PartKey::Index(name.clone()));
             }
             Change::AddIndex { table, index, .. } => {
                 let owner = self.table(table)?;
@@ -774,6 +805,24 @@ impl Cx<'_> {
                 }
                 for c in &index.include {
                     self.requires_column(table, c, false);
+                }
+                // A partitioned parent's index, built after a partition's
+                // own of its shape, would take that one as its clone: the
+                // parent's goes first (DEC-1688.1). Which of the partition's
+                // indexes it could take is a question of shape, so every
+                // index the parent ends with is waited for; one that stands
+                // throughout, or a parent that is not rebuilt, draws no edge.
+                if let Some((_, own)) = self.final_of(&owner)
+                    && let Some(of) = &own.partition_of
+                    && let Ok(parent) = self.table(&of.parent)
+                    && let Some((_, parent_table)) = self.final_of(&parent)
+                {
+                    for name in parent_table.indexes.keys() {
+                        self.requires(Requirement::Is(
+                            Self::part(&parent, PartKey::Index(name.clone())),
+                            Incarnation::Final,
+                        ));
+                    }
                 }
             }
             Change::InsertRow {
@@ -800,14 +849,20 @@ impl Cx<'_> {
                     }
                 }
                 self.row_meets_constraints(&owner, table, &written);
-                let cells: Vec<(&str, &Value)> =
-                    row.columns().map(|(c, v)| (c.as_str(), v)).collect();
-                self.row_references(&owner, &cells, true);
-                for (c, v) in &cells {
+                self.row_parents(&owner, true, false);
+                self.row_cycle(&owner);
+                for (c, v) in row.columns() {
                     if v.is_null() {
                         self.row_needs_nullable(&owner, table, c);
                     }
                 }
+                self.creates(Resource::Object(
+                    ObjectKey::Rows {
+                        table: owner.clone(),
+                        side: RowSide::Written,
+                    },
+                    Incarnation::Final,
+                ));
                 self.creates(Resource::Object(
                     ObjectKey::Row {
                         table: owner,
@@ -818,20 +873,35 @@ impl Cx<'_> {
             }
             Change::UpdateRow {
                 table,
+                key_column,
                 key,
                 columns,
+                unchanged,
                 ..
             } => {
                 let owner = self.table(table)?;
                 self.row_basics(&owner, table, key);
                 let written: Vec<&str> = columns.keys().map(String::as_str).collect();
                 self.row_writes(table, &owner, &written);
+                // The statement holds the row to the cells it leaves alone
+                // and finds it by its key, before and after it runs, so it
+                // names those columns too: a rename of one goes first
+                // (DECISIONS 136).
+                for c in unchanged
+                    .keys()
+                    .map(String::as_str)
+                    .chain([key_column.as_str()])
+                {
+                    if !written.contains(&c)
+                        && let Ok(column) = self.column(&table.column(c))
+                    {
+                        self.exists(ObjectKey::Column(column));
+                    }
+                }
                 self.row_meets_constraints(&owner, table, &written);
-                let mut cells: Vec<(&str, &Value)> = Vec::new();
-                for (c, (from, to)) in columns {
+                for (c, (_, to)) in columns {
                     match to {
                         crate::Cell::Value(v) => {
-                            cells.push((c.as_str(), v));
                             if v.is_null() {
                                 self.row_needs_nullable(&owner, table, c);
                             }
@@ -848,17 +918,16 @@ impl Cx<'_> {
                             }
                         }
                     }
-                    let _ = from;
                 }
-                self.row_references(&owner, &cells, true);
-                let old: Vec<(&str, &Value)> = columns
-                    .iter()
-                    .filter_map(|(c, (from, _))| match from {
-                        crate::Cell::Value(v) => Some((c.as_str(), v)),
-                        crate::Cell::Default(_) => None,
-                    })
-                    .collect();
-                self.row_references(&owner, &old, false);
+                self.row_parents(&owner, true, true);
+                self.row_cycle(&owner);
+                self.creates(Resource::Object(
+                    ObjectKey::Rows {
+                        table: owner.clone(),
+                        side: RowSide::Written,
+                    },
+                    Incarnation::Final,
+                ));
                 // The row must stand; its values change, its identity does
                 // not, so a lookup of it by another row waits for nothing
                 // here.
@@ -868,20 +937,33 @@ impl Cx<'_> {
                 });
             }
             Change::DeleteRow {
-                table, key, row, ..
+                table,
+                key_column,
+                key,
+                row,
+                ..
             } => {
                 let owner = self.table(table)?;
                 self.row_basics(&owner, table, key);
                 let written: Vec<&str> = row.keys().map(String::as_str).collect();
                 self.row_writes(table, &owner, &written);
-                let mut cells: Vec<(&str, &Value)> = Vec::new();
-                for (c, cell) in row {
-                    if let crate::Cell::Value(v) = cell {
-                        cells.push((c.as_str(), v));
-                    }
+                // The statement finds the row by its key, which a payload
+                // leaves out, so a rename of that column goes first.
+                if !written.contains(&key_column.as_str())
+                    && let Ok(column) = self.column(&table.column(key_column))
+                {
+                    self.exists(ObjectKey::Column(column));
                 }
-                self.row_references(&owner, &cells, false);
-                self.row_blockers_gone(&owner);
+                self.row_parents(&owner, false, true);
+                self.row_cycle(&owner);
+                self.row_inbound_keys_gone(&owner);
+                self.removes(Resource::Object(
+                    ObjectKey::Rows {
+                        table: owner,
+                        side: RowSide::Held,
+                    },
+                    Incarnation::Base,
+                ));
             }
             Change::SetDataMode { table, .. } | Change::SetEnsureKeys { table, .. } => {
                 let owner = self.table(table)?;
@@ -1099,7 +1181,13 @@ impl Cx<'_> {
         else {
             return;
         };
-        let (Some(was), Some(will)) = (was.columns.get(column), will.columns.get(column)) else {
+        // The column under each side's own name: the parent may rename it, and
+        // the step spells the name it ends with.
+        let (was_name, will_name) = self
+            .names_of(&key)
+            .unwrap_or_else(|| (column.to_owned(), column.to_owned()));
+        let (Some(was), Some(will)) = (was.columns.get(&was_name), will.columns.get(&will_name))
+        else {
             return;
         };
         match attribute {
@@ -1260,6 +1348,41 @@ impl Cx<'_> {
             for (fk_name, fk) in &other.foreign_keys {
                 if fk.references_table == name && fk.references_columns.iter().any(|c| c == column)
                 {
+                    gone.push(Self::part(
+                        &other_owner,
+                        PartKey::ForeignKey(fk_name.clone()),
+                    ));
+                }
+            }
+        }
+        for key in gone {
+            self.requires(Requirement::Absent(key));
+        }
+    }
+
+    /// The foreign keys over a column, and those into it, must be gone. The
+    /// keys are the baseline's, so the column is named as the baseline names
+    /// it: through its uid, since the step spells the name it ends with.
+    fn requires_foreign_keys_over_column_gone(&mut self, owner: &Recorded, column: &crate::Uid) {
+        let Some((name, table)) = self.base_of(owner) else {
+            return;
+        };
+        let Some(column) = self.before.ids.columns.get(column).map(|c| c.name.clone()) else {
+            return;
+        };
+        let name = name.clone();
+        let mut gone = Vec::new();
+        for (n, fk) in &table.foreign_keys {
+            if fk.columns.contains(&column) {
+                gone.push(Self::part(owner, PartKey::ForeignKey(n.clone())));
+            }
+        }
+        for (other_name, other) in &self.before.schema.tables {
+            let Some(other_owner) = self.base_table(other_name) else {
+                continue;
+            };
+            for (fk_name, fk) in &other.foreign_keys {
+                if fk.references_table == name && fk.references_columns.contains(&column) {
                     gone.push(Self::part(
                         &other_owner,
                         PartKey::ForeignKey(fk_name.clone()),
@@ -1446,6 +1569,18 @@ impl Cx<'_> {
 
     // Rows.
 
+    /// A constraint the plan takes away is released: a row written after it
+    /// meets none of it (`row_meets_constraints`).
+    fn releases_constraint(&mut self, owner: &Recorded, part: PartKey) {
+        self.creates(Resource::Object(
+            ObjectKey::Rows {
+                table: owner.clone(),
+                side: RowSide::Released(part),
+            },
+            Incarnation::Final,
+        ));
+    }
+
     fn row_basics(&mut self, owner: &Recorded, table: &TableName, _key: &RowKey) {
         let _ = table;
         self.exists(ObjectKey::Table(owner.clone()));
@@ -1473,6 +1608,31 @@ impl Cx<'_> {
         else {
             return;
         };
+        // Whatever the plan takes away goes before a row is written, by its
+        // name and whatever its text: a check the resolver rebinds is torn
+        // down and put back around the rows (DEC-1968.2).
+        let mut parts_held: Vec<PartKey> = Vec::new();
+        if was.primary_key.is_some() {
+            parts_held.push(PartKey::PrimaryKey);
+        }
+        parts_held.extend(was.checks.keys().cloned().map(PartKey::Check));
+        parts_held.extend(was.unique.keys().cloned().map(PartKey::Unique));
+        parts_held.extend(was.foreign_keys.keys().cloned().map(PartKey::ForeignKey));
+        parts_held.extend(
+            was.indexes
+                .iter()
+                .filter(|(_, i)| i.unique || i.filter.is_some())
+                .map(|(n, _)| PartKey::Index(n.clone())),
+        );
+        for part in parts_held {
+            self.requires(Requirement::Is(
+                ObjectKey::Rows {
+                    table: owner.clone(),
+                    side: RowSide::Released(part),
+                },
+                Incarnation::Final,
+            ));
+        }
         // Only the parts compared below, and what `apply` looks a partition's
         // columns up by: the whole table would bring its reference rows into
         // every row step's copy.
@@ -1559,66 +1719,171 @@ impl Cx<'_> {
         }
     }
 
-    /// A row that references a parent row needs it to stand; a row that stops
-    /// referencing one leaves before it goes.
-    fn row_references(&mut self, owner: &Recorded, cells: &[(&str, &Value)], _adds: bool) {
-        // Only a key that stands throughout constrains the row: one the plan
-        // adds is installed after the rows it checks, one it drops is gone
-        // before them.
-        let (Some((_, was)), Some((_, will))) = (self.base_of(owner), self.final_of(owner)) else {
+    /// A row waits for the rows of the tables its foreign keys reference, and
+    /// a row that goes leaves before they do (DEC-1968.2). Table against
+    /// table, never row against row: a value does not name the row it needs
+    /// (a default, a unique key, a tuple, a rename), and the differ already
+    /// orders the rows of two tables by the foreign key between them. A key
+    /// counts only if it stands throughout, compared through the plan's
+    /// renames as the differ compares it: one the plan adds is installed
+    /// after the rows it checks, one it drops is gone before them. Two tables
+    /// in one cycle of foreign keys, a table and itself included, are left in
+    /// the order given, as the differ leaves them (`data::supply_order`).
+    fn row_parents(&mut self, owner: &Recorded, written: bool, held: bool) {
+        let (Some((base_name, was)), Some((own_name, will))) =
+            (self.base_of(owner), self.final_of(owner))
+        else {
             return;
         };
-        let mut wanted = Vec::new();
+        let forward = self
+            .renames_of(base_name, was)
+            .apply(
+                &Table {
+                    foreign_keys: was.foreign_keys.clone(),
+                    partition_of: was.partition_of.clone(),
+                    ..Table::default()
+                },
+                base_name,
+            )
+            .into_owned();
+        let mut parents = BTreeSet::new();
         for (name, fk) in &will.foreign_keys {
-            if was.foreign_keys.get(name) != Some(fk) {
+            if forward.foreign_keys.get(name) != Some(fk) {
                 continue;
             }
-            let ([column], [referenced]) =
-                (fk.columns.as_slice(), fk.references_columns.as_slice())
-            else {
+            if self.references_back(&fk.references_table, own_name) {
                 continue;
-            };
-            let Some((_, value)) = cells.iter().find(|(c, _)| c == column) else {
-                continue;
-            };
-            let key = match value {
-                Value::Int(i) => i.to_string(),
-                Value::Text(t) => t.clone(),
-                Value::Bool(b) => b.to_string(),
-                Value::Null => continue,
-            };
-            let Some(parent) = self
+            }
+            if let Some(parent) = self
                 .final_table(&fk.references_table)
                 .or_else(|| self.base_table(&fk.references_table))
-            else {
-                continue;
-            };
-            // A row is keyed by its primary key: a value of any other
-            // referenced column does not name a row this plan writes.
-            let keyed = self
-                .final_of(&parent)
-                .or_else(|| self.base_of(&parent))
-                .is_some_and(|(_, t)| {
-                    t.primary_key
-                        .as_ref()
-                        .is_some_and(|pk| pk.columns.as_slice() == std::slice::from_ref(referenced))
-                });
-            if !keyed {
-                continue;
+            {
+                parents.insert(parent);
             }
-            wanted.push(ObjectKey::Row {
-                table: parent,
-                key: RowKey(key),
-            });
         }
-        for key in wanted {
-            self.exists(key);
+        for parent in parents {
+            if written {
+                self.requires(Requirement::Is(
+                    ObjectKey::Rows {
+                        table: parent.clone(),
+                        side: RowSide::Written,
+                    },
+                    Incarnation::Final,
+                ));
+            }
+            if held {
+                self.requires(Requirement::Is(
+                    ObjectKey::Rows {
+                        table: parent,
+                        side: RowSide::Held,
+                    },
+                    Incarnation::Base,
+                ));
+            }
         }
     }
 
-    /// The rows the baseline's constraints held: nothing here. Deleting a
-    /// row is blocked by a child row only; that is `row_references`' edge.
-    fn row_blockers_gone(&mut self, _owner: &Recorded) {}
+    /// The rows of the tables in one cycle of foreign keys with this one keep
+    /// the order given: a write of one resource that all of them share, which
+    /// the effect graph orders by the operations' ids (DEC-1954.6). The
+    /// differ leaves such tables in name order and draws no edge between them
+    /// from the keys (`data::supply_order`), so neither do the effects.
+    fn row_cycle(&mut self, owner: &Recorded) {
+        let Some((own_name, _)) = self.final_of(owner) else {
+            return;
+        };
+        if !self.references_back_from_own(own_name) {
+            return;
+        }
+        let mut members = BTreeSet::new();
+        members.insert(owner.clone());
+        let mut seen: BTreeSet<&TableName> = BTreeSet::new();
+        let mut queue = vec![own_name];
+        while let Some(current) = queue.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            let Some(table) = self.after.schema.tables.get(current) else {
+                continue;
+            };
+            for fk in table.foreign_keys.values() {
+                queue.push(&fk.references_table);
+            }
+        }
+        for name in seen {
+            if name != own_name
+                && self.references_back(name, own_name)
+                && let Some(member) = self.final_table(name)
+            {
+                members.insert(member);
+            }
+        }
+        if let Some(representative) = members.into_iter().next() {
+            self.rewrites(Resource::Column(ObjectKey::Rows {
+                table: representative,
+                side: RowSide::Written,
+            }));
+        }
+    }
+
+    /// Whether the table reaches itself through the desired state's foreign
+    /// keys.
+    fn references_back_from_own(&self, own: &TableName) -> bool {
+        self.after.schema.tables.get(own).is_some_and(|table| {
+            table
+                .foreign_keys
+                .values()
+                .any(|fk| self.references_back(&fk.references_table, own))
+        })
+    }
+
+    /// A foreign key into this table that the plan drops, a rebuild's too, is
+    /// gone before the table's rows go: a delete leaves the rows that
+    /// reference them standing otherwise. By the drop's own key, as a row
+    /// waits for a check's (`row_meets_constraints`).
+    fn row_inbound_keys_gone(&mut self, owner: &Recorded) {
+        let Some((name, _)) = self.base_of(owner) else {
+            return;
+        };
+        let name = name.clone();
+        let mut gone = Vec::new();
+        for (other_name, other) in &self.before.schema.tables {
+            let Some(other_owner) = self.base_table(other_name) else {
+                continue;
+            };
+            for (fk_name, fk) in &other.foreign_keys {
+                if fk.references_table == name {
+                    gone.push(ObjectKey::Rows {
+                        table: other_owner.clone(),
+                        side: RowSide::Released(PartKey::ForeignKey(fk_name.clone())),
+                    });
+                }
+            }
+        }
+        for key in gone {
+            self.requires(Requirement::Is(key, Incarnation::Final));
+        }
+    }
+
+    /// Whether `from` reaches `to` through the desired state's foreign keys,
+    /// or is it: they are then in one cycle with the foreign key that was
+    /// followed.
+    fn references_back(&self, from: &TableName, to: &TableName) -> bool {
+        let mut seen: BTreeSet<&TableName> = BTreeSet::new();
+        let mut queue = vec![from];
+        while let Some(current) = queue.pop() {
+            if current == to {
+                return true;
+            }
+            if !seen.insert(current) {
+                continue;
+            }
+            if let Some(table) = self.after.schema.tables.get(current) {
+                queue.extend(table.foreign_keys.values().map(|fk| &fk.references_table));
+            }
+        }
+        false
+    }
 }
 
 /// Every named part a table holds, as keys' parts.
@@ -1745,7 +2010,7 @@ pub fn baseline_keys(before: Snapshot<'_>, owners: &dyn Owners) -> BTreeSet<Obje
 /// Whether the baseline model can say if it holds `key` at all.
 pub fn holds_unknown(key: &ObjectKey) -> bool {
     match key {
-        ObjectKey::Row { .. } | ObjectKey::Grant { .. } => true,
+        ObjectKey::Row { .. } | ObjectKey::Rows { .. } | ObjectKey::Grant { .. } => true,
         ObjectKey::Column(ColumnKey::Partition { .. })
         | ObjectKey::NotNull(ColumnKey::Partition { .. }) => true,
         ObjectKey::Table(_)

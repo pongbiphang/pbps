@@ -448,39 +448,6 @@ data:
 "#,
     },
     Scenario {
-        name: "a_row_updated_beside_a_new_column",
-        pair: ["UpdateRow", "AddColumn"],
-        gap: Some(2079),
-        uid_order: None,
-        base: r#"
-table: app.t
-columns:
-  id: {type: int, nullable: false}
-  a: {type: int}
-  b: {type: int}
-primary_key: {name: pk_t, columns: [id]}
-data:
-  mode: exact
-  rows:
-    1: {a: 1, b: 2}
-    2: {a: 3, b: 4}
-"#,
-        desired: r#"
-table: app.t
-columns:
-  id: {type: int, nullable: false}
-  a: {type: int}
-  b: {type: int}
-  c: {type: int}
-primary_key: {name: pk_t, columns: [id]}
-data:
-  mode: exact
-  rows:
-    1: {a: 7, b: 2}
-    2: {a: 3, b: 4}
-"#,
-    },
-    Scenario {
         name: "a_row_deleted_beside_an_index",
         pair: ["DeleteRow", "AddIndex"],
         gap: None,

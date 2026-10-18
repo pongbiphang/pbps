@@ -12,9 +12,9 @@
 //! [`Source`]. An effect edge's reason is [`reason`]'s exhaustive match over
 //! the effect behind it, not its source (DEC-1956.1).
 //!
-//! In this slice the resolver, `order_after_releases` and the SQL Server
-//! computed-column release order through it in every build, each over its own
-//! edges. In tests and debug builds the verifier settles every observed order
+//! The resolver, `order_after_releases` and the SQL Server computed-column
+//! release order through it in every build, the resolver over the effects and
+//! the others over their own edges. In tests and debug builds the verifier settles every observed order
 //! over the full effect graph and requires the order it was given back: that
 //! is how "every edge is respected" is checked (DEC-1956.3).
 
@@ -541,6 +541,7 @@ fn components(n: usize, constraints: &[&Constraint]) -> Vec<Vec<usize>> {
 pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
     match edge.source {
         Source::Binding => OrderReason::Binding,
+        Source::Execution => OrderReason::Authorization,
         Source::Declared => OrderReason::Structural,
         // A proposed edge orders a slot's handover (#1957).
         Source::Search => OrderReason::Identity,
@@ -570,7 +571,10 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
             Because::Writes(_) => OrderReason::Data,
             // Two writes of one object are a question of which instance
             // stands; two writes of values or rows, of which values do.
-            Because::WriteWrite(Resource::Object(ObjectKey::Row { .. }, _))
+            Because::WriteWrite(Resource::Object(
+                ObjectKey::Row { .. } | ObjectKey::Rows { .. },
+                _,
+            ))
             | Because::WriteWrite(Resource::Column(_)) => OrderReason::Data,
             Because::WriteWrite(Resource::Object(
                 ObjectKey::Table(_)
@@ -593,7 +597,7 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
 /// What depending on an object is, by the kind of object.
 fn of_key(key: &ObjectKey) -> OrderReason {
     match key {
-        ObjectKey::Row { .. } => OrderReason::Data,
+        ObjectKey::Row { .. } | ObjectKey::Rows { .. } => OrderReason::Data,
         ObjectKey::Grant { .. } | ObjectKey::Role(_) => OrderReason::Authorization,
         ObjectKey::Table(_)
         | ObjectKey::Column(_)

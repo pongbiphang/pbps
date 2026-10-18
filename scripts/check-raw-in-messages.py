@@ -139,10 +139,6 @@ ALLOWED = {
         "matches a raw column target against its raw table-address prefix; "
         "this identity key remains raw after #2084 step 5",
     ),
-    "crates/pbps-diff/src/order/compare.rs": (
-        5,
-        "builds raw name-slot identity keys that remain raw after #2084 step 5",
-    ),
     "crates/pbps-dialect/tests/support/positional_preflight.rs": (
         6,
         "builds fixture SQL, whose identifiers remain raw after #2084 step 5",

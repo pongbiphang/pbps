@@ -1054,37 +1054,87 @@ fn rows_of_c(before_key: bool, after_key: bool, logical: Vec<PlannedChange>) -> 
 #[test]
 fn rows_wait_only_for_a_key_that_stands_when_they_are_written() {
     let none = ModuleDeps::new();
-    // The key is added after the rows it checks: 1 -> 2 and 2 -> NULL, the
-    // child first, as the ids give it.
-    let adds = rows_of_c(
-        false,
-        true,
+    let rows = |child: i64, parent: i64| {
         vec![
-            child_row(1, Some(2)),
-            child_row(2, None),
-            p(Change::AddForeignKey {
-                table: t("c"),
-                name: "fk".into(),
-                constraint: Box::new(self_referencing(true).foreign_keys["fk"].clone()),
-            }),
-        ],
+            plain_row("c", child, &[("pid", 1)]),
+            plain_row("p", parent, &[]),
+        ]
+    };
+    // The key is added after the rows it checks: the child first, as the
+    // ids give it, is the order that works.
+    let mut added = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        rows(1, 1),
     );
-    let (ops, fx, baseline) = adds.analysed(ModuleEdits::InPlace);
+    added
+        .before
+        .tables
+        .get_mut(&t("c"))
+        .unwrap()
+        .foreign_keys
+        .clear();
+    added.logical.push(p(Change::AddForeignKey {
+        table: t("c"),
+        name: "fk".into(),
+        constraint: Box::new(reference(&["pid"], &["id"])),
+    }));
+    let (ops, fx, baseline) = added.analysed(ModuleEdits::InPlace);
     assert_eq!(
         run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
         []
     );
-    // Negative: a key that stands throughout wants the parent row first.
-    let stands = rows_of_c(true, true, vec![child_row(2, None), child_row(1, Some(2))]);
+    // Negative: a key that stands throughout wants the parent's rows first.
+    let stands = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        rows(1, 1),
+    );
     let (ops, fx, baseline) = stands.analysed(ModuleEdits::InPlace);
-    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
-    assert!(!run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty());
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+    // Negative: one the plan drops is gone before the rows.
+    let mut dropped = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        rows(1, 1),
+    );
+    dropped
+        .after
+        .tables
+        .get_mut(&t("c"))
+        .unwrap()
+        .foreign_keys
+        .clear();
+    dropped.logical.insert(
+        0,
+        p(Change::DropForeignKey {
+            table: t("c"),
+            name: "fk".into(),
+        }),
+    );
+    let (ops, fx, baseline) = dropped.analysed(ModuleEdits::InPlace);
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
 }
 
 #[test]
-fn a_row_value_names_a_row_only_through_the_referenced_primary_key() {
-    // `code` is unique but is not the key rows are named by: the referenced
-    // value 2 need not be the row keyed 2.
+fn the_rows_of_a_table_referencing_itself_keep_the_order_given() {
+    // A table in a cycle of one: its rows are left in the order given, as the
+    // differ leaves them (`supply_order`), and draw no edge between them but
+    // the write order of one table.
     let mut table = self_referencing(false);
     table.columns.insert("code".into(), Column::new(int()));
     table.unique.insert(
@@ -1127,6 +1177,14 @@ fn a_row_value_names_a_row_only_through_the_referenced_primary_key() {
         ),
         []
     );
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
 }
 
 #[test]
@@ -2504,4 +2562,1573 @@ fn a_replica_identity_switched_to_an_index_over_a_new_not_null_column_verifies_c
     );
     // Negative: the switch before the index it selects.
     assert!(!run(&ops, &fx, &baseline, &[0, 2, 1], &none, Checks::ALL).is_empty());
+}
+
+/// `t(a)` with a default, and a plan that takes the default off and then
+/// either renames the column or retypes it. Ops 0 (the removal) and 1.
+fn default_taken_off(then_rename: bool) -> Plan {
+    use pbps_model::ValueSource;
+    let with_default = |name: &str, default: Option<&str>, ty: &str| {
+        let mut table = table_with(&["id"]);
+        let mut column = Column::new(ty.parse().unwrap());
+        if let Some(text) = default {
+            column.value_source = ValueSource::Default(text.into());
+        }
+        table.columns.insert(name.into(), column);
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before
+        .tables
+        .insert(t("t"), with_default("a", Some("1"), "int"));
+    let moved = uid(UidKind::Column, "t.a");
+    let named = |column: &str| {
+        let mut ids = Plan::ids(&["t"], &[("t", "id")]);
+        ids.columns.insert(moved.clone(), t("t").column(column));
+        ids
+    };
+    let removal = p(Change::AlterColumnDefault {
+        uid: moved.clone(),
+        column: t("t").column("a"),
+        from: Some("1".into()),
+        to: None,
+    });
+    let (second, later, ids) = if then_rename {
+        after.tables.insert(t("t"), with_default("b", None, "int"));
+        (
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("t"),
+                from: "a".into(),
+                to: "b".into(),
+                table_was: None,
+            }),
+            "b",
+            named("b"),
+        )
+    } else {
+        after
+            .tables
+            .insert(t("t"), with_default("a", None, "bigint"));
+        (
+            p(Change::AlterColumnType {
+                uid: moved.clone(),
+                column: t("t").column("a"),
+                from: "int".parse().unwrap(),
+                to: "bigint".parse().unwrap(),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+            }),
+            "a",
+            named("a"),
+        )
+    };
+    let _ = later;
+    Plan {
+        logical: vec![removal, second],
+        before,
+        after,
+        before_ids: named("a"),
+        after_ids: ids,
+    }
+}
+
+/// A removal that spells the column by its old name goes before the rename
+/// that moves the name; a retype of the same column is no such move, and the
+/// default goes before it by `Absent` alone (DEC-1168.1, DEC-1968.2).
+#[test]
+fn a_base_spelled_reader_precedes_the_rename_of_what_it_names_and_not_a_retype() {
+    let none = ModuleDeps::new();
+    let rewrite_edges = |plan: &Plan| -> Vec<(usize, usize)> {
+        let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+        graph(ops.as_slice(), &fx, &baseline, &none, Checks::ALL)
+            .edges
+            .iter()
+            .filter(|e| matches!(e.because, Because::Rewrites(_)))
+            .map(|e| (e.before, e.after))
+            .collect()
+    };
+    let renamed = default_taken_off(true);
+    assert_eq!(rewrite_edges(&renamed), [(0, 1)]);
+    // The order that runs the rename first is refused by that edge.
+    let (ops, fx, baseline) = renamed.analysed(ModuleEdits::InPlace);
+    let violations = run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL);
+    assert!(
+        violations.iter().any(|v| matches!(
+            v,
+            Violation::Edge { edge, .. } if matches!(edge.because, Because::Rewrites(_))
+        )),
+        "{violations:?}"
+    );
+    // Negative: a retype of the same column draws no rewrite edge, either
+    // way, so the removal is ordered by the default alone.
+    let retyped = default_taken_off(false);
+    assert_eq!(rewrite_edges(&retyped), []);
+    let (ops, fx, baseline) = retyped.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+}
+
+/// The default of `t.a` taken off under the name the rename gave the column,
+/// `b`: the removal is the plan's second step, so it spells the name the
+/// column has once the rename has run (DEC-1968.2, review of #2120).
+fn default_taken_off_after_the_rename() -> Plan {
+    use pbps_model::ValueSource;
+    let table = |name: &str, default: Option<&str>| {
+        let mut table = table_with(&["id"]);
+        let mut column = Column::new(int());
+        if let Some(text) = default {
+            column.value_source = ValueSource::Default(text.into());
+        }
+        table.columns.insert(name.into(), column);
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table("a", Some("1")));
+    after.tables.insert(t("t"), table("b", None));
+    let moved = uid(UidKind::Column, "t.a");
+    let named = |column: &str| {
+        let mut ids = Plan::ids(&["t"], &[("t", "id")]);
+        ids.columns.insert(moved.clone(), t("t").column(column));
+        ids
+    };
+    Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("t"),
+                from: "a".into(),
+                to: "b".into(),
+                table_was: None,
+            }),
+            p(Change::AlterColumnDefault {
+                uid: moved.clone(),
+                column: t("t").column("b"),
+                from: Some("1".into()),
+                to: None,
+            }),
+        ],
+        before,
+        after,
+        before_ids: named("a"),
+        after_ids: named("b"),
+    }
+}
+
+#[test]
+fn a_final_spelled_reader_of_the_base_follows_the_rename_it_names_the_column_by() {
+    let none = ModuleDeps::new();
+    let plan = default_taken_off_after_the_rename();
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let rewrites: Vec<(usize, usize)> = graph(ops.as_slice(), &fx, &baseline, &none, Checks::ALL)
+        .edges
+        .iter()
+        .filter(|e| matches!(e.because, Because::Rewrites(_)))
+        .map(|e| (e.before, e.after))
+        .collect();
+    assert_eq!(rewrites, [(0, 1)]);
+    // The removal first would name a column that has no such name yet.
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    let violations = run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL);
+    assert!(
+        violations.iter().any(|v| matches!(
+            v,
+            Violation::Edge { edge, .. } if matches!(edge.because, Because::Rewrites(_))
+        )),
+        "{violations:?}"
+    );
+}
+
+/// A column renamed and retyped in one plan: the retype names the column by
+/// its new name, and the foreign key into it is the baseline's, spelled by
+/// the old one (review of #2120).
+#[test]
+fn a_retype_of_a_renamed_column_still_waits_for_the_foreign_key_into_it() {
+    use pbps_model::ValueSource;
+    let _ = ValueSource::None;
+    let mut before = Schema::default();
+    before.tables.insert(t("p"), table_with(&["id"]));
+    let mut child = table_with(&["pid"]);
+    child.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: vec!["pid".into()],
+            references_table: t("p"),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    before.tables.insert(t("c"), child.clone());
+    let mut after = Schema::default();
+    after.tables.insert(t("p"), table_with(&["key"]));
+    child.foreign_keys.clear();
+    after.tables.insert(t("c"), child);
+    let moved = uid(UidKind::Column, "p.id");
+    let mut before_ids = Plan::ids(&["p", "c"], &[("c", "pid")]);
+    before_ids
+        .columns
+        .insert(moved.clone(), t("p").column("id"));
+    let mut after_ids = Plan::ids(&["p", "c"], &[("c", "pid")]);
+    after_ids
+        .columns
+        .insert(moved.clone(), t("p").column("key"));
+    let plan = Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("p"),
+                from: "id".into(),
+                to: "key".into(),
+                table_was: None,
+            }),
+            p(Change::AlterColumnType {
+                uid: moved,
+                column: t("p").column("key"),
+                from: int(),
+                to: "bigint".parse().unwrap(),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+            }),
+            p(Change::DropForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+            }),
+        ],
+        before,
+        after,
+        before_ids,
+        after_ids,
+    };
+    let (ops, fx, _) = plan.analysed(ModuleEdits::InPlace);
+    let waits = |x: &Effects| {
+        x.requires
+            .iter()
+            .any(|r| matches!(r, Requirement::Absent(ObjectKey::Part { .. })))
+    };
+    assert!(waits(&fx[1]), "{:?}", fx[1].requires);
+    // Negative: a retype of a column no foreign key names waits for none.
+    assert!(!waits(&fx[0]), "{:?}", fx[0].requires);
+    let _ = ops;
+}
+
+/// `t(id, a, n)`, with `a` renamed to `b` by the plan, and one row updated:
+/// `n` changes, and `b` is held to its recorded value when `guard` says so
+/// (review of #2120).
+fn update_beside_a_rename(guard: bool) -> Plan {
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table_with(&["id", "a", "n"]));
+    after.tables.insert(t("t"), table_with(&["id", "b", "n"]));
+    let moved = uid(UidKind::Column, "t.a");
+    let named = |column: &str| {
+        let mut ids = Plan::ids(&["t"], &[("t", "id"), ("t", "n")]);
+        ids.columns.insert(moved.clone(), t("t").column(column));
+        ids
+    };
+    let unchanged = if guard {
+        [("b".to_owned(), pbps_model::Cell::Value(Value::Int(7)))]
+            .into_iter()
+            .collect()
+    } else {
+        Default::default()
+    };
+    Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("t"),
+                from: "a".into(),
+                to: "b".into(),
+                table_was: None,
+            }),
+            p(Change::UpdateRow {
+                table: t("t"),
+                key_column: "id".into(),
+                key: RowKey::from("1"),
+                columns: [(
+                    "n".to_owned(),
+                    (
+                        pbps_model::Cell::Value(Value::Int(5)),
+                        pbps_model::Cell::Value(Value::Int(6)),
+                    ),
+                )]
+                .into_iter()
+                .collect(),
+                unchanged,
+                types: Default::default(),
+                after_types: Default::default(),
+                key_type: Default::default(),
+            }),
+        ],
+        before,
+        after,
+        before_ids: named("a"),
+        after_ids: named("b"),
+    }
+}
+
+/// The update's guards read the columns it leaves alone and its key, so a
+/// rename of one of them goes first (review of #2120).
+#[test]
+fn a_row_update_waits_for_the_rename_of_a_column_its_guards_read() {
+    let none = ModuleDeps::new();
+    let guarded = update_beside_a_rename(true);
+    let (ops, fx, baseline) = guarded.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    let early = run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL);
+    assert!(
+        early.iter().any(|v| matches!(
+            v,
+            Violation::Edge { edge, .. } if matches!(edge.because, Because::Rewrites(_))
+        )),
+        "{early:?}"
+    );
+    // Negative: an update that holds that column to nothing is free of the
+    // rename.
+    let free = update_beside_a_rename(false);
+    let (ops, fx, baseline) = free.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// A parent `p` and a child `c` whose foreign key stands throughout, over the
+/// columns given, and the two rows the plan inserts, the child's first.
+fn rows_across(
+    parent_columns: &[&str],
+    key: &[&str],
+    child_columns: &[&str],
+    parent_row: &[(&str, i64)],
+    child_row: &[(&str, i64)],
+) -> Plan {
+    let strings = |v: &[&str]| v.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+    let mut parent = table_with(parent_columns);
+    parent.unique.insert(
+        "u".into(),
+        pbps_model::UniqueConstraint {
+            columns: strings(key),
+            storage_parameters: Default::default(),
+        },
+    );
+    let mut child = table_with(&[&["id"], child_columns].concat());
+    child.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: strings(child_columns),
+            references_table: t("p"),
+            references_columns: strings(key),
+            on_delete: ReferentialAction::default(),
+            on_update: ReferentialAction::default(),
+        },
+    );
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    for schema in [&mut before, &mut after] {
+        schema.tables.insert(t("p"), parent.clone());
+        schema.tables.insert(t("c"), child.clone());
+    }
+    let mut columns: Vec<(&str, &str)> = parent_columns.iter().map(|c| ("p", *c)).collect();
+    columns.extend(child_columns.iter().map(|c| ("c", *c)));
+    columns.push(("c", "id"));
+    let ids = Plan::ids(&["p", "c"], &columns);
+    let insert = |table: &str, key_column: &str, cells: &[(&str, i64)]| {
+        p(Change::InsertRow {
+            table: t(table),
+            key_column: key_column.into(),
+            identity_key: false,
+            key: RowKey::from(cells[0].1.to_string().as_str()),
+            row: cells
+                .iter()
+                .map(|(c, v)| ((*c).to_owned(), Value::Int(*v)))
+                .collect::<Row>(),
+            defaults: Default::default(),
+            types: Default::default(),
+        })
+    };
+    Plan {
+        logical: vec![
+            insert("c", "id", child_row),
+            insert("p", parent_columns[0], parent_row),
+        ],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    }
+}
+
+/// A child row waits for the parent's rows whatever its reference names, a
+/// unique column other than the key or several columns: the order is table
+/// against table and reads no value (DEC-1968.2).
+#[test]
+fn a_child_row_waits_for_the_parent_rows_whatever_its_reference_names() {
+    let none = ModuleDeps::new();
+    for plan in [
+        // A unique column that is not the parent's key.
+        rows_across(
+            &["id", "code"],
+            &["code"],
+            &["pcode"],
+            &[("id", 1), ("code", 9)],
+            &[("id", 1), ("pcode", 9)],
+        ),
+        // Two columns.
+        rows_across(
+            &["a", "b"],
+            &["a", "b"],
+            &["pa", "pb"],
+            &[("a", 1), ("b", 2)],
+            &[("id", 1), ("pa", 1), ("pb", 2)],
+        ),
+        // A value no parent row holds: the table is the dependency.
+        rows_across(
+            &["id", "code"],
+            &["code"],
+            &["pcode"],
+            &[("id", 1), ("code", 9)],
+            &[("id", 1), ("pcode", 8)],
+        ),
+    ] {
+        let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+        // The child first, as the differ's row order may leave it.
+        let early = run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL);
+        assert!(
+            early.iter().any(|v| matches!(v, Violation::Edge { .. })),
+            "{early:?}"
+        );
+        assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+    }
+}
+
+/// A retype of a column a foreign key stands over, through the differ, whose
+/// result the test build's observer judges: a key the plan keeps is recorded
+/// as a dependent that stands, never failed (DEC-1954.6; review of #2120).
+#[test]
+fn a_retype_beside_a_foreign_key_the_plan_keeps_is_recorded_and_not_refused() {
+    let mut parent = table_with(&["id"]);
+    parent.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    });
+    let mut child = table_with(&["pid"]);
+    child.foreign_keys.insert(
+        "fk".into(),
+        ForeignKey {
+            columns: vec!["pid".into()],
+            references_table: t("p"),
+            references_columns: vec!["id".into()],
+            on_delete: ReferentialAction::NoAction,
+            on_update: ReferentialAction::NoAction,
+        },
+    );
+    let mut before = Schema::default();
+    before.tables.insert(t("p"), parent.clone());
+    before.tables.insert(t("c"), child.clone());
+    let mut after = Schema::default();
+    parent
+        .columns
+        .insert("id".into(), Column::new("bigint".parse().unwrap()));
+    child
+        .columns
+        .insert("pid".into(), Column::new("bigint".parse().unwrap()));
+    after.tables.insert(t("p"), parent);
+    after.tables.insert(t("c"), child);
+    let ids = Plan::ids(&["p", "c"], &[("p", "id"), ("c", "pid")]);
+    let plan = crate::diff(
+        crate::Side {
+            schema: &before,
+            ids: &ids,
+        },
+        crate::Side {
+            schema: &after,
+            ids: &ids,
+        },
+        &pbps_dialect::MinimalDialect,
+        &pbps_model::Hints::default(),
+    )
+    .unwrap();
+    assert!(
+        plan.changes
+            .iter()
+            .any(|p| matches!(p.change, Change::AlterColumnType { .. })),
+        "{plan:?}"
+    );
+    assert!(
+        !plan
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, Change::DropForeignKey { .. })),
+        "{plan:?}"
+    );
+}
+
+fn plain_row(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
+    p(Change::InsertRow {
+        table: t(table),
+        key_column: "id".into(),
+        identity_key: false,
+        key: RowKey::from(key.to_string().as_str()),
+        // A real payload leaves the key column to `key`.
+        row: cells
+            .iter()
+            .map(|(c, v)| ((*c).to_owned(), Value::Int(*v)))
+            .collect::<Row>(),
+        defaults: Default::default(),
+        types: Default::default(),
+    })
+}
+
+fn reference(columns: &[&str], references: &[&str]) -> ForeignKey {
+    ForeignKey {
+        columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+        references_table: t("p"),
+        references_columns: references.iter().map(|c| (*c).to_owned()).collect(),
+        on_delete: ReferentialAction::default(),
+        on_update: ReferentialAction::default(),
+    }
+}
+
+/// `p` and `c`, the columns and unique keys given, `c` holding the foreign key
+/// `fk`, both standing in both states, and the ids of every column named.
+fn parent_and_child(
+    parent_columns: &[&str],
+    unique: &[&str],
+    child_columns: &[&str],
+    fk: ForeignKey,
+    logical: Vec<PlannedChange>,
+) -> Plan {
+    let mut parent = table_with(parent_columns);
+    parent.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    });
+    if !unique.is_empty() {
+        parent.unique.insert(
+            "u".into(),
+            pbps_model::UniqueConstraint {
+                columns: unique.iter().map(|c| (*c).to_owned()).collect(),
+                storage_parameters: Default::default(),
+            },
+        );
+    }
+    let mut child = table_with(child_columns);
+    child.primary_key = Some(pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    });
+    child.foreign_keys.insert("fk".into(), fk);
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    for schema in [&mut before, &mut after] {
+        schema.tables.insert(t("p"), parent.clone());
+        schema.tables.insert(t("c"), child.clone());
+    }
+    let mut columns: Vec<(&str, &str)> = parent_columns.iter().map(|c| ("p", *c)).collect();
+    columns.extend(child_columns.iter().map(|c| ("c", *c)));
+    let ids = Plan::ids(&["p", "c"], &columns);
+    Plan {
+        logical,
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    }
+}
+
+/// Rows keyed by `id` carry no `id` cell, so a reference over the key column
+/// itself is read from the key (review of #2120).
+#[test]
+fn a_child_row_sharing_its_parents_primary_key_waits_for_the_parent_row() {
+    let none = ModuleDeps::new();
+    let plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id"],
+        reference(&["id"], &["id"]),
+        vec![plain_row("c", 1, &[]), plain_row("p", 1, &[])],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// An update that sets one component of a composite reference resolves the
+/// tuple it ends with, the cell it leaves alone included (review of #2120).
+#[test]
+fn a_child_update_of_one_component_of_a_composite_reference_waits_for_the_new_tuple() {
+    let none = ModuleDeps::new();
+    let update = p(Change::UpdateRow {
+        table: t("c"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        columns: [(
+            "pa".to_owned(),
+            (
+                pbps_model::Cell::Value(Value::Int(1)),
+                pbps_model::Cell::Value(Value::Int(3)),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: [("pb".to_owned(), pbps_model::Cell::Value(Value::Int(2)))]
+            .into_iter()
+            .collect(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    });
+    let plan = parent_and_child(
+        &["id", "a", "b"],
+        &["a", "b"],
+        &["id", "pa", "pb"],
+        reference(&["pa", "pb"], &["a", "b"]),
+        vec![update, plain_row("p", 1, &[("a", 3), ("b", 2)])],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+fn delete(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
+    p(Change::DeleteRow {
+        table: t(table),
+        key_column: "id".into(),
+        key: RowKey::from(key.to_string().as_str()),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+        row: cells
+            .iter()
+            .map(|(c, v)| ((*c).to_owned(), pbps_model::Cell::Value(Value::Int(*v))))
+            .collect(),
+        dropped: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: None,
+    })
+}
+
+/// The row that held the referenced values goes after the rows that name
+/// them, as the row keyed by them does (review of #2120).
+#[test]
+fn a_parent_row_deleted_with_the_child_that_names_its_unique_value_goes_last() {
+    let none = ModuleDeps::new();
+    let plan = parent_and_child(
+        &["id", "code"],
+        &["code"],
+        &["id", "pcode"],
+        reference(&["pcode"], &["code"]),
+        vec![
+            delete("p", 1, &[("code", 9)]),
+            delete("c", 1, &[("pcode", 9)]),
+        ],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// Two rows swap the values of a unique index the plan rebuilds around them
+/// (its INCLUDE list changes): the index is absent while they move, so no
+/// name changes hands and the effects find no cycle (review of #2120).
+#[test]
+fn rows_swapping_the_values_of_a_rebuilt_unique_index_draw_no_cycle() {
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod};
+    let index = |include: &[&str]| Index {
+        columns: vec![IndexColumn {
+            key: IndexKey::Column("code".into()),
+            descending: false,
+            opclass: None,
+        }],
+        include: include.iter().map(|c| (*c).to_owned()).collect(),
+        unique: true,
+        filter: None,
+        method: IndexMethod::Btree,
+        storage_parameters: Default::default(),
+    };
+    let swap = |key: i64, from: i64, to: i64| {
+        p(Change::UpdateRow {
+            table: t("t"),
+            key_column: "id".into(),
+            key: RowKey::from(key.to_string().as_str()),
+            columns: [(
+                "code".to_owned(),
+                (
+                    pbps_model::Cell::Value(Value::Int(from)),
+                    pbps_model::Cell::Value(Value::Int(to)),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            unchanged: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+            key_type: Default::default(),
+        })
+    };
+    let table = |include: &[&str]| {
+        let mut table = table_with(&["id", "code", "x"]);
+        table.indexes.insert("ix".into(), index(include));
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table(&[]));
+    after.tables.insert(t("t"), table(&["x"]));
+    let ids = Plan::ids(&["t"], &[("t", "id"), ("t", "code"), ("t", "x")]);
+    let plan = Plan {
+        logical: vec![
+            p(Change::DropIndex {
+                table: t("t"),
+                name: "ix".into(),
+            }),
+            swap(1, 1, 2),
+            swap(2, 2, 1),
+            p(Change::AddIndex {
+                table: t("t"),
+                name: "ix".into(),
+                index: Box::new(index(&["x"])),
+                clustered: false,
+            }),
+        ],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
+}
+
+/// A retained foreign key whose parent table the plan renames still stands,
+/// so a child row waits for the parent row (review of #2120).
+#[test]
+fn a_foreign_key_into_a_renamed_table_still_orders_the_rows() {
+    let none = ModuleDeps::new();
+    let moved = uid(UidKind::Table, "p");
+    let mut plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        Vec::new(),
+    );
+    // After the plan the parent is `q`, and the child's key names it.
+    let mut parent = plan.after.tables.remove(&t("p")).unwrap();
+    parent.foreign_keys.clear();
+    plan.after.tables.insert(t("q"), parent);
+    plan.after
+        .tables
+        .get_mut(&t("c"))
+        .unwrap()
+        .foreign_keys
+        .get_mut("fk")
+        .unwrap()
+        .references_table = t("q");
+    plan.after_ids.tables.insert(moved.clone(), t("q"));
+    plan.after_ids
+        .columns
+        .insert(uid(UidKind::Column, "p.id"), t("q").column("id"));
+    let row = |table: &str, key: i64, cells: &[(&str, i64)]| {
+        let mut row = plain_row(table, key, cells);
+        if let Change::InsertRow { table: name, .. } = &mut row.change {
+            *name = t(table);
+        }
+        row
+    };
+    plan.logical = vec![
+        p(Change::RenameTable {
+            uid: moved,
+            from: t("p"),
+            to: t("q"),
+            defaults: Vec::new(),
+        }),
+        row("c", 1, &[("pid", 1)]),
+        row("q", 1, &[]),
+    ];
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let early = run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL);
+    assert!(
+        early.iter().any(|v| matches!(v, Violation::Edge { .. })),
+        "{early:?}"
+    );
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 2, 1], &none, Checks::ALL),
+        []
+    );
+}
+
+/// A child that omits its foreign-key column takes the column's literal
+/// default, which names its parent row (review of #2120).
+#[test]
+fn a_child_row_taking_a_literal_default_for_its_reference_waits_for_the_parent() {
+    let none = ModuleDeps::new();
+    let child = p(Change::InsertRow {
+        table: t("c"),
+        key_column: "id".into(),
+        identity_key: false,
+        key: RowKey::from("1"),
+        row: Row::default(),
+        defaults: [("pid".to_owned(), "1".to_owned())].into_iter().collect(),
+        types: Default::default(),
+    });
+    let mut plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![child, plain_row("p", 1, &[])],
+    );
+    for schema in [&mut plan.before, &mut plan.after] {
+        schema
+            .tables
+            .get_mut(&t("c"))
+            .unwrap()
+            .columns
+            .get_mut("pid")
+            .unwrap()
+            .value_source = pbps_model::ValueSource::Default("1".into());
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// The payloads of a delete spell a renamed column by the name the plan ends
+/// with, so the parent's unique value is found under it (review of #2120).
+#[test]
+fn a_parent_row_deleted_under_a_renamed_unique_column_still_goes_after_its_child() {
+    let none = ModuleDeps::new();
+    let moved = uid(UidKind::Column, "p.code");
+    let mut plan = parent_and_child(
+        &["id", "code"],
+        &["code"],
+        &["id", "pcode"],
+        reference(&["pcode"], &["code"]),
+        vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("p"),
+                from: "code".into(),
+                to: "slug".into(),
+                table_was: None,
+            }),
+            delete("p", 1, &[("slug", 9)]),
+            delete("c", 1, &[("pcode", 9)]),
+        ],
+    );
+    let parent = plan.after.tables.get_mut(&t("p")).unwrap();
+    let column = parent.columns.shift_remove("code").unwrap();
+    parent.columns.insert("slug".into(), column);
+    parent.unique.get_mut("u").unwrap().columns = vec!["slug".into()];
+    plan.after
+        .tables
+        .get_mut(&t("c"))
+        .unwrap()
+        .foreign_keys
+        .get_mut("fk")
+        .unwrap()
+        .references_columns = vec!["slug".into()];
+    plan.after_ids.columns.insert(moved, t("p").column("slug"));
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 2, 1], &none, Checks::ALL),
+        []
+    );
+}
+
+/// A unique key over a column the plan retypes may be rebuilt around the
+/// retype, and rows that swap its values in the meantime draw no cycle
+/// (review of #2120).
+#[test]
+fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
+    let swap = |key: i64, from: i64, to: i64| {
+        p(Change::UpdateRow {
+            table: t("t"),
+            key_column: "id".into(),
+            key: RowKey::from(key.to_string().as_str()),
+            columns: [(
+                "code".to_owned(),
+                (
+                    pbps_model::Cell::Value(Value::Int(from)),
+                    pbps_model::Cell::Value(Value::Int(to)),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            unchanged: Default::default(),
+            types: Default::default(),
+            after_types: Default::default(),
+            key_type: Default::default(),
+        })
+    };
+    let table = |ty: &str| {
+        let mut table = table_with(&["id"]);
+        table
+            .columns
+            .insert("code".into(), Column::new(ty.parse().unwrap()));
+        table.unique.insert(
+            "u".into(),
+            pbps_model::UniqueConstraint {
+                columns: vec!["code".into()],
+                storage_parameters: Default::default(),
+            },
+        );
+        table
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table("int"));
+    after.tables.insert(t("t"), table("bigint"));
+    let ids = Plan::ids(&["t"], &[("t", "id"), ("t", "code")]);
+    let plan = Plan {
+        logical: vec![
+            p(Change::AlterColumnType {
+                uid: uid(UidKind::Column, "t.code"),
+                column: t("t").column("code"),
+                from: "int".parse().unwrap(),
+                to: "bigint".parse().unwrap(),
+                from_nullable: true,
+                to_nullable: true,
+                from_collation: None,
+                to_collation: None,
+                through_external_partitions: false,
+            }),
+            swap(1, 1, 2),
+            swap(2, 2, 1),
+        ],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
+}
+
+/// A child waits for a parent's update, whatever value `SET c = DEFAULT` sets
+/// (review of #2120).
+#[test]
+fn a_child_row_waits_for_a_parent_update_to_a_literal_default() {
+    let none = ModuleDeps::new();
+    let update = p(Change::UpdateRow {
+        table: t("p"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        columns: [(
+            "code".to_owned(),
+            (
+                pbps_model::Cell::Value(Value::Int(9)),
+                pbps_model::Cell::Default("5".into()),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    });
+    let mut plan = parent_and_child(
+        &["id", "code"],
+        &["code"],
+        &["id", "pcode"],
+        reference(&["pcode"], &["code"]),
+        vec![plain_row("c", 1, &[("pcode", 5)]), update],
+    );
+    for schema in [&mut plan.before, &mut plan.after] {
+        schema
+            .tables
+            .get_mut(&t("p"))
+            .unwrap()
+            .columns
+            .get_mut("code")
+            .unwrap()
+            .value_source = pbps_model::ValueSource::Default("5".into());
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// A parent row deleted while it held a literal default as its unique value
+/// still ends the name its child holds it by.
+#[test]
+fn a_parent_row_deleted_holding_a_default_goes_after_its_child() {
+    let none = ModuleDeps::new();
+    let parent = p(Change::DeleteRow {
+        table: t("p"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        cause: pbps_model::change::DeleteCause::Undeclared,
+        row: [("code".to_owned(), pbps_model::Cell::Default("5".into()))]
+            .into_iter()
+            .collect(),
+        dropped: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: None,
+    });
+    let plan = parent_and_child(
+        &["id", "code"],
+        &["code"],
+        &["id", "pcode"],
+        reference(&["pcode"], &["code"]),
+        vec![parent, delete("c", 1, &[("pcode", 5)])],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// A default that is no literal names no value before it runs, and the child
+/// still waits: the dependency is the table's (DEC-1968.2).
+#[test]
+fn a_child_row_taking_a_computed_default_for_its_reference_waits_for_the_parent() {
+    let none = ModuleDeps::new();
+    let child = p(Change::InsertRow {
+        table: t("c"),
+        key_column: "id".into(),
+        identity_key: false,
+        key: RowKey::from("1"),
+        row: Row::default(),
+        defaults: [("pid".to_owned(), "app.next_parent()".to_owned())]
+            .into_iter()
+            .collect(),
+        types: Default::default(),
+    });
+    let mut plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![child, plain_row("p", 1, &[])],
+    );
+    for schema in [&mut plan.before, &mut plan.after] {
+        schema
+            .tables
+            .get_mut(&t("c"))
+            .unwrap()
+            .columns
+            .get_mut("pid")
+            .unwrap()
+            .value_source = pbps_model::ValueSource::Default("app.next_parent()".into());
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
+/// A third table no foreign key joins to either is ordered by neither
+/// (DEC-1968.2).
+#[test]
+fn a_table_no_foreign_key_joins_to_the_others_gets_no_row_edge() {
+    let mut plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![
+            plain_row("c", 1, &[("pid", 1)]),
+            plain_row("p", 1, &[]),
+            plain_row("u", 1, &[]),
+        ],
+    );
+    for (schema, ids) in [
+        (&mut plan.before, &mut plan.before_ids),
+        (&mut plan.after, &mut plan.after_ids),
+    ] {
+        schema.tables.insert(t("u"), table_with(&["id"]));
+        ids.tables.insert(uid(UidKind::Table, "u"), t("u"));
+        ids.columns
+            .insert(uid(UidKind::Column, "u.id"), t("u").column("id"));
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(
+        g.edges.iter().all(|e| e.before != 2 && e.after != 2),
+        "{:?}",
+        g.edges
+    );
+}
+
+/// Two tables that reference each other draw no row edge between them: the
+/// differ leaves such tables in name order and does not refuse them
+/// (`data::supply_order`), so the rows keep the order given in either
+/// direction and the graph has no cycle.
+#[test]
+fn the_rows_of_two_tables_referencing_each_other_keep_the_order_given() {
+    let none = ModuleDeps::new();
+    let mut plan = parent_and_child(
+        &["id", "cid"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![
+            plain_row("p", 1, &[("cid", 1)]),
+            plain_row("c", 1, &[("pid", 1)]),
+        ],
+    );
+    // And the parent references the child back.
+    for schema in [&mut plan.before, &mut plan.after] {
+        schema.tables.get_mut(&t("p")).unwrap().foreign_keys.insert(
+            "back".into(),
+            ForeignKey {
+                columns: vec!["cid".into()],
+                references_table: t("c"),
+                references_columns: vec!["id".into()],
+                on_delete: ReferentialAction::default(),
+                on_update: ReferentialAction::default(),
+            },
+        );
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    // Negative: a chain that is no cycle keeps its edge.
+    let chain = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![plain_row("p", 1, &[]), plain_row("c", 1, &[("pid", 1)])],
+    );
+    let (ops, fx, baseline) = chain.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+}
+
+/// A child update that gives its reference up goes before the parent's
+/// delete, as the child's own delete does (review of #2120).
+#[test]
+fn a_child_update_releasing_its_reference_goes_before_the_parent_row_is_deleted() {
+    let none = ModuleDeps::new();
+    let update = p(Change::UpdateRow {
+        table: t("c"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        columns: [(
+            "pid".to_owned(),
+            (
+                pbps_model::Cell::Value(Value::Int(1)),
+                pbps_model::Cell::Value(Value::Null),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    });
+    let plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![update, delete("p", 1, &[])],
+    );
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+}
+
+/// A foreign key into a table that the plan drops goes before that table's
+/// rows are deleted; one that stands is no such obligation (review of #2120).
+#[test]
+fn a_parent_row_is_deleted_after_the_incoming_foreign_key_the_plan_drops() {
+    let none = ModuleDeps::new();
+    let mut dropped = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![
+            p(Change::DropForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+            }),
+            delete("p", 1, &[]),
+        ],
+    );
+    dropped
+        .after
+        .tables
+        .get_mut(&t("c"))
+        .unwrap()
+        .foreign_keys
+        .clear();
+    let (ops, fx, baseline) = dropped.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+    // Negative: a key that stands is not waited for.
+    let stands = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![delete("p", 1, &[])],
+    );
+    let (ops, fx, baseline) = stands.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(g.edges.is_empty(), "{:?}", g.edges);
+}
+
+/// The rows of tables in one cycle of foreign keys keep the order given, when
+/// the order matters and the keys do not say: an insert, then an update of
+/// the other table to reference it (review of #2120).
+#[test]
+fn the_rows_of_tables_in_a_cycle_of_foreign_keys_keep_their_relative_order() {
+    let none = ModuleDeps::new();
+    let update = p(Change::UpdateRow {
+        table: t("c"),
+        key_column: "id".into(),
+        key: RowKey::from("1"),
+        columns: [(
+            "pid".to_owned(),
+            (
+                pbps_model::Cell::Value(Value::Null),
+                pbps_model::Cell::Value(Value::Int(1)),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+        unchanged: Default::default(),
+        types: Default::default(),
+        after_types: Default::default(),
+        key_type: Default::default(),
+    });
+    let mut plan = parent_and_child(
+        &["id", "cid"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![plain_row("p", 1, &[("cid", 1)]), update],
+    );
+    for schema in [&mut plan.before, &mut plan.after] {
+        schema.tables.get_mut(&t("p")).unwrap().foreign_keys.insert(
+            "back".into(),
+            ForeignKey {
+                columns: vec!["cid".into()],
+                references_table: t("c"),
+                references_columns: vec!["id".into()],
+                on_delete: ReferentialAction::default(),
+                on_update: ReferentialAction::default(),
+            },
+        );
+    }
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let g = graph(
+        ops.as_slice(),
+        &fx,
+        &baseline,
+        &ModuleDeps::new(),
+        Checks::ALL,
+    );
+    assert!(!g.has_cycle(ops.len()), "{:?}", g.edges);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+}
+
+/// A check the plan tears down and puts back unchanged (the resolver does,
+/// when its binding changes) is gone before a row is written, and back after
+/// (review of #2120).
+#[test]
+fn a_row_update_waits_for_the_teardown_of_a_check_that_is_put_back_unchanged() {
+    let none = ModuleDeps::new();
+    let mut plan = checked("n > 0", "n > 0", pbps_model::Cell::Value(Value::Int(6)));
+    plan.logical.push(p(Change::DropCheck {
+        table: t("t"),
+        name: "ck".into(),
+    }));
+    plan.logical.push(p(Change::AddCheck {
+        table: t("t"),
+        name: "ck".into(),
+        constraint: pbps_model::CheckConstraint {
+            expression: "n > 0".into(),
+        },
+    }));
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    // The update first meets the old check.
+    let early = run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL);
+    assert!(
+        early.iter().any(|v| matches!(v, Violation::Edge { .. })),
+        "{early:?}"
+    );
+    // Drop, update, add: the row is written while no check stands.
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[1, 0, 2], &none, Checks::ALL),
+        []
+    );
+    // Negative: a plan that takes nothing away puts no obligation on a row.
+    let kept = checked("n > 0", "n > 0", pbps_model::Cell::Value(Value::Int(7)));
+    let (ops, fx, baseline) = kept.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0], &none, Checks::ALL), []);
+    let _ = (&ops, &fx);
+}
+
+/// The effects the scheduler consumes (`analyse`) read a foreign key the plan
+/// drops and adds again as the baseline's: a parent's delete still waits for
+/// its drop (review of #2120).
+#[test]
+fn a_parent_row_is_deleted_after_a_foreign_key_the_plan_rebuilds() {
+    let none = ModuleDeps::new();
+    let plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![
+            p(Change::DropForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+            }),
+            delete("p", 1, &[]),
+            p(Change::AddForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+                constraint: Box::new(reference(&["pid"], &["id"])),
+            }),
+        ],
+    );
+    let ops = Operations::of_plan(&plan.logical, ModuleEdits::InPlace);
+    let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
+    let owners = PlanOwners::new(names, &plan.before_ids, &plan.after_ids);
+    let (before, after) = (
+        Snapshot {
+            schema: &plan.before,
+            ids: &plan.before_ids,
+        },
+        Snapshot {
+            schema: &plan.after,
+            ids: &plan.after_ids,
+        },
+    );
+    let baseline = Baseline::of(before, &owners);
+    let shadowed =
+        super::shadow::analyse(&ops, &owners, before, after, &pbps_dialect::MinimalDialect);
+    let fx = shadowed.effects;
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0, 2], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+}
+
+/// The statement finds the row it deletes by its key column, which the row's
+/// payload leaves out, so a rename of that column goes first (review of #2120).
+#[test]
+fn a_row_delete_waits_for_the_rename_of_its_key_column() {
+    let none = ModuleDeps::new();
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table_with(&["a", "n"]));
+    after.tables.insert(t("t"), table_with(&["k", "n"]));
+    let moved = uid(UidKind::Column, "t.a");
+    let named = |column: &str| {
+        let mut ids = Plan::ids(&["t"], &[("t", "n")]);
+        ids.columns.insert(moved.clone(), t("t").column(column));
+        ids
+    };
+    let plan = Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("t"),
+                from: "a".into(),
+                to: "k".into(),
+                table_was: None,
+            }),
+            p(Change::DeleteRow {
+                table: t("t"),
+                key_column: "k".into(),
+                key: RowKey::from("1"),
+                cause: pbps_model::change::DeleteCause::Undeclared,
+                row: [("n".to_owned(), pbps_model::Cell::Value(Value::Int(5)))]
+                    .into_iter()
+                    .collect(),
+                dropped: Default::default(),
+                types: Default::default(),
+                after_types: Default::default(),
+                key_type: None,
+            }),
+        ],
+        before,
+        after,
+        before_ids: named("a"),
+        after_ids: named("k"),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    assert!(
+        run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
+}
+
+/// A partition's own default follows its parent's, also when the parent's
+/// column is renamed in the plan: the parent is read under each side's own
+/// name for the column (review of #2120).
+#[test]
+fn a_partitions_default_follows_its_parents_default_through_a_column_rename() {
+    use pbps_model::{PartitionBound, PartitionColumn, PartitionOf, ValueSource};
+    let with_default = |name: &str, default: &str| {
+        let mut table = table_with(&["id"]);
+        let mut column = Column::new(int());
+        column.value_source = ValueSource::Default(default.into());
+        table.columns.insert(name.into(), column);
+        table
+    };
+    let mut before = Schema::default();
+    before.tables.insert(t("par"), with_default("a", "1"));
+    before.tables.insert(t("pt"), table_with(&["id"]));
+    let mut member = table_with(&[]);
+    member.partition_of = Some(PartitionOf {
+        parent: t("par"),
+        bound: PartitionBound::Default,
+        columns: [(
+            "b".to_owned(),
+            PartitionColumn {
+                default: Some("5".into()),
+                not_null: false,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    });
+    let mut after = Schema::default();
+    after.tables.insert(t("par"), with_default("b", "2"));
+    after.tables.insert(t("pt"), member);
+    let moved = uid(UidKind::Column, "par.a");
+    let named = |column: &str| {
+        let mut ids = Plan::ids(&["par", "pt"], &[("par", "id")]);
+        ids.columns.insert(moved.clone(), t("par").column(column));
+        ids
+    };
+    let plan = Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: moved.clone(),
+                table: t("par"),
+                from: "a".into(),
+                to: "b".into(),
+                table_was: None,
+            }),
+            p(Change::AlterColumnDefault {
+                uid: moved.clone(),
+                column: t("par").column("b"),
+                from: Some("1".into()),
+                to: Some("2".into()),
+            }),
+            p(Change::SetPartitionDefault {
+                uid: uid(UidKind::Table, "pt"),
+                table: t("pt"),
+                parent: t("par"),
+                column: "b".into(),
+                from: None,
+                to: Some("5".into()),
+                fallback: None,
+            }),
+        ],
+        before,
+        after,
+        before_ids: named("a"),
+        after_ids: named("b"),
+    };
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1, 2], &none, Checks::ALL),
+        []
+    );
+    assert!(
+        run(&ops, &fx, &baseline, &[0, 2, 1], &none, Checks::ALL)
+            .iter()
+            .any(|v| matches!(v, Violation::Edge { .. }))
+    );
 }

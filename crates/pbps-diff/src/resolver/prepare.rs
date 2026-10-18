@@ -186,8 +186,6 @@ pub(super) fn invalidates(parts: &[PartEffect<'_>], surface: &Surface) -> bool {
 /// splits, then the rebuilds its evidence appends.
 pub(super) struct Prepared {
     pub changes: ChangeSet,
-    /// How many of `changes` are the ordinary plan's, which come first.
-    pub ordinary: usize,
     /// Where each of `changes` came from, by position: which change of the
     /// ordinary plan, or which rebinding, and its role in it (#1961). Never
     /// part of the plan: the operations are built from it and dropped.
@@ -603,17 +601,11 @@ pub(super) fn changes(
     // dropped: the same normalization the differ's and the dependents
     // pass's rebuilds get (#1516 review). Only ordinary changes go, so the
     // ordinary ones still come first.
-    let mut all: Vec<(bool, Origin, PlannedChange)> = changes
-        .into_iter()
-        .map(|(o, p)| (false, o, p))
-        .chain(added.into_iter().map(|(o, p)| (true, o, p)))
-        .collect();
-    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut all, |(_, _, p)| &p.change);
-    let ordinary = all.iter().filter(|(added, _, _)| !added).count();
-    let (origins, changes) = all.into_iter().map(|(_, o, p)| (o, p)).unzip();
+    let mut all: Vec<(Origin, PlannedChange)> = changes.into_iter().chain(added).collect();
+    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut all, |(_, p)| &p.change);
+    let (origins, changes) = all.into_iter().unzip();
     Ok(Prepared {
         changes: ChangeSet { changes },
-        ordinary,
         origins,
     })
 }

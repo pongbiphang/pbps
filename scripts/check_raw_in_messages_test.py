@@ -249,7 +249,6 @@ class TheAllowlist(unittest.TestCase):
                 'crates/pbps-dialect/src/lib.rs',
                 'crates/pbps-dialect/tests/support/positional_preflight.rs',
                 'crates/pbps-diff/src/identity.rs',
-                'crates/pbps-diff/src/order/compare.rs',
                 'crates/pbps-model/src/module.rs',
                 'crates/pbps-model/src/name.rs',
                 'crates/pbps-mssql/src/estimate.rs',
