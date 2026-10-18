@@ -1557,7 +1557,8 @@ pub(crate) fn permission_sql(p: Permission) -> Result<&'static str, DialectError
         Permission::Execute => "EXECUTE",
         Permission::Alter => "ALTER",
         Permission::ViewDefinition => "VIEW DEFINITION",
-        Permission::Usage
+        Permission::SerialSequences
+        | Permission::Usage
         | Permission::Create
         | Permission::Truncate
         | Permission::Trigger

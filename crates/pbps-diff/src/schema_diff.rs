@@ -6194,6 +6194,31 @@ fn diff_roles(
     // three identity changes are conditional and every `Grant` and `Revoke`
     // below is built the same on both engines.
     let manages_roles = dialect.manages_roles();
+    // The table marker can stay equal while its set of sequences grows. Its
+    // statement discovers that set after the column changes (DEC-1892.1).
+    let serial_creates: BTreeSet<TableName> = changes
+        .iter()
+        .filter_map(|change| {
+            let is_serial = |source: &ValueSource| matches!(source, ValueSource::Sequence(_));
+            if let Change::AddColumn { table, column, .. } = change {
+                return is_serial(&column.value_source).then(|| table.clone());
+            }
+            if let Change::AlterColumnNumbering {
+                column, from, to, ..
+            } = change
+            {
+                return (is_serial(to) && !is_serial(from)).then(|| column.table.clone());
+            }
+            if let Change::CreateTable { name, table, .. } = change {
+                return table
+                    .columns
+                    .values()
+                    .any(|c| is_serial(&c.value_source))
+                    .then(|| name.clone());
+            }
+            None
+        })
+        .collect();
     let mut dropped: Vec<pbps_model::Dropped> = changes.iter().filter_map(Change::drops).collect();
     // `Change::drops` answers `None` for `AlterModule` — the object is
     // restated, not removed, and every other reader of it wants exactly that
@@ -6380,7 +6405,12 @@ fn diff_roles(
                 before.get(target).cloned().unwrap_or_default()
             };
             let d = role.grants.get(target).cloned().unwrap_or_default();
-            let added: BTreeSet<Permission> = d.difference(&b).copied().collect();
+            let mut added: BTreeSet<Permission> = d.difference(&b).copied().collect();
+            if d.contains(&Permission::SerialSequences)
+                && matches!(target, GrantTarget::Object(table) if serial_creates.contains(table))
+            {
+                added.insert(Permission::SerialSequences);
+            }
             let removed: BTreeSet<Permission> = b.difference(&d).copied().collect();
             if !added.is_empty() {
                 changes.push(Change::Grant {
@@ -20555,6 +20585,126 @@ mod tests {
                 );
             }
             r
+        }
+
+        #[test]
+        fn a_new_serial_regrants_an_unchanged_table_marker_after_the_column() {
+            let mut base = side(&[(
+                "r_aaaaaa",
+                "writer",
+                role(&[(
+                    "dbo.customer",
+                    &[Permission::Insert, Permission::SerialSequences],
+                )]),
+            )]);
+            base.0
+                .tables
+                .get_mut(&"dbo.customer".parse().unwrap())
+                .unwrap()
+                .columns["id"]
+                .value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+            let mut declared = base.clone();
+            let mut column = Column::new(ty("int")).not_null();
+            column.value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+            declared
+                .0
+                .tables
+                .get_mut(&"dbo.customer".parse().unwrap())
+                .unwrap()
+                .columns
+                .insert("other".into(), column);
+            declared.1.columns.insert(
+                "c_bbbbbb".parse().unwrap(),
+                "dbo.customer.other".parse().unwrap(),
+            );
+            let changes = diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                changes.changes[0].change,
+                Change::AddColumn { .. }
+            ));
+            assert_eq!(changes.changes.len(), 2);
+            assert!(
+                matches!(&changes.changes[1].change, Change::Grant { role, permissions, .. }
+                if role == "writer" && *permissions == BTreeSet::from([Permission::SerialSequences]))
+            );
+            let unchanged = diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .unwrap();
+            assert!(unchanged.is_empty());
+            declared
+                .0
+                .tables
+                .get_mut(&"dbo.customer".parse().unwrap())
+                .unwrap()
+                .columns["other"]
+                .value_source = ValueSource::None;
+            assert_eq!(
+                kinds(&base, &declared).len(),
+                1,
+                "an ordinary column regrants nothing"
+            );
+        }
+
+        #[test]
+        fn converting_a_column_to_serial_regrants_only_the_declared_holders() {
+            let base = side(&[(
+                "r_aaaaaa",
+                "writer",
+                role(&[(
+                    "dbo.customer",
+                    &[Permission::Insert, Permission::SerialSequences],
+                )]),
+            )]);
+            let declared = base.clone();
+            for from in [
+                ValueSource::None,
+                ValueSource::Identity(pbps_model::Identity::new(1, 1)),
+                ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
+            ] {
+                let creates = !matches!(from, ValueSource::Sequence(_));
+                let mut changes = vec![Change::AlterColumnNumbering {
+                    uid: "c_aaaaaa".parse().unwrap(),
+                    column: "dbo.customer.id".parse().unwrap(),
+                    ty: ty("int"),
+                    from,
+                    to: ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
+                }];
+                diff_roles(
+                    Side {
+                        schema: &base.0,
+                        ids: &base.1,
+                    },
+                    Side {
+                        schema: &declared.0,
+                        ids: &declared.1,
+                    },
+                    &ClusterRoles,
+                    &mut changes,
+                );
+                assert_eq!(changes.len(), if creates { 2 } else { 1 });
+            }
         }
 
         /// One table `dbo.customer` (uid t_aaaaaa) on both sides, plus the

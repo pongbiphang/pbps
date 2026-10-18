@@ -1831,6 +1831,10 @@ impl Dialect for Postgres {
         false
     }
 
+    fn implied_grants(&self, schema: &mut Schema) {
+        pbps_model::role::implied_serial_grants(schema);
+    }
+
     /// **Yes** (#1889): an identity's start and increment are `SET` in place,
     /// an owned sequence's are `ALTER SEQUENCE`, and either is put on or
     /// taken off a column with `ALTER COLUMN`, measured on 16 and 18.

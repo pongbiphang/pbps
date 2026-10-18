@@ -4776,6 +4776,28 @@ mod plan_name_tests {
     }
 
     #[test]
+    fn serial_revocability_evidence_follows_its_table_through_renames() {
+        let (mut changes, ids) = crate::plan_fixture::chain();
+        changes.changes.push(PlannedChange::new(Change::Revoke {
+            role: "writer".into(),
+            target: GrantTarget::Object(TableName::new("app", "final_table")),
+            permissions: [Permission::SerialSequences].into(),
+        }));
+        let mut found = pbps_db::catalog::Unrevocable {
+            role: "writer".into(),
+            target: GrantTarget::Object(TableName::new("app", "original_table")),
+            permission: Permission::SerialSequences,
+            why: "the sequence grantor cannot be selected".into(),
+        };
+        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found.clone()]).is_err());
+        found.permission = Permission::Usage;
+        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found.clone()]).is_ok());
+        found.permission = Permission::SerialSequences;
+        found.target = "app.unmanaged".parse().unwrap();
+        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found]).is_ok());
+    }
+
+    #[test]
     fn grant_checks_keep_catalog_ownership_and_grantors_through_a_rename_chain() {
         let (mut changes, ids) = crate::plan_fixture::chain();
         let target = GrantTarget::Object(TableName::new("app", "final_table"));

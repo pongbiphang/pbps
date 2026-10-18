@@ -2215,6 +2215,10 @@ pub struct RangeSeries {
 
 /// Dialect knowledge that needs no database connection.
 pub trait Dialect {
+    /// Expands only declarations into the permissions compared and planned.
+    /// Reads and recorded snapshots must retain the access actually observed.
+    fn implied_grants(&self, _schema: &mut Schema) {}
+
     fn name(&self) -> &'static str;
 
     /// Dependencies that cannot remain standing while this type changes.

@@ -129,7 +129,12 @@ pub(super) async fn missing(
     }
     for (target, permissions) in &demands {
         for right in permissions {
-            let Ok(word) = crate::emit::permission_sql(*right) else {
+            let word = if *right == Permission::SerialSequences {
+                Ok("USAGE")
+            } else {
+                crate::emit::permission_sql(*right)
+            };
+            let Ok(word) = word else {
                 // Offline validation names privileges belonging to the other
                 // dialect; never send an unknown privilege to PostgreSQL.
                 continue;
@@ -316,6 +321,25 @@ fn question(target: &GrantTarget, right: Permission) -> (Securable, String, Vec<
                 params,
             )
         }
+        GrantTarget::Object(o) if right == Permission::SerialSequences => (
+            Securable::Object(o.clone()),
+            // A declared serial may not exist yet. Keep the table row even
+            // when it owns no sequences, so absence is not a missing target.
+            "SELECT COALESCE(pg_catalog.bool_and(
+                        pg_catalog.has_sequence_privilege(s.oid, $3)), true) AS held,
+                    pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS usage_ok
+               FROM pg_catalog.pg_class t
+               JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+               LEFT JOIN pg_catalog.pg_depend d
+                 ON d.refobjid = t.oid AND d.refobjsubid > 0 AND d.deptype = 'a'
+                AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+                AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+               LEFT JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+              WHERE n.nspname = $1 AND t.relname = $2 AND t.relkind IN ('r', 'p')
+              GROUP BY t.oid, n.oid"
+                .to_owned(),
+            vec![Param::Str(&o.schema), Param::Str(&o.name)],
+        ),
         GrantTarget::Object(o) if right == Permission::Execute => (
             Securable::Routine(o.clone(), None),
             routine_question().replace("$PRIVILEGE", "$3"),
@@ -388,6 +412,28 @@ fn catalog_question(values: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_grant_authority_is_asked_of_owned_sequences_and_not_the_table() {
+        let target: GrantTarget = "app.t".parse().unwrap();
+        let (securable, query, params) = question(&target, Permission::SerialSequences);
+        assert_eq!(securable, Securable::Object(ObjectName::new("app", "t")));
+        assert_eq!(params.len(), 2);
+        assert!(
+            query.contains("has_sequence_privilege(s.oid, $3)"),
+            "{query}"
+        );
+        assert!(query.contains("d.deptype = 'a'"), "{query}");
+        assert!(
+            query.contains("d.refclassid = 'pg_catalog.pg_class'"),
+            "{query}"
+        );
+        assert!(query.contains("COALESCE(pg_catalog.bool_and("), "{query}");
+        assert!(!query.contains("has_table_privilege"), "{query}");
+        let (_, ordinary, _) = question(&target, Permission::Insert);
+        assert!(ordinary.contains("has_table_privilege"), "{ordinary}");
+        assert!(!ordinary.contains("has_sequence_privilege"), "{ordinary}");
+    }
 
     #[test]
     fn routine_grant_lookup_and_bindings_use_the_catalogs_raw_signature() {

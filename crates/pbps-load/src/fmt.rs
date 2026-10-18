@@ -567,9 +567,10 @@ pub fn render_role(name: &str, role: &pbps_model::Role, pending: &[Intent]) -> S
             let _ = writeln!(s, "renamed_from: {}", scalar(from));
         }
     }
-    if !role.grants.is_empty() {
+    let grants: Vec<_> = role.declarable_grants().collect();
+    if !grants.is_empty() {
         s.push_str("\ngrants:\n");
-        for (target, permissions) in &role.grants {
+        for (target, permissions) in grants {
             let names: Vec<String> = permissions.iter().map(|p| p.as_str().to_owned()).collect();
             let _ = writeln!(s, "  {}: {}", scalar(&target.to_string()), seq(&names));
         }
@@ -1392,6 +1393,54 @@ mod tests {
     /// too. Measured on SQL Server 2025: `CREATE SCHEMA [ app]` keeps its
     /// padding, and `pull` renders the target as a quoted `"schema:: app"` —
     /// so a trimmed reload targets a schema that is not there (DECISIONS 178).
+    #[test]
+    fn rendered_roles_keep_declared_access_and_omit_serial_markers() {
+        use pbps_model::{Permission, Role};
+        let role = Role {
+            grants: [
+                (
+                    "app.t".parse().unwrap(),
+                    [Permission::Insert, Permission::SerialSequences].into(),
+                ),
+                (
+                    "app.hidden".parse().unwrap(),
+                    [Permission::SerialSequences].into(),
+                ),
+                ("schema::app".parse().unwrap(), [Permission::Usage].into()),
+            ]
+            .into(),
+            ..Role::default()
+        };
+        let out = render_role("writer", &role, &[]);
+        assert!(!out.contains("serial-sequences"), "{out}");
+        assert!(!out.contains("hidden"), "{out}");
+        let loaded = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
+        assert_eq!(
+            loaded.role.grants[&"app.t".parse().unwrap()],
+            [Permission::Insert].into()
+        );
+        assert_eq!(
+            loaded.role.grants[&"schema::app".parse().unwrap()],
+            [Permission::Usage].into()
+        );
+        let only = Role {
+            grants: [(
+                "app.t".parse().unwrap(),
+                [Permission::SerialSequences].into(),
+            )]
+            .into(),
+            ..Role::default()
+        };
+        assert_eq!(render_role("writer", &only, &[]), "role: writer\n");
+        assert!(
+            crate::load_role_str(
+                Path::new("r.yml"),
+                "role: writer\ngrants:\n  app.t: [serial-sequences]\n"
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn a_grant_target_keeps_the_whitespace_the_database_gave_it() {
         let mut role = pbps_model::Role::default();

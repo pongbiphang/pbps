@@ -294,6 +294,12 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
     let names: Vec<String> = schema.roles.keys().cloned().collect();
     for name in names {
         let role = schema.roles.get_mut(&name).expect("listed above");
+        // Validation judges the declaration pull writes, not its internal ACL
+        // marker. Removing a whole target here would also lose its INSERT.
+        role.grants = role
+            .declarable_grants()
+            .map(|(target, permissions)| (target.clone(), permissions))
+            .collect();
         let (left_out, whole) = narrow_role(&name, role, &mut probe, dialect);
         pulled.unexpressible.extend(left_out);
         if let Some(why) = whole {
@@ -1004,6 +1010,39 @@ mod tests {
     }
 
     /// Nothing refused, nothing moved: the common case is untouched.
+    #[test]
+    fn pull_keeps_insert_while_removing_the_internal_serial_marker() {
+        let mut pulled = Pulled::default();
+        pulled
+            .schema
+            .tables
+            .insert(TableName::new("app", "t"), table("integer", None));
+        pulled.schema.roles.insert(
+            "writer".into(),
+            role(&[
+                ("schema::app", Permission::Usage),
+                ("app.t", Permission::Insert),
+                ("app.t", Permission::SerialSequences),
+                ("app.marker_only", Permission::SerialSequences),
+            ]),
+        );
+        leave_out_what_validate_refuses(&mut pulled, pg().as_ref());
+        assert!(
+            pulled.unexpressible.is_empty(),
+            "{:?}",
+            pulled.unexpressible
+        );
+        let grants = &pulled.schema.roles["writer"].grants;
+        assert_eq!(
+            grants[&"app.t".parse().unwrap()],
+            [Permission::Insert].into()
+        );
+        assert!(!grants.contains_key(&"app.marker_only".parse().unwrap()));
+        let written = pbps_load::render_role("writer", &pulled.schema.roles["writer"], &[]);
+        assert!(!written.contains("serial-sequences"), "{written}");
+        assert!(written.contains("insert"), "{written}");
+    }
+
     #[test]
     fn a_pull_validate_accepts_is_left_exactly_as_read() {
         let mut pulled = Pulled::default();
