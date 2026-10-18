@@ -286,6 +286,16 @@ fn no_such_image(error: &str) -> bool {
     error.contains("no such image") || error.contains("image not known")
 }
 
+/// The label naming the process that starts a scratch container: its pid,
+/// for a reader, and a value drawn once per process, since processes in
+/// different PID namespaces (containers sharing the host's Docker socket)
+/// can have the same pid (#2194 review).
+pub(super) fn process_label() -> String {
+    static TOKEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let token = TOKEN.get_or_init(rand::random::<u64>);
+    format!("pbps.resolver.process={}-{token:016x}", std::process::id())
+}
+
 /// The `docker run` that starts the scratch server.
 fn run_args(name: &str, password: &str, image: &str) -> Vec<String> {
     [
@@ -299,6 +309,11 @@ fn run_args(name: &str, password: &str, image: &str) -> Vec<String> {
         name,
         "--label",
         "pbps.resolver=scratch",
+        // Which process started it. Another pbps on the same host labels its
+        // scratch containers the same way, so this is what tells a leftover's
+        // owner, and what lets the live tests count only their own (#2095).
+        "--label",
+        &process_label(),
         "--env",
         &format!("POSTGRES_PASSWORD={password}"),
         // An omitted host port: Docker and Podman both pick a free one, on
@@ -445,6 +460,22 @@ mod tests {
         assert_eq!(after("--pull"), "never");
         assert_eq!(after("--publish"), "127.0.0.1::5432");
         assert_eq!(after("--name"), "pbps-scratch-0");
+        let labels: Vec<&str> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--label")
+            .map(|(i, _)| args[i + 1].as_str())
+            .collect();
+        let label = super::process_label();
+        assert_eq!(labels, ["pbps.resolver=scratch", label.as_str()]);
+        // One value for the process's lifetime, which the live tests filter
+        // on, and more than the pid, which another PID namespace can share.
+        assert_eq!(label, super::process_label());
+        let pid = format!("pbps.resolver.process={}-", std::process::id());
+        assert!(
+            label.starts_with(&pid) && label.len() == pid.len() + 16,
+            "{label}"
+        );
         assert_eq!(args.last().map(String::as_str), Some("postgres:18"));
         // Negative: no other pull policy, and no second publish.
         assert_eq!(args.iter().filter(|a| a.starts_with("--pull")).count(), 1);

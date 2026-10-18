@@ -4470,9 +4470,12 @@ const DOCKER_PAIRS: &[(&str, &str)] = &[
     ("PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_OLD_SCRATCH_IMAGE"),
 ];
 
-/// The containers a Docker scratch labels, so a test can tell what a run
-/// left behind.
+/// The containers a Docker scratch of this process labels, so a test can
+/// tell what a run left behind. Only this process's: another session's
+/// resolver run on the same host starts and removes scratch containers under
+/// the same scratch label meanwhile (#2095).
 fn scratch_containers() -> std::collections::BTreeSet<String> {
+    let process = format!("label={}", super::container::process_label());
     let output = std::process::Command::new("docker")
         .args([
             "ps",
@@ -4480,6 +4483,8 @@ fn scratch_containers() -> std::collections::BTreeSet<String> {
             "--no-trunc",
             "--filter",
             "label=pbps.resolver=scratch",
+            "--filter",
+            &process,
             "--format",
             "{{.ID}}",
         ])
