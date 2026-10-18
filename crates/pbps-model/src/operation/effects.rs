@@ -1635,35 +1635,32 @@ impl Cx<'_> {
         // checked, and whether it does is the engine's to say: the release
         // pass lets a drop pass the insert there (`Dependence::base_required`,
         // #1397), so no requirement is stated (#2175 review). Only a trigger
-        // that stands at the insert: one the plan keeps unchanged, under the
-        // table's name at each end. One it drops or rewrites may be gone when
-        // the row is written, and one it creates comes after the rows. Only a
-        // declared trigger is seen here; an undeclared one is the catalog's,
-        // which the effects do not read.
-        if let Some((final_name, _)) = self.final_of(owner) {
-            let on = |id: &crate::ModuleId, table: &TableName| -> Option<String> {
-                match id {
-                    crate::ModuleId::Trigger { on, name }
-                        if on.schema == table.schema && on.name == table.name =>
-                    {
-                        Some(name.clone())
-                    }
-                    crate::ModuleId::Trigger { .. }
-                    | crate::ModuleId::Named(_)
-                    | crate::ModuleId::Routine(_) => None,
-                }
-            };
-            let kept =
-                self.before.schema.modules.iter().any(|(id, was)| {
-                    on(id, base_name).is_some_and(|name| {
-                        self.after.schema.modules.iter().any(|(id, will)| {
-                            on(id, final_name) == Some(name.clone()) && will == was
-                        })
-                    })
-                });
-            if kept {
-                return;
-            }
+        // that stands at the insert: one declared under the same id at both
+        // ends, on a table the plan neither renames nor replaces. The differ
+        // changes such a trigger's text in one step, so it stands throughout,
+        // and what its new text fills is the engine's to say too. A trigger
+        // under a new id, a renamed table's among them, is dropped before
+        // the rows and created after them. Only a declared trigger is seen
+        // here; an undeclared one is the catalog's, which the effects do not
+        // read.
+        let stands = |id: &crate::ModuleId| {
+            matches!(id, crate::ModuleId::Trigger { on, .. }
+                if on.schema == base_name.schema && on.name == base_name.name)
+        };
+        if self
+            .final_of(owner)
+            .is_some_and(|(final_name, _)| final_name == base_name)
+            && self.before.schema.modules.iter().any(|(id, was)| {
+                stands(id)
+                    && self
+                        .after
+                        .schema
+                        .modules
+                        .get(id)
+                        .is_some_and(|will| will.kind == was.kind)
+            })
+        {
+            return;
         }
         let written: Vec<ColumnKey> = written
             .iter()

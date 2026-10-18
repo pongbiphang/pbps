@@ -3117,6 +3117,19 @@ fn a_row_insert_waits_for_the_drop_of_a_not_null_column_it_leaves_out() {
     }
     let (ops, fx, baseline) = triggered.analysed(ModuleEdits::InPlace);
     assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+    // So does one whose text or description the plan changes: it is changed
+    // in one step and stands throughout (#2175 review).
+    let mut rewritten = insert_beside_a_dropped_column(true);
+    rewritten
+        .before
+        .modules
+        .insert(trigger.0.clone(), trigger.1.clone());
+    let mut new_text = trigger.1.clone();
+    new_text.definition = "BEFORE INSERT  ON t FOR EACH ROW EXECUTE FUNCTION g()".into();
+    new_text.description = Some("fills a".into());
+    rewritten.after.modules.insert(trigger.0.clone(), new_text);
+    let (ops, fx, baseline) = rewritten.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
     // But a trigger the plan drops may be gone when the row is written, so
     // the insert still waits (#2175 review).
     let mut dropped = insert_beside_a_dropped_column(true);
