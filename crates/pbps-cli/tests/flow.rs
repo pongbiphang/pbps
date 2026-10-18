@@ -7761,6 +7761,24 @@ fn a_depends_on_cycle_is_refused_before_planning() {
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
 
+    // A view listing itself is a cycle of one, refused the same way by an
+    // offline plan (#2189 review).
+    d.module(
+        "dbo.a.yml",
+        "view: dbo.a\ndepends_on: [dbo.a]\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("`dbo.a` lists itself"),
+        "{}",
+        stderr(&o)
+    );
+    d.module(
+        "dbo.a.yml",
+        "view: dbo.a\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    );
+
     // Negative: a revision that reverses a committed edge. The baseline's
     // `b -> a` is not carried beside the declared `a -> b` while `b` is
     // still declared, so nothing closes (#2083 review).

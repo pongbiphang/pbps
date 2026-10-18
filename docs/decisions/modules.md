@@ -1919,8 +1919,9 @@ does not ask `validate`'s questions first.
 
 The alternative was to keep name order and have the verifier skip declared
 edges inside a cycle. It plans what the declarations contradict and leaves
-the engine to object mid-apply. A self-reference is still
-`check_dependencies`' finding. A target that is not declared closes
+the engine to object mid-apply. A module that lists itself is a cycle of
+one: the differ refuses it with the rest, and `validate` leaves it to
+`check_dependencies`' own finding. A target that is not declared closes
 nothing, since only declared modules are walked.
 
 Pinned by `a_depends_on_cycle_is_refused_with_every_member_named`
