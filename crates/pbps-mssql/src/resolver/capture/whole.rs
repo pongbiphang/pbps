@@ -74,6 +74,8 @@ fn number(row: &WholeRow, column: &str) -> Option<i64> {
 
 pub(super) struct Whole<'a> {
     catalog: &'a Catalog,
+    /// The object ids the rows translated since the last take named.
+    referenced: std::cell::RefCell<std::collections::BTreeSet<i64>>,
     per_object: BTreeMap<&'static str, BTreeMap<i64, &'a WholeRow>>,
     per_column: BTreeMap<&'static str, BTreeMap<(i64, i64), &'a WholeRow>>,
     indexes: BTreeMap<i64, Vec<&'a WholeRow>>,
@@ -96,6 +98,7 @@ impl<'a> Whole<'a> {
         let rows = |view: &str| catalog.whole.get(view).map(Vec::as_slice).unwrap_or(&[]);
         let mut whole = Self {
             catalog,
+            referenced: Default::default(),
             per_object: BTreeMap::new(),
             per_column: BTreeMap::new(),
             indexes: BTreeMap::new(),
@@ -293,7 +296,10 @@ impl<'a> Whole<'a> {
                 Rule::Skip(_) | Rule::AsReported(_) => unreachable!("handled above"),
                 Rule::Principal => json!(index.principal(id)?),
                 Rule::Schema => json!(index.schema_identity(id)?),
-                Rule::Object => self.object_identity(view, id, index)?,
+                Rule::Object => {
+                    self.referenced.borrow_mut().insert(id);
+                    self.object_identity(view, id, index)?
+                }
                 Rule::Type => json!(index.type_identity(id)?),
                 Rule::Column(source) => match (id, number(row, source)) {
                     (0, _) => Value::Null,
@@ -434,6 +440,11 @@ impl<'a> Whole<'a> {
             out.insert(format!("sys.{view}"), value);
         }
         Ok(Value::Object(out))
+    }
+
+    /// The object ids named by the rows translated since the last call.
+    pub(super) fn take_referenced(&self) -> std::collections::BTreeSet<i64> {
+        std::mem::take(&mut *self.referenced.borrow_mut())
     }
 
     /// The security policies whose predicates name `object` as their target:

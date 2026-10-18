@@ -410,6 +410,25 @@ fn a_stoplist_is_compared_by_its_words_not_its_name_alone() {
 }
 
 #[test]
+fn a_retained_identity_the_capture_cannot_look_up_refuses() {
+    let mut scope = scope();
+    scope
+        .retained
+        .insert(super::super::capture::ObjectIdentity {
+            class: class::COLUMN.into(),
+            name: vec!["v".into()],
+            signature: vec![object("app", "v")],
+        });
+    match select::select(&catalog(), &scope) {
+        Ok(_) => panic!("the capture was expected to refuse"),
+        Err(refusal) => assert_eq!(
+            refusal.condition,
+            "a retained identity is of a class or shape the capture does not look up"
+        ),
+    }
+}
+
+#[test]
 fn an_engine_object_is_read_by_identity_only() {
     let mut catalog = catalog();
     // `sys.objects` is the engine's own: no row of it is in the catalog read.

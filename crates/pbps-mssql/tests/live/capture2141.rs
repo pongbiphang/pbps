@@ -1527,6 +1527,30 @@ async fn mssql_a_tables_own_settings_are_compared() {
             .any(|d| d.object.as_ref() == Some(what) && d.change == InputChange::Properties)
     };
     let versioned = object("app", "versioned");
+    // The history table the parent names joins the closure: its own shape
+    // is compared too.
+    let history = object("app", "versioned_history");
+    assert!(
+        sealed.objects().any(|o| *o == history),
+        "the history table is read"
+    );
+    run(
+        &mut db.conn,
+        &["CREATE INDEX ix_history ON app.versioned_history (vt);"],
+    )
+    .await;
+    let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+        .await
+        .expect("recapture");
+    assert!(
+        differs(&differences, &history),
+        "history index: {differences:?}"
+    );
+    run(
+        &mut db.conn,
+        &["DROP INDEX ix_history ON app.versioned_history;"],
+    )
+    .await;
     run(
         &mut db.conn,
         &["ALTER TABLE app.versioned SET (SYSTEM_VERSIONING = OFF);"],

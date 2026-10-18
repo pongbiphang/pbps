@@ -3730,6 +3730,14 @@ column after another, which is why §8 rejected it for the externals file.
   A security policy on a captured object joins its closure. A full-text
   stoplist is compared by its words and a search property list by its
   properties.
+- **An object a row names joins the closure.** Every object of the
+  database's own that a translated row names by id, such as a temporal
+  table's history table, a ledger view or an edge constraint's tables, is
+  read too. Its own properties are then compared, not only its name.
+- **A retained identity must be one the capture can look up:** an object
+  or a type by schema and name, or a schema or principal. Any other
+  refuses, rather than being sealed as asked yet never read. This answers
+  #2150's ninth ready review.
 - **The typed reads stay.** The dependency classification, the closure,
   the candidates and ownership read them (DEC-2141.1). The whole rows are
   what a capture compares.

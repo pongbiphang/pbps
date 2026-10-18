@@ -273,6 +273,17 @@ impl Builder<'_> {
         Ok(bindings)
     }
 
+    /// Every object of the database's own that a whole row just translated
+    /// named, such as a temporal table's history table or a ledger view:
+    /// named, it joins the closure, so its own properties are compared too.
+    fn follow_referenced(&mut self) {
+        for id in self.whole.take_referenced() {
+            if self.index.objects.contains_key(&id) {
+                self.enqueue(id);
+            }
+        }
+    }
+
     fn type_ref(&mut self, id: i64) -> Result<ObjectIdentity, Uncovered> {
         self.types.insert(id);
         self.index.type_identity(id)
@@ -643,6 +654,7 @@ impl Builder<'_> {
                 ("persisted".to_owned(), json!(column.persisted)),
             ]);
             properties.extend(self.whole.column(id, column.id, &self.index)?);
+            self.follow_referenced();
             let mut bindings = column_bindings.remove(&column.id).unwrap_or_default();
             bindings.extend(self.standalone(self.whole.column_row(id, column.id))?);
             self.insert(
@@ -671,6 +683,7 @@ impl Builder<'_> {
             self.enqueue(child);
         }
         properties.extend(self.whole.object(id, &self.index)?);
+        self.follow_referenced();
         self.insert(
             me,
             Input {
@@ -794,6 +807,7 @@ impl Builder<'_> {
                 ("table_type".to_owned(), json!(found.table_type)),
             ]);
             properties.extend(self.whole.type_rows(id, &self.index)?);
+            self.follow_referenced();
             bindings.extend(self.standalone(self.whole.type_row(id))?);
             self.insert(
                 me,
@@ -854,20 +868,29 @@ pub(super) fn select(catalog: &Catalog, scope: &CaptureScope) -> Result<Selected
         )?;
     }
     for object in &scope.retained {
-        if let [schema, name] = object.name.as_slice() {
-            let key = (schema.clone(), name.clone());
-            match object.class.as_str() {
-                class::OBJECT => {
-                    for id in catalog.objects_named.get(&key).into_iter().flatten() {
-                        builder.enqueue(*id);
-                    }
-                }
-                class::TYPE => {
-                    for id in catalog.types_named.get(&key).into_iter().flatten() {
-                        builder.types.insert(*id);
-                    }
-                }
-                _ => {}
+        // A retained identity is one the capture can look up: an object or
+        // a type by schema and name, or a schema or principal, which every
+        // capture holds whole. Any other would be sealed as asked yet never
+        // read, so it refuses rather than read as absent.
+        let key = match (object.class.as_str(), object.name.as_slice()) {
+            (class::OBJECT | class::TYPE, [schema, name]) if object.signature.is_empty() => {
+                (schema.clone(), name.clone())
+            }
+            (class::SCHEMA | class::PRINCIPAL, [_]) if object.signature.is_empty() => continue,
+            _ => {
+                return Err(Uncovered::object(
+                    object,
+                    "a retained identity is of a class or shape the capture does not look up",
+                ));
+            }
+        };
+        if object.class == class::OBJECT {
+            for id in catalog.objects_named.get(&key).into_iter().flatten() {
+                builder.enqueue(*id);
+            }
+        } else {
+            for id in catalog.types_named.get(&key).into_iter().flatten() {
+                builder.types.insert(*id);
             }
         }
     }
