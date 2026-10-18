@@ -53,40 +53,6 @@ data:
 "#,
     },
     Scenario {
-        name: "two_columns_added_to_one_table",
-        pair: ["AddColumn", "AddColumn"],
-        gap: Some(2080),
-        uid_order: Some(2080),
-        base: r#"
-table: app.t
-columns:
-  id: {type: int, nullable: false}
-  a: {type: int}
-  b: {type: int}
-primary_key: {name: pk_t, columns: [id]}
-data:
-  mode: exact
-  rows:
-    1: {a: 1, b: 2}
-    2: {a: 3, b: 4}
-"#,
-        desired: r#"
-table: app.t
-columns:
-  id: {type: int, nullable: false}
-  a: {type: int}
-  b: {type: int}
-  c: {type: int}
-  d: {type: nvarchar(20)}
-primary_key: {name: pk_t, columns: [id]}
-data:
-  mode: exact
-  rows:
-    1: {a: 1, b: 2}
-    2: {a: 3, b: 4}
-"#,
-    },
-    Scenario {
         name: "an_index_and_a_check_dropped_from_one_table",
         pair: ["DropIndex", "DropCheck"],
         gap: None,

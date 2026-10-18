@@ -1944,6 +1944,21 @@ pub(crate) fn diff_partial_rebuilding(
                 dependency_rank(&p.change, &create_rank, &drop_rank, &data_rank, &role_rank)
             },
             p.change.subject(),
+            // Columns added to one table in the order they are declared:
+            // the engine appends each, so this is the table's column order,
+            // which a pull writes and a positional `INSERT` binds to. Left
+            // to the rendering below, the column's random uid decided it
+            // (#2080).
+            if let Change::AddColumn { table, name, .. } = &p.change {
+                declared
+                    .schema
+                    .tables
+                    .get(table)
+                    .and_then(|t| t.columns.get_index_of(name))
+                    .unwrap_or(0)
+            } else {
+                0
+            },
             format!("{:?}", p.change),
         )
     });
@@ -19732,6 +19747,56 @@ mod tests {
 
     /// The expressible half of the same comparison survives. `diff` accumulates
     /// every change it can phrase and only then checks for errors, so returning
+    /// Columns added to one table are added in the order they are declared,
+    /// which is the order the engine leaves them in, whatever their names and
+    /// whatever uids they are minted: before, the uid in each change's
+    /// rendering broke the tie, so the table's column order changed from one
+    /// plan to the next (#2080). Minted afresh each time, as `plan` mints a
+    /// new column's uid.
+    #[test]
+    fn columns_added_to_one_table_follow_their_declared_order() {
+        let bare = schema_of("app.t", table(&[("id", Column::new(ty("int")))]));
+        let added = schema_of(
+            "app.t",
+            table(&[
+                ("id", Column::new(ty("int"))),
+                ("z", Column::new(ty("int"))),
+                ("m", Column::new(ty("int"))),
+                ("a", Column::new(ty("int"))),
+            ]),
+        );
+        let from_ids = crate::resolve(&bare, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        for _ in 0..16 {
+            let to_ids = crate::resolve(&added, &from_ids, &[], &ctx()).unwrap().ids;
+            let order: Vec<String> = diff_partial(
+                Side {
+                    schema: &bare,
+                    ids: &from_ids,
+                },
+                Side {
+                    schema: &added,
+                    ids: &to_ids,
+                },
+                &MinimalDialect,
+                &Hints::default(),
+            )
+            .changes
+            .changes
+            .iter()
+            .filter_map(|p| {
+                if let Change::AddColumn { name, .. } = &p.change {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+            assert_eq!(order, ["z", "m", "a"]);
+        }
+    }
+
     /// A generated column is added after, and dropped before, the ordinary
     /// columns of the same plan: the engine refuses an expression over a
     /// column not added yet, and refuses to drop a column a generated column
