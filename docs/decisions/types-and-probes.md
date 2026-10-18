@@ -2224,11 +2224,14 @@ key, unique constraint or unique index: measured, once a cycling sequence
 wraps, the next insert fails as a duplicate key, so on a key a cycle only
 trades "reached maximum value" for a later and less clear failure. A unique
 index whose key is an expression naming the column, such as `(id + 0)`, is
-such a key too (measured on 18: the wrap fails on it as a duplicate key).
-The model does not parse expressions, so an expression counts where it
-names the column by the rules a stored body is read with (literals and
-comments are not names); at worst an expression that only spells the
-column's name in another role refuses the cycle, naming the index (#2014).
+sometimes a key too. Measured on 18: under `(id + 0)` the wrap fails as a
+duplicate key, and under `NULLIF(id, id)`, which is always NULL and so never
+a duplicate under the default `NULLS DISTINCT`, it does not. Which one an
+expression is takes reading it, and the model does not parse expressions.
+So such an index refuses nothing: `validate` notes it as not checked, naming
+the column and the index. The expression names the column by the rules a
+stored body is read with (literals and comments are not names). Refusing it
+would refuse a valid plan (#2014, maintainer's choice on its review).
 On a column under no key it is accepted. SQL Server's `IDENTITY` has only a seed
 and an increment, and refuses every option by name.
 

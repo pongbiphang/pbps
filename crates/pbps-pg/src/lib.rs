@@ -511,18 +511,8 @@ fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
             keys.push(format!("unique constraint `{name}`"));
         }
     }
-    // A unique index's key may be an expression over the column, such as
-    // `(id + 0)`, which wraps onto a value a row holds as surely as the
-    // column itself (#2014). The model does not parse expressions, so one
-    // that names the column, by the rules `impact::mentions` reads a stored
-    // body with, counts: at worst a cycle beside an expression that only
-    // spells the column's name otherwise is refused, naming the index.
     for (name, index) in &table.indexes {
-        let over_column = |key: &pbps_model::IndexKey| match key {
-            pbps_model::IndexKey::Column(c) => c == column,
-            pbps_model::IndexKey::Expression(text) => crate::impact::mentions(text, column),
-        };
-        if index.unique && index.columns.iter().any(|c| over_column(&c.key)) {
+        if index.unique && index.columns.iter().any(|c| c.key.column() == Some(column)) {
             keys.push(format!("unique index `{name}`"));
         }
     }
@@ -536,6 +526,54 @@ fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
             ),
         })
         .collect()
+}
+
+/// Each cycling numbering column under a unique index whose key is an
+/// expression naming it, as a note rather than a refusal (#2014,
+/// DEC-1921.1). A wrap collides there as on the column itself where the
+/// expression gives back the number, as `(id + 0)` does (measured on 18), and
+/// does not where it gives back NULL, as `NULLIF(id, id)` does under the
+/// default `NULLS DISTINCT`. Which one an expression is takes reading it,
+/// which the model does not do, so the plan is not refused and the question
+/// is said to be open. The expression names the column by the rules
+/// `impact::mentions` reads a stored body with.
+fn cycle_expression_notes(schema: &Schema) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (table_name, table) in &schema.tables {
+        for (column, c) in &table.columns {
+            let cycles = match &c.value_source {
+                pbps_model::ValueSource::Identity(identity) => identity.options.cycle,
+                pbps_model::ValueSource::Sequence(sequence) => sequence.options.cycle,
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Generated(_) => false,
+            };
+            if !cycles {
+                continue;
+            }
+            for (name, index) in &table.indexes {
+                let over_expression = index.columns.iter().any(|k| {
+                    matches!(&k.key, pbps_model::IndexKey::Expression(text)
+                        if crate::impact::mentions(text, column))
+                });
+                // A plain key on the column is refused by `cycle_problems`.
+                let over_column = index
+                    .columns
+                    .iter()
+                    .any(|k| k.key.column() == Some(column.as_str()));
+                if index.unique && over_expression && !over_column {
+                    notes.push(format!(
+                        "{}.{column} has `cycle: true` and unique index `{name}` has an \
+                         expression over it: whether a number the sequence hands out again \
+                         collides there depends on what the expression gives back, which is \
+                         not checked",
+                        table_name.shown()
+                    ));
+                }
+            }
+        }
+    }
+    notes
 }
 
 /// The PostgreSQL dialect.
@@ -1984,7 +2022,9 @@ impl Dialect for Postgres {
     }
 
     fn declaration_notes(&self, schema: &Schema) -> Vec<String> {
-        rows::not_checked_offline(schema)
+        let mut notes = rows::not_checked_offline(schema);
+        notes.extend(cycle_expression_notes(schema));
+        notes
     }
 }
 
@@ -6085,10 +6125,11 @@ mod tests {
     /// A sequence that cycles hands out, once it wraps, a number a row
     /// already holds, so on a column under a primary key, a unique
     /// constraint or a unique index it is refused, naming the key (#1921,
-    /// DEC-1921.1), and under a unique index whose expression names the
-    /// column (#2014). The same sequence on a column under no key is
+    /// DEC-1921.1). Under a unique index whose expression names the column it
+    /// is accepted with a note, since only the expression decides whether a
+    /// wrap collides (#2014). The same sequence on a column under no key is
     /// accepted, and beside a non-unique expression index, a unique one over
-    /// another column, or a literal that spells the name.
+    /// another column, or a literal that spells the name, with no note.
     #[test]
     fn a_cycling_sequence_under_a_key_is_refused_naming_the_key() {
         let t: TableName = "app.t".parse().unwrap();
@@ -6156,9 +6197,10 @@ mod tests {
                 "{kind}: {refused:?}"
             );
 
-            // A unique expression index over the column wraps onto a held
-            // value too (#2014); a non-unique one, and a unique one over
-            // another column's expression, refuse nothing.
+            // A unique expression index over the column is a note, not a
+            // refusal: whether a wrap collides there depends on the
+            // expression (#2014). A non-unique one, one over another column,
+            // and a literal that spells the name give no note.
             let expression = |unique, text: &str| pbps_model::Index {
                 columns: vec![pbps_model::IndexColumn {
                     key: pbps_model::IndexKey::Expression(text.into()),
@@ -6171,23 +6213,32 @@ mod tests {
                 method: Default::default(),
                 storage_parameters: Default::default(),
             };
-            let mut over = table.clone();
-            over.indexes
-                .insert("t_id_expr".into(), expression(true, "(id + 0)"));
-            let refused = found(&over);
-            assert!(
-                refused
-                    .iter()
-                    .any(|m| m.contains("unique index `t_id_expr`")),
-                "{kind}: {refused:?}"
-            );
+            let noted = |table: &Table| {
+                let mut schema = pbps_model::Schema::default();
+                schema.tables.insert(t.clone(), table.clone());
+                Postgres::new().declaration_notes(&schema)
+            };
+            for text in ["(id + 0)", "NULLIF(id, id)"] {
+                let mut over = table.clone();
+                over.indexes
+                    .insert("t_id_expr".into(), expression(true, text));
+                assert_eq!(found(&over), Vec::<String>::new(), "{kind}: {text}");
+                let notes = noted(&over);
+                assert!(
+                    notes.len() == 1
+                        && notes[0].contains("app.t.id has `cycle: true`")
+                        && notes[0].contains("unique index `t_id_expr`"),
+                    "{kind}: {text}: {notes:?}"
+                );
+            }
             for (unique, text) in [(false, "(id + 0)"), (true, "(v + 0)"), (true, "('id')")] {
                 let mut other = table.clone();
                 other
                     .indexes
                     .insert("t_expr".into(), expression(unique, text));
+                assert_eq!(found(&other), Vec::<String>::new(), "{kind}: {text}");
                 assert_eq!(
-                    found(&other),
+                    noted(&other),
                     Vec::<String>::new(),
                     "{kind}: {unique} {text}"
                 );
