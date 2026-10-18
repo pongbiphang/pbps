@@ -463,6 +463,7 @@
         "darwin"
       ],
       "cases": [
+        "a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names",
         "a_table_a_publication_lists_is_refused_unlogged_by_name",
         "abrupt_committed_apply_without_caller_success_is_not_replayed",
         "abrupt_staged_ddl_refuses_unrecorded_progress",

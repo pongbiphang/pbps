@@ -8284,6 +8284,99 @@ fn pg_partman_parent_is_pulled_with_external_partitions(server: &str, k: usize) 
     assert!(!reader.dir.join("schema/app.ev.yml").exists());
 }
 
+/// A pending drop intent takes a held partition's uid out of the identity
+/// file before anything runs. Under a parent now declared `partitions:
+/// external`, `baseline` would then read the partition as one of the
+/// parent's external ones and hand it over undropped. The recorded state
+/// decides instead: the baseline is refused by name, and goes once a plan has
+/// dropped the partition (#1852, DEC-1852.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        a_baseline_does_not_hand_over_a_held_partition_on(server, k);
+    }
+}
+
+fn a_baseline_does_not_hand_over_a_held_partition_on(server: &str, k: usize) {
+    let db = OwnDatabase::new(server, "handover-1852");
+    let connection = db.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+    );
+    let d = Demo::new(&format!("handover-1852-{k}"));
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let held = text.find("\npartitions:\n").unwrap();
+    let entries = || scalar(&connection, "SELECT count(*) FROM public.__pbps_state");
+
+    // Negative, as before this change: external without a drop intent is
+    // two owners for the partition, refused by the scope itself.
+    std::fs::write(&path, format!("{}\npartitions: external\n", &text[..held])).unwrap();
+    d.commit();
+    let o = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.ev_2025 is a partition pbps holds of the managed table app.ev"),
+        "{}",
+        stderr(&o)
+    );
+
+    // With a drop intent, the working identity file no longer holds it, and
+    // the recorded state refuses the handover by name.
+    succeeds(d.run(&["drop-table", "app.ev_2025", "--reason", "retired"]));
+    // The intent may change no tracked file; the history needs no new commit.
+    d.git(&["add", "-A"]);
+    d.git(&["commit", "-q", "--allow-empty", "-m", "drop intent"]);
+    let o = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains(
+            "app.ev_2025 is held by the recorded state (entry #1), and this baseline would \
+             leave it to the external parent app.ev's other tool undropped"
+        ) && stderr(&o).contains("DEC-1852.1"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(entries(), 1, "the refused baseline recorded an entry");
+
+    // Dropped by a plan of its own first, with the parent's partitions still
+    // declared (a plan refuses to drop them while making them external), and
+    // then made external: the baseline goes.
+    std::fs::write(&path, &text).unwrap();
+    d.commit();
+    std::fs::write(&path, &text[..held]).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.git(&["add", "-A"]);
+    d.git(&["commit", "-q", "--allow-empty", "-m", "plan"]);
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.ev_2025')"
+        ),
+        0
+    );
+    std::fs::write(&path, format!("{}\npartitions: external\n", &text[..held])).unwrap();
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "hand over"]));
+}
+
 /// `pull --partitions-external` declares a parent's partitions external
 /// where no catalog says so (#1533): a parent whose partitions an application
 /// makes is written alone, and a baseline leaves nothing to plan. Without the

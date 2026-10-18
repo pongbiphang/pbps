@@ -5202,6 +5202,55 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
 }
 
 /// `pbps baseline` — take the database as it stands as the new starting point.
+/// Refuses a baseline that would hand to another tool a partition the
+/// recorded state holds (#1852, DEC-1852.1). A pending drop intent takes the
+/// partition's uid out of the working identity file before anything runs, so
+/// under a parent the declarations now make `partitions: external` the scope
+/// reads it as one of the parent's external partitions. Recorded so, it is
+/// never dropped, and no later plan takes it back. Whatever the working file
+/// says, a partition the recorded state holds is dropped or detached by a
+/// plan before the parent's partitions become external.
+fn refuse_handing_over_held_partitions(
+    previous: &pbps_db::LedgerEntry,
+    scoped: &pbps_diff::Scoped,
+    label: &str,
+) -> anyhow::Result<()> {
+    let held: BTreeSet<&TableName> = previous.snapshot.ids.tables.values().collect();
+    let lines: Vec<String> = scoped
+        .external
+        .iter()
+        .filter(|name| held.contains(name))
+        .map(|name| {
+            let parent = previous
+                .snapshot
+                .schema
+                .tables
+                .get(name)
+                .and_then(|t| t.partition_of.as_ref())
+                .map_or_else(
+                    || "its external parent".to_owned(),
+                    |of| format!("the external parent {}", of.parent.shown()),
+                );
+            format!(
+                "{} is held by the recorded state (entry #{}), and this baseline would leave it \
+                 to {parent}'s other tool undropped",
+                name.shown(),
+                previous.id
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "`{label}` holds {} partition(s) this baseline would hand over:\n  {}\n\
+         A pending drop intent leaves a partition out of the identity file before it is \
+         dropped. Drop or detach it with a plan first, then baseline (DEC-1852.1).",
+        lines.len(),
+        lines.join("\n  ")
+    );
+}
+
 pub fn cmd_baseline(
     project: &Project,
     target: &Target,
@@ -5230,6 +5279,12 @@ pub fn cmd_baseline(
             .await?;
             report_missing(&scoped);
             refuse_unexpressible(&scoped, &target.label, "baseline again")?;
+            // The working identity file may already lack a partition a pending
+            // drop intent names, and the scope then reads it as one of its
+            // external parent's (#1852). What the recorded state holds decides.
+            if let Some(previous) = crate::engine::latest(&mut conn).await? {
+                refuse_handing_over_held_partitions(&previous, &scoped, &target.label)?;
+            }
 
             // What the database holds, as `snapshot` records it (#1600, #1606).
             crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
