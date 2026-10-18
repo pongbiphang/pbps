@@ -1557,3 +1557,128 @@ async fn mssql_a_tables_own_settings_are_compared() {
     );
     db.drop().await;
 }
+
+/// #2153's audit: every catalog view the pinned build reports under `sys`,
+/// the dynamic management views aside, is read whole, read as a definition,
+/// read by the typed reads, refused by name or set aside with its reason.
+/// A view a later build adds fails here until it is classed; and the views
+/// classed as read are exactly the ones read whole.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_every_catalog_view_is_read_or_set_aside_with_a_reason() {
+    let mut db = TestDb::create("views2141").await;
+    let rows = db
+        .conn
+        .query(
+            "SELECT CONVERT(nvarchar(128), name) AS name FROM sys.all_views \
+             WHERE schema_id = SCHEMA_ID(N'sys') AND name NOT LIKE N'dm[_]%';",
+        )
+        .await
+        .expect("list the catalog views");
+    let reported: BTreeSet<String> = rows
+        .iter()
+        .map(|row| row.try_get::<&str>("name").unwrap().unwrap().to_owned())
+        .collect();
+    let unclassed: Vec<_> = reported
+        .iter()
+        .filter(|view| capture::disposition(view).is_none())
+        .collect();
+    assert_eq!(unclassed, Vec::<&String>::new(), "views no rule classes");
+    let read: BTreeSet<&str> = capture::CATALOG
+        .iter()
+        .filter(|(_, d)| *d == capture::Disposition::Read)
+        .map(|(view, _)| *view)
+        .collect();
+    let whole: BTreeSet<&str> = capture::WHOLE_VIEWS.iter().copied().collect();
+    assert_eq!(
+        read, whole,
+        "the views classed as read are the ones read whole"
+    );
+    db.drop().await;
+}
+
+/// What the audit added is compared: a column's masking function, a
+/// trigger's firing order, a security policy's predicate on a table, and a
+/// partition's compression each differ, though the object's text does not.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_the_audits_views_are_compared() {
+    let mut db = TestDb::create("audit2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE TABLE app.t (id int NOT NULL CONSTRAINT pk_t PRIMARY KEY, \
+             email nvarchar(50) MASKED WITH (FUNCTION = 'email()') NULL);",
+            "CREATE TRIGGER app.tr_a ON app.t AFTER INSERT AS SELECT 1;",
+            "CREATE TRIGGER app.tr_b ON app.t AFTER INSERT AS SELECT 2;",
+            "CREATE FUNCTION app.allow(@id int) RETURNS TABLE WITH SCHEMABINDING AS RETURN SELECT 1 AS ok WHERE @id > 0;",
+            "CREATE SECURITY POLICY app.filter ADD FILTER PREDICATE app.allow(id) ON app.t WITH (STATE = ON);",
+        ],
+    )
+    .await;
+    let sealed = capture::capture(&mut db.conn, &objects(&[("app", "t")]))
+        .await
+        .expect("capture");
+    let t = object("app", "t");
+    let policy = object("app", "filter");
+    assert!(
+        bound(&sealed, &t).contains(&policy),
+        "the policy binds the table"
+    );
+    let differs = |differences: &[pbps_db::resolver::capture::CaptureDifference],
+                   what: &ObjectIdentity| {
+        differences
+            .iter()
+            .any(|d| d.object.as_ref() == Some(what) && d.change == InputChange::Properties)
+    };
+    for (change, what) in [
+        (
+            "ALTER TABLE app.t ALTER COLUMN email ADD MASKED WITH (FUNCTION = 'default()');",
+            column(&t, "email"),
+        ),
+        (
+            "EXEC sp_settriggerorder @triggername = N'app.tr_b', @order = N'First', @stmttype = N'INSERT';",
+            object("app", "tr_b"),
+        ),
+        (
+            "ALTER SECURITY POLICY app.filter WITH (STATE = OFF);",
+            policy.clone(),
+        ),
+        (
+            "ALTER TABLE app.t REBUILD WITH (DATA_COMPRESSION = PAGE);",
+            t.clone(),
+        ),
+    ] {
+        run(&mut db.conn, &[change]).await;
+        let (_, differences) = capture::recapture(&mut db.conn, &sealed)
+            .await
+            .expect("recapture");
+        assert!(differs(&differences, &what), "{change}: {differences:?}");
+    }
+    db.drop().await;
+}
+
+/// A numbered procedure group (`proc;2`) is not read, so a procedure that
+/// has one refuses by name rather than be sealed by its first number only.
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn mssql_a_numbered_procedure_group_refuses_by_name() {
+    let mut db = TestDb::create("numbered2141").await;
+    run(
+        &mut db.conn,
+        &[
+            "CREATE SCHEMA app;",
+            "CREATE PROCEDURE app.grouped AS SELECT 1;",
+            "CREATE PROCEDURE app.grouped;2 AS SELECT 2;",
+        ],
+    )
+    .await;
+    let refused = capture::capture(&mut db.conn, &objects(&[("app", "grouped")])).await;
+    assert!(
+        matches!(&refused, Err(CaptureError::Coverage(u)) if u.condition.contains("numbered")),
+        "{:?}",
+        refused.err()
+    );
+    db.drop().await;
+}

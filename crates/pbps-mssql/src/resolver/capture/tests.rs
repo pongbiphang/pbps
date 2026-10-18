@@ -88,6 +88,8 @@ fn catalog() -> Catalog {
         triggers: BTreeMap::new(),
         whole: BTreeMap::new(),
         table_type_objects: BTreeMap::new(),
+        fulltext: BTreeMap::new(),
+        numbered: BTreeSet::new(),
         data_spaces: BTreeMap::new(),
         xml_collections: BTreeMap::new(),
         encryption_keys: BTreeMap::new(),
@@ -373,6 +375,24 @@ fn a_system_procedure_set_naming_another_schema_refuses() {
             "a system-procedure candidate names a schema other than sys"
         ),
     }
+}
+
+#[test]
+fn a_clr_object_refuses_by_name() {
+    let mut catalog = catalog();
+    catalog.objects[1].kind = "PC".into();
+    catalog.modules.clear();
+    assert_eq!(
+        condition(&catalog),
+        "a CLR object's code is in an assembly, which the capture does not read"
+    );
+    let mut external = self::catalog();
+    external.objects[1].kind = "ET".into();
+    external.modules.clear();
+    assert_eq!(
+        condition(&external),
+        "an external table's shape is not read by the capture"
+    );
 }
 
 #[test]

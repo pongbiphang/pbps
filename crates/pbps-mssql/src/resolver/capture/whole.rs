@@ -14,6 +14,12 @@ use std::collections::BTreeMap;
 
 /// The views whose rows each describe one object, keyed by `object_id`.
 const PER_OBJECT: &[&str] = &[
+    "periods",
+    "change_tracking_tables",
+    "filetables",
+    "fulltext_indexes",
+    "edge_constraints",
+    "security_policies",
     "objects",
     "tables",
     "views",
@@ -29,7 +35,36 @@ const PER_OBJECT: &[&str] = &[
 ];
 
 /// The views whose rows each describe one column.
-const PER_COLUMN: &[&str] = &["columns", "computed_columns", "identity_columns"];
+const PER_COLUMN: &[&str] = &[
+    "columns",
+    "computed_columns",
+    "identity_columns",
+    "masked_columns",
+];
+
+/// The views whose rows list something of one object, keyed by `object_id`,
+/// each with the column that orders them.
+const OBJECT_LISTS: &[(&str, &str)] = &[
+    ("trigger_events", "type"),
+    ("fulltext_index_columns", "column_id"),
+    ("edge_constraint_clauses", "clause_number"),
+    ("security_predicates", "security_predicate_id"),
+];
+
+/// The views whose rows describe one index, keyed by `(object_id,
+/// index_id)`: one row each, or a list in the order of the column given.
+const INDEX_ROWS: &[(&str, Option<&str>)] = &[
+    ("xml_indexes", None),
+    ("spatial_indexes", None),
+    ("json_indexes", None),
+    ("vector_indexes", None),
+    ("hash_indexes", None),
+    ("spatial_index_tessellations", None),
+    ("selective_xml_index_paths", Some("path_id")),
+    ("selective_xml_index_namespaces", Some("uri")),
+    ("json_index_paths", Some("path")),
+    ("partitions", Some("partition_number")),
+];
 
 fn number(row: &WholeRow, column: &str) -> Option<i64> {
     row.get(column)
@@ -42,6 +77,8 @@ pub(super) struct Whole<'a> {
     per_object: BTreeMap<&'static str, BTreeMap<i64, &'a WholeRow>>,
     per_column: BTreeMap<&'static str, BTreeMap<(i64, i64), &'a WholeRow>>,
     indexes: BTreeMap<i64, Vec<&'a WholeRow>>,
+    object_lists: BTreeMap<&'static str, BTreeMap<i64, Vec<&'a WholeRow>>>,
+    index_rows: BTreeMap<&'static str, BTreeMap<(i64, i64), Vec<&'a WholeRow>>>,
     index_columns: BTreeMap<(i64, i64), Vec<&'a WholeRow>>,
     foreign_key_columns: BTreeMap<i64, Vec<&'a WholeRow>>,
     parameters: BTreeMap<i64, Vec<&'a WholeRow>>,
@@ -62,6 +99,8 @@ impl<'a> Whole<'a> {
             per_object: BTreeMap::new(),
             per_column: BTreeMap::new(),
             indexes: BTreeMap::new(),
+            object_lists: BTreeMap::new(),
+            index_rows: BTreeMap::new(),
             index_columns: BTreeMap::new(),
             foreign_key_columns: BTreeMap::new(),
             parameters: BTreeMap::new(),
@@ -103,6 +142,24 @@ impl<'a> Whole<'a> {
                 whole.indexes.entry(object).or_default().push(row);
                 let name = row.get("name").cloned().flatten();
                 whole.index_names.insert((object, index), name);
+            }
+        }
+        for &(view, _) in OBJECT_LISTS {
+            let filed = whole.object_lists.entry(view).or_default();
+            for row in rows(view) {
+                if let Some(object) = number(row, "object_id") {
+                    filed.entry(object).or_default().push(row);
+                }
+            }
+        }
+        for &(view, _) in INDEX_ROWS {
+            let filed = whole.index_rows.entry(view).or_default();
+            for row in rows(view) {
+                if let (Some(object), Some(index)) =
+                    (number(row, "object_id"), number(row, "index_id"))
+                {
+                    filed.entry((object, index)).or_default().push(row);
+                }
             }
         }
         for row in rows("index_columns") {
@@ -218,6 +275,7 @@ impl<'a> Whole<'a> {
                 | Rule::DataSpace
                 | Rule::XmlCollection
                 | Rule::EncryptionKey
+                | Rule::FullText(_)
                 | Rule::ExecuteAs => {}
             }
             let Some(text) = value.as_deref() else {
@@ -273,6 +331,15 @@ impl<'a> Whole<'a> {
                             .ok_or_else(|| Self::unknown(view))?
                     ),
                 },
+                Rule::FullText(kind) => match id {
+                    0 => Value::Null,
+                    _ => json!(
+                        self.catalog
+                            .fulltext
+                            .get(&(kind, id))
+                            .ok_or_else(|| Self::unknown(view))?
+                    ),
+                },
                 Rule::EncryptionKey => json!(
                     self.catalog
                         .encryption_keys
@@ -324,6 +391,7 @@ impl<'a> Whole<'a> {
                 name.clone(),
                 json!({
                     "name": name,
+                    "kinds": self.index_kinds(object, id, index)?,
                     "index": self.translate("indexes", row, index)?,
                     "columns": self.ordered(
                         "index_columns",
@@ -340,6 +408,49 @@ impl<'a> Whole<'a> {
         ))
     }
 
+    /// What the per-index views hold about one index, by view.
+    fn index_kinds(
+        &self,
+        object: i64,
+        id: i64,
+        index: &super::select::Lookup<'_>,
+    ) -> Result<Value, Uncovered> {
+        let mut out = Map::new();
+        for &(view, order) in INDEX_ROWS {
+            let Some(rows) = self
+                .index_rows
+                .get(view)
+                .and_then(|rows| rows.get(&(object, id)))
+            else {
+                continue;
+            };
+            let value = match order {
+                Some(order) => self.ordered(view, Some(rows), order, index)?,
+                None => match rows.as_slice() {
+                    [row] => self.translate(view, row, index)?,
+                    _ => return Err(Self::unknown(view)),
+                },
+            };
+            out.insert(format!("sys.{view}"), value);
+        }
+        Ok(Value::Object(out))
+    }
+
+    /// The security policies whose predicates name `object` as their target:
+    /// they filter or block what its rows return, so they join its closure.
+    pub(super) fn policies_on(&self, object: i64) -> Vec<i64> {
+        self.object_lists
+            .get("security_predicates")
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .filter(|(_, rows)| {
+                rows.iter()
+                    .any(|row| number(row, "target_object_id") == Some(object))
+            })
+            .map(|(policy, _)| *policy)
+            .collect()
+    }
+
     /// Everything the whole views hold about one object, by view.
     pub(super) fn object(
         &self,
@@ -354,6 +465,14 @@ impl<'a> Whole<'a> {
         }
         if self.indexes.contains_key(&id) {
             out.insert("sys.indexes".into(), self.indexes_of(id, index)?);
+        }
+        for &(view, order) in OBJECT_LISTS {
+            if let Some(rows) = self.object_lists.get(view).and_then(|rows| rows.get(&id)) {
+                out.insert(
+                    format!("sys.{view}"),
+                    self.ordered(view, Some(rows), order, index)?,
+                );
+            }
         }
         if self.parameters.contains_key(&id) {
             out.insert(

@@ -24,6 +24,7 @@
 //! Scratch, separation, the externals comparison and assessment are #2142;
 //! nothing here is wired into planning yet (#2143).
 
+mod catalog;
 mod columns;
 mod manifest;
 mod ownership;
@@ -104,6 +105,8 @@ pub struct CaptureScope {
     pub retained: BTreeSet<ObjectIdentity>,
     pub candidates: BTreeSet<CandidateSet>,
 }
+
+pub use catalog::{CATALOG, Disposition, disposition};
 
 /// The catalog views the capture reads whole (#2153), by name under `sys`.
 pub const WHOLE_VIEWS: &[&str] = columns::VIEWS;

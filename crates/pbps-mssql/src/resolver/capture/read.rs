@@ -225,6 +225,12 @@ pub(super) struct Catalog {
     /// Every row of each view in `columns::VIEWS` that describes something
     /// this database's own objects or types hold, read whole (#2153).
     pub whole: BTreeMap<&'static str, Vec<WholeRow>>,
+    /// Full-text catalogs, stoplists and search property lists, by kind and
+    /// id: a full-text index names each by number.
+    pub fulltext: BTreeMap<(&'static str, i64), String>,
+    /// The procedures with a numbered group (`proc;2`), which the capture
+    /// does not read and refuses.
+    pub numbered: BTreeSet<i64>,
     /// Each table type's own table object and the constraint objects on it,
     /// by the type's `user_type_id`. They are the engine's
     /// (`is_ms_shipped = 1`), so the ordinary object read never lists them.
@@ -495,6 +501,24 @@ fn whole_select(view: &str, columns: &[(String, String)]) -> String {
 const TABLE_TYPE_OBJECTS: &str = "SELECT CONVERT(nvarchar(20), tt.user_type_id) AS type, \
     CONVERT(nvarchar(20), o.object_id) AS id FROM sys.table_types tt \
     JOIN sys.objects o ON o.object_id = tt.type_table_object_id OR o.parent_object_id = tt.type_table_object_id;";
+
+const FULLTEXT_NAMES: &[(&str, &str)] = &[
+    (
+        "catalog",
+        "SELECT CONVERT(nvarchar(20), fulltext_catalog_id) AS id, CONVERT(nvarchar(128), name) AS name FROM sys.fulltext_catalogs;",
+    ),
+    (
+        "stoplist",
+        "SELECT CONVERT(nvarchar(20), stoplist_id) AS id, CONVERT(nvarchar(128), name) AS name FROM sys.fulltext_stoplists;",
+    ),
+    (
+        "property list",
+        "SELECT CONVERT(nvarchar(20), property_list_id) AS id, CONVERT(nvarchar(128), name) AS name FROM sys.registered_search_property_lists;",
+    ),
+];
+
+const NUMBERED: &str = "SELECT DISTINCT CONVERT(nvarchar(20), object_id) AS id \
+    FROM sys.numbered_procedures WHERE procedure_number > 1;";
 
 const DATA_SPACES: &str = "SELECT CONVERT(nvarchar(20), data_space_id) AS id, \
     CONVERT(nvarchar(128), name) AS name, CONVERT(nvarchar(10), type) AS type FROM sys.data_spaces;";
@@ -1052,6 +1076,17 @@ pub(super) async fn read(
     }
     let mut data_spaces = BTreeMap::new();
     let mut encryption_keys = BTreeMap::new();
+    let mut fulltext = BTreeMap::new();
+    for &(kind, sql) in FULLTEXT_NAMES {
+        for row in rows(conn, sql).await? {
+            let row = Text(&row);
+            fulltext.insert((kind, row.number("id")?), row.required("name")?);
+        }
+    }
+    let mut numbered = BTreeSet::new();
+    for row in rows(conn, NUMBERED).await? {
+        numbered.insert(Text(&row).number("id")?);
+    }
     let mut table_type_objects: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
     for row in rows(conn, TABLE_TYPE_OBJECTS).await? {
         let row = Text(&row);
@@ -1232,6 +1267,8 @@ pub(super) async fn read(
         unique_indexes,
         foreign_keys,
         whole,
+        fulltext,
+        numbered,
         table_type_objects,
         data_spaces,
         xml_collections,

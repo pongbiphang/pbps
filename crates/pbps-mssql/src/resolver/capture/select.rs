@@ -284,6 +284,28 @@ impl Builder<'_> {
             Uncovered::class(class::OBJECT, "a selected object is not in the catalog")
         })?;
         let me = self.index.object(object)?;
+        // What the capture cannot read refuses by name (`catalog.rs`).
+        match object.kind.as_str() {
+            "AF" | "FS" | "FT" | "PC" | "TA" => {
+                return Err(Uncovered::object(
+                    &me,
+                    "a CLR object's code is in an assembly, which the capture does not read",
+                ));
+            }
+            "ET" => {
+                return Err(Uncovered::object(
+                    &me,
+                    "an external table's shape is not read by the capture",
+                ));
+            }
+            _ => {}
+        }
+        if catalog.numbered.contains(&id) {
+            return Err(Uncovered::object(
+                &me,
+                "a numbered procedure group is not read by the capture",
+            ));
+        }
         let mut properties = BTreeMap::new();
         properties.insert("type".into(), json!(object.kind));
         properties.insert("owner".into(), json!(self.index.owner(object)?));
@@ -349,6 +371,22 @@ impl Builder<'_> {
             properties.insert("column".into(), column);
         }
         let mut bindings = BTreeSet::new();
+        // A security policy filtering or blocking this object's rows binds
+        // it: its predicate is what a read of the rows runs.
+        for policy in self.whole.policies_on(id) {
+            let Some(found) = self.index.objects.get(&policy).copied() else {
+                return Err(Uncovered::object(
+                    &me,
+                    "a security policy on the object is not in the catalog",
+                ));
+            };
+            self.enqueue(policy);
+            bindings.insert(Binding {
+                node: "sys.security_predicates".into(),
+                path: Vec::new(),
+                target: self.index.object(found)?,
+            });
+        }
         if let Some((disabled, instead_of, not_for_replication)) = catalog.triggers.get(&id) {
             properties.insert("disabled".into(), json!(disabled));
             properties.insert("instead_of".into(), json!(instead_of));
@@ -564,15 +602,22 @@ impl Builder<'_> {
                     ));
                 }
             };
+            let mut path = vec![
+                dependency.schema.clone().unwrap_or_default(),
+                dependency.entity.clone(),
+            ];
+            // A security policy's minor id is its predicate's number, not a
+            // column (measured on #2141): the binding is the policy's.
+            let policy = object.kind == "SP";
+            if policy {
+                path.push(dependency.referencing_column.to_string());
+            }
             let binding = Binding {
                 node: "sys.sql_expression_dependencies".into(),
-                path: vec![
-                    dependency.schema.clone().unwrap_or_default(),
-                    dependency.entity.clone(),
-                ],
+                path,
                 target,
             };
-            if dependency.referencing_column > 0 {
+            if dependency.referencing_column > 0 && !policy {
                 column_bindings
                     .entry(dependency.referencing_column)
                     .or_default()
@@ -647,6 +692,18 @@ impl Builder<'_> {
                 .get(&id)
                 .ok_or_else(|| Uncovered::class(class::TYPE, "a type is not in the catalog"))?;
             let me = self.index.type_identity(id)?;
+            if self
+                .whole
+                .type_row(id)
+                .and_then(|row| row.get("is_assembly_type"))
+                .and_then(Option::as_deref)
+                == Some("1")
+            {
+                return Err(Uncovered::object(
+                    &me,
+                    "a CLR type's shape is in an assembly, which the capture does not read",
+                ));
+            }
             // A table type's computed column, DEFAULT or CHECK may not call a
             // user function on the pinned build (2785, 4105; pinned by
             // `mssql_a_table_types_expressions_call_no_user_function`), so

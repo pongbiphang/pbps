@@ -40,6 +40,29 @@ pub(super) const VIEWS: &[&str] = &[
     "parameters",
     "types",
     "table_types",
+    // What each object, column or index has beyond those views, from the
+    // classification of every catalog view (`catalog.rs`).
+    "masked_columns",
+    "trigger_events",
+    "periods",
+    "change_tracking_tables",
+    "filetables",
+    "fulltext_indexes",
+    "fulltext_index_columns",
+    "xml_indexes",
+    "spatial_indexes",
+    "json_indexes",
+    "vector_indexes",
+    "hash_indexes",
+    "selective_xml_index_paths",
+    "selective_xml_index_namespaces",
+    "spatial_index_tessellations",
+    "json_index_paths",
+    "partitions",
+    "edge_constraints",
+    "edge_constraint_clauses",
+    "security_policies",
+    "security_predicates",
 ];
 
 /// What one column of one view is.
@@ -69,6 +92,9 @@ pub(super) enum Rule {
     XmlCollection,
     /// A column encryption key's id, NULL for none.
     EncryptionKey,
+    /// A full-text catalog's, stoplist's or search property list's id, 0 or
+    /// NULL for none (a stoplist's 0 is the system one), by the kind given.
+    FullText(&'static str),
     /// `sys.sql_modules.execute_as_principal_id`: NULL is the caller, -2 the
     /// owner, any other a principal (`SELF` is stored as its creator's).
     ExecuteAs,
@@ -83,6 +109,71 @@ const DATES: Rule = Rule::Skip("a creation or change date differs by constructio
 pub(super) fn rule(view: &str, column: &str) -> Option<Rule> {
     Some(match (view, column) {
         (_, "create_date" | "modify_date") => DATES,
+        // Every per-index view is filed under its index.
+        (
+            "xml_indexes"
+            | "spatial_indexes"
+            | "json_indexes"
+            | "vector_indexes"
+            | "hash_indexes"
+            | "selective_xml_index_paths"
+            | "selective_xml_index_namespaces"
+            | "spatial_index_tessellations"
+            | "json_index_paths"
+            | "partitions",
+            "object_id" | "index_id",
+        ) => KEY,
+        (
+            "trigger_events"
+            | "periods"
+            | "change_tracking_tables"
+            | "filetables"
+            | "fulltext_indexes"
+            | "fulltext_index_columns"
+            | "edge_constraints"
+            | "edge_constraint_clauses"
+            | "security_policies"
+            | "security_predicates"
+            | "masked_columns",
+            "object_id",
+        ) => KEY,
+        ("masked_columns", "column_id") => POSITION,
+        ("periods", "start_column_id" | "end_column_id") => Rule::Column("object_id"),
+        ("change_tracking_tables", "min_valid_version" | "begin_version" | "cleanup_version") => {
+            Rule::Skip("a status: the change-tracking versions reached so far")
+        }
+        ("filetables", "filename_collation_id") => Rule::AsReported("an engine constant"),
+        ("fulltext_indexes", "unique_index_id") => Rule::Index("object_id"),
+        ("fulltext_indexes", "fulltext_catalog_id") => Rule::FullText("catalog"),
+        ("fulltext_indexes", "stoplist_id") => Rule::FullText("stoplist"),
+        ("fulltext_indexes", "property_list_id") => Rule::FullText("property list"),
+        (
+            "fulltext_indexes",
+            "has_crawl_completed"
+            | "crawl_type"
+            | "crawl_type_desc"
+            | "crawl_start_date"
+            | "crawl_end_date"
+            | "incremental_timestamp"
+            | "index_version",
+        ) => Rule::Skip("a status: how far the population has got"),
+        ("fulltext_index_columns", "column_id" | "type_column_id") => Rule::Column("object_id"),
+        ("fulltext_index_columns", "language_id") => Rule::AsReported("an engine constant"),
+        ("xml_indexes", "using_xml_index_id") => Rule::Index("object_id"),
+        ("xml_indexes" | "selective_xml_index_paths", "path_id") => POSITION,
+        // A component's number in its collection: the collection is compared
+        // with the schemas it holds.
+        ("selective_xml_index_paths", "xml_component_id") => {
+            Rule::Skip("a number within its XML schema collection, compared whole")
+        }
+        ("partitions", "partition_id" | "hobt_id") => Rule::Skip("an internal storage number"),
+        ("partitions", "rows") => Rule::Skip("a status: the rows the partition holds"),
+        ("partitions", "partition_number") => POSITION,
+        ("partitions", "filestream_filegroup_id") => Rule::DataSpace,
+        ("edge_constraint_clauses", "clause_number") => POSITION,
+        ("edge_constraint_clauses", "from_object_id" | "to_object_id") => Rule::Object,
+        ("security_predicates", "security_predicate_id") => POSITION,
+        ("security_predicates", "target_object_id") => Rule::Object,
         // Each row is filed under the identity its key names.
         ("foreign_key_columns", "constraint_object_id") => KEY,
         ("foreign_key_columns", "parent_object_id" | "referenced_object_id") => Rule::Object,
