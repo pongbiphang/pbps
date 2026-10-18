@@ -23,6 +23,7 @@ pub use assess::{Answer, Assessment, assess};
 use crate::order::Source;
 use crate::order::{Baseline, Checks, Schedule, analyse, graph};
 use pbps_dialect::Dialect;
+use pbps_model::escape::Escaped;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
 #[cfg(test)]
 use pbps_model::resolver::OrderReason;
@@ -237,6 +238,27 @@ fn scheduled(
     );
     for c in graph::constraints(changes, origins, owners, resolution, base, desired) {
         schedule.edge(c.before, c.after, c.source, c.reason);
+    }
+    // Unknown effects do not establish independence: keep every pair rather
+    // than inventing edges that could contradict known effects (DEC-2158.1).
+    for (id, _) in &shadowed.unowned {
+        let i = operations
+            .iter()
+            .position(|op| op.id() == *id)
+            .expect("an unowned operation belongs to the analysed plan");
+        for j in 0..operations.len() {
+            if i != j {
+                schedule.keep(
+                    i.min(j),
+                    i.max(j),
+                    format!(
+                        "cannot reorder `{}` across `{}`: the latter's names have no recorded owner",
+                        Escaped(&changes.changes[j].change.subject()),
+                        Escaped(&changes.changes[i].change.subject()),
+                    ),
+                );
+            }
+        }
     }
     schedule
 }

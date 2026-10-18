@@ -201,6 +201,216 @@ fn a_binding_edge_is_respected_where_the_effects_allow_the_other_order() {
     assert_eq!(steps(&without), ["app.v", "app.t"]);
 }
 
+mod unowned_steps {
+    use super::*;
+    use pbps_model::operation::{Origin, OwnerError, Source};
+    use pbps_model::{CheckConstraint, Column, IdsFile, Module, ModuleKind, Schema, Table};
+
+    /// A PostgreSQL-shaped check rebuild waits for a function. The ordinary
+    /// plan also drops a check on a cross-schema table neither model owns.
+    /// `order` selects the teardown, restoration, unowned drop and function
+    /// create; origins deliberately differ from the prepared positions.
+    fn rebuild(order: &[usize]) -> (ChangeSet, Schedule) {
+        named_rebuild(order, "t", "t")
+    }
+
+    fn named_rebuild(order: &[usize], managed: &str, unmanaged: &str) -> (ChangeSet, Schedule) {
+        let table = pbps_model::TableName::new("app", managed);
+        let external = pbps_model::TableName::new("external", unmanaged);
+        let external_shown = external.shown().to_string();
+        let function: pbps_model::ModuleId = "app.f()".parse().unwrap();
+        let check = Surface::Check {
+            table: table.clone(),
+            name: "ck".into(),
+        };
+        let mut shape = Table::default();
+        shape
+            .columns
+            .insert("id".into(), Column::new("int".parse().unwrap()));
+        shape.checks.insert(
+            "ck".into(),
+            CheckConstraint {
+                expression: "id > 0".into(),
+            },
+        );
+        let mut base = Schema::default();
+        base.tables.insert(table.clone(), shape);
+        let mut desired = base.clone();
+        let constraint = CheckConstraint {
+            expression: "app.f() > 0".into(),
+        };
+        desired
+            .tables
+            .get_mut(&table)
+            .unwrap()
+            .checks
+            .insert("ck".into(), constraint.clone());
+        let module = Module {
+            kind: ModuleKind::Function,
+            description: None,
+            definition: "CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$"
+                .into(),
+        };
+        desired.modules.insert(function.clone(), module.clone());
+        let before_ids = ids(&base, &IdsFile::default());
+        let after_ids = ids(&desired, &before_ids);
+        let create = PlannedChange::new(Change::CreateModule {
+            id: function.clone(),
+            module: Box::new(module),
+        });
+        let unowned = PlannedChange::new(Change::DropCheck {
+            table: external,
+            name: "old_check".into(),
+        });
+        let mut logical = ChangeSet {
+            changes: vec![create.clone()],
+        };
+        if order.contains(&2) {
+            logical.changes.push(unowned.clone());
+        }
+        let rebinding = Source::Rebinding(check.clone());
+        let candidates = [
+            (
+                Origin::Teardown(rebinding.clone()),
+                PlannedChange::new(Change::DropCheck {
+                    table: table.clone(),
+                    name: "ck".into(),
+                }),
+            ),
+            (
+                Origin::Restoration(rebinding),
+                PlannedChange::new(Change::AddCheck {
+                    table,
+                    name: "ck".into(),
+                    constraint,
+                }),
+            ),
+            (Origin::Whole(1), unowned),
+            (Origin::Whole(0), create),
+        ];
+        let (origins, steps): (Vec<_>, Vec<_>) =
+            order.iter().map(|&i| candidates[i].clone()).unzip();
+        let changes = ChangeSet { changes: steps };
+        let owners = PlanOwners::new(
+            pbps_model::plan_names::PlanNames::of(&logical.changes, &after_ids).unwrap(),
+            &before_ids,
+            &after_ids,
+        );
+        let operations = Operations::expanded(
+            logical.changes.len(),
+            origins.iter().cloned().zip(changes.changes.iter().cloned()),
+            ModuleEdits::Rebuilt,
+        );
+        let (before, after) = (
+            Snapshot {
+                schema: &base,
+                ids: &before_ids,
+            },
+            Snapshot {
+                schema: &desired,
+                ids: &after_ids,
+            },
+        );
+        let shadowed = analyse(&operations, &owners, before, after, &Candidates);
+        if let Some(at) = order.iter().position(|&i| i == 2) {
+            assert!(matches!(
+                shadowed.unowned.as_slice(),
+                [(id, OwnerError::Unmanaged { name, .. })]
+                    if *id == operations.as_slice()[at].id() && name == &external_shown
+            ));
+            assert_ne!(operations.as_slice()[at].id().source() as usize, at);
+        } else {
+            assert!(shadowed.unowned.is_empty());
+        }
+        let schedule = scheduled(
+            &changes,
+            &origins,
+            &operations,
+            &owners,
+            &[observation(
+                check,
+                BTreeSet::from([Surface::Module(function)]),
+            )],
+            &Default::default(),
+            crate::Side {
+                schema: &base,
+                ids: &before_ids,
+            },
+            crate::Side {
+                schema: &desired,
+                ids: &after_ids,
+            },
+            &Candidates,
+        );
+        (changes, schedule)
+    }
+
+    #[test]
+    fn an_unowned_step_refuses_a_rebuild_that_would_cross_it_by_name() {
+        let (given, schedule) = rebuild(&[0, 1, 2, 3]);
+        let crossing = given.changes[1].change.subject();
+        let unowned = given.changes[2].change.subject();
+        match settle(given, &schedule) {
+            Err(Error::Cycle(text)) => {
+                assert!(
+                    text.contains(&crossing) && text.contains(&unowned),
+                    "{text}"
+                );
+                assert!(text.contains("names have no recorded owner"), "{text}");
+            }
+            other => panic!("settled: {:?}", other.map(|(o, _)| o.changes)),
+        }
+    }
+
+    #[test]
+    fn an_unowned_steps_refusal_shows_each_name_once() {
+        let (given, schedule) = named_rebuild(&[0, 1, 2, 3], "a\\\nb", "c\\\nd");
+        match settle(given, &schedule) {
+            Err(Error::Cycle(text)) => assert_eq!(
+                text,
+                r"cannot reorder `app.a\\\nb` across `external.c\\\nd`: the latter's names have no recorded owner",
+            ),
+            other => panic!("settled: {:?}", other.map(|(o, _)| o.changes)),
+        }
+    }
+
+    #[test]
+    fn an_unowned_step_allows_a_rebuild_that_stays_on_its_side() {
+        let (given, schedule) = rebuild(&[0, 3, 1, 2]);
+        let (ordered, sequence) = settle(given.clone(), &schedule).unwrap();
+        assert_eq!(ordered.changes, given);
+        assert_eq!(sequence, [0, 1, 2, 3]);
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+
+    #[test]
+    fn a_rebuild_without_an_unowned_step_keeps_its_order_and_proof() {
+        let (given, schedule) = rebuild(&[0, 1, 3]);
+        let (ordered, sequence) = settle(given.clone(), &schedule).unwrap();
+        assert_eq!(sequence, [0, 2, 1]);
+        assert_eq!(
+            ordered.changes.changes,
+            [0, 2, 1].map(|i| given.changes[i].clone()),
+        );
+        assert_eq!(
+            ordered.proof.edges(),
+            &BTreeSet::from([
+                OrderEdge {
+                    before: 0,
+                    after: 2,
+                    reason: OrderReason::Identity,
+                },
+                OrderEdge {
+                    before: 1,
+                    after: 2,
+                    reason: OrderReason::Binding,
+                },
+            ]),
+        );
+        ordered.proof.validate(&ordered.changes).unwrap();
+    }
+}
+
 /// A resolver plan with a cycle through its own edges is refused by name: a
 /// declared dependency of a view on another, and the evidence binding the
 /// other to the view.
