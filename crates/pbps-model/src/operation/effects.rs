@@ -866,6 +866,7 @@ impl Cx<'_> {
                     }
                 }
                 self.row_meets_constraints(&owner, table, &written);
+                self.row_leaves_no_required_column(&owner, table, &written);
                 self.row_parents(&owner, true, false);
                 self.row_cycle(&owner);
                 for (c, v) in row.columns() {
@@ -1610,6 +1611,39 @@ impl Cx<'_> {
             ObjectKey::ColumnOrder(owner),
             Incarnation::Final,
         ));
+    }
+
+    /// An inserted row writes no value into a baseline column the row and
+    /// its defaults leave out, so such a column that is `NOT NULL` with
+    /// nothing to fill it, no default, identity, sequence or generation,
+    /// refuses the row while its NOT NULL stands: the insert waits for that
+    /// NOT NULL to go, with the column's drop or its relaxation (#2086). Only
+    /// the baseline's columns, as `row_meets_constraints` reads them: a NOT
+    /// NULL column the plan adds with nothing to fill it is one the row has
+    /// to write in any order.
+    fn row_leaves_no_required_column(
+        &mut self,
+        owner: &Recorded,
+        table: &TableName,
+        written: &[&str],
+    ) {
+        let Some((base_name, was)) = self.base_of(owner) else {
+            return;
+        };
+        let written: Vec<ColumnKey> = written
+            .iter()
+            .filter_map(|c| self.column(&table.column(*c)).ok())
+            .collect();
+        for (name, column) in &was.columns {
+            if column.nullable || !matches!(column.value_source, crate::ValueSource::None) {
+                continue;
+            }
+            if let Some(key) = self.base_column(&base_name.column(name.as_str()))
+                && !written.contains(&key)
+            {
+                self.requires(Requirement::Absent(Self::not_null(key)));
+            }
+        }
     }
 
     fn row_writes(&mut self, table: &TableName, owner: &Recorded, written: &[&str]) {

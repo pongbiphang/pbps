@@ -3021,6 +3021,64 @@ fn two_columns_added_to_one_table_keep_the_plans_order() {
     assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
 }
 
+/// `t(id, a)` with `a` dropped, and a row inserted that writes `id` alone;
+/// `a` is NOT NULL with no default when `required`, otherwise nullable
+/// (#2086).
+fn insert_beside_a_dropped_column(required: bool) -> Plan {
+    let mut was = table_with(&["id", "a"]);
+    was.columns.get_mut("a").unwrap().nullable = !required;
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), was);
+    after.tables.insert(t("t"), table_with(&["id"]));
+    Plan {
+        logical: vec![
+            p(Change::DropColumn {
+                uid: uid(UidKind::Column, "t.a"),
+                column: t("t").column("a"),
+            }),
+            p(Change::InsertRow {
+                table: t("t"),
+                key_column: "id".into(),
+                identity_key: false,
+                key: RowKey::from("3"),
+                row: Row::default(),
+                defaults: Default::default(),
+                types: Default::default(),
+            }),
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(&["t"], &[("t", "id"), ("t", "a")]),
+        after_ids: Plan::ids(&["t"], &[("t", "id")]),
+    }
+}
+
+/// While a NOT NULL column with no default stands, the engine refuses a row
+/// inserted without it, so the insert waits for the column's drop. A
+/// nullable column lets the row in, in either order (#2086).
+#[test]
+fn a_row_insert_waits_for_the_drop_of_a_not_null_column_it_leaves_out() {
+    let none = ModuleDeps::new();
+    let required = insert_beside_a_dropped_column(true);
+    let (ops, fx, baseline) = required.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    let early = run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL);
+    assert!(
+        early.iter().any(|v| matches!(
+            v,
+            Violation::Edge { edge, .. } if matches!(
+                &edge.because,
+                Because::Frees(ObjectKey::NotNull(_))
+            )
+        )),
+        "{early:?}"
+    );
+    // Negative: a nullable column lets the row in while it stands.
+    let free = insert_beside_a_dropped_column(false);
+    let (ops, fx, baseline) = free.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
 /// A parent `p` and a child `c` whose foreign key stands throughout, over the
 /// columns given, and the two rows the plan inserts, the child's first.
 fn rows_across(
