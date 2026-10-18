@@ -2104,7 +2104,14 @@ where a b-tree index leads with the column, in one index probe (a hash or
 BRIN index gives no ordered probe); without one it
 says the apply reads it, since the read would scan every row. The pre-flight
 counts the values too near the type's bound for numbering to continue past
-them, which would otherwise refuse the `setval` mid-apply.
+them, which would otherwise refuse the `setval` mid-apply. For a conversion
+that counts the same way it also reads the old counter: called, its next
+number is `last_value + increment`, computed in `numeric`, and past the new
+source's bound it leaves nothing to continue at. A counter this login cannot
+read is counted as exhausted, as for a bound moved in place, and a retype the
+plan makes first leaves the change unchecked (#2005). Pinned by the live
+`a_conversion_past_an_exhausted_counter_is_refused_before_apply`, on 16 and
+18.
 
 **The gate**, `numbering`, asks only for the changes that can make a writer
 working today fail:

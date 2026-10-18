@@ -3459,14 +3459,71 @@ fn build<'v, 'p: 'v>(
                     unchecked,
                 ));
             }
+            // A conversion that counts the same way carries the old source's
+            // counter too: the block continues at its next number, which an
+            // exhausted counter has past the new source's bound, and `setval`
+            // then refuses it mid-apply (#2005). Counted in `numeric`, as the
+            // block computes it; a counter this login cannot read counts too,
+            // as an unreadable counter does for a bound moved in place.
+            let carried = match (from, to) {
+                (ValueSource::Identity(was), ValueSource::Sequence(_)) => Some(was.increment),
+                (ValueSource::Sequence(was), ValueSource::Identity(_)) => Some(was.increment),
+                (ValueSource::Identity(_) | ValueSource::Sequence(_), _)
+                | (ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_), _) => {
+                    None
+                }
+            }
+            .filter(|was| (*was < 0) == (increment < 0));
+            let mut probes = Vec::new();
+            if carried.is_some() {
+                let read = |field: &str| {
+                    format!(
+                        "(pg_catalog.xpath('/row/{field}/text()', \
+                         pg_catalog.query_to_xml(pg_catalog.format('SELECT {field} FROM %s', \
+                         q.seqrelid::pg_catalog.regclass), false, true, '')))[1]::text"
+                    )
+                };
+                let next = format!(
+                    "CASE WHEN {}::pg_catalog.bool THEN {}::pg_catalog.numeric \
+                     OPERATOR(pg_catalog.+) q.seqincrement ELSE {}::pg_catalog.numeric END",
+                    read("is_called"),
+                    read("last_value"),
+                    read("last_value")
+                );
+                let (operator, bound) = if increment < 0 {
+                    ("<", *bounds.start())
+                } else {
+                    (">", *bounds.end())
+                };
+                probes.push(Probe::new(
+                    format!(
+                        "the counter {column}'s old source carries past the bound {bound} of \
+                         its new one, or not readable",
+                        column = column.raw(),
+                    ),
+                    format!(
+                        "SELECT {} AS n FROM pg_catalog.pg_sequence q \
+                         WHERE q.seqrelid OPERATOR(pg_catalog.=) \
+                         pg_catalog.pg_get_serial_sequence({}, {})::pg_catalog.regclass \
+                         AND CASE WHEN NOT pg_catalog.has_sequence_privilege(q.seqrelid, 'SELECT') \
+                         THEN true ELSE {next} OPERATOR(pg_catalog.{operator}) \
+                         {bound}::pg_catalog.numeric END;",
+                        saturated_count("count(*)"),
+                        value_literal(&qualified(&stored.table)?),
+                        value_literal(&stored.name),
+                    ),
+                ));
+            }
             // Nor, where the plan deletes rows of the table, are the values
-            // stored now all the ones it reads (#1930 review).
+            // stored now all the ones it reads (#1930 review). The counter
+            // is not a row, so its probe stands.
             if names.deleted_from.contains(&column.table) {
-                return Ok(skip(
+                probes.extend(skip(
                     change,
                     "this plan deletes rows of the table, which may be gone before numbering reads it",
                     unchecked,
                 ));
+                return Ok(probes);
             }
             // The last value from which one more step stays in the type.
             let (operator, last) = if increment < 0 {
@@ -3474,7 +3531,7 @@ fn build<'v, 'p: 'v>(
             } else {
                 (">", i128::from(*bounds.end()) - i128::from(increment))
             };
-            Ok(vec![Probe::new(
+            probes.push(Probe::new(
                 format!(
                     "values in {column} too near its sequence's bound for numbering to \
                      continue past them",
@@ -3487,7 +3544,8 @@ fn build<'v, 'p: 'v>(
                     qualified(&stored.table)?,
                     quote(&stored.name)?
                 ),
-            )])
+            ));
+            Ok(probes)
         }
 
         // Everything else either cannot fail on the data or cannot be counted.
