@@ -3077,6 +3077,26 @@ fn a_row_insert_waits_for_the_drop_of_a_not_null_column_it_leaves_out() {
     let free = insert_beside_a_dropped_column(false);
     let (ops, fx, baseline) = free.analysed(ModuleEdits::InPlace);
     assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+    // Negative: a NOT NULL column the plan keeps and gives an identity is
+    // filled by the engine once the identity is on, so the insert does not
+    // wait for its NOT NULL to go (#2175 review).
+    let mut numbered = insert_beside_a_dropped_column(true);
+    numbered.logical.remove(0);
+    let mut kept = table_with(&["id", "a"]);
+    let a = kept.columns.get_mut("a").unwrap();
+    a.nullable = false;
+    a.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity::new(1, 1));
+    numbered.after.tables.insert(t("t"), kept);
+    numbered.after_ids = numbered.before_ids.clone();
+    let (_, fx, _) = numbered.analysed(ModuleEdits::InPlace);
+    assert!(
+        !fx[0]
+            .requires
+            .iter()
+            .any(|r| matches!(r, Requirement::Absent(ObjectKey::NotNull(_)))),
+        "{:?}",
+        fx[0].requires
+    );
 }
 
 /// A parent `p` and a child `c` whose foreign key stands throughout, over the

@@ -1620,7 +1620,8 @@ impl Cx<'_> {
     /// NOT NULL to go, with the column's drop or its relaxation (#2086). Only
     /// the baseline's columns, as `row_meets_constraints` reads them: a NOT
     /// NULL column the plan adds with nothing to fill it is one the row has
-    /// to write in any order.
+    /// to write in any order. Nor one the plan gives something to fill it:
+    /// the engine fills it once that change runs.
     fn row_leaves_no_required_column(
         &mut self,
         owner: &Recorded,
@@ -1634,12 +1635,27 @@ impl Cx<'_> {
             .iter()
             .filter_map(|c| self.column(&table.column(*c)).ok())
             .collect();
+        // A column the plan gives a numbering source, a default or a
+        // generation is filled by the engine once that change has run,
+        // which the insert follows already (#2175 review): only a column
+        // left with nothing to fill it needs its NOT NULL gone.
+        let filled_at_the_end: Vec<ColumnKey> = self
+            .final_of(owner)
+            .map(|(final_name, will)| {
+                will.columns
+                    .iter()
+                    .filter(|(_, c)| !matches!(c.value_source, crate::ValueSource::None))
+                    .filter_map(|(n, _)| self.final_column(&final_name.column(n.as_str())))
+                    .collect()
+            })
+            .unwrap_or_default();
         for (name, column) in &was.columns {
             if column.nullable || !matches!(column.value_source, crate::ValueSource::None) {
                 continue;
             }
             if let Some(key) = self.base_column(&base_name.column(name.as_str()))
                 && !written.contains(&key)
+                && !filled_at_the_end.contains(&key)
             {
                 self.requires(Requirement::Absent(Self::not_null(key)));
             }
