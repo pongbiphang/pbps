@@ -794,3 +794,76 @@ Tests: `external_partitions_are_a_setting_on_the_parent_alone`
 `pg_partman_parents_are_pulled_with_external_partitions` and
 `pull_declares_a_named_parents_partitions_external`
 (`crates/pbps-cli/tests/flow_pg.rs`), on 16 and 18.
+
+<a id="dec-1852-1"></a>
+
+**DEC-1852.1. A baseline does not hand another tool a partition that a drop
+intent names while the recorded state still holds it (#1852).**
+`pbps baseline` scopes its read with the working identity file. A
+`drop-table` intent removes the table's uid from that file before anything
+runs. Consider a partition pbps holds under a parent whose declaration has
+just become `partitions: external` (DEC-1533.1). The scope then reads the
+partition as one of the parent's external partitions, the baseline records
+the handover, and the partition is never dropped.
+
+The check is narrow on purpose. The baseline reads the latest ledger entry
+only while a table tombstone is in the working file and the scope leaves some
+partition external. It matches each tombstone to the recorded state by uid.
+It does not try to find which live partition the held one now is. An intent
+can rename it any number of times before the drop, and by hand it can be
+renamed, rebound, or detached and reattached, so no name or bound
+recognises it (#2172 review, four times). pbps records no identity for a
+table that outlives that (#2177). So the check refuses by the parent: the
+recorded parent's uid, under the name the working file gives it, with any
+of its partitions left external. The outcomes:
+- refused, naming the partition as the database has it, when one left
+  external has the recorded parent and bound (one parent's bounds never
+  overlap);
+- refused, naming the parent and the partitions left external, when none
+  has the bound, since which of them it is cannot be told;
+- allowed: the recorded state does not hold the uid (an old tombstone, even
+  when a new table reused its name), no partition of the recorded parent is
+  left external, or the ledger is empty;
+- refused: the ledger cannot be read, since then nothing can say which
+  partition an intent names.
+
+The refusal costs a handover of the parent's other partitions until the
+pending drop is finished, which is the order it has to be finished in
+anyway. There are two ways out:
+- a partition still in the database is dropped or detached with a plan
+  first. A plan refuses to drop a partition while it makes the partitions
+  external (DEC-1533.1), so that plan keeps the parent's partitions declared;
+- a partition already gone from the database is resolved by reverting the
+  drop intent. The identity file then names it, the scope reports it
+  missing, and the baseline stops holding it. The intent made again names a
+  uid nothing holds.
+
+Reading the ledger for every baseline was the first draft, and the live suite
+refused it twice:
+- a deliberate handover, `pull --partitions-external` in a new project over a
+  database whose recorded state holds the partitions (#1533), names no drop
+  intent, and is the move SPEC §1.3 gives `baseline`;
+- `baseline` is the named remedy for a ledger entry this build cannot read,
+  so it must not stop on one when nothing asks.
+
+Without a drop intent, a partition pbps holds under an external parent is
+still refused by the scope itself, as two owners (#1833).
+
+Pinned by `a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names`
+in `crates/pbps-cli/tests/flow_pg.rs` (16 and 18). It covers:
+- the refusal, and the scope's own refusal without the intent;
+- the baseline that goes once a plan has dropped the partition;
+- two renames by the intent, with the database renamed only to the middle
+  name;
+- a partition rebound by hand, then dropped by hand, beside another tool's
+  partition, and the way out by reverting the intent.
+
+Also pinned by
+`a_baseline_refuses_handing_over_only_a_held_partition_a_drop_intent_names`
+in `crates/pbps-cli/src/deploy.rs`, which covers:
+- chained renames, and an unrenamed partition;
+- no partition with the bound;
+- only another parent's partitions left external;
+- a parent's name reused by another table;
+- a column's tombstone, and an old tombstone whose name was reused;
+- an empty ledger and an unreadable one.

@@ -8284,6 +8284,224 @@ fn pg_partman_parent_is_pulled_with_external_partitions(server: &str, k: usize) 
     assert!(!reader.dir.join("schema/app.ev.yml").exists());
 }
 
+/// A pending drop intent takes a held partition's uid out of the identity
+/// file before anything runs. Under a parent now declared `partitions:
+/// external`, `baseline` would then read the partition as one of the
+/// parent's external ones and hand it over undropped. The recorded state
+/// decides instead: the baseline is refused by name, and goes once a plan has
+/// dropped the partition (#1852, DEC-1852.1).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        a_baseline_does_not_hand_over_a_held_partition_on(server, k);
+        a_baseline_does_not_hand_over_a_partition_renamed_first_on(server, k);
+        a_baseline_does_not_hand_over_a_rebound_partition_on(server, k);
+    }
+}
+
+/// The held partition is detached and reattached by hand under another bound
+/// while another tool has made a partition of its own: no partition left
+/// external has the recorded bound, so which one it is cannot be told, and
+/// the baseline is refused by the parent (#2172 review, #2177). Dropped by
+/// hand, it is still refused. Reverting the drop intent is the way out: the
+/// baseline records it missing, and the intent made again is an old one.
+fn a_baseline_does_not_hand_over_a_rebound_partition_on(server: &str, k: usize) {
+    let db = OwnDatabase::new(server, "handover-1852-rebound");
+    let connection = db.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+    );
+    let d = Demo::new(&format!("handover-1852-rebound-{k}"));
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let held = text.find("\npartitions:\n").unwrap();
+    let external = format!("{}\npartitions: external\n", &text[..held]);
+    let entries = || scalar(&connection, "SELECT count(*) FROM public.__pbps_state");
+
+    std::fs::write(&path, &external).unwrap();
+    succeeds(d.run(&["drop-table", "app.ev_2025", "--reason", "retired"]));
+    d.commit();
+    on_server(
+        &connection,
+        "CREATE TABLE app.ev_2026 PARTITION OF app.ev \
+             FOR VALUES FROM ('2026-01-01') TO ('2027-01-01'); \
+         ALTER TABLE app.ev DETACH PARTITION app.ev_2025; \
+         ALTER TABLE app.ev ATTACH PARTITION app.ev_2025 \
+             FOR VALUES FROM ('2027-01-01') TO ('2028-01-01')",
+    );
+    let refused = |what: &str| {
+        let o = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+        assert_ne!(code(&o), 0, "{what}: {}", stdout(&o));
+        assert!(
+            stderr(&o).contains(
+                "app.ev_2025 is named by a drop intent and held by the recorded state (entry #1) \
+                 as a partition of app.ev, whose partitions this baseline would leave external"
+            ) && stderr(&o).contains("which of them it is now cannot be told")
+                && stderr(&o).contains("revert the drop intent"),
+            "{what}: {}",
+            stderr(&o)
+        );
+        assert_eq!(
+            entries(),
+            1,
+            "{what}: the refused baseline recorded an entry"
+        );
+    };
+    refused("rebound");
+    on_server(&connection, "DROP TABLE app.ev_2025");
+    refused("dropped by hand");
+
+    // The way out: the drop intent reverted, the baseline records the
+    // partition missing; made again, the intent names a uid nothing holds.
+    d.git(&["revert", "--no-edit", "HEAD"]);
+    std::fs::write(&path, &external).unwrap();
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "gone"]));
+    assert_eq!(entries(), 2);
+    succeeds(d.run(&["drop-table", "app.ev_2025", "--reason", "retired"]));
+    d.git(&["add", "-A"]);
+    d.git(&["commit", "-q", "--allow-empty", "-m", "drop intent again"]);
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "hand over"]));
+    assert_eq!(entries(), 3);
+}
+
+/// The intent renames the partition twice before dropping it, and the
+/// database is renamed ahead of the baseline only as far as the middle name:
+/// the recorded state, the database and the intent each have another name.
+/// The partition is found by its parent and bound, and the baseline is still
+/// refused by the name the database has (#2172 review).
+fn a_baseline_does_not_hand_over_a_partition_renamed_first_on(server: &str, k: usize) {
+    let db = OwnDatabase::new(server, "handover-1852-renamed");
+    let connection = db.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+    );
+    let d = Demo::new(&format!("handover-1852-renamed-{k}"));
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let held = text.find("\npartitions:\n").unwrap();
+
+    std::fs::write(&path, text.replace("  ev_2025:", "  ev_mid:")).unwrap();
+    succeeds(d.run(&["rename-table", "app.ev_2025", "app.ev_mid"]));
+    d.commit();
+    std::fs::write(&path, text.replace("  ev_2025:", "  ev_old:")).unwrap();
+    succeeds(d.run(&["rename-table", "app.ev_mid", "app.ev_old"]));
+    d.commit();
+    std::fs::write(&path, format!("{}\npartitions: external\n", &text[..held])).unwrap();
+    succeeds(d.run(&["drop-table", "app.ev_old", "--reason", "retired"]));
+    d.commit();
+    on_server(&connection, "ALTER TABLE app.ev_2025 RENAME TO ev_mid");
+    let o = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains(
+            "app.ev_mid is named by a drop intent and held by the recorded state (entry #1, \
+             recorded as app.ev_2025)"
+        ),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(
+        scalar(&connection, "SELECT count(*) FROM public.__pbps_state"),
+        1,
+        "the refused baseline recorded an entry"
+    );
+}
+
+fn a_baseline_does_not_hand_over_a_held_partition_on(server: &str, k: usize) {
+    let db = OwnDatabase::new(server, "handover-1852");
+    let connection = db.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; \
+         CREATE TABLE app.ev (id integer NOT NULL, ts date NOT NULL) PARTITION BY RANGE (ts); \
+         CREATE TABLE app.ev_2025 PARTITION OF app.ev \
+             FOR VALUES FROM ('2025-01-01') TO ('2026-01-01')",
+    );
+    let d = Demo::new(&format!("handover-1852-{k}"));
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let path = d.dir.join("schema/app.ev.yml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let held = text.find("\npartitions:\n").unwrap();
+    let entries = || scalar(&connection, "SELECT count(*) FROM public.__pbps_state");
+
+    // Negative, as before this change: external without a drop intent is
+    // two owners for the partition, refused by the scope itself.
+    std::fs::write(&path, format!("{}\npartitions: external\n", &text[..held])).unwrap();
+    d.commit();
+    let o = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.ev_2025 is a partition pbps holds of the managed table app.ev"),
+        "{}",
+        stderr(&o)
+    );
+
+    // With a drop intent, the working identity file no longer holds it, and
+    // the recorded state refuses the handover by name.
+    succeeds(d.run(&["drop-table", "app.ev_2025", "--reason", "retired"]));
+    // The intent may change no tracked file; the history needs no new commit.
+    d.git(&["add", "-A"]);
+    d.git(&["commit", "-q", "--allow-empty", "-m", "drop intent"]);
+    let o = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains(
+            "app.ev_2025 is named by a drop intent and held by the recorded state (entry #1); \
+             this baseline would leave it to its external parent undropped"
+        ) && stderr(&o).contains("DEC-1852.1"),
+        "{}",
+        stderr(&o)
+    );
+    assert_eq!(entries(), 1, "the refused baseline recorded an entry");
+
+    // Dropped by a plan of its own first, with the parent's partitions still
+    // declared (a plan refuses to drop them while making them external), and
+    // then made external: the baseline goes.
+    std::fs::write(&path, &text).unwrap();
+    d.commit();
+    std::fs::write(&path, &text[..held]).unwrap();
+    succeeds(d.run(&["plan"]));
+    d.git(&["add", "-A"]);
+    d.git(&["commit", "-q", "--allow-empty", "-m", "plan"]);
+    let plan = d.dir.join("plan.json");
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.ev_2025')"
+        ),
+        0
+    );
+    std::fs::write(&path, format!("{}\npartitions: external\n", &text[..held])).unwrap();
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "hand over"]));
+}
+
 /// `pull --partitions-external` declares a parent's partitions external
 /// where no catalog says so (#1533): a parent whose partitions an application
 /// makes is written alone, and a baseline leaves nothing to plan. Without the
