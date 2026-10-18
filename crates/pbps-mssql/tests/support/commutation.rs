@@ -19,7 +19,6 @@ const SCENARIOS: &[Scenario] = &[
         name: "an_index_and_a_check_on_one_table",
         pair: ["AddIndex", "AddCheck"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -56,7 +55,6 @@ data:
         name: "an_index_and_a_check_dropped_from_one_table",
         pair: ["DropIndex", "DropCheck"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -93,7 +91,6 @@ data:
         name: "a_column_dropped_beside_an_index",
         pair: ["DropColumn", "AddIndex"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -129,7 +126,6 @@ data:
         name: "a_column_renamed_beside_a_dropped_unique_constraint",
         pair: ["RenameColumn", "DropUnique"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -163,7 +159,6 @@ data:
         name: "a_column_retyped_beside_a_new_column",
         pair: ["AlterColumnType", "AddColumn"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -196,7 +191,6 @@ data:
         name: "a_column_made_not_null_beside_a_dropped_foreign_key",
         pair: ["AlterColumnNullability", "DropForeignKey"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.p
 columns:
@@ -254,7 +248,6 @@ data:
         name: "a_default_changed_beside_a_deprecation",
         pair: ["AlterColumnDefault", "SetColumnDeprecated"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -286,7 +279,6 @@ data:
         name: "a_computed_column_added_beside_an_index",
         pair: ["AddComputedColumn", "AddIndex"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -323,7 +315,6 @@ data:
         name: "a_computed_column_dropped_beside_a_check",
         pair: ["DropComputedColumn", "AddCheck"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -359,7 +350,6 @@ data:
         name: "a_primary_key_renamed_beside_a_check",
         pair: ["SetPrimaryKey", "AddCheck"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.k
 columns:
@@ -381,7 +371,6 @@ checks:
         name: "a_row_inserted_beside_an_index",
         pair: ["InsertRow", "AddIndex"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -417,7 +406,6 @@ data:
         name: "a_row_deleted_beside_an_index",
         pair: ["DeleteRow", "AddIndex"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -451,7 +439,6 @@ data:
         name: "a_data_mode_changed_beside_an_index",
         pair: ["SetDataMode", "AddIndex"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -486,7 +473,6 @@ data:
         name: "ensure_keys_beside_a_check",
         pair: ["SetEnsureKeys", "AddCheck"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -519,7 +505,6 @@ data:
         name: "a_table_created_beside_a_view",
         pair: ["CreateTable", "CreateModule"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -561,7 +546,6 @@ definition: SELECT t.id, t.a FROM app.t
         name: "a_table_dropped_beside_a_view_redefined",
         pair: ["DropTable", "AlterModule"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -607,7 +591,6 @@ definition: SELECT t.id, t.b FROM app.t
         name: "a_table_renamed_beside_a_view_dropped",
         pair: ["RenameTable", "DropModule"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -656,7 +639,6 @@ primary_key: {name: pk_u, columns: [id]}
         name: "a_grant_beside_a_revoke",
         pair: ["Grant", "Revoke"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -710,7 +692,6 @@ grants:
         name: "a_role_created_beside_a_table",
         pair: ["CreateRole", "CreateTable"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -751,7 +732,6 @@ role: {role}
         name: "a_role_dropped_beside_an_index",
         pair: ["DropRole", "AddIndex"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -789,7 +769,6 @@ data:
         name: "a_role_renamed_beside_a_check",
         pair: ["RenameRole", "AddCheck"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -830,7 +809,6 @@ renamed_from: {role}
         name: "a_foreign_key_added_beside_an_index",
         pair: ["AddForeignKey", "AddIndex"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.p
 columns:
@@ -891,7 +869,6 @@ data:
         name: "a_unique_constraint_dropped_beside_another_added",
         pair: ["DropUnique", "AddUnique"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -927,7 +904,6 @@ data:
         name: "an_index_dropped_beside_a_row_update",
         pair: ["DropIndex", "UpdateRow"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -962,7 +938,6 @@ data:
         name: "a_view_created_beside_a_column_added",
         pair: ["CreateModule", "AddColumn"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -999,7 +974,6 @@ definition: SELECT t.id, t.a FROM app.t
         name: "a_grant_beside_a_column_added",
         pair: ["Grant", "AddColumn"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -1037,7 +1011,6 @@ grants:
         name: "a_check_dropped_beside_a_new_column",
         pair: ["DropCheck", "AddColumn"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -1084,7 +1057,6 @@ const HELD: &[Scenario] = &[
         // shows as independent and the engine refuses it swapped; once they
         // do, `AlterModule`'s rewrite orders it here.
         gap: Some(2192),
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -1117,7 +1089,6 @@ definition: |-
         name: "held_a_computed_column_dropped_with_its_index",
         pair: ["DropIndex", "DropComputedColumn"],
         gap: None,
-        uid_order: None,
         base: r#"
 table: app.t
 columns:
@@ -1275,7 +1246,6 @@ const NEGATIVE: Scenario = Scenario {
     name: "a_row_filled_by_the_default_of_a_column_added",
     pair: ["AddColumn", "InsertRow"],
     gap: None,
-    uid_order: None,
     base: r#"
 table: app.t
 columns:
