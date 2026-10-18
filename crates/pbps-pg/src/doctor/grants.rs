@@ -265,7 +265,7 @@ fn manages(
         }
         Securable::Routine(o, Some(signature)) => modules.iter().any(|id| {
             matches!(id, ModuleId::Routine(r) if &r.name == o &&
-                r.args.iter().map(|a| a.as_str()).collect::<Vec<_>>().join(", ") == *signature)
+                r.args.iter().map(|a| a.raw()).collect::<Vec<_>>().join(", ") == *signature)
         }),
         Securable::Routine(_, None) => false,
     }
@@ -286,7 +286,7 @@ fn question(target: &GrantTarget, right: Permission) -> (Securable, String, Vec<
             let signature = r
                 .args
                 .iter()
-                .map(|a| a.as_str())
+                .map(|a| a.raw())
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut query = routine_question();
@@ -309,7 +309,7 @@ fn question(target: &GrantTarget, right: Permission) -> (Securable, String, Vec<
             }
             query = query.replace("$PRIVILEGE", &format!("${}", r.args.len() + 3));
             let mut params = vec![Param::Str(&r.name.schema), Param::Str(&r.name.name)];
-            params.extend(r.args.iter().map(|a| Param::Str(a.as_str())));
+            params.extend(r.args.iter().map(|a| Param::Str(a.raw())));
             (
                 Securable::Routine(r.name.clone(), Some(signature)),
                 query,
@@ -383,4 +383,35 @@ fn catalog_question(values: &str) -> String {
          WHERE me.rolname = current_user AND a.grantee <> t.owner
          ORDER BY 1, 2, 3, 4, 5, 6"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn routine_grant_lookup_and_bindings_use_the_catalogs_raw_signature() {
+        let part = "x\n\\\u{200b}";
+        let arg = format!("s.\"{part}\"");
+        let routine: pbps_model::RoutineId = format!("app.f({arg},integer)").parse().unwrap();
+        let target = GrantTarget::Routine(routine.clone());
+        let modules = [ModuleId::Routine(routine)].into();
+        let (securable, _, params) = question(&target, Permission::Execute);
+        assert!(manages(&securable, &BTreeSet::new(), &modules));
+        assert_eq!(
+            securable,
+            Securable::Routine(ObjectName::new("app", "f"), Some(format!("{arg}, integer")))
+        );
+        assert!(matches!(params[2], Param::Str(actual) if actual == arg));
+        let escaped = Securable::Routine(
+            ObjectName::new("app", "f"),
+            Some("s.\"x\\n\\\\\\u{200b}\", integer".into()),
+        );
+        assert!(!manages(&escaped, &BTreeSet::new(), &modules));
+        assert!(!manages(
+            &Securable::Routine(ObjectName::new("app", "f"), None),
+            &BTreeSet::new(),
+            &modules
+        ));
+    }
 }

@@ -500,7 +500,7 @@ fn target_kind(
     if !answering.is_empty() {
         let mut signatures: Vec<String> = answering
             .iter()
-            .map(|(id, _)| id.to_string())
+            .map(|(id, _)| id.raw().to_string())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();

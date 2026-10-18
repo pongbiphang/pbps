@@ -398,8 +398,8 @@ mod tests {
             .iter()
             .map(|p| match &p.change {
                 Change::CreateTable { name, .. } => format!("table {name}", name = name.shown()),
-                Change::CreateModule { id, .. } => format!("create {id}"),
-                Change::DropModule { id, .. } => format!("drop {id}"),
+                Change::CreateModule { id, .. } => format!("create {id}", id = id.shown()),
+                Change::DropModule { id, .. } => format!("drop {id}", id = id.shown()),
                 Change::AlterColumnDefault { column, .. } => {
                     format!("default {}.{}", column.table.shown(), column.name)
                 }

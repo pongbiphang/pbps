@@ -2043,12 +2043,14 @@ fn signature(id: &ModuleId) -> Result<String, DialectError> {
         invalid(format!(
             "`{id}` is a routine without an argument list, and this engine identifies a routine by \
              its arguments: two overloads share the name, so `DROP FUNCTION` needs the signature \
-             to say which one (ADR-0009 section 1)"
+             to say which one (ADR-0009 section 1)",
+            // raw: whole-message escaped until #2084 step 5.
+            id = id.raw()
         ))
     })?;
     Ok(args
         .iter()
-        .map(RoutineArg::as_str)
+        .map(RoutineArg::raw)
         .collect::<Vec<_>>()
         .join(", "))
 }
@@ -2057,7 +2059,9 @@ fn attached_to(id: &ModuleId) -> Result<&TableName, DialectError> {
     id.attached_to().ok_or_else(|| {
         invalid(format!(
             "trigger `{id}` does not say which table it is on, and on this engine a trigger's \
-             name is scoped to its table rather than to a schema (ADR-0009 section 1)"
+             name is scoped to its table rather than to a schema (ADR-0009 section 1)",
+            // raw: whole-message escaped until #2084 step 5.
+            id = id.raw()
         ))
     })
 }
@@ -2121,7 +2125,7 @@ fn securable(
             qualified(&r.name)?,
             r.args
                 .iter()
-                .map(RoutineArg::as_str)
+                .map(RoutineArg::raw)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -2656,8 +2660,8 @@ fn agrees(declared: &RoutineArg, identity: &RoutineArg) -> bool {
     // plan, which is the one direction this gate may not be wrong in — and the
     // catalog assertion after the `CREATE` (ADR-0009 §3) is what covers the
     // case this cannot decide.
-    let (declared, declared_array) = types::peel_array(declared.as_str());
-    let (identity, identity_array) = types::peel_array(identity.as_str());
+    let (declared, declared_array) = types::peel_array(declared.raw());
+    let (identity, identity_array) = types::peel_array(identity.raw());
     declared_array == identity_array
         && !declared.is_empty()
         && !identity.is_empty()
@@ -2696,7 +2700,9 @@ fn the_body_declares_the_identity(
              engine the emitter writes `CREATE FUNCTION {}` and the declaration writes everything \
              after the name, so the list is the body's -- and **measured**, the engine requires \
              one: `CREATE FUNCTION f RETURNS int ...` is a syntax error",
-            id.object_name().raw()
+            id.object_name().raw(),
+            // raw: whole-message escaped until #2084 step 5.
+            id = id.raw()
         ))];
     };
     let carried: Vec<&str> = parameters(list)
@@ -2710,7 +2716,9 @@ fn the_body_declares_the_identity(
              argument types (ADR-0009 section 1), so the engine would create an object this key does not \
              name -- and accept it without a word",
             args.len(),
-            carried.len()
+            carried.len(),
+            // raw: whole-message escaped until #2084 step 5.
+            id = id.raw()
         ))];
     }
     carried
@@ -2724,14 +2732,22 @@ fn the_body_declares_the_identity(
                  parameter as `{parameter}`. The identity comes from the parameter list the \
                  definition holds, so the engine would create a different routine under this key \
                  and the next plan would not find the one named here",
-                at + 1
+                at + 1,
+                // raw: whole-message escaped until #2084 step 5.
+                id = id.raw(),
+                // raw: whole-message escaped until #2084 step 5.
+                arg = arg.raw()
             ))
         })
         .collect()
 }
 
 fn empty_definition(id: &ModuleId) -> DialectError {
-    invalid(format!("module `{id}` has an empty definition"))
+    invalid(format!(
+        "module `{id}` has an empty definition",
+        // raw: whole-message escaped until #2084 step 5.
+        id = id.raw()
+    ))
 }
 
 /// What a module declaration must satisfy before anything connects.
@@ -2760,7 +2776,9 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
     let schema = id.schema();
     if !crate::catalog::a_projects_schema(schema) {
         found.push(invalid(format!(
-            "module `{id}` is declared in `{schema}`, which this dialect's pull never reads:              `pg_catalog`, `information_schema` and every schema whose name begins with `pg_`              are excluded from the managed set. The engine would create the module and no plan              could ever see it again -- and `pg_temp` is worse than invisible, because it is              this engine's alias for the session's temporary schema: measured, `CREATE VIEW              \"pg_temp\".\"v\"` leaves a `pg_temp_4.v` that disappears with the connection.              Declare the module in a schema of the project's own"
+            "module `{id}` is declared in `{schema}`, which this dialect's pull never reads:              `pg_catalog`, `information_schema` and every schema whose name begins with `pg_`              are excluded from the managed set. The engine would create the module and no plan              could ever see it again -- and `pg_temp` is worse than invisible, because it is              this engine's alias for the session's temporary schema: measured, `CREATE VIEW              \"pg_temp\".\"v\"` leaves a `pg_temp_4.v` that disappears with the connection.              Declare the module in a schema of the project's own",
+            // raw: whole-message escaped until #2084 step 5.
+            id = id.raw()
         )));
     }
     // The rule a table and a grant already have, for the same reason: every
@@ -2773,7 +2791,9 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
             "module `{id}` is declared in a schema named `{schema}`, which this engine reads as \
              the current role's own schema wherever a `search_path` names it -- quoting does not \
              make it literal. Every statement this dialect emits for a module sets the path \
-             first, so no plan can carry this one. Declare it under a name the path can carry"
+             first, so no plan can carry this one. Declare it under a name the path can carry",
+            // raw: whole-message escaped until #2084 step 5.
+            id = id.raw()
         )));
     }
     match module.kind {
@@ -2788,7 +2808,9 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                 found.extend(args.iter().filter_map(types::overlong_name).map(|name| {
                     invalid(format!(
                         "module `{id}` names `{name}` in an argument type, and that name is                          over {} bytes. The engine truncates a longer identifier with a NOTICE                          nothing reads and creates the routine under the truncated identity,                          which is not this key: the next plan cannot find it, and the `CREATE`                          it emits again is refused as already existing",
-                        crate::MAX_IDENT_BYTES
+                        crate::MAX_IDENT_BYTES,
+                        // raw: whole-message escaped until #2084 step 5.
+                        id = id.raw()
                     ))
                 }));
                 // An empty definition is already refused above; running the
@@ -2818,7 +2840,9 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                          definition naming another table creates the trigger there, under this \
                          key, and the next plan cannot find it",
                         id.name(),
-                        on = on.raw()
+                        on = on.raw(),
+                        // raw: whole-message escaped until #2084 step 5.
+                        id = id.raw()
                     ))),
                     None => found.push(invalid(format!(
                         "trigger `{id}` has a definition this dialect cannot find an `ON \
@@ -2826,7 +2850,9 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                          created on, and it has to be the `{on}` this identity names -- so a \
                          definition whose target cannot be read is refused rather than created \
                          somewhere this key does not point",
-                        on = on.raw()
+                        on = on.raw(),
+                        // raw: whole-message escaped until #2084 step 5.
+                        id = id.raw()
                     ))),
                 }
             }
@@ -5336,6 +5362,22 @@ fn row_statement(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn routine_argument_comparison_and_drop_sql_keep_raw_type_names() {
+        let part = "x\n\\\u{200b}";
+        let bare: RoutineArg = format!("\"{part}\"[]").parse().unwrap();
+        let qualified: RoutineArg = format!("s.\"{part}\"[]").parse().unwrap();
+        assert!(agrees(&bare, &qualified));
+        let escaped: RoutineArg = bare.shown().to_string().parse().unwrap();
+        assert!(!agrees(&escaped, &qualified));
+        let id: ModuleId = format!("app.f(s.\"{part}\"[],integer)").parse().unwrap();
+        assert_eq!(signature(&id).unwrap(), format!("s.\"{part}\"[], integer"));
+        assert_ne!(
+            signature(&id).unwrap(),
+            "s.\"x\\n\\\\\\u{200b}\"[], integer"
+        );
+    }
+
     /// A detach finds the clones it keeps through their parents before it
     /// detaches, and the checks after, in one batch. Every name moves to a
     /// temporary one the catalog says is free, then every declared name is
@@ -7613,7 +7655,8 @@ mod tests {
                 vec![format!(
                     "SET search_path = \"app\", \"pg_temp\";\n{expected}\n;\nSET search_path = '';"
                 )],
-                "{id}"
+                "{}",
+                id.shown()
             );
         }
     }
@@ -7683,8 +7726,13 @@ mod tests {
                     kind,
                 },
             );
-            assert_eq!(sql.len(), 1, "{id}");
-            assert!(sql[0].contains(expected), "{id}: {}", sql[0]);
+            assert_eq!(sql.len(), 1, "{}", id.shown());
+            assert!(
+                sql[0].contains(expected),
+                "{id}: {}",
+                sql[0],
+                id = id.shown()
+            );
         }
     }
 

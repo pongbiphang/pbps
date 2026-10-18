@@ -367,7 +367,7 @@ impl Reconstruction {
                     steps.push(step(
                         dialect,
                         phase,
-                        &format!("{} {id}", module.kind),
+                        &format!("{} {id}", module.kind, id = id.shown()),
                         change,
                         names,
                         compiled,
@@ -759,7 +759,7 @@ pub fn dropped_signature(
         ModuleKind::View | ModuleKind::Trigger => return Ok(None),
     };
     let unwritable = |error: pbps_dialect::DialectError| ReconstructError::Emit {
-        declaration: id.to_string(),
+        declaration: id.shown().to_string(),
         reason: error.to_string(),
     };
     Ok(Some(crate::resolver::capture::DroppedSignature {
@@ -774,7 +774,7 @@ pub fn dropped_signature(
             routine
                 .args
                 .iter()
-                .map(pbps_model::RoutineArg::as_str)
+                .map(pbps_model::RoutineArg::raw)
                 .collect::<Vec<_>>()
                 .join(",")
         ),
@@ -1019,3 +1019,28 @@ fn step(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn a_dropped_signature_keeps_raw_sql_names_and_arguments() {
+        let part = "x\n\\\u{200b}";
+        let id: ModuleId = format!("app.{part}(s.\"{part}\")").parse().unwrap();
+        let found = dropped_signature(&crate::Postgres::new(), &id, ModuleKind::Function)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.spelled, format!("\"app\".\"{part}\"(s.\"{part}\")"));
+        assert_ne!(found.spelled, id.shown().to_string());
+        assert!(
+            dropped_signature(
+                &crate::Postgres::new(),
+                &"app.v".parse().unwrap(),
+                ModuleKind::View
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+}

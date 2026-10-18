@@ -481,7 +481,7 @@ pub fn render_module(
                 .to_string(),
             Some(on.raw().to_string()),
         ),
-        other @ (ModuleId::Named(_) | ModuleId::Routine(_)) => (other.to_string(), None),
+        other @ (ModuleId::Named(_) | ModuleId::Routine(_)) => (other.raw().to_string(), None),
     };
     let _ = writeln!(s, "{}: {}", module.kind.as_str(), scalar(&declared));
 
@@ -492,7 +492,7 @@ pub fn render_module(
         let _ = writeln!(s, "on: {}", scalar(on));
     }
     if !depends_on.is_empty() {
-        let names: Vec<String> = depends_on.iter().map(ToString::to_string).collect();
+        let names: Vec<String> = depends_on.iter().map(|id| id.raw().to_string()).collect();
         let _ = writeln!(s, "depends_on: {}", seq(&names));
     }
     // Written only when it is `true`. `false` is what the absent key means,

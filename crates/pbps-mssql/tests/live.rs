@@ -2302,7 +2302,7 @@ async fn system_versioned_tables_round_trip_through_an_empty_database() {
         .schema
         .modules
         .keys()
-        .map(ToString::to_string)
+        .map(|id| id.raw().to_string())
         .collect();
     assert_eq!(views, ["dbo.v_named"]);
     assert!(
@@ -3904,7 +3904,7 @@ async fn temporal_tables_and_their_history_are_not_pulled_as_ordinary_tables() {
         .schema
         .modules
         .keys()
-        .map(ToString::to_string)
+        .map(|id| id.raw().to_string())
         .collect();
     assert_eq!(modules, ["dbo.disabled.tr_disabled", "dbo.plain.tr_plain"]);
     assert_eq!(pulled.unmanaged_modules.len(), 6);
@@ -4161,7 +4161,7 @@ async fn pull_reads_every_kind_of_module_back() {
         .schema
         .modules
         .keys()
-        .map(ToString::to_string)
+        .map(|id| id.raw().to_string())
         .collect();
     managed.sort();
     assert_eq!(
@@ -4247,7 +4247,7 @@ async fn a_bare_name_in_another_schema_is_not_an_edge() {
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }
@@ -4298,7 +4298,7 @@ async fn a_view_named_by_a_reserved_word_is_created_after_the_view_it_selects_fr
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::CreateModule { id, .. } = &c.change {
-                Some(id.to_string())
+                Some(id.raw().to_string())
             } else {
                 None
             }

@@ -1923,7 +1923,7 @@ fn add_module(
     // The same round trip the tables are asked for: a module id is written as
     // text and read back by parsing it, and PostgreSQL will give a name that
     // does not survive that — a view called `f(int)`, a schema called `a.b`.
-    if ModuleId::from_str(&id.to_string()).as_ref() != Ok(&id) {
+    if ModuleId::from_str(&id.raw().to_string()).as_ref() != Ok(&id) {
         return note_module(
             pulled,
             kind.as_str(),
@@ -1932,7 +1932,8 @@ fn add_module(
                 "`{id}` is a module whose identity the declaration format cannot write back: it \
                  is stored as text and read by parsing it, and this one does not survive that. It \
                  is left out of the pull entirely rather than pulled into a schema that will not \
-                 load."
+                 load.",
+                id = id.shown()
             ),
         );
     }
@@ -3545,6 +3546,28 @@ mod tests {
     /// order written, `NULL` unquoted and a quoted `'NULL'` text, and a
     /// HASH's modulus and remainder in lower case.
     #[test]
+    fn a_module_round_trip_checks_its_raw_catalog_name() {
+        let part = "x\n\\\u{200b}";
+        let raw = RawCatalog {
+            modules: vec![raw_module(
+                'v',
+                part,
+                &format!("CREATE VIEW app.\"{part}\" AS SELECT 1;"),
+            )],
+            ..Default::default()
+        };
+        let pulled = assemble(&raw);
+        let id = ModuleId::Named(TableName::new("app", part));
+        assert!(pulled.schema.modules.contains_key(&id), "{pulled:?}");
+        assert!(
+            !pulled
+                .schema
+                .modules
+                .contains_key(&id.shown().to_string().parse().unwrap())
+        );
+    }
+
+    #[test]
     fn a_deparsed_bound_comes_apart_and_nothing_else_does() {
         use pbps_model::{BoundDatum as D, ListDatum as L, PartitionBound as B};
         let v = |s: &str| D::Value(s.to_owned());
@@ -4860,7 +4883,7 @@ mod tests {
             .schema
             .modules
             .iter()
-            .map(|(id, m)| (id.to_string(), m.definition.clone()))
+            .map(|(id, m)| (id.raw().to_string(), m.definition.clone()))
             .collect();
         assert_eq!(
             got,

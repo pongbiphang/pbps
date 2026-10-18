@@ -1989,7 +1989,13 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // is checked here, at the one place engine names enter the model, and
         // a name that does not survive it is inventoried like any other shape
         // the format cannot carry.
-        if id.to_string().parse::<pbps_model::ModuleId>().as_ref() != Ok(&id) {
+        if id
+            .raw()
+            .to_string()
+            .parse::<pbps_model::ModuleId>()
+            .as_ref()
+            != Ok(&id)
+        {
             unmanageable(
                 "its name contains a period or a parenthesis, which a declaration cannot spell \
                  (the tool would read it back as a different module)",
@@ -4322,6 +4328,25 @@ mod module_tests {
     }
 
     #[test]
+    fn a_module_round_trip_checks_its_raw_catalog_name() {
+        let part = "x\n\\\u{200b}";
+        let definition = format!("CREATE VIEW [app].[{part}] AS SELECT 1 AS n");
+        let raw = RawCatalog {
+            modules: vec![module("app", part, ModuleKind::View, Some(&definition))],
+            ..Default::default()
+        };
+        let pulled = assemble(&raw);
+        let id = pbps_model::ModuleId::Named(TableName::new("app", part));
+        assert!(pulled.schema.modules.contains_key(&id), "{pulled:?}");
+        assert!(
+            !pulled
+                .schema
+                .modules
+                .contains_key(&id.shown().to_string().parse().unwrap())
+        );
+    }
+
+    #[test]
     fn ledger_tables_their_history_and_their_views_are_reported_instead_of_managed() {
         let base = raw_one_table();
         let mut raw = RawCatalog::default();
@@ -4883,7 +4908,7 @@ mod module_tests {
             p.schema
                 .modules
                 .keys()
-                .map(ToString::to_string)
+                .map(|id| id.raw().to_string())
                 .collect::<Vec<_>>(),
             ["dbo.sales_archive"],
             "{:?}",

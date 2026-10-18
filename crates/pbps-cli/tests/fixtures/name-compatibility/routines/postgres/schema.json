@@ -1,0 +1,1 @@
+{"tables":{},"modules":{"app.viewname\nline\r\u001b[31m\\‮名前":{"kind":"view","definition":"SELECT 1 AS id"},"app.routinename\nline\r\u001b[31m\\‮名前(app.\"name\nline\r\u001b[31m\\‮名前\")":{"kind":"function","definition":"(v app.\"name\nline\r\u001b[31m\\‮名前\") RETURNS integer LANGUAGE sql RETURN 1"}}}

@@ -220,7 +220,7 @@ fn module_address(
             schema: routine.name.schema.clone(),
             table: None,
             name: routine.name.name.clone(),
-            signature: Some(routine.to_string()),
+            signature: Some(routine.raw().to_string()),
         },
         ModuleId::Trigger { on, name } => Address {
             kind: NameKind::Module(kind),
@@ -560,4 +560,33 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_routine_claim_and_release_use_the_same_raw_signature() {
+        let part = "x\n\\\u{200b}";
+        let id: ModuleId = format!("app.{part}(s.\"{part}\")").parse().unwrap();
+        let claim = module_address(|_| None, &id, ModuleKind::Function).unwrap();
+        // A catalog/serialized identity is the other side of the slot lookup.
+        let parsed: ModuleId = id.raw().to_string().parse().unwrap();
+        let release = module_address(|_| None, &parsed, ModuleKind::Function).unwrap();
+        assert_eq!(claim, release);
+        assert_eq!(
+            claim.signature.as_deref(),
+            Some(id.raw().to_string().as_str())
+        );
+        assert_ne!(
+            claim.signature.as_deref(),
+            Some(id.shown().to_string().as_str())
+        );
+        let sibling: ModuleId = format!("app.{part}(text)").parse().unwrap();
+        assert_ne!(
+            claim,
+            module_address(|_| None, &sibling, ModuleKind::Function).unwrap()
+        );
+    }
 }

@@ -1,0 +1,12 @@
+view: "app.viewname\nline\r\e[31m\x9B\\‮名前"
+depends_on: ["app.routinename\nline\r\e[31m\x9B\\‮名前(app.\"name\nline\r\e[31m\x9B\\‮名前\")"]
+
+definition: |-
+  SELECT 1 AS id
+
+---
+function: "app.routinename\nline\r\e[31m\x9B\\‮名前(app.\"name\nline\r\e[31m\x9B\\‮名前\")"
+
+definition: |-
+  (v app."name
+  line[31m\‮名前") RETURNS integer LANGUAGE sql RETURN 1

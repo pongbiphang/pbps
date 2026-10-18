@@ -240,6 +240,7 @@ class TheAllowlist(unittest.TestCase):
         self.assertEqual(
             sorted(holes), [
                 'crates/pbps-cli/src/adopt.rs',
+                'crates/pbps-cli/src/dependents.rs',
                 'crates/pbps-cli/src/deploy.rs',
                 'crates/pbps-cli/src/engine.rs',
                 'crates/pbps-cli/src/explain/resolver.rs',
@@ -259,6 +260,7 @@ class TheAllowlist(unittest.TestCase):
                 'crates/pbps-pg/src/impact.rs',
                 'crates/pbps-pg/src/lib.rs',
                 'crates/pbps-pg/src/partition_series.rs',
+                'crates/pbps-pg/src/resolver/reconstruct.rs',
                 'crates/pbps-pg/src/validate.rs',
                 'crates/pbps-pg/tests/live.rs',
                 'crates/pbps-policy/src/evaluate.rs',

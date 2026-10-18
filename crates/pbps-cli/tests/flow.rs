@@ -16728,7 +16728,7 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
         .changes
         .iter()
         .filter(|planned| matches!(planned.change, pbps_model::Change::AlterModule { .. }))
-        .filter_map(|planned| planned.change.module_id().map(ToString::to_string))
+        .filter_map(|planned| planned.change.module_id().map(|id| id.raw().to_string()))
         .collect();
     assert_eq!(altered, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
 
@@ -16750,7 +16750,7 @@ fn connected_planning_keeps_dependencies_for_deleted_modules() {
         .changes
         .iter()
         .filter(|planned| matches!(planned.change, pbps_model::Change::DropModule { .. }))
-        .filter_map(|planned| planned.change.module_id().map(ToString::to_string))
+        .filter_map(|planned| planned.change.module_id().map(|id| id.raw().to_string()))
         .collect();
     assert_eq!(dropped, ["dbo.pbps_dep_leaf", "dbo.pbps_dep_base"]);
 

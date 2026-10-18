@@ -509,7 +509,9 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             dialect: DIALECT,
             feature: format!(
                 "settling PUBLIC execution on `{routine}`: this engine grants none to revoke or \
-                 keep, and `public` here is an ordinary database role"
+                 keep, and `public` here is an ordinary database role",
+                // raw: whole-message escaped until #2084 step 5.
+                routine = routine.raw()
             ),
         }),
 
@@ -860,7 +862,11 @@ pub fn module_definition(id: &ModuleId, module: &Module) -> Result<String, Diale
     if body.is_empty() {
         return Err(DialectError::Invalid {
             dialect: DIALECT,
-            message: format!("module `{id}` has an empty definition"),
+            message: format!(
+                "module `{id}` has an empty definition",
+                // raw: whole-message escaped until #2084 step 5.
+                id = id.raw()
+            ),
         });
     }
     let head = format!(
@@ -877,7 +883,11 @@ pub fn module_definition(id: &ModuleId, module: &Module) -> Result<String, Diale
             // not a module this emitter can be handed: the type says so.
             let on = id.attached_to().ok_or_else(|| DialectError::Invalid {
                 dialect: DIALECT,
-                message: format!("trigger `{id}` does not say which table it is on"),
+                message: format!(
+                    "trigger `{id}` does not say which table it is on",
+                    // raw: whole-message escaped until #2084 step 5.
+                    id = id.raw()
+                ),
             })?;
             format!("{head}\nON {}\n{body}", qualified(on)?)
         }
@@ -1502,7 +1512,9 @@ fn securable(target: &GrantTarget) -> Result<String, DialectError> {
             return Err(DialectError::Invalid {
                 dialect: DIALECT,
                 message: format!(
-                    "`{r}` names an argument list; SQL Server identifies a routine by name alone"
+                    "`{r}` names an argument list; SQL Server identifies a routine by name alone",
+                    // raw: whole-message escaped until #2084 step 5.
+                    r = r.raw()
                 ),
             });
         }

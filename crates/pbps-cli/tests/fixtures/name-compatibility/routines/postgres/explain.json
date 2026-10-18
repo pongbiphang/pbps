@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.0.0",
+  "command": "explain",
+  "result": "ok",
+  "findings": [],
+  "data": {
+    "applyable": true,
+    "dialect": "postgres",
+    "created_at": "2026-10-18T00:00:00Z",
+    "baseline": "routine/module master fixture",
+    "mode": "transactional",
+    "checksum": "f26f7fe0fbd3aafab1b3c36e9dea55dc89c7278950543233a060cb9a3dac7271",
+    "change_count": 3,
+    "table_count": 0,
+    "module_count": 2,
+    "role_count": 0,
+    "risks": [],
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum f26f7fe0fbd3aafab1b3c36e9dea55dc89c7278950543233a060cb9a3dac7271",
+    "probes": [],
+    "unchecked": [],
+    "statement_count": 3
+  }
+}

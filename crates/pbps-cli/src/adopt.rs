@@ -989,7 +989,7 @@ mod tests {
             .schema
             .modules
             .keys()
-            .map(|id| id.to_string())
+            .map(|id| id.raw().to_string())
             .collect();
         kept.sort();
         assert_eq!(kept, ["app.t.audit", "app.v"]);

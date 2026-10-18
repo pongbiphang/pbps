@@ -981,7 +981,8 @@ fn weave(
                      calls it; rebuild it and detach in separate plans",
                     moving.join(", "),
                     d.described,
-                    table = table.shown()
+                    table = table.shown(),
+                    root = root.shown()
                 ));
             }
         }
@@ -1047,19 +1048,22 @@ impl std::fmt::Display for Named {
             Need::Split { root, .. } => write!(
                 f,
                 "{} is edited in one step and has to be split around `{root}`",
-                self.described
+                self.described,
+                root = root.shown()
             ),
             Need::Removed { root, .. } => {
                 write!(
                     f,
                     "{} has to be gone before `{root}` is dropped",
-                    self.described
+                    self.described,
+                    root = root.shown()
                 )
             }
             Need::Restored { root, .. } => write!(
                 f,
                 "{} has to come back after `{root}` is created",
-                self.described
+                self.described,
+                root = root.shown()
             ),
         }
     }
@@ -1091,7 +1095,7 @@ impl Weave<'_> {
         self.found
             .get(root)
             .and_then(|deps| deps.get(k))
-            .ok_or_else(|| format!("`{root}` has no dependent {k}"))
+            .ok_or_else(|| format!("`{root}` has no dependent {k}", root = root.shown()))
     }
 
     /// The first thing `d` still needs around `root`, as the plan stands.
@@ -1200,13 +1204,19 @@ impl Expansion for Weave<'_> {
                 Ok(Rewrite::Split {
                     at,
                     parts: Box::new([planned(removal, dialect), planned(restoration, dialect)]),
-                    reason: format!("{} depends on `{root}`", d.described),
+                    // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
+                    reason: format!("{} depends on `{root}`", d.described, root = root.raw()),
                 })
             }
             Need::Removed { root, k } => {
                 let d = self.dependent(root, *k)?;
                 let at = span(changes, root).ok_or_else(|| format!("{named}: no drop"))?;
-                let reason = format!("{} depends on `{root}`, which this plan drops", d.described);
+                // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
+                let reason = format!(
+                    "{} depends on `{root}`, which this plan drops",
+                    d.described,
+                    root = root.raw()
+                );
                 match find(&view, &parts, &d.holds, partitions, removes) {
                     // Moved to the module's drop, ahead of everything from
                     // the drop to where the plan had it, and written with the
@@ -1300,9 +1310,11 @@ impl Expansion for Weave<'_> {
                                 of: after,
                                 change: added,
                                 anchor: Anchor::After(after),
+                                // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
                                 reason: format!(
                                     "{} depends on `{root}`, which this plan rebuilds",
-                                    d.described
+                                    d.described,
+                                    root = root.raw()
                                 ),
                             })],
                             respelled: Vec::new(),
@@ -1316,7 +1328,8 @@ impl Expansion for Weave<'_> {
                         "`{root}` is dropped by this plan, and {} depends on it and is kept by \
                          the declarations. Remove the dependency from its declaration, or keep \
                          `{root}`, and plan again.",
-                        d.described
+                        d.described,
+                        root = root.shown()
                     )),
                 }
             }
@@ -3431,7 +3444,7 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
             index_text(index),
         )],
         Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
-            vec![(format!("{id}"), module.definition.clone())]
+            vec![(format!("{id}", id = id.shown()), module.definition.clone())]
         }
         _ => Vec::new(),
     };
@@ -3735,7 +3748,12 @@ fn cycle(
             ),
         other => format!("{other:?}"),
     };
-    let module = |i: usize| cs.changes[i].change.module_id().map(|id| format!("`{id}`"));
+    let module = |i: usize| {
+        cs.changes[i]
+            .change
+            .module_id()
+            .map(|id| format!("`{id}`", id = id.shown()))
+    };
     let functions: Vec<String> = named.iter().filter_map(|&i| module(i)).collect();
     let blockers: Vec<String> = (0..window.len())
         .filter(|&i| {
@@ -4055,7 +4073,11 @@ pub(crate) fn unaccounted(
                 .is_some_and(|i| i < at.drop_at)
                 || taken_by_its_parent(&cs.changes, &d.holds, at.drop_at);
             if !removed_first {
-                out.push(format!("{} depends on `{root}`", d.described));
+                out.push(format!(
+                    "{} depends on `{root}`",
+                    d.described,
+                    root = root.shown()
+                ));
             }
         }
     }
@@ -4192,9 +4214,9 @@ mod tests {
         cs.changes
             .iter()
             .map(|p| match &p.change {
-                Change::DropModule { id, .. } => format!("drop {id}"),
-                Change::CreateModule { id, .. } => format!("create {id}"),
-                Change::AlterModule { id, .. } => format!("alter {id}"),
+                Change::DropModule { id, .. } => format!("drop {id}", id = id.shown()),
+                Change::CreateModule { id, .. } => format!("create {id}", id = id.shown()),
+                Change::AlterModule { id, .. } => format!("alter {id}", id = id.shown()),
                 Change::DropCheck { name, .. } => format!("drop check {name}"),
                 Change::AddCheck { name, .. } => format!("add check {name}"),
                 Change::AlterColumnDefault { column, to, .. } => {
@@ -4268,7 +4290,9 @@ mod tests {
             .changes
             .iter()
             .map(|p| match &p.change {
-                Change::PublicExecution { routine, .. } => format!("public {routine}"),
+                Change::PublicExecution { routine, .. } => {
+                    format!("public {routine}", routine = routine.shown())
+                }
                 Change::CreateRole { name, .. } => format!("role {name}"),
                 other => rendered(&ChangeSet {
                     changes: vec![PlannedChange::new(other.clone())],
@@ -5682,7 +5706,7 @@ mod tests {
                 .iter()
                 .position(|p| {
                     matches!(&p.change, Change::CreateTable { name: n, .. } if n.raw().to_string() == name)
-                        || matches!(&p.change, Change::CreateModule { id, .. } if id.to_string() == name)
+                        || matches!(&p.change, Change::CreateModule { id, .. } if id.raw().to_string() == name)
                 })
                 .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
         };
@@ -5716,7 +5740,7 @@ mod tests {
                 .iter()
                 .position(|p| {
                     matches!(&p.change, Change::CreateTable { name: n, .. } if n.raw().to_string() == name)
-                        || matches!(&p.change, Change::CreateModule { id, .. } if id.to_string() == name)
+                        || matches!(&p.change, Change::CreateModule { id, .. } if id.raw().to_string() == name)
                 })
                 .unwrap_or_else(|| panic!("{name} missing from {order:?}"))
         };
@@ -7194,6 +7218,49 @@ mod tests {
         assert_eq!(rendered(&cs), again);
     }
 
+    #[test]
+    fn dependency_provenance_keeps_raw_json_and_is_shown_once_by_the_report() {
+        let part = "x\n\\\u{200b}";
+        let raw = format!("app.{part}");
+        let shown = r"app.x\n\\\u{200b}";
+        let mut schema = Schema::default();
+        schema
+            .modules
+            .insert(id(&raw), module(ModuleKind::View, "SELECT 1 AS id"));
+        schema
+            .modules
+            .insert(id("app.child"), module(ModuleKind::View, "SELECT 1 AS id"));
+        let mut cs = plan(vec![alter(&schema, &raw)]);
+        let found = [(id(&raw), vec![view("app.child")])].into();
+        let ids = IdsFile::default();
+        weave(&mut cs, &found, &schema, &[&ids], pg().as_ref()).unwrap();
+        let origins = crate::report::origins(&cs);
+        assert_eq!(origins.len(), 2);
+        for origin in &origins {
+            assert_eq!(origin.source, raw);
+            let suffix = if origin.role == "teardown" {
+                "drops"
+            } else {
+                "rebuilds"
+            };
+            assert_eq!(
+                origin.reason,
+                format!("view app.child depends on `{raw}`, which this plan {suffix}")
+            );
+            let report = crate::report::changes(&cs);
+            let expected =
+                format!("view app.child depends on `{shown}`, which this plan {suffix}\n");
+            assert!(
+                report.contains(&expected),
+                "expected {expected:?} in {report:?}"
+            );
+        }
+        let json = serde_json::to_value(&origins).unwrap();
+        assert_eq!(json[0]["source"], raw);
+        assert!(json[0]["reason"].as_str().unwrap().contains(&raw));
+        assert!(!json[0]["reason"].as_str().unwrap().contains(shown));
+    }
+
     /// A chain of views over a rebuilt view: dropped deepest first, created
     /// back in reverse (DECISIONS 311).
     #[test]
@@ -7595,7 +7662,7 @@ mod tests {
         )]);
         let back: Vec<String> = untouched_module_dependents(&cs, &found, &s)
             .iter()
-            .map(ToString::to_string)
+            .map(|id| id.raw().to_string())
             .collect();
         assert_eq!(back, ["app.v2"]);
     }
@@ -7623,7 +7690,7 @@ mod tests {
         let rebuilt = plan(vec![alter(&s, "app.f(integer)")]);
         let back: Vec<String> = untouched_module_dependents(&rebuilt, &found, &s)
             .iter()
-            .map(ToString::to_string)
+            .map(|id| id.raw().to_string())
             .collect();
         assert_eq!(back, ["app.v0"]);
 
@@ -7659,7 +7726,7 @@ mod tests {
         let cs = plan(vec![drop.clone(), alter(&s, "app.v1")]);
         let back: Vec<String> = untouched_module_dependents(&cs, &found, &s)
             .iter()
-            .map(ToString::to_string)
+            .map(|id| id.raw().to_string())
             .collect();
         assert_eq!(back, ["app.v2"]);
         // What `rediff` returns with `v2` rebuilt, woven without refusal.

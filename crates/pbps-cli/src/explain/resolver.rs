@@ -216,7 +216,7 @@ fn surface(surface: &Surface) -> String {
         Surface::Default(column) => format!("default {column}", column = column.raw()),
         Surface::Check { table, name } => format!("check {table}.{name}", table = table.raw()),
         Surface::Index { table, name } => format!("index {table}.{name}", table = table.raw()),
-        Surface::Module(module) => format!("module {module}"),
+        Surface::Module(module) => format!("module {module}", module = module.raw()),
     }
 }
 

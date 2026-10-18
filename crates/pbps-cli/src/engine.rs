@@ -3029,9 +3029,10 @@ pub async fn refuse_unsafe_definers(
             DefinerPath::Absent if absent == Absent::NotYetCreated => {}
             DefinerPath::Absent => anyhow::bail!(
                 "{id}: this plan writes the routine, and the catalog holds no routine by that \
-                 identity after its statements ran"
+                 identity after its statements ran",
+                id = id.shown()
             ),
-            DefinerPath::Unsafe(why) => unsafe_.push(format!("{id}: {why}")),
+            DefinerPath::Unsafe(why) => unsafe_.push(format!("{id}: {why}", id = id.shown())),
         }
     }
     if !unsafe_.is_empty() {
@@ -3083,7 +3084,7 @@ pub fn require_transactional_rebuilds(
                 ..
             } = &p.change
             {
-                Some(pbps_model::escape::Escaped(&routine.to_string()).to_string())
+                Some(routine.shown().to_string())
             } else {
                 None
             }
@@ -3134,7 +3135,7 @@ pub async fn check_module_rebuilds(
                     anyhow::bail!("before_a_rebuild (PostgreSQL): {reason}");
                 }
                 if !after && let pbps_pg::modules::Serialized::Not(reason) = found.serialized {
-                    eprintln!("warning: {id}: {reason}");
+                    eprintln!("warning: {id}: {reason}", id = id.shown());
                 }
             }
             Ok(ConnectedCheck {

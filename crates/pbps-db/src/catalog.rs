@@ -217,7 +217,8 @@ impl std::fmt::Display for LimitationTarget {
             Self::Relation(name) | Self::SharedModule(name) | Self::UnnameableModule(name) => {
                 name.raw().fmt(f)
             }
-            Self::Module(id) => id.fmt(f),
+            // Raw inventory text is escaped by its human writer until #2084 step 5 (DEC-2084.1).
+            Self::Module(id) => id.raw().fmt(f),
         }
     }
 }
