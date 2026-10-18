@@ -3016,6 +3016,7 @@ async fn a_generated_columns_inputs_leave_out_its_own_column() {
             base: "a".into(),
             generated: "b".into(),
             base_required: false,
+            filled_by_trigger: false,
         }]
     );
     // Which inputs a row cannot be inserted without (#1397): `NOT NULL` with
@@ -3065,6 +3066,17 @@ async fn a_generated_columns_inputs_leave_out_its_own_column() {
         .await
         .expect("the catalog answers");
     assert!(required(&found).is_empty(), "{found:?}");
+    // Not required, but filled only by the trigger: the plan that drops it
+    // makes the input required again (#2178). Only the strict input.
+    assert_eq!(
+        found
+            .iter()
+            .filter(|d| d.filled_by_trigger)
+            .map(|d| d.base.as_str())
+            .collect::<Vec<_>>(),
+        ["req"],
+        "{found:?}"
+    );
     db.execute(&format!("ALTER TABLE {s}.r DISABLE TRIGGER fill;"))
         .await
         .expect("disabled");
@@ -3072,6 +3084,7 @@ async fn a_generated_columns_inputs_leave_out_its_own_column() {
         .await
         .expect("the catalog answers");
     assert_eq!(required(&found), ["req"], "{found:?}");
+    assert!(found.iter().all(|d| !d.filled_by_trigger), "{found:?}");
     db.execute(&format!("ALTER TABLE {s}.t ALTER COLUMN b TYPE bigint;"))
         .await
         .expect("the generated column itself retypes");

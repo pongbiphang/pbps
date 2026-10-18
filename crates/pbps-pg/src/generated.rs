@@ -26,6 +26,12 @@ pub struct Dependence {
     /// while it stands, a row inserted without it is refused (#1397). Where a
     /// trigger may supply it, whether it does is the engine's to say.
     pub base_required: bool,
+    /// The input is `NOT NULL` with no default and no identity, and an
+    /// enabled row-level `BEFORE INSERT` trigger on the table may fill it:
+    /// required all the same where the plan drops or rewrites a trigger on
+    /// the table, since the one that would fill it may be gone when the row
+    /// is written (#2178).
+    pub filled_by_trigger: bool,
 }
 
 /// Every column of `table` that a generated column of the same table is
@@ -46,12 +52,13 @@ pub async fn dependences(conn: &mut Conn, table: &TableName) -> Result<Vec<Depen
     let sql = format!(
         "SELECT base.attname AS base, gen.attname AS generated,
                 base.attnotnull AND NOT base.atthasdef AND base.attidentity = ''
-                  AND NOT EXISTS (
+                  AS strict,
+                EXISTS (
                     SELECT 1 FROM pg_catalog.pg_trigger tg
                      WHERE tg.tgrelid = c.oid AND NOT tg.tgisinternal
                        AND tg.tgenabled <> 'D'
                        AND (tg.tgtype::integer & 7) = 7)
-                  AS base_required
+                  AS triggered
            FROM pg_catalog.pg_attrdef ad
            JOIN pg_catalog.pg_attribute gen
              ON gen.attrelid = ad.adrelid AND gen.attnum = ad.adnum AND gen.attgenerated <> ''
@@ -76,12 +83,16 @@ pub async fn dependences(conn: &mut Conn, table: &TableName) -> Result<Vec<Depen
                 .map(str::to_owned)
                 .ok_or_else(|| DbError::BadRow(format!("catalog column `{column}` is null")))
         };
+        let flag = |column: &str| -> Result<bool, DbError> {
+            row.try_get::<bool>(column)?
+                .ok_or_else(|| DbError::BadRow(format!("catalog column `{column}` is null")))
+        };
+        let (strict, triggered) = (flag("strict")?, flag("triggered")?);
         out.push(Dependence {
             base: text("base")?,
             generated: text("generated")?,
-            base_required: row.try_get::<bool>("base_required")?.ok_or_else(|| {
-                DbError::BadRow("catalog column `base_required` is null".to_owned())
-            })?,
+            base_required: strict && !triggered,
+            filled_by_trigger: strict && triggered,
         });
     }
     Ok(out)

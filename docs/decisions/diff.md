@@ -6849,3 +6849,29 @@ found, or the scenario waits until it is, rather than being listed.
 Pinned by `a_plan_that_ends_otherwise_with_new_uids_fails_whatever_is_listed`
 (`crates/pbps-diff/tests/support/commutation.rs`, run by both engines' live
 test binaries).
+
+<a id="dec-2178-1"></a>
+
+**DEC-2178.1. An input a trigger may fill counts as required where the plan
+drops or rewrites a trigger on its table.** The release pass reads which
+generated-column inputs a row cannot be inserted without from the catalog.
+An enabled row-level `BEFORE INSERT` trigger made every input fillable
+(#1397), but that reads the trigger as it stands before the plan. A plan
+that drops the trigger, or rewrites it (on PostgreSQL a `DROP` and a
+`CREATE`), may run the insert without it. The pass then let the input's drop
+pass the row, and the engine refused the row mid-apply.
+
+The catalog now also says which inputs only a trigger fills
+(`Dependence::filled_by_trigger`). Those count as required where the plan
+drops or rewrites any trigger on the table, and the plan is refused by name
+as for an input nothing fills. Any trigger counts, not only the one that
+would fill: which trigger fills which column is the trigger's code, which
+the pass does not read. A plan that only creates a trigger changes nothing:
+the input was already required without one.
+
+Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
+(`crates/pbps-cli/src/engine.rs`), the live
+`a_released_input_a_trigger_fills_is_required_once_the_plan_drops_the_trigger`
+(`crates/pbps-cli/tests/flow_pg.rs`) and
+`a_generated_columns_inputs_leave_out_its_own_column`
+(`crates/pbps-pg/tests/live.rs`).
