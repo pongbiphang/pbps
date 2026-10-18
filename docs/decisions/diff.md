@@ -6749,3 +6749,9 @@ Server.
 The commutation suites drop their `two_columns_added_to_one_table` pair,
 listed with this issue as a gap and as a uid-order difference: the effects
 now order it, so it is no longer a pair they call independent.
+
+<a id="dec-2158-1"></a>
+
+**DEC-2158.1. The resolver uses `Keep` for every pair involving an unowned
+step, refusing a reversal by name because unrecorded owners leave reordered
+dependencies unverified.**
