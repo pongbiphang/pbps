@@ -958,40 +958,6 @@ data:
 "#,
     },
     Scenario {
-        name: "a_column_added_beside_a_row_insert",
-        pair: ["AddColumn", "InsertRow"],
-        gap: Some(2079),
-        uid_order: None,
-        base: r#"
-table: app.t
-columns:
-  id: {type: int, nullable: false}
-  a: {type: int}
-  b: {type: int}
-primary_key: {name: pk_t, columns: [id]}
-data:
-  mode: exact
-  rows:
-    1: {a: 1, b: 2}
-    2: {a: 3, b: 4}
-"#,
-        desired: r#"
-table: app.t
-columns:
-  id: {type: int, nullable: false}
-  a: {type: int}
-  b: {type: int}
-  c: {type: int}
-primary_key: {name: pk_t, columns: [id]}
-data:
-  mode: exact
-  rows:
-    1: {a: 1, b: 2}
-    2: {a: 3, b: 4}
-    3: {a: 5, b: 6}
-"#,
-    },
-    Scenario {
         name: "an_index_dropped_beside_a_row_update",
         pair: ["DropIndex", "UpdateRow"],
         gap: None,

@@ -2895,6 +2895,70 @@ fn a_row_update_waits_for_the_rename_of_a_column_its_guards_read() {
     assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
 }
 
+/// `t(id, a)` gains a nullable column `c` with no default, and one row is
+/// inserted spelling `a` alone; `held` says whether the insert's `types`
+/// carry `c`, which its postcondition then holds to NULL (#2079).
+fn insert_beside_a_new_column(held: bool) -> Plan {
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table_with(&["id", "a"]));
+    after.tables.insert(t("t"), table_with(&["id", "a", "c"]));
+    let mut types: std::collections::BTreeMap<String, ColumnType> =
+        [("a".to_owned(), int())].into_iter().collect();
+    if held {
+        types.insert("c".to_owned(), int());
+    }
+    Plan {
+        logical: vec![
+            p(Change::AddColumn {
+                uid: uid(UidKind::Column, "t.c"),
+                table: t("t"),
+                name: "c".into(),
+                column: Box::new(Column::new(int())),
+            }),
+            p(Change::InsertRow {
+                table: t("t"),
+                key_column: "id".into(),
+                identity_key: false,
+                key: RowKey::from("3"),
+                row: [("a".to_owned(), Value::Int(5))]
+                    .into_iter()
+                    .collect::<Row>(),
+                defaults: Default::default(),
+                types,
+            }),
+        ],
+        before,
+        after,
+        before_ids: Plan::ids(&["t"], &[("t", "id"), ("t", "a")]),
+        after_ids: Plan::ids(&["t"], &[("t", "id"), ("t", "a"), ("t", "c")]),
+    }
+}
+
+/// An insert's postcondition reads every column in its `types`, the ones it
+/// leaves at NULL among them, so an insert ahead of the `AddColumn` of such
+/// a column is refused: the engine refuses it, `column "c" does not exist`
+/// (#2079).
+#[test]
+fn a_row_insert_waits_for_a_new_column_its_postcondition_reads() {
+    let none = ModuleDeps::new();
+    let held = insert_beside_a_new_column(true);
+    let (ops, fx, baseline) = held.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL), []);
+    let early = run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL);
+    assert!(
+        early.iter().any(|v| matches!(
+            v,
+            Violation::Edge { edge, .. } if matches!(edge.because, Because::Creates(_))
+        )),
+        "{early:?}"
+    );
+    // Negative: an insert whose statement never names the column is free of
+    // it.
+    let free = insert_beside_a_new_column(false);
+    let (ops, fx, baseline) = free.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+}
+
 /// A parent `p` and a child `c` whose foreign key stands throughout, over the
 /// columns given, and the two rows the plan inserts, the child's first.
 fn rows_across(

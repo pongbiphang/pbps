@@ -831,6 +831,7 @@ impl Cx<'_> {
                 key,
                 row,
                 defaults,
+                types,
                 ..
             } => {
                 let owner = self.table(table)?;
@@ -839,6 +840,17 @@ impl Cx<'_> {
                 written.extend(row.columns().map(|(c, _)| c.as_str()));
                 written.extend(defaults.keys().map(String::as_str));
                 self.row_writes(table, &owner, &written);
+                // The statement's postcondition holds every column in
+                // `types` to what the insert left in it, NULL for a column
+                // the row and the defaults leave out, so it names those
+                // columns too: one the plan adds goes first (#2079).
+                for c in types.keys().map(String::as_str) {
+                    if !written.contains(&c)
+                        && let Ok(column) = self.column(&table.column(c))
+                    {
+                        self.exists(ObjectKey::Column(column));
+                    }
+                }
                 for (c, expression) in defaults {
                     let _ = expression;
                     if let Ok(column) = self.column(&table.column(c.as_str())) {
