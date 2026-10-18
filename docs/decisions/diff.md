@@ -7005,3 +7005,34 @@ on 16 and 18, by
 test covers a publication named for an identity and a `serial` added
 together, a table with none left unnamed, a created table not named, the plan
 applying, and the pass once the publication is gone.
+
+<a id="dec-2100-1"></a>
+
+**DEC-2100.1. A constraint trigger's companion constraint names, its clones'
+included, are slots held and released by its module.** Measured on PostgreSQL
+16 and 18: a check or foreign key cannot take the companion's name until the
+trigger is dropped or rebuilt as an ordinary trigger. `AlterModule` was in
+class 14, after a check's class 13, so the valid handover failed at apply.
+
+`pbps_dialect::slots::names` supplements the portable names through the existing
+`declares_a_constraint` and `clones_to_partitions` answers; the model does not
+parse a trigger definition. The companion and each standing partition clone
+hold a `NameKind::Constraint`, scoped by the table's identity and held by the
+parent trigger's `ObjectKey::Module`. The baseline seeds the same names.
+The old kind comes from the baseline and the new kind from the operation's
+payload, so a kept constraint gives up no slot, and an ordinary trigger claims
+none. There is no new object kind or fabricated identity.
+
+Only these module-to-constraint handover edges join `after_the_rebuilds`'
+existing `Schedule::settle`. It keeps DEC-1956.2: the claimer sinks after the
+release. A plan without such a handover keeps its bytes and its existing
+function-ordering behavior. There is no new pass, rank or hoisting mode.
+A cycle is refused through `Refusal::describe` with the steps named and the
+plan unchanged. Before the shared schedule runs, the debug verifier records
+these particular edges as pending; the scheduled and final orders enforce
+them. Generated key-name replay remains #2101's separate question.
+
+Pinned by `a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots`,
+`ordinary_modules_checks_and_rows_without_a_handover_keep_their_bytes`,
+`a_constraint_slot_cycle_is_refused_with_its_steps_named`, and the live
+`a_constraint_trigger_rebuild_frees_its_name_before_a_check_or_foreign_key`.

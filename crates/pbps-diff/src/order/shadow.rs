@@ -106,7 +106,7 @@ pub(crate) fn observe_plan(
         &hints.module_deps,
         changes,
         &operations,
-        Stage::Differ,
+        Stage::BeforeSchedule,
         None,
     );
 }
@@ -118,6 +118,8 @@ pub(crate) fn observe_plan(
 #[cfg(any(test, debug_assertions))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
+    /// The class order, before the shared schedule releases constraint slots.
+    BeforeSchedule,
     /// Before the connected passes: a computed column and its function may
     /// still be in the wrong order.
     Differ,
@@ -204,7 +206,7 @@ pub(crate) fn observe(
     let ops = operations.as_slice();
     let (violations, any) = judge(ops, &report, stage);
     lines.extend(violations);
-    let (slot_lines, slot_fail) = judge_slots(ops, &owners, before, dialect, facts);
+    let (slot_lines, slot_fail) = judge_slots(ops, &owners, before, dialect, facts, stage);
     lines.extend(slot_lines);
     let any = any || slot_fail;
     if std::env::var_os("PBPS_ORDER_SHADOW").is_some() {
@@ -274,7 +276,7 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
     // that runs. Recorded as `connected`, and not failed, until the verifier
     // runs on the order that runs.
     let module_op = |id: OperationId| {
-        stage == Stage::Differ
+        stage != Stage::Final
             && find(id).is_some_and(|o| {
                 matches!(
                     o.change(),
@@ -367,10 +369,54 @@ pub(crate) fn judge_slots(
     before: Snapshot<'_>,
     dialect: &dyn Dialect,
     facts: Option<&pbps_dialect::slots::CatalogFacts>,
+    stage: Stage,
 ) -> (Vec<String>, bool) {
     use super::slots::{SlotViolation, analyse, verify};
     let slots = analyse(ops, owners, before, dialect);
     let (violations, skipped) = verify(ops, &slots, dialect, facts, owners, before);
+    // The class order has not visited after_the_rebuilds yet. Record only
+    // the companion-slot handovers that pass owns as pending here; its
+    // output and the final order must satisfy them (DEC-2100.1).
+    let pending: Vec<_> = if stage == Stage::BeforeSchedule {
+        super::slots::edges(&slots, None, &[])
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    ops[e.before].change(),
+                    pbps_model::Change::AlterModule {
+                        id: pbps_model::ModuleId::Trigger { .. },
+                        ..
+                    } | pbps_model::Change::DropModule {
+                        id: pbps_model::ModuleId::Trigger { .. },
+                        ..
+                    }
+                ) && matches!(
+                    ops[e.after].change(),
+                    pbps_model::Change::AddCheck { .. }
+                        | pbps_model::Change::AddForeignKey { .. }
+                        | pbps_model::Change::AddUnique { .. }
+                        | pbps_model::Change::SetPrimaryKey { to: Some(_), .. }
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let is_pending = |violation: &SlotViolation| match violation {
+        SlotViolation::Held {
+            operation, slot, ..
+        } => pending
+            .iter()
+            .any(|e| ops[e.after].id() == *operation && e.slot == *slot),
+        SlotViolation::Edge {
+            before,
+            after,
+            slot,
+        } => pending.iter().any(|e| {
+            ops[e.before].id() == *before && ops[e.after].id() == *after && e.slot == *slot
+        }),
+        SlotViolation::Contested { .. } | SlotViolation::IntermediateHeld { .. } => false,
+    };
     let name = |id: OperationId| {
         ops.iter().find(|o| o.id() == id).map_or_else(
             || id.to_string(),
@@ -424,7 +470,14 @@ pub(crate) fn judge_slots(
             ),
         })
         .collect();
-    let fail = lines.iter().any(|l| !l.starts_with("slot contested "));
+    for (line, violation) in lines.iter_mut().zip(&violations) {
+        if is_pending(violation) {
+            *line = format!("scheduled {line}");
+        }
+    }
+    let fail = lines
+        .iter()
+        .any(|l| !l.starts_with("slot contested ") && !l.starts_with("scheduled "));
     for s in &skipped {
         lines.push(format!(
             "slot skipped {} {mode} {} claims {} beside {}",

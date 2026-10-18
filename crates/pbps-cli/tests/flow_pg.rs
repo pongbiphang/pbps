@@ -14004,6 +14004,101 @@ fn a_dropped_constraint_trigger_frees_its_name_for_a_key() {
     );
 }
 
+/// A constraint trigger and its partition clones release their companion
+/// constraint names before a check or foreign key takes them (#2100).
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_constraint_trigger_rebuild_frees_its_name_before_a_check_or_foreign_key() {
+    for partition in [false, true] {
+        for foreign_key in [false, true] {
+            let slug = format!("trigger-slot-{}-{}", partition, foreign_key);
+            let own = OwnDatabase::new(&server(), &slug);
+            let connection = own.connection();
+            let create = if partition {
+                "CREATE TABLE app.t (id integer) PARTITION BY RANGE (id);
+                 CREATE TABLE app.p0 PARTITION OF app.t FOR VALUES FROM (0) TO (10);"
+            } else {
+                "CREATE TABLE app.t (id integer PRIMARY KEY);"
+            };
+            on_server(connection, &format!(
+                "CREATE SCHEMA app;
+                 CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+                 CREATE TABLE app.r (id integer PRIMARY KEY); INSERT INTO app.r VALUES (1);
+                 {create}
+                 CREATE CONSTRAINT TRIGGER audit AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f();
+                 INSERT INTO app.t VALUES (1);"));
+            let d = Demo::new(&slug);
+            succeeds(d.run(&["pull", "--db", connection]));
+            d.commit();
+            succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+            let target = if partition { "app.p0" } else { "app.t" };
+            // Without releasing the trigger, the name is still occupied.
+            // Measure the engine's refusal rather than adding a new intake
+            // rule for an invalid final declaration to this ordering fix.
+            let kept = try_on_server(
+                connection,
+                &format!("ALTER TABLE {target} ADD CONSTRAINT audit CHECK (id >= 0)"),
+            )
+            .unwrap_err();
+            assert!(
+                kept.contains("audit") && kept.contains("already exists"),
+                "{kept}"
+            );
+            let part = if foreign_key {
+                "foreign_keys:\n  audit:\n    columns: [id]\n    references: app.r(id)\n"
+            } else {
+                "checks:\n  audit: id >= 0\n"
+            };
+            let table = d.dir.join("schema/app.t.yml");
+            if partition {
+                let indented: String = part.lines().map(|line| format!("    {line}\n")).collect();
+                std::fs::write(&table, format!(
+                    "table: app.t\ncolumns:\n  id: {{type: integer}}\npartition_by: [id]\npartitions:\n  p0:\n    from: ['0']\n    to: ['10']\n{indented}"
+                )).unwrap();
+            } else {
+                let original = std::fs::read_to_string(&table).unwrap();
+                std::fs::write(&table, format!("{original}{part}")).unwrap();
+            }
+            let trigger = d.dir.join("schema/app.t%2Eaudit.trigger.yml");
+            let original = std::fs::read_to_string(&trigger).unwrap();
+            let ordinary = original
+                .replace("CONSTRAINT AFTER", "AFTER")
+                .replace(" NOT DEFERRABLE INITIALLY IMMEDIATE", "");
+            assert_ne!(ordinary, original);
+            std::fs::write(&trigger, ordinary).unwrap();
+            let (plan, script) = connected_plan(&d, connection);
+            assert!(
+                script.find("DROP TRIGGER \"audit\"").unwrap()
+                    < script.find("ADD CONSTRAINT \"audit\"").unwrap(),
+                "{script}"
+            );
+            succeeds(approved_apply(
+                &d,
+                connection,
+                &plan,
+                &["--allow", "destructive,constraint"],
+            ));
+            succeeds(d.run(&["verify", "--db", connection]));
+            let next = succeeds(d.run(&["plan", "--db", connection]));
+            assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+            assert_eq!(
+                scalar(connection, "SELECT count(*)::bigint FROM app.t WHERE id=1"),
+                1
+            );
+            assert_eq!(
+                scalar(
+                    connection,
+                    &format!(
+                        "SELECT count(*)::bigint FROM pg_constraint WHERE conrelid='{target}'::regclass AND conname='audit' AND contype='{}'",
+                        if foreign_key { "f" } else { "c" }
+                    )
+                ),
+                1
+            );
+        }
+    }
+}
+
 /// #1749: `ALTER TABLE ... SET SCHEMA` takes a table's indexes along under
 /// their names, and refuses one whose name a relation of the destination
 /// holds (measured on 16 and 18). An unmanaged sequence `s2.n` and a table

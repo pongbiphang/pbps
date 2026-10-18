@@ -200,8 +200,58 @@ pub(crate) fn schedule(
         // A create that moves rows out of a DEFAULT is not held with the rest
         // (#1763 review).
         split_moving_defaults(&mut cs, declared.schema, dialect);
-        moved += after_the_rebuilds(&mut cs, &releases, declared.module_deps, declared.schema)
-            .map_err(Refusal::module_passes)?;
+        let mut handovers = pbps_diff::order::Schedule::new(cs.changes.len());
+        if declared
+            .sources
+            .before
+            .schema
+            .modules
+            .values()
+            .any(|m| dialect.declares_a_constraint(m))
+        {
+            let slots = pbps_diff::order::slots::handovers(
+                &cs.changes,
+                declared.sources.before,
+                pbps_diff::Side {
+                    schema: declared.schema,
+                    ids: declared.sources.after,
+                },
+                dialect,
+                &Default::default(),
+            )
+            .map_err(Refusal)?;
+            // Only the new constraint-trigger handovers join this existing
+            // settle. Every other slot keeps its current ordering route;
+            // without a handover the old pass is byte-identical (DEC-2100.1).
+            for edge in slots.constraints() {
+                if matches!(
+                    &cs.changes[edge.before].change,
+                    Change::AlterModule {
+                        id: ModuleId::Trigger { .. },
+                        ..
+                    } | Change::DropModule {
+                        id: ModuleId::Trigger { .. },
+                        ..
+                    }
+                ) && matches!(
+                    &cs.changes[edge.after].change,
+                    Change::AddCheck { .. }
+                        | Change::AddForeignKey { .. }
+                        | Change::AddUnique { .. }
+                        | Change::SetPrimaryKey { to: Some(_), .. }
+                ) {
+                    handovers.edge(edge.before, edge.after, edge.source, edge.reason);
+                }
+            }
+        }
+        moved += after_the_rebuilds(
+            &mut cs,
+            &releases,
+            declared.module_deps,
+            declared.schema,
+            handovers,
+        )
+        .map_err(Refusal::module_passes)?;
         // A partition's own default after its parent's, wherever the passes
         // above left that (#1588).
         added += after_their_parents_defaults(&mut cs, declared.schema, &ids, dialect)
@@ -483,10 +533,19 @@ mod tests {
     mod before_the_schedule {
         use super::*;
         use crate::dependents::{
-            after_the_rebuilds, after_their_parents_defaults, before_its_partitions_indexes,
-            settle_public_execution, split_moving_defaults, split_new_tables,
-            take_public_execution,
+            after_their_parents_defaults, before_its_partitions_indexes, settle_public_execution,
+            split_moving_defaults, split_new_tables, take_public_execution,
         };
+
+        fn after_the_rebuilds(
+            cs: &mut ChangeSet,
+            released: &BTreeSet<super::ColumnRef>,
+            deps: &ModuleDeps,
+            schema: &Schema,
+        ) -> Result<usize, String> {
+            let order = pbps_diff::order::Schedule::new(cs.changes.len());
+            crate::dependents::after_the_rebuilds(cs, released, deps, schema, order)
+        }
 
         pub(super) fn bootstrap(mut cs: ChangeSet, schema: &Schema, ids: &IdsFile) -> ChangeSet {
             let decisions = take_public_execution(&mut cs);

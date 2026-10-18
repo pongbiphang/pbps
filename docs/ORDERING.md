@@ -153,6 +153,9 @@ Then, in this order:
     function create, so they run right after it in their order, and places a
     new column whose expression names one after that create, with what may
     read the column after it (DEC-942.1, DEC-1364.1, DEC-1967.1).
+    A constraint trigger's companion-name handovers join the same settle,
+    including its partition clones: the check or foreign key taking the name
+    sinks after the module change releasing it (DEC-2100.1).
   - `after_their_parents_defaults` then sets each partition's own default
     again after a parent's default the plan sets, which reaches every
     partition (DEC-1581.1).
@@ -232,7 +235,9 @@ difference, so a new kind or a new effect updates both (DEC-1954.1).
 
 Names are stated the same way, apart from the effects, because a name is an
 address and not an identity. `pbps_model::operation::names` reports, for each
-operation, the names it claims and releases. The dialect's `slots::slot`
+operation, the names it claims and releases. `pbps_dialect::slots::names`
+adds a constraint trigger's companion names and its clones' names from the
+dialect's existing answers (DEC-2100.1). The dialect's `slots::slot`
 says which namespace holds each one. Whether two spellings are one name is the
 engine's rule, or the catalog's answer under a collation (DEC-1964.1).
 `pbps_diff::order::slots` then does three things beside every order
@@ -345,7 +350,7 @@ rows below list each.
 | A table rename moving a holder away (P) → a cross-schema rename carrying an index or owned sequence onto the held name | engine-sourced | on a connected PostgreSQL plan, `order_carried_moves` settles the plan over the name handovers, the catalog's occupants included, where only table renames pass one another; refused at `plan --db` with the remedy otherwise | ✓ DEC-1767.1, DEC-1957.2 |
 | `RenameColumn` or another later class freeing a default name → `RenameTable` into it | — | refused at `plan --db` with the remedy | ✓ refused by design, DEC-1366.2 |
 | Index (P) or named constraint (S) drop → `RenameTable` into its name | fixed | `rename_order` | ✓ DECISIONS 496, DEC-496.1 |
-| Constraint or index drop → add of the same name | fixed | class 2 before 13 | ✓ DECISIONS 168 (namespaces) |
+| Constraint or index drop → add of the same name | fixed | class 2 before 13; P: a constraint trigger's companion name, on its table and its partitions, is released by its module change before the check or foreign key taking it, by slot edges in `after_the_rebuilds`' settle | ✓ DECISIONS 168 (namespaces), DEC-2100.1 |
 | `DropModule` → `CreateModule` of its id | fixed | class 0 before 14 | ✓ |
 | `DropRole` or `RenameRole` away → `CreateRole` of its name | fixed | class 0 or 1 before 15 | ✓ |
 | `DropRole` → `RenameRole` into its name (S) | fixed | class 0 before 1 | ✓ |

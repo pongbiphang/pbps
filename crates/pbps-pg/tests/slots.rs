@@ -101,3 +101,158 @@ fn two_spellings_are_two_names_without_any_catalog_fact() {
         Same::Yes
     );
 }
+
+#[test]
+fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
+    use pbps_diff::order::slots::{SlotViolation, analyse, edges, verify};
+    use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+    use pbps_model::plan_names::PlanNames;
+    use pbps_model::{
+        Change, CheckConstraint, IdsFile, Module, PartitionBound, PartitionOf, PlannedChange,
+        Schema, Table, TableName, Uid, UidKind,
+    };
+    let t = TableName::new("app", "t");
+    let p = TableName::new("app", "p0");
+    let u = TableName::new("app", "u");
+    let trigger = ModuleId::Trigger {
+        on: t.clone(),
+        name: "audit".into(),
+    };
+    let module = |constraint| Module {
+        kind: ModuleKind::Trigger,
+        description: None,
+        definition: format!(
+            "{}AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()",
+            if constraint { "CONSTRAINT " } else { "" }
+        ),
+    };
+    let mut schema = Schema::default();
+    let mut ids = IdsFile::default();
+    for table in [&t, &p, &u] {
+        schema.tables.insert(table.clone(), Table::default());
+        ids.tables.insert(
+            Uid::derived(UidKind::Table, &table.raw().to_string(), 0),
+            table.clone(),
+        );
+    }
+    schema.tables.get_mut(&p).unwrap().partition_of = Some(PartitionOf {
+        parent: t.clone(),
+        bound: PartitionBound::Default,
+        columns: Default::default(),
+    });
+    for constraint in [false, true] {
+        schema.modules.insert(trigger.clone(), module(constraint));
+        let changes = vec![
+            PlannedChange::new(Change::DropModule {
+                id: trigger.clone(),
+                kind: ModuleKind::Trigger,
+            }),
+            PlannedChange::new(Change::CreateModule {
+                id: trigger.clone(),
+                module: Box::new(module(constraint)),
+            }),
+        ];
+        let names = PlanNames::of(&changes, &ids).unwrap();
+        let owners = PlanOwners::new(names, &ids, &ids);
+        let before = Snapshot {
+            schema: &schema,
+            ids: &ids,
+        };
+        let ops = Operations::of_plan(&changes, ModuleEdits::Rebuilt);
+        let removed =
+            pbps_dialect::slots::names(&Postgres::new(), &ops.as_slice()[0], &owners, before)
+                .unwrap();
+        let created =
+            pbps_dialect::slots::names(&Postgres::new(), &ops.as_slice()[1], &owners, before)
+                .unwrap();
+        let count = |names: &[pbps_model::operation::Named]| {
+            names
+                .iter()
+                .filter(|n| n.address.kind == NameKind::Constraint)
+                .count()
+        };
+        assert_eq!(count(&removed.releases), if constraint { 2 } else { 0 });
+        assert_eq!(count(&created.claims), if constraint { 2 } else { 0 });
+        assert_eq!(
+            count(&pbps_dialect::slots::baseline_names(
+                &Postgres::new(),
+                &owners,
+                before
+            )),
+            if constraint { 2 } else { 0 }
+        );
+    }
+    for (was, will, target, expected) in [
+        (true, false, &t, true),
+        (true, false, &p, true),
+        (true, false, &u, false),
+        (true, true, &p, false),
+        (false, false, &t, false),
+    ] {
+        schema.modules.insert(trigger.clone(), module(was));
+        let changes: Vec<_> = vec![
+            Change::AddCheck {
+                table: target.clone(),
+                name: "audit".into(),
+                constraint: CheckConstraint {
+                    expression: "id > 0".into(),
+                },
+            },
+            Change::AlterModule {
+                id: trigger.clone(),
+                module: Box::new(module(will)),
+            },
+        ]
+        .into_iter()
+        .map(PlannedChange::new)
+        .collect();
+        let names = PlanNames::of(&changes, &ids).unwrap();
+        let owners = PlanOwners::new(names, &ids, &ids);
+        let before = Snapshot {
+            schema: &schema,
+            ids: &ids,
+        };
+        let ops = Operations::of_plan(&changes, ModuleEdits::Rebuilt);
+        let slots = analyse(ops.as_slice(), &owners, before, &Postgres::new());
+        let found = edges(&slots, None, &[]);
+        assert_eq!(
+            found.iter().any(|e| (e.before, e.after) == (1, 0)),
+            expected,
+            "was={was}, will={will}, target={target:?}: {found:?}"
+        );
+        let (violations, _) = verify(
+            ops.as_slice(),
+            &slots,
+            &Postgres::new(),
+            None,
+            &owners,
+            before,
+        );
+        assert_eq!(
+            violations
+                .iter()
+                .any(|v| matches!(v, SlotViolation::Held { .. })),
+            expected,
+            "{violations:?}"
+        );
+        if expected {
+            let mut schedule = pbps_diff::order::Schedule::new(changes.len());
+            pbps_diff::order::slots::schedule(&mut schedule, &found);
+            assert_eq!(schedule.sequence().unwrap(), [1, 0]);
+            let ordered = ops.reordered(&[1, 0]);
+            let slots = analyse(ordered.as_slice(), &owners, before, &Postgres::new());
+            assert!(
+                verify(
+                    ordered.as_slice(),
+                    &slots,
+                    &Postgres::new(),
+                    None,
+                    &owners,
+                    before
+                )
+                .0
+                .is_empty()
+            );
+        }
+    }
+}
