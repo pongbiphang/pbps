@@ -4375,3 +4375,520 @@ fn a_partitions_default_follows_its_parents_default_through_a_column_rename() {
             .any(|v| matches!(v, Violation::Edge { .. }))
     );
 }
+
+// One pin per effect the #1965 mutation audit could delete unnoticed (#2091).
+// Each is a two-step plan in a valid order that nothing but the named effect
+// orders: run backwards, the verifier must refuse it. Deleting the effect
+// makes the verifier more permissive and nothing else moves, so these are the
+// tests that notice. Each pin's comment names the effect; deleting it fails
+// the pin, which `scripts/effect-mutations.py` re-checks.
+
+/// The two-step `plan` is accepted as given and refused backwards.
+fn refused_backwards(plan: &Plan) {
+    let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
+    let none = ModuleDeps::new();
+    assert_eq!(
+        run(&ops, &fx, &baseline, &[0, 1], &none, Checks::ALL),
+        [],
+        "the plan's own order is accepted"
+    );
+    assert!(
+        !run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL).is_empty(),
+        "backwards is refused"
+    );
+}
+
+fn one_index(name: &str, column: &str) -> (String, pbps_model::Index) {
+    use pbps_model::{Index, IndexColumn, IndexKey, IndexMethod};
+    (
+        name.to_owned(),
+        Index {
+            columns: vec![IndexColumn {
+                key: IndexKey::Column(column.into()),
+                descending: false,
+                opclass: None,
+            }],
+            include: vec![],
+            unique: false,
+            filter: None,
+            method: IndexMethod::Btree,
+            storage_parameters: Default::default(),
+        },
+    )
+}
+
+fn add_index(table: &str, index: (String, pbps_model::Index)) -> PlannedChange {
+    p(Change::AddIndex {
+        table: t(table),
+        name: index.0,
+        index: Box::new(index.1),
+        clustered: false,
+    })
+}
+
+fn add_check(table: &str) -> PlannedChange {
+    p(Change::AddCheck {
+        table: t(table),
+        name: "ck".into(),
+        constraint: pbps_model::CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    })
+}
+
+/// `t(id)` before, `will` after, the ids of `columns` on both sides.
+fn on_one_table(logical: Vec<PlannedChange>, was: Table, will: Table, columns: &[&str]) -> Plan {
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), was);
+    after.tables.insert(t("t"), will);
+    let columns: Vec<(&str, &str)> = columns.iter().map(|c| ("t", *c)).collect();
+    let ids = Plan::ids(&["t"], &columns);
+    Plan {
+        logical,
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    }
+}
+
+/// CreateTable: `Exists` of the table a new foreign key references.
+#[test]
+fn a_new_table_s_foreign_key_waits_for_the_table_it_references() {
+    let mut child = table_with(&["id", "pid"]);
+    child
+        .foreign_keys
+        .insert("fk".into(), reference(&["pid"], &["id"]));
+    let mut after = Schema::default();
+    after.tables.insert(t("p"), table_with(&["id"]));
+    after.tables.insert(t("c"), child.clone());
+    let create = |name: &str, table: Table| {
+        p(Change::CreateTable {
+            uid: uid(UidKind::Table, name),
+            name: t(name),
+            table: Box::new(table),
+            beside_default: None,
+            moves_at_most: None,
+        })
+    };
+    refused_backwards(&Plan {
+        logical: vec![create("p", table_with(&["id"])), create("c", child)],
+        before: Schema::default(),
+        after,
+        before_ids: IdsFile::default(),
+        after_ids: Plan::ids(&["p", "c"], &[("p", "id"), ("c", "id"), ("c", "pid")]),
+    });
+}
+
+/// RenameTable: `Rewrites` of the table, which a step spelling the new name
+/// follows.
+#[test]
+fn a_step_spelling_a_renamed_table_s_new_name_follows_the_rename() {
+    let (tid, id, c) = (
+        uid(UidKind::Table, "a"),
+        uid(UidKind::Column, "a.id"),
+        uid(UidKind::Column, "b.c"),
+    );
+    let mut before = Schema::default();
+    before.tables.insert(t("a"), table_with(&["id"]));
+    let mut after = Schema::default();
+    after.tables.insert(t("b"), table_with(&["id", "c"]));
+    let mut before_ids = IdsFile::default();
+    before_ids.tables.insert(tid.clone(), t("a"));
+    before_ids.columns.insert(id.clone(), t("a").column("id"));
+    let mut after_ids = IdsFile::default();
+    after_ids.tables.insert(tid.clone(), t("b"));
+    after_ids.columns.insert(id, t("b").column("id"));
+    after_ids.columns.insert(c.clone(), t("b").column("c"));
+    refused_backwards(&Plan {
+        logical: vec![
+            p(Change::RenameTable {
+                uid: tid,
+                from: t("a"),
+                to: t("b"),
+                defaults: vec![],
+            }),
+            p(Change::AddColumn {
+                uid: c,
+                table: t("b"),
+                name: "c".into(),
+                column: Box::new(Column::new(int())),
+            }),
+        ],
+        before,
+        after,
+        before_ids,
+        after_ids,
+    });
+}
+
+/// AddColumn: `Creates` of the column's values, which fill the table's rows
+/// a check then validates. (The column itself, as an object, is the
+/// operation's own definition, which no audit can delete.)
+#[test]
+fn a_check_follows_a_new_column_that_fills_the_rows_it_validates() {
+    let mut will = table_with(&["id", "c"]);
+    will.checks.insert(
+        "ck".into(),
+        pbps_model::CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    let mut plan = on_one_table(
+        vec![
+            p(Change::AddColumn {
+                uid: uid(UidKind::Column, "t.c"),
+                table: t("t"),
+                name: "c".into(),
+                column: Box::new(Column::new(int())),
+            }),
+            add_check("t"),
+        ],
+        table_with(&["id"]),
+        will,
+        &["id", "c"],
+    );
+    plan.before_ids.columns.remove(&uid(UidKind::Column, "t.c"));
+    refused_backwards(&plan);
+}
+
+/// AddIndex: `Exists` of the columns it indexes.
+#[test]
+fn an_index_over_a_new_column_follows_the_column() {
+    let mut will = table_with(&["id", "c"]);
+    let (name, index) = one_index("ix", "c");
+    will.indexes.insert(name, index);
+    let mut plan = on_one_table(
+        vec![
+            p(Change::AddColumn {
+                uid: uid(UidKind::Column, "t.c"),
+                table: t("t"),
+                name: "c".into(),
+                column: Box::new(Column::new(int())),
+            }),
+            add_index("t", one_index("ix", "c")),
+        ],
+        table_with(&["id"]),
+        will,
+        &["id", "c"],
+    );
+    plan.before_ids.columns.remove(&uid(UidKind::Column, "t.c"));
+    refused_backwards(&plan);
+}
+
+/// DropColumn: `Absent` of what depends on the column.
+#[test]
+fn a_column_s_drop_follows_the_drop_of_an_index_over_it() {
+    let mut was = table_with(&["id", "c"]);
+    let (name, index) = one_index("ix", "c");
+    was.indexes.insert(name, index);
+    let mut plan = on_one_table(
+        vec![
+            p(Change::DropIndex {
+                table: t("t"),
+                name: "ix".into(),
+            }),
+            p(Change::DropColumn {
+                uid: uid(UidKind::Column, "t.c"),
+                column: t("t").column("c"),
+            }),
+        ],
+        was,
+        table_with(&["id"]),
+        &["id", "c"],
+    );
+    plan.after_ids.columns.remove(&uid(UidKind::Column, "t.c"));
+    refused_backwards(&plan);
+}
+
+/// RenameColumn: `Rewrites` of the column, which a step spelling the new
+/// name follows.
+#[test]
+fn an_index_spelling_a_renamed_column_s_new_name_follows_the_rename() {
+    let mut will = table_with(&["id", "d"]);
+    let (name, index) = one_index("ix", "d");
+    will.indexes.insert(name, index);
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("t"), table_with(&["id", "c"]));
+    after.tables.insert(t("t"), will);
+    let before_ids = Plan::ids(&["t"], &[("t", "id"), ("t", "c")]);
+    let mut after_ids = before_ids.clone();
+    after_ids
+        .columns
+        .insert(uid(UidKind::Column, "t.c"), t("t").column("d"));
+    refused_backwards(&Plan {
+        logical: vec![
+            p(Change::RenameColumn {
+                uid: uid(UidKind::Column, "t.c"),
+                table: t("t"),
+                from: "c".into(),
+                to: "d".into(),
+                table_was: None,
+            }),
+            add_index("t", one_index("ix", "d")),
+        ],
+        before,
+        after,
+        before_ids,
+        after_ids,
+    });
+}
+
+fn retype_c() -> PlannedChange {
+    p(Change::AlterColumnType {
+        uid: uid(UidKind::Column, "t.c"),
+        column: t("t").column("c"),
+        from: int(),
+        to: "bigint".parse().unwrap(),
+        from_nullable: false,
+        to_nullable: false,
+        from_collation: None,
+        to_collation: None,
+        through_external_partitions: false,
+    })
+}
+
+/// AlterColumnType: `Writes` of the column's values, which a check over the
+/// table's rows reads.
+#[test]
+fn a_check_follows_a_retype_that_rewrites_the_values_it_reads() {
+    let mut will = table_with(&["id", "c"]);
+    will.columns.get_mut("c").unwrap().ty = "bigint".parse().unwrap();
+    let mut checked = will.clone();
+    checked.checks.insert(
+        "ck".into(),
+        pbps_model::CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    refused_backwards(&on_one_table(
+        vec![retype_c(), add_check("t")],
+        table_with(&["id", "c"]),
+        checked,
+        &["id", "c"],
+    ));
+}
+
+/// AlterColumnDefault: `Exists` of the column a new default is written for,
+/// which follows the column's retype.
+#[test]
+fn a_new_default_follows_the_retype_of_its_column() {
+    let mut will = table_with(&["id", "c"]);
+    let c = will.columns.get_mut("c").unwrap();
+    c.ty = "bigint".parse().unwrap();
+    c.value_source = pbps_model::ValueSource::Default("0".into());
+    refused_backwards(&on_one_table(
+        vec![
+            retype_c(),
+            p(Change::AlterColumnDefault {
+                uid: uid(UidKind::Column, "t.c"),
+                column: t("t").column("c"),
+                from: None,
+                to: Some("0".into()),
+            }),
+        ],
+        table_with(&["id", "c"]),
+        will,
+        &["id", "c"],
+    ));
+}
+
+/// AddUnique: `Reads` of the table's rows.
+#[test]
+fn a_unique_key_follows_the_rows_it_validates() {
+    let mut will = table_with(&["id", "c"]);
+    will.unique.insert(
+        "u".into(),
+        pbps_model::UniqueConstraint {
+            columns: vec!["c".into()],
+            storage_parameters: Default::default(),
+        },
+    );
+    refused_backwards(&on_one_table(
+        vec![
+            plain_row("t", 1, &[("c", 1)]),
+            p(Change::AddUnique {
+                table: t("t"),
+                name: "u".into(),
+                constraint: will.unique["u"].clone(),
+                clustered: false,
+            }),
+        ],
+        table_with(&["id", "c"]),
+        will,
+        &["id", "c"],
+    ));
+}
+
+/// AddCheck: `Reads` of the table's rows.
+#[test]
+fn a_check_follows_the_rows_it_validates() {
+    let mut will = table_with(&["id"]);
+    will.checks.insert(
+        "ck".into(),
+        pbps_model::CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    refused_backwards(&on_one_table(
+        vec![plain_row("t", 1, &[]), add_check("t")],
+        table_with(&["id"]),
+        will,
+        &["id"],
+    ));
+}
+
+/// AddForeignKey: `Is` of the key it references, as the plan leaves it.
+#[test]
+fn a_foreign_key_follows_the_key_it_references() {
+    let key = pbps_model::PrimaryKey {
+        name: None,
+        columns: vec!["id".into()],
+        storage_parameters: Default::default(),
+    };
+    let mut parent_after = table_with(&["id"]);
+    parent_after.primary_key = Some(key.clone());
+    let mut child_after = table_with(&["id", "pid"]);
+    child_after
+        .foreign_keys
+        .insert("fk".into(), reference(&["pid"], &["id"]));
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.tables.insert(t("p"), table_with(&["id"]));
+    before.tables.insert(t("c"), table_with(&["id", "pid"]));
+    after.tables.insert(t("p"), parent_after);
+    after.tables.insert(t("c"), child_after);
+    let ids = Plan::ids(&["p", "c"], &[("p", "id"), ("c", "id"), ("c", "pid")]);
+    refused_backwards(&Plan {
+        logical: vec![
+            p(Change::SetPrimaryKey {
+                table: t("p"),
+                from: None,
+                to: Some(key),
+                nonclustered: false,
+            }),
+            p(Change::AddForeignKey {
+                table: t("c"),
+                name: "fk".into(),
+                constraint: Box::new(reference(&["pid"], &["id"])),
+            }),
+        ],
+        before,
+        after,
+        before_ids: ids.clone(),
+        after_ids: ids,
+    });
+}
+
+/// DeleteRow: `Is` of the parent's rows released by the deletes of the rows
+/// that reference them.
+#[test]
+fn a_parent_row_s_delete_follows_the_delete_of_its_child_row() {
+    refused_backwards(&parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![delete("c", 5, &[("pid", 1)]), delete("p", 1, &[])],
+    ));
+}
+
+/// AlterModule: `Rewrites` of a module edited in place, which a step that
+/// needs the module as the plan leaves it follows.
+#[test]
+fn a_routine_s_public_execution_follows_its_edit_in_place() {
+    let id: ModuleId = "app.f(integer)".parse().unwrap();
+    let module = |body: &str| Module {
+        kind: ModuleKind::Function,
+        definition: format!(
+            "CREATE FUNCTION app.f(a integer) RETURNS integer AS '{body}' LANGUAGE sql;"
+        ),
+        description: None,
+    };
+    let ModuleId::Routine(routine) = id.clone() else {
+        unreachable!("declared as a routine")
+    };
+    let (mut before, mut after) = (Schema::default(), Schema::default());
+    before.modules.insert(id.clone(), module("SELECT a"));
+    after.modules.insert(id.clone(), module("SELECT a + 1"));
+    refused_backwards(&Plan {
+        logical: vec![
+            p(Change::AlterModule {
+                id,
+                module: Box::new(module("SELECT a + 1")),
+            }),
+            p(Change::PublicExecution {
+                routine,
+                access: pbps_model::PublicAccess::Revoked,
+                origin: pbps_model::RoutineOrigin::Rebuilt,
+            }),
+        ],
+        before,
+        after,
+        before_ids: IdsFile::default(),
+        after_ids: IdsFile::default(),
+    });
+}
+
+/// SetPrimaryKey: `Absent` of the foreign keys into the key it drops. The
+/// child table's drop takes the foreign key with it and, unlike a
+/// `DropForeignKey`, names no requirement of its own on the key.
+#[test]
+fn a_primary_key_s_drop_follows_the_drop_of_the_table_whose_key_references_it() {
+    let mut plan = parent_and_child(
+        &["id"],
+        &[],
+        &["id", "pid"],
+        reference(&["pid"], &["id"]),
+        vec![
+            p(Change::DropTable {
+                uid: uid(UidKind::Table, "c"),
+                name: t("c"),
+                detach_from: None,
+            }),
+            p(Change::SetPrimaryKey {
+                table: t("p"),
+                from: Some(pbps_model::PrimaryKey {
+                    name: None,
+                    columns: vec!["id".into()],
+                    storage_parameters: Default::default(),
+                }),
+                to: None,
+                nonclustered: false,
+            }),
+        ],
+    );
+    plan.after.tables.remove(&t("c"));
+    plan.after.tables.get_mut(&t("p")).unwrap().primary_key = None;
+    plan.after_ids = Plan::ids(&["p"], &[("p", "id")]);
+    refused_backwards(&plan);
+}
+
+/// DropComputedColumn: `Absent` of what reads the computed column.
+#[test]
+fn a_computed_column_s_drop_follows_the_drop_of_an_index_over_it() {
+    let computed = pbps_model::ComputedColumn {
+        expression: "id * 2".into(),
+        persisted: true,
+        not_null: false,
+    };
+    let mut was = table_with(&["id"]);
+    was.computed.insert("cc".into(), computed.clone());
+    let (name, index) = one_index("ix", "cc");
+    was.indexes.insert(name, index);
+    refused_backwards(&on_one_table(
+        vec![
+            p(Change::DropIndex {
+                table: t("t"),
+                name: "ix".into(),
+            }),
+            p(Change::DropComputedColumn {
+                table: t("t"),
+                name: "cc".into(),
+                computed,
+            }),
+        ],
+        was,
+        table_with(&["id"]),
+        &["id"],
+    ));
+}

@@ -742,25 +742,137 @@ pub fn verdict(scenario: &Scenario, found: Checked) -> Option<String> {
     (!wrong.is_empty()).then(|| wrong.join("\n"))
 }
 
+/// Whether the suite runs as an audit: every pair of each scenario's plan the
+/// effects call independent, not only the listed one (#2091). An effect
+/// deleted or never written makes pairs independent that are not, and the
+/// listed pair is rarely one of them; the audit swaps them all, on the
+/// engine. It costs a database per pair, so it is a manual or nightly run,
+/// outside the merge group's cap.
+pub fn audits() -> bool {
+    std::env::var_os("PBPS_COMMUTE_ALL").is_some()
+}
+
+/// Every pair of `scenario`'s plan the effects call independent, swapped and
+/// run against the plan's own order: how many ran, and one line for each
+/// that ended otherwise. The scenario's listed gap pair is left out, since
+/// the sample already holds it to showing.
+pub async fn audit<E: Engine>(engine: &E, scenario: &Scenario, role: &str) -> (usize, Vec<String>) {
+    let dialect = engine.dialect();
+    let p = prepare(engine.name(), dialect, scenario, role);
+    let sides = (
+        pbps_diff::Side {
+            schema: &p.base.schema,
+            ids: &p.base_ids,
+        },
+        pbps_diff::Side {
+            schema: &p.desired.schema,
+            ids: &p.ids,
+        },
+    );
+    let declared = &p.desired.hints.module_deps;
+    let name = scenario.name;
+    let read = match commute::read(sides.0, sides.1, dialect, declared, &p.changes, None) {
+        Ok(read) => read,
+        Err(e) => return (0, vec![format!("{name}: the effects cannot be read: {e}")]),
+    };
+    let n = p.changes.changes.len();
+    let tag = |t: &str| format!("cx_{t}_{}", name.chars().take(28).collect::<String>());
+    let own: Vec<usize> = (0..n).collect();
+    let a = match outcome_of(
+        engine,
+        &tag("a"),
+        &p,
+        &p.creation,
+        &p.changes,
+        &own,
+        &p.ids,
+        true,
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(f) => return (0, vec![format!("{name}: the plan's own order: {f:?}")]),
+    };
+    let listed = |i: usize, j: usize| {
+        scenario.gap.is_some()
+            && [i, j].iter().any(|&x| p.kinds[x] == scenario.pair[0])
+            && [i, j].iter().any(|&x| p.kinds[x] == scenario.pair[1])
+    };
+    let (mut ran, mut found) = (0, Vec::new());
+    for earlier in 0..n {
+        for later in earlier + 1..n {
+            if listed(earlier, later) {
+                continue;
+            }
+            let Some(swapped) = commute::swapped(&read.report.graph, n, earlier, later) else {
+                continue;
+            };
+            ran += 1;
+            let what = format!(
+                "{name}: {} #{earlier} and {} #{later} swapped",
+                p.kinds[earlier], p.kinds[later]
+            );
+            let ended = outcome_of(
+                engine,
+                &tag("b"),
+                &p,
+                &p.creation,
+                &p.changes,
+                &swapped,
+                &p.ids,
+                false,
+            )
+            .await
+            .and_then(|b| same(&what, &a, &b));
+            if let Err(f) = ended {
+                found.push(format!("{what}: {f:?}"));
+            }
+        }
+    }
+    (ran, found)
+}
+
 /// Runs the whole sample and fails with every scenario that is wrong: a pair
 /// that does not commute, a stale pair, and a listed gap that no longer
-/// shows.
-pub async fn suite<E: Engine>(engine: &E, scenarios: &[Scenario], role: &str) {
+/// shows. As an audit ([`audits`]) it swaps every independent pair instead,
+/// in the sample and in `held`, and fails with each one that ends otherwise.
+///
+/// `held` are plans that hold a dependency an effect states, one per effect
+/// the engine can show (#2091): with the effect deleted, the audit swaps the
+/// pair it ordered and the engine refuses or ends otherwise. They run only
+/// in the audit, so they cost the merge group nothing and the cap does not
+/// count them.
+pub async fn suite<E: Engine>(engine: &E, scenarios: &[Scenario], held: &[Scenario], role: &str) {
     assert!(
         scenarios.len() <= CAP,
         "the sample is capped at {CAP} pairs"
     );
     let started = std::time::Instant::now();
-    let mut failures = Vec::new();
-    for scenario in scenarios {
-        if let Some(failure) = verdict(scenario, check(engine, scenario, role).await) {
+    let (mut swaps, mut failures) = (0, Vec::new());
+    let all: Vec<&Scenario> = if audits() {
+        scenarios.iter().chain(held).collect()
+    } else {
+        scenarios.iter().collect()
+    };
+    for scenario in all {
+        if audits() {
+            let (ran, found) = audit(engine, scenario, role).await;
+            swaps += ran;
+            failures.extend(found);
+        } else if let Some(failure) = verdict(scenario, check(engine, scenario, role).await) {
             failures.push(failure);
         }
     }
     eprintln!(
-        "commutation suite ({}): {} pairs in {:.1}s",
+        "commutation {} ({}): {} scenarios, {} swapped pairs, in {:.1}s",
+        if audits() { "audit" } else { "suite" },
         engine.name(),
-        scenarios.len(),
+        if audits() {
+            scenarios.len() + held.len()
+        } else {
+            scenarios.len()
+        },
+        if audits() { swaps } else { scenarios.len() },
         started.elapsed().as_secs_f64()
     );
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
