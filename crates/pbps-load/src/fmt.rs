@@ -479,12 +479,9 @@ fn value(v: &pbps_model::Value) -> String {
 
 /// Renders one module as canonical YAML (ADR-0002).
 ///
-/// The definition goes out as a literal block scalar (`|`), which is the only
-/// YAML form that keeps SQL exactly as written: no escaping, no line joining,
-/// and the round trip is byte-for-byte. A definition with trailing whitespace
-/// or no final newline would come back subtly different, so the block is
-/// written with `|-` and the text normalized to it — which is `fmt`'s job
-/// anyway, and never changes what the SQL means.
+/// Definitions normally use a literal block scalar (`|-`). Characters that
+/// cannot stay literal use the ordinary double-quoted escapes instead, keeping
+/// the complete definition intact rather than normalizing its whitespace.
 ///
 /// `depends_on` is persistent, like `strategy:`: it is an answer about this
 /// project that stays true, so rewriting the file must not lose it. So is
@@ -529,6 +526,18 @@ pub fn render_module(
     // every view and trigger file in the project, where the loader refuses it.
     if public_execute {
         let _ = writeln!(s, "public_execute: true");
+    }
+
+    // Quotes and backslashes need no escaping in a literal block, and tabs
+    // and LF keep their meaning there. Every other escape follows the shared
+    // scalar policy: literal controls can invalidate YAML or change on reload.
+    if module
+        .definition
+        .chars()
+        .any(|c| needs_escape(c) && !matches!(c, '\t' | '\n' | '\\' | '"'))
+    {
+        let _ = writeln!(s, "\ndefinition: {}", quoted(&module.definition));
+        return s;
     }
 
     s.push_str("\ndefinition: |-\n");
@@ -879,6 +888,64 @@ mod tests {
         let back = crate::load_module_str(Path::new("dbo.v.yml"), &out)
             .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}"));
         assert_eq!(back.module.definition, module.definition);
+    }
+
+    #[test]
+    fn module_definitions_escape_controls_without_changing_their_text() {
+        let controls = (0..=0x1f)
+            .chain(0x7f..=0x9f)
+            .map(|c| char::from_u32(c).unwrap())
+            .filter(|c| !matches!(c, '\t' | '\n'))
+            .chain(['\u{2028}', '\u{2029}', '\u{feff}', '\u{fffe}', '\u{ffff}']);
+        for c in controls {
+            for definition in [
+                format!("SELECT 'before{c}after' AS note"),
+                format!("{c}SELECT 1"),
+                format!("SELECT 1{c}"),
+                format!("\nSELECT 'first  \n{c}\"second\\last' AS note\r\n \t\n"),
+            ] {
+                for header in [
+                    "view: dbo.v",
+                    "function: dbo.f",
+                    "procedure: dbo.p",
+                    "trigger: dbo.trg\non: dbo.t",
+                ] {
+                    let out = module_round_trip(&format!(
+                        "{header}\ndefinition: {}\n",
+                        quoted(&definition)
+                    ));
+                    assert!(out.contains("\ndefinition: \""), "{c:?}: {out:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_module_definitions_keep_their_literal_block_bytes() {
+        for (definition, block) in [
+            ("SELECT 1", "  SELECT 1\n"),
+            (
+                "SELECT 'first  \nsecond' AS note\n\nFROM dbo.t",
+                "  SELECT 'first  \n  second' AS note\n\n  FROM dbo.t\n",
+            ),
+            ("BEGIN\n\tSELECT 1;\nEND", "  BEGIN\n  \tSELECT 1;\n  END\n"),
+            (
+                "SELECT 'quoted: #value', \"a\\b\" -- comment",
+                "  SELECT 'quoted: #value', \"a\\b\" -- comment\n",
+            ),
+            ("SELECT '繁體中文 é 😀'", "  SELECT '繁體中文 é 😀'\n"),
+        ] {
+            for header in [
+                "view: dbo.v",
+                "function: dbo.f",
+                "procedure: dbo.p",
+                "trigger: dbo.trg\non: dbo.t",
+            ] {
+                let out =
+                    module_round_trip(&format!("{header}\ndefinition: {}\n", quoted(definition)));
+                assert_eq!(out, format!("{header}\n\ndefinition: |-\n{block}"));
+            }
+        }
     }
 
     fn round_trip(yaml: &str) {
