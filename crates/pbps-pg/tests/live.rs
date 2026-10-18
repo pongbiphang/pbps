@@ -18749,6 +18749,18 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
             "CREATE TRIGGER audit BEFORE INSERT ON {s}.scratch FOR EACH ROW EXECUTE FUNCTION \
              {s}.tg()"
         ),
+        // PR B reads RLS metadata but keeps adoption out until PR C. Neither
+        // FORCE by itself nor a policy with both flags off can admit a trigger.
+        format!("CREATE TABLE {s}.forced_scratch (id int)"),
+        format!("ALTER TABLE {s}.forced_scratch FORCE ROW LEVEL SECURITY"),
+        format!(
+            "CREATE TRIGGER audit BEFORE INSERT ON {s}.forced_scratch FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
+        ),
+        format!("CREATE TABLE {s}.dormant_scratch (id int)"),
+        format!("CREATE POLICY bare ON {s}.dormant_scratch"),
+        format!(
+            "CREATE TRIGGER audit BEFORE INSERT ON {s}.dormant_scratch FOR EACH ROW EXECUTE FUNCTION {s}.tg()"
+        ),
         // A view an extension owns is left out of the pull (DECISIONS 305); a
         // user's trigger on it is not extension-owned — measured — and has to
         // go with the view. An extension is database-global, and a run that
@@ -18799,6 +18811,8 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
     assert_eq!(
         inventory,
         [
+            format!("{s}.dormant_scratch.audit"),
+            format!("{s}.forced_scratch.audit"),
             format!("{s}.part.audit"),
             format!("{s}.pg_buffercache.user_tg"),
             format!("{s}.scratch.audit"),
@@ -18842,6 +18856,10 @@ async fn a_trigger_on_a_relation_the_pull_leaves_out_is_left_out_with_it_and_nam
         "part.audit",
         "scratch",
         "scratch.audit",
+        "forced_scratch",
+        "forced_scratch.audit",
+        "dormant_scratch",
+        "dormant_scratch.audit",
         "pg_buffercache.user_tg",
         "theirs.user_tg",
     ] {

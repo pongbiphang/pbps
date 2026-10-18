@@ -6825,9 +6825,10 @@ PR A represents and formats this state but does not execute it. Until the
 later PRs of #1172 supply planning, the common differ refuses either input
 with flags or policies, and saved-plan validation refuses every operation
 carrying such a table shape (create, attach or detach). Both refusals name
-that delivery boundary. Catalog exclusions remain until PR B. Declared
-expression tracking, create-only change kinds, emission, dependent refusals
-and filtered-probe wrapping belong to PR C.
+that delivery boundary. PR B reads the metadata while keeping adoption
+excluded until PR C (DEC-1172.4). Declared expression tracking, create-only
+change kinds, emission, dependent refusals and filtered-probe wrapping belong
+to PR C.
 
 <a id="dec-2104-1"></a>
 

@@ -901,3 +901,27 @@ was left out wrongly, and the live test fails.
 Pinned by the unit `a_computed_column_or_filter_reading_a_left_out_column_goes_with_it`
 and the live test of the same name, which lays a computed column's id over a
 filtered index's.
+
+<a id="dec-1172-4"></a>
+
+**DEC-1172.4. Read row-security metadata before adopting its tables.** PR A
+represents RLS but refuses planning it until PR C can reconstruct it. Adopting
+an existing RLS table in PR B would therefore refuse every plan over that
+baseline, including changes to unrelated ordinary tables. The catalog batch
+reads the independent enable/force flags and every policy, including policies
+on a disabled table, but the assembler leaves those tables out before building
+identity lookups. Their triggers stay out with them, and both are named as
+limitations. RLS on any partition-tree member still leaves the whole tree out.
+PR C removes the temporary adoption boundary when its planning is available.
+
+The policy part reads `pg_policy` directly, in the same statement snapshot and
+under the empty search path. Missing or unreadable metadata fails the read;
+NULL predicates stay distinct from present text. PUBLIC is OID zero, never a
+role name. The preceding ordinary-table predicate already queried `pg_policy`:
+measured on PostgreSQL 16.15 and 18.6, revoking its SELECT grant failed with
+`42501`, while `pg_policies` continued to answer. The table-level privilege
+requirement is unchanged. A role granted only `SELECT(polrelid)` could run the
+old predicate and policy count, but needs the other policy columns for this
+complete read; without them the batch fails with `42501` rather than claiming
+an empty policy set. Neither the display view nor the table's enable flag can
+stand in for a complete policy read.

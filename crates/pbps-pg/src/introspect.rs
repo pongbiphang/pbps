@@ -80,6 +80,8 @@ pub use pbps_db::catalog::{Limitation, LimitationTarget, Pulled, Unexpressible, 
 /// One ordinary table, as `pg_class` has it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawTable {
+    /// Independent flags, including FORCE while disabled (#1172).
+    pub row_security: pbps_model::RowSecurity,
     pub oid: i64,
     pub schema: String,
     pub name: String,
@@ -104,6 +106,14 @@ pub struct RawTable {
     /// A partition's parent, by oid, and its bound as `pg_get_expr` deparses
     /// it under the canonical session (#1170).
     pub partition_of: Option<(i64, String)>,
+}
+
+/// A table-local policy; PUBLIC and absent predicates retain their own shapes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawPolicy {
+    pub table_oid: i64,
+    pub name: String,
+    pub policy: pbps_model::RowPolicy,
 }
 
 /// One module, with the text this engine deparses for it.
@@ -337,6 +347,7 @@ pub struct RawIndex {
 /// Everything one pull read, before any of it is interpreted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawCatalog {
+    pub row_policies: Vec<RawPolicy>,
     pub tables: Vec<RawTable>,
     pub columns: Vec<RawColumn>,
     pub constraints: Vec<RawConstraint>,
@@ -714,6 +725,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     };
 
     let columns_by_table = group(&raw.columns, |c| c.table_oid);
+    let policies_by_table = group(&raw.row_policies, |p| p.table_oid);
 
     // Which tables can be recorded at all, decided **before** anything is built
     // that names one. A table left out for a name the declaration cannot write
@@ -729,6 +741,28 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         .iter()
         .filter(|t| {
             let name = TableName::new(&t.schema, &t.name);
+            // Reading RLS must not adopt a table the differ still refuses:
+            // that would block unrelated plans until PR C (DEC-1172.4).
+            // Refuse before building lookups, so no foreign key can retain it.
+            if !t.row_security.is_default() || policies_by_table.contains_key(&t.oid) {
+                let state = if t.row_security.enabled {
+                    "row-level security enabled"
+                } else if t.row_security.forced {
+                    "FORCE ROW LEVEL SECURITY"
+                } else {
+                    "row-level security policies that are not in force"
+                };
+                note(
+                    &mut pulled,
+                    &name,
+                    format!(
+                        "{} has {state}. Its row-security metadata was read, but adoption and RLS \
+                     planning arrive with #1172's later PRs. It is left out of the pull entirely.",
+                        name.shown()
+                    ),
+                );
+                return true;
+            }
             let columns = columns_by_table.get(&t.oid).map_or(&[][..], Vec::as_slice);
             match a_name_the_declaration_cannot_write(&name, columns) {
                 Some(detail) => {
@@ -3835,6 +3869,7 @@ mod tests {
                 reloptions: Vec::new(),
                 toast_reloptions: Vec::new(),
                 unlogged: false,
+                row_security: Default::default(),
                 partition_key: None,
                 partition_of: None,
                 partition_strategy: Default::default(),
@@ -4934,6 +4969,7 @@ mod tests {
                 reloptions: Vec::new(),
                 toast_reloptions: Vec::new(),
                 unlogged: false,
+                row_security: Default::default(),
                 partition_key: None,
                 partition_of: None,
                 partition_strategy: Default::default(),
@@ -5245,6 +5281,76 @@ mod tests {
     }
     use super::*;
 
+    #[test]
+    fn row_security_tables_stay_out_of_adoption_even_with_both_flags_off() {
+        let mut enabled = table(1, "enabled");
+        enabled.row_security.enabled = true;
+        let mut forced = table(2, "forced");
+        forced.row_security.forced = true;
+        let raw = RawCatalog {
+            tables: vec![enabled, forced, table(3, "disabled"), table(4, "ordinary")],
+            columns: (1..=4).map(|oid| col(oid, 1, "id", "integer")).collect(),
+            row_policies: vec![RawPolicy {
+                table_oid: 3,
+                name: "bare".into(),
+                policy: Default::default(),
+            }],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(
+            pulled.schema.tables.keys().cloned().collect::<Vec<_>>(),
+            vec![TableName::new("app", "ordinary")]
+        );
+        assert_eq!(pulled.limitations.len(), 3, "{:?}", pulled.limitations);
+        for name in ["enabled", "forced", "disabled"] {
+            let detail = &pulled
+                .limitations
+                .iter()
+                .find(|l| l.target == LimitationTarget::Relation(TableName::new("app", name)))
+                .unwrap()
+                .detail;
+            assert!(detail.contains("#1172's later PRs"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn row_security_refusal_precedes_foreign_key_target_lookup() {
+        let mut fk = constraint(1, "c_fk", 'f');
+        fk.columns = vec![1];
+        fk.ref_columns = vec![1];
+        fk.ref_table = Some(2);
+        let raw = RawCatalog {
+            tables: vec![table(1, "c"), table(2, "secured")],
+            columns: vec![col(1, 1, "id", "integer"), col(2, 1, "id", "integer")],
+            constraints: vec![fk],
+            row_policies: vec![RawPolicy {
+                table_oid: 2,
+                name: "bare".into(),
+                policy: Default::default(),
+            }],
+            ..RawCatalog::default()
+        };
+        let pulled = assemble(&raw);
+        assert_eq!(pulled.schema.tables.len(), 1);
+        assert!(
+            pulled.schema.tables[&TableName::new("app", "c")]
+                .foreign_keys
+                .is_empty()
+        );
+        assert!(pulled.warnings.iter().any(|w| w.contains("c_fk")));
+        // The same key retains an ordinary target.
+        let mut ordinary = raw;
+        ordinary.row_policies.clear();
+        assert_eq!(assemble(&ordinary).schema.tables.len(), 2);
+        assert_eq!(
+            assemble(&ordinary).schema.tables[&TableName::new("app", "c")]
+                .foreign_keys
+                .len(),
+            1
+        );
+    }
+
     fn table(oid: i64, name: &str) -> RawTable {
         RawTable {
             oid,
@@ -5255,6 +5361,7 @@ mod tests {
             reloptions: Vec::new(),
             toast_reloptions: Vec::new(),
             unlogged: false,
+            row_security: Default::default(),
             partition_key: None,
             partition_of: None,
             partition_strategy: Default::default(),
