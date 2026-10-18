@@ -194,8 +194,8 @@ pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
     }
 }
 
-/// Takes out the temporary CHECK a staged attach left on its table, before
-/// `baseline` takes the database as it stands (#1638, DEC-1638.1).
+/// The temporary CHECKs a staged attach left on its tables, which `baseline`
+/// takes out before it takes the database as it stands (#1638, DEC-1638.1).
 ///
 /// Only under the exact name a table's identity in the project's ids file
 /// gives: never by a prefix. Not from the ledger: `baseline` is the remedy
@@ -204,25 +204,34 @@ pub async fn is_initialized(conn: &mut Conn) -> Result<bool, DbError> {
 /// entry's kind or ids can be asked first. No declared constraint can hold
 /// the name, the database cannot be read while a `NOT VALID` one stands, and
 /// a validated one is pbps's own. SQL Server's staged plans write none.
-/// Returns each removed, named, for the record.
-pub async fn remove_scan_checks(
+pub async fn standing_scan_checks(
     conn: &mut Conn,
     ids: &pbps_model::IdsFile,
+) -> anyhow::Result<Vec<pbps_dialect::ScanCheck>> {
+    Ok(match conn.driver() {
+        Driver::Mssql => Vec::new(),
+        Driver::Postgres => pbps_pg::staged::standing_scan_checks(conn, &ids.tables).await?,
+    })
+}
+
+/// Drops `checks`, inside the transaction `baseline` records in (#2127), and
+/// names each for the record.
+pub async fn drop_scan_checks(
+    conn: &mut Conn,
+    checks: &[pbps_dialect::ScanCheck],
 ) -> anyhow::Result<Vec<String>> {
-    let removed = match conn.driver() {
-        Driver::Mssql => return Ok(Vec::new()),
-        Driver::Postgres => pbps_pg::staged::remove_scan_checks(conn, &ids.tables).await?,
-    };
-    Ok(removed
-        .into_iter()
+    if checks.is_empty() {
+        return Ok(Vec::new());
+    }
+    pbps_pg::staged::drop_scan_checks(conn, checks).await?;
+    Ok(checks
+        .iter()
         .map(|check| {
-            let said = format!(
+            format!(
                 "the staged attach's temporary CHECK `{}` on `{}`",
                 check.name,
                 check.table.raw()
-            );
-            println!("Removed {}.", pbps_model::escape::Escaped(&said));
-            said
+            )
         })
         .collect())
 }
