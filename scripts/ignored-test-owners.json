@@ -664,6 +664,7 @@
         "rename_order_pg::saved_rename_dependencies_apply_and_record_only_surviving_objects",
         "resolver_selection_is_lazy_and_obeys_cli_environment_project_precedence",
         "routine_rebuilds_do_not_restore_revoked_public_execute",
+        "row_security_left_out_of_adoption_does_not_block_an_ordinary_plan",
         "staged_and_resumed_writes_pin_the_session_before_the_next_statement",
         "the_cli_ledger_preserves_history_and_distinguishes_absent_empty_and_unreadable",
         "the_cli_probe_counts_real_null_rows_before_any_statement_and_then_accepts_clean_data",
@@ -1160,6 +1161,7 @@
       "cases": [
         "catalog::tests::a_failed_canonical_permission_query_restores_both_transaction_scopes",
         "catalog::tests::partition_membership_is_scoped_and_shared_by_the_catalog_parts",
+        "catalog::tests::row_security_is_read_coherently_but_adoption_waits_for_planning",
         "catalog::tests::the_canonical_scope_reads_without_jit_and_hands_back_the_sessions_own",
         "preflight::tests::probe_intermediates_stay_wide_until_the_final_clamp",
         "resolver::binding_tests::a_body_compiled_before_a_same_named_candidate_is_unresolved",

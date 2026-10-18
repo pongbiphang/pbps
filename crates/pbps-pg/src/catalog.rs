@@ -40,7 +40,8 @@ pub use pbps_db::catalog::Spellings;
 use crate::introspect::{
     GrantedKind, Limitation, LimitationTarget, Pulled, RawCatalog, RawColumn, RawConstraint,
     RawDefaultAcl, RawEmptyRoutineAcl, RawGrant, RawIdentity, RawIndex, RawModule, RawModuleArg,
-    RawOtherGrant, RawOwner, RawRole, RawSerial, RawSharedDependency, RawTable, assemble,
+    RawOtherGrant, RawOwner, RawPolicy, RawRole, RawSerial, RawSharedDependency, RawTable,
+    assemble,
 };
 
 /// The emitter quotes both parts of every table name. PostgreSQL compares
@@ -119,14 +120,8 @@ fn not_one_of_our_tables() -> String {
     format!("(c.relkind <> 'r' OR {})", not_one_of_ours())
 }
 
-/// `relkind = 'r'`, and the filter is the whole point: `pg_attribute` holds a
-/// row for every index and sequence column too, so a reader without it reports
-/// `child_id_seq` and `child_pk` as tables with columns.
-///
-/// A partitioned table (`p`) is deliberately not here. It is a table the model
-/// cannot hold — the partition key has nowhere to go — and pulling it as an
-/// ordinary one would produce a plan that recreates it without its partitions.
-/// It is reported by [`PARTITIONED`] instead.
+/// Structurally representable tables, including RLS metadata not yet adopted
+/// until PR C (DEC-1172.4), and every member of a supported partition tree.
 fn tables_query() -> String {
     let not_one_of_ours = not_one_of_ours();
     let not_an_extensions = not_an_extensions("c.oid", "pg_class");
@@ -157,6 +152,8 @@ fn tables_query() -> String {
             COALESCE((SELECT x.indexrelid::int8 FROM pg_catalog.pg_index x
                        WHERE x.indrelid = c.oid AND x.indisreplident), 0) AS identity_index,
             c.relpersistence::text AS persistence,
+            c.relrowsecurity AS row_security,
+            c.relforcerowsecurity AS force_row_security,
             COALESCE(c.reloptions, '{{}}'::text[]) AS reloptions,
             COALESCE((SELECT tc.reloptions FROM pg_catalog.pg_class tc
                        WHERE tc.oid = c.reltoastrelid), '{{}}'::text[]) AS toast_reloptions
@@ -227,11 +224,9 @@ fn partition_tree(root: &str) -> String {
     };
     let plain = |rel: &str| {
         format!(
-            "NOT {rel}.relrowsecurity AND NOT {rel}.relforcerowsecurity
-             AND NOT {rel}.relhasrules AND {rel}.reloftype = 0
-             AND {rel}.relreplident = 'd'
-             AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol
-                              WHERE pol.polrelid = {rel}.oid)"
+            "{} AND NOT {rel}.relhasrules AND {rel}.reloftype = 0
+             AND {rel}.relreplident = 'd'",
+            no_row_security(rel)
         )
     };
     // A partition's persistence and storage parameters are its own (#1580),
@@ -359,18 +354,13 @@ macro_rules! identity_names_no_index {
 }
 const IDENTITY_NAMES_NO_INDEX: &str = identity_names_no_index!();
 
-/// What makes a `pg_class` row `c` a table this model holds: the predicate of
-/// [`tables_query`], as one string, so that the one other reader that has to
-/// agree with it — the trigger arm of [`modules_query`], and its complement in
-/// [`unheld_modules_query`] — cannot drift from it. Each flag is the negation
-/// of a case [`partitioned_query`] names.
+/// The structural ordinary-table shape. RLS is represented in the raw read;
+/// [`adoptable_ordinary_table`] keeps adoption and trigger selection narrower
+/// until reconstruction and planning arrive (DEC-1172.4).
 const ORDINARY_TABLE: &str = concat!(
     "c.relkind = 'r'
         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
                          WHERE i.inhrelid = c.oid OR i.inhparent = c.oid)
-        AND NOT c.relrowsecurity
-        AND NOT c.relforcerowsecurity
-        AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy p WHERE p.polrelid = c.oid)
         AND c.relpersistence IN ('p', 'u')
         AND NOT ",
     identity_names_no_index!(),
@@ -379,6 +369,20 @@ const ORDINARY_TABLE: &str = concat!(
         AND c.reloftype = 0
         AND c.relam = (SELECT am.oid FROM pg_catalog.pg_am am WHERE am.amname = 'heap')"
 );
+
+/// The same RLS boundary for ordinary-table adoption and each partition-tree
+/// member. A disabled policy is still state; checking only the flags loses it.
+fn no_row_security(rel: &str) -> String {
+    format!(
+        "NOT {rel}.relrowsecurity AND NOT {rel}.relforcerowsecurity
+         AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_policy pol
+                          WHERE pol.polrelid = {rel}.oid)"
+    )
+}
+
+fn adoptable_ordinary_table() -> String {
+    format!("({ORDINARY_TABLE} AND {})", no_row_security("c"))
+}
 
 /// `pg_get_viewdef` omits these options. Only the two boolean options set to
 /// false have the behavior a plain declaration recreates; check options and
@@ -417,10 +421,11 @@ fn on_a_relation_the_pull_holds() -> String {
     // And a table of a partition tree the pull holds, its parent or one of
     // its partitions (#1632).
     let tree = partition_tree_table();
+    let ordinary = adoptable_ordinary_table();
     format!(
         "({not_an_extensions}
           AND ((c.relkind = 'v' AND {DEFAULT_VIEW_OPTIONS})
-               OR (({ORDINARY_TABLE} OR {tree}) AND {not_one_of_ours})))"
+               OR (({ordinary} OR {tree}) AND {not_one_of_ours})))"
     )
 }
 
@@ -644,10 +649,7 @@ fn partitioned_query() -> String {
     let held_tree = partition_tree_table();
     format!(
         "SELECT n.nspname AS schema_name, c.relname AS table_name, c.relkind::text AS kind,
-            c.relrowsecurity AS row_security, c.relpersistence::text AS persistence,
-            c.relforcerowsecurity AS force_row_security,
-            (SELECT pg_catalog.count(*) FROM pg_catalog.pg_policy p
-              WHERE p.polrelid = c.oid)::int8 AS policies,
+            c.relpersistence::text AS persistence,
             {IDENTITY_NAMES_NO_INDEX} AS identity_names_no_index,
             c.relhasrules AS has_rules, am.amname AS access_method,
             c.reloftype::regtype::text AS of_type,
@@ -665,10 +667,6 @@ fn partitioned_query() -> String {
              OR (c.relkind = 'r'
                  AND (EXISTS (SELECT 1 FROM pg_catalog.pg_inherits i
                                WHERE i.inhrelid = c.oid OR i.inhparent = c.oid)
-                      OR c.relrowsecurity
-                      OR c.relforcerowsecurity
-                      OR EXISTS (SELECT 1 FROM pg_catalog.pg_policy p
-                                  WHERE p.polrelid = c.oid)
                       OR c.relpersistence NOT IN ('p', 'u')
                       OR {IDENTITY_NAMES_NO_INDEX}
                       OR c.relhasrules
@@ -1173,7 +1171,8 @@ fn batch_query() -> String {
     // itself would reorder columns and routine arguments (pinned live).
     let parts = [
         ("partitioned", partitioned_query(), "schema_name, table_name"),
-        ("tables", tables_query(), "schema_name, table_name"),
+        ("tables", "SELECT * FROM pbps_read_tables".to_owned(), "schema_name, table_name"),
+        ("policies", policies_query().to_owned(), "table_oid, policy_name"),
         ("columns", columns_query(), "table_oid, attnum"),
         ("constraints", constraints_query(), "table_oid, name"),
         ("indexes", indexes_query(), "table_oid, name"),
@@ -1196,7 +1195,62 @@ fn batch_query() -> String {
     ))
     .collect::<Vec<_>>()
     .join(" UNION ALL ");
-    format!("WITH {} {parts}", partition_tables_cte())
+    format!(
+        "WITH {}, pbps_read_tables AS ({}) {parts}",
+        partition_tables_cte(),
+        tables_query()
+    )
+}
+
+/// Direct catalog access is deliberate: pg_policies can still answer after
+/// pg_policy SELECT was revoked. An unreadable part must fail the whole batch.
+/// `oid[]` becomes JSON strings; `int8[]` keeps the role OIDs numeric.
+fn policies_query() -> &'static str {
+    "SELECT p.polrelid::int8 AS table_oid, p.polname::text AS policy_name,
+            p.polcmd::text AS command, p.polpermissive AS permissive,
+            p.polroles::int8[] AS role_oids,
+            ARRAY(SELECT r.rolname::text
+                    FROM pg_catalog.unnest(p.polroles) WITH ORDINALITY AS targets(oid, pos)
+                    LEFT JOIN pg_catalog.pg_roles r ON r.oid = targets.oid
+                   ORDER BY targets.pos) AS role_names,
+            p.polqual IS NOT NULL AS has_using,
+            pg_catalog.pg_get_expr(p.polqual, p.polrelid) AS using_expression,
+            p.polwithcheck IS NOT NULL AS has_check,
+            pg_catalog.pg_get_expr(p.polwithcheck, p.polrelid) AS check_expression
+       FROM pg_catalog.pg_policy p JOIN pbps_read_tables t ON t.oid = p.polrelid::int8"
+}
+
+fn policy_roles(row: &serde_json::Value) -> Result<pbps_model::PolicyRoles, DbError> {
+    let bad = || {
+        DbError::BadRow("policy role OIDs and names are empty, unreadable or inconsistent".into())
+    };
+    let oids = row
+        .get("role_oids")
+        .ok_or_else(|| missing("role_oids"))?
+        .as_array()
+        .ok_or_else(bad)?;
+    let names = row
+        .get("role_names")
+        .ok_or_else(|| missing("role_names"))?
+        .as_array()
+        .ok_or_else(bad)?;
+    if oids.is_empty() || oids.len() != names.len() {
+        return Err(bad());
+    }
+    if oids.len() == 1 && oids[0].as_u64() == Some(0) && names[0].is_null() {
+        return Ok(pbps_model::PolicyRoles::Public);
+    }
+    let roles = oids
+        .iter()
+        .zip(names)
+        .map(|(oid, name)| {
+            if oid.as_u64().is_none_or(|oid| oid == 0) {
+                return Err(bad());
+            }
+            name.as_str().map(str::to_owned).ok_or_else(bad)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(pbps_model::PolicyRoles::Roles(roles))
 }
 
 async fn read_batch(conn: &mut Conn) -> Result<CatalogBatch, DbError> {
@@ -1245,26 +1299,6 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
                  parent's trigger in another mode"
             }
             "f" => "a foreign table",
-            "r" if flag(row, "row_security")? => {
-                "a table with row-level security enabled, whose policies this model does not hold"
-            }
-            // `FORCE` makes the policies apply to the table's owner too, and
-            // it is a separate flag: measured, a table can carry it with row
-            // level security not enabled at all.
-            "r" if flag(row, "force_row_security")? => {
-                "a table with `FORCE ROW LEVEL SECURITY`, which decides whether its own owner is \
-                 subject to the policies"
-            }
-            // Policies with the switch off. They do nothing today, and that is
-            // the trap: a rebuild drops them, and whoever turns row-level
-            // security on afterwards gets a table with no policies — open,
-            // where this one was about to be closed.
-            "r" if number(row, "policies")? > 0 => {
-                "a table with row-level security policies that are not in force, which this model \
-                 does not hold. They do nothing while the switch is off, so a rebuild would drop \
-                 them silently and enabling row-level security afterwards would leave the table \
-                 open"
-            }
             "r" if text(row, "persistence")? == "t" => "a temporary table",
             // Every replica identity is declared (#1444) but one that names
             // an index which is gone: see `IDENTITY_NAMES_NO_INDEX`.
@@ -1317,6 +1351,10 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             oid: number(row, "oid")?,
             schema: text(row, "schema_name")?,
             name: text(row, "table_name")?,
+            row_security: pbps_model::RowSecurity {
+                enabled: flag(row, "row_security")?,
+                forced: flag(row, "force_row_security")?,
+            },
             replica_identity: first_char(&text(row, "replica_identity")?).unwrap_or(' '),
             identity_index: {
                 let oid = number(row, "identity_index")?;
@@ -1343,6 +1381,49 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
                 Some(bound) => Some((number(row, "partition_parent")?, bound)),
                 None => None,
             },
+        });
+    }
+    let policy_tables: BTreeMap<_, _> = raw.tables.iter().map(|table| (table.oid, table)).collect();
+    for row in batch.get("policies").ok_or_else(|| missing("policies"))? {
+        let table_oid = number(row, "table_oid")?;
+        let table = policy_tables.get(&table_oid).ok_or_else(|| {
+            DbError::BadRow("a policy names a table absent from the catalog batch".into())
+        })?;
+        let name = text(row, "policy_name")?;
+        let command = match text(row, "command")?.as_str() {
+            "*" => pbps_model::PolicyCommand::All,
+            "r" => pbps_model::PolicyCommand::Select,
+            "a" => pbps_model::PolicyCommand::Insert,
+            "w" => pbps_model::PolicyCommand::Update,
+            "d" => pbps_model::PolicyCommand::Delete,
+            other => return Err(DbError::BadRow(format!("unknown policy command `{other}`"))),
+        };
+        let expression = |present, column| -> Result<Option<pbps_model::Text>, DbError> {
+            let value = optional_text(row, column)?;
+            match (flag(row, present)?, value) {
+                (false, None) => Ok(None),
+                (true, Some(value)) => Ok(Some(value.into())),
+                (true, None) => Err(deparsed_away(
+                    'p',
+                    &table.schema,
+                    &format!("{}.{}", table.name, name),
+                )),
+                (false, Some(_)) => Err(DbError::BadRow(format!(
+                    "absent policy expression has `{column}` text"
+                ))),
+            }
+        };
+        let policy = pbps_model::RowPolicy {
+            command,
+            restrictive: !flag(row, "permissive")?,
+            to: policy_roles(row)?,
+            using: expression("has_using", "using_expression")?,
+            with_check: expression("has_check", "check_expression")?,
+        };
+        raw.row_policies.push(RawPolicy {
+            table_oid,
+            name,
+            policy,
         });
     }
     for row in batch.get("columns").ok_or_else(|| missing("columns"))? {
@@ -4197,6 +4278,212 @@ mod tests {
         assert!(decode_batch(&CatalogBatch::new()).is_err());
     }
 
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions"]
+    async fn row_security_is_read_coherently_but_adoption_waits_for_planning() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+            let database = format!("pbps_catalog1172_{}", probe_token().replace('-', "_"));
+            let mut admin = Conn::connect(pbps_db::Driver::Postgres, &base)
+                .await
+                .unwrap();
+            admin
+                .execute(&format!("CREATE DATABASE {database}"))
+                .await
+                .unwrap();
+            let connection = format!("{base} dbname={database}");
+            let result = tokio::task::LocalSet::new()
+                .run_until(async move {
+                    tokio::task::spawn_local(check_row_security_catalog(connection)).await
+                })
+                .await;
+            admin
+                .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+                .await
+                .unwrap();
+            result.expect("row-security catalog fixture failed after cleanup");
+        }
+    }
+
+    async fn check_row_security_catalog(connection: String) {
+        let mut conn = Conn::connect(pbps_db::Driver::Postgres, &connection)
+            .await
+            .unwrap();
+        let role = format!("pbps_catalog1172_{}", probe_token().replace('-', "_"));
+        conn.execute(&format!("BEGIN; CREATE ROLE {role};
+            DO $role$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname='PUBLIC')
+                THEN CREATE ROLE \"PUBLIC\"; END IF; END $role$;
+            CREATE SCHEMA app;
+            CREATE TABLE app.ordinary (id integer PRIMARY KEY);
+            CREATE TABLE app.enabled (id integer);
+            ALTER TABLE app.enabled ENABLE ROW LEVEL SECURITY;
+            CREATE TABLE app.forced (id integer);
+            ALTER TABLE app.forced FORCE ROW LEVEL SECURITY;
+            CREATE TABLE app.disabled (id integer);
+            CREATE FUNCTION app.visible(integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 > 0';
+            CREATE POLICY bare ON app.disabled;
+            CREATE POLICY sel ON app.disabled FOR SELECT USING (app.visible(id));
+            CREATE POLICY ins ON app.disabled FOR INSERT WITH CHECK (id > 0);
+            CREATE POLICY upd ON app.disabled FOR UPDATE TO {role} USING (id > 0);
+            CREATE POLICY equal ON app.disabled AS RESTRICTIVE FOR UPDATE TO \"PUBLIC\",{role}
+                USING (id > 0) WITH CHECK (id > 0);
+            CREATE POLICY del ON app.disabled FOR DELETE USING (id > 0);
+            CREATE TABLE app.parent (id integer) PARTITION BY RANGE(id);
+            CREATE TABLE app.child PARTITION OF app.parent FOR VALUES FROM (0) TO (10);
+            ALTER TABLE app.parent ENABLE ROW LEVEL SECURITY;
+            CREATE TABLE app.other_parent (id integer) PARTITION BY RANGE(id);
+            CREATE TABLE app.other_child PARTITION OF app.other_parent FOR VALUES FROM (0) TO (10);
+            CREATE POLICY dormant ON app.other_child;
+            CREATE FUNCTION app.tg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NEW; END';
+            CREATE TRIGGER audit BEFORE INSERT ON app.ordinary FOR EACH ROW EXECUTE FUNCTION app.tg();
+            CREATE TRIGGER audit BEFORE INSERT ON app.enabled FOR EACH ROW EXECUTE FUNCTION app.tg();
+            CREATE TRIGGER audit BEFORE INSERT ON app.forced FOR EACH ROW EXECUTE FUNCTION app.tg();
+            CREATE TRIGGER audit BEFORE INSERT ON app.disabled FOR EACH ROW EXECUTE FUNCTION app.tg();
+            SET LOCAL search_path=app;")).await.unwrap();
+        let (raw, _, _) = read_all(&mut conn).await.unwrap();
+        assert_eq!(raw.row_policies.len(), 6, "{raw:#?}");
+        let policy = |name| {
+            &raw.row_policies
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap()
+                .policy
+        };
+        assert_eq!(policy("bare"), &pbps_model::RowPolicy::default());
+        assert_eq!(
+            policy("sel").using.as_ref().unwrap().raw(),
+            "app.visible(id)"
+        );
+        assert_eq!(policy("ins").command, pbps_model::PolicyCommand::Insert);
+        assert_eq!(policy("del").command, pbps_model::PolicyCommand::Delete);
+        assert_eq!(policy("upd").with_check, None);
+        assert_eq!(
+            policy("upd").to,
+            pbps_model::PolicyRoles::Roles([role.clone()].into())
+        );
+        assert!(policy("equal").restrictive);
+        assert_eq!(policy("equal").using, policy("equal").with_check);
+        assert_eq!(
+            policy("equal").to,
+            pbps_model::PolicyRoles::Roles(["PUBLIC".into(), role.clone()].into())
+        );
+        for (name, enabled, forced) in [
+            ("disabled", false, false),
+            ("enabled", true, false),
+            ("forced", false, true),
+        ] {
+            let table = raw.tables.iter().find(|t| t.name == name).unwrap();
+            assert_eq!(
+                table.row_security,
+                pbps_model::RowSecurity { enabled, forced }
+            );
+        }
+        let pulled = introspect_within_transaction(&mut conn).await.unwrap();
+        assert_eq!(
+            pulled.schema.tables.keys().cloned().collect::<Vec<_>>(),
+            vec![TableName::new("app", "ordinary")]
+        );
+        for name in [
+            "enabled",
+            "forced",
+            "disabled",
+            "parent",
+            "child",
+            "other_parent",
+            "other_child",
+        ] {
+            assert!(
+                pulled
+                    .limitations
+                    .iter()
+                    .any(|l| l.target == LimitationTarget::Relation(TableName::new("app", name))),
+                "missing {name}: {:?}",
+                pulled.limitations
+            );
+        }
+        for name in ["enabled", "forced", "disabled"] {
+            let limitations: Vec<_> = pulled
+                .limitations
+                .iter()
+                .filter(|l| l.target == LimitationTarget::Relation(TableName::new("app", name)))
+                .collect();
+            assert_eq!(limitations.len(), 1, "{name}: {limitations:?}");
+            assert!(limitations[0].detail.contains("#1172's later PRs"));
+            let trigger = pbps_model::ModuleId::Trigger {
+                on: TableName::new("app", name),
+                name: "audit".into(),
+            };
+            assert!(!pulled.schema.modules.contains_key(&trigger));
+            assert!(
+                pulled
+                    .unmanaged_modules
+                    .iter()
+                    .any(|m| m.target == LimitationTarget::Module(trigger.clone()))
+            );
+        }
+        assert!(
+            pulled
+                .schema
+                .modules
+                .contains_key(&pbps_model::ModuleId::Trigger {
+                    on: TableName::new("app", "ordinary"),
+                    name: "audit".into()
+                })
+        );
+        // Direct catalog privilege is required even when a display view can
+        // still show policies. A failed batch must never become empty metadata.
+        conn.execute(&format!(
+            "REVOKE SELECT ON pg_catalog.pg_policy FROM PUBLIC;
+            SET LOCAL ROLE {role}; SAVEPOINT denied_policy_read;"
+        ))
+        .await
+        .unwrap();
+        let views = conn
+            .query("SELECT count(*)::int8 AS n FROM pg_catalog.pg_policies WHERE schemaname='app'")
+            .await
+            .unwrap();
+        assert_eq!(number(&views[0], "n").unwrap(), 7);
+        let error = read_all(&mut conn).await.unwrap_err();
+        assert!(
+            matches!(&error, DbError::Driver { code: Some(code), .. } if code == "42501"),
+            "{error:?}"
+        );
+        conn.execute(&format!(
+            "ROLLBACK TO SAVEPOINT denied_policy_read; RESET ROLE;
+            GRANT SELECT(polrelid) ON pg_catalog.pg_policy TO {role};
+            SET LOCAL ROLE {role}; SAVEPOINT partial_policy_read;"
+        ))
+        .await
+        .unwrap();
+        // Before PR B, the filter and COUNT(*) needed only polrelid. Complete
+        // policy definitions need the remaining columns too, and fail loudly.
+        let ordinary = conn
+            .query(&format!(
+                "SELECT count(*)::int8 AS n
+            FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname='app' AND {}",
+                adoptable_ordinary_table()
+            ))
+            .await
+            .unwrap();
+        assert_eq!(number(&ordinary[0], "n").unwrap(), 1);
+        let count = conn
+            .query("SELECT count(*)::int8 AS n FROM pg_catalog.pg_policy")
+            .await
+            .unwrap();
+        assert_eq!(number(&count[0], "n").unwrap(), 7);
+        let error = read_all(&mut conn).await.unwrap_err();
+        assert!(
+            matches!(&error, DbError::Driver { code: Some(code), .. } if code == "42501"),
+            "{error:?}"
+        );
+        conn.execute("ROLLBACK TO SAVEPOINT partial_policy_read; RESET ROLE; ROLLBACK")
+            .await
+            .unwrap();
+        // Role creation, optional uppercase PUBLIC creation and catalog ACLs
+        // are transactional. Roll back before the owned database is dropped.
+    }
+
     /// Every batch key [`decode_batch`] requires, each holding no rows —
     /// a starting point for a test that cares about exactly one part.
     fn empty_catalog_batch() -> CatalogBatch {
@@ -4204,6 +4491,7 @@ mod tests {
         for part in [
             "partitioned",
             "tables",
+            "policies",
             "columns",
             "constraints",
             "indexes",
@@ -4227,6 +4515,123 @@ mod tests {
             vec![serde_json::json!({"role": "deploy"})],
         );
         batch
+    }
+
+    fn row_security_table_row() -> serde_json::Value {
+        serde_json::json!({"oid": 7, "schema_name": "app", "table_name": "secured",
+            "replica_identity": "d", "identity_index": 0, "reloptions": [],
+            "toast_reloptions": [], "persistence": "p", "row_security": false,
+            "force_row_security": false, "partition_key": null, "partition_strategy": null,
+            "partition_parent": null, "partition_bound": null})
+    }
+
+    fn row_security_policy_row() -> serde_json::Value {
+        serde_json::json!({"table_oid": 7, "policy_name": "p", "command": "*",
+            "permissive": true, "role_oids": [0], "role_names": [null],
+            "has_using": false, "using_expression": null,
+            "has_check": false, "check_expression": null})
+    }
+
+    #[test]
+    fn row_security_metadata_keeps_every_command_target_and_predicate_presence() {
+        let mut batch = empty_catalog_batch();
+        batch.insert("tables".into(), vec![row_security_table_row()]);
+        for (command, expected) in [
+            ("*", pbps_model::PolicyCommand::All),
+            ("r", pbps_model::PolicyCommand::Select),
+            ("a", pbps_model::PolicyCommand::Insert),
+            ("w", pbps_model::PolicyCommand::Update),
+            ("d", pbps_model::PolicyCommand::Delete),
+        ] {
+            let mut row = row_security_policy_row();
+            row["command"] = command.into();
+            batch.insert("policies".into(), vec![row]);
+            let (raw, _, _) = decode_batch(&batch).unwrap();
+            assert_eq!(raw.row_policies[0].policy.command, expected);
+            assert_eq!(
+                raw.row_policies[0].policy.to,
+                pbps_model::PolicyRoles::Public
+            );
+            assert_eq!(raw.row_policies[0].policy.using, None);
+            assert_eq!(raw.row_policies[0].policy.with_check, None);
+            // Both flags can be false while the policy still exists.
+            assert!(raw.tables[0].row_security.is_default());
+        }
+        let mut row = row_security_policy_row();
+        row["permissive"] = false.into();
+        row["role_oids"] = serde_json::json!([17, 19]);
+        row["role_names"] = serde_json::json!(["app_user", "PUBLIC"]);
+        row["has_using"] = true.into();
+        row["using_expression"] = "  app.f(id) /* retained */  ".into();
+        row["has_check"] = true.into();
+        row["check_expression"] = row["using_expression"].clone();
+        batch.insert("policies".into(), vec![row]);
+        let (raw, _, _) = decode_batch(&batch).unwrap();
+        let policy = &raw.row_policies[0].policy;
+        assert!(policy.restrictive);
+        assert_eq!(
+            policy.to,
+            pbps_model::PolicyRoles::Roles(["PUBLIC".into(), "app_user".into()].into())
+        );
+        assert_eq!(
+            policy.using.as_ref().map(pbps_model::Text::raw),
+            Some("  app.f(id) /* retained */  ")
+        );
+        assert_eq!(policy.with_check, policy.using);
+    }
+
+    #[test]
+    fn row_security_metadata_never_reads_missing_or_malformed_as_empty() {
+        let mut batch = empty_catalog_batch();
+        batch.remove("policies");
+        assert!(decode_batch(&batch).is_err());
+        batch.insert("tables".into(), vec![row_security_table_row()]);
+        for (field, invalid) in [
+            ("command", serde_json::json!("?")),
+            ("command", serde_json::Value::Null),
+            ("table_oid", serde_json::json!(8)),
+            ("permissive", serde_json::Value::Null),
+            ("role_oids", serde_json::json!([])),
+            ("role_oids", serde_json::json!([0, 19])),
+            ("role_oids", serde_json::json!(["0"])),
+            ("role_names", serde_json::json!(["public"])),
+            ("has_using", serde_json::json!(true)),
+            ("using_expression", serde_json::json!("unexpected")),
+            ("has_check", serde_json::json!(true)),
+            ("check_expression", serde_json::json!(false)),
+        ] {
+            let mut row = row_security_policy_row();
+            row[field] = invalid;
+            batch.insert("policies".into(), vec![row]);
+            assert!(decode_batch(&batch).is_err(), "accepted malformed {field}");
+        }
+        for field in [
+            "command",
+            "policy_name",
+            "has_using",
+            "using_expression",
+            "has_check",
+            "check_expression",
+            "role_oids",
+            "role_names",
+        ] {
+            let mut row = row_security_policy_row();
+            row.as_object_mut().unwrap().remove(field);
+            batch.insert("policies".into(), vec![row]);
+            assert!(decode_batch(&batch).is_err(), "accepted missing {field}");
+        }
+        // A named OID whose role cannot be read is not a missing target.
+        let mut row = row_security_policy_row();
+        row["role_oids"] = serde_json::json!([19]);
+        batch.insert("policies".into(), vec![row]);
+        assert!(decode_batch(&batch).is_err());
+        for field in ["row_security", "force_row_security"] {
+            let mut row = row_security_table_row();
+            row.as_object_mut().unwrap().remove(field);
+            batch.insert("tables".into(), vec![row]);
+            batch.insert("policies".into(), vec![]);
+            assert!(decode_batch(&batch).is_err(), "accepted missing {field}");
+        }
     }
 
     /// Absent, empty and unreadable are three different things, and none of
@@ -4581,6 +4986,11 @@ mod tests {
         assert!(tables_query().contains(ORDINARY_TABLE));
         let held = on_a_relation_the_pull_holds();
         assert!(held.contains(ORDINARY_TABLE));
+        assert!(held.contains(&adoptable_ordinary_table()));
+        assert!(!tables_query().contains(&no_row_security("c")));
+        for member in ["pc", "ch"] {
+            assert!(partition_tree("pc.oid").contains(&no_row_security(member)));
+        }
         assert!(held.contains("c.relkind = 'v'"));
         assert!(held.contains(&not_an_extensions("c.oid", "pg_class")));
         assert!(

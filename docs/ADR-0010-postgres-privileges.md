@@ -457,9 +457,10 @@ all unchanged. As with ADR-0009, the dialect-agnostic crates hold.
   [`a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it`](../crates/pbps-pg/tests/live.rs).
   This protects that rebuild; it does not make column grants declarable.
 - **Row-level security is represented by table flags and policies** (#1172
-  PR A, DEC-1172.1). Loading and formatting are available; catalog adoption
-  and deployment await the later PRs of #1172, and planning and saved-plan
-  replay refuse non-default RLS state meanwhile. `SET ROLE` chaining,
+  PR A, DEC-1172.1). Loading, formatting and the catalog read are available.
+  Adoption and deployment await PR C: RLS tables remain named limitations,
+  preserving planning for unrelated tables (DEC-1172.4). Planning and saved-plan
+  replay refuse declared RLS state meanwhile. `SET ROLE` chaining,
   `pg_hba.conf`, `CONNECT` and database-level privileges remain outside the
   declaration model as cluster or connection concerns.
 - **Sequence, type, domain and foreign-data-wrapper grants remain unmodelled.**

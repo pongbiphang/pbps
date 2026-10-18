@@ -301,8 +301,10 @@ indexes:
   omitted WITH CHECK remains distinct from one equal to USING. A policy
   has no uid. `data:` with either flag or any policy, and RLS on partition
   trees, are refused. SQL Server refuses non-default flags or a nonempty
-  policy map. PR A supplies the model and format; planning and saved-plan
-  replay refuse RLS until #1172's later PRs land.
+  policy map. PRs A and B supply the model, format and catalog read. RLS
+  tables remain named limitations and are excluded from adoption until PR C,
+  so their presence does not block unrelated ordinary-table plans
+  (DEC-1172.4). Planning and saved-plan replay refuse declared RLS meanwhile.
 - **`system_time:` gives a SQL Server table its `PERIOD FOR SYSTEM_TIME`**:
   `period: [start, end]` names two `datetime2` columns, not nullable, and
   `hidden: true` hides both. Under `versioning:` it gives the table system

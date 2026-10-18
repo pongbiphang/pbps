@@ -1700,10 +1700,11 @@ table with `relrowsecurity`, and the message said why: "whose policies this
 model does not hold". The policies were the reason; the switch was the
 condition. Measured, `CREATE POLICY` without `ENABLE ROW LEVEL SECURITY` leaves
 `relrowsecurity` false and the policy rows there, so the table came through as
-an ordinary one — and a rebuild drops the policies, after which whoever turns
-row-level security on gets a table that is open where this one was about to be
-closed. `relforcerowsecurity` is a third flag, independent of both. **Read the
-guard's own sentence and check the code says the same thing**: when the reason
+an ordinary one — and a rebuild drops the policies, changing the access rules
+whoever turns row-level security on later expects. Enabled RLS with no policies
+is default-deny for a role subject to it; it is not unrestricted access.
+`relforcerowsecurity` is a third flag, independent of both. **Read the guard's
+own sentence and check the code says the same thing**: when the reason
 names an object and the condition names a switch, the condition is the narrower
 of the two.
 

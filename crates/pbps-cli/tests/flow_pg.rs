@@ -28715,3 +28715,82 @@ fn a_partitions_drop_follows_the_row_changes_that_stop_referencing_it() {
     );
     assert_eq!(scalar(&conn, "SELECT count(*) FROM app.r"), 2);
 }
+
+#[test]
+#[ignore = "needs both live PostgreSQL versions"]
+fn row_security_left_out_of_adoption_does_not_block_an_ordinary_plan() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+        let own = OwnDatabase::new(&base, "rls1172");
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app;
+            CREATE TABLE app.t (id bigint NOT NULL PRIMARY KEY);
+            INSERT INTO app.t VALUES (1);
+            CREATE TABLE app.enabled (id integer);
+            ALTER TABLE app.enabled ENABLE ROW LEVEL SECURITY;
+            CREATE TABLE app.forced (id integer);
+            ALTER TABLE app.forced FORCE ROW LEVEL SECURITY;
+            CREATE TABLE app.disabled (id integer);
+            CREATE POLICY bare ON app.disabled;",
+        );
+        let catalog = "SELECT pg_catalog.jsonb_agg(pg_catalog.jsonb_build_array(
+            c.relname,c.relrowsecurity,c.relforcerowsecurity,p.polname,p.polcmd,
+            p.polpermissive,p.polroles,pg_catalog.pg_get_expr(p.polqual,p.polrelid),
+            pg_catalog.pg_get_expr(p.polwithcheck,p.polrelid)) ORDER BY c.relname,p.polname)::text
+            FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+            LEFT JOIN pg_catalog.pg_policy p ON p.polrelid=c.oid
+            WHERE n.nspname='app' AND c.relname IN ('enabled','forced','disabled')";
+        let before = text_of(connection, catalog);
+        let d = Demo::new("rls1172");
+        let pulled = succeeds(d.run(&["pull", "--db", connection]));
+        assert!(
+            stderr(&pulled).contains("#1172's later PRs"),
+            "{}",
+            stderr(&pulled)
+        );
+        for name in ["enabled", "forced", "disabled"] {
+            assert!(!d.dir.join(format!("schema/app.{name}.yml")).exists());
+        }
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "adopt ordinary table",
+        ]));
+        let path = d.dir.join("schema/app.t.yml");
+        let original = std::fs::read_to_string(&path).unwrap();
+        let edited = original.replace("columns:\n", "columns:\n  label: {type: text}\n");
+        assert_ne!(edited, original);
+        std::fs::write(path, edited).unwrap();
+        let plan = connected_artifact(&d, connection, false);
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection, "--format", "json"]));
+        let next: serde_json::Value = serde_json::from_str(&stdout(&next)).unwrap();
+        assert_eq!(next["data"]["changes"], 0, "{next}");
+        assert_eq!(text_of(connection, catalog), before);
+        let snapshot = latest_snapshot(connection);
+        assert_eq!(snapshot.schema.tables.len(), 1);
+        assert!(
+            snapshot
+                .schema
+                .tables
+                .values()
+                .all(|t| !t.has_row_security())
+        );
+
+        // The same flags on the managed table still refuse before planning.
+        on_server(connection, "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY");
+        let refused = d.run(&["plan", "--db", connection]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("row-level security"),
+            "{}",
+            stderr(&refused)
+        );
+    }
+}
