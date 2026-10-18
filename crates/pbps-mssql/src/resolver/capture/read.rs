@@ -226,8 +226,10 @@ pub(super) struct Catalog {
     /// this database's own objects or types hold, read whole (#2153).
     pub whole: BTreeMap<&'static str, Vec<WholeRow>>,
     /// Full-text catalogs, stoplists and search property lists, by kind and
-    /// id: a full-text index names each by number.
-    pub fulltext: BTreeMap<(&'static str, i64), String>,
+    /// id: a full-text index names each by number. A stoplist carries its
+    /// words and a property list its properties, which decide what the index
+    /// holds while neither name changes.
+    pub fulltext: BTreeMap<(&'static str, i64), serde_json::Value>,
     /// The procedures with a numbered group (`proc;2`), which the capture
     /// does not read and refuses.
     pub numbered: BTreeSet<i64>,
@@ -514,6 +516,19 @@ const FULLTEXT_NAMES: &[(&str, &str)] = &[
     (
         "property list",
         "SELECT CONVERT(nvarchar(20), property_list_id) AS id, CONVERT(nvarchar(128), name) AS name FROM sys.registered_search_property_lists;",
+    ),
+];
+
+/// A stoplist's words and a property list's properties, by the list's id,
+/// each row's members as text.
+const FULLTEXT_MEMBERS: &[(&str, &str)] = &[
+    (
+        "stoplist",
+        "SELECT CONVERT(nvarchar(20), stoplist_id) AS id, CONVERT(nvarchar(4000), CONCAT(language_id, N':', stopword)) AS member FROM sys.fulltext_stopwords;",
+    ),
+    (
+        "property list",
+        "SELECT CONVERT(nvarchar(20), property_list_id) AS id, CONVERT(nvarchar(4000), CONCAT(property_set_guid, N':', property_int_id, N':', property_name)) AS member FROM sys.registered_search_properties;",
     ),
 ];
 
@@ -871,6 +886,12 @@ async fn data_spaces_and_keys(
     Ok((spaces, keys))
 }
 
+/// A full-text catalog, stoplist or property list as compared: its name and
+/// what it holds.
+pub(super) fn fulltext_entry(name: String, members: Option<BTreeSet<String>>) -> serde_json::Value {
+    serde_json::json!({"name": name, "members": members.unwrap_or_default()})
+}
+
 /// Every component, in turn, between two observations of the session. A
 /// session input that moved while the components were read refuses: the
 /// reads would then belong to two different sessions.
@@ -1077,10 +1098,24 @@ pub(super) async fn read(
     let mut data_spaces = BTreeMap::new();
     let mut encryption_keys = BTreeMap::new();
     let mut fulltext = BTreeMap::new();
+    let mut members: BTreeMap<(&str, i64), BTreeSet<String>> = BTreeMap::new();
+    for &(kind, sql) in FULLTEXT_MEMBERS {
+        for row in rows(conn, sql).await? {
+            let row = Text(&row);
+            members
+                .entry((kind, row.number("id")?))
+                .or_default()
+                .insert(row.required("member")?);
+        }
+    }
     for &(kind, sql) in FULLTEXT_NAMES {
         for row in rows(conn, sql).await? {
             let row = Text(&row);
-            fulltext.insert((kind, row.number("id")?), row.required("name")?);
+            let id = row.number("id")?;
+            fulltext.insert(
+                (kind, id),
+                fulltext_entry(row.required("name")?, members.remove(&(kind, id))),
+            );
         }
     }
     let mut numbered = BTreeSet::new();

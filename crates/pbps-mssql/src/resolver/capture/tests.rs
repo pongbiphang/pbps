@@ -396,6 +396,20 @@ fn a_clr_object_refuses_by_name() {
 }
 
 #[test]
+fn a_stoplist_is_compared_by_its_words_not_its_name_alone() {
+    use super::read::fulltext_entry;
+    let words = |list: &[&str]| Some(list.iter().map(|w| (*w).to_owned()).collect());
+    assert_ne!(
+        fulltext_entry("sl".into(), words(&["1033:foo"])),
+        fulltext_entry("sl".into(), words(&["1033:foo", "1033:bar"]))
+    );
+    assert_eq!(
+        fulltext_entry("sl".into(), None),
+        fulltext_entry("sl".into(), words(&[]))
+    );
+}
+
+#[test]
 fn an_engine_object_is_read_by_identity_only() {
     let mut catalog = catalog();
     // `sys.objects` is the engine's own: no row of it is in the catalog read.

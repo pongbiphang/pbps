@@ -10,7 +10,8 @@ pub enum Disposition {
     /// Read whole, its rows filed under what they describe (`columns::VIEWS`).
     Read,
     /// Read as the definition an id names: a data space, an XML schema
-    /// collection, a column encryption key, a full-text catalog or stoplist.
+    /// collection, a column encryption key, a full-text catalog, stoplist
+    /// (with its words) or search property list (with its properties).
     Named,
     /// Read by the typed reads the capture's logic uses.
     Typed,
@@ -261,7 +262,7 @@ pub const CATALOG: &[(&str, Disposition)] = &[
         Disposition::Skipped(INSTANCE),
     ),
     ("fulltext_stoplists", Disposition::Named),
-    ("fulltext_stopwords", Disposition::Skipped(UNBOUND)),
+    ("fulltext_stopwords", Disposition::Named),
     ("fulltext_system_stopwords", Disposition::Skipped(INSTANCE)),
     ("function_order_columns", Disposition::Refused(CLR)),
     ("hash_indexes", Disposition::Read),
@@ -339,10 +340,7 @@ pub const CATALOG: &[(&str, Disposition)] = &[
         Disposition::Skipped(TELEMETRY),
     ),
     ("query_store_wait_stats", Disposition::Skipped(TELEMETRY)),
-    (
-        "registered_search_properties",
-        Disposition::Skipped(INSTANCE),
-    ),
+    ("registered_search_properties", Disposition::Named),
     ("registered_search_property_lists", Disposition::Named),
     (
         "remote_data_archive_databases",

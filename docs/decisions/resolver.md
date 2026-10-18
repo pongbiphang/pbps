@@ -3717,6 +3717,19 @@ column after another, which is why §8 rejected it for the externals file.
   procedure's startup flag. A table's `max_column_id_used` is skipped as
   history, since the same shape reads differently by the columns it once
   had. This answers #2150's seventh ready review.
+- **Every catalog view is classed** (`catalog.rs`). Each of the 311 views
+  the pinned build reports, the dynamic management views aside, is read
+  whole, read as the definition an id names, read by the typed reads,
+  refused by name, or set aside with its reason. The refused are CLR
+  objects and types, external tables and numbered procedures. The set
+  aside include compatibility views, instance scope, telemetry, Service
+  Broker, authorization (read by #611's context), derived usages and
+  documentation. The audit, at the maintainer's request, added 21 views
+  read whole: masking, trigger order, periods, change tracking, full-text,
+  the per-index views, partitions, edge constraints and security policies.
+  A security policy on a captured object joins its closure. A full-text
+  stoplist is compared by its words and a search property list by its
+  properties.
 - **The typed reads stay.** The dependency classification, the closure,
   the candidates and ownership read them (DEC-2141.1). The whole rows are
   what a capture compares.
