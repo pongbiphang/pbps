@@ -8300,10 +8300,11 @@ fn a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names() {
     }
 }
 
-/// The intent renames the partition before dropping it, and the database is
-/// renamed ahead of the baseline: the recorded state still has the old name,
-/// the database and the intent the new one. The baseline is still refused by
-/// the name the database has (#1852 review).
+/// The intent renames the partition twice before dropping it, and the
+/// database is renamed ahead of the baseline only as far as the middle name:
+/// the recorded state, the database and the intent each have another name.
+/// The partition is found by its parent and bound, and the baseline is still
+/// refused by the name the database has (#2172 review).
 fn a_baseline_does_not_hand_over_a_partition_renamed_first_on(server: &str, k: usize) {
     let db = OwnDatabase::new(server, "handover-1852-renamed");
     let connection = db.connection().to_owned();
@@ -8322,18 +8323,22 @@ fn a_baseline_does_not_hand_over_a_partition_renamed_first_on(server: &str, k: u
     let text = std::fs::read_to_string(&path).unwrap();
     let held = text.find("\npartitions:\n").unwrap();
 
+    std::fs::write(&path, text.replace("  ev_2025:", "  ev_mid:")).unwrap();
+    succeeds(d.run(&["rename-table", "app.ev_2025", "app.ev_mid"]));
+    d.commit();
     std::fs::write(&path, text.replace("  ev_2025:", "  ev_old:")).unwrap();
-    succeeds(d.run(&["rename-table", "app.ev_2025", "app.ev_old"]));
+    succeeds(d.run(&["rename-table", "app.ev_mid", "app.ev_old"]));
     d.commit();
     std::fs::write(&path, format!("{}\npartitions: external\n", &text[..held])).unwrap();
     succeeds(d.run(&["drop-table", "app.ev_old", "--reason", "retired"]));
     d.commit();
-    on_server(&connection, "ALTER TABLE app.ev_2025 RENAME TO ev_old");
+    on_server(&connection, "ALTER TABLE app.ev_2025 RENAME TO ev_mid");
     let o = d.run(&["baseline", "--db", &connection, "--reason", "hand over"]);
     assert_ne!(code(&o), 0, "{}", stdout(&o));
     assert!(
         stderr(&o).contains(
-            "app.ev_old is named by a drop intent and held by the recorded state (entry #1)"
+            "app.ev_mid is named by a drop intent and held by the recorded state (entry #1, \
+             recorded as app.ev_2025)"
         ),
         "{}",
         stderr(&o)

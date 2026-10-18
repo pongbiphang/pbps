@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_model::{ColumnRef, IdsFile, ModuleId, Schema, TableName, Uid, UidKind};
+use pbps_model::{ColumnRef, IdsFile, ModuleId, PartitionOf, Schema, TableName, Uid, UidKind};
 
 /// A live schema cut down to the managed set, with what fell outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,8 +34,10 @@ pub struct Scoped {
     /// Partitions of a managed parent whose partitions are external (#1533):
     /// another tool's to create and drop, held as the parent makes them and
     /// compared not at all. Kept apart from [`Scoped::unmanaged`], whose
-    /// policy is about tables nobody declared a reason to leave alone.
-    pub external: Vec<TableName>,
+    /// policy is about tables nobody declared a reason to leave alone. Each
+    /// with its parent and bound as the database has them, which say which
+    /// partition it is whatever it is named (#1852).
+    pub external: BTreeMap<TableName, PartitionOf>,
 
     /// Tables the identity file names that the database does not have.
     ///
@@ -113,7 +115,7 @@ pub fn scope(
 
     let mut scoped = Schema::default();
     let mut unmanaged = Vec::new();
-    let mut external = Vec::new();
+    let mut external = BTreeMap::new();
     let mut unexpressible = Vec::new();
     for (name, table) in &schema.tables {
         // A partition pbps holds under a parent whose partitions are
@@ -170,7 +172,7 @@ pub fn scope(
                     name = name.shown()
                 ));
             } else {
-                external.push(name.clone());
+                external.insert(name.clone(), of.clone());
                 continue;
             }
         }
@@ -577,7 +579,10 @@ mod tests {
             "{:?}",
             scoped.unexpressible
         );
-        assert_eq!(scoped.external, [t("app.ev_p1"), t("app.ev_p2")]);
+        assert_eq!(
+            scoped.external.keys().collect::<Vec<_>>(),
+            [&t("app.ev_p1"), &t("app.ev_p2")]
+        );
         assert!(scoped.unmanaged.is_empty(), "{:?}", scoped.unmanaged);
         assert_eq!(scoped.schema.tables.len(), 1);
         assert!(
@@ -618,7 +623,10 @@ mod tests {
             "{:?}",
             scoped.unexpressible
         );
-        assert_eq!(scoped.external, [t("app.ev_p1")]);
+        assert_eq!(
+            scoped.external.keys().collect::<Vec<_>>(),
+            [&t("app.ev_p1")]
+        );
 
         // Negative: a partition pbps holds a uid for is two owners for one
         // table, refused rather than kept or handed over (#1833 review).
@@ -637,7 +645,10 @@ mod tests {
             "{:?}",
             scoped.unexpressible
         );
-        assert_eq!(scoped.external, [t("app.ev_p2")]);
+        assert_eq!(
+            scoped.external.keys().collect::<Vec<_>>(),
+            [&t("app.ev_p2")]
+        );
 
         // Negative: not named external, the undeclared partitions are refused.
         let scoped = scope(&live, &managed, &BTreeSet::new(), &BTreeSet::new());

@@ -809,16 +809,19 @@ the handover, and the partition is never dropped.
 The check is narrow on purpose. The baseline reads the latest ledger entry
 only while a table tombstone is in the working file and the scope leaves some
 partition external. It matches each tombstone to the recorded state by uid,
-not by the tombstone's name: an intent can rename the table before it drops
-it, and the tombstone then carries a name the database and the recorded state
-do not have (#2172 review). Which name the database has depends on whether
-the rename was made there first, so the partition left external is matched
-under either name: the recorded state's, or the tombstone's (#2172 review).
-The outcomes:
-- refused by name: the recorded state still holds the tombstoned uid, and the
-  scope leaves it external under the recorded name or the tombstone's;
+and finds the partition left external by its parent's uid and its bound,
+never by a name. An intent can rename the table any number of times before it
+drops it, and the database can have any of those names when the baseline runs,
+so the tombstone's name, the recorded name and the database's can all differ
+(#2172 review, three times). One parent's bounds never overlap, so the parent
+and the bound are one partition whatever it is called. The outcomes:
+- refused, naming the partition as the database has it: the recorded state
+  still holds the tombstoned uid, as a partition of a parent the working file
+  holds under the same uid, and the scope leaves a partition of that parent
+  with the same bound external;
 - allowed: the recorded state does not hold the uid (an old tombstone, even
-  when a new table reused its name), or the ledger is empty;
+  when a new table reused its name), no external partition has its parent and
+  bound (it was dropped by hand already), or the ledger is empty;
 - refused: the ledger cannot be read, since then nothing can say which
   partition an intent names.
 
@@ -840,9 +843,10 @@ still refused by the scope itself, as two owners (#1833).
 Pinned by `a_baseline_does_not_hand_over_a_held_partition_a_drop_intent_names`
 in `crates/pbps-cli/tests/flow_pg.rs` (16 and 18). It covers the refusal, the
 scope's own refusal without the intent, the baseline that goes once a
-plan has dropped the partition, and a rename made in the database before the
-baseline. Also pinned by
+plan has dropped the partition, and two renames by the intent with the
+database renamed only to the middle name. Also pinned by
 `a_baseline_refuses_handing_over_only_a_held_partition_a_drop_intent_names`
-in `crates/pbps-cli/src/deploy.rs`, which covers a rename before the drop,
-made in the database first or not, a column's tombstone, an old tombstone whose name was reused, an empty ledger
-and an unreadable one.
+in `crates/pbps-cli/src/deploy.rs`, which covers chained renames, an
+unrenamed partition, one already dropped by hand, a parent's name reused by
+another table, a column's tombstone, an old tombstone whose name was reused,
+an empty ledger and an unreadable one.
