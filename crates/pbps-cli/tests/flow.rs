@@ -7760,6 +7760,21 @@ fn a_depends_on_cycle_is_refused_before_planning() {
     );
     let o = d.run(&["plan"]);
     assert_eq!(code(&o), 0, "{}", stderr(&o));
+
+    // Negative: a revision that reverses a committed edge. The baseline's
+    // `b -> a` is not carried beside the declared `a -> b` while `b` is
+    // still declared, so nothing closes (#2083 review).
+    d.commit();
+    d.module(
+        "dbo.a.yml",
+        "view: dbo.a\ndepends_on: [dbo.b]\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    );
+    d.module(
+        "dbo.b.yml",
+        "view: dbo.b\ndefinition: |-\n  SELECT id FROM dbo.t\n",
+    );
+    let o = d.run(&["plan"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
 }
 
 /// Bootstrap builds what the identity file knows; a declared role (or

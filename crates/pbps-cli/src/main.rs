@@ -3279,15 +3279,16 @@ fn cmd_plan(
     // removes declares no `depends_on:` any more, and the edge it recorded is
     // one the identifier scan could not find — so without this the drops fall
     // back to name order and can remove a dependency before its dependent.
-    // Declared hints win where both sides have an entry: the current revision is
-    // the one being planned. (`plan --db` cannot do the same; its baseline is
-    // the ledger, which records the state, not the annotations beside it.)
+    // Only a removed module's: a module still declared owns its current
+    // `depends_on:`, and one that dropped an edge has dropped it. Carried
+    // across, the old edge beside a reversed new one made a cycle the
+    // declarations do not hold, which is refused (#2083 review). `plan --db`
+    // carries the snapshot's the same way.
     let mut hints = loaded.hints.clone();
     for (name, deps) in &base.hints.module_deps {
-        hints
-            .module_deps
-            .entry(name.clone())
-            .or_insert_with(|| deps.clone());
+        if !loaded.schema.modules.contains_key(name) {
+            hints.module_deps.insert(name.clone(), deps.clone());
+        }
     }
 
     // A snapshot baseline is a read-back, and the engine respells what it
