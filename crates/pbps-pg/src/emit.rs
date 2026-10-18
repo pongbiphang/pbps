@@ -52,6 +52,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Created, DialectError, ScanCheckStep, Statement};
+use pbps_model::escape::Escaped;
 use pbps_model::{
     Cell, Change, Column, ColumnType, ForeignKey, GrantTarget, Index, Module, ModuleId, ModuleKind,
     Permission, PrimaryKey, PublicAccess, ReferentialAction, ReplicaIdentity, RoutineArg, Row,
@@ -927,7 +928,7 @@ fn numbering(
         refuse(&format!(
             "{column} is not numbered by a sequence it owns, as this plan expected; nothing \
              was applied",
-            column = column.raw()
+            column = column.shown()
         ))
     );
     let block = |body: &[String], variables: &[(&str, &str)]| {
@@ -4266,14 +4267,14 @@ fn beside_its_default(
             "a publication publishes inserts into every table, or every table of {}, so the rows \
              moved into {name} before it is attached would reach subscribers as rows of a table \
              they do not have; nothing was moved",
-            name.schema,
-            name = name.raw()
+            Escaped(&name.schema),
+            name = name.shown()
         )),
         published = refuse(format!(
             "a publication publishes deletes from {default}, so moving its rows of the range of \
              {name} would send subscribers their delete and not their insert; nothing was moved",
-            default = default.raw(),
-            name = name.raw()
+            default = default.shown(),
+            name = name.shown()
         )),
         reaches =
             crate::preflight::delete_reaches(&format!("{}::pg_catalog.regclass", literal(&d))),
@@ -4295,27 +4296,27 @@ fn beside_its_default(
         statement = refuse(format!(
             "a statement trigger or rule on {default} fires on the delete that moves its rows of \
              the range of {name} into it; nothing was moved",
-            default = default.raw(),
-            name = name.raw()
+            default = default.shown(),
+            name = name.shown()
         )),
         row = refuse(format!(
             "a row trigger on {default} fires on the delete that would move its rows of the range \
              of {name} into it; nothing was moved",
-            default = default.raw(),
-            name = name.raw()
+            default = default.shown(),
+            name = name.shown()
         )),
         hidden = refuse(format!(
             "a table with a foreign key whose action a delete from {default} fires is under \
              row-level security, so the rows referencing the rows the move would take into \
              {name} cannot all be counted; nothing was moved",
-            default = default.raw(),
-            name = name.raw()
+            default = default.shown(),
+            name = name.shown()
         )),
         referenced = refuse(format!(
             "rows reference rows of {default} the move would take into {name}, and the delete \
              would fire the action of their foreign key; nothing was moved",
-            default = default.raw(),
-            name = name.raw()
+            default = default.shown(),
+            name = name.shown()
         )),
         // The rows it counts and locks are the rows it would move: none
         // without a move a human allowed, at most its bound with one
@@ -4324,7 +4325,15 @@ fn beside_its_default(
         allowed = moves_at_most.unwrap_or(0),
         beyond = literal(&format!(
             " {}",
-            moving_beyond_its_intent(name, parent, default, bound, moves_at_most)?
+            // The shared probe description stays raw for explain; the raised text
+            // has no whole-message escaping boundary after the driver (#2161).
+            Escaped(&moving_beyond_its_intent(
+                name,
+                parent,
+                default,
+                bound,
+                moves_at_most
+            )?)
         )),
         delete = literal(&format!("WITH moved AS (DELETE FROM {d} AS r WHERE ")),
         insert = literal(&format!(") INSERT INTO {q} (")),
@@ -4343,8 +4352,8 @@ fn beside_its_default(
             "moving its rows of the range of {name} out of {default} would change the value of a \
              generated column, which the new partition computes otherwise (as one of its \
              tableoid does); nothing was moved",
-            name = name.raw(),
-            default = default.raw()
+            name = name.shown(),
+            default = default.shown()
         )),
     );
     let tag = dollar_tag(&body);
@@ -5038,7 +5047,7 @@ fn wrote_the_row(
              trigger on the table, another writer inside it, or a value the engine stores \
              differently from the way it is declared. Nothing was applied; `pbps plan --db` \
              says which.",
-            table = table.raw()
+            table = table.shown()
         ))
     ))
 }
@@ -5093,7 +5102,7 @@ fn gone_row(
         refuse(&format!(
             "{table} row `{key}` is back after this plan deleted it -- a trigger on the table, \
              or another writer inside it. Nothing was applied.",
-            table = table.raw()
+            table = table.shown()
         ))
     ))
 }
@@ -5109,7 +5118,7 @@ fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
         refuse(&format!(
             "{table} row `{key}` is not as the plan recorded it: changed or deleted since the \
              plan was made. Plan again.",
-            table = table.raw()
+            table = table.shown()
         ))
     )
 }

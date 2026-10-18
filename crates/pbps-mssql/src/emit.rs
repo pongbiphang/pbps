@@ -1341,7 +1341,7 @@ fn gone_row(table: &TableName, key: &RowKey, key_column: &str) -> Result<String,
         literal(&format!(
             "{table} row `{key}` is back after this plan deleted it — a trigger on the table, \
              or another writer inside it. Nothing was applied.",
-            table = table.raw()
+            table = table.shown()
         ))
     ))
 }
@@ -1487,7 +1487,7 @@ fn wrote_the_row(
              trigger on the table, another writer inside it, or a value the engine stores \
              differently from the way it is declared. Nothing was applied; `pbps plan --db` \
              says which.",
-            table = table.raw()
+            table = table.shown()
         ))
     ))
 }
@@ -1498,7 +1498,7 @@ fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
         literal(&format!(
             "{table} row `{key}` is not as the plan recorded it: changed or deleted since the \
              plan was made. Plan again.",
-            table = table.raw()
+            table = table.shown()
         ))
     )
 }
