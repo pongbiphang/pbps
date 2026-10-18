@@ -107,7 +107,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
     s.push_str("| Column | Type | Null | Default | Description |\n");
     s.push_str("|---|---|---|---|---|\n");
     for (col_name, c) in &table.columns {
-        let mut label = format!("`{col_name}`");
+        let mut label = code_cell(col_name);
         if table
             .primary_key
             .as_ref()
@@ -200,7 +200,7 @@ fn computed_table(s: &mut String, table: &Table) {
     }
     s.push_str("\n| Computed column | Expression | Stored |\n|---|---|---|\n");
     for (col_name, c) in &table.computed {
-        let mut label = format!("`{col_name}`");
+        let mut label = code_cell(col_name);
         if table
             .primary_key
             .as_ref()
@@ -368,6 +368,37 @@ mod tests {
             .filter(|l| l.starts_with("| `a_") || l.starts_with("| `z_"))
         {
             assert_eq!(line.replace("\\|", "").matches('|').count(), 6, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_column_name_stays_inside_its_cell() {
+        // A `|` in a name split the cell and a backtick ended the span
+        // (#1874): columns and computed columns alike.
+        let mut s = documented();
+        let t = s
+            .tables
+            .get_mut(&TableName::new("dbo", "customer"))
+            .unwrap();
+        t.columns
+            .insert("a|b".into(), Column::new(ty("int")).not_null());
+        t.columns
+            .insert("x`y".into(), Column::new(ty("int")).not_null());
+        t.computed.insert(
+            "c|d".into(),
+            ComputedColumn {
+                expression: "1".into(),
+                persisted: false,
+                not_null: false,
+            },
+        );
+        let out = render(&s, &IdsFile::default(), "Schema");
+        for row in [
+            "| `a\\|b` | `int` | no | — | — |\n",
+            "| ``x`y`` | `int` | no | — | — |\n",
+            "| `c\\|d` | `1` | — |\n",
+        ] {
+            assert!(out.contains(row), "{row}{out}");
         }
     }
 
