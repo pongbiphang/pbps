@@ -1631,6 +1631,29 @@ impl Cx<'_> {
         let Some((base_name, was)) = self.base_of(owner) else {
             return;
         };
+        // A trigger on the table may fill the column before the row is
+        // checked, and whether it does is the engine's to say: the release
+        // pass lets a drop pass the insert there (`Dependence::base_required`,
+        // #1397), so no requirement is stated (#2175 review). Only a declared
+        // trigger is seen here; an undeclared one is the catalog's, which the
+        // effects do not read.
+        let final_name = self.final_of(owner).map(|(name, _)| name);
+        let triggered = self
+            .before
+            .schema
+            .modules
+            .keys()
+            .chain(self.after.schema.modules.keys())
+            .any(|id| {
+                matches!(id, crate::ModuleId::Trigger { on, .. }
+                    if [Some(base_name), final_name]
+                        .into_iter()
+                        .flatten()
+                        .any(|t| on.schema == t.schema && on.name == t.name))
+            });
+        if triggered {
+            return;
+        }
         let written: Vec<ColumnKey> = written
             .iter()
             .filter_map(|c| self.column(&table.column(*c)).ok())

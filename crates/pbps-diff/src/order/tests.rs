@@ -3097,6 +3097,22 @@ fn a_row_insert_waits_for_the_drop_of_a_not_null_column_it_leaves_out() {
         "{:?}",
         fx[0].requires
     );
+    // Negative: a table with a trigger, which may fill the column before
+    // the row is checked: the engine says whether it does (#2175 review).
+    let mut triggered = insert_beside_a_dropped_column(true);
+    triggered.before.modules.insert(
+        ModuleId::Trigger {
+            on: t("t"),
+            name: "fill".into(),
+        },
+        Module {
+            kind: ModuleKind::Trigger,
+            definition: "BEFORE INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()".into(),
+            description: None,
+        },
+    );
+    let (ops, fx, baseline) = triggered.analysed(ModuleEdits::InPlace);
+    assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
 }
 
 /// A parent `p` and a child `c` whose foreign key stands throughout, over the
