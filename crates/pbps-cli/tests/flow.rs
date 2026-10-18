@@ -20,6 +20,15 @@ async fn connect_live(connection: &str) -> Result<pbps_db::Conn, pbps_db::DbErro
 
 const BIN: &str = env!("CARGO_BIN_EXE_pbps");
 
+#[path = "support/raised_messages.rs"]
+mod raised_messages;
+
+#[test]
+#[ignore = "needs live mssql"]
+fn raised_guard_messages_are_shown_once_on_every_apply_path() {
+    raised_messages::check(&std::env::var("PBPS_TEST_DB").unwrap(), false);
+}
+
 #[path = "support/verify_failures.rs"]
 mod verify_failures;
 

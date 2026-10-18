@@ -1316,7 +1316,7 @@ pub(crate) fn still_referenced(
             "{table} row `{key}` is referenced by row(s) that arrived after this plan was \
              checked; the delete would orphan or cascade into them. Nothing was applied. \
              Plan again.",
-            table = table.raw()
+            table = table.shown()
         ))
     ))
 }

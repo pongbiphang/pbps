@@ -413,7 +413,8 @@
         "renamed_data_takeovers_use_final_names_and_require_approval",
         "verify_distinguishes_missing_empty_and_unreadable_recorded_state",
         "verify_distinguishes_permission_denials_from_failed_connections",
-        "doctor_accepts_future_table_and_view_grants_before_a_db_owner_bootstrap"
+        "doctor_accepts_future_table_and_view_grants_before_a_db_owner_bootstrap",
+        "raised_guard_messages_are_shown_once_on_every_apply_path"
       ]
     },
     {
@@ -753,7 +754,8 @@
         "verify_distinguishes_missing_empty_and_unreadable_recorded_state",
         "verify_distinguishes_permission_denials_from_failed_connections",
         "alias_batches::large_exact_and_ensure_catalogues_can_be_adopted_planned_and_verified",
-        "alias_batches::large_catalogues_read_back_inside_bootstrap_and_apply_transactions"
+        "alias_batches::large_catalogues_read_back_inside_bootstrap_and_apply_transactions",
+        "raised_guard_messages_are_shown_once_on_every_apply_path"
       ]
     },
     {

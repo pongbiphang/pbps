@@ -1145,7 +1145,7 @@ pub(crate) fn still_referenced(
              deleted anyway, which is the silent loss this guard exists to prevent. Nothing \
              was applied. Delete the row as a role the policy does not filter, or remove the \
              row-level security from the referencing table.",
-            table = table.raw()
+            table = table.shown()
         )),
         counting_expression(&Referencing {
             parent: &parent,
@@ -1186,7 +1186,7 @@ pub(crate) fn still_referenced(
             "{table} row `{key}` is referenced by row(s) that arrived after this plan was \
              checked; the delete would orphan or cascade into them. Nothing was applied. \
              Plan again.",
-            table = table.raw()
+            table = table.shown()
         ))
     )))
 }
