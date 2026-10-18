@@ -1119,12 +1119,17 @@ pub(crate) fn refuse_published_unlogged(
     let mut lines = Vec::new();
     for (declared, stored) in made_unlogged {
         for found in naming.iter().filter(|n| n.table == *stored) {
-            // The statement is shown runnable, its identifiers quoted; the
-            // escaping that follows only makes a control character visible.
-            let remove = found.drop_statement().map_or_else(
-                || "remove it from that publication".to_owned(),
-                |statement| format!("remove it there (`{}`)", Escaped(&statement)),
-            );
+            // The statement is shown only where it runs exactly as shown: a
+            // name whose display escaping would change the statement's
+            // spelling (a backslash, a control character) gets the words
+            // instead, since a quoted identifier takes those literally.
+            let remove = found
+                .drop_statement()
+                .filter(|statement| Escaped(statement).to_string() == *statement)
+                .map_or_else(
+                    || "remove it from that publication".to_owned(),
+                    |statement| format!("remove it there (`{statement}`)"),
+                );
             lines.push(format!(
                 "{} is listed by the publication `{}`; {remove}, or keep the table logged",
                 declared.shown(),
@@ -10850,6 +10855,17 @@ mod tests {
         assert!(
             e.contains("app.t2 is listed by the publication `pub_x`")
                 && e.contains(r#"ALTER PUBLICATION "pub_x" DROP TABLE "app"."t";`"#),
+            "{e}"
+        );
+        // A name the display would escape gets no statement: shown escaped,
+        // it would not be the statement that runs.
+        let odd = NamingPublication {
+            table: "app.t".parse().unwrap(),
+            publication: "pub\\x".into(),
+        };
+        let e = refused(vec![switch("app.t", true)], &[odd]).unwrap_err();
+        assert!(
+            e.contains("remove it from that publication") && !e.contains("ALTER PUBLICATION"),
             "{e}"
         );
         // Negative: made logged, another table listed, or nothing listed.
