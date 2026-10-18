@@ -1752,6 +1752,74 @@ async fn an_object_over_a_left_out_column_is_left_out_with_it() {
     }
 }
 
+/// #2147, #2148: a computed column reading a left-out column, and a filtered
+/// index whose filter alone reads one, go with it, and an index over that
+/// computed column goes in turn. Laid out so a computed column's `column_id`
+/// equals a filtered index's `index_id` (4): the engine's resolution reports
+/// both readers under that one id, and only the stored definitions tell
+/// which column each reads. The negative cases: the computed column and the
+/// filtered index over the kept column stay.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
+async fn a_computed_column_or_filter_reading_a_left_out_column_goes_with_it() {
+    let mut db = TestDb::create("left_out2147").await;
+    db.conn
+        .execute("CREATE TYPE dbo.money_t FROM decimal(10, 2) NULL;")
+        .await
+        .expect("create an alias type");
+    db.conn
+        .execute(
+            "CREATE TABLE dbo.t (
+                 id int NOT NULL CONSTRAINT pk_t PRIMARY KEY,
+                 a int NULL,
+                 m dbo.money_t,
+                 c AS (m * 2),
+                 e AS (a + 1)
+             );
+             CREATE INDEX ix_c ON dbo.t (c);
+             CREATE INDEX ix_f ON dbo.t (a) WHERE m IS NOT NULL;
+             CREATE INDEX ix_g ON dbo.t (a) WHERE a IS NOT NULL;",
+        )
+        .await
+        .expect("create readers of an alias-typed column");
+    let ids = db
+        .conn
+        .query(
+            "SELECT (SELECT column_id FROM sys.columns
+                      WHERE object_id = OBJECT_ID(N'dbo.t') AND name = N'c') AS c,
+                    (SELECT index_id FROM sys.indexes
+                      WHERE object_id = OBJECT_ID(N'dbo.t') AND name = N'ix_g') AS g;",
+        )
+        .await
+        .expect("read the ids");
+    let c: i32 = ids[0].try_get("c").unwrap().unwrap();
+    let g: i32 = ids[0].try_get("g").unwrap().unwrap();
+    assert_eq!((c, g), (4, 4), "the layout shares an id");
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn)
+        .await
+        .expect("introspect readers of a left-out column");
+    db.drop().await;
+
+    let name = TableName::new("dbo", "t");
+    let t = &pulled.schema.tables[&name];
+    let errors = pbps_mssql::validate::table(&name, t);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(t.columns.keys().collect::<Vec<_>>(), ["id", "a"]);
+    assert_eq!(t.computed.keys().collect::<Vec<_>>(), ["e"]);
+    assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_g"]);
+    for detail in [
+        "t.c: the computed column reads column `m`, which was left out",
+        "index `ix_c` is over column `c`, which was left out",
+        "index `ix_f` is over column `m`, which was left out",
+    ] {
+        assert!(
+            pulled.limitations.iter().any(|l| l.detail.contains(detail)),
+            "{detail}: {:?}",
+            pulled.limitations
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs a live SQL Server; run scripts/live-tests.sh"]
 async fn omitted_character_columns_do_not_request_a_bootstrap_collation() {

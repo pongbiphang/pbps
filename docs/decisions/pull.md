@@ -867,3 +867,37 @@ in `crates/pbps-cli/src/deploy.rs`, which covers:
 - a parent's name reused by another table;
 - a column's tombstone, and an old tombstone whose name was reused;
 - an empty ledger and an unreadable one.
+
+<a id="dec-2147-1"></a>
+
+**DEC-2147.1. The SQL Server pull leaves out a computed column or a
+filtered index that reads a column it leaves out, and tells the two readers
+apart by their stored text where the engine does not (#2147, #2148).**
+#1438 leaves out a key, index, check or foreign key over a column the pull
+cannot hold. A computed column whose expression reads one, and a filtered
+index whose filter alone reads one, were still declared, so bootstrapping
+the pulled table failed at `CREATE TABLE` or `CREATE INDEX`. Each now goes
+with the column, with a limitation naming it. A computed column left out
+this way is a left-out column itself, so an index over it goes too. One
+pass suffices: the engine refuses a computed column that reads another
+(Msg 1759).
+
+The columns read are the engine's resolution, `sys.dm_sql_referenced_entities`
+on each table, as for a check, and under the same managed-schema grant.
+`sys.sql_expression_dependencies` would keep the readers apart by class, but
+returns nothing without database `VIEW DEFINITION` (DEC-1644.1).
+
+The function reports a computed column and a filtered index under one
+`referencing_minor_id`, the `column_id` or the `index_id`, with no column
+that tells them apart (measured on 2025), and the two ids often coincide.
+Where the id is only one of them, the resolution answers alone. Where it is
+both, each resolved column goes to whichever reader's stored definition names
+it bracketed, as the engine stores every column reference. A string literal
+holding `[m]` gives it to both, which at worst leaves out a reader that does
+not read the column, with a limitation saying so. Without that tie-break, a
+filtered index sharing its id with a computed column over a left-out column
+was left out wrongly, and the live test fails.
+
+Pinned by the unit `a_computed_column_or_filter_reading_a_left_out_column_goes_with_it`
+and the live test of the same name, which lays a computed column's id over a
+filtered index's.

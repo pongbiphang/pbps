@@ -418,6 +418,31 @@ pub struct RawCheckColumn {
     pub column: String,
 }
 
+/// What reads a column of its own table besides a key, an index's columns or
+/// a check: a computed column's expression, or a filtered index's filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnReader {
+    Computed,
+    Filter,
+}
+
+/// One column of its own table a computed column or a filtered index reads
+/// (#2147, #2148), so the assembler can leave either out with a column it
+/// leaves out instead of declaring an expression over a column the pulled
+/// table does not have.
+///
+/// The engine's resolution, as for [`RawCheckColumn`], with the stored text
+/// only to tell a computed column from a filtered index that share an id
+/// (`catalog::READ_COLUMNS`).
+#[derive(Debug, Clone)]
+pub struct RawReadColumn {
+    pub object_id: i32,
+    pub reader: ColumnReader,
+    /// The computed column's or the index's name.
+    pub name: String,
+    pub column: String,
+}
+
 /// The physical kind of an index, as `sys.indexes.type` reports it.
 ///
 /// The declarations hold rowstore B-tree indexes, clustered or not (the
@@ -627,6 +652,7 @@ pub struct RawCatalog {
     pub foreign_key_columns: Vec<RawForeignKeyColumn>,
     pub checks: Vec<RawCheck>,
     pub check_columns: Vec<RawCheckColumn>,
+    pub read_columns: Vec<RawReadColumn>,
     pub index_columns: Vec<RawIndexColumn>,
     pub modules: Vec<RawModule>,
     pub object_dependencies: Vec<RawObjectDependency>,
@@ -1314,6 +1340,43 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         table.columns.insert(c.name.clone(), column);
     }
 
+    // A computed column that reads a column left out above names a column
+    // the pulled table does not have, so its `CREATE TABLE` fails (#2147). It
+    // goes too, and is then left out itself, so a key or index over it goes
+    // as well. One pass: no computed column can read another (Msg 1759).
+    let computed_over_left_out: Vec<&RawReadColumn> = raw
+        .read_columns
+        .iter()
+        .filter(|r| {
+            r.reader == ColumnReader::Computed
+                && left_out_columns
+                    .get(&r.object_id)
+                    .is_some_and(|columns| columns.contains(&r.column))
+        })
+        .collect();
+    for r in computed_over_left_out {
+        if let Some(table) = tables.get_mut(&r.object_id) {
+            table.computed.remove(&r.name);
+        }
+        if left_out_columns
+            .entry(r.object_id)
+            .or_default()
+            .insert(r.name.clone())
+        {
+            push_limitation(
+                &mut warnings,
+                &mut limitations,
+                names.get(&r.object_id),
+                format!(
+                    "{}.{}: the computed column reads column `{}`, which was left out of the declarations; it was left out too",
+                    name_of(r.object_id, &names),
+                    r.name,
+                    r.column
+                ),
+            );
+        }
+    }
+
     // Each key, index, foreign key and check over a column left out above,
     // with the columns, keyed as the loops below dedupe their rows: by owning
     // object and name for the first three, by the constraint's id for a check.
@@ -1343,6 +1406,18 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .entry((i.object_id, i.index_name.clone()))
             .or_default()
             .insert(&i.column);
+    }
+    // A filtered index whose filter alone reads one: its `CREATE INDEX`
+    // names a column the pulled table does not have (#2148).
+    for r in raw
+        .read_columns
+        .iter()
+        .filter(|r| r.reader == ColumnReader::Filter && over_left_out(r.object_id, &r.column))
+    {
+        indexes_over_left_out
+            .entry((r.object_id, r.name.clone()))
+            .or_default()
+            .insert(&r.column);
     }
     let mut foreign_keys_over_left_out: BTreeMap<(i32, String), BTreeSet<&str>> = BTreeMap::new();
     for f in raw
@@ -3814,6 +3889,91 @@ mod tests {
         }
         // Those eight and the three columns themselves; nothing else.
         assert_eq!(pulled.limitations.len(), 11, "{:?}", pulled.limitations);
+    }
+
+    /// #2147, #2148: a computed column whose expression reads a left-out
+    /// column, and a filtered index whose filter alone reads one, were still
+    /// declared, so bootstrapping the pulled table failed at `CREATE TABLE`
+    /// or `CREATE INDEX`. Each now goes with the column, and an index over a
+    /// computed column left out this way goes with it in turn. The negative
+    /// cases: a computed column and a filtered index over a kept column stay.
+    #[test]
+    fn a_computed_column_or_filter_reading_a_left_out_column_goes_with_it() {
+        let mut raw = RawCatalog {
+            tables: vec![raw_table(10, "dbo", "t")],
+            ..Default::default()
+        };
+        let mut id = raw_column(10, "id", "int");
+        id.is_nullable = false;
+        let mut m = raw_column(10, "m", "money_t");
+        m.is_user_defined_type = true;
+        let computed = |name: &str, definition: &str| {
+            let mut c = raw_column(10, name, "int");
+            c.is_computed = true;
+            c.computed_definition = Some(definition.into());
+            c
+        };
+        raw.columns = vec![
+            id,
+            raw_column(10, "a", "int"),
+            m,
+            computed("c", "([m]*(2))"),
+            computed("e", "([a]+(1))"),
+        ];
+        let read = |reader, name: &str, column: &str| RawReadColumn {
+            object_id: 10,
+            reader,
+            name: name.into(),
+            column: column.into(),
+        };
+        raw.read_columns = vec![
+            read(ColumnReader::Computed, "c", "m"),
+            read(ColumnReader::Computed, "e", "a"),
+            read(ColumnReader::Filter, "ix_f", "m"),
+            read(ColumnReader::Filter, "ix_g", "a"),
+        ];
+        let index = |name: &str, column: &str, filter: Option<&str>| RawIndexColumn {
+            is_disabled: false,
+            ignore_dup_key: false,
+            object_id: 10,
+            index_name: name.into(),
+            is_unique: false,
+            kind: IndexKind::Nonclustered,
+            filter: filter.map(str::to_owned),
+            column: column.into(),
+            is_included: false,
+            is_descending: false,
+            rows_partitioned: false,
+        };
+        raw.index_columns = vec![
+            index("ix_c", "c", None),
+            index("ix_f", "a", Some("([m] IS NOT NULL)")),
+            index("ix_g", "a", Some("([a] IS NOT NULL)")),
+        ];
+        raw.key_columns = vec![key(10, "pk_t", true, 1, "id")];
+
+        let pulled = assemble(&raw);
+
+        let name = TableName::new("dbo", "t");
+        let t = &pulled.schema.tables[&name];
+        let errors = crate::validate::table(&name, t);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(t.columns.keys().collect::<Vec<_>>(), ["id", "a"]);
+        assert_eq!(t.computed.keys().collect::<Vec<_>>(), ["e"]);
+        assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_g"]);
+        for detail in [
+            "t.c: the computed column reads column `m`, which was left out",
+            "index `ix_c` is over column `c`, which was left out",
+            "index `ix_f` is over column `m`, which was left out",
+        ] {
+            assert!(
+                pulled.limitations.iter().any(|l| l.detail.contains(detail)),
+                "{detail}: {:?}",
+                pulled.limitations
+            );
+        }
+        // Those three and `m` itself; nothing else.
+        assert_eq!(pulled.limitations.len(), 4, "{:?}", pulled.limitations);
     }
 
     #[test]
