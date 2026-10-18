@@ -3619,6 +3619,76 @@ pub async fn key_name_holders(
     Ok(out)
 }
 
+/// A publication that names a table itself (#1489).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamingPublication {
+    pub table: TableName,
+    pub publication: String,
+}
+
+impl NamingPublication {
+    /// The statement that takes the table out of the publication, every
+    /// identifier quoted as the emitter quotes it, so that it can be run as
+    /// shown: `pub_X` or `app."Big t"` mean themselves, not a lowercased
+    /// other object. `None` for a name no identifier can spell.
+    pub fn drop_statement(&self) -> Option<String> {
+        Some(format!(
+            "ALTER PUBLICATION {} DROP TABLE {}.{};",
+            crate::quote(&self.publication).ok()?,
+            crate::quote(&self.table.schema).ok()?,
+            crate::quote(&self.table.name).ok()?
+        ))
+    }
+}
+
+/// The publications that name each of `tables` itself, in `pg_publication_rel`
+/// (#1489, DEC-1489.1). Only those: measured on 16 and 18, `SET UNLOGGED` is
+/// refused on a table a `FOR TABLE` publication lists ("cannot change table
+/// … to unlogged because it is part of a publication"), and taken on one that
+/// is published only `FOR ALL TABLES`, `FOR TABLES IN SCHEMA` or as a
+/// partition of a listed parent. Read in the caller's transaction.
+pub async fn publications_naming(
+    conn: &mut Conn,
+    tables: &[TableName],
+) -> Result<Vec<NamingPublication>, DbError> {
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params: Vec<Param<'_>> = tables
+        .iter()
+        .flat_map(|n| [Param::Str(n.schema.as_str()), Param::Str(n.name.as_str())])
+        .collect();
+    let rows: Vec<String> = (0..tables.len())
+        .map(|i| format!("(${}::text, ${}::text)", 2 * i + 1, 2 * i + 2))
+        .collect();
+    let sql = format!(
+        "SELECT n.nspname AS table_schema, c.relname AS table_name, p.pubname AS publication\n  \
+           FROM pg_catalog.pg_publication_rel pr\n  \
+           JOIN pg_catalog.pg_publication p ON p.oid = pr.prpubid\n  \
+           JOIN pg_catalog.pg_class c ON c.oid = pr.prrelid\n  \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
+           JOIN (VALUES {}) AS w(schema_name, table_name)\n    \
+             ON w.schema_name = n.nspname AND w.table_name = c.relname\n \
+          ORDER BY 1, 2, 3",
+        rows.join(", ")
+    );
+    let mut out = Vec::new();
+    for row in &conn.query_with(&sql, &params).await? {
+        let text = |column: &str| -> Result<String, DbError> {
+            row.try_get::<&str>(column)?
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    DbError::BadRow(format!("the publication query returned a NULL {column}"))
+                })
+        };
+        out.push(NamingPublication {
+            table: TableName::new(text("table_schema")?, text("table_name")?),
+            publication: text("publication")?,
+        });
+    }
+    Ok(out)
+}
+
 /// A permanent table whose foreign key references a partitioned table
 /// (#1595). The engine refuses a permanent table's key to an unlogged table,
 /// but not one through a partitioned table that has, or later gets, an
@@ -3787,6 +3857,26 @@ fn quote_for_regclass(part: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// #1489: the remedy is shown as a statement that runs, so each
+    /// identifier is quoted the way the emitter quotes it.
+    #[test]
+    fn a_publications_drop_statement_quotes_every_identifier() {
+        let found = |schema: &str, table: &str, publication: &str| NamingPublication {
+            table: TableName::new(schema, table),
+            publication: publication.into(),
+        };
+        assert_eq!(
+            found("app", "t", "pub_t").drop_statement().unwrap(),
+            r#"ALTER PUBLICATION "pub_t" DROP TABLE "app"."t";"#
+        );
+        assert_eq!(
+            found("App", "Big \"t\"", "Pub X").drop_statement().unwrap(),
+            r#"ALTER PUBLICATION "Pub X" DROP TABLE "App"."Big ""t""";"#
+        );
+        // No statement for a name no identifier can spell.
+        assert!(found("app", "t", "a\0b").drop_statement().is_none());
+    }
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
     async fn a_failed_canonical_permission_query_restores_both_transaction_scopes() {

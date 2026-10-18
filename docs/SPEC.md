@@ -291,6 +291,8 @@ indexes:
 - **`unlogged: true` makes a PostgreSQL table `UNLOGGED`**, emptied by a crash
   and never on a standby. Switching to it is `destructive`; a permanent table
   may not reference an unlogged one; SQL Server refuses the key (DEC-1443.1).
+  A table a publication lists by name cannot be made unlogged, and the switch
+  is refused naming the publication (DEC-1489.1).
 - **`system_time:` gives a SQL Server table its `PERIOD FOR SYSTEM_TIME`**:
   `period: [start, end]` names two `datetime2` columns, not nullable, and
   `hidden: true` hides both. Under `versioning:` it gives the table system

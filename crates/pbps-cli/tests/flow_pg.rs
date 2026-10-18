@@ -7898,6 +7898,112 @@ fn an_unlogged_table_switches_through_the_cli_behind_its_risk() {
     switch(true, &["--allow", "destructive"]);
 }
 
+/// Making a table unlogged is refused by name when a publication lists it
+/// (#1489, DEC-1489.1): the engine refuses `SET UNLOGGED` there and nowhere
+/// else (measured on 16 and 18), so a table published only through its
+/// schema or `FOR ALL TABLES` switches, and a publication added between the
+/// plan and the apply is refused before anything runs.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_table_a_publication_lists_is_refused_unlogged_by_name() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "unlogged-1489");
+    let connection = own.connection().to_owned();
+    on_server(
+        &connection,
+        "CREATE SCHEMA app; CREATE SCHEMA other; \
+         CREATE TABLE app.t (id integer PRIMARY KEY); \
+         CREATE TABLE app.free (id integer PRIMARY KEY); \
+         CREATE TABLE app.late (id integer PRIMARY KEY); \
+         CREATE TABLE other.s (id integer PRIMARY KEY); \
+         CREATE PUBLICATION pub_t FOR TABLE app.t; \
+         CREATE PUBLICATION pub_s FOR TABLES IN SCHEMA other; \
+         CREATE PUBLICATION pub_all FOR ALL TABLES",
+    );
+    let d = Demo::new("unlogged-1489");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    let declare_unlogged = |file: &str| {
+        let path = d.dir.join(format!("schema/{file}.yml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("unlogged: true"), "{text}");
+        std::fs::write(&path, format!("{text}\nunlogged: true\n")).unwrap();
+        text
+    };
+    let unlogged = |table: &str| {
+        scalar(
+            &connection,
+            &format!(
+                "SELECT (relpersistence = 'u')::int::bigint FROM pg_class WHERE oid = '{table}'::regclass"
+            ),
+        ) == 1
+    };
+    let plan = d.dir.join("plan.json");
+
+    // Listed by name: refused, naming the publication and the remedy.
+    let original = declare_unlogged("app.t");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let o = d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.t is listed by the publication `pub_t`")
+            && stderr(&o).contains(r#"ALTER PUBLICATION "pub_t" DROP TABLE "app"."t";"#)
+            && stderr(&o).contains("DEC-1489.1"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!unlogged("app.t"));
+    // The remedy as shown is a statement that runs, and the plan then goes.
+    let said = stderr(&o);
+    let statement = said
+        .split("remove it there (`")
+        .nth(1)
+        .and_then(|rest| rest.split("`)").next())
+        .unwrap_or_else(|| panic!("no statement in {said}"))
+        .to_owned();
+    on_server(&connection, &statement);
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    on_server(&connection, "ALTER PUBLICATION pub_t ADD TABLE app.t");
+    std::fs::write(d.dir.join("schema/app.t.yml"), original).unwrap();
+
+    // Published only through its schema, or by `FOR ALL TABLES`, or not at
+    // all: each switches, and the engine takes it.
+    declare_unlogged("other.s");
+    declare_unlogged("app.free");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "destructive"],
+    ));
+    succeeds(d.run(&["verify", "--db", &connection]));
+    assert!(unlogged("other.s"));
+    assert!(unlogged("app.free"));
+
+    // Listed between the plan and the apply: the apply asks again.
+    declare_unlogged("app.late");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    on_server(
+        &connection,
+        "CREATE PUBLICATION pub_late FOR TABLE app.late",
+    );
+    let o = approved_apply(&d, &connection, &plan, &["--allow", "destructive"]);
+    assert_ne!(code(&o), 0, "{}", stdout(&o));
+    assert!(
+        stderr(&o).contains("app.late is listed by the publication `pub_late`"),
+        "{}",
+        stderr(&o)
+    );
+    assert!(!unlogged("app.late"));
+}
+
 /// An array column goes the whole way through the CLI (#1167): pulled as
 /// `integer[]`, widened to `bigint[]` by a saved plan that applies on
 /// populated rows, verifies and leaves nothing to plan; a narrowing is refused
