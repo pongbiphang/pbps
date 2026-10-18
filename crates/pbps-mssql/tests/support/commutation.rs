@@ -1070,6 +1070,76 @@ data:
     },
 ];
 
+/// The audit's plans that hold a dependency an effect states which only
+/// this engine plans (#2091): a module edited in place, and a computed
+/// column. PostgreSQL's list holds the rest; what neither engine can show is
+/// said there. The module's pair waits on #2192: no effect yet makes a
+/// caller need the callee it binds to, so the audit leaves that listed gap
+/// out, as the sample does.
+const HELD: &[Scenario] = &[
+    Scenario {
+        name: "held_a_function_edited_before_a_bound_caller",
+        pair: ["AlterModule", "CreateModule"],
+        // The effects do not yet see the caller's reference, so the pair
+        // shows as independent and the engine refuses it swapped; once they
+        // do, `AlterModule`'s rewrite orders it here.
+        gap: Some(2192),
+        uid_order: None,
+        base: r#"
+table: app.t
+columns:
+  id: {type: int, nullable: false}
+primary_key: {name: pk_t, columns: [id]}
+
+---
+function: app.f(int)
+definition: |-
+  (@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @a END
+"#,
+        desired: r#"
+table: app.t
+columns:
+  id: {type: int, nullable: false}
+primary_key: {name: pk_t, columns: [id]}
+
+---
+function: app.f(int)
+definition: |-
+  (@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @a + 1 END
+
+---
+function: app.g(int)
+definition: |-
+  (@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN app.f(@a) END
+"#,
+    },
+    Scenario {
+        name: "held_a_computed_column_dropped_with_its_index",
+        pair: ["DropIndex", "DropComputedColumn"],
+        gap: None,
+        uid_order: None,
+        base: r#"
+table: app.t
+columns:
+  id: {type: int, nullable: false}
+  a: {type: int}
+primary_key: {name: pk_t, columns: [id]}
+computed:
+  g: {expression: '[a]+(1)'}
+indexes:
+  ix_g:
+    columns: [g]
+"#,
+        desired: r#"
+table: app.t
+columns:
+  id: {type: int, nullable: false}
+  a: {type: int}
+primary_key: {name: pk_t, columns: [id]}
+"#,
+    },
+];
+
 struct Ms;
 
 impl Engine for Ms {
@@ -1192,7 +1262,7 @@ impl Engine for Ms {
 #[tokio::test]
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
 async fn pairs_the_effects_call_independent_commute_on_the_engine() {
-    core::suite(&Ms, SCENARIOS, "pbps_commute").await;
+    core::suite(&Ms, SCENARIOS, HELD, "pbps_commute").await;
 }
 
 /// A column added with a default the insert's postcondition cannot hold it

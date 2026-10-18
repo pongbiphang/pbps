@@ -6755,3 +6755,41 @@ now order it, so it is no longer a pair they call independent.
 **DEC-2158.1. The resolver uses `Keep` for every pair involving an unowned
 step, refusing a reversal by name because unrecorded owners leave reordered
 dependencies unverified.**
+
+<a id="dec-2091-1"></a>
+
+**DEC-2091.1. Each effect has a unit pin; the commutation audit swaps every
+independent pair, on plans held outside the sample's cap.** The #1965
+mutation audit deleted 20 effects one at a time and 15 left every test
+green. Deleting an effect only makes the verifier more permissive: today's
+passes still order the plan, so no output moves. The commutation sample
+lists pairs that are already independent, so the pair a deletion frees is
+not on it.
+
+Two guards, at two costs. A unit pin in `order::tests` per effect: a
+two-step plan that nothing else orders, refused when run backwards. It runs
+in `quick`, and `scripts/effect-mutations.py` deletes each effect and checks
+a test notices. And an audit mode of the commutation suite,
+`PBPS_COMMUTE_ALL=1`, which swaps every pair the effects call independent in
+each scenario's plan and runs it on the engine. It also runs a `HELD` list
+per engine: plans that hold one effect's dependency. Those are audit-only,
+so the sample's cap of 30 (DEC-1965.1) and the merge group's cost are
+unchanged. `effect-mutations.py --audit` checks that the engine notices each
+deletion.
+
+Not every effect can be shown on an engine. An effect that makes a step wait
+for rows it reads, such as a check or unique key after the rows, or a
+retype's or new column's values, ends the same in either order on a valid
+plan. A new table's foreign key is never inside its `CREATE`, because the
+differ splits it out. A primary key's drop waits on foreign keys the differ
+always drops first, with a step that needs the key itself. For these the
+unit pin is the guard, and the script lists them as `UNSHOWABLE` so a change
+there is noticed. A module edited in place is listed until #2192 gives a
+caller's reference an effect. The audit found that gap on SQL Server.
+
+Pinned by the 15 pins from
+`a_new_table_s_foreign_key_waits_for_the_table_it_references` to
+`a_computed_column_s_drop_follows_the_drop_of_an_index_over_it`
+(`crates/pbps-diff/src/order/tests.rs`), and the `HELD` lists in
+`crates/pbps-pg/tests/support/commutation.rs` and
+`crates/pbps-mssql/tests/support/commutation.rs`.

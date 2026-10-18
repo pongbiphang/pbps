@@ -1103,6 +1103,218 @@ grants:
     },
 ];
 
+/// The audit's plans that hold a dependency an effect states, one per effect
+/// an engine can show (#2091): deleted, the effect leaves the pair
+/// independent, the audit swaps it, and the engine refuses. Not in the
+/// sample, so not capped; each names in `pair` the two steps it orders.
+/// SQL Server's list holds the kinds only it plans.
+///
+/// Some effects no plan the differ makes can show, and their guard is the
+/// unit pin alone (`order::tests`):
+/// - the ones that read rows a valid plan already leaves valid (a check or a
+///   unique key after the rows, a retype's or a new column's values), which
+///   end the same in either order;
+/// - a new table's `Exists` of the table its foreign key references, since
+///   the differ splits every foreign key out of the `CREATE`;
+/// - a primary key's drop waiting on the foreign keys into it, since the
+///   differ drops each of those with a `DropForeignKey`, which already
+///   needs the key standing.
+const HELD: &[Scenario] = &[
+    Scenario {
+        name: "held_a_column_added_to_a_renamed_table",
+        pair: ["RenameTable", "AddColumn"],
+        gap: None,
+        uid_order: None,
+        base: r#"
+table: app.u
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+"#,
+        desired: r#"
+table: app.u2
+renamed_from: app.u
+columns:
+  id: {type: integer, nullable: false}
+  c: {type: integer}
+primary_key: [id]
+"#,
+    },
+    Scenario {
+        name: "held_an_index_over_a_renamed_column",
+        pair: ["RenameColumn", "AddIndex"],
+        gap: None,
+        uid_order: None,
+        base: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+  b: {type: integer}
+primary_key: [id]
+"#,
+        desired: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+  b2: {type: integer, renamed_from: b}
+primary_key: [id]
+indexes:
+  ix_b2:
+    columns: [b2]
+"#,
+    },
+    Scenario {
+        name: "held_a_column_dropped_with_its_index",
+        pair: ["DropIndex", "DropColumn"],
+        gap: None,
+        uid_order: None,
+        base: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+  c: {type: integer}
+primary_key: [id]
+indexes:
+  ix_c:
+    columns: [c]
+"#,
+        desired: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+"#,
+    },
+    Scenario {
+        name: "held_an_index_over_a_new_column",
+        pair: ["AddColumn", "AddIndex"],
+        gap: None,
+        uid_order: None,
+        base: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+"#,
+        desired: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+  c: {type: integer}
+primary_key: [id]
+indexes:
+  ix_c:
+    columns: [c]
+"#,
+    },
+    Scenario {
+        name: "held_a_default_for_a_retyped_column",
+        pair: ["AlterColumnType", "AlterColumnDefault"],
+        gap: None,
+        uid_order: None,
+        base: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+  c: {type: integer}
+primary_key: [id]
+"#,
+        desired: r#"
+table: app.t
+columns:
+  id: {type: integer, nullable: false}
+  c: {type: text, default: "'abc'::text"}
+primary_key: [id]
+"#,
+    },
+    Scenario {
+        name: "held_a_key_into_a_new_primary_key",
+        pair: ["SetPrimaryKey", "AddForeignKey"],
+        gap: None,
+        uid_order: None,
+        base: r#"
+table: app.p
+columns:
+  id: {type: integer, nullable: false}
+
+---
+table: app.c
+columns:
+  id: {type: integer, nullable: false}
+  pid: {type: integer}
+primary_key: [id]
+"#,
+        desired: r#"
+table: app.p
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+
+---
+table: app.c
+columns:
+  id: {type: integer, nullable: false}
+  pid: {type: integer}
+primary_key: [id]
+foreign_keys:
+  fk_p:
+    columns: [pid]
+    references: app.p(id)
+"#,
+    },
+    Scenario {
+        name: "held_a_parent_row_deleted_after_the_key_into_it",
+        pair: ["DropForeignKey", "DeleteRow"],
+        gap: None,
+        uid_order: None,
+        base: r#"
+table: app.p
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+data:
+  mode: exact
+  rows:
+    1: {}
+
+---
+table: app.c
+columns:
+  id: {type: integer, nullable: false}
+  pid: {type: integer}
+primary_key: [id]
+foreign_keys:
+  fk_p:
+    columns: [pid]
+    references: app.p(id)
+data:
+  mode: exact
+  rows:
+    5: {pid: 1}
+"#,
+        desired: r#"
+table: app.p
+columns:
+  id: {type: integer, nullable: false}
+primary_key: [id]
+data:
+  mode: exact
+  rows: {}
+
+---
+table: app.c
+columns:
+  id: {type: integer, nullable: false}
+  pid: {type: integer}
+primary_key: [id]
+data:
+  mode: exact
+  rows:
+    5: {pid: 1}
+"#,
+    },
+];
+
 struct Pg(pbps_pg::Postgres);
 
 impl Engine for Pg {
@@ -1228,5 +1440,5 @@ async fn with_role<F: std::future::Future<Output = ()>>(run: impl FnOnce(String)
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 async fn pairs_the_effects_call_independent_commute_on_the_engine() {
     let pg = Pg(pbps_pg::Postgres::new());
-    with_role(|role| async move { core::suite(&pg, SCENARIOS, &role).await }).await;
+    with_role(|role| async move { core::suite(&pg, SCENARIOS, HELD, &role).await }).await;
 }
