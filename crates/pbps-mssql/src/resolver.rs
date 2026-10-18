@@ -1,10 +1,11 @@
 //! Resolver support for SQL Server (ADR-0016): advisory discovery, the
 //! dedicated-server instance and session reads, and the analysis-scope
 //! qualification — environment facts, the versioned compatibility rule and
-//! the deployment authorization context (#611). Qualification is not a
-//! binding adapter; SQL Server binding stays unimplemented (#619, #620).
+//! the deployment authorization context (#611) — and the target capture
+//! (#2141). Planning does not use the capture yet (#2143).
 
 pub mod authorization;
+pub mod capture;
 pub mod compatibility;
 pub mod environment;
 

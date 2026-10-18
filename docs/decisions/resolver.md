@@ -3523,3 +3523,248 @@ copy is not filled over), live; and the `resolver::draft` unit tests
 `chained_shapes_wait_for_the_step_that_creates_what_they_name` and
 `names_created_between_steps_are_later_only_for_modules_before_them` and
 `a_generated_columns_later_names_follow_its_tables_step`.
+
+<a id="dec-2141-1"></a>
+
+**DEC-2141.1. The SQL Server target capture binds only id-bound references,
+leaves a one-part name to its candidates, lets the engine match every name,
+and needs both VIEW DEFINITION and SELECT on the dependency catalog
+(#2141, #620 (a)).** It implements DEC-619.1 and DEC-619.2 in
+`pbps-mssql/src/resolver/capture/`, in the shape of `pbps-pg`'s capture.
+Planning does not use it yet (#2143).
+
+- **A dependency row is one of four things**, measured on the pinned
+  build:
+  - a name in another database or server, which refuses by name;
+  - a one-part `EXEC` (`is_caller_dependent`, no id, `EXECUTE AS` or not).
+    A call to a system procedure leaves no row at all, even when `dbo`
+    holds a procedure of that name;
+  - a one-part name in a body that is not schema-bound. Its row carries the
+    id it resolves to *now*, which is no binding: the module is recorded as
+    runtime-bound and the name's candidates stand for it;
+  - an id-bound reference, schema-bound or two-part, which is a binding.
+    With no id the name does not exist yet, and it refuses: nothing can say
+    what it will bind.
+
+  A one-part *type* in a body, such as a local variable's, is the same
+  case: its row's id moves to a type arriving in the module's schema
+  (measured), so it is runtime-bound, with `sys.types` candidates in the
+  module's schema and `dbo`.
+
+  Types bind where they are used: a column's from `sys.columns`, which
+  the dependency catalog does not list, and a parameter's from
+  `sys.parameters`.
+- **A runtime-bound name's candidates** are DEC-619.2's. A call's sets are
+  asked whatever `sys` holds, and the assessment (#2142) reads them in the
+  engine's order: whether `sys` holds the name is that set's own
+  membership, sealed with the rest.
+- **The engine matches every requested name**, by a join under `COLLATE
+  DATABASE_DEFAULT`. Names compare under the database's collation, usually
+  case-insensitive and possibly accent-insensitive. A match folded by hand
+  would answer differently from the resolution it stands for.
+- **Both permissions are required.** Without SELECT on
+  `sys.sql_expression_dependencies`, which only `db_owner` holds by
+  default, the read is refused (229). With SELECT but without VIEW
+  DEFINITION on the database, it reads no rows, which cannot be told from no
+  references. This is measured on #2141 as a `db_ddladmin`; #619's §4 named
+  only the second. Each missing permission refuses by name before the read.
+- **Schemas and principals are complete sets.** A call's candidates are the
+  principals' default schemas, and every owner is a principal. An object the
+  engine owns that something names, such as a `sys` view or a system
+  procedure, is in the capture by identity only.
+- **What cannot be read is refused, not sealed.** A module created `WITH
+  ENCRYPTION` reads its definition as NULL even to `sa`, so it refuses by
+  name. A user-defined table type is captured with its columns, CHECKs and
+  keys. Its own table object is the engine's (`is_ms_shipped = 1`), so the
+  ordinary object reads never list it, and a type rebuilt with another shape
+  would otherwise read as unchanged.
+- **A key is its ordered columns.** A PRIMARY KEY or UNIQUE constraint is
+  captured with its key columns and its index's kind, and a table with its
+  unique indexes that are no constraint. A foreign key binds its table and,
+  by index id, the key it references; its column pairs and actions are
+  properties. A key rebuilt under the same name on another column would
+  otherwise read as unchanged, though no column did.
+- **A state that keeps its text is a property.** A CHECK disabled with
+  `NOCHECK`, or enabled without `WITH CHECK`, keeps its definition; so does
+  a disabled trigger or a disabled key index. Each stops enforcing what it
+  says, so its disabled (and a CHECK's trusted) state is captured, as a
+  foreign key's is.
+- **A seal needs its runtime candidates.** `capture_qualified` refuses, by
+  the module's name, a scope that lacks a set its runtime-bound names need.
+  Sealed so, a later recapture would reuse the short scope, and an object
+  arriving under the omitted name would rebind the module with no difference
+  to show. A set asked and found empty is a required absence; one never
+  asked is no answer.
+- **Replication and identity are part of the shape.** An identity's seed,
+  increment and `NOT FOR REPLICATION` are captured, a table type's columns
+  included, as is `NOT FOR
+  REPLICATION` on a CHECK, a foreign key and a trigger. On a CHECK or a
+  foreign key it also marks the constraint untrusted (measured), so either
+  property shows the change.
+- **Ownership matches the catalog's spelling.** A declaration spelled
+  differently owns nothing, which leaves its record unqualified, never
+  another object's.
+
+**Pinned by** `mssql_each_surface_gets_the_engines_answer`,
+`mssql_a_one_part_names_candidates_see_an_arrival_in_the_modules_schema_only`,
+`mssql_a_schema_bound_binding_is_the_targets_observed_one`,
+`mssql_unreadable_dependency_metadata_never_verifies`,
+`mssql_a_procedure_calls_candidates_follow_sys_and_the_executing_principals`,
+`mssql_a_recapture_finds_a_lasting_change_from_another_session_and_not_a_restored_one`,
+`mssql_ownership_follows_the_declaration_and_an_owner_change_is_a_difference`
+`mssql_a_candidate_is_matched_under_the_databases_collation`,
+`mssql_an_encrypted_module_refuses_by_name` and
+`mssql_a_table_types_shape_is_captured_through_the_procedure_that_takes_it`
+`mssql_a_keys_columns_and_a_foreign_keys_target_key_are_captured` and
+`mssql_a_checks_disabled_and_untrusted_states_are_differences` and
+`mssql_a_one_part_type_in_a_body_is_runtime_bound_with_type_candidates`,
+`mssql_a_seal_without_its_runtime_candidates_refuses` and
+`mssql_an_identitys_seed_and_not_for_replication_are_differences`, live;
+and the `resolver::capture` unit tests.
+
+<a id="dec-2153-1"></a>
+
+**DEC-2153.1. The SQL Server capture compares every column a catalog view
+reports, minus a reasoned skip list (#2153, in #2150).** The maintainer
+agreed on 2026-10-18, after #2150's seventh review round. It applies
+§8's rule (DEC-619.4) to the capture, and the capture rule moves to
+`mssql-capture-v2`.
+
+**Why.** From round b on, every finding was one column the capture's
+hand-written projection did not read:
+
+- a key's columns;
+- a CHECK's, trigger's and index's disabled state;
+- an identity's seed;
+- `NOT FOR REPLICATION`;
+- a table type's identity;
+- a unique index's filter.
+
+An unread column compares as unchanged, so an object rebuilt with only that
+column changed recaptured as the same. A hand-written list misses one
+column after another, which is why §8 rejected it for the externals file.
+
+**The rule** (`pbps-mssql/src/resolver/capture/columns.rs`, `whole.rs`):
+
+- **Each view is read whole.** The 17 views the capture's objects come
+  from are `sys.objects`, the module, synonym, constraint, key, foreign-key
+  and trigger views, the three column views, the index views,
+  `sys.parameters` and the two type views. Each is read from its own column
+  list in `sys.all_columns`, and each row is filed under the object, column
+  or type it describes.
+- **Values are read without loss.** A value is converted to text in a style
+  that keeps it whole:
+  - ISO 8601 with milliseconds for a date or time, since the default
+    style keeps a `datetime` only to the minute;
+  - 17 digits for a `float`;
+  - hex for a binary value.
+- **What a rule does with a column.**
+  - **An id is compared as the identity it names:** a schema, principal,
+    object, type, column, index, data space, XML schema collection or
+    column encryption key. A table type's own table object is named by its
+    type.
+  - **Some columns ending in `_id` are compared as reported,** each for a
+    reason. A position (`column_id`, `parameter_id`, `index_column_id`,
+    `constraint_column_id`) is the same on every database of the same
+    shape, and `system_type_id` is an engine constant.
+  - **A few columns are skipped:**
+    - `create_date` and `modify_date`, which differ by construction;
+    - an identity's `last_value`, a status;
+    - each row's own key;
+    - a table type's own table object, read through its columns.
+  - **Any column no rule names is compared as reported**, so a column a
+    later build adds is compared before anyone names it.
+  - **An id column no rule names refuses by name.** Compared raw, it would
+    compare one database's numbering.
+- **A table type's own objects bind nothing to follow.** Its computed
+  column, DEFAULT and CHECK may not call a user function on the pinned
+  build (2785, 4105, measured), so its dependency rows name only its own
+  columns. Should a build allow more, the capture refuses that type by name
+  rather than leave the function out of its closure. A constraint on its own
+  table object, such as a column's DEFAULT that `default_object_id` names,
+  stands as its type's, since its name is the engine's and its definition
+  is in the type's structure. This answers #2150's second ready review.
+- **A bound DEFAULT or RULE is a binding.** A standalone DEFAULT or RULE
+  bound with `sp_bindefault` or `sp_bindrule` is what its column or alias
+  type runs. So a column's or a type's `default_object_id` or
+  `rule_object_id` naming one is a binding, and its object, definition
+  included, joins the closure. The type pass and the object pass alternate
+  until neither finds anything new, since a type can bind a rule. This
+  answers #2150's third ready review. The same review's
+  engine-generated-name finding is deferred to #2157, for #2142's
+  target-versus-scratch comparison.
+- **A sequence and an XML schema collection are compared too.**
+  `sys.sequences` is one of the views read whole: a sequence a DEFAULT
+  draws from is compared on its declaration. Its `current_value`,
+  `last_used_value` and `is_exhausted` are skipped as status. A typed
+  `xml` column's collection is named together with the schemas it holds
+  (`XML_SCHEMA_NAMESPACE`), so `ALTER XML SCHEMA COLLECTION … ADD` differs.
+  This answers #2150's fourth ready review.
+- **A data space and a column encryption key are named with their
+  definitions.** A partition scheme carries its function, boundaries and
+  destinations, a NEXT USED filegroup included, since `SPLIT RANGE` moves
+  rows without renaming anything. An encryption key carries its values and
+  their master keys. A `sql_variant` is read in style 126, which keeps a
+  date to the millisecond. This answers #2150's fifth ready review.
+- **No stand-in can collide.** An object's indexes are a list in name
+  order, a heap (which has no name) as `null`, since any text could also be
+  an index's name. A system-procedure candidate must name `sys`, the only
+  schema that holds one; any other refuses rather than seal `sys` members
+  under it. This answers #2150's sixth ready review.
+- **Each kind's own view is read whole.** `sys.tables`, `sys.views` and
+  `sys.procedures` add what only that kind has: a table's temporal, ledger,
+  lock-escalation and durability settings, a view's CHECK OPTION, a
+  procedure's startup flag. A table's `max_column_id_used` is skipped as
+  history, since the same shape reads differently by the columns it once
+  had. This answers #2150's seventh ready review.
+- **Every catalog view is classed** (`catalog.rs`). Each of the 311 views
+  the pinned build reports, the dynamic management views aside, is read
+  whole, read as the definition an id names, read by the typed reads,
+  refused by name, or set aside with its reason. The refused are CLR
+  objects and types, external tables and numbered procedures. The set
+  aside include compatibility views, instance scope, telemetry, Service
+  Broker, authorization (read by #611's context), derived usages and
+  documentation. The audit, at the maintainer's request, added 21 views
+  read whole: masking, trigger order, periods, change tracking, full-text,
+  the per-index views, partitions, edge constraints and security policies.
+  A security policy on a captured object joins its closure. A full-text
+  stoplist is compared by its words and a search property list by its
+  properties.
+- **An object a row names joins the closure.** Every object of the
+  database's own that a translated row names by id, such as a temporal
+  table's history table, a ledger view or an edge constraint's tables, is
+  read too. Its own properties are then compared, not only its name.
+- **A retained identity must be one the capture can look up:** an object
+  or a type by schema and name, or a schema or principal. Any other
+  refuses, rather than being sealed as asked yet never read. This answers
+  #2150's ninth ready review.
+- **Every dependency class a module can report binds.**
+  - **Class 7, an index,** binds its table, whose properties hold the index.
+  - **Class 10, an XML schema collection,** binds the collection with the
+    schemas it holds.
+  - **Class 21, a partition function through `$PARTITION`,** binds the
+    function with its parameters and boundaries. A partition function has
+    no schema, so its schema-less name is no runtime-bound name (measured).
+- **Settings without a name of their own.** A full-text catalog is compared
+  with its accent sensitivity and default flag. A full-text index's system
+  stoplist (`0`) and no stoplist (`NULL`) stay distinct. Two partition
+  schemes sharing a function each carry the whole function. This answers
+  #2150's tenth ready review.
+- **The typed reads stay.** The dependency classification, the closure,
+  the candidates and ownership read them (DEC-2141.1). The whole rows are
+  what a capture compares.
+
+**Pinned by** `mssql_every_catalog_column_has_a_rule_or_is_compared` (every
+column the pinned build reports for every view has a rule or may be compared
+as reported), `mssql_a_column_no_rule_names_is_compared` (a unique
+index's filter and a column's `SPARSE`) and
+`mssql_a_table_types_expressions_call_no_user_function` and
+`mssql_a_bound_default_or_rule_is_a_binding_and_its_definition_is_compared`
+and `mssql_a_sequences_declaration_and_an_xml_collections_schemas_are_compared`,
+live; and
+`a_dependency_of_a_table_types_own_objects_refuses`,
+`a_heap_and_an_index_named_like_a_stand_in_are_both_kept` and
+`a_system_procedure_set_naming_another_schema_refuses`. Each test fails with its part
+of the rule removed. The rebuilt-alike case of
+`mssql_an_identitys_seed_and_not_for_replication_are_differences` fails if
+the dates are compared.
