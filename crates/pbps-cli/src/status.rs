@@ -412,6 +412,16 @@ fn record_catalog_findings(
         record_status_issue(row, "drift", unexpressible.join("; "));
     }
 
+    // What the scoped read itself refuses by name: a partition nobody
+    // declared under a managed parent (#1170), or a partition of an external
+    // parent with parts of its own or held by uid (#1533). `verify` and
+    // `plan --db` refuse these, so `status` calls the environment drifted
+    // too, never `ok` on an unchanged parent checksum (#1845).
+    if !scoped.unexpressible.is_empty() {
+        record_drift(row, entry.id, &name);
+        record_status_issue(row, "drift", scoped.unexpressible.join("; "));
+    }
+
     // Decided here and recorded in two places: drift right away, so that it
     // keeps outranking an `unmanaged: warn` on the row; a failure at the very
     // end, so that nothing established in between is dropped.
@@ -1016,6 +1026,116 @@ mod tests {
         let ids: Vec<&str> = findings.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["state.drift", "state.unmanaged-refused"]);
         assert!(findings[1].message.contains("dbo.surprise"));
+    }
+
+    /// #1845: what the scoped read refuses by name is drift to `status`, as
+    /// it is to `verify`, even while the parent's checksum is unchanged and
+    /// `unmanaged: ignore` reports no stray object.
+    #[test]
+    fn a_partition_the_scoped_read_refuses_is_drift() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionOf, Table, TableName};
+        let parent_name = TableName::new("app", "ev");
+        let mut ids = pbps_model::IdsFile::default();
+        ids.tables.insert(
+            pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.ev", 0),
+            parent_name.clone(),
+        );
+        let parent = |external: bool| Table {
+            partition_by: Some(PartitionBy {
+                external,
+                columns: vec!["id".into()],
+                strategy: Default::default(),
+            }),
+            ..Table::default()
+        };
+        let partition = |own_check: bool| {
+            let mut t = Table {
+                partition_of: Some(PartitionOf {
+                    parent: parent_name.clone(),
+                    bound: PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Table::default()
+            };
+            if own_check {
+                t.checks.insert(
+                    "ck_own".into(),
+                    pbps_model::CheckConstraint {
+                        expression: "id > 0".into(),
+                    },
+                );
+            }
+            t
+        };
+        let status_of = |external: bool, part: Table| {
+            let mut recorded = pbps_model::Schema::default();
+            recorded
+                .tables
+                .insert(parent_name.clone(), parent(external));
+            let entry = pbps_db::LedgerEntry {
+                id: 9,
+                applied_at: "2026-10-18T05:00:00.000".into(),
+                snapshot: pbps_model::StateSnapshot::new(
+                    pbps_model::StateKind::Apply,
+                    recorded,
+                    ids.clone(),
+                    "ci-deploy",
+                ),
+            };
+            let mut live = pbps_model::Schema::default();
+            // A live read cannot say a parent's partitions are external; the
+            // scope sets it from what is compared against.
+            live.tables.insert(parent_name.clone(), parent(false));
+            live.tables.insert(TableName::new("app", "ev_x"), part);
+            let pulled = pbps_db::catalog::Pulled {
+                schema: live,
+                ..Default::default()
+            };
+            let external_parents = if external {
+                [parent_name.clone()].into()
+            } else {
+                Default::default()
+            };
+            let scoped = pbps_diff::scope(
+                &pulled.schema,
+                &ids,
+                &recorded_modules(&entry),
+                &external_parents,
+            );
+            let mut r = row("prod", "ok");
+            record_catalog_findings(
+                &mut r,
+                &entry,
+                &pulled,
+                &scoped,
+                Ok(Default::default()),
+                pbps_config::Unmanaged::Ignore,
+            );
+            r
+        };
+
+        // A partition nobody declared under a managed parent (#1170).
+        let r = status_of(false, partition(false));
+        assert_eq!(r.state, "drift", "{r:?}");
+        assert!(
+            r.detail.as_deref().unwrap_or_default().contains(
+                "app.ev_x is a partition of the managed table app.ev and is not declared"
+            ),
+            "{r:?}"
+        );
+        // A partition of an external parent with a part of its own (#1533).
+        let r = status_of(true, partition(true));
+        assert_eq!(r.state, "drift", "{r:?}");
+        assert!(
+            r.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("whose partitions are external, and holds"),
+            "{r:?}"
+        );
+        // Negative: an external partition only as its parent makes it.
+        let r = status_of(true, partition(false));
+        assert_eq!(r.state, "ok", "{r:?}");
     }
 
     /// A ledger entry that recorded an empty schema, and a catalog that has one
