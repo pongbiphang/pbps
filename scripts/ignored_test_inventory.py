@@ -578,6 +578,12 @@ PULL_REQUEST_OMISSION = "${{ github.event_name != 'pull_request' }}"
 # reads as `true` as readily, is read as empty and refused.
 KEEPS_FAILURES = ("false", "${{ false }}")
 
+# Every key the readings below look for, each by one spelling: unquoted, with
+# its colon right after it. YAML takes the same key quoted or with whitespace
+# before the colon, and those readings would not see it, so any other spelling
+# of one of these is refused and only the one they read passes (#1863).
+AUDITED_KEYS = ("if", "run", "continue-on-error", "strategy", "matrix", "include", "exclude", "runs-on")
+
 
 def workflow_runs(source, job, platform=None):
     """Read the repository's run scalar/block subset; ambiguous owners fail."""
@@ -586,6 +592,18 @@ def workflow_runs(source, job, platform=None):
     tail = source[match.end():]
     following = re.search(r"^  [\w-]+:\s*$", tail, re.M)
     body = tail[:following.start()] if following else tail
+    # A block scalar's lines are its text, not mapping entries: they run on
+    # while indented past the column of the key that opened it.
+    block = None
+    for line in body.splitlines():
+        if block is not None:
+            if not line.strip() or len(line) - len(line.lstrip(" ")) > block: continue
+            block = None
+        key = re.match(r"(\s*(?:-\s+)?)(?:(['\"])([\w-]+)\2|([\w-]+))(\s*):(?:\s|$)", line)
+        if not key: continue
+        require(not ((key[3] or key[4]) in AUDITED_KEYS and (key[2] or key[5])),
+                f"an alternate spelling of a key needs an explicit audit: {job}: {line.strip()}")
+        if re.search(r":\s*[|>][-+0-9]*\s*(?:#.*)?$", line): block = len(key[1])
     if platform is not None:
         runner = re.search(r"^    runs-on: ([\w-]+)\s*$", body, re.M)
         prefix = {"linux": "ubuntu-", "win32": "windows-", "darwin": "macos-"}[platform]
