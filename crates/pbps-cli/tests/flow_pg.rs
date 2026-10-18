@@ -26289,8 +26289,8 @@ fn trap_operators(schema: &str) -> String {
 /// the managed schema, the path an apply's batches carry. A pull, a connected
 /// plan with its probes, an apply that drops a key the declaration never
 /// named, deletes a declared row a child could still reference, and updates
-/// and deletes rows by a `varchar` key, and `doctor` all run without
-/// springing one. On 16 and 18. Before, the apply's key lookup compared
+/// and deletes rows by a `varchar` key, grants a declared INSERT's serial
+/// sequence USAGE (#1892), and `doctor` all run without springing one. On 16 and 18. Before, the apply's key lookup compared
 /// `conrelid` with a `regclass` on `app`'s path and the trap there refused
 /// the plan, and a row write's `"k" = E'a'` called the `varchar` trap.
 #[test]
@@ -26328,6 +26328,17 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
         let coded = "table: app.v\ncolumns:\n  k: {type: varchar(10), nullable: false}\n  \
                      n: {type: integer}\nprimary_key: {columns: [k]}\ndata:\n  mode: exact\n  rows:\n";
         write("v", &format!("{coded}    a: {{n: 1}}\n    b: {{n: 2}}\n"));
+        // A serial whose sequence a declared INSERT grants USAGE on: the
+        // grant's catalog read is pbps's own (#1892).
+        write(
+            "s",
+            "table: app.s\ncolumns:\n  id: {type: serial}\nprimary_key: {columns: [id]}\n",
+        );
+        let writer = format!("pbps_trap_writer_{}", std::process::id());
+        on_server(
+            connection,
+            &format!("DROP ROLE IF EXISTS {writer}; CREATE ROLE {writer}"),
+        );
         succeeds(d.run(&["plan"]));
         d.commit();
         succeeds(d.run(&["bootstrap", "--db", connection]));
@@ -26362,6 +26373,11 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
         // deletes row `b` by their `varchar` key.
         write("k", &keyed(70, "replica_identity: primary_key\n"));
         write("v", &format!("{coded}    a: {{n: 5}}\n"));
+        std::fs::write(
+            d.dir.join(format!("schema/{writer}.yml")),
+            format!("role: {writer}\ngrants:\n  schema::app: [usage]\n  app.s: [insert]\n"),
+        )
+        .unwrap();
         write(
             "p",
             &format!(
@@ -26408,6 +26424,13 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
             "{version}: row a updated and row b deleted by their key"
         );
         clean("doctor", d.run(&["doctor", "--db", connection]));
+        on_server(
+            connection,
+            &format!(
+                "SET ROLE {writer}; INSERT INTO app.s DEFAULT VALUES; RESET ROLE; \
+                 DROP OWNED BY {writer}; DROP ROLE {writer}"
+            ),
+        );
     }
 }
 

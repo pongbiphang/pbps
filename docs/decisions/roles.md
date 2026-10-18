@@ -1070,7 +1070,10 @@ marker; the ledger retains the access read back from the database.
 
 The existing Grant and Revoke changes carry the marker. Their statements
 find auto-dependent sequences through the table at execution time, so
-renames and generated names require no guess. Adding a serial column or
+renames and generated names require no guess. Being pbps's own catalog read, the
+block runs on the empty `search_path` with every operator qualified, so an
+operator a schema user created cannot be chosen over the built-in one
+(DEC-1564.1); `pbps_sql_calls_no_operator_a_schema_user_could_add` pins it. Adding a serial column or
 converting a column to serial re-grants the marker even when it was already
 held: a table-level set comparison alone cannot see a newly created
 sequence. The ordinary grant order follows those creations, with no new

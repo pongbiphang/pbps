@@ -2172,6 +2172,10 @@ fn serial_sequence_permission(
     // Names are resolved when this statement runs: a rename may have carried
     // the sequence, and a column added earlier in this plan owns a new one.
     // Identity sequences have deptype 'i' and need no such grant (DEC-1892.1).
+    // pbps's own catalog read, so it runs on the empty path with every
+    // operator qualified: on the table's schema's path, an exact-match
+    // operator a schema user created there is chosen over the built-in one
+    // reached through a cast (DEC-1564.1).
     let (action, direction) = if revoke {
         ("REVOKE", "FROM")
     } else {
@@ -2184,12 +2188,14 @@ BEGIN
     FOR pbps_sequence IN
         SELECT n.nspname, s.relname
           FROM pg_catalog.pg_depend d
-          JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S'
-          JOIN pg_catalog.pg_namespace n ON n.oid = s.relnamespace
-         WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
-           AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
-           AND d.refobjid = {}::pg_catalog.regclass
-           AND d.refobjsubid > 0 AND d.deptype = 'a'
+          JOIN pg_catalog.pg_class s ON s.oid OPERATOR(pg_catalog.=) d.objid
+               AND s.relkind OPERATOR(pg_catalog.=) 'S'
+          JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) s.relnamespace
+         WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid
+           AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid
+           AND d.refobjid OPERATOR(pg_catalog.=) {}::pg_catalog.regclass::pg_catalog.oid
+           AND d.refobjsubid OPERATOR(pg_catalog.>) 0
+           AND d.deptype OPERATOR(pg_catalog.=) 'a'
          ORDER BY n.nspname, s.relname
     LOOP
         EXECUTE pg_catalog.format('{action} USAGE ON SEQUENCE %I.%I {direction} %I',
@@ -2241,11 +2247,9 @@ fn grant_statements(
         }
     }
     if serial {
-        statements.push(scoped(
-            pg,
-            target.schema(),
-            &serial_sequence_permission(role, target, revoke)?,
-        )?);
+        statements.push(Statement::new(serial_sequence_permission(
+            role, target, revoke,
+        )?));
     }
     Ok(statements)
 }
@@ -7041,9 +7045,9 @@ mod tests {
                     "DO $pbps1$",
                     "pg_catalog.pg_depend",
                     "d.refclassid",
-                    "d.refobjsubid > 0",
-                    "d.deptype = 'a'",
-                    "s.relkind = 'S'",
+                    "d.refobjsubid OPERATOR(pg_catalog.>) 0",
+                    "d.deptype OPERATOR(pg_catalog.=) 'a'",
+                    "s.relkind OPERATOR(pg_catalog.=) 'S'",
                     "%I.%I",
                     "writer ''$pbps$",
                 ] {
@@ -7060,6 +7064,12 @@ mod tests {
                 assert!(!sql.contains("USAGE ON TABLE"), "{sql}");
                 assert!(!sql.contains("serial-sequences"), "{sql}");
                 assert!(!sql.contains("deptype = 'i'"), "{sql}");
+                // The catalog read runs on the empty path, with no bare
+                // operator a schema user could shadow (DEC-1564.1).
+                let block = emitted.last().unwrap().sql.as_str();
+                assert!(block.starts_with("DO "), "{block}");
+                assert!(!block.contains("search_path"), "{block}");
+                assert!(!block.contains(" = ") && !block.contains(" > "), "{block}");
                 assert_eq!(sql.contains(" ON TABLE "), mixed);
             }
         }
