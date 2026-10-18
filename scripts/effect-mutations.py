@@ -144,6 +144,11 @@ def main(args):
     env = dict(os.environ, PBPS_COMMUTE_ALL="1") if commands is AUDIT else None
     original = EFFECTS.read_text()
     chosen = [m for m in MUTATIONS if not selected or any(s in m[0] for s in selected)]
+    # A name that matches nothing would run no mutation and report success.
+    unmatched = [s for s in selected if not any(s in m[0] for m in MUTATIONS)]
+    if unmatched:
+        print(f"no mutation is named by {unmatched}")
+        return 2
     for name, text, _ in chosen:
         if original.count(text) != 1:
             print(f"anchor for {name!r} occurs {original.count(text)} times")
