@@ -884,6 +884,32 @@ pub async fn refuse_unlogged_partition_referencers(
     crate::deploy::refuse_permanent_referencers(cs, &names, &referencers, staged)
 }
 
+/// Refuses making a table unlogged while a publication names it (#1489,
+/// DEC-1489.1), asked of the catalog in the caller's transaction. A failed
+/// read is an error, never "unpublished".
+pub async fn refuse_published_unlogged(
+    conn: &mut Conn,
+    cs: &ChangeSet,
+    ids: &pbps_model::IdsFile,
+) -> anyhow::Result<()> {
+    if conn.driver() != Driver::Postgres {
+        return Ok(());
+    }
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, ids)?;
+    let made_unlogged = crate::deploy::tables_made_unlogged(&names);
+    if made_unlogged.is_empty() {
+        return Ok(());
+    }
+    let stored: Vec<TableName> = made_unlogged.iter().map(|(_, s)| s.clone()).collect();
+    let naming = pbps_pg::catalog::publications_naming(conn, &stored)
+        .await
+        .map_err(|e| {
+            anyhow::Error::new(e)
+                .context("cannot read the publications of a table this plan makes unlogged")
+        })?;
+    crate::deploy::refuse_published_unlogged(&made_unlogged, &naming)
+}
+
 /// Catalog reads precede the plan, while the caller names an object at its
 /// statement boundary. Keep that translation identical for the edge query,
 /// its visibility proof, and the preliminary computed-column presence read.

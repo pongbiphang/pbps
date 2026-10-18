@@ -1088,6 +1088,60 @@ pub(crate) fn refuse_permanent_referencers(
     );
 }
 
+/// Each table this plan makes unlogged, as declared and as the catalog names
+/// it when the plan starts, which is when the publications are read (#1489).
+pub(crate) fn tables_made_unlogged(
+    names: &pbps_model::plan_names::PlanNames<'_>,
+) -> Vec<(TableName, TableName)> {
+    let mut out = Vec::new();
+    for p in names.changes() {
+        if let pbps_model::Change::SetTablePersistence {
+            uid,
+            table,
+            unlogged: true,
+        } = &p.change
+            && let Some(stored) = names.table_at(uid, pbps_model::plan_names::At::Start)
+        {
+            out.push((table.clone(), stored.clone()));
+        }
+    }
+    out
+}
+
+/// Refuses a plan that makes a table unlogged while a publication names it
+/// (#1489, DEC-1489.1). The engine refuses that `SET UNLOGGED` at apply; asked
+/// here, the refusal names the publication before anything runs.
+pub(crate) fn refuse_published_unlogged(
+    made_unlogged: &[(TableName, TableName)],
+    naming: &[pbps_pg::catalog::NamingPublication],
+) -> anyhow::Result<()> {
+    use pbps_model::escape::Escaped;
+    let mut lines = Vec::new();
+    for (declared, stored) in made_unlogged {
+        for found in naming.iter().filter(|n| n.table == *stored) {
+            lines.push(format!(
+                "{} is listed by the publication `{}`; remove it there (`ALTER PUBLICATION \
+                 {} DROP TABLE {}`), or keep the table logged",
+                declared.shown(),
+                Escaped(&found.publication),
+                Escaped(&found.publication),
+                stored.shown()
+            ));
+        }
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{} table(s) this plan makes unlogged are published:\n  {}\n\
+         PostgreSQL refuses `SET UNLOGGED` on a table a publication lists, because an \
+         unlogged table cannot be replicated. A publication is outside the declarations, so \
+         it is the operator's to change (DEC-1489.1).",
+        lines.len(),
+        lines.join("\n  ")
+    );
+}
+
 /// The tables this plan moves to another schema, by the catalog's names for
 /// them: `SET SCHEMA` carries their indexes and owned sequences along
 /// (#1084), so the occupant read asks what each of them owns.
@@ -6297,6 +6351,7 @@ pub fn cmd_plan_db(
                 staged,
             )
             .await?;
+            crate::engine::refuse_published_unlogged(&mut conn, &cs, &resolved.ids).await?;
             let rename_evidence = crate::engine::external_role_renames(
                 &mut conn,
                 &recorded_snapshot.ids,
@@ -8664,6 +8719,8 @@ async fn preflight(
         plan.mode.is_staged(),
     )
     .await?;
+    // A publication can list the table between the plan and this apply (#1489).
+    crate::engine::refuse_published_unlogged(conn, &plan.changes, &plan.ids).await?;
     // The edition, asked again. `plan --db` checked it, but nothing binds a
     // saved plan to an environment: the same file can be applied to a different
     // server, or to the same one after an edition change, and an `ONLINE = ON`
@@ -10740,6 +10797,64 @@ mod tests {
     /// renames the table, and through the key a partitioned table declares
     /// for its leaf's copy. A parent the plan renames is read back to the
     /// catalog's name too (#1613).
+    /// #1489: a table this plan makes unlogged is refused by name when a
+    /// publication lists it, under the name the catalog has it by when the
+    /// plan starts. A table made logged is never asked about.
+    #[test]
+    fn a_table_made_unlogged_is_refused_by_the_publication_that_lists_it() {
+        use pbps_model::{Change, ChangeSet, PlannedChange};
+        use pbps_pg::catalog::NamingPublication;
+        let uid = pbps_model::Uid::derived(pbps_model::UidKind::Table, "app.t", 0);
+        let switch = |table: &str, unlogged: bool| {
+            PlannedChange::new(Change::SetTablePersistence {
+                uid: uid.clone(),
+                table: table.parse().unwrap(),
+                unlogged,
+            })
+        };
+        let rename = PlannedChange::new(Change::RenameTable {
+            uid: uid.clone(),
+            from: "app.t".parse().unwrap(),
+            to: "app.t2".parse().unwrap(),
+            defaults: vec![],
+        });
+        let listing = |table: &str| NamingPublication {
+            table: table.parse().unwrap(),
+            publication: "pub_x".into(),
+        };
+        let refused = |changes: Vec<PlannedChange>, naming: &[NamingPublication]| {
+            let cs = ChangeSet { changes };
+            let ids = crate::plan_fixture::ids(&cs);
+            let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
+            super::refuse_published_unlogged(&super::tables_made_unlogged(&names), naming)
+                .map_err(|e| e.to_string())
+        };
+
+        let e = refused(vec![switch("app.t", true)], &[listing("app.t")]).unwrap_err();
+        assert!(
+            e.contains("app.t is listed by the publication `pub_x`")
+                && e.contains("ALTER PUBLICATION pub_x DROP TABLE app.t")
+                && e.contains("DEC-1489.1"),
+            "{e}"
+        );
+        // Renamed first: named as declared, and asked about, and fixed, under
+        // the catalog's name for it.
+        let e = refused(
+            vec![rename.clone(), switch("app.t2", true)],
+            &[listing("app.t")],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("app.t2 is listed by the publication `pub_x`")
+                && e.contains("ALTER PUBLICATION pub_x DROP TABLE app.t`"),
+            "{e}"
+        );
+        // Negative: made logged, another table listed, or nothing listed.
+        refused(vec![switch("app.t", false)], &[listing("app.t")]).expect("made logged");
+        refused(vec![switch("app.t", true)], &[listing("app.other")]).expect("another table");
+        refused(vec![switch("app.t", true)], &[]).expect("unpublished");
+    }
+
     #[test]
     fn an_unlogged_partition_under_a_permanent_key_is_refused_by_name() {
         use pbps_model::{Change, ChangeSet, PartitionBound, PartitionOf, PlannedChange, Table};

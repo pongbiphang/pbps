@@ -51,8 +51,10 @@ storage parameters (`fillfactor` and `deduplicate_items` for a B-tree,
 
 A PostgreSQL table declares `unlogged: true`; a switch is one `ALTER TABLE …
 SET LOGGED/UNLOGGED`, ordered by the foreign keys between the tables it
-switches, and `destructive` to unlogged (#1443, DEC-1443.1). Temporary tables
-stay limitations.
+switches, and `destructive` to unlogged (#1443, DEC-1443.1). A switch to
+unlogged on a table a publication lists is refused by name, by `plan --db`
+and again by the apply (#1489, DEC-1489.1). Temporary tables stay
+limitations.
 
 A PostgreSQL column of a built-in element type may be an array, `T[]`. It is
 pulled, rebuilt, and widened element-wise by a rewrite. Element narrowing,

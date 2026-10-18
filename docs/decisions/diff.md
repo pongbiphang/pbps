@@ -6682,3 +6682,37 @@ Pinned by `a_binding_edge_is_respected_where_the_effects_allow_the_other_order`,
 *Amends [DEC-1956.1](#dec-1956-1) and [DEC-1954.7](#dec-1954-7): the resolver
 no longer keeps its own edges and reasons, and the comparison with the hand
 graph is retired with it.*
+
+<a id="dec-1489-1"></a>
+
+**DEC-1489.1. A switch to unlogged is refused, naming the publication, when
+a publication lists the table itself (#1489).** PostgreSQL refuses `ALTER
+TABLE … SET UNLOGGED` on such a table with `cannot change table "t" to unlogged
+because it is part of a publication`. Until now nothing asked about
+publications before the apply, so a plan saved with that switch was refused
+partway through. Publications are outside the declarations, so the remedy is
+the operator's: drop the table from the publication, or keep it logged.
+
+What the engine refuses was measured on 16 and 18, and it is narrower than the
+issue assumed:
+- refused: a table a `FOR TABLE` publication lists, which is a row of
+  `pg_publication_rel`;
+- taken: a table published only through `FOR TABLES IN SCHEMA` or `FOR ALL
+  TABLES`, which then simply stops being replicated, and a partition of a
+  listed parent, whether or not `publish_via_partition_root` is set.
+
+So the read asks `pg_publication_rel` for the tables the plan makes unlogged,
+under the names the catalog has them by when the plan starts, and nothing
+else. Refusing for the schema-wide and all-tables publications would refuse
+a switch the engine takes. A partitioned table cannot be declared `unlogged`
+(DEC-1443.1), so its own listing never comes up.
+
+The read runs in `plan --db`, beside DEC-1595.1's referencer read, and again
+in the apply's preflight, because a publication can list the table between
+the plan and the apply. A failed read is an error, never "unpublished".
+
+Pinned by `a_table_a_publication_lists_is_refused_unlogged_by_name` in
+`crates/pbps-cli/tests/flow_pg.rs`, which covers the listed, schema-wide,
+all-tables, unpublished and listed-after-the-plan cases on 16 and 18, and by
+`a_table_made_unlogged_is_refused_by_the_publication_that_lists_it` in
+`crates/pbps-cli/src/deploy.rs`.

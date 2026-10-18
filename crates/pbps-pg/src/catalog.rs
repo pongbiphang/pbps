@@ -3619,6 +3619,61 @@ pub async fn key_name_holders(
     Ok(out)
 }
 
+/// A publication that names a table itself (#1489).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamingPublication {
+    pub table: TableName,
+    pub publication: String,
+}
+
+/// The publications that name each of `tables` itself, in `pg_publication_rel`
+/// (#1489, DEC-1489.1). Only those: measured on 16 and 18, `SET UNLOGGED` is
+/// refused on a table a `FOR TABLE` publication lists ("cannot change table
+/// … to unlogged because it is part of a publication"), and taken on one that
+/// is published only `FOR ALL TABLES`, `FOR TABLES IN SCHEMA` or as a
+/// partition of a listed parent. Read in the caller's transaction.
+pub async fn publications_naming(
+    conn: &mut Conn,
+    tables: &[TableName],
+) -> Result<Vec<NamingPublication>, DbError> {
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+    let params: Vec<Param<'_>> = tables
+        .iter()
+        .flat_map(|n| [Param::Str(n.schema.as_str()), Param::Str(n.name.as_str())])
+        .collect();
+    let rows: Vec<String> = (0..tables.len())
+        .map(|i| format!("(${}::text, ${}::text)", 2 * i + 1, 2 * i + 2))
+        .collect();
+    let sql = format!(
+        "SELECT n.nspname AS table_schema, c.relname AS table_name, p.pubname AS publication\n  \
+           FROM pg_catalog.pg_publication_rel pr\n  \
+           JOIN pg_catalog.pg_publication p ON p.oid = pr.prpubid\n  \
+           JOIN pg_catalog.pg_class c ON c.oid = pr.prrelid\n  \
+           JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace\n  \
+           JOIN (VALUES {}) AS w(schema_name, table_name)\n    \
+             ON w.schema_name = n.nspname AND w.table_name = c.relname\n \
+          ORDER BY 1, 2, 3",
+        rows.join(", ")
+    );
+    let mut out = Vec::new();
+    for row in &conn.query_with(&sql, &params).await? {
+        let text = |column: &str| -> Result<String, DbError> {
+            row.try_get::<&str>(column)?
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    DbError::BadRow(format!("the publication query returned a NULL {column}"))
+                })
+        };
+        out.push(NamingPublication {
+            table: TableName::new(text("table_schema")?, text("table_name")?),
+            publication: text("publication")?,
+        });
+    }
+    Ok(out)
+}
+
 /// A permanent table whose foreign key references a partitioned table
 /// (#1595). The engine refuses a permanent table's key to an unlogged table,
 /// but not one through a partitioned table that has, or later gets, an
