@@ -51,10 +51,6 @@ pub struct Scenario {
     /// The issue of a known gap: a pair the effects call independent and the
     /// engine does not.
     pub gap: Option<u32>,
-    /// The issue of a known gap in the plan itself: made with new uids, it
-    /// orders the pair otherwise and so ends otherwise. Only this excuses a
-    /// difference of the plan with new uids, never one from the same uids.
-    pub uid_order: Option<u32>,
     pub base: &'static str,
     pub desired: &'static str,
 }
@@ -118,7 +114,9 @@ pub enum Finding {
 pub struct Checked {
     pub pair: Result<(), Finding>,
     /// How the plan with new uids ended otherwise, if it did. Not the pair's
-    /// fault, so a listed `gap` does not excuse it; only `uid_order`.
+    /// fault, so a listed `gap` does not excuse it, and nothing else does: a
+    /// plan whose result depends on its uids is fixed when found, not listed
+    /// (#2104, DEC-2104.1).
     pub reminted: Option<String>,
 }
 
@@ -714,14 +712,14 @@ pub async fn forced<E: Engine>(engine: &E, scenario: &Scenario, role: &str) -> R
 }
 
 /// What a scenario's run says, `None` when it is as listed. A listed gap
-/// excuses only the pair's own difference (`Differs`), and `uid_order` only
-/// the plan with new uids ending otherwise; each is judged whatever the
-/// other found. A plan that is not byte-identical from the same uids, a
-/// broken harness or a stale pair fails whatever is listed.
+/// excuses only the pair's own difference (`Differs`). The plan with new
+/// uids ending otherwise, a plan that is not byte-identical from the same
+/// uids, a broken harness or a stale pair fails whatever is listed, each
+/// judged whatever the others found.
 pub fn verdict(scenario: &Scenario, found: Checked) -> Option<String> {
     let name = scenario.name;
     let mut wrong = Vec::new();
-    if let (Some(e), None) = (&found.reminted, scenario.uid_order) {
+    if let Some(e) = &found.reminted {
         wrong.push(format!(
             "{name}: the plan with new uids ends otherwise: {e}"
         ));
@@ -882,12 +880,11 @@ pub async fn suite<E: Engine>(engine: &E, scenarios: &[Scenario], held: &[Scenar
 mod verdict_tests {
     use super::*;
 
-    fn scenario(gap: Option<u32>, uid_order: Option<u32>) -> Scenario {
+    fn scenario(gap: Option<u32>) -> Scenario {
         Scenario {
             name: "s",
             pair: ["AddColumn", "AddColumn"],
             gap,
-            uid_order,
             base: "",
             desired: "",
         }
@@ -906,11 +903,8 @@ mod verdict_tests {
 
     #[test]
     fn a_listed_gap_excuses_the_pairs_own_difference() {
-        assert_eq!(
-            verdict(&scenario(Some(1), None), found(differs(), None)),
-            None
-        );
-        assert_eq!(verdict(&scenario(None, None), found(Ok(()), None)), None);
+        assert_eq!(verdict(&scenario(Some(1)), found(differs(), None)), None);
+        assert_eq!(verdict(&scenario(None), found(Ok(()), None)), None);
     }
 
     /// The plan's own instability is never the pair's: a gap does not hide
@@ -919,25 +913,25 @@ mod verdict_tests {
     #[test]
     fn a_listed_gap_does_not_excuse_an_unstable_plan() {
         let same_uids = || Err(Finding::Nondeterministic("not byte-identical".into()));
-        let gap = scenario(Some(1), None);
+        let gap = scenario(Some(1));
         assert!(verdict(&gap, found(same_uids(), None)).is_some());
         assert!(verdict(&gap, found(differs(), Some("column order"))).is_some());
         let harness = Err(Finding::Harness("refused".into()));
         assert!(verdict(&gap, found(harness, None)).is_some());
-        // Not even a listed uid order excuses a plan unstable from the same
-        // uids.
-        assert!(verdict(&scenario(Some(1), Some(1)), found(same_uids(), None)).is_some());
     }
 
-    /// A listed uid order excuses the plan with new uids, and the swapped
-    /// run is still judged: a failure there is not hidden by it.
+    /// Nothing excuses the plan with new uids ending otherwise, and the
+    /// swapped run is judged beside it: neither hides the other (#2104).
     #[test]
-    fn a_listed_uid_order_still_judges_the_swapped_run() {
-        let ordered = scenario(None, Some(1));
-        assert_eq!(verdict(&ordered, found(Ok(()), Some("x"))), None);
-        assert!(verdict(&ordered, found(differs(), Some("x"))).is_some());
-        let harness = Err(Finding::Harness("the swapped run failed".into()));
-        assert!(verdict(&ordered, found(harness, Some("x"))).is_some());
+    fn a_plan_that_ends_otherwise_with_new_uids_fails_whatever_is_listed() {
+        for gap in [None, Some(1)] {
+            assert!(verdict(&scenario(gap), found(Ok(()), Some("x"))).is_some());
+        }
+        let both = verdict(&scenario(None), found(differs(), Some("new uids"))).unwrap();
+        assert!(
+            both.contains("new uids") && both.contains("Differs"),
+            "{both}"
+        );
     }
 
     /// A swapped order that runs but leaves a next plan is the pair's
@@ -984,9 +978,9 @@ mod verdict_tests {
 
     #[test]
     fn a_gap_that_no_longer_shows_or_is_ordered_fails() {
-        assert!(verdict(&scenario(Some(1), None), found(Ok(()), None)).is_some());
+        assert!(verdict(&scenario(Some(1)), found(Ok(()), None)).is_some());
         let stale = Err(Finding::Stale("edge".into()));
-        assert!(verdict(&scenario(Some(1), None), found(stale, None)).is_some());
-        assert!(verdict(&scenario(None, None), found(differs(), None)).is_some());
+        assert!(verdict(&scenario(Some(1)), found(stale, None)).is_some());
+        assert!(verdict(&scenario(None), found(differs(), None)).is_some());
     }
 }

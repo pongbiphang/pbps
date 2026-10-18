@@ -6828,3 +6828,24 @@ carrying such a table shape (create, attach or detach). Both refusals name
 that delivery boundary. Catalog exclusions remain until PR B. Declared
 expression tracking, create-only change kinds, emission, dependent refusals
 and filtered-probe wrapping belong to PR C.
+
+<a id="dec-2104-1"></a>
+
+**DEC-2104.1. The commutation suite lists no exception for a plan whose
+result depends on its uids.** A scenario's plan made with new uids must end
+as the plan does, and nothing excuses it. The `uid_order` field that once
+did is removed. It listed the issue of a plan that ordered a pair otherwise
+when its uids compared otherwise, as #2080's two added columns did. Nothing
+told that a listed exception had gone stale: new uids are minted at random,
+so the difference showed only about one run in two.
+
+The alternative was a deterministic check: a second identity set whose uids
+compare in reverse, required to differ while the exception is listed. It
+costs a database per scenario for a field no scenario uses since #2080 was
+fixed. A plan whose result depends on its random uids can deploy one
+declaration differently in two projects. Such a bug is fixed when it is
+found, or the scenario waits until it is, rather than being listed.
+
+Pinned by `a_plan_that_ends_otherwise_with_new_uids_fails_whatever_is_listed`
+(`crates/pbps-diff/tests/support/commutation.rs`, run by both engines' live
+test binaries).
