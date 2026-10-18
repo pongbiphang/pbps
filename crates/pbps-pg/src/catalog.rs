@@ -318,9 +318,26 @@ fn partition_tree(root: &str) -> String {
 
 /// Whether `c` is a table of a partition tree [`partition_tree`] holds: its
 /// parent, or one of its partitions.
-fn partition_tree_table() -> String {
+fn partition_tree_table() -> &'static str {
+    "EXISTS (SELECT 1 FROM pbps_partition_tables ht WHERE ht.oid = c.oid)"
+}
+
+fn partition_tables_cte() -> String {
+    // Five catalog projections need this same classification. Materialize it
+    // once in their statement, within its snapshot, rather than planning each
+    // expanded tree predicate again (#2115). Scope the candidates as the table
+    // readers do: excluded objects must not acquire extra deparser reads.
+    let not_one_of_ours = not_one_of_ours();
+    let not_an_extensions = not_an_extensions("c.oid", "pg_class");
     format!(
-        "((c.relkind = 'p' AND {}) OR (c.relkind = 'r' AND c.relispartition AND {}))",
+        "pbps_partition_tables AS MATERIALIZED (
+            SELECT c.oid FROM pg_catalog.pg_class c
+              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+             WHERE {NOT_A_PROJECTS_SCHEMA}
+               AND {not_one_of_ours}
+               AND {not_an_extensions}
+               AND ((c.relkind = 'p' AND {})
+                    OR (c.relkind = 'r' AND c.relispartition AND {})))",
         partition_tree("c.oid"),
         partition_tree(
             "(SELECT h.inhparent FROM pg_catalog.pg_inherits h WHERE h.inhrelid = c.oid)"
@@ -1154,7 +1171,7 @@ const SESSION: &str = "SELECT current_user::text AS role";
 fn batch_query() -> String {
     // Aggregation must preserve semantic position order: sorting the JSON
     // itself would reorder columns and routine arguments (pinned live).
-    [
+    let parts = [
         ("partitioned", partitioned_query(), "schema_name, table_name"),
         ("tables", tables_query(), "schema_name, table_name"),
         ("columns", columns_query(), "table_oid, attnum"),
@@ -1178,7 +1195,8 @@ fn batch_query() -> String {
         "SELECT '{part}'::text AS part, COALESCE(jsonb_agg(to_jsonb(r) ORDER BY {order}), '[]'::jsonb)::text AS payload FROM ({query}) r"
     ))
     .collect::<Vec<_>>()
-    .join(" UNION ALL ")
+    .join(" UNION ALL ");
+    format!("WITH {} {parts}", partition_tables_cte())
 }
 
 async fn read_batch(conn: &mut Conn) -> Result<CatalogBatch, DbError> {
@@ -3787,6 +3805,169 @@ fn quote_for_regclass(part: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    #[ignore = "needs both live PostgreSQL versions; PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+    async fn partition_membership_is_scoped_and_shared_by_the_catalog_parts() {
+        for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+            let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
+            let database = format!("pbps_catalog2115_{}", probe_token().replace('-', "_"));
+            let mut admin = Conn::connect(pbps_db::Driver::Postgres, &base)
+                .await
+                .unwrap();
+            admin
+                .execute(&format!("CREATE DATABASE {database}"))
+                .await
+                .unwrap();
+            let connection = format!("{base} dbname={database}");
+            let result = tokio::task::LocalSet::new()
+                .run_until(async move {
+                    tokio::task::spawn_local(check_partition_membership(connection)).await
+                })
+                .await;
+            admin
+                .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+                .await
+                .unwrap();
+            result.expect("partition membership fixture failed after cleanup");
+        }
+    }
+
+    async fn check_partition_membership(connection: String) {
+        let mut conn = Conn::connect(pbps_db::Driver::Postgres, &connection)
+            .await
+            .unwrap();
+        conn.execute(
+            "BEGIN;
+             CREATE SCHEMA app; CREATE SCHEMA unrelated; CREATE SCHEMA pga;
+             CREATE TABLE app.held (id integer) PARTITION BY RANGE (id);
+             CREATE TABLE unrelated.held_child PARTITION OF app.held FOR VALUES FROM (0) TO (10);
+             CREATE TABLE pga.__pbps_state (id integer) PARTITION BY LIST (id);
+             CREATE TABLE app.list_child PARTITION OF pga.__pbps_state FOR VALUES IN (1);
+             CREATE TABLE public.__pbps_customers (id integer) PARTITION BY HASH (id);
+             CREATE TABLE app.hash_child PARTITION OF public.__pbps_customers
+                 FOR VALUES WITH (MODULUS 1, REMAINDER 0);
+             CREATE TABLE app.ordinary (id integer);
+             CREATE TABLE app.unsupported (id integer) PARTITION BY RANGE ((id + 1));
+             CREATE TABLE app.unsupported_child PARTITION OF app.unsupported
+                 FOR VALUES FROM (0) TO (10);
+             CREATE TABLE app.extension_owned (id integer) PARTITION BY RANGE (id);
+             CREATE TABLE app.extension_child PARTITION OF app.extension_owned
+                 FOR VALUES FROM (0) TO (10);
+             ALTER EXTENSION plpgsql ADD TABLE app.extension_owned;
+             ALTER EXTENSION plpgsql ADD TABLE app.extension_child;
+             CREATE TABLE public.__pbps_state (id integer) PARTITION BY RANGE (id);
+             CREATE TABLE public.__pbps_lock PARTITION OF public.__pbps_state
+                 FOR VALUES FROM (0) TO (10);
+             CREATE TEMP TABLE temporary_parent (id integer) PARTITION BY RANGE (id);
+             CREATE TEMP TABLE temporary_child PARTITION OF temporary_parent
+                 FOR VALUES FROM (0) TO (10);
+             CREATE FUNCTION app.tg() RETURNS trigger LANGUAGE plpgsql
+                 AS 'BEGIN RETURN NEW; END';
+             CREATE TRIGGER held_trigger BEFORE INSERT ON app.held
+                 FOR EACH ROW EXECUTE FUNCTION app.tg();
+             CREATE TRIGGER child_trigger BEFORE INSERT ON unrelated.held_child
+                 FOR EACH ROW EXECUTE FUNCTION app.tg();
+             CREATE TRIGGER unsupported_trigger BEFORE INSERT ON app.unsupported
+                 FOR EACH ROW EXECUTE FUNCTION app.tg();
+             SET LOCAL search_path = ''; SET LOCAL jit = off;",
+        )
+        .await
+        .unwrap();
+        let batch = read_batch(&mut conn).await.unwrap();
+        let table_names = |part: &str| {
+            batch[part]
+                .iter()
+                .map(|row| {
+                    (
+                        row["schema_name"].as_str().unwrap(),
+                        row["table_name"].as_str().unwrap(),
+                    )
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            table_names("tables"),
+            std::collections::BTreeSet::from([
+                ("app", "held"),
+                ("unrelated", "held_child"),
+                ("pga", "__pbps_state"),
+                ("app", "list_child"),
+                ("public", "__pbps_customers"),
+                ("app", "hash_child"),
+                ("app", "ordinary"),
+            ])
+        );
+        assert_eq!(
+            table_names("partitioned"),
+            std::collections::BTreeSet::from([
+                ("app", "unsupported"),
+                ("app", "unsupported_child"),
+            ])
+        );
+        let names = |part: &str| {
+            batch[part]
+                .iter()
+                .map(|row| row["name"].as_str().unwrap())
+                .collect::<Vec<_>>()
+        };
+        for name in ["held_trigger", "child_trigger"] {
+            assert!(names("modules").contains(&name), "{name}");
+            assert!(!names("unheld_modules").contains(&name), "{name}");
+        }
+        assert!(!names("modules").contains(&"unsupported_trigger"));
+        assert!(names("unheld_modules").contains(&"unsupported_trigger"));
+
+        // Pin the engine's sharing, rather than a timing threshold affected by
+        // the host's load. Six in-scope partition tables, with ordinary,
+        // unsupported, extension, ledger and temporary tables all excluded.
+        let plan = conn
+            .query(&format!(
+                "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {}",
+                batch_query()
+            ))
+            .await
+            .unwrap();
+        let lines = plan
+            .iter()
+            .map(|row| text(row, "QUERY PLAN").unwrap())
+            .collect::<Vec<_>>();
+        let definitions = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim() == "CTE pbps_partition_tables")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            definitions.len(),
+            1,
+            "partition classification must be shared once"
+        );
+        let classification = &lines[definitions[0] + 1];
+        let actual_rows = classification
+            .split_once("actual rows=")
+            .unwrap()
+            .1
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert!(
+            actual_rows == 6.0 && classification.contains("loops=1)"),
+            "the shared classification must run once and stay scoped: {}",
+            lines[definitions[0] + 1]
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("CTE Scan on pbps_partition_tables "))
+                .count(),
+            5,
+            "every existing partition predicate must reuse the classification"
+        );
+        conn.execute("ROLLBACK").await.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
     async fn a_failed_canonical_permission_query_restores_both_transaction_scopes() {
