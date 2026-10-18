@@ -5323,73 +5323,100 @@ pub fn cmd_baseline(
     reason: &pbps_model::Reason,
 ) -> anyhow::Result<()> {
     let ids = crate::read_ids(project)?;
-    let (declared_modules, declared_data, loaded) =
-        declared_scope(project, crate::dialect(project)?.as_ref())?;
+    let dialect = crate::dialect(project)?;
+    let (declared_modules, declared_data, loaded) = declared_scope(project, dialect.as_ref())?;
     let operator = crate::operator(project.root());
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
         crate::engine::lock(&mut conn, &operator).await?;
         let result = async {
-            let removed = crate::engine::remove_scan_checks(&mut conn, &ids).await?;
-            let scoped = managed_state(
-                &mut conn,
-                &ids,
-                &declared_modules,
-                &pbps_diff::external_parents(&loaded.schema),
-                project.config.unmanaged,
-                &declared_data,
-                &loaded.schema,
-                crate::engine::Read::Snapshot,
-            )
-            .await?;
-            report_missing(&scoped);
-            refuse_unexpressible(&scoped, &target.label, "baseline again")?;
-            // A partition a drop intent names is out of the working identity
-            // file before it is dropped, and the scope then reads it as one of
-            // its external parent's (#1852). Asked only while an intent names a
-            // table and a partition is left external, so a baseline that is the
-            // remedy for an unreadable ledger, or a deliberate handover with no
-            // intent, never reads the ledger here.
-            let dropped = tables_a_drop_intent_names(&ids);
-            if !dropped.is_empty() && !scoped.external.is_empty() {
-                let previous = crate::engine::latest(&mut conn).await;
-                refuse_handing_over_held_partitions(
-                    &dropped,
+            // A staged attach's temporary CHECK is taken out in the same
+            // transaction as the read and the record. Dropped on its own, a
+            // baseline that then refused left the database without it while
+            // the newest staged checkpoint still recorded it, and `apply
+            // --resume` refused that drift (#2127). Without one to remove,
+            // the read is the snapshot it always was.
+            let checks = crate::engine::standing_scan_checks(&mut conn, &ids).await?;
+            let read = if checks.is_empty() {
+                crate::engine::Read::Snapshot
+            } else {
+                conn.begin(&dialect.transaction_framing(&pin_zone(&conn)))
+                    .await
+                    .context("cannot open a transaction")?;
+                crate::engine::Read::InsideOwnTransaction
+            };
+            let body = async {
+                let removed = crate::engine::drop_scan_checks(&mut conn, &checks).await?;
+                let scoped = managed_state(
+                    &mut conn,
                     &ids,
-                    &scoped,
-                    previous,
-                    &target.label,
-                )?;
-            }
-
-            // What the database holds, as `snapshot` records it (#1600, #1606).
-            crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
-            let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
-            let held = ids.without(&scoped.missing).without_roles(&gone);
-            let mut snapshot = with_provenance(
-                project.root(),
-                StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
-            );
-            snapshot.module_deps = loaded.hints.module_deps.clone();
-            // The note on what was removed rides on the reason only where
-            // the bounded column has room for both: it never turns a reason
-            // that fits into a record that fails after the removal committed.
-            // The removal was printed either way.
-            let noted = format!("{reason} (first removed {})", removed.join(", "));
-            snapshot.reason = Some(
-                if removed.is_empty()
-                    || crate::engine::truncate_reason(conn.driver(), &noted) != noted
-                {
-                    reason.to_string()
-                } else {
-                    noted
+                    &declared_modules,
+                    &pbps_diff::external_parents(&loaded.schema),
+                    project.config.unmanaged,
+                    &declared_data,
+                    &loaded.schema,
+                    read,
+                )
+                .await?;
+                report_missing(&scoped);
+                refuse_unexpressible(&scoped, &target.label, "baseline again")?;
+                // A partition a drop intent names is out of the working identity
+                // file before it is dropped, and the scope then reads it as one of
+                // its external parent's (#1852). Asked only while an intent names a
+                // table and a partition is left external, so a baseline that is the
+                // remedy for an unreadable ledger, or a deliberate handover with no
+                // intent, never reads the ledger here.
+                let dropped = tables_a_drop_intent_names(&ids);
+                if !dropped.is_empty() && !scoped.external.is_empty() {
+                    let previous = crate::engine::latest(&mut conn).await;
+                    refuse_handing_over_held_partitions(
+                        &dropped,
+                        &ids,
+                        &scoped,
+                        previous,
+                        &target.label,
+                    )?;
                 }
-                .into(),
-            );
 
-            let tables = snapshot.schema.tables.len();
-            let id = crate::engine::record(&mut conn, &snapshot).await?;
+                // What the database holds, as `snapshot` records it (#1600, #1606).
+                crate::engine::prove_tables_absent(&mut conn, &scoped.missing).await?;
+                let gone = crate::engine::absent_roles(&mut conn, &scoped.missing_roles).await?;
+                let held = ids.without(&scoped.missing).without_roles(&gone);
+                let mut snapshot = with_provenance(
+                    project.root(),
+                    StateSnapshot::new(StateKind::Baseline, scoped.schema, held, &operator),
+                );
+                snapshot.module_deps = loaded.hints.module_deps.clone();
+                // The note on what was removed rides on the reason only where
+                // the bounded column has room for both: it never turns a reason
+                // that fits into a record that fails. The removal is printed
+                // either way, once it has committed.
+                let noted = format!("{reason} (first removed {})", removed.join(", "));
+                snapshot.reason = Some(
+                    if removed.is_empty()
+                        || crate::engine::truncate_reason(conn.driver(), &noted) != noted
+                    {
+                        reason.to_string()
+                    } else {
+                        noted
+                    }
+                    .into(),
+                );
+
+                let tables = snapshot.schema.tables.len();
+                let id = crate::engine::record(&mut conn, &snapshot).await?;
+                Ok::<_, anyhow::Error>((id, tables, removed))
+            }
+            .await;
+            let (id, tables, removed) = if checks.is_empty() {
+                body
+            } else {
+                finish_transaction(&mut conn, dialect.as_ref(), body).await
+            }?;
+            for said in &removed {
+                println!("Removed {}.", pbps_model::escape::Escaped(said));
+            }
             Ok::<_, anyhow::Error>((id, tables))
         }
         .await;

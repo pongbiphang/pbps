@@ -6221,7 +6221,12 @@ the namespace a table's constraints share.
   first drops a CHECK named after a table's identity in the project's ids
   file, on that table, and its recorded reason says what it removed where
   the bounded `reason` column holds both; a reason that fits only on its own
-  is kept whole, and the removal is printed either way. It asks
+  is kept whole, and the removal is printed once it has committed. The
+  drop, the read and the ledger insert are one transaction on PostgreSQL:
+  dropped on its own, a baseline that then refused left the database
+  without the CHECK while the newest staged checkpoint still recorded it,
+  and `--resume` refused that drift (#2127). A baseline with no such CHECK
+  reads its snapshot as before. It asks
   the ledger nothing: a run that dies between the `ADD` and the `VALIDATE`'s
   checkpoint records neither a checkpoint nor a failure, and `baseline` is
   the remedy for an entry this build cannot read (DECISIONS 203).
@@ -6234,7 +6239,8 @@ Pinned by the live
 18):
 - a `VALIDATE` stopped by an event trigger leaves no CHECK and no checkpoint;
 - an attach stopped after its checkpoint leaves the validated CHECK, which
-  `baseline` removes by name;
+  `baseline` removes by name, and which a refused `baseline` leaves in place
+  with no entry recorded;
 - a `NOT VALID` CHECK left with no checkpoint after it is removed by
   `baseline` too, also under a newest entry of an obsolete version;
 - the same stop resumed drops it, and the next plan is empty;

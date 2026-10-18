@@ -10504,6 +10504,26 @@ fn a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody() {
         "{said}"
     );
     assert_eq!((temporaries(), attached("t")), (1, 0), "{said}");
+    // A baseline that refuses leaves the CHECK where the staged checkpoint
+    // recorded it: its removal is in the same transaction as the record
+    // (#2127). An undeclared partition of the managed parent makes it refuse.
+    let entries = || scalar(&connection, "SELECT count(*) FROM public.__pbps_state");
+    let before = entries();
+    on_server(
+        &connection,
+        "CREATE TABLE app.ev_2030 PARTITION OF app.ev \
+             FOR VALUES FROM ('2030-01-01') TO ('2031-01-01')",
+    );
+    let o = d.run(&["baseline", "--db", &connection, "--reason", "refused"]);
+    let said = format!("{}{}", stdout(&o), stderr(&o));
+    assert!(
+        code(&o) != 0
+            && said.contains("app.ev_2030 is a partition of the managed table app.ev")
+            && !said.contains("Removed the staged attach's"),
+        "{said}"
+    );
+    assert_eq!((temporaries(), entries()), (1, before), "{said}");
+    on_server(&connection, "DROP TABLE app.ev_2030");
     let o = succeeds(d.run(&[
         "baseline",
         "--db",

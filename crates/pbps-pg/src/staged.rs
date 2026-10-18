@@ -163,16 +163,17 @@ async fn remove_unvalidated(conn: &mut Conn, check: &ScanCheck) -> Result<String
     ))
 }
 
-/// Takes out the temporary CHECKs a staged attach left, before a `baseline`
-/// reads the database (#1638, DEC-1638.1).
+/// The temporary CHECKs a staged attach left, before a `baseline` reads the
+/// database (#1638, DEC-1638.1).
 ///
 /// `tables` are the project's tables, with their identities; a staged attach's CHECK is named after its table's identity
 /// ([`crate::emit::scan_check_name`]), so each is looked for by that exact
 /// name on that table, and nothing else is touched. No declared check can
 /// hold such a name ([`crate::emit::SCAN_CHECK_PREFIX`]), so one that stands
 /// is pbps's, whatever the run that left it recorded before it stopped.
-/// Returns what was removed, for the record.
-pub async fn remove_scan_checks<'a>(
+/// Only read: [`drop_scan_checks`] takes them out, inside the baseline's own
+/// transaction (#2127).
+pub async fn standing_scan_checks<'a>(
     conn: &mut Conn,
     tables: impl IntoIterator<Item = (&'a pbps_model::Uid, &'a pbps_model::TableName)>,
 ) -> Result<Vec<ScanCheck>, DbError> {
@@ -196,26 +197,31 @@ pub async fn remove_scan_checks<'a>(
         };
         standing.insert((field("nspname")?, field("relname")?, field("conname")?));
     }
-    let mut removed = Vec::new();
-    for (uid, table) in tables {
-        let check = ScanCheck {
+    Ok(tables
+        .into_iter()
+        .map(|(uid, table)| ScanCheck {
             table: table.clone(),
             name: crate::emit::scan_check_name(uid),
             step: ScanCheckStep::Add,
-        };
-        if !standing.contains(&(
-            check.table.schema.as_str().to_owned(),
-            check.table.name.as_str().to_owned(),
-            check.name.clone(),
-        )) {
-            continue;
-        }
-        let sql = crate::emit::drop_scan_check(&check)
+        })
+        .filter(|check| {
+            standing.contains(&(
+                check.table.schema.as_str().to_owned(),
+                check.table.name.as_str().to_owned(),
+                check.name.clone(),
+            ))
+        })
+        .collect())
+}
+
+/// Drops `checks`, as [`standing_scan_checks`] found them.
+pub async fn drop_scan_checks(conn: &mut Conn, checks: &[ScanCheck]) -> Result<(), DbError> {
+    for check in checks {
+        let sql = crate::emit::drop_scan_check(check)
             .map_err(|error| DbError::Refused(error.to_string()))?;
         conn.execute(&sql).await?;
-        removed.push(check);
     }
-    Ok(removed)
+    Ok(())
 }
 
 fn missing(column: &str) -> DbError {
