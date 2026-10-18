@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 50;
+pub const SCHEMA_VERSION: u32 = 51;
+// 51: a table's `row_security:` and `row_policies:` (issue #1172 PR A).
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).
 // 29: a table's `partition_by:` and `partitions:` (issue #1170).
@@ -840,11 +841,95 @@ mod tests {
             "IndexDto",
             "ForeignKeyDto",
             "ModuleDto",
+            "RowPolicyDto",
+            "RowSecurityDto",
         ] {
             assert_eq!(
                 defs[name]["additionalProperties"],
                 serde_json::json!(false),
                 "{name} must refuse unknown fields: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn row_security_declaration_schema_and_loader_agree() {
+        let validator = jsonschema::validator_for(&schema(SchemaKind::Declaration)).unwrap();
+        for (policy, valid) in [
+            (serde_json::json!({}), true),
+            (serde_json::json!({"to": "public"}), true),
+            (serde_json::json!({"to": ["PUBLIC", "app"]}), true),
+            (
+                serde_json::json!({"command": "update", "restrictive": true, "using": "id > 0", "with_check": "id > 0"}),
+                true,
+            ),
+            (
+                serde_json::json!({"command": "insert", "with_check": "id > 0"}),
+                true,
+            ),
+            (
+                serde_json::json!({"command": "delete", "using": "id > 0"}),
+                true,
+            ),
+            (
+                serde_json::json!({"command": "select", "using": "id > 0", "with_check": null}),
+                true,
+            ),
+            (
+                serde_json::json!({"command": "insert", "using": "id > 0"}),
+                false,
+            ),
+            (
+                serde_json::json!({"command": "select", "with_check": "id > 0"}),
+                false,
+            ),
+            (
+                serde_json::json!({"command": "delete", "with_check": "id > 0"}),
+                false,
+            ),
+            (serde_json::json!({"command": "truncate"}), false),
+            (serde_json::json!({"to": []}), false),
+            (serde_json::json!({"to": ["public", "app"]}), false),
+            (serde_json::json!({"to": ["current_user"]}), false),
+            (serde_json::json!({"to": ["session_user"]}), false),
+            (serde_json::json!({"to": ["current_role"]}), false),
+            (serde_json::json!({"to": "app"}), false),
+            (serde_json::json!({"to": null}), false),
+            (serde_json::json!({"with_chek": "true"}), false),
+        ] {
+            let declaration = serde_json::json!({
+                "table": "app.t", "columns": {"id": {"type": "integer"}},
+                "row_policies": {"p": policy},
+            });
+            assert_eq!(validator.is_valid(&declaration), valid, "schema: {policy}");
+            assert_eq!(
+                pbps_load::load_table_str(std::path::Path::new("t.yml"), &declaration.to_string())
+                    .is_ok(),
+                valid,
+                "loader: {policy}"
+            );
+        }
+        for security in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": true, "forced": false}),
+            serde_json::json!({"enabled": false, "forced": true}),
+        ] {
+            let declaration = serde_json::json!({"table": "app.t", "columns": {"id": {"type": "integer"}}, "row_security": security});
+            assert!(validator.is_valid(&declaration));
+            assert!(
+                pbps_load::load_table_str(std::path::Path::new("t.yml"), &declaration.to_string())
+                    .is_ok()
+            );
+        }
+        for security in [
+            serde_json::json!({"enable": true}),
+            serde_json::json!({"enabled": null}),
+        ] {
+            let declaration = serde_json::json!({"table": "app.t", "columns": {"id": {"type": "integer"}}, "row_security": security});
+            assert!(!validator.is_valid(&declaration));
+            assert!(
+                pbps_load::load_table_str(std::path::Path::new("t.yml"), &declaration.to_string())
+                    .is_err()
             );
         }
     }

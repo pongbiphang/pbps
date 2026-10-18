@@ -88,6 +88,9 @@ fn artifacts() -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
     // format must not silently change the fixture's version or checksum.
     plan.version = 36;
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids.clone(), "fixture");
+    // Pin this historical envelope as the plan above is pinned. Adding
+    // default-omitted table fields must preserve every fixture byte (#1172).
+    state.version = 25;
     state.declared = Declared::from_schema(&schema);
     state.plan_checksum = Some(plan.checksum());
     (schema, ids, plan, state)

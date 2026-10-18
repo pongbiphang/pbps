@@ -249,7 +249,10 @@ use crate::zone::SessionZone;
 /// Bumped to 42 for a staged attach's scan-free form (DEC-1638.1): an
 /// `AttachPartition`'s `key`, which an older build cannot read, and would
 /// otherwise refuse as no pbps plan rather than as a newer one.
-pub const CURRENT_VERSION: u32 = 42;
+///
+/// Bumped to 43 for table row-security state (DEC-1172.2). A build must not
+/// read those fields and then emit a table without its policies or flags.
+pub const CURRENT_VERSION: u32 = 43;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -723,7 +726,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 42);
+        assert_eq!(CURRENT_VERSION, 43);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

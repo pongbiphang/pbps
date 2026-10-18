@@ -163,6 +163,14 @@ impl Created<'_> {
         moved: &mut Vec<String>,
     ) {
         let declared = self.declared;
+        // No policy operation can own these fields yet (DEC-1172.1).
+        if &declared.row_security != now.row_security || &declared.row_policies != now.row_policies
+        {
+            moved.push(format!(
+                "{} row-security flags or policies are not what this plan declares",
+                now_name.shown()
+            ));
+        }
         let mut named = |kind: &str, was: BTreeSet<&str>, now: BTreeSet<&str>| {
             for extra in now.difference(&was) {
                 moved.push(format!(

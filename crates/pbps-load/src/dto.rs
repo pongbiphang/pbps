@@ -384,6 +384,14 @@ pub struct TableDto {
     #[serde(default)]
     pub unlogged: bool,
 
+    /// PostgreSQL's independent ENABLE and FORCE row-security flags.
+    #[serde(default)]
+    pub row_security: RowSecurityDto,
+
+    /// Table-local PostgreSQL policies, including policies on a disabled table.
+    #[serde(default)]
+    pub row_policies: BTreeMap<String, RowPolicyDto>,
+
     /// A PostgreSQL partitioned parent's key columns: `[ts]` for RANGE, or
     /// `{list: [k]}` or `{hash: [a, b]}` (#1632).
     #[serde(default)]
@@ -408,6 +416,108 @@ pub struct TableDto {
     /// the opt-in that lets the tool touch rows at all.
     #[serde(default)]
     pub data: Option<DataDto>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RowSecurityDto {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub forced: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("allOf" = [
+    serde_json::json!({
+        "if": {"required": ["command"], "properties": {"command": {"enum": ["select", "delete"]}}},
+        "then": {"properties": {"with_check": {"type": "null"}}},
+    }),
+    serde_json::json!({
+        "if": {"required": ["command"], "properties": {"command": {"const": "insert"}}},
+        "then": {"properties": {"using": {"type": "null"}}},
+    }),
+]))]
+pub struct RowPolicyDto {
+    #[serde(default)]
+    pub command: PolicyCommandDto,
+    #[serde(default)]
+    pub restrictive: bool,
+    #[serde(default)]
+    pub to: PolicyRolesDto,
+    #[serde(default)]
+    pub using: Option<String>,
+    #[serde(default)]
+    pub with_check: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyCommandDto {
+    #[default]
+    All,
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyPublicDto {
+    Public,
+}
+
+#[derive(Debug, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum PolicyRolesDto {
+    Public(PolicyPublicDto),
+    Roles(#[schemars(schema_with = "policy_role_list_schema")] Vec<String>),
+}
+
+fn policy_role_list_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "minItems": 1,
+        "items": {"type": "string", "not": {"enum": ["public", "current_user", "session_user", "current_role"]}},
+    })
+}
+
+impl Default for PolicyRolesDto {
+    fn default() -> Self {
+        Self::Public(PolicyPublicDto::Public)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PolicyRolesDto {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Dispatch by YAML shape, without buffering an untagged value: names
+        // must reach the same String reader as other declared identifiers.
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PolicyRolesDto;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the scalar `public`, or a list of role names")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "public" => Ok(PolicyRolesDto::default()),
+                    _ => Err(E::custom(
+                        "write the scalar `public`, or a list of role names",
+                    )),
+                }
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(PolicyRolesDto::Roles)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// The `data:` block.

@@ -3921,6 +3921,24 @@ pub(crate) fn validate_saved_plan(
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
 
     for (index, planned) in plan.changes.changes.iter().enumerate() {
+        // A saved artifact need not have passed this build's differ. Refuse
+        // every operation carrying a complete table shape (DEC-1172.1).
+        // The other operations carry no Table payload.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let shape = match &planned.change {
+            pbps_model::Change::CreateTable { name, table, .. } => Some((name, table)),
+            pbps_model::Change::AttachPartition { table, shape, .. }
+            | pbps_model::Change::DetachPartition { table, shape, .. } => Some((table, shape)),
+            _ => None,
+        };
+        if let Some((name, table)) = shape
+            && table.has_row_security()
+        {
+            bail!(
+                "{} has row-security flags or policies; RLS planning arrives with #1172's later PRs",
+                name.shown()
+            );
+        }
         let expected = dialect.change_risks(&planned.change);
         if planned.risks != expected {
             let names = |risks: &std::collections::BTreeSet<pbps_model::RiskClass>| {
@@ -4581,6 +4599,88 @@ mod tests {
                         .to_string()
                         .contains("inconsistent risks")
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn row_security_saved_plans_refuse_every_table_payload_until_later_prs() {
+        use pbps_model::{
+            Change, ChangeSet, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, SavedPlan, Table,
+        };
+        for engine in [DialectName::Postgres, DialectName::Mssql] {
+            let dialect = dialect_for(engine);
+            for kind in 0..3 {
+                for security in 0..4 {
+                    let mut shape = Table::default();
+                    match security {
+                        1 => shape.row_security.enabled = true,
+                        2 => shape.row_security.forced = true,
+                        3 => {
+                            shape
+                                .row_policies
+                                .insert("p".into(), pbps_model::RowPolicy::default());
+                        }
+                        _ => {}
+                    }
+                    let table = "app.t".parse().unwrap();
+                    let uid = "t_117200".parse().unwrap();
+                    let change = match kind {
+                        0 => Change::CreateTable {
+                            uid,
+                            name: table,
+                            table: Box::new(shape),
+                            beside_default: None,
+                            moves_at_most: None,
+                        },
+                        1 => Change::AttachPartition {
+                            uid,
+                            table,
+                            parent: "app.parent".parse().unwrap(),
+                            bound: pbps_model::PartitionBound::Default,
+                            key: vec![],
+                            shape: Box::new(shape),
+                        },
+                        _ => Change::DetachPartition {
+                            uid,
+                            table,
+                            parent: "app.parent".parse().unwrap(),
+                            names: vec![],
+                            shape: Box::new(shape),
+                        },
+                    };
+                    let mut planned = PlannedChange::new(change);
+                    planned.risks = dialect.change_risks(&planned.change);
+                    let plan = SavedPlan::new(
+                        PlanOrigin::Database,
+                        dialect.name(),
+                        "2026-10-18T00:00:00Z",
+                        PlanBaseline {
+                            time_zone: None,
+                            description: "test".into(),
+                            checksum: "a".repeat(64),
+                            database_collation: None,
+                        },
+                        ChangeSet {
+                            changes: vec![planned],
+                        },
+                        IdsFile::default(),
+                    );
+                    // Exercise artifact deserialization, not just the builder.
+                    let plan =
+                        serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+                    let result = validate_saved_plan(&plan, dialect.as_ref());
+                    if security == 0 {
+                        result.unwrap();
+                    } else {
+                        let message = result.unwrap_err().to_string();
+                        assert!(message.contains("app.t"), "{message}");
+                        assert!(
+                            message.contains("RLS planning arrives with #1172's later PRs"),
+                            "{message}"
+                        );
+                    }
+                }
             }
         }
     }

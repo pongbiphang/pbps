@@ -1179,3 +1179,16 @@ limitation, so every table it recorded is neither, which is what the absent
 fields read as. An older build reading a version 25 plan would create an
 ordinary table where a partition tree was planned. The published schema set
 is 29.
+
+<a id="dec-1172-2"></a>
+
+**DEC-1172.2. State 26, plan 43 and schema set 51 carry row-security state;
+the oldest readable state stays 6.** (#1172 PR A.) Table gains independent
+enable/force flags and a policy map (DEC-1172.1). Earlier catalog readers
+excluded tables with either flag or any policy, including disabled policies,
+and a limitation on a managed table refuses recording. An old state's
+missing fields therefore mean disabled flags and no policies, rather than
+unread metadata. Default fields are skipped on serialization, preserving
+ordinary-table schema bytes and checksums. Historical state and plan byte
+fixtures keep their original envelope versions. A new envelope advances its
+version deliberately; prior published schema archives are never rewritten.

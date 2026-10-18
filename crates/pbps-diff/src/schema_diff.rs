@@ -35,6 +35,11 @@ use pbps_model::{
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffError {
+    #[error(
+        "{table} has row-security flags or policies; RLS planning arrives with #1172's later PRs",
+        table = .table.shown(),
+    )]
+    RowSecurityPlanningPending { table: TableName },
     /// In most databases IDENTITY cannot be changed with ALTER; the whole table
     /// has to be rebuilt. That is beyond what declarative automation should do on
     /// its own — a human has to choose the migration strategy.
@@ -610,6 +615,27 @@ pub(crate) fn diff_partial_rebuilding(
             .into_iter()
             .map(|modules| DiffError::DependsOnCycle { modules })
             .collect();
+
+    // Representability must not turn a policy into an ignored CreateTable
+    // field, or erase a standing policy change (DEC-1172.1). Both sides matter:
+    // removing the last policy is just as unsupported as adding the first.
+    let secured: BTreeSet<_> = base
+        .schema
+        .tables
+        .iter()
+        .chain(&declared.schema.tables)
+        .filter(|(_, table)| table.has_row_security())
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !secured.is_empty() {
+        return Diffed {
+            errors: secured
+                .into_iter()
+                .map(|table| DiffError::RowSecurityPlanningPending { table })
+                .collect(),
+            ..Default::default()
+        };
+    }
 
     let base_tables = &base.ids.tables;
     let declared_tables = &declared.ids.tables;
@@ -6915,6 +6941,68 @@ mod tests {
         let mut s = Schema::default();
         s.tables.insert(name.parse().unwrap(), t);
         s
+    }
+
+    #[test]
+    fn row_security_planning_refuses_either_input_until_later_prs() {
+        let empty = Schema::default();
+        let empty_ids = IdsFile::default();
+        let plain = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+        let ids = crate::resolve(&plain, &IdsFile::default(), &[], &ctx())
+            .unwrap()
+            .ids;
+        let empty_side = Side {
+            schema: &empty,
+            ids: &empty_ids,
+        };
+        let plain_side = Side {
+            schema: &plain,
+            ids: &ids,
+        };
+        let created = diff(empty_side, plain_side, &MinimalDialect, &Hints::default()).unwrap();
+        assert!(
+            matches!(&created.changes[..], [change] if matches!(change.change, Change::CreateTable { .. }))
+        );
+        assert!(
+            diff(plain_side, plain_side, &MinimalDialect, &Hints::default())
+                .unwrap()
+                .is_empty()
+        );
+        for shape in 0..3 {
+            let mut secured = plain.clone();
+            let t = secured.tables.values_mut().next().unwrap();
+            match shape {
+                0 => t.row_security.enabled = true,
+                1 => t.row_security.forced = true,
+                _ => {
+                    t.row_policies
+                        .insert("p".into(), pbps_model::RowPolicy::default());
+                }
+            }
+            let secured_side = Side {
+                schema: &secured,
+                ids: &ids,
+            };
+            for (base, declared) in [
+                (empty_side, secured_side),
+                (plain_side, secured_side),
+                (secured_side, plain_side),
+                (secured_side, secured_side),
+            ] {
+                let errors = diff(base, declared, &MinimalDialect, &Hints::default()).unwrap_err();
+                assert!(
+                    matches!(&errors[..], [DiffError::RowSecurityPlanningPending { table }] if table == &TableName::new("app", "t"))
+                );
+                assert!(
+                    errors[0]
+                        .to_string()
+                        .contains("RLS planning arrives with #1172's later PRs")
+                );
+                let partial = diff_partial(base, declared, &MinimalDialect, &Hints::default());
+                assert!(partial.changes.is_empty());
+                assert_eq!(partial.errors, errors);
+            }
+        }
     }
 
     /// Reproduces the real flow: the base side's identity file is the one from

@@ -108,6 +108,9 @@ use crate::schema::Schema;
 /// partition bounded by a list or a modulus and remainder (DEC-1632.1).
 /// Versions 6 to 24 stay readable.
 ///
+/// Bumped to 26 for row-security flags and policies (DEC-1172.2). Versions
+/// 6 to 25 stay readable: earlier readers excluded every such table.
+///
 /// Readers refuse a version they do not understand rather than reading it
 /// partially.
 ///
@@ -126,7 +129,7 @@ use crate::schema::Schema;
 /// order, which can drop a schema-bound dependency before its dependent.
 /// Refused, with the remedy `check_version` already names: re-record it with
 /// `pbps baseline --reason ...`.
-pub const CURRENT_VERSION: u32 = 25;
+pub const CURRENT_VERSION: u32 = 26;
 
 /// The oldest snapshot version this build reads as its own.
 ///
@@ -608,7 +611,7 @@ mod tests {
         // the whole story rather than a sample of it; 6 is readable because
         // the field 7 added is one it truly lacks.
         assert_eq!(OLDEST_READABLE_VERSION, 6);
-        assert_eq!(CURRENT_VERSION, 25);
+        assert_eq!(CURRENT_VERSION, 26);
     }
 
     fn schema_with(ty: &str) -> Schema {

@@ -296,6 +296,8 @@ pub fn own_parts(table: &pbps_model::Table) -> Vec<&'static str> {
         replica_identity,
         storage_parameters,
         unlogged,
+        row_security,
+        row_policies,
         partition_by,
         partition_of,
         system_time,
@@ -314,6 +316,8 @@ pub fn own_parts(table: &pbps_model::Table) -> Vec<&'static str> {
         (replica_identity.is_some(), "a replica identity"),
         (!storage_parameters.is_empty(), "storage parameters"),
         (*unlogged, "unlogged persistence"),
+        (!row_security.is_default(), "row-security flags"),
+        (!row_policies.is_empty(), "row-security policies"),
         (partition_by.is_some(), "partitions"),
         (
             partition_of
@@ -473,6 +477,18 @@ mod tests {
             );
         }
         s
+    }
+
+    #[test]
+    fn row_security_is_an_owned_part_even_when_policies_are_disabled() {
+        let mut t = pbps_model::Table::default();
+        assert!(own_parts(&t).is_empty());
+        t.row_security.forced = true;
+        assert_eq!(own_parts(&t), ["row-security flags"]);
+        t.row_security = Default::default();
+        t.row_policies
+            .insert("p".into(), pbps_model::RowPolicy::default());
+        assert_eq!(own_parts(&t), ["row-security policies"]);
     }
 
     fn ids(entries: &[(&str, &str)]) -> IdsFile {

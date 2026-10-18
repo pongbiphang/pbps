@@ -60,3 +60,4 @@ DECISIONS 465).
 - `33/` adds a partition's own `columns:`, each a `default:` or `nullable: false`, to a `partitions:` entry (issue #1578).
 - `34/` adds a partition's own `unlogged:` and `storage_parameters:` to a `partitions:` entry (issue #1580).
 - `49/` adds a partition's own `foreign_keys:` to a `partitions:` entry (issue #1632).
+- `51/` adds table `row_security:` and `row_policies:` (issue #1172 PR A).

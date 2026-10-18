@@ -24,6 +24,69 @@ fn plan(changes: Vec<Change>) -> ChangeSet {
     }
 }
 
+#[test]
+fn row_security_is_held_exactly_for_kept_and_created_tables() {
+    let pg = pbps_pg::Postgres::new();
+    let mut declared = table();
+    declared.row_policies.insert(
+        "p".into(),
+        pbps_model::RowPolicy {
+            using: Some("id > 0".into()),
+            ..Default::default()
+        },
+    );
+    let after = schema(declared.clone());
+    let mut baseline = declared.clone();
+    baseline.columns["id"].value_source = pbps_model::ValueSource::Default("7".into());
+    let before = schema(baseline);
+    let kept = plan(vec![Change::AlterColumnDefault {
+        uid: "c_117200".parse().unwrap(),
+        column: TableName::new("app", "t").column("id"),
+        from: Some("7".into()),
+        to: None,
+    }]);
+    let create = plan(vec![Change::CreateTable {
+        uid: "t_117200".parse().unwrap(),
+        name: TableName::new("app", "t"),
+        table: Box::new(declared.clone()),
+        beside_default: None,
+        moves_at_most: None,
+    }]);
+    for read in [Settled::SoFar, Settled::Whole, Settled::Closing] {
+        for (baseline, changes) in [
+            (&before, kept.clone()),
+            (&Schema::default(), create.clone()),
+        ] {
+            refuse_unplanned_movement(&pg, &changes, baseline, &after, "test", read).unwrap();
+            for field in 0..5 {
+                let mut changed = declared.clone();
+                match field {
+                    0 => changed.row_security.enabled = true,
+                    1 => changed.row_security.forced = true,
+                    2 => {
+                        changed.row_policies.clear();
+                    }
+                    3 => changed.row_policies.get_mut("p").unwrap().using = Some("id > 1".into()),
+                    _ => {
+                        changed.row_policies.get_mut("p").unwrap().with_check =
+                            Some("id > 0".into())
+                    }
+                }
+                let error = refuse_unplanned_movement(
+                    &pg,
+                    &changes,
+                    baseline,
+                    &schema(changed),
+                    "test",
+                    read,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("row-security"), "{error:#}");
+            }
+        }
+    }
+}
+
 fn partition(default: Option<&str>, not_null: bool) -> Table {
     Table {
         partition_of: Some(pbps_model::PartitionOf {

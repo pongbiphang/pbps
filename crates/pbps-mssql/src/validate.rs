@@ -521,6 +521,16 @@ pub(crate) fn table_sources(
     let mut errs = Vec::new();
     errs.extend(table.constraint_name_conflicts().into_iter().map(invalid));
     errs.extend(table.clustered_problems().into_iter().map(invalid));
+    if !table.row_security.is_default() {
+        errs.push(invalid(
+            "`row_security` is a PostgreSQL setting; SQL Server refuses non-default row-security flags",
+        ));
+    }
+    if !table.row_policies.is_empty() {
+        errs.push(invalid(
+            "`row_policies` are PostgreSQL policies; SQL Server refuses a nonempty policy map",
+        ));
+    }
     if table.replica_identity.is_some() {
         errs.push(invalid(
             "`replica_identity` is a PostgreSQL logical-replication setting; SQL Server has no \

@@ -6,6 +6,11 @@ bugs behind the scar tissue are in [PITFALLS.md](PITFALLS.md).
 
 ## Phase
 
+#1172 PR A adds the PostgreSQL row-security model and YAML format
+(`row_security:`, `row_policies:`). Catalog adoption and deployment remain
+pending; planning and saved-plan replay refuse non-default RLS state until
+the later PRs of #1172 (DEC-1172.1).
+
 **Phases 0-5 complete** (0, 1, 2, 3, 3.1, 3.5, 4 and 5), with SQL Server
 and PostgreSQL supported through the CLI. SQL Server uses `tiberius` 0.13.0
 with rustls and aws-lc-rs; PostgreSQL's rustls configuration selects the same
