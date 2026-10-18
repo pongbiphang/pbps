@@ -3097,10 +3097,10 @@ fn a_row_insert_waits_for_the_drop_of_a_not_null_column_it_leaves_out() {
         "{:?}",
         fx[0].requires
     );
-    // Negative: a table with a trigger, which may fill the column before
-    // the row is checked: the engine says whether it does (#2175 review).
-    let mut triggered = insert_beside_a_dropped_column(true);
-    triggered.before.modules.insert(
+    // Negative: a table with a trigger the plan keeps, which may fill the
+    // column before the row is checked: the engine says whether it does
+    // (#2175 review).
+    let trigger = (
         ModuleId::Trigger {
             on: t("t"),
             name: "fill".into(),
@@ -3111,8 +3111,18 @@ fn a_row_insert_waits_for_the_drop_of_a_not_null_column_it_leaves_out() {
             description: None,
         },
     );
+    let mut triggered = insert_beside_a_dropped_column(true);
+    for side in [&mut triggered.before, &mut triggered.after] {
+        side.modules.insert(trigger.0.clone(), trigger.1.clone());
+    }
     let (ops, fx, baseline) = triggered.analysed(ModuleEdits::InPlace);
     assert_eq!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
+    // But a trigger the plan drops may be gone when the row is written, so
+    // the insert still waits (#2175 review).
+    let mut dropped = insert_beside_a_dropped_column(true);
+    dropped.before.modules.insert(trigger.0, trigger.1);
+    let (ops, fx, baseline) = dropped.analysed(ModuleEdits::InPlace);
+    assert_ne!(run(&ops, &fx, &baseline, &[1, 0], &none, Checks::ALL), []);
 }
 
 /// A parent `p` and a child `c` whose foreign key stands throughout, over the

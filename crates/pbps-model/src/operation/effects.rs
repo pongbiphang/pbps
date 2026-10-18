@@ -1634,25 +1634,36 @@ impl Cx<'_> {
         // A trigger on the table may fill the column before the row is
         // checked, and whether it does is the engine's to say: the release
         // pass lets a drop pass the insert there (`Dependence::base_required`,
-        // #1397), so no requirement is stated (#2175 review). Only a declared
-        // trigger is seen here; an undeclared one is the catalog's, which the
-        // effects do not read.
-        let final_name = self.final_of(owner).map(|(name, _)| name);
-        let triggered = self
-            .before
-            .schema
-            .modules
-            .keys()
-            .chain(self.after.schema.modules.keys())
-            .any(|id| {
-                matches!(id, crate::ModuleId::Trigger { on, .. }
-                    if [Some(base_name), final_name]
-                        .into_iter()
-                        .flatten()
-                        .any(|t| on.schema == t.schema && on.name == t.name))
-            });
-        if triggered {
-            return;
+        // #1397), so no requirement is stated (#2175 review). Only a trigger
+        // that stands at the insert: one the plan keeps unchanged, under the
+        // table's name at each end. One it drops or rewrites may be gone when
+        // the row is written, and one it creates comes after the rows. Only a
+        // declared trigger is seen here; an undeclared one is the catalog's,
+        // which the effects do not read.
+        if let Some((final_name, _)) = self.final_of(owner) {
+            let on = |id: &crate::ModuleId, table: &TableName| -> Option<String> {
+                match id {
+                    crate::ModuleId::Trigger { on, name }
+                        if on.schema == table.schema && on.name == table.name =>
+                    {
+                        Some(name.clone())
+                    }
+                    crate::ModuleId::Trigger { .. }
+                    | crate::ModuleId::Named(_)
+                    | crate::ModuleId::Routine(_) => None,
+                }
+            };
+            let kept =
+                self.before.schema.modules.iter().any(|(id, was)| {
+                    on(id, base_name).is_some_and(|name| {
+                        self.after.schema.modules.iter().any(|(id, will)| {
+                            on(id, final_name) == Some(name.clone()) && will == was
+                        })
+                    })
+                });
+            if kept {
+                return;
+            }
         }
         let written: Vec<ColumnKey> = written
             .iter()
