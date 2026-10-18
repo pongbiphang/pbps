@@ -1,4 +1,5 @@
 //! Captured on master d4752d3f before #2084 step 1b changed routine/module formatting.
+//! #2186 corrects only the PostgreSQL definition's unsafe literal YAML controls.
 
 use pbps_dialect::Dialect;
 use pbps_model::{

@@ -2460,6 +2460,84 @@ fn pull_round_trips_ordinary_engine_names_without_a_name_warning() {
     assert_eq!(code(&validate), 0, "{}", stderr(&validate));
 }
 
+#[test]
+#[ignore = "needs live mssql"]
+fn pull_preserves_trigger_definitions_with_yaml_controls() {
+    let server = std::env::var("PBPS_TEST_DB").unwrap();
+    let own = OwnDatabase::new(&server, "pull_controls2186");
+    let connection = own.connection();
+    for (i, name) in ["ordinary", "multi\nline", "guard\n\x1b[31m"]
+        .iter()
+        .enumerate()
+    {
+        on_server(
+            connection,
+            &format!("CREATE TABLE dbo.[{name}] (code int NOT NULL PRIMARY KEY);"),
+        );
+        // The header's ON table is split out of SQL Server's definition, so
+        // the body must also name it to exercise scalar escaping.
+        on_server(
+            connection,
+            &format!(
+                "SET QUOTED_IDENTIFIER ON; SET ANSI_NULLS ON;
+                 EXEC(N'CREATE TRIGGER dbo.skip_{i} ON dbo.[{name}] AFTER INSERT
+                     AS DELETE FROM dbo.[{name}] WHERE code IS NULL;');"
+            ),
+        );
+    }
+    let expected = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = connect_live(connection).await.unwrap();
+            pbps_mssql::catalog::introspect(&mut conn)
+                .await
+                .unwrap()
+                .schema
+                .modules
+        });
+    assert_eq!(expected.len(), 3);
+    assert!(expected.values().any(|m| m.definition.contains('\x1b')));
+
+    let d = Demo::new("pull-controls2186");
+    let pulled = d.run(&["pull", "--db", connection]);
+    assert_eq!(code(&pulled), 0, "{}{}", stdout(&pulled), stderr(&pulled));
+    let schema = d.dir.join("schema");
+    assert_eq!(
+        pbps_load::load_schema_dir(&schema).unwrap().schema.modules,
+        expected
+    );
+    let files: Vec<_> = pbps_load::schema_files(&schema)
+        .unwrap()
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            if p.to_string_lossy().ends_with(".trigger.yml") {
+                let yaml = std::str::from_utf8(&bytes).unwrap();
+                let module = pbps_load::load_module_str(&p, yaml).unwrap().module;
+                assert_eq!(
+                    yaml.contains("\ndefinition: \""),
+                    module.definition.contains('\x1b'),
+                    "{yaml:?}"
+                );
+            }
+            (p, bytes)
+        })
+        .collect();
+    for args in [&["validate"][..], &["fmt"], &["fmt", "--check"]] {
+        let output = d.run(args);
+        assert_eq!(code(&output), 0, "{}{}", stdout(&output), stderr(&output));
+    }
+    assert_eq!(
+        pbps_load::load_schema_dir(&schema).unwrap().schema.modules,
+        expected
+    );
+    for (path, bytes) in files {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+}
+
 /// #1214: a constraint the plan adds is checked against the database too,
 /// not only against what the plan itself puts there. A synonym already at
 /// the name of a check the plan adds refuses the plan by name, where the

@@ -27,6 +27,83 @@ fn raised_guard_messages_are_shown_once_on_every_apply_path() {
     raised_messages::check(&server(), true);
 }
 
+#[test]
+#[ignore = "needs live pg"]
+fn pull_preserves_trigger_definitions_with_yaml_controls() {
+    let own = OwnDatabase::new(&server(), "pull_controls2186");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app;
+         CREATE FUNCTION app.skip() RETURNS trigger LANGUAGE plpgsql AS
+             $$ BEGIN RETURN NULL; END $$;",
+    );
+    for (i, name) in ["ordinary", "multi\nline", "guard\n\x1b[31m"]
+        .iter()
+        .enumerate()
+    {
+        on_server(
+            connection,
+            &format!(
+                "CREATE TABLE app.\"{name}\" (code int PRIMARY KEY);
+                 CREATE TRIGGER skip_{i} BEFORE INSERT ON app.\"{name}\"
+                     FOR EACH ROW EXECUTE FUNCTION app.skip();"
+            ),
+        );
+    }
+    let expected = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut conn = pbps_db::Conn::connect(pbps_db::Driver::Postgres, connection)
+                .await
+                .unwrap();
+            pbps_pg::catalog::introspect(&mut conn)
+                .await
+                .unwrap()
+                .schema
+                .modules
+        });
+    assert_eq!(expected.len(), 4);
+    assert!(expected.values().any(|m| m.definition.contains('\x1b')));
+
+    let d = Demo::new("pull-controls2186");
+    succeeds(d.run(&["pull", "--db", connection]));
+    let schema = d.dir.join("schema");
+    assert_eq!(
+        pbps_load::load_schema_dir(&schema).unwrap().schema.modules,
+        expected
+    );
+    let files: Vec<_> = pbps_load::schema_files(&schema)
+        .unwrap()
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            if p.to_string_lossy().ends_with(".trigger.yml") {
+                let yaml = std::str::from_utf8(&bytes).unwrap();
+                let module = pbps_load::load_module_str(&p, yaml).unwrap().module;
+                assert_eq!(
+                    yaml.contains("\ndefinition: \""),
+                    module.definition.contains('\x1b'),
+                    "{yaml:?}"
+                );
+            }
+            (p, bytes)
+        })
+        .collect();
+    for args in [&["validate"][..], &["fmt"], &["fmt", "--check"]] {
+        succeeds(d.run(args));
+    }
+    assert_eq!(
+        pbps_load::load_schema_dir(&schema).unwrap().schema.modules,
+        expected
+    );
+    for (path, bytes) in files {
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+}
+
 #[path = "support/alias_batches.rs"]
 mod alias_batches;
 
