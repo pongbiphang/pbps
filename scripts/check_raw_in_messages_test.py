@@ -255,6 +255,58 @@ class BuilderMessages(unittest.TestCase):
                     self.assertEqual(run(text, path=path), [])
                     self.assertEqual(len(run(text.replace('n.shown()', 'n.raw()'), path=path)), 1)
 
+    def test_turbofish_error_payloads_are_checked(self):
+        for path in guard.SQL_BUILDERS:
+            for text in [
+                'Err::<_, DialectError>(no_column_collation(&n.raw().to_string(), collation))',
+                'std::result::Result::Err::<_, String>(format!("bad {}", n.raw()))',
+                'Err /* call */ :: /* types */ <Vec<Result<fn(u8) -> u16, [u8; 2]>>, '
+                'DialectError>(invalid(format!("bad {}", n.raw())))',
+            ]:
+                with self.subTest(path=path, text=text):
+                    self.assertEqual(len(run(text, path=path)), 1)
+                    self.assertEqual(run(text.replace('n.raw()', 'n.shown()'), path=path), [])
+        # Naming the generic constructor without calling it is not a sink.
+        self.assertEqual(run('let make = Err::<String, DialectError>;', path=BUILDER), [])
+        text = (
+            'Err::<_, RowsError>(RowsError::Dialect(DialectError::ByHand { '
+            'why: format!("bad {}", n.shown()), '
+            'statement: format!("ALTER TABLE {}", quote(sql.raw())) }))'
+        )
+        self.assertEqual(run(text, path=BUILDER), [])
+        self.assertEqual(len(run(text.replace('n.shown()', 'n.raw()'), path=BUILDER)), 1)
+
+    def test_grouped_errors_preserve_sql_but_check_prose(self):
+        payload = (
+            'DialectError::ByHand { why: format!("bad {}", n.shown()), '
+            'statement: format!("ALTER TABLE {}", quote(sql.raw())) }'
+        )
+        block = (
+            '{ let statement = format!("ALTER TABLE {}", quote(sql.raw())); '
+            'DialectError::ByHand { dialect: DIALECT, '
+            'why: format!("bad {}", n.shown()), statement } }'
+        )
+        for path in guard.SQL_BUILDERS:
+            for text in [
+                f'Err((({payload})))',
+                f'Err({{ {payload} }})',
+                f'Err(({block}))',
+                f'Err::<_, DialectError>({block})',
+            ]:
+                with self.subTest(path=path, text=text):
+                    self.assertEqual(run(text, path=path), [])
+                    self.assertEqual(len(run(text.replace('n.shown()', 'n.raw()'), path=path)), 1)
+        text = f'Err(({payload}).to_string() + &format!("bad {{}}", extra.raw()))'
+        self.assertEqual(len(run(text, path=BUILDER)), 1)
+        self.assertEqual(run(text.replace('extra.raw()', 'extra.shown()'), path=BUILDER), [])
+        text = (
+            'Err({ let statement = format!("ALTER TABLE {}", quote(sql.raw())); '
+            'no_column_collation(&n.raw().to_string(), collation) })'
+        )
+        self.assertEqual(len(run(text, path=BUILDER)), 1)
+        text = f'Err({{ let _ = invalid(format!("bad {{}}", extra.raw())); {payload} }})'
+        self.assertEqual(len(run(text, path=BUILDER)), 1)
+
     def test_every_message_macro_and_error_attribute_is_checked_in_builders(self):
         for macro in guard.MACROS:
             if macro == 'format':

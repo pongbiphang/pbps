@@ -52,7 +52,7 @@ RAW = re.compile(r"\.\s*(?:r#)?raw\s*\(|::\s*(?:r#)?raw\b")
 RAW_STRING = re.compile(r"(?:br|cr|r)(#*)\"")
 ERROR_CALL = re.compile(
     r"\b(?:\w+\s*::\s*)*(invalid|Err|(?:DbError|DialectError|RowsError)"
-    r"\s*::\s*(?:r#)?[A-Z]\w*)\s*[(\{]"
+    r"\s*::\s*(?:r#)?[A-Z]\w*)\s*(?:::\s*<|[(\{])"
 )
 MESSAGE_FIELDS = {"message", "feature", "part", "detail", "why"}
 SQL_BUILDERS = {
@@ -330,6 +330,71 @@ def message_start(code, opened, end, name):
     return end
 
 
+def error_opening(code, match):
+    """Find the call after optional type arguments, including nested types."""
+    opened = match.end() - 1
+    if code[opened] != "<":
+        return opened
+    depth, i = 1, opened + 1
+    while i < len(code):
+        c = code[i]
+        if c in "([{":
+            # Array lengths and const arguments can contain angle operators.
+            end = closing(code, i)
+            if end is None:
+                return None
+            i = end
+        elif c == "<":
+            depth += 1
+        elif c == ">" and code[i - 1] != "-":  # not a function type's arrow
+            depth -= 1
+            if depth == 0:
+                i += 1
+                while i < len(code) and code[i].isspace():
+                    i += 1
+                return i if i < len(code) and code[i] in "({" else None
+        elif c == ";":
+            return None
+        i += 1
+    return None
+
+
+def err_ranges(code, start, stop):
+    """Read an Err's value through groups and the tail of a block.
+
+    Local statements are not the returned prose. Their named diagnostic sinks
+    are checked separately; tracing text through locals remains out of scope.
+    """
+    pending, ranges = [(start, stop)], []
+    while pending:
+        start, stop = pending.pop()
+        while start < stop and code[start].isspace():
+            start += 1
+        if start == stop:
+            continue
+        if code[start] in "({":
+            end = closing(code, start)
+            if end is not None and end < stop:
+                tail = start + 1
+                if code[start] == "{":
+                    i = tail
+                    while i < end:
+                        if code[i] in "([{":
+                            i = closing(code, i)
+                        elif code[i] == ";":
+                            tail = i + 1
+                        i += 1
+                pending.extend([(tail, end), (end + 1, stop)])
+                continue
+        nested = ERROR_CALL.match(code, start)
+        opened = error_opening(code, nested) if nested else None
+        end = closing(code, opened) if opened is not None else None
+        # The nested constructor checks its own fields, but a suffix can add
+        # context whose raw operands are still part of this Err's message.
+        ranges.append((end + 1 if end is not None else start, stop))
+    return ranges
+
+
 def error_ranges(code, opened, end, name):
     """The prose arguments or fields of a recognized error constructor.
 
@@ -341,14 +406,8 @@ def error_ranges(code, opened, end, name):
     if code[opened] == "(":
         if re.sub(r"\s+|r#", "", name) == "RowsError::Dialect":
             return []
-        start = opened + 1
-        while start < end and code[start].isspace():
-            start += 1
-        nested = ERROR_CALL.match(code, start) if name == "Err" else None
-        if nested:
-            nested_end = closing(code, nested.end() - 1)
-            if nested_end is not None:
-                return [(nested_end + 1, end)]
+        if name == "Err":
+            return err_ranges(code, opened + 1, end)
         return [(opened, end)]
     ranges, depth, start = [], 0, opened + 1
     for i in range(opened + 1, end + 1):
@@ -378,7 +437,10 @@ def hits(src, builder=False):
     calls = [(m.end() - 1, m[1] + "!", False) for m in MACRO_CALL.finditer(code)]
     calls += [(m.end() - 1, "#[error]", False) for m in ERROR_ATTR.finditer(code)]
     if builder:
-        calls += [(m.end() - 1, m[1], True) for m in ERROR_CALL.finditer(code)]
+        for m in ERROR_CALL.finditer(code):
+            opened = error_opening(code, m)
+            if opened is not None:
+                calls.append((opened, m[1], True))
     found, lost = {}, []
     for opened, name, error in calls:
         end = closing(code, opened)
