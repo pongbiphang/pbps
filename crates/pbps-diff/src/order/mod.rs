@@ -16,7 +16,8 @@
 //!   swaps it, for the live suites that check the facts against an engine.
 //!
 //! In a release build the effects order the resolver's plan and the connected
-//! PostgreSQL handover of an identity sequence's name (DEC-1986.1). Other
+//! PostgreSQL handovers of an identity sequence's or detached clone's name
+//! (DEC-1986.1, DEC-1558.1). Other
 //! callers settle only the edges they state, such as the generated- and
 //! computed-column releases (DEC-1956.3). The resolver combines the effects,
 //! name slots and its evidence (DEC-1968.2).

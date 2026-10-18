@@ -243,7 +243,9 @@ pub fn carried(
             .zip(&keys)
             .enumerate()
             .filter(|(_, (op, key))| {
-                leaves(op, key.as_ref(), &who) || moves(op, key.as_ref(), &who)
+                leaves(op, key.as_ref(), &who)
+                    || moves(op, key.as_ref(), &who)
+                    || detached_release(op, key.as_ref(), &o.slot, Some(facts))
             })
             .map(|(i, _)| i)
             .collect();
@@ -697,7 +699,9 @@ pub fn verify(
                         // order.
                         Occupier::Catalog { .. } => operations.iter().any(|op| {
                             let key = op.key(owners).ok();
-                            leaves(op, key.as_ref(), who) || moves(op, key.as_ref(), who)
+                            leaves(op, key.as_ref(), who)
+                                || moves(op, key.as_ref(), who)
+                                || detached_release(op, key.as_ref(), h, facts)
                         }),
                     };
                     return Some((who.describe(), gives_up));
@@ -720,7 +724,11 @@ pub fn verify(
         // the new schema with a move, where it claims its name again.
         let mut landed = Vec::new();
         let key = op.key(owners).ok();
-        held.retain(|(_, who)| !leaves(op, key.as_ref(), who));
+        held.retain(|(slot, who)| {
+            !leaves(op, key.as_ref(), who)
+                && !(matches!(who, Occupier::Catalog { .. })
+                    && detached_release(op, key.as_ref(), slot, facts))
+        });
         if let Change::RenameTable { from, to, .. } = op.change()
             && from.schema != to.schema
         {
@@ -786,6 +794,19 @@ pub fn verify(
         }
     }
     (violations, skipped)
+}
+
+/// A detach only releases the clone names the catalog proved it renames.
+/// Its other indexes, and an unnamed key, keep their names (DEC-1558.1).
+fn detached_release(
+    op: &Operation,
+    key: Option<&ObjectKey>,
+    slot: &SlotKey,
+    facts: Option<&CatalogFacts>,
+) -> bool {
+    matches!(op.change(), Change::DetachPartition { .. })
+        && matches!(key, Some(ObjectKey::Table(owner))
+            if facts.and_then(|f| f.detach_releases.get(slot)) == Some(owner.uid()))
 }
 
 /// Whether `op`, whose own key is `key`, takes a catalog occupant out of its

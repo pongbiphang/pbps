@@ -103,6 +103,9 @@ Then, in this order:
   the generic slot release ambiguous (DEC-1986.2). That
   handover is settled with the effects, carrying the creation's consumers
   after it while keeping other steps in their relative order (DEC-1986.1).
+  A detach taking another detached partition's clone name uses the same
+  handover, from exact catalog releases for the clones the detach renames
+  (DEC-1558.1). Its per-detach block still owns temporary names and guards.
   `refuse_created_name_occupants` calls it before the module
   passes. It runs again, over the same catalog reads, after the last pass
   that reorders, because a module pass may plan the revision again in the
@@ -353,6 +356,7 @@ rows below list each.
 | A column rename cycle (a swap) | — | refused at diff time, `ColumnRenameCycle` | ✓ refused by design, DEC-541.1 |
 | A table rename chain | fixed | `rename_order` | ✓ DEC-536.1 |
 | A table rename cycle (a swap, a rotation, or a cycle through a cross-schema move's intermediate name) | — | left out of `rename_order`'s graph; refused at diff time, `TableRenameCycle` | ✓ refused by design, DEC-1966.1 |
+| P: a detach vacating a clone's catalog name → another detach claiming it | engine-sourced | exact catalog releases are handover edges, settled with the effects; retained names and an unnamed key are not released | ✓ DEC-1558.1 |
 | An owned sequence rename chain | fixed | (6, 1 + chain depth), `sequence_release_depths` | ✓ DEC-1889.1 |
 | P: an identity given up or converted → a new relation claiming its sequence's catalog name | engine-sourced | the connected name handover is settled with the effects; a kept or retuned identity keeps its name | ✓ DEC-1986.1 |
 | An owned sequence rename cycle (a swap or a rotation) | — | refused at diff time, `SequenceRenameCycle` | ✓ refused by design, DEC-1889.1 |
