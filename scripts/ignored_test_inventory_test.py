@@ -157,6 +157,36 @@ class Ownership(unittest.TestCase):
                 with self.assertRaisesRegex(audit.InventoryError, "continue-on-error needs an explicit execution audit"):
                     self.check()
 
+    def test_an_alternate_spelling_of_an_audited_key_is_refused(self):
+        # YAML reads `key : v` and a quoted key as `key: v`, which the
+        # readings find by that spelling only (#1863): on the job and on the
+        # step, for the key #1863 names and for the others the audit reads.
+        matrix = "    strategy:\n      matrix:\n        x: [a]\n"
+        for workflow in (WORKFLOW.replace("    steps:", "    continue-on-error : true\n    steps:"),
+                         WORKFLOW.replace("    steps:", "    'continue-on-error': true\n    steps:"),
+                         WORKFLOW.replace("    steps:", '    "continue-on-error" : true\n    steps:'),
+                         WORKFLOW.replace("      - run:", "      - continue-on-error : true\n        run:"),
+                         WORKFLOW.replace("      - run:", "      - name: selected\n        'continue-on-error': true\n        run:"),
+                         WORKFLOW.replace("    steps:", "    if : false\n    steps:"),
+                         WORKFLOW.replace("      - run:", "      - name: disabled\n        'if': false\n        run:"),
+                         WORKFLOW.replace("      - run:", "      - 'run':"),
+                         WORKFLOW.replace("    steps:", "    strategy :\n      matrix:\n        x: [a]\n    steps:"),
+                         WORKFLOW.replace("    steps:", matrix.replace("      matrix:", "      'matrix':") + "    steps:"),
+                         WORKFLOW.replace("    steps:", matrix + "        'include': []\n    steps:"),
+                         WORKFLOW.replace("    runs-on:", "    runs-on :")):
+            with self.subTest(workflow=workflow):
+                self.workflow.write_text(workflow)
+                with self.assertRaisesRegex(audit.InventoryError, "an alternate spelling of a key needs an explicit audit"):
+                    self.check()
+        # Negative: the canonical spelling, a value holding a colon, and a key
+        # the audit does not read pass as before.
+        for workflow in (WORKFLOW.replace("    steps:", "    continue-on-error: false\n    steps:"),
+                         WORKFLOW.replace("      - run:", "      - name: 'a: b'\n        run:"),
+                         WORKFLOW.replace("    steps:", "    'timeout-minutes' : 5\n    steps:")):
+            with self.subTest(workflow=workflow):
+                self.workflow.write_text(workflow)
+                self.assertEqual(self.check(), 1)
+
     def test_continue_on_error_that_hides_no_case_failure_is_accepted(self):
         # A literal false keeps failures, and a step that runs no command an
         # owner could be hides none.
