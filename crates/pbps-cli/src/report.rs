@@ -1636,31 +1636,110 @@ pub fn env_arg(name: &str) -> String {
     shell_arg(name).unwrap_or_else(|| placeholder("environment"))
 }
 
-/// A value source as a numbering change's line names it (#1889).
+/// A value source as a numbering change's line names it (#1889), with the
+/// options it sets beside the engine's (#2015, DEC-1921.1): an options-only
+/// retune, such as a maximum lowered, is what its `numbering` approval is
+/// asked for, and both sides read alike without them.
 fn numbering_source(source: &pbps_model::ValueSource) -> String {
     use pbps_model::ValueSource;
     match source {
         ValueSource::None => "nothing".to_owned(),
         ValueSource::Default(text) => format!("the default {text}"),
         ValueSource::Identity(id) => format!(
-            "an identity (start {}, increment {})",
-            id.seed, id.increment
+            "an identity (start {}, increment {}{})",
+            id.seed,
+            id.increment,
+            sequence_options(&id.options)
         ),
         ValueSource::Sequence(sequence) => format!(
-            "{} (start {}, increment {})",
+            "{} (start {}, increment {}{})",
             sequence.name.as_ref().map_or_else(
                 || "its own sequence".to_owned(),
                 |n| format!("its sequence {n}")
             ),
             sequence.start,
-            sequence.increment
+            sequence.increment,
+            sequence_options(&sequence.options)
         ),
         ValueSource::Generated(generated) => format!("the expression {}", generated.expression),
     }
 }
 
+/// The options a sequence sets beside the engine's, each after a comma;
+/// nothing for the engine's own.
+fn sequence_options(options: &pbps_model::SequenceOptions) -> String {
+    let mut out = String::new();
+    if let Some(min) = options.min {
+        out.push_str(&format!(", min {min}"));
+    }
+    if let Some(max) = options.max {
+        out.push_str(&format!(", max {max}"));
+    }
+    if options.cycle {
+        out.push_str(", cycle");
+    }
+    if let Some(cache) = options.cache {
+        out.push_str(&format!(", cache {cache}"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    /// A numbering change's line shows the options each side sets, so an
+    /// options-only retune reads as the change it is (#2015). The negative
+    /// case: a retune of the start alone shows no options.
+    #[test]
+    fn a_numbering_line_shows_the_options_each_side_sets() {
+        use pbps_model::{Change, ColumnRef, Identity, SequenceOptions, ValueSource};
+        let identity = |seed, options| {
+            ValueSource::Identity(Identity {
+                seed,
+                increment: 1,
+                options,
+            })
+        };
+        let line = |from, to| {
+            super::describe(&Change::AlterColumnNumbering {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: ColumnRef {
+                    table: "app.t".parse().unwrap(),
+                    name: "id".into(),
+                },
+                ty: "integer".parse().unwrap(),
+                from,
+                to,
+            })
+        };
+        let bounded = |max| SequenceOptions {
+            max: Some(max),
+            ..Default::default()
+        };
+        assert_eq!(
+            line(identity(1, bounded(1000)), identity(1, bounded(100))),
+            "~ id numbered by an identity (start 1, increment 1, max 1000) -> an identity \
+             (start 1, increment 1, max 100)"
+        );
+        let every = SequenceOptions {
+            min: Some(-5),
+            max: Some(9),
+            cycle: true,
+            cache: Some(20),
+        };
+        assert!(
+            line(identity(1, Default::default()), identity(1, every))
+                .ends_with("(start 1, increment 1, min -5, max 9, cycle, cache 20)")
+        );
+        assert_eq!(
+            line(
+                identity(1, Default::default()),
+                identity(5, Default::default())
+            ),
+            "~ id numbered by an identity (start 1, increment 1) -> an identity (start 5, \
+             increment 1)"
+        );
+    }
+
     /// A step a rule added names its origin under it, escaped like every
     /// other text out of the plan; a step without one, as every step of a
     /// plan read back from its file, shows none (DEC-1958.3).
