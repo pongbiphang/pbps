@@ -2325,6 +2325,19 @@ parent; creation uses the ordinary table's sequence-before-table and
 `OWNED BY`-after-table statement, before the engine copies the default into
 its partitions. No model or saved-format change is needed.
 
+A partition may override that serial's default with an ordinary default of
+its own, held on `PartitionOf::columns` under DEC-1578.1. Measured on 16.15
+and 18.6, both `PARTITION OF p (id DEFAULT 0)` at create and `ALTER TABLE p1
+ALTER COLUMN id SET DEFAULT 0` afterward are accepted. A direct insert takes
+0 without advancing the parent's sequence; an insert through the parent
+still takes its next sequence value, even when routed to that partition.
+Validation therefore allows an own default under a serial parent, and the
+partition emitter's existing post-create `SET DEFAULT` recreates it. The
+identity refusal stays: on 18 that post-create `SET DEFAULT` is refused for
+an identity column; an inline default is accepted but direct inserts still
+take the identity's value instead. A serial's ordinary default has neither
+restriction.
+
 This is #1893 part A, read and create. Part B (#2218) leaves attaching a
 table without the parent's serial default for its own change. Until part C
 (#2219), adding or dropping a serial column on an existing partitioned
@@ -2334,10 +2347,12 @@ retune), is refused by name citing #2219. Plain tables retain those changes.
 Pinned by `a_partitioned_parents_serial_holds_only_its_same_column_same_text_copies`,
 `a_serial_that_is_nullable_defaulted_on_a_partition_or_misnamed_is_refused`,
 `a_created_partitioned_parent_owns_its_serial_and_its_partition_owns_none`,
-`a_standing_parents_serial_column_changes_name_their_partition_support_issue`
+`a_standing_parents_serial_column_changes_name_their_partition_support_issue`,
+`a_partitions_own_default_can_override_a_serial_but_not_an_identity`
 and, live on 16 and 18,
 `a_partitioned_parents_serial_round_trips_without_partition_drift` (SQL-created
 tree, connected create into an empty database, empty next plan, byte-identical
-re-pull, numbered inserts, shared and differing-default limitations, and the
+re-pull, numbered inserts, a partition's own non-sequence default used only
+by direct inserts, shared and differing-default limitations, and the
 measured attach/add behavior). Restoring the old reader restriction makes
 the live test fail.

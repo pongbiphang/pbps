@@ -1130,7 +1130,10 @@ impl Dialect for Postgres {
         // parent's columns (#1578). One equal to the parent's is not an
         // override, and would be planned against a read-back that has none.
         // Measured on 16 and 18: a generated column refuses a default of the
-        // partition's own, and on 18 an identity column does too.
+        // partition's own. On 18 an identity refuses the post-create SET
+        // DEFAULT this emitter uses; an inline default is accepted but does
+        // not supply a direct insert's value. A serial's nextval is an
+        // ordinary default, which a partition can override (DEC-2217.1).
         let own = partition
             .partition_of
             .as_ref()
@@ -1162,7 +1165,7 @@ impl Dialect for Postgres {
             let Some(default) = &own.default else {
                 continue;
             };
-            let (mut generated, mut identity, mut serial) = (false, false, false);
+            let (mut generated, mut identity) = (false, false);
             for source in parent_sources.get(column.raw(), theirs) {
                 match source {
                     pbps_model::ValueSource::Default(parent_default) => {
@@ -1176,20 +1179,16 @@ impl Dialect for Postgres {
                     }
                     pbps_model::ValueSource::Generated(_) => generated = true,
                     pbps_model::ValueSource::Identity(_) => identity = true,
-                    pbps_model::ValueSource::Sequence(_) => serial = true,
-                    pbps_model::ValueSource::None => {}
+                    pbps_model::ValueSource::None | pbps_model::ValueSource::Sequence(_) => {}
                 }
             }
             // Preserve the diagnostic precedence from before the exclusive
             // model: equality first, then generation rather than identity.
-            // A `serial` is the third (#1631).
-            if generated || identity || serial {
+            if generated || identity {
                 let kind = if generated {
                     "generated"
-                } else if identity {
-                    "an identity column"
                 } else {
-                    "a `serial`"
+                    "an identity column"
                 };
                 found.push(invalid(format!(
                     "column `{column}` is {kind} on its parent, and takes no default of the partition's own",
@@ -2368,6 +2367,53 @@ mod tests {
                 "{expected}: {got:?}"
             );
         }
+    }
+
+    /// A serial is a replaceable default; an identity on 18 refuses the
+    /// emitter's post-create SET DEFAULT even on a partition (DEC-2217.1).
+    #[test]
+    fn a_partitions_own_default_can_override_a_serial_but_not_an_identity() {
+        use pbps_model::{
+            Identity, OwnedSequence, PartitionBound, PartitionColumn, PartitionOf, ValueSource,
+        };
+        let mut parent = partitioned(&["id", "v"], &["v"]);
+        let id = parent.columns.get_mut("id").unwrap();
+        id.ty = ty("bigint");
+        id.value_source = ValueSource::Sequence(OwnedSequence::serial());
+        let partition = Table {
+            partition_of: Some(PartitionOf {
+                parent: "app.t".parse().unwrap(),
+                bound: PartitionBound::Default,
+                columns: [(
+                    "id".into(),
+                    PartitionColumn {
+                        default: Some("0".into()),
+                        not_null: false,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..Default::default()
+        };
+        let name = "app.p1".parse().unwrap();
+        let pg = Postgres::new();
+        let found = pg.validate_partition(&name, &partition, &parent);
+        assert!(found.is_empty(), "{found:?}");
+
+        parent.columns.get_mut("id").unwrap().value_source = ValueSource::Identity(Identity {
+            seed: 1,
+            increment: 1,
+            options: Default::default(),
+        });
+        let found = pg.validate_partition(&name, &partition, &parent);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0]
+                .to_string()
+                .contains("is an identity column on its parent"),
+            "{found:?}"
+        );
     }
 
     /// A partition's own trigger takes no name its parent's row trigger

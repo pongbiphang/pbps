@@ -2557,7 +2557,8 @@ fn a_connected_plan_knows_a_serials_generated_sequence_name() {
 }
 
 /// A parent's serial survives the engine's partition-default copies through
-/// pull, a connected create and re-pull; independent sequence users still
+/// pull, a connected create and re-pull, including a partition's own default
+/// on that column; independent sequence users still
 /// name a limitation (DEC-2217.1). Both supported server versions are measured.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
@@ -2580,7 +2581,9 @@ fn a_partitioned_parents_serial_round_trips_without_partition_drift() {
             "CREATE SCHEMA app;
             CREATE TABLE app.p (id bigserial, v integer) PARTITION BY RANGE (v);
             CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (0) TO (10);
-            CREATE TABLE app.p2 PARTITION OF app.p FOR VALUES FROM (10) TO (20)",
+            CREATE TABLE app.p2 PARTITION OF app.p FOR VALUES FROM (10) TO (20);
+            CREATE TABLE app.p_own PARTITION OF app.p (id DEFAULT 0)
+                FOR VALUES FROM (20) TO (30)",
         );
         // The engine records all three calls, but only the parent owns the
         // sequence: counting the copies as independent users loses the tree.
@@ -2596,12 +2599,13 @@ fn a_partitioned_parents_serial_round_trips_without_partition_drift() {
         let d = Demo::new("serial-parent");
         let pulled = succeeds(d.run(&["pull", "--db", src]));
         assert!(!stderr(&pulled).contains("sequence"), "{}", stderr(&pulled));
+        assert!(!stderr(&pulled).contains("left out"), "{}", stderr(&pulled));
         let path = d.dir.join("schema/app.p.yml");
         let bytes = std::fs::read(&path).unwrap();
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.contains("    type: bigserial\n"), "{text}");
         let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
-        assert_eq!(loaded.schema.tables.len(), 3);
+        assert_eq!(loaded.schema.tables.len(), 4);
         let parent = &loaded.schema.tables[&"app.p".parse().unwrap()];
         assert!(matches!(
             parent.columns["id"].value_source,
@@ -2612,6 +2616,15 @@ fn a_partitioned_parents_serial_round_trips_without_partition_drift() {
             assert!(p.columns.is_empty());
             assert!(p.partition_of.as_ref().unwrap().columns.is_empty());
         }
+        let own = &loaded.schema.tables[&"app.p_own".parse().unwrap()];
+        assert!(own.columns.is_empty());
+        assert_eq!(
+            own.partition_of.as_ref().unwrap().columns["id"]
+                .default
+                .as_deref(),
+            Some("0")
+        );
+        succeeds(d.run(&["validate"]));
         succeeds(d.run(&["plan"]));
         d.commit();
         on_server(tgt, "CREATE SCHEMA app");
@@ -2630,17 +2643,23 @@ fn a_partitioned_parents_serial_round_trips_without_partition_drift() {
         on_server(
             tgt,
             "INSERT INTO app.p (v) VALUES (1), (15);
-            INSERT INTO app.p1 (v) VALUES (2)",
+            INSERT INTO app.p1 (v) VALUES (2);
+            INSERT INTO app.p_own (v) VALUES (21)",
         );
         assert_eq!(
             scalar(
                 tgt,
                 "SELECT count(*) FROM app.p
-            WHERE (id, v) IN ((1, 1), (2, 15), (3, 2))"
+            WHERE (id, v) IN ((1, 1), (2, 15), (3, 2), (0, 21))"
             ),
-            3
+            4
         );
         assert_eq!(scalar(tgt, "SELECT last_value FROM app.p_id_seq"), 3);
+        // Direct access takes the override without advancing the sequence;
+        // routing through the parent still numbers from its own default.
+        on_server(tgt, "INSERT INTO app.p (v) VALUES (22)");
+        assert_eq!(scalar(tgt, "SELECT id FROM app.p_own WHERE v = 22"), 4);
+        assert_eq!(scalar(tgt, "SELECT last_value FROM app.p_id_seq"), 4);
 
         // An ordinary table is never a partition copy, even with the same
         // column and text. Its call keeps the parent's shared limitation.
