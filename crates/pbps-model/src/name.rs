@@ -101,6 +101,97 @@ impl schemars::JsonSchema for ColumnName {
     }
 }
 
+/// One role's original identifier, without implicit human rendering.
+///
+/// Serialization and identity retain the original bytes (SPEC §4.3). Choose
+/// `.shown()` for prose and `.raw()` for SQL quoting and textual keys.
+///
+/// ```compile_fail,E0277
+/// let name = pbps_model::RoleName::from("role");
+/// let _ = format!("{}", name);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let name = pbps_model::RoleName::from("role");
+/// let _ = name.to_string();
+/// ```
+#[derive(
+    Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct RoleName(String);
+
+// Keep String's Debug spelling for byte-identical History collision diagnostics.
+impl fmt::Debug for RoleName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl RoleName {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.0
+    }
+
+    pub fn shown(&self) -> crate::escape::Escaped<'_> {
+        crate::escape::Escaped(&self.0)
+    }
+
+    pub fn into_raw(self) -> String {
+        self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for RoleName {
+    fn borrow(&self) -> &str {
+        self.raw()
+    }
+}
+
+impl From<String> for RoleName {
+    fn from(name: String) -> Self {
+        Self(name)
+    }
+}
+
+impl From<&str> for RoleName {
+    fn from(name: &str) -> Self {
+        Self(name.to_owned())
+    }
+}
+
+impl From<&String> for RoleName {
+    fn from(name: &String) -> Self {
+        Self(name.clone())
+    }
+}
+
+impl From<&RoleName> for RoleName {
+    fn from(name: &RoleName) -> Self {
+        name.clone()
+    }
+}
+
+// The DTO schema remains that of a bare string, without a new definition/ref.
+impl schemars::JsonSchema for RoleName {
+    fn inline_schema() -> bool {
+        <String as schemars::JsonSchema>::inline_schema()
+    }
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        <String as schemars::JsonSchema>::schema_name()
+    }
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        <String as schemars::JsonSchema>::schema_id()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <String as schemars::JsonSchema>::json_schema(generator)
+    }
+}
+
 /// A refusal of a name, which shows the text it was given escaped.
 ///
 /// The text is whatever the file spelled, control characters included: SPEC

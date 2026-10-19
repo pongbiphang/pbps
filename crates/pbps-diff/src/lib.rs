@@ -782,8 +782,8 @@ mod tests {
             .expect("a stale annotation must be absorbed when its reused source is dropped");
         assert!(r.renamed_roles.is_empty());
         assert_eq!(r.dropped_roles.len(), 1);
-        assert!(r.ids.role_uid("old").is_none());
-        assert!(r.ids.role_uid("new").is_some());
+        assert!(r.ids.role_uid(&pbps_model::RoleName::from("old")).is_none());
+        assert!(r.ids.role_uid(&pbps_model::RoleName::from("new")).is_some());
     }
 
     /// A rename supplied as a current decision is not stale provenance: even
@@ -1616,7 +1616,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(r.renamed_roles.len(), 1);
-        assert_eq!(r.renamed_roles[0].2, "aaa");
+        assert_eq!(r.renamed_roles[0].2, "aaa".into());
     }
 
     /// A contested rename reports the contest and nothing else. The
@@ -1813,13 +1813,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn role_rename_conflict_keys_and_tombstones_keep_the_original_name() {
+        let name = "role\nline\\\u{202e}名前";
+        let lookalike = pbps_model::RoleName::from(name).shown().to_string();
+        let old = with_roles(&[], &[name, &lookalike]);
+        let ids = resolve(&old, &IdsFile::default(), &[], &ctx()).unwrap().ids;
+        let next = with_roles(&[], &["new", &lookalike]);
+        let intent = Intent::RenameRole {
+            from: name.into(),
+            to: "new".into(),
+        };
+        let renamed = resolve(&next, &ids, &[intent], &ctx()).unwrap();
+        assert_eq!(
+            renamed.ids.role_uid(&"new".into()),
+            ids.role_uid(&name.into())
+        );
+        assert_eq!(
+            renamed.ids.role_uid(&lookalike.as_str().into()),
+            ids.role_uid(&lookalike.as_str().into())
+        );
+        // Both destinations must be declared for both rename claims to be live.
+        let contested = with_roles(&[], &["new", "other", &lookalike]);
+        let collision = resolve(
+            &contested,
+            &ids,
+            &[
+                Intent::RenameRole {
+                    from: name.into(),
+                    to: "new".into(),
+                },
+                Intent::RenameRole {
+                    from: name.into(),
+                    to: "other".into(),
+                },
+            ],
+            &ctx(),
+        )
+        .unwrap_err();
+        assert!(collision.iter().any(
+            |b| matches!(b, Blocker::ConflictingRenameIntents { name: key, .. } if key == name)
+        ));
+        assert!(!collision.iter().any(|b| matches!(b, Blocker::ConflictingRenameIntents { name: key, .. } if key == &lookalike)));
+        let occupied = resolve(
+            &with_roles(&[], &[&lookalike]),
+            &ids,
+            &[Intent::RenameRole {
+                from: name.into(),
+                to: lookalike.as_str().into(),
+            }],
+            &ctx(),
+        )
+        .unwrap_err();
+        assert!(
+            occupied.iter().any(
+                |b| matches!(b, Blocker::RenameTargetExists { target } if target == &lookalike)
+            )
+        );
+        let dropped = resolve(
+            &with_roles(&[], &[&lookalike]),
+            &ids,
+            &[Intent::DropRole {
+                role: name.into(),
+                reason: "retired".parse().unwrap(),
+            }],
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            dropped.ids.tombstones[ids.role_uid(&name.into()).unwrap()].was,
+            name
+        );
+        assert_eq!(
+            dropped.ids.role_uid(&lookalike.as_str().into()),
+            ids.role_uid(&lookalike.as_str().into())
+        );
+    }
+
     // ---- roles (ADR-0005) ----
 
     fn with_roles(spec: &[(&str, &[&str])], roles: &[&str]) -> Schema {
         let mut s = schema(spec);
         for r in roles {
             s.roles
-                .insert((*r).to_string(), pbps_model::Role::default());
+                .insert((*r).to_string().into(), pbps_model::Role::default());
         }
         s
     }
@@ -1829,7 +1906,7 @@ mod tests {
         let s = with_roles(&[("dbo.customer", &["id"])], &["app_reader"]);
         let r = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap();
         assert_eq!(r.created_roles.len(), 1);
-        assert_eq!(r.created_roles[0].1, "app_reader");
+        assert_eq!(r.created_roles[0].1, "app_reader".into());
         assert_eq!(r.created_roles[0].0.kind(), pbps_model::UidKind::Role);
         r.ids.validate().unwrap();
 
@@ -1845,13 +1922,16 @@ mod tests {
     fn a_role_rename_without_intent_is_ambiguous_and_with_intent_keeps_the_uid() {
         let s = with_roles(&[("dbo.customer", &["id"])], &["reader"]);
         let ids = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap().ids;
-        let before = ids.role_uid("reader").unwrap().clone();
+        let before = ids
+            .role_uid(&pbps_model::RoleName::from("reader"))
+            .unwrap()
+            .clone();
 
         let s = with_roles(&[("dbo.customer", &["id"])], &["app_reader"]);
         let errs = resolve(&s, &ids, &[], &ctx()).unwrap_err();
         assert!(
             matches!(&errs[0], Blocker::AmbiguousRoles { disappeared, appeared }
-                if disappeared == &["reader".to_string()] && appeared == &["app_reader".to_string()]),
+                if disappeared == &[pbps_model::RoleName::from("reader")] && appeared == &[pbps_model::RoleName::from("app_reader")]),
             "{errs:?}"
         );
 
@@ -1866,8 +1946,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.renamed_roles.len(), 1);
-        assert_eq!(r.ids.role_uid("app_reader"), Some(&before));
-        assert_eq!(r.ids.role_uid("reader"), None);
+        assert_eq!(
+            r.ids.role_uid(&pbps_model::RoleName::from("app_reader")),
+            Some(&before)
+        );
+        assert_eq!(r.ids.role_uid(&pbps_model::RoleName::from("reader")), None);
         // Absorbed: the same annotation left in the file is not a typo.
         let annotation = Intent::RenameRole {
             from: "reader".into(),
@@ -1884,12 +1967,15 @@ mod tests {
     fn a_role_drop_needs_a_reason_and_leaves_a_tombstone() {
         let s = with_roles(&[("dbo.customer", &["id"])], &["legacy"]);
         let ids = resolve(&s, &IdsFile::default(), &[], &ctx()).unwrap().ids;
-        let uid = ids.role_uid("legacy").unwrap().clone();
+        let uid = ids
+            .role_uid(&pbps_model::RoleName::from("legacy"))
+            .unwrap()
+            .clone();
 
         let s = schema(&[("dbo.customer", &["id"])]);
         let errs = resolve(&s, &ids, &[], &ctx()).unwrap_err();
         assert!(
-            matches!(&errs[0], Blocker::DropRoleNeedsReason { role } if role == "legacy"),
+            matches!(&errs[0], Blocker::DropRoleNeedsReason { role } if role.raw() == "legacy"),
             "{errs:?}"
         );
 
@@ -1903,7 +1989,7 @@ mod tests {
             &ctx(),
         )
         .unwrap();
-        assert_eq!(r.dropped_roles, vec![(uid.clone(), "legacy".to_string())]);
+        assert_eq!(r.dropped_roles, vec![(uid.clone(), "legacy".into())]);
         assert_eq!(r.ids.tombstones[&uid].was, "legacy");
         assert_eq!(r.ids.tombstones[&uid].reason, "SEC-7: retired");
         r.ids.validate().unwrap();

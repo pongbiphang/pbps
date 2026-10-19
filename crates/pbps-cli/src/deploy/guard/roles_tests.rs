@@ -19,7 +19,7 @@ fn schema(roles: &[(&str, &[Permission])]) -> Schema {
                     .into()
                 };
                 (
-                    name.to_string(),
+                    pbps_model::RoleName::from(*name),
                     Role {
                         description: None,
                         grants,
@@ -57,7 +57,7 @@ fn ids(roles: &[(&str, &str)]) -> IdsFile {
     IdsFile {
         roles: roles
             .iter()
-            .map(|(uid, name)| (uid.parse().unwrap(), name.to_string()))
+            .map(|(uid, name)| (uid.parse().unwrap(), pbps_model::RoleName::from(*name)))
             .collect(),
         ..IdsFile::default()
     }
@@ -246,4 +246,20 @@ fn ambiguous_baseline_roles_do_not_overwrite_each_others_grant_comparison() {
     for held in [&[Select][..], &[Insert][..]] {
         assert!(compare(&cs, &ids, &before, &schema(&[("b", held)])).is_err());
     }
+}
+
+#[test]
+fn hostile_role_handoffs_keep_raw_grant_holders_distinct() {
+    use Permission::{Insert, Select};
+    let name = "role\nline\\\u{202e}名前";
+    let shown = pbps_model::RoleName::from(name).shown().to_string();
+    let cs = changes(vec![
+        drop_role("r_aaaaaa", name),
+        rename("r_bbbbbb", &shown, name),
+    ]);
+    let final_ids = ids(&[("r_bbbbbb", name)]);
+    let before = schema(&[(name, &[Insert]), (&shown, &[Select])]);
+    compare(&cs, &final_ids, &before, &schema(&[(name, &[Select])])).unwrap();
+    assert!(compare(&cs, &final_ids, &before, &schema(&[(name, &[Insert])])).is_err());
+    assert!(compare(&cs, &final_ids, &before, &schema(&[(&shown, &[Select])])).is_err());
 }

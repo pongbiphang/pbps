@@ -766,8 +766,13 @@ fn a_real_ledger_snapshot_with_a_grantless_role_remains_an_offline_baseline() {
                 .to_owned()
         });
     let snapshot = pbps_model::StateSnapshot::from_json(&text).unwrap();
-    assert!(snapshot.ids.role_uid(&role.1).is_some());
-    assert!(snapshot.schema.roles[&role.1].grants.is_empty());
+    assert!(
+        snapshot
+            .ids
+            .role_uid(&pbps_model::RoleName::from(&role.1))
+            .is_some()
+    );
+    assert!(snapshot.schema.roles[role.1.as_str()].grants.is_empty());
     let path = d.dir.join("export.json");
     std::fs::write(&path, &text).unwrap();
     let ids = std::fs::read(d.dir.join("schema.ids.json")).unwrap();

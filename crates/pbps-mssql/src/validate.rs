@@ -70,15 +70,20 @@ pub(crate) fn permission_words() -> String {
 /// defines on what the target *is*. `public` and the fixed database roles are
 /// the engine's own and cannot be created, dropped or renamed; declaring one
 /// would plan a statement the engine refuses.
-pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
+pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<DialectError> {
     let mut errs = Vec::new();
-    if let Err(e) = ident::quote(name) {
+    if let Err(e) = ident::quote(name.raw()) {
         errs.push(e);
     }
-    if FIXED_ROLES.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+    if FIXED_ROLES
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(name.raw()))
+    {
         errs.push(invalid(format!(
             "`{name}` is a built-in database role, which cannot be created, dropped or renamed; \
-             declare a role of your own and grant to that"
+             declare a role of your own and grant to that",
+            // Whole-message escaping remains until #2084 step 5.
+            name = name.raw(),
         )));
     }
     for (target, permissions) in &role.grants {
@@ -95,7 +100,9 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                     "role `{name}`: `{r}` names an argument list; SQL Server identifies a routine \
                      by name alone, so grant on `{}` instead",
                     r.name.raw(),
-                    r = r.raw()
+                    r = r.raw(),
+                    // Whole-message escaping remains until #2084 step 5.
+                    name = name.raw(),
                 )));
                 vec![&r.name.schema, &r.name.name]
             }
@@ -114,7 +121,11 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
             errs.push(invalid(format!(
                 "role `{name}`: `{}` on `{target}` is not a permission SQL Server has; it is                  PostgreSQL's (ADR-0010 §6), and this engine takes {}",
                 p.as_str(),
-                permission_words()
+                permission_words(),
+                // Whole-message escaping remains until #2084 step 5.
+                target = target.raw(),
+                // Whole-message escaping remains until #2084 step 5.
+                name = name.raw(),
             )));
         }
         // `GRANT EXECUTE` on a table, `GRANT SELECT` on a procedure: the
@@ -2456,7 +2467,7 @@ mod tests {
             let mut role = Role::default();
             role.grants
                 .insert(target.parse().unwrap(), [p].into_iter().collect());
-            super::role("r", &role, &schema)
+            super::role(&pbps_model::RoleName::from("r"), &role, &schema)
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
@@ -2806,7 +2817,7 @@ mod tests {
             let mut role = Role::default();
             role.grants
                 .insert(target.parse().unwrap(), ps.iter().copied().collect());
-            super::role("r", &role, &schema)
+            super::role(&pbps_model::RoleName::from("r"), &role, &schema)
         };
         for p in [
             Permission::Usage,
@@ -2845,19 +2856,39 @@ mod tests {
             "dbo.customer".parse().unwrap(),
             [pbps_model::Permission::Select].into_iter().collect(),
         );
-        assert!(super::role("app_reader", &role, &Schema::default()).is_empty());
-        let errs = super::role("db_datareader", &role, &Schema::default());
+        assert!(
+            super::role(
+                &pbps_model::RoleName::from("app_reader"),
+                &role,
+                &Schema::default()
+            )
+            .is_empty()
+        );
+        let errs = super::role(
+            &pbps_model::RoleName::from("db_datareader"),
+            &role,
+            &Schema::default(),
+        );
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].to_string().contains("built-in"), "{errs:?}");
         // Case is the engine's, not the file's.
-        assert!(!super::role("PUBLIC", &role, &Schema::default()).is_empty());
+        assert!(
+            !super::role(
+                &pbps_model::RoleName::from("PUBLIC"),
+                &role,
+                &Schema::default()
+            )
+            .is_empty()
+        );
         // And a target that cannot be quoted is refused where the name is.
         let mut bad = Role::default();
         bad.grants.insert(
             GrantTarget::Schema("a\0b".into()),
             [pbps_model::Permission::Select].into_iter().collect(),
         );
-        assert!(!super::role("ok", &bad, &Schema::default()).is_empty());
+        assert!(
+            !super::role(&pbps_model::RoleName::from("ok"), &bad, &Schema::default()).is_empty()
+        );
     }
     #[test]
     fn every_cross_kind_constraint_name_collision_is_reported() {

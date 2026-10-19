@@ -53,7 +53,7 @@ pub struct LoadedModule {
 /// The result of loading one role declaration (ADR-0005).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedRole {
-    pub name: String,
+    pub name: pbps_model::RoleName,
     pub role: Role,
     /// A `renamed_from:`, extracted rather than stored — the same one-shot
     /// rule tables follow.
@@ -80,7 +80,7 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
     // is a legal principal name, the emitter quotes it, and `pull` writes
     // it back as it is — refusing it here made a freshly pulled project
     // fail to load.
-    if name.trim().is_empty() {
+    if name.raw().trim().is_empty() {
         errs.push(LoadError::semantic(
             src,
             to_span(&dto.role.defined),
@@ -93,7 +93,7 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
         // The same, for the same reason: this names a role the database has,
         // and a trimmed one asks it to rename a principal that is not there.
         let from = from.value.clone();
-        if !name.trim().is_empty() {
+        if !name.raw().trim().is_empty() {
             intents.push(Intent::RenameRole {
                 from,
                 to: name.clone(),
@@ -143,7 +143,7 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
             errs.push(LoadError::semantic(
                 src,
                 to_span(&dto.role.defined),
-                format!("`{target}` is listed with no permission"),
+                format!("`{}` is listed with no permission", target.shown()),
                 "empty list",
             ));
             continue;
@@ -198,8 +198,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 path: std::path::PathBuf::from(&src.name),
                 message: format!(
                     "column `{}.{column}` can have only one of default, identity, a `serial` type or generated",
-                    table.name.shown()
-                ,
+                    table.name.shown(),
                     column = column.shown(),
                 ),
             })

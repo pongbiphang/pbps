@@ -81,7 +81,7 @@ pub(crate) fn setting_value(name: &str, value: &str) -> Result<String, DbError> 
 /// the effective answer follows from the reproduced membership.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SchemaAuthorization {
-    pub owner: String,
+    pub owner: pbps_model::RoleName,
     pub privileges: BTreeMap<String, bool>,
     pub acl: BTreeMap<String, Vec<Grant>>,
 }
@@ -96,7 +96,7 @@ pub struct SchemaAuthorization {
 pub struct Grant {
     pub privilege: String,
     pub grantable: bool,
-    pub grantor: String,
+    pub grantor: pbps_model::RoleName,
 }
 
 /// A role in the deployer's authorization closure, and what about it a
@@ -117,7 +117,7 @@ pub struct RoleAttributes {
 pub struct AuthorizationContext {
     pub principal: DeploymentPrincipal,
     pub schemas: BTreeMap<String, SchemaAuthorization>,
-    pub roles: BTreeMap<String, RoleAttributes>,
+    pub roles: BTreeMap<pbps_model::RoleName, RoleAttributes>,
     /// Effective role- and database-scoped settings for the deployer, keyed
     /// `<scope>:<name>` where scope is `role`, `database` or `database-role`.
     pub settings: BTreeMap<String, String>,
@@ -146,7 +146,7 @@ pub async fn principal(conn: &mut impl QueryConnection) -> Result<DeploymentPrin
     };
     Ok(DeploymentPrincipal {
         login: required(row, "login", "the session user")?,
-        effective: required(row, "effective", "the current user")?,
+        effective: required(row, "effective", "the current user")?.into(),
         superuser: required(row, "superuser", "the superuser flag")? == "on",
     })
 }
@@ -183,7 +183,10 @@ pub async fn read(
     })
 }
 
-async fn schema_owner(conn: &mut impl QueryConnection, schema: &str) -> Result<String, DbError> {
+async fn schema_owner(
+    conn: &mut impl QueryConnection,
+    schema: &str,
+) -> Result<pbps_model::RoleName, DbError> {
     let rows = conn
         .query(&format!(
             "SELECT pg_catalog.pg_get_userbyid(n.nspowner) AS owner \
@@ -192,7 +195,7 @@ async fn schema_owner(conn: &mut impl QueryConnection, schema: &str) -> Result<S
         ))
         .await?;
     match rows.as_slice() {
-        [row] => required(row, "owner", "a schema's owner"),
+        [row] => required(row, "owner", "a schema's owner").map(Into::into),
         // A schema the deployer cannot see is not an owner of nothing: it is
         // a scope the context could not be established for.
         [] => Err(DbError::BadRow(format!(
@@ -236,7 +239,7 @@ async fn schema_acl(
             .push(Grant {
                 privilege: required(row, "privilege", "a privilege type")?,
                 grantable: flag(row, "grantable")?,
-                grantor: required(row, "grantor", "a grantor")?,
+                grantor: required(row, "grantor", "a grantor")?.into(),
             });
     }
     for grants in acl.values_mut() {
@@ -268,7 +271,7 @@ async fn schema_privileges(
 /// inheritance (`USAGE`) and switching (`MEMBER`).
 async fn role_attributes(
     conn: &mut impl QueryConnection,
-) -> Result<BTreeMap<String, RoleAttributes>, DbError> {
+) -> Result<BTreeMap<pbps_model::RoleName, RoleAttributes>, DbError> {
     let rows = conn
         .query(
             "SELECT r.rolname::text AS name, r.rolsuper::text AS superuser, r.rolinherit::text AS inherit, \
@@ -283,7 +286,7 @@ async fn role_attributes(
     let mut roles = BTreeMap::new();
     for row in &rows {
         roles.insert(
-            required(row, "name", "a role's name")?,
+            required(row, "name", "a role's name")?.into(),
             RoleAttributes {
                 superuser: flag(row, "superuser")?,
                 inherit: flag(row, "inherit")?,
@@ -345,13 +348,13 @@ async fn settings(conn: &mut impl QueryConnection) -> Result<BTreeMap<String, St
 /// and every schema grantee.
 #[derive(Debug, Clone)]
 pub struct RoleMap {
-    to_run_local: BTreeMap<String, String>,
+    to_run_local: BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
     /// `to_run_local` the other way round, so the comparison after a
     /// reproduction finds the logical role of each run-local one in a lookup
     /// and not a scan of the map: a superuser's closure is every role in the
     /// cluster, and a scan per role is quadratic in it (#2049).
-    to_logical: BTreeMap<String, String>,
-    run_login: String,
+    to_logical: BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
+    run_login: pbps_model::RoleName,
 }
 
 /// Whether a schema is one the engine itself provides: `information_schema`
@@ -404,7 +407,7 @@ impl RoleMap {
             logical.insert(schema.owner.clone());
             for (grantee, grants) in &schema.acl {
                 if grantee != "PUBLIC" {
-                    logical.insert(grantee.clone());
+                    logical.insert(grantee.clone().into());
                 }
                 // Each entry is replayed under its grantor, so the grantor
                 // needs a run-local role too, whether or not the deployer
@@ -419,17 +422,17 @@ impl RoleMap {
         // `apply_planned` has no run-local role for it (finding on #688).
         for grant in planned {
             if grant.role != "PUBLIC" {
-                logical.insert(grant.role.clone());
+                logical.insert(grant.role.clone().into());
             }
         }
         let to_run_local = logical
             .into_iter()
             .enumerate()
             .map(|(index, name)| {
-                let run_local = if is_predefined(&name) {
+                let run_local = if is_predefined(name.raw()) {
                     name.clone()
                 } else {
-                    format!("pbps_role_{index}_{token}")
+                    format!("pbps_role_{index}_{token}").into()
                 };
                 (name, run_local)
             })
@@ -437,7 +440,10 @@ impl RoleMap {
         Self::new(to_run_local, run_login)
     }
 
-    fn new(to_run_local: BTreeMap<String, String>, run_login: &str) -> Self {
+    fn new(
+        to_run_local: BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
+        run_login: &str,
+    ) -> Self {
         let mut to_logical = BTreeMap::new();
         for (logical, run_local) in &to_run_local {
             // The first logical role by name, as a scan of the map would find.
@@ -448,7 +454,7 @@ impl RoleMap {
         Self {
             to_run_local,
             to_logical,
-            run_login: run_login.to_owned(),
+            run_login: run_login.into(),
         }
     }
 
@@ -458,7 +464,7 @@ impl RoleMap {
     /// compiled object names is the scratch server's own.
     pub fn supplied(context: &AuthorizationContext, login: &str) -> Self {
         Self::new(
-            BTreeMap::from([(context.principal.effective.clone(), login.to_owned())]),
+            BTreeMap::from([(context.principal.effective.clone(), login.into())]),
             login,
         )
     }
@@ -470,7 +476,9 @@ impl RoleMap {
         if logical == "PUBLIC" {
             return Some("PUBLIC".to_owned());
         }
-        self.to_run_local.get(logical).cloned()
+        self.to_run_local
+            .get(logical)
+            .map(|name| name.raw().to_owned())
     }
 
     /// The logical role a run-local name stands for, for comparing a
@@ -479,23 +487,26 @@ impl RoleMap {
         if run_local == "PUBLIC" {
             return Some("PUBLIC".to_owned());
         }
-        self.to_logical.get(run_local).cloned()
+        self.to_logical
+            .get(run_local)
+            .map(|name| name.raw().to_owned())
     }
 
     /// Every run-local role name, so the run records them as recovery names
     /// before creating them and drops them on cleanup.
-    pub fn run_local_names(&self) -> Vec<String> {
+    pub fn run_local_names(&self) -> Vec<pbps_model::RoleName> {
         self.to_run_local
             .values()
-            .filter(|name| !is_predefined(name))
+            .filter(|name| !is_predefined(name.raw()))
             .cloned()
             .collect()
     }
 
     /// The run-local role the compilation session must `SET ROLE` to: the
     /// mapping of the target's deployer principal.
-    pub fn deployer(&self, context: &AuthorizationContext) -> Option<String> {
-        self.run_local(&context.principal.effective)
+    pub fn deployer(&self, context: &AuthorizationContext) -> Option<pbps_model::RoleName> {
+        self.run_local(context.principal.effective.raw())
+            .map(Into::into)
     }
 }
 
@@ -624,7 +635,8 @@ pub async fn reconstruct(
 ) -> Result<(), DbError> {
     let missing = |logical: &str| {
         DbError::BadRow(format!(
-            "the authorization reconstruction has no run-local role for {logical}"
+            "the authorization reconstruction has no run-local role for {logical}",
+            logical = pbps_model::escape::Escaped(logical)
         ))
     };
     // Roles. A role in the closure carries its measured attributes; an owner
@@ -634,7 +646,7 @@ pub async fn reconstruct(
     // (#2049).
     let mut creations = Vec::new();
     for (logical, run) in &map.to_run_local {
-        if is_predefined(logical) {
+        if is_predefined(logical.raw()) {
             continue;
         }
         let attrs = context.roles.get(logical);
@@ -643,7 +655,7 @@ pub async fn reconstruct(
         let bypass = attrs.is_some_and(|a| a.bypass_rls);
         creations.push(format!(
             "CREATE ROLE {} NOLOGIN {} {} {}",
-            quote_ident(run),
+            quote_ident(run.raw()),
             if superuser {
                 "SUPERUSER"
             } else {
@@ -658,14 +670,16 @@ pub async fn reconstruct(
     // from or can switch to, with the measured options, reproduces the same
     // `has_*_privilege` and `pg_has_role` answers.
     let deployer = map
-        .run_local(&context.principal.effective)
-        .ok_or_else(|| missing(&context.principal.effective))?;
+        .run_local(context.principal.effective.raw())
+        .ok_or_else(|| missing(context.principal.effective.raw()))?;
     let mut memberships = Vec::new();
     for (logical, attrs) in &context.roles {
         if *logical == context.principal.effective {
             continue;
         }
-        let role = map.run_local(logical).ok_or_else(|| missing(logical))?;
+        let role = map
+            .run_local(logical.raw())
+            .ok_or_else(|| missing(logical.raw()))?;
         memberships.push(format!(
             "GRANT {} TO {} WITH INHERIT {}, SET {}",
             quote_ident(&role),
@@ -681,7 +695,7 @@ pub async fn reconstruct(
         .query(&format!(
             "GRANT {} TO {} WITH INHERIT FALSE, SET TRUE",
             quote_ident(&deployer),
-            quote_ident(&map.run_login),
+            quote_ident(map.run_login.raw()),
         ))
         .await?;
     // Schemas, with the same name the emitter's write path uses, owned by the
@@ -720,8 +734,8 @@ pub async fn reconstruct(
             continue;
         }
         let owner = map
-            .run_local(&schema.owner)
-            .ok_or_else(|| missing(&schema.owner))?;
+            .run_local(schema.owner.raw())
+            .ok_or_else(|| missing(schema.owner.raw()))?;
         // A fresh database from template0 already has `public`, with the
         // template's explicit ACL (`{pg_database_owner=UC/...,=U/...}`,
         // measured on 18). A target whose `public` was dropped and recreated
@@ -781,7 +795,7 @@ pub async fn reconstruct(
             .iter()
             .flat_map(|(grantee, grants)| grants.iter().map(move |grant| (grantee, grant)))
             .collect();
-        let mut able: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut able: BTreeSet<(pbps_model::RoleName, String)> = BTreeSet::new();
         while !pending.is_empty() {
             let (ready, waiting): (Vec<_>, Vec<_>) = pending.into_iter().partition(|(_, grant)| {
                 grant.grantor == schema.owner
@@ -791,7 +805,11 @@ pub async fn reconstruct(
                 let stuck: Vec<String> = waiting
                     .iter()
                     .map(|(grantee, grant)| {
-                        format!("{} to {grantee} by {}", grant.privilege, grant.grantor)
+                        format!(
+                            "{} to {grantee} by {}",
+                            grant.privilege,
+                            grant.grantor.shown()
+                        )
                     })
                     .collect();
                 return Err(DbError::BadRow(format!(
@@ -801,8 +819,8 @@ pub async fn reconstruct(
             }
             for (grantee, grant) in ready {
                 let grantor = map
-                    .run_local(&grant.grantor)
-                    .ok_or_else(|| missing(&grant.grantor))?;
+                    .run_local(grant.grantor.raw())
+                    .ok_or_else(|| missing(grant.grantor.raw()))?;
                 let recipient = map.run_local(grantee).ok_or_else(|| missing(grantee))?;
                 let recipient = if recipient == "PUBLIC" {
                     "PUBLIC".to_owned()
@@ -831,7 +849,7 @@ pub async fn reconstruct(
                 admin.query("SET ROLE NONE").await?;
                 outcome?;
                 if grant.grantable && grantee != "PUBLIC" {
-                    able.insert((grantee.clone(), grant.privilege.clone()));
+                    able.insert((grantee.clone().into(), grant.privilege.clone()));
                 }
             }
             pending = waiting;
@@ -842,7 +860,7 @@ pub async fn reconstruct(
     for (key, value) in &context.settings {
         let (scope, name) = key
             .split_once(':')
-            .ok_or_else(|| DbError::BadRow(format!("a setting key without a scope: {key}")))?;
+            .ok_or_else(|| DbError::BadRow(format!("a setting key without a scope: {key}",)))?;
         // Role- and database-role defaults are the target login's, and go on
         // the run login: it is what opens the scratch session, and PostgreSQL
         // applies role defaults at login and not on SET ROLE, so this is how
@@ -870,7 +888,7 @@ pub async fn reconstruct(
         match scope {
             "role" => statements.push(format!(
                 "ALTER ROLE {} SET {} {assignment}",
-                quote_ident(&map.run_login),
+                quote_ident(map.run_login.raw()),
                 quote_ident(name),
             )),
             "database" => statements.push(format!(
@@ -880,7 +898,7 @@ pub async fn reconstruct(
             )),
             "database-role" => statements.push(format!(
                 "ALTER ROLE {} IN DATABASE {} SET {} {assignment}",
-                quote_ident(&map.run_login),
+                quote_ident(map.run_login.raw()),
                 quote_ident(database),
                 quote_ident(name),
             )),
@@ -900,7 +918,7 @@ pub async fn reconstruct(
 pub async fn apply_planned(
     admin: &mut impl QueryConnection,
     map: &RoleMap,
-    deployer: &str,
+    deployer: &pbps_model::RoleName,
     grants: &[PlannedGrant],
 ) -> Result<(), DbError> {
     if grants.is_empty() {
@@ -910,7 +928,7 @@ pub async fn apply_planned(
     // administrator: a grant the deployer lacks ownership or grant option for
     // must fail here exactly as it would at apply (finding on #688).
     admin
-        .query(&format!("SET ROLE {}", quote_ident(deployer)))
+        .query(&format!("SET ROLE {}", quote_ident(deployer.raw())))
         .await?;
     let outcome = apply_planned_grants(admin, map, grants).await;
     admin.query("SET ROLE NONE").await?;
@@ -994,7 +1012,7 @@ pub fn with_planned(
                 })
                 .collect();
             defaults.sort();
-            schema.acl.insert(owner, defaults);
+            schema.acl.insert(owner.raw().to_owned(), defaults);
         }
         for privilege in privileges {
             let entry = schema.acl.entry(grant.role.clone()).or_default();
@@ -1025,9 +1043,9 @@ pub fn with_planned(
 /// an inherited owner. Without verified traversal order, multiple inherited
 /// full-mask holders cannot be selected by spelling (DEC-483).
 enum GrantorChoice {
-    Known(String),
+    Known(pbps_model::RoleName),
     Missing,
-    Ambiguous(Vec<String>),
+    Ambiguous(Vec<pbps_model::RoleName>),
 }
 
 fn grantor_choice(
@@ -1042,9 +1060,9 @@ fn grantor_choice(
     if context.principal.superuser || &schema.owner == actor {
         return GrantorChoice::Known(schema.owner.clone());
     }
-    let holds_all = |role: &String| {
+    let holds_all = |role: &pbps_model::RoleName| {
         privileges.iter().all(|privilege| {
-            schema.acl.get(role).is_some_and(|grants| {
+            schema.acl.get(role.raw()).is_some_and(|grants| {
                 grants
                     .iter()
                     .any(|grant| grant.privilege == *privilege && grant.grantable)
@@ -1057,7 +1075,7 @@ fn grantor_choice(
     let inherited = context
         .roles
         .iter()
-        .filter(|(role, attrs)| attrs.inherits && role.as_str() != actor.as_str())
+        .filter(|(role, attrs)| attrs.inherits && role.raw() != actor.raw())
         .filter(|(role, _)| *role == &schema.owner || holds_all(role))
         .map(|(role, _)| role.clone())
         .collect::<Vec<_>>();
@@ -1082,7 +1100,11 @@ pub fn ambiguous_grantors(context: &AuthorizationContext, grants: &[PlannedGrant
                 "{} on schema {} is held with the grant option through {}",
                 grant.privilege,
                 grant.schema,
-                holders.join(" and ")
+                holders
+                    .iter()
+                    .map(|name| name.shown().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
             )];
         }
         projected = with_planned(projected, std::slice::from_ref(grant));
@@ -1104,18 +1126,18 @@ pub fn ambiguous_grantors(context: &AuthorizationContext, grants: &[PlannedGrant
 fn recompute_schema_effective(context: &mut AuthorizationContext) {
     let deployer = context.principal.effective.clone();
     let superuser = context.principal.superuser;
-    let inherited: BTreeSet<String> = context
+    let inherited: BTreeSet<pbps_model::RoleName> = context
         .roles
         .iter()
         .filter(|(_, attrs)| attrs.inherits)
         .map(|(role, _)| role.clone())
         .collect();
     let holders = |grantee: &str| -> bool {
-        grantee == "PUBLIC" || grantee == deployer || inherited.contains(grantee)
+        grantee == "PUBLIC" || grantee == deployer.raw() || inherited.contains(grantee)
     };
     for schema in context.schemas.values_mut() {
         let owns_default = schema.acl.is_empty()
-            && (schema.owner == deployer || inherited.contains(&schema.owner));
+            && (schema.owner == deployer || inherited.contains(schema.owner.raw()));
         for privilege in ["USAGE", "CREATE"] {
             let granted = schema.acl.iter().any(|(grantee, grants)| {
                 holders(grantee) && grants.iter().any(|g| g.privilege == privilege)
@@ -1142,8 +1164,10 @@ pub async fn verify(
     let mut differences = Vec::new();
     // The compilation must run as the mapped deployer, and its superuser
     // standing must match the target's.
-    if map.logical_of(&reproduced.principal.effective).as_deref()
-        != Some(target.principal.effective.as_str())
+    if map
+        .logical_of(reproduced.principal.effective.raw())
+        .as_deref()
+        != Some(target.principal.effective.raw())
     {
         differences.push("principal".into());
     }
@@ -1165,7 +1189,7 @@ pub async fn verify(
         if is_system_schema(name) {
             continue;
         }
-        if map.logical_of(&got.owner).as_deref() != Some(want.owner.as_str()) {
+        if map.logical_of(got.owner.raw()).as_deref() != Some(want.owner.raw()) {
             differences.push(format!("schema:{name}:owner"));
         }
         let got_acl: BTreeMap<String, Vec<Grant>> = got
@@ -1178,7 +1202,8 @@ pub async fn verify(
                         privilege: g.privilege.clone(),
                         grantable: g.grantable,
                         grantor: map
-                            .logical_of(&g.grantor)
+                            .logical_of(g.grantor.raw())
+                            .map(pbps_model::RoleName::from)
                             .unwrap_or_else(|| g.grantor.clone()),
                     })
                     .collect();
@@ -1196,16 +1221,19 @@ pub async fn verify(
     // Role attributes, mapped back to logical names: a reproduction must give
     // the deployer the same closure with the same superuser/inherit/switch
     // standing, or a privilege answer could match today and diverge later.
-    let got_roles: BTreeMap<String, &RoleAttributes> = reproduced
+    let got_roles: BTreeMap<pbps_model::RoleName, &RoleAttributes> = reproduced
         .roles
         .iter()
-        .filter_map(|(name, attrs)| map.logical_of(name).map(|logical| (logical, attrs)))
+        .filter_map(|(name, attrs)| {
+            map.logical_of(name.raw())
+                .map(|logical| (logical.into(), attrs))
+        })
         .collect();
     for (name, want) in &target.roles {
         match got_roles.get(name) {
             Some(got) if *got == want => {}
-            Some(_) => differences.push(format!("role:{name}")),
-            None => differences.push(format!("role:{name}:absent")),
+            Some(_) => differences.push(format!("role:{name}", name = name.shown(),)),
+            None => differences.push(format!("role:{name}:absent", name = name.shown(),)),
         }
     }
     // And in the other direction: a role the reproduction still has and the
@@ -1213,7 +1241,7 @@ pub async fn verify(
     // broader authorization than the target's, not a match (finding on #688).
     for name in got_roles.keys() {
         if !target.roles.contains_key(name) {
-            differences.push(format!("role:{name}:extra"));
+            differences.push(format!("role:{name}:extra", name = name.shown(),));
         }
     }
     // Role- and database-scoped settings must reproduce exactly; their keys
@@ -1270,6 +1298,28 @@ fn required(row: &Row, field: &str, what: &str) -> Result<String, DbError> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn role_mapping_and_context_keys_preserve_raw_named_role_identity() {
+        let name = pbps_model::RoleName::from("role\nline\\\u{202e}名前");
+        let lookalike = pbps_model::RoleName::from(name.shown().to_string());
+        let mut context = context();
+        let attrs = context.roles.values().next().unwrap().clone();
+        context.roles.insert(name.clone(), attrs.clone());
+        context.roles.insert(lookalike.clone(), attrs);
+        context.schemas.get_mut("app").unwrap().owner = name.clone();
+        let json: serde_json::Value = serde_json::from_slice(&context.canonical()).unwrap();
+        assert!(json["roles"].get(name.raw()).is_some());
+        assert!(json["roles"].get(lookalike.raw()).is_some());
+        assert_eq!(json["schemas"]["app"]["owner"], name.raw());
+        let map = RoleMap::generate(&context, &[], "login", "hostile");
+        let run = map.run_local(name.raw()).unwrap();
+        assert_ne!(Some(&run), map.run_local(lookalike.raw()).as_ref());
+        assert_eq!(map.logical_of(&run).as_deref(), Some(name.raw()));
+        assert_eq!(map.run_local("PUBLIC").as_deref(), Some("PUBLIC"));
+        assert!(map.run_local("absent").is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -1411,7 +1461,7 @@ mod tests {
             .into_iter()
             .collect(),
             roles: [(
-                "app_reader".to_owned(),
+                "app_reader".into(),
                 RoleAttributes {
                     superuser: false,
                     inherit: true,
@@ -1436,7 +1486,7 @@ mod tests {
         let mut ctx = context();
         for role in ["pg_read_all_settings", "pg_database_owner"] {
             ctx.roles.insert(
-                role.to_owned(),
+                role.to_owned().into(),
                 RoleAttributes {
                     superuser: false,
                     inherit: true,
@@ -1469,7 +1519,7 @@ mod tests {
         assert!(
             map.run_local_names()
                 .iter()
-                .all(|name| name.starts_with("pbps_role_")),
+                .all(|name| name.raw().starts_with("pbps_role_")),
             "{:?}",
             map.run_local_names()
         );
@@ -1485,13 +1535,16 @@ mod tests {
         let attributes = ctx.roles["app_reader"].clone();
         for i in 0..20_000 {
             ctx.roles
-                .insert(format!("crowd_{i:05}"), attributes.clone());
+                .insert(format!("crowd_{i:05}").into(), attributes.clone());
         }
         ctx.roles.insert("pg_monitor".into(), attributes);
         let map = RoleMap::generate(&ctx, &[], "pbps_run_x", "tok");
         let started = std::time::Instant::now();
         for (logical, run_local) in &map.to_run_local {
-            assert_eq!(map.logical_of(run_local).as_deref(), Some(logical.as_str()));
+            assert_eq!(
+                map.logical_of((run_local).raw()).as_deref(),
+                Some(logical.raw())
+            );
         }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
@@ -1523,7 +1576,7 @@ mod tests {
         let mut two = context();
         for role in ["aa_second", "zz_first"] {
             two.roles.insert(
-                role.to_owned(),
+                role.to_owned().into(),
                 RoleAttributes {
                     superuser: false,
                     inherit: true,

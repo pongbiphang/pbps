@@ -2879,14 +2879,14 @@ async fn refuse_taken_history_names(
 /// to a string comparison here (DECISIONS 119).
 async fn refuse_taken_role_names(
     conn: &mut Conn,
-    wanted: &[String],
-    vacated: &[String],
+    wanted: &[pbps_model::RoleName],
+    vacated: &[pbps_model::RoleName],
 ) -> anyhow::Result<()> {
     if wanted.is_empty() {
         return Ok(());
     }
-    let wanted: Vec<&str> = wanted.iter().map(String::as_str).collect();
-    let vacated: Vec<&str> = vacated.iter().map(String::as_str).collect();
+    let wanted: Vec<&str> = wanted.iter().map(pbps_model::RoleName::raw).collect();
+    let vacated: Vec<&str> = vacated.iter().map(pbps_model::RoleName::raw).collect();
     // The wanted names against one another first: two declared roles the
     // database reads as one name pass every check against the catalog, and
     // the second `CREATE ROLE` fails after everything before it has run
@@ -2981,7 +2981,7 @@ fn role_name_expectations(
     dialect: &dyn pbps_dialect::Dialect,
     mode: pbps_model::PlanMode,
     completed: usize,
-) -> anyhow::Result<(Vec<String>, Vec<String>)> {
+) -> anyhow::Result<(Vec<pbps_model::RoleName>, Vec<pbps_model::RoleName>)> {
     let mut wanted = Vec::new();
     let mut vacated = Vec::new();
     let mut at = 0usize;
@@ -3394,7 +3394,7 @@ fn schemas_declared(schema: &Schema) -> BTreeMap<String, String> {
         for target in role.grants.keys() {
             if let pbps_model::GrantTarget::Schema(s) = target {
                 out.entry(s.clone())
-                    .or_insert_with(|| format!("granted to role `{name}`"));
+                    .or_insert_with(|| format!("granted to role `{name}`", name = name.shown(),));
             }
         }
     }
@@ -3988,7 +3988,7 @@ pub(crate) fn unmanaged_objects(
             scoped
                 .unmanaged_roles
                 .iter()
-                .map(|r| format!("role {}", pbps_model::escape::Escaped(r))),
+                .map(|r| format!("role {}", r.shown())),
         )
         // Unreadable modules are absent from `scoped.schema`, but they are
         // still catalog objects. If their target is outside the supplied managed
@@ -4066,7 +4066,12 @@ fn report_missing(scoped: &pbps_diff::Scoped) {
         eprintln!(
             "warning: the identity file names {} role(s) this database does not have: {}",
             scoped.missing_roles.len(),
-            scoped.missing_roles.join(", ")
+            scoped
+                .missing_roles
+                .iter()
+                .map(|name| name.shown().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
 }
@@ -4351,7 +4356,7 @@ fn refuse_pinned_movement(
     // asking whether the plan touched `app.f` would exempt every overload of
     // it from the comparison below.
     let mut touched_modules: BTreeSet<&pbps_model::ModuleId> = BTreeSet::new();
-    let mut roles: BTreeSet<&str> = BTreeSet::new();
+    let mut roles: BTreeSet<&pbps_model::RoleName> = BTreeSet::new();
     for p in &changes.changes {
         objects.extend(p.change.objects());
         touched_modules.extend(p.change.module_id());
@@ -4374,8 +4379,10 @@ fn refuse_pinned_movement(
     // permissions it adds and the ones it takes away, kept apart because the
     // comparison below reconstructs the set rather than excusing it.
     type Permissions = BTreeSet<pbps_model::Permission>;
-    let mut granting: BTreeMap<(&str, &pbps_model::GrantTarget), Permissions> = BTreeMap::new();
-    let mut revoking: BTreeMap<(&str, &pbps_model::GrantTarget), Permissions> = BTreeMap::new();
+    let mut granting: BTreeMap<(&pbps_model::RoleName, &pbps_model::GrantTarget), Permissions> =
+        BTreeMap::new();
+    let mut revoking: BTreeMap<(&pbps_model::RoleName, &pbps_model::GrantTarget), Permissions> =
+        BTreeMap::new();
     // The columns this plan changes, under the table they are on, and the
     // objects it removes outright. Both are things the plan does to a
     // *container* that show up somewhere else without any change of its own
@@ -4801,7 +4808,8 @@ fn refuse_pinned_movement(
     // `CREATE ROLE` another session undid was recorded as success
     // (DECISIONS 161).
     if settled.whole() {
-        let mut expected_roles: BTreeMap<&str, pbps_model::Presence> = BTreeMap::new();
+        let mut expected_roles: BTreeMap<&pbps_model::RoleName, pbps_model::Presence> =
+            BTreeMap::new();
         for p in &changes.changes {
             expected_roles.extend(p.change.roles_after());
         }
@@ -4811,10 +4819,12 @@ fn refuse_pinned_movement(
         for (name, expected) in expected_roles {
             match (expected, after.roles.contains_key(name)) {
                 (pbps_model::Presence::Present, false) => moved.push(format!(
-                    "role {name} is not there, and this plan creates it"
+                    "role {name} is not there, and this plan creates it",
+                    name = name.shown(),
                 )),
                 (pbps_model::Presence::Absent, true) => moved.push(format!(
-                    "role {name} is still there, and this plan removes it"
+                    "role {name} is still there, and this plan removes it",
+                    name = name.shown(),
                 )),
                 _ => {}
             }
@@ -4826,7 +4836,7 @@ fn refuse_pinned_movement(
     // grant change at all — the role is untouched. Compared by name alone,
     // the one grant read as two and every such rename was refused
     // (DECISIONS 157).
-    let before_roles: BTreeMap<String, pbps_model::Role> = before
+    let before_roles: BTreeMap<pbps_model::RoleName, pbps_model::Role> = before
         .roles
         .iter()
         .map(|(name, role)| {
@@ -4866,15 +4876,15 @@ fn refuse_pinned_movement(
             )
         })
         .collect();
-    let named_role = |n: &String| roles.contains(n.as_str());
+    let named_role = |n: &pbps_model::RoleName| roles.contains(n);
     compare(
         "role ",
         &before_roles,
         &after.roles,
         named_role,
-        |_: &String, was: &pbps_model::Role, now: &pbps_model::Role| was == now,
+        |_: &pbps_model::RoleName, was: &pbps_model::Role, now: &pbps_model::Role| was == now,
         &mut moved,
-        Clone::clone,
+        |name| name.shown().to_string(),
     );
     // And the same for a role the plan does name: exempt down to the
     // permissions it moves, and no further. A plan that adds one grant is not
@@ -4909,7 +4919,8 @@ fn refuse_pinned_movement(
         .collect();
     // Keep the pairs, not a map keyed by their destination: two observed
     // baseline names must not silently overwrite one grant comparison.
-    let carried_roles: BTreeSet<&str> = carried.iter().map(|(name, _)| *name).collect();
+    let carried_roles: BTreeSet<&pbps_model::RoleName> =
+        carried.iter().map(|(name, _)| *name).collect();
     let no_grants = pbps_model::Role {
         description: None,
         grants: BTreeMap::new(),
@@ -4918,8 +4929,8 @@ fn refuse_pinned_movement(
         after
             .roles
             .keys()
-            .filter(|name| named_role(name) && !carried_roles.contains(name.as_str()))
-            .map(|name| (name.as_str(), &no_grants)),
+            .filter(|name| named_role(name) && !carried_roles.contains(*name))
+            .map(|name| (name, &no_grants)),
     );
     for (now_name, was) in touched_roles {
         if !roles.contains(now_name) {
@@ -5010,7 +5021,9 @@ fn refuse_pinned_movement(
                 }
                 moved.push(format!(
                     "role {now_name} does not hold on {target} what this plan leaves it holding: {}",
-                    detail.join("; ")
+                    detail.join("; "),
+                    now_name = now_name.shown(),
+                    target = target.shown(),
                 ));
             }
         }
@@ -5791,7 +5804,7 @@ pub fn cmd_bootstrap(
                 .roles
                 .keys()
                 .filter(|r| ids.role_uid(r).is_none())
-                .map(|r| format!("role {r}")),
+                .map(|r| format!("role {r}", r = r.shown(),)),
         )
         .collect();
     if !unidentified.is_empty() {
@@ -6051,7 +6064,7 @@ pub fn cmd_bootstrap(
                 .roles
                 .iter()
                 .filter(|(_, role)| dialect.manages_roles() || !role.grants.is_empty())
-                .map(|(name, _)| format!("role {name}"))
+                .map(|(name, _)| format!("role {name}", name = name.shown(),))
                 .collect();
 
             // Bootstrap means "into an empty database". Running it over an
@@ -6992,7 +7005,7 @@ pub fn cmd_plan_db(
                 .context("cannot read what the roles own")?;
             for p in &cs.changes {
                 if let pbps_model::Change::DropRole { name, .. } = &p.change
-                    && let Some(securables) = owned.get(name.as_str())
+                    && let Some(securables) = owned.get(name.raw())
                     && !securables.is_empty()
                 {
                     bail!(
@@ -7002,7 +7015,8 @@ pub fn cmd_plan_db(
                          the role.",
                         target.label,
                         securables.join(", "),
-                        securables[0]
+                        securables[0],
+                        name = name.shown(),
                     );
                 }
             }
@@ -8132,7 +8146,10 @@ fn pinned_managed(recorded: &StateSnapshot, changes: &pbps_model::ChangeSet) -> 
 
 /// The cluster already moved these identities. Both the planner and the
 /// checkout-free apply must scope and pin the same names (DECISIONS 377).
-fn rename_snapshot_roles(snapshot: &mut StateSnapshot, renames: &BTreeMap<String, String>) {
+fn rename_snapshot_roles(
+    snapshot: &mut StateSnapshot,
+    renames: &BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
+) {
     for (from, to) in renames {
         snapshot.ids.rename_role(from, to);
         if let Some(role) = snapshot.schema.roles.remove(from) {
@@ -9008,7 +9025,7 @@ fn role_drop_expectations(
     dialect: &dyn pbps_dialect::Dialect,
     mode: pbps_model::PlanMode,
     completed: usize,
-) -> anyhow::Result<Vec<(String, Vec<String>)>> {
+) -> anyhow::Result<Vec<(pbps_model::RoleName, Vec<pbps_model::RoleName>)>> {
     let mut out = Vec::new();
     let mut at = 0usize;
     for p in &cs.changes {
@@ -9032,7 +9049,7 @@ fn role_drop_expectations(
 /// role in place (DECISIONS 92, 102).
 async fn check_role_drops(
     conn: &mut Conn,
-    expected: &[(String, Vec<String>)],
+    expected: &[(pbps_model::RoleName, Vec<pbps_model::RoleName>)],
 ) -> anyhow::Result<()> {
     if expected.is_empty() {
         return Ok(());
@@ -9044,35 +9061,43 @@ async fn check_role_drops(
         .await
         .context("cannot read what the roles own")?;
     for (name, listed) in expected {
-        let listed: std::collections::BTreeSet<&str> = listed.iter().map(String::as_str).collect();
-        let now: std::collections::BTreeSet<&str> = members_now
-            .get(name.as_str())
-            .map(|m| m.iter().map(String::as_str).collect())
+        let listed: std::collections::BTreeSet<&pbps_model::RoleName> = listed.iter().collect();
+        let now: std::collections::BTreeSet<&pbps_model::RoleName> = members_now
+            .get(name)
+            .map(|m| m.iter().collect())
             .unwrap_or_default();
-        let added: Vec<&str> = now.difference(&listed).copied().collect();
-        let gone: Vec<&str> = listed.difference(&now).copied().collect();
+        let added: Vec<&pbps_model::RoleName> = now.difference(&listed).copied().collect();
+        let gone: Vec<&pbps_model::RoleName> = listed.difference(&now).copied().collect();
         if !added.is_empty() || !gone.is_empty() {
             let mut detail = Vec::new();
             if !added.is_empty() {
                 detail.push(format!(
                     "member(s) the plan did not list: {}",
-                    added.join(", ")
+                    added
+                        .iter()
+                        .map(|name| name.shown().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
             if !gone.is_empty() {
                 detail.push(format!(
                     "listed member(s) no longer in it: {}",
-                    gone.join(", ")
+                    gone.iter()
+                        .map(|name| name.shown().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
             bail!(
                 "role `{name}` is not the role this plan was made against: {}.\n\
                  Its membership changed after `plan --db`, and the plan lists who loses \
                  the role so a reviewer can see it. Recompute it with `pbps plan --db`.",
-                detail.join("; ")
+                detail.join("; "),
+                name = name.shown(),
             );
         }
-        if let Some(securables) = owned_now.get(name.as_str())
+        if let Some(securables) = owned_now.get(name)
             && !securables.is_empty()
         {
             bail!(
@@ -9082,7 +9107,8 @@ async fn check_role_drops(
                  since pbps does not decide who owns a securable), then recompute the plan \
                  with `pbps plan --db`.",
                 securables.join(", "),
-                securables[0]
+                securables[0],
+                name = name.shown(),
             );
         }
     }
@@ -13698,7 +13724,7 @@ mod tests {
             missing_roles: Vec::new(),
             public_execute: Default::default(),
             owners: Default::default(),
-            session_role: String::new(),
+            session_role: String::new().into(),
         };
         let mut table = empty.clone();
         table.unmanaged.push(x.clone());
@@ -13754,7 +13780,7 @@ mod tests {
             missing_roles: Vec::new(),
             public_execute: Default::default(),
             owners: Default::default(),
-            session_role: String::new(),
+            session_role: String::new().into(),
         };
         let check = |scoped: &pbps_diff::Scoped,
                      unreadable: &[(LimitationTarget, String)],
@@ -14335,16 +14361,17 @@ mod tests {
         let mut ids = IdsFile::default();
         ids.tables.insert("t_aaaaaa".parse().unwrap(), mine.clone());
         ids.roles
-            .insert("r_aaaaaa".parse().unwrap(), "app".to_owned());
+            .insert("r_aaaaaa".parse().unwrap(), "app".to_owned().into());
         let module: ModuleId = "dbo.v".parse().unwrap();
         let modules: BTreeSet<ModuleId> = [module.clone()].into_iter().collect();
 
-        let entry =
-            |role: &str, target: Option<pbps_model::GrantTarget>, what: &str| Unexpressible {
-                role: role.to_owned(),
-                target,
-                what: what.to_owned(),
-            };
+        let entry = |role: &pbps_model::RoleName,
+                     target: Option<pbps_model::GrantTarget>,
+                     what: &str| Unexpressible {
+            role: role.to_owned(),
+            target,
+            what: what.to_owned(),
+        };
         let object = |t: &TableName| Some(pbps_model::GrantTarget::Object(t.clone()));
         let pulled = Pulled {
             schema: Schema::default(),
@@ -14354,23 +14381,35 @@ mod tests {
             unmanaged_modules: Vec::new(),
             public_execute: Default::default(),
             owners: Default::default(),
-            session_role: String::new(),
+            session_role: String::new().into(),
             unrevocable: Vec::new(),
             unexpressible: vec![
-                entry("app", object(&mine), "on a table this project manages"),
                 entry(
-                    "app",
+                    &pbps_model::RoleName::from("app"),
+                    object(&mine),
+                    "on a table this project manages",
+                ),
+                entry(
+                    &pbps_model::RoleName::from("app"),
                     object(&module.object_name()),
                     "on a module this project manages",
                 ),
-                entry("app", object(&theirs), "on somebody else's table"),
-                entry("other", object(&mine), "an unmanaged role's business"),
+                entry(
+                    &pbps_model::RoleName::from("app"),
+                    object(&theirs),
+                    "on somebody else's table",
+                ),
+                entry(
+                    &pbps_model::RoleName::from("other"),
+                    object(&mine),
+                    "an unmanaged role's business",
+                ),
                 // No object to belong to: a permission on the database itself,
                 // and a class the model cannot even name (105).
-                entry("app", None, "on the database"),
+                entry(&pbps_model::RoleName::from("app"), None, "on the database"),
                 // Declarable, so a DENY on one is a difference we must hold.
                 entry(
-                    "app",
+                    &pbps_model::RoleName::from("app"),
                     Some(pbps_model::GrantTarget::Schema("dbo".to_owned())),
                     "on a schema",
                 ),
@@ -14741,7 +14780,7 @@ mod tests {
         let schema = |cols: &str, held: &[pbps_model::Permission]| {
             let mut s = Schema::default();
             s.tables.insert("dbo.t".parse().unwrap(), table(cols));
-            s.roles.insert("app".to_owned(), role(held));
+            s.roles.insert("app".to_owned().into(), role(held));
             s
         };
         let changes = |c: Vec<pbps_model::Change>| pbps_model::ChangeSet {
@@ -14776,7 +14815,7 @@ mod tests {
         // The same change, when it *is* this plan's: a plan that revokes the
         // grant must not be refused for having revoked it.
         let planned = changes(vec![pbps_model::Change::Revoke {
-            role: "app".to_owned(),
+            role: "app".to_owned().into(),
             target: dbo(),
             permissions: [pbps_model::Permission::Select].into_iter().collect(),
         }]);
@@ -14997,12 +15036,12 @@ mod tests {
         };
         let schema = |held: &[Permission]| {
             let mut s = Schema::default();
-            s.roles.insert("app".to_owned(), role(held));
+            s.roles.insert("app".to_owned().into(), role(held));
             s
         };
         let plan_granting = |permission: Permission| pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-                role: "app".to_owned(),
+                role: "app".to_owned().into(),
                 target: dbo(),
                 permissions: [permission].into_iter().collect(),
             })],
@@ -15035,7 +15074,7 @@ mod tests {
         // And a revoke the plan *did* ask for is not reported as movement.
         let revoking = pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Revoke {
-                role: "app".to_owned(),
+                role: "app".to_owned().into(),
                 target: dbo(),
                 permissions: [Permission::Select].into_iter().collect(),
             })],
@@ -15103,7 +15142,7 @@ mod tests {
                 },
             );
             s.roles.insert(
-                "app".to_owned(),
+                "app".to_owned().into(),
                 pbps_model::Role {
                     description: None,
                     grants,
@@ -15202,7 +15241,7 @@ mod tests {
                 grants.insert(on(&text), [Permission::Execute].into_iter().collect());
             }
             s.roles.insert(
-                "app".to_owned(),
+                "app".to_owned().into(),
                 pbps_model::Role {
                     description: None,
                     grants,
@@ -16303,7 +16342,7 @@ mod tests {
             }
             let mut s = Schema::default();
             s.roles.insert(
-                "app".to_owned(),
+                "app".to_owned().into(),
                 pbps_model::Role {
                     description: None,
                     grants,
@@ -16315,10 +16354,10 @@ mod tests {
             changes: vec![
                 pbps_model::PlannedChange::new(pbps_model::Change::CreateRole {
                     uid: "r_aaaaaa".parse().unwrap(),
-                    name: "app".to_owned(),
+                    name: "app".to_owned().into(),
                 }),
                 pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-                    role: "app".to_owned(),
+                    role: "app".to_owned().into(),
                     target: GrantTarget::Schema("dbo".to_owned()),
                     permissions: [Permission::Select].into_iter().collect(),
                 }),
@@ -16356,7 +16395,7 @@ mod tests {
         let role = |grants: BTreeMap<GrantTarget, BTreeSet<Permission>>| {
             let mut s = Schema::default();
             s.roles.insert(
-                "app".to_owned(),
+                "app".to_owned().into(),
                 pbps_model::Role {
                     description: None,
                     grants,
@@ -16366,7 +16405,7 @@ mod tests {
         };
         let granting = pbps_model::ChangeSet {
             changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-                role: "app".to_owned(),
+                role: "app".to_owned().into(),
                 target: GrantTarget::Schema("dbo".to_owned()),
                 permissions: [Permission::Select].into_iter().collect(),
             })],
@@ -19563,7 +19602,7 @@ mod tests {
             changes: vec![pbps_model::PlannedChange::new(
                 pbps_model::Change::CreateRole {
                     uid: "r_aaaaaa".parse().unwrap(),
-                    name: "app".to_owned(),
+                    name: "app".to_owned().into(),
                 },
             )],
         };
@@ -19580,7 +19619,7 @@ mod tests {
 
         let mut made = Schema::default();
         made.roles.insert(
-            "app".to_owned(),
+            "app".to_owned().into(),
             pbps_model::Role {
                 description: None,
                 grants: BTreeMap::new(),
@@ -19601,7 +19640,7 @@ mod tests {
             changes: vec![pbps_model::PlannedChange::new(
                 pbps_model::Change::DropRole {
                     uid: "r_aaaaaa".parse().unwrap(),
-                    name: "app".to_owned(),
+                    name: "app".to_owned().into(),
                     members: Vec::new(),
                 },
             )],
@@ -19636,7 +19675,7 @@ mod tests {
             s.tables
                 .insert(table.parse().unwrap(), pbps_model::Table::default());
             s.roles.insert(
-                "app".to_owned(),
+                "app".to_owned().into(),
                 pbps_model::Role {
                     description: None,
                     grants,
@@ -19763,7 +19802,7 @@ mod tests {
             .tables
             .insert("dbo.t".parse().unwrap(), pbps_model::Table::default());
         before.roles.insert(
-            "app".to_owned(),
+            "app".to_owned().into(),
             pbps_model::Role {
                 description: None,
                 grants: [(
@@ -19776,7 +19815,7 @@ mod tests {
         );
         let mut after = Schema::default();
         after.roles.insert(
-            "app".to_owned(),
+            "app".to_owned().into(),
             pbps_model::Role {
                 description: None,
                 grants: BTreeMap::new(),
@@ -19830,7 +19869,7 @@ mod tests {
             .tables
             .insert("dbo.old".parse().unwrap(), pbps_model::Table::default());
         before.roles.insert(
-            "was".to_owned(),
+            "was".to_owned().into(),
             pbps_model::Role {
                 description: None,
                 grants: Default::default(),
@@ -19841,7 +19880,7 @@ mod tests {
             .tables
             .insert("dbo.new".parse().unwrap(), pbps_model::Table::default());
         after.roles.insert(
-            "now".to_owned(),
+            "now".to_owned().into(),
             pbps_model::Role {
                 description: None,
                 grants: Default::default(),
@@ -19858,8 +19897,8 @@ mod tests {
                 },
                 pbps_model::Change::RenameRole {
                     uid: "r_aaaaaa".parse().unwrap(),
-                    from: "was".to_owned(),
-                    to: "now".to_owned(),
+                    from: "was".to_owned().into(),
+                    to: "now".to_owned().into(),
                 },
             ]
             .into_iter()
@@ -20132,7 +20171,13 @@ mod tests {
             )
             .unwrap()
         };
-        let both = vec![("reporting".to_owned(), vec!["a".to_owned(), "b".to_owned()])];
+        let both = vec![(
+            pbps_model::RoleName::from("reporting"),
+            vec![
+                pbps_model::RoleName::from("a"),
+                pbps_model::RoleName::from("b"),
+            ],
+        )];
         assert_eq!(expect(0), both, "before statement one");
         assert_eq!(
             expect(1),
@@ -20141,12 +20186,15 @@ mod tests {
         );
         assert_eq!(
             expect(2),
-            vec![("reporting".to_owned(), vec!["b".to_owned()])],
+            vec![(
+                pbps_model::RoleName::from("reporting"),
+                vec![pbps_model::RoleName::from("b")]
+            )],
             "one DROP MEMBER committed"
         );
         assert_eq!(
             expect(3),
-            vec![("reporting".to_owned(), vec![])],
+            vec![(pbps_model::RoleName::from("reporting"), vec![])],
             "every member gone; the DROP ROLE still to run"
         );
         assert!(
@@ -20192,7 +20240,11 @@ mod tests {
             )
             .unwrap()
         };
-        let s = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let s = |v: &[&str]| {
+            v.iter()
+                .map(|s| pbps_model::RoleName::from(*s))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
             expect(0),
             (s(&["app_reader", "auditors"]), s(&["reader", "reporting"])),
@@ -20237,7 +20289,9 @@ mod tests {
             d_uid.clone(),
             pbps_model::ColumnRef::new("app.other".parse().unwrap(), "later"),
         );
-        plan_ids.roles.insert(r_uid.clone(), "auditors".to_owned());
+        plan_ids
+            .roles
+            .insert(r_uid.clone(), "auditors".to_owned().into());
 
         let mut live = IdsFile::default();
         adopt_created(&mut live, &plan_ids, &[Created::Table(table.clone())]);
@@ -20257,7 +20311,10 @@ mod tests {
             ],
         );
         assert!(live.columns.contains_key(&d_uid));
-        assert_eq!(live.roles.get(&r_uid).map(String::as_str), Some("auditors"));
+        assert_eq!(
+            live.roles.get(&r_uid).map(pbps_model::RoleName::raw),
+            Some("auditors")
+        );
         assert_eq!(live.roles.len(), 1);
         assert_eq!(live.tables.len(), 1);
     }
@@ -20355,7 +20412,7 @@ mod tests {
             ],
             public_execute: Default::default(),
             owners: Default::default(),
-            session_role: String::new(),
+            session_role: String::new().into(),
             unrevocable: Vec::new(),
             database_collation: None,
         }

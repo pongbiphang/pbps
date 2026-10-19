@@ -281,7 +281,7 @@ impl From<&IndexPart> for PartKey {
 /// (ADR-0010 §5), so it is a grantee of its own rather than a role's name.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Grantee {
-    Role(String),
+    Role(crate::RoleName),
     Public,
 }
 
@@ -405,7 +405,7 @@ pub trait Owners {
     /// The uid of the role a step spells as `name`: a grant names its role
     /// by spelling, and a role can be created or renamed by the same plan
     /// (DEC-1954.1).
-    fn role(&self, name: &str, spelling: Spelling) -> Result<Uid, OwnerError>;
+    fn role(&self, name: &crate::RoleName, spelling: Spelling) -> Result<Uid, OwnerError>;
 }
 
 /// Ownership from the logical plan's own identity history and the two
@@ -499,12 +499,12 @@ impl Owners for PlanOwners<'_> {
         }
     }
 
-    fn role(&self, name: &str, spelling: Spelling) -> Result<Uid, OwnerError> {
+    fn role(&self, name: &crate::RoleName, spelling: Spelling) -> Result<Uid, OwnerError> {
         let recorded = |ids: &IdsIndex<'_>| {
             ids.role_uid(name)
                 .cloned()
                 .ok_or_else(|| OwnerError::Unmanaged {
-                    name: name.to_owned(),
+                    name: name.shown().to_string(),
                     spelling,
                 })
         };
@@ -513,7 +513,11 @@ impl Owners for PlanOwners<'_> {
             Spelling::Final => recorded(&self.desired),
             Spelling::At(_) => {
                 let at = self.inside(spelling)?;
-                held(self.names.role_holder(name, at), name.to_owned(), spelling)
+                held(
+                    self.names.role_holder(name, at),
+                    name.shown().to_string(),
+                    spelling,
+                )
             }
         }
     }

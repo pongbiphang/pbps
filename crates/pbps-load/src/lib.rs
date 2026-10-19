@@ -231,7 +231,7 @@ fn collect_schema_dir(
         std::collections::BTreeMap::new();
     // Roles live in their own namespace — a role and a table may share a
     // word — so they are checked for duplicates among themselves.
-    let mut seen_roles: std::collections::BTreeMap<String, std::path::PathBuf> =
+    let mut seen_roles: std::collections::BTreeMap<pbps_model::RoleName, std::path::PathBuf> =
         std::collections::BTreeMap::new();
 
     for path in files {
@@ -282,7 +282,7 @@ fn collect_schema_dir(
             LoadedFile::Role(r) => {
                 let mut r = *r;
                 if let Some(first) = seen_roles.get(&r.name) {
-                    errs.push(already(&path, &format!("role `{}`", r.name), first));
+                    errs.push(already(&path, &format!("role `{}`", r.name.shown()), first));
                     continue;
                 }
                 seen_roles.insert(r.name.clone(), path);
@@ -354,6 +354,40 @@ fn collect_yaml_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io:
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn hostile_role_declarations_round_trip_names_grant_keys_and_rename_intent() {
+        let name = pbps_model::RoleName::from("role\nline\\\u{202e}名前");
+        let before = pbps_model::RoleName::from(name.shown().to_string());
+        let role = pbps_model::Role {
+            grants: [(
+                pbps_model::GrantTarget::Schema(name.raw().into()),
+                [pbps_model::Permission::Usage].into(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let intents = vec![pbps_model::Intent::RenameRole {
+            from: before.clone(),
+            to: name.clone(),
+        }];
+        let yaml = fmt::render_role(&name, &role, &intents);
+        let LoadedFile::Role(loaded) = load_file_str(Path::new("role.yml"), &yaml).unwrap() else {
+            panic!("expected role")
+        };
+        assert_eq!(loaded.name, name);
+        assert_eq!(loaded.role, role);
+        assert_eq!(loaded.intents, intents);
+        assert_ne!(loaded.name, before);
+        assert!(
+            load_file_str(
+                Path::new("role.yml"),
+                "role: r\ngrants:\n  schema::app: [unknown]\n"
+            )
+            .is_err()
+        );
+    }
+
     use super::*;
     use pbps_model::{ReferentialAction, TypeArg};
 
@@ -1175,7 +1209,7 @@ indexes:
         let LoadedFile::Role(r) = f else {
             panic!("not a role: {f:?}");
         };
-        assert_eq!(r.name, "app_reader");
+        assert_eq!(r.name, "app_reader".into());
         assert_eq!(
             r.role.description.as_ref().map(pbps_model::Text::raw),
             Some("Read-only access")
@@ -1212,7 +1246,7 @@ indexes:
         // schema, but the dot is the name's, and `pull` writes it back as is.
         let f = load_file_str(Path::new("r.yml"), "role: app.reader\n").unwrap();
         match f {
-            LoadedFile::Role(r) => assert_eq!(r.name, "app.reader"),
+            LoadedFile::Role(r) => assert_eq!(r.name, "app.reader".into()),
             other @ (LoadedFile::Table(_) | LoadedFile::Module(_)) => {
                 panic!("not a role: {other:?}")
             }

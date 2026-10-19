@@ -795,7 +795,7 @@ fn grant_targets(
         &mut loaded.hints,
         dialect,
     );
-    let mut roles: std::collections::BTreeSet<String> =
+    let mut roles: std::collections::BTreeSet<pbps_model::RoleName> =
         loaded.schema.roles.keys().cloned().collect();
     roles.extend(ids.roles.values().cloned());
     let mut objects = std::collections::BTreeSet::new();

@@ -16,7 +16,7 @@ fn names(changes: &ChangeSet) -> Vec<&str> {
         .changes
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropRole { name, .. } => Some(name.as_str()),
+            Change::DropRole { name, .. } => Some(name.raw()),
             _ => None,
         })
         .collect()
@@ -126,4 +126,18 @@ fn a_same_depth_role_cannot_cross_its_earlier_peer() {
     schedule.edge(1, 0, Source::Catalog, OrderReason::Authorization);
     let why = schedule.settle(drops).unwrap_err();
     assert!(matches!(why, super::super::Refusal::Cycle { .. }), "{why}");
+}
+
+#[test]
+fn role_membership_order_uses_raw_names_instead_of_shown_lookalikes() {
+    let raw = "role\nline\\\u{202e}名前";
+    let lookalike = pbps_model::RoleName::from(raw).shown().to_string();
+    let input = ChangeSet {
+        changes: vec![drop(raw, &[], 0), drop(&lookalike, &[raw], 0)],
+    };
+    assert_eq!(names(&same_as_before(input)), [lookalike.as_str(), raw]);
+    let independent = ChangeSet {
+        changes: vec![drop(raw, &[], 0), drop(&lookalike, &["absent"], 0)],
+    };
+    assert_eq!(same_as_before(independent.clone()), independent);
 }

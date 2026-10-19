@@ -63,11 +63,11 @@ pub enum Blocker {
     DropTableNeedsReason { table: TableName },
     /// Roles both disappeared and appeared (ADR-0005).
     AmbiguousRoles {
-        disappeared: Vec<String>,
-        appeared: Vec<String>,
+        disappeared: Vec<pbps_model::RoleName>,
+        appeared: Vec<pbps_model::RoleName>,
     },
     /// A role vanished from the declarations with no reason for dropping it.
-    DropRoleNeedsReason { role: String },
+    DropRoleNeedsReason { role: pbps_model::RoleName },
     /// An intent was given that matches nothing in either the declarations or the
     /// identity file — almost always a typo.
     ///
@@ -171,10 +171,10 @@ pub struct Resolution {
     pub added_columns: Vec<(Uid, ColumnRef)>,
     pub dropped_columns: Vec<(Uid, ColumnRef)>,
     pub renamed_columns: Vec<(Uid, ColumnRef, ColumnRef)>,
-    pub created_roles: Vec<(Uid, String)>,
-    pub dropped_roles: Vec<(Uid, String)>,
+    pub created_roles: Vec<(Uid, pbps_model::RoleName)>,
+    pub dropped_roles: Vec<(Uid, pbps_model::RoleName)>,
     /// `(uid, old name, new name)`
-    pub renamed_roles: Vec<(Uid, String, String)>,
+    pub renamed_roles: Vec<(Uid, pbps_model::RoleName, pbps_model::RoleName)>,
 }
 
 /// Resolves identities with every intent read as a **current decision**: a
@@ -589,7 +589,7 @@ struct Conflicting {
 pub fn intent_is_absorbed(intent: &Intent, ids: &IdsFile, source: RenameSource) -> bool {
     let has_column = |c: &ColumnRef| ids.column_uid(c).is_some();
     let has_table = |t: &TableName| ids.table_uid(t).is_some();
-    let has_role = |r: &str| ids.role_uid(r).is_some();
+    let has_role = |r: &pbps_model::RoleName| ids.role_uid(r).is_some();
     // A live source name stops being evidence of a pending rename once the
     // declarations ask for that name again: what holds it then is the new
     // object, not the one this rename is still waiting to move.
@@ -688,26 +688,26 @@ fn resolve_roles(
     blockers: &mut Vec<Blocker>,
     used: &mut BTreeSet<usize>,
 ) {
-    let declared_names: BTreeSet<&String> = declared.roles.keys().collect();
-    let known: BTreeMap<String, Uid> = r
+    let declared_names: BTreeSet<&pbps_model::RoleName> = declared.roles.keys().collect();
+    let known: BTreeMap<pbps_model::RoleName, Uid> = r
         .ids
         .roles
         .iter()
         .map(|(u, n)| (n.clone(), u.clone()))
         .collect();
 
-    let mut appeared: BTreeSet<String> = declared_names
+    let mut appeared: BTreeSet<pbps_model::RoleName> = declared_names
         .iter()
         .filter(|n| !known.contains_key(**n))
         .map(|n| (*n).clone())
         .collect();
-    let mut disappeared: BTreeSet<String> = known
+    let mut disappeared: BTreeSet<pbps_model::RoleName> = known
         .keys()
         .filter(|n| !declared_names.contains(n))
         .cloned()
         .collect();
 
-    let claims: Vec<Claim<'_, &String>> = intents
+    let claims: Vec<Claim<'_, &pbps_model::RoleName>> = intents
         .iter()
         .filter_map(|intent| {
             let Intent::RenameRole { from, to } = intent else {
@@ -720,7 +720,7 @@ fn resolve_roles(
             })
         })
         .collect();
-    let (rename_blockers, conflicting) = contested_rename_claims(&claims, |n| (*n).clone());
+    let (rename_blockers, conflicting) = contested_rename_claims(&claims, |n| n.raw().to_owned());
     blockers.extend(rename_blockers);
 
     // A target that is already known and still declared is not in `appeared`,
@@ -749,7 +749,9 @@ fn resolve_roles(
                 && !stale_annotation
                 && occupied_targets.insert(to.clone())
             {
-                blockers.push(Blocker::RenameTargetExists { target: to.clone() });
+                blockers.push(Blocker::RenameTargetExists {
+                    target: to.raw().to_owned(),
+                });
             }
             used.insert(i);
         }
@@ -785,7 +787,7 @@ fn resolve_roles(
             r.ids.tombstones.insert(
                 uid.clone(),
                 Tombstone {
-                    was: role.clone(),
+                    was: role.raw().to_owned(),
                     dropped_at: ctx.today.clone(),
                     reason: reason.to_string(),
                     operator: ctx.operator.clone(),
@@ -798,10 +800,10 @@ fn resolve_roles(
 
     // The conflict already accounts for these sources. Offering the losing
     // source again would make ambiguity candidates depend on intent order.
-    disappeared.retain(|role| !conflicting.sources.contains(role));
+    disappeared.retain(|role| !conflicting.sources.contains(role.raw()));
     let candidates: Vec<_> = appeared
         .iter()
-        .filter(|role| !conflicting.targets.contains(*role))
+        .filter(|role| !conflicting.targets.contains(role.raw()))
         .cloned()
         .collect();
     if !candidates.is_empty() && !disappeared.is_empty() {

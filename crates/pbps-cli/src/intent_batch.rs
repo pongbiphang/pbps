@@ -81,8 +81,8 @@ fn parse_pair(flag: &str, first: &str, second: &str) -> anyhow::Result<Intent> {
             to: second.parse()?,
         },
         "--rename-role" => Intent::RenameRole {
-            from: first.to_owned(),
-            to: second.to_owned(),
+            from: first.to_owned().into(),
+            to: second.to_owned().into(),
         },
         "--drop" => Intent::DropColumn {
             column: first.parse()?,
@@ -93,7 +93,7 @@ fn parse_pair(flag: &str, first: &str, second: &str) -> anyhow::Result<Intent> {
             reason: second.parse()?,
         },
         "--drop-role" => Intent::DropRole {
-            role: first.to_owned(),
+            role: first.to_owned().into(),
             reason: second.parse()?,
         },
         _ => unreachable!("only the six declared pair options reach this parser"),

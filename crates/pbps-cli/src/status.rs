@@ -1169,7 +1169,7 @@ mod tests {
             unmanaged_modules: Vec::new(),
             public_execute: Default::default(),
             owners: Default::default(),
-            session_role: String::new(),
+            session_role: String::new().into(),
             unrevocable: Vec::new(),
             database_collation: None,
         };

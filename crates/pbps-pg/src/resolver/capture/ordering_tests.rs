@@ -444,7 +444,7 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
         rows: BTreeMap::new(),
     });
     data_base.roles.insert(
-        worker.clone(),
+        worker.clone().into(),
         pbps_model::Role {
             description: None,
             grants: BTreeMap::from([(

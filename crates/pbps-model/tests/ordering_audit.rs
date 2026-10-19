@@ -253,7 +253,7 @@ mod effects_of_each_kind {
         ids.columns
             .insert(uid(UidKind::Column, "n.id"), tn("n").column("id"));
         ids.roles
-            .insert(uid(UidKind::Role, "reader"), "reader".to_owned());
+            .insert(uid(UidKind::Role, "reader"), "reader".to_owned().into());
         // The desired state: `x` takes another default, `y` is relaxed and
         // the check is gone, so the kinds that read what the plan takes away
         // have something to read.

@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 /// `principal` is the role or user the statement names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedGrant {
-    pub principal: String,
+    pub principal: pbps_model::RoleName,
     pub schema: String,
     pub privilege: String,
     pub revoke: bool,
@@ -47,7 +47,7 @@ fn pg_planned(planned: &[PlannedGrant]) -> Vec<pg_auth::PlannedGrant> {
     planned
         .iter()
         .map(|grant| pg_auth::PlannedGrant {
-            role: grant.principal.clone(),
+            role: grant.principal.raw().to_owned(),
             schema: grant.schema.clone(),
             privilege: grant.privilege.clone(),
             revoke: grant.revoke,
@@ -175,7 +175,8 @@ pub(crate) async fn read_target(
             let scope = pbps_mssql::resolver::environment::Scope { schemas };
             // The planned grants' principals are resolved to the catalog's
             // spelling within each bracketed read (#726).
-            let names: Vec<String> = planned.iter().map(|g| g.principal.clone()).collect();
+            let names: Vec<pbps_model::RoleName> =
+                planned.iter().map(|g| g.principal.clone()).collect();
             let (catalog, authorization) = pbps_mssql::resolver::scope_facts(
                 connection,
                 &scope,
@@ -490,7 +491,7 @@ impl Principals {
 
     /// The server-wide principals this run creates and must drop. SQL
     /// Server's are database-scoped and go with the scratch database.
-    pub(crate) fn server_wide_names(&self) -> Vec<String> {
+    pub(crate) fn server_wide_names(&self) -> Vec<pbps_model::RoleName> {
         match self {
             Self::Postgres(map) => map.run_local_names(),
             Self::Mssql(_) => Vec::new(),
@@ -503,7 +504,7 @@ impl Principals {
     pub(crate) fn deployer(
         &self,
         authorization: &Authorization,
-    ) -> Result<Option<String>, &'static str> {
+    ) -> Result<Option<pbps_model::RoleName>, &'static str> {
         match (self, authorization) {
             (Self::Postgres(map), Authorization::Postgres(context)) => map
                 .deployer(context)
@@ -561,12 +562,15 @@ pub(crate) async fn prepare(
 pub(crate) async fn enter(
     session: &mut impl QueryConnection,
     driver: Driver,
-    deployer: Option<&str>,
+    deployer: Option<&pbps_model::RoleName>,
 ) -> Result<(), DbError> {
     match (driver, deployer) {
         (_, None) => Ok(()),
         (Driver::Postgres, Some(deployer)) => session
-            .query(&format!("SET ROLE \"{}\"", deployer.replace('"', "\"\"")))
+            .query(&format!(
+                "SET ROLE \"{}\"",
+                deployer.raw().replace('"', "\"\"")
+            ))
             .await
             .map(|_| ()),
         (Driver::Mssql, Some(deployer)) => mssql_auth::enter(session, Some(deployer)).await,

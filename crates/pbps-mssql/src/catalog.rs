@@ -692,7 +692,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 
     for row in conn.query(ROLES).await? {
         raw.roles.push(crate::introspect::RawRole {
-            name: get::<&str>(&row, "name")?.to_owned(),
+            name: get::<&str>(&row, "name")?.to_owned().into(),
         });
     }
 
@@ -720,7 +720,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             _ => Securable::Unnamed,
         };
         raw.permissions.push(crate::introspect::RawPermission {
-            role: get::<&str>(&row, "role_name")?.to_owned(),
+            role: get::<&str>(&row, "role_name")?.to_owned().into(),
             class,
             class_desc: get::<&str>(&row, "class_desc")?.trim().to_owned(),
             permission: get::<&str>(&row, "permission_name")?.trim().to_owned(),
@@ -1291,13 +1291,16 @@ pub async fn prove_schemas_visible(conn: &mut Conn, schemas: &[String]) -> Resul
 /// cannot: `ALTER ANY ROLE` alone shows every role while `VIEW DEFINITION` on
 /// the database answers 0. A name that resolves to a user rather than a role
 /// is returned too: it is not absent, whatever it is.
-pub async fn held_principals(conn: &mut Conn, roles: &[String]) -> Result<Vec<String>, DbError> {
+pub async fn held_principals(
+    conn: &mut Conn,
+    roles: &[pbps_model::RoleName],
+) -> Result<Vec<pbps_model::RoleName>, DbError> {
     if roles.is_empty() {
         return Ok(Vec::new());
     }
     let rows = roles
         .iter()
-        .map(|r| format!("({})", crate::ident::literal(r)))
+        .map(|r| format!("({})", crate::ident::literal(r.raw())))
         .collect::<Vec<_>>()
         .join(", ");
     conn.query(&format!(
@@ -1306,7 +1309,7 @@ pub async fn held_principals(conn: &mut Conn, roles: &[String]) -> Result<Vec<St
     ))
     .await?
     .iter()
-    .map(|row| get::<&str>(row, "name").map(str::to_owned))
+    .map(|row| get::<&str>(row, "name").map(pbps_model::RoleName::from))
     .collect()
 }
 
@@ -1713,7 +1716,7 @@ SELECT r.name AS role_name, x.securable
 /// leaving users without access and the role still there.
 pub async fn role_owned_securables(
     conn: &mut Conn,
-) -> Result<BTreeMap<String, Vec<String>>, DbError> {
+) -> Result<BTreeMap<pbps_model::RoleName, Vec<String>>, DbError> {
     // The views that are not on every engine, asked about in one round trip:
     // `OBJECT_ID` is NULL for a view this version does not have.
     let optional: Vec<&str> = OWNABLE.iter().filter_map(|(since, _)| *since).collect();
@@ -1738,16 +1741,18 @@ pub async fn role_owned_securables(
         }
     }
     let query = owned_query(&|view| present.contains(&view));
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut out: BTreeMap<pbps_model::RoleName, Vec<String>> = BTreeMap::new();
     for row in conn.query(&query).await? {
-        out.entry(get::<&str>(&row, "role_name")?.to_owned())
+        out.entry(get::<&str>(&row, "role_name")?.into())
             .or_default()
             .push(get::<&str>(&row, "securable")?.to_owned());
     }
     Ok(out)
 }
 
-pub async fn role_members(conn: &mut Conn) -> Result<BTreeMap<String, Vec<String>>, DbError> {
+pub async fn role_members(
+    conn: &mut Conn,
+) -> Result<BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>>, DbError> {
     const MEMBERS: &str = "\
 SELECT r.name AS role_name, m.name AS member_name
   FROM sys.database_role_members rm
@@ -1755,11 +1760,11 @@ SELECT r.name AS role_name, m.name AS member_name
   JOIN sys.database_principals m ON m.principal_id = rm.member_principal_id
  WHERE r.type = 'R' AND r.is_fixed_role = 0 AND r.name <> 'public'
  ORDER BY r.name, m.name;";
-    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut out: BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>> = BTreeMap::new();
     for row in conn.query(MEMBERS).await? {
-        out.entry(get::<&str>(&row, "role_name")?.to_owned())
+        out.entry(get::<&str>(&row, "role_name")?.into())
             .or_default()
-            .push(get::<&str>(&row, "member_name")?.to_owned());
+            .push(get::<&str>(&row, "member_name")?.into());
     }
     Ok(out)
 }

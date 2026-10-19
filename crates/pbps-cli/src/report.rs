@@ -41,8 +41,14 @@ pub fn intent(i: &Intent) -> String {
             "drop column {column} (reason: {reason})",
             column = column.shown()
         ),
-        Intent::RenameRole { from, to } => format!("rename role {from} -> {to}"),
-        Intent::DropRole { role, reason } => format!("drop role {role} (reason: {reason})"),
+        Intent::RenameRole { from, to } => format!(
+            "rename role {from} -> {to}",
+            from = from.shown(),
+            to = to.shown(),
+        ),
+        Intent::DropRole { role, reason } => {
+            format!("drop role {role} (reason: {reason})", role = role.shown(),)
+        }
         Intent::MoveRows {
             table,
             max_rows,
@@ -136,7 +142,9 @@ fn supplied_flag(intent: &Intent) -> Option<String> {
             &to.raw().to_string(),
             "new table",
         ),
-        Intent::RenameRole { from, to } => pair_flag("--rename-role", from, to, "new role"),
+        Intent::RenameRole { from, to } => {
+            pair_flag("--rename-role", from.raw(), to.raw(), "new role")
+        }
         Intent::DropColumn { column, reason } => {
             pair_flag("--drop", &column.raw().to_string(), reason.as_ref(), "why")
         }
@@ -146,7 +154,9 @@ fn supplied_flag(intent: &Intent) -> Option<String> {
             reason.as_ref(),
             "why",
         ),
-        Intent::DropRole { role, reason } => pair_flag("--drop-role", role, reason.as_ref(), "why"),
+        Intent::DropRole { role, reason } => {
+            pair_flag("--drop-role", role.raw(), reason.as_ref(), "why")
+        }
         // MoveRows remains a separate command (SPEC §6.5); do not advertise an
         // option the identity batch does not accept.
         Intent::MoveRows { .. } => return None,
@@ -240,7 +250,12 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
             appeared,
         } => {
             for from in disappeared {
-                alternatives("--rename-role", "--drop-role", from, appeared.clone());
+                alternatives(
+                    "--rename-role",
+                    "--drop-role",
+                    from.raw(),
+                    appeared.iter().map(|name| name.raw().to_owned()).collect(),
+                );
             }
         }
         Blocker::DropColumnNeedsReason { column } => fixed.push(pair_flag(
@@ -256,7 +271,7 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
             "why",
         )),
         Blocker::DropRoleNeedsReason { role } => {
-            fixed.push(pair_flag("--drop-role", role, "<why>", "why"))
+            fixed.push(pair_flag("--drop-role", role.raw(), "<why>", "why"))
         }
         Blocker::ProvisionalTableIdentity { from, to, blocker } => {
             // A derived column choice is conditional on its table identity.
@@ -682,17 +697,22 @@ fn one_blocker(b: &Blocker) -> String {
         } => {
             let mut s = format!(
                 "  role {} disappeared, {} is new\n\n",
-                join(disappeared),
-                join(appeared)
+                join(disappeared.iter().map(pbps_model::RoleName::shown)),
+                join(appeared.iter().map(pbps_model::RoleName::shown))
             );
             for from in disappeared {
-                let source_arg = shell_arg(from).unwrap_or_else(|| placeholder("role"));
+                let source_arg = shell_arg(from.raw()).unwrap_or_else(|| placeholder("role"));
                 for to in appeared {
-                    let command = pair_flag("pbps rename-role", from, to, "new role");
-                    s.push_str(&format!("    if {from} was renamed to {to}:  {command}\n"));
+                    let command = pair_flag("pbps rename-role", from.raw(), to.raw(), "new role");
+                    s.push_str(&format!(
+                        "    if {from} was renamed to {to}:  {command}\n",
+                        from = from.shown(),
+                        to = to.shown(),
+                    ));
                 }
                 s.push_str(&format!(
-                    "    to drop {from}:                pbps drop-role {source_arg} --reason {why}\n"
+                    "    to drop {from}:                pbps drop-role {source_arg} --reason {why}\n",
+                    from = from.shown(),
                 ));
             }
             s
@@ -700,7 +720,8 @@ fn one_blocker(b: &Blocker) -> String {
         Blocker::DropRoleNeedsReason { role } => format!(
             "  role {role} disappeared from the declarations, but a drop must record why — \
              its members lose whatever it granted\n\n    pbps drop-role {argument} --reason {why}\n",
-            argument = shell_arg(role).unwrap_or_else(|| placeholder("role"))
+            argument = shell_arg(role.raw()).unwrap_or_else(|| placeholder("role")),
+            role = role.shown(),
         ),
         Blocker::UnusedIntent { intent: i } => {
             format!(
@@ -845,13 +866,13 @@ pub fn touched(names: &PlanNames<'_>) -> (usize, usize) {
 // Exhaustive rather than a wildcard, for the reason `Change::roles` gives: a
 // change added later that names a role has to be classified here, or the
 // summary stops counting it.
-fn role_of(change: &Change) -> Option<&str> {
+fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
     match change {
         Change::CreateRole { name, .. }
         | Change::DropRole { name, .. }
         | Change::Grant { role: name, .. }
-        | Change::Revoke { role: name, .. } => Some(name.as_str()),
-        Change::RenameRole { from, .. } => Some(from.as_str()),
+        | Change::Revoke { role: name, .. } => Some(name),
+        Change::RenameRole { from, .. } => Some(from),
         Change::CreateTable { .. }
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
@@ -1558,26 +1579,57 @@ pub fn describe(c: &Change) -> String {
         // Roles (ADR-0005). The permissions are spelled out: "grant on
         // dbo.customer" tells a reviewer nothing about how much wider access
         // just got.
-        Change::CreateRole { name, .. } => format!("+ create role {name}"),
+        Change::CreateRole { name, .. } => format!(
+            "+ create role {name}",
+            // Whole-message escaping remains until #2084 step 5.
+            name = name.raw(),
+        ),
         Change::DropRole { name, members, .. } if members.is_empty() => {
-            format!("- drop role {name}")
+            format!(
+                "- drop role {name}",
+                // Whole-message escaping remains until #2084 step 5.
+                name = name.raw(),
+            )
         }
         Change::DropRole { name, members, .. } => format!(
             "- drop role {name}, removing {} member(s) first: {}",
             members.len(),
-            members.join(", ")
+            members
+                .iter()
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                .map(pbps_model::RoleName::raw)
+                .collect::<Vec<_>>()
+                .join(", "),
+            // Whole-message escaping remains until #2084 step 5.
+            name = name.raw(),
         ),
-        Change::RenameRole { from, to, .. } => format!("~ rename role {from} -> {to}"),
+        Change::RenameRole { from, to, .. } => format!(
+            "~ rename role {from} -> {to}",
+            // Whole-message escaping remains until #2084 step 5.
+            from = from.raw(),
+            // Whole-message escaping remains until #2084 step 5.
+            to = to.raw(),
+        ),
         Change::Grant {
             target,
             permissions,
             ..
-        } => format!("+ grant {} on {target}", permissions_list(permissions)),
+        } => format!(
+            "+ grant {} on {target}",
+            permissions_list(permissions),
+            // Whole-message escaping remains until #2084 step 5.
+            target = target.raw(),
+        ),
         Change::Revoke {
             target,
             permissions,
             ..
-        } => format!("- revoke {} on {target}", permissions_list(permissions)),
+        } => format!(
+            "- revoke {} on {target}",
+            permissions_list(permissions),
+            // Whole-message escaping remains until #2084 step 5.
+            target = target.raw(),
+        ),
         Change::PublicExecution {
             routine,
             access: pbps_model::PublicAccess::Revoked,

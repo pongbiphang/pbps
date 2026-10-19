@@ -76,13 +76,13 @@ fn modules_section(s: &mut String, modules: &BTreeMap<ModuleId, Module>) {
 
 /// Database roles and what each is granted (ADR-0005). Membership is not
 /// here: it is each environment's own, and pbps never reads it.
-fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
+fn roles_section(s: &mut String, roles: &BTreeMap<pbps_model::RoleName, Role>) {
     if roles.is_empty() {
         return;
     }
     s.push_str("\n## Roles\n");
     for (name, role) in roles {
-        let _ = writeln!(s, "\n### `{name}`\n");
+        let _ = writeln!(s, "\n### `{name}`\n", name = name.raw());
         if let Some(d) = &role.description {
             let _ = writeln!(s, "{}\n", d.raw());
         }
@@ -94,7 +94,12 @@ fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
         s.push_str("| Granted on | Permissions |\n|---|---|\n");
         for (target, permissions) in grants {
             let list: Vec<&str> = permissions.iter().map(|p| p.as_str()).collect();
-            let _ = writeln!(s, "| `{target}` | {} |", list.join(", "));
+            let _ = writeln!(
+                s,
+                "| `{target}` | {} |",
+                list.join(", "),
+                target = target.raw()
+            );
         }
     }
 }

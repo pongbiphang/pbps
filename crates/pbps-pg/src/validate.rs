@@ -579,12 +579,12 @@ fn routine_kind(routine: &pbps_model::RoutineId, schema: &Schema) -> Option<Targ
 ///
 /// Returns one error per problem, all of them: a role with three unspellable
 /// grants should need one pass.
-pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
+pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<DialectError> {
     let mut errs = Vec::new();
-    if let Err(e) = quote(name) {
+    if let Err(e) = quote(name.raw()) {
         errs.push(e);
     }
-    if name == PUBLIC {
+    if name.raw() == PUBLIC {
         errs.push(invalid(format!(
             "`{PUBLIC}` is PostgreSQL's name for every principal in the cluster, not a role: \
              `CREATE ROLE \"{PUBLIC}\"` is refused as reserved, and a `GRANT ... TO \"{PUBLIC}\"` \
@@ -598,12 +598,14 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
     // (`manages_roles` is false), so the refusal is not about the `CREATE` —
     // it is that the sixteen `pg_*` roles are the cluster's predefined ones,
     // whose membership and grants are the DBA's and not this project's.
-    if name.starts_with("pg_") {
+    if name.raw().starts_with("pg_") {
         errs.push(invalid(format!(
             "`{name}` is in PostgreSQL's reserved `pg_` namespace, which holds the cluster's \
              predefined roles; the engine refuses `CREATE ROLE` on such a name, and what those \
              roles are granted is the cluster's business rather than this database's \
-             (ADR-0010 section 3)"
+             (ADR-0010 section 3)",
+            // Whole-message escaping remains until #2084 step 5.
+            name = name.raw(),
         )));
     }
 
@@ -655,7 +657,11 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                  engine reads as the current role's own schema wherever a `search_path` names \
                  it -- quoting does not make it literal. Every grant this dialect emits sets \
                  the path first, so no plan can carry this one. Grant in a schema the path \
-                 can name"
+                 can name",
+                // Whole-message escaping remains until #2084 step 5.
+                target = target.raw(),
+                // Whole-message escaping remains until #2084 step 5.
+                name = name.raw(),
             )));
             continue;
         }
@@ -665,7 +671,11 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                  own and not a project's: `pg_catalog`, `information_schema` and every `pg_` \
                  schema are left out of the pull, so a grant there reads back as absent and \
                  every plan would propose it again (DECISIONS 385). Grant in a schema this \
-                 project declares"
+                 project declares",
+                // Whole-message escaping remains until #2084 step 5.
+                target = target.raw(),
+                // Whole-message escaping remains until #2084 step 5.
+                name = name.raw(),
             )));
             continue;
         }
@@ -681,7 +691,11 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                 "role `{name}`: `{}` on `{target}` is not a permission PostgreSQL has; it is SQL \
                  Server's (ADR-0010 section 6), and this engine takes {}",
                 p.as_str(),
-                permission_words()
+                permission_words(),
+                // Whole-message escaping remains until #2084 step 5.
+                target = target.raw(),
+                // Whole-message escaping remains until #2084 step 5.
+                name = name.raw(),
             )));
         }
         let engine_words = || permissions.iter().copied().filter(|p| has_permission(*p));
@@ -713,6 +727,11 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                             .collect::<Vec<_>>()
                             .join(" and "),
                         p.as_str(),
+
+                        // Whole-message escaping remains until #2084 step 5.
+                        target = target.raw(),
+                        // Whole-message escaping remains until #2084 step 5.
+                        name = name.raw(),
                     )));
                 }
             }
@@ -727,7 +746,11 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                          role has no `usage` on -- PostgreSQL checks the schema before the object, \
                          so every permission here reaches nothing and the role's own query is \
                          `permission denied for schema {schema_of}` (ADR-0010 section 1, measured). Add \
-                         `schema::{schema_of}: [usage]` to this role"
+                         `schema::{schema_of}: [usage]` to this role",
+                        // Whole-message escaping remains until #2084 step 5.
+                        target = target.raw(),
+                        // Whole-message escaping remains until #2084 step 5.
+                        name = name.raw(),
                     )));
                 }
                 let kind = match target {
@@ -760,7 +783,11 @@ pub fn role(name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
                             .iter()
                             .map(|p| p.as_str())
                             .collect::<Vec<_>>()
-                            .join(", ")
+                            .join(", "),
+                        // Whole-message escaping remains until #2084 step 5.
+                        target = target.raw(),
+                        // Whole-message escaping remains until #2084 step 5.
+                        name = name.raw(),
                     )));
                 }
             }
@@ -827,7 +854,7 @@ mod tests {
     }
 
     fn role_errors(name: &str, role: &Role) -> Vec<DialectError> {
-        super::role(name, role, &declarations())
+        super::role(&pbps_model::RoleName::from(name), role, &declarations())
     }
 
     /// `baseline` removes a staged attach's temporary CHECK by its exact
@@ -1153,10 +1180,11 @@ mod tests {
             "public.pubt".parse().expect("a grant target parses"),
             [Permission::Select].into_iter().collect(),
         );
-        let problems: Vec<String> = super::role("app_reader", &role, &schema)
-            .into_iter()
-            .map(|e| e.to_string())
-            .collect();
+        let problems: Vec<String> =
+            super::role(&pbps_model::RoleName::from("app_reader"), &role, &schema)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect();
         assert!(problems.is_empty(), "{problems:?}");
         // And a schema that is not `public` still needs it.
         let mut role = Role::default();
@@ -1164,10 +1192,11 @@ mod tests {
             "app.customer".parse().expect("a grant target parses"),
             [Permission::Select].into_iter().collect(),
         );
-        let problems: Vec<String> = super::role("app_reader", &role, &schema)
-            .into_iter()
-            .map(|e| e.to_string())
-            .collect();
+        let problems: Vec<String> =
+            super::role(&pbps_model::RoleName::from("app_reader"), &role, &schema)
+                .into_iter()
+                .map(|e| e.to_string())
+                .collect();
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("`usage`"), "{}", problems[0]);
     }

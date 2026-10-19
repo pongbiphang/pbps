@@ -55,12 +55,12 @@ pub enum Intent {
     /// through `ALTER ROLE ... WITH NAME`, which is why this is intent and not
     /// drop plus add.
     RenameRole {
-        from: String,
-        to: String,
+        from: crate::RoleName,
+        to: crate::RoleName,
     },
     /// Drop a role. "Why was this access removed" is an auditor's question.
     DropRole {
-        role: String,
+        role: crate::RoleName,
         reason: Reason,
     },
     /// Allow the DEFAULT partition's rows inside a new range partition's

@@ -61,13 +61,13 @@ fn escape_reserved_stem(encoded: String) -> String {
 /// the top), so the two can no longer name one path. The loader reads
 /// every `.yml` under the schema directory and tells a role by its content,
 /// so a hand-written role file elsewhere still loads.
-pub fn role_path(dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
-    let readable = format!("{}.yml", escape_reserved_stem(component(name)));
+pub fn role_path(dir: &Path, name: &pbps_model::RoleName) -> anyhow::Result<PathBuf> {
+    let readable = format!("{}.yml", escape_reserved_stem(component(name.raw())));
     let file = if readable.len() <= 240 {
         readable
     } else {
         let mut hasher = Sha256::new();
-        hasher.update(name.as_bytes());
+        hasher.update(name.raw().as_bytes());
         hasher.update([0]);
         hasher.update(b"role");
         format!("~pbps-{:x}.yml", hasher.finalize())
@@ -193,7 +193,10 @@ pub fn paths_of(
         ));
     }
     for name in schema.roles.keys() {
-        out.push((format!("role {name}"), role_path(directory, name)?));
+        out.push((
+            format!("role {name}", name = name.shown(),),
+            role_path(directory, name)?,
+        ));
     }
     Ok(out)
 }
@@ -272,10 +275,10 @@ mod tests {
         }
         schema
             .roles
-            .insert("Reader".to_owned(), pbps_model::Role::default());
+            .insert("Reader".to_owned().into(), pbps_model::Role::default());
         schema
             .roles
-            .insert("reader".to_owned(), pbps_model::Role::default());
+            .insert("reader".to_owned().into(), pbps_model::Role::default());
 
         let paths = paths_of(dir, &schema).unwrap();
         let err = refuse_folded_paths(&paths).unwrap_err().to_string();
@@ -293,7 +296,7 @@ mod tests {
             .insert("dbo.reader".parse().unwrap(), pbps_model::Table::default());
         plain
             .roles
-            .insert("reader".to_owned(), pbps_model::Role::default());
+            .insert("reader".to_owned().into(), pbps_model::Role::default());
         refuse_folded_paths(&paths_of(dir, &plain).unwrap()).expect("no collision");
     }
 
@@ -302,13 +305,13 @@ mod tests {
     #[test]
     fn a_role_file_cannot_share_a_path_with_any_table_file() {
         let dir = Path::new("schema");
-        let role = role_path(dir, "app_reader").unwrap();
+        let role = role_path(dir, &pbps_model::RoleName::from("app_reader")).unwrap();
         assert_eq!(role, dir.join("roles").join("app_reader.yml"));
         let table = path(dir, &"app_reader.role".parse().unwrap(), None).unwrap();
         assert_ne!(role, table);
         assert_eq!(table, dir.join("app_reader.role.yml"));
         // A role named after a table's file still lands beside the roles.
-        let role = role_path(dir, "dbo.customer").unwrap();
+        let role = role_path(dir, &pbps_model::RoleName::from("dbo.customer")).unwrap();
         assert!(role.starts_with(dir.join("roles")), "{}", role.display());
     }
 

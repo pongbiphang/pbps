@@ -6057,15 +6057,16 @@ fn rank_of(order: &[ModuleId]) -> BTreeMap<ModuleId, usize> {
 /// number of drops regardless, so a catalog that somehow held a cycle costs
 /// a wrong order rather than a hang.
 #[allow(clippy::wildcard_enum_match_arm)]
-pub(crate) fn member_depth(planned: &[PlannedChange]) -> BTreeMap<String, usize> {
-    let dropped: BTreeMap<&str, &[String]> = planned
+pub(crate) fn member_depth(planned: &[PlannedChange]) -> BTreeMap<pbps_model::RoleName, usize> {
+    let dropped: BTreeMap<&pbps_model::RoleName, &[pbps_model::RoleName]> = planned
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropRole { name, members, .. } => Some((name.as_str(), members.as_slice())),
+            Change::DropRole { name, members, .. } => Some((name, members.as_slice())),
             _ => None,
         })
         .collect();
-    let mut depth: BTreeMap<String, usize> = dropped.keys().map(|n| ((*n).to_owned(), 0)).collect();
+    let mut depth: BTreeMap<pbps_model::RoleName, usize> =
+        dropped.keys().map(|n| ((*n).to_owned(), 0)).collect();
     for _ in 0..dropped.len() {
         let mut moved = false;
         for (holder, members) in &dropped {
@@ -6101,7 +6102,7 @@ fn dependency_rank(
     create_rank: &BTreeMap<ModuleId, usize>,
     drop_rank: &BTreeMap<ModuleId, usize>,
     data_rank: &BTreeMap<TableName, usize>,
-    role_rank: &BTreeMap<String, usize>,
+    role_rank: &BTreeMap<pbps_model::RoleName, usize>,
 ) -> isize {
     match change {
         Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => {
@@ -17474,7 +17475,7 @@ mod tests {
             r
         };
         let with_role = |mut s: Schema, r: Role| {
-            s.roles.insert("app_reader".to_owned(), r);
+            s.roles.insert("app_reader".to_owned().into(), r);
             s
         };
         let base = with_role(
@@ -17507,12 +17508,12 @@ mod tests {
                     target,
                     permissions,
                     ..
-                } => Some(format!("grant {target} {permissions:?}")),
+                } => Some(format!("grant {} {permissions:?}", target.raw())),
                 Change::Revoke {
                     target,
                     permissions,
                     ..
-                } => Some(format!("revoke {target} {permissions:?}")),
+                } => Some(format!("revoke {} {permissions:?}", target.raw())),
                 _ => None,
             })
             .collect();
@@ -21131,7 +21132,7 @@ mod tests {
             assert_eq!(changes.changes.len(), 2);
             assert!(
                 matches!(&changes.changes[1].change, Change::Grant { role, permissions, .. }
-                if role == "writer" && *permissions == BTreeSet::from([Permission::SerialSequences]))
+                if role.raw() == "writer" && *permissions == BTreeSet::from([Permission::SerialSequences]))
             );
             let unchanged = diff(
                 Side {
@@ -21217,8 +21218,9 @@ mod tests {
                 "dbo.customer.id".parse().unwrap(),
             );
             for (uid, name, role) in roles {
-                ids.roles.insert(uid.parse().unwrap(), (*name).to_owned());
-                s.roles.insert((*name).to_owned(), role.clone());
+                ids.roles
+                    .insert(uid.parse().unwrap(), (*name).to_owned().into());
+                s.roles.insert((*name).to_owned().into(), role.clone());
             }
             (s, ids)
         }
@@ -21426,9 +21428,23 @@ mod tests {
 
         fn describe(c: &Change) -> String {
             match c {
-                Change::CreateRole { name, .. } => format!("create {name}"),
-                Change::DropRole { name, .. } => format!("drop {name}"),
-                Change::RenameRole { from, to, .. } => format!("rename {from}->{to}"),
+                Change::CreateRole { name, .. } => format!(
+                    "create {name}",
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    name = name.raw(),
+                ),
+                Change::DropRole { name, .. } => format!(
+                    "drop {name}",
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    name = name.raw(),
+                ),
+                Change::RenameRole { from, to, .. } => format!(
+                    "rename {from}->{to}",
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    from = from.raw(),
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    to = to.raw(),
+                ),
                 Change::Grant {
                     role,
                     target,
@@ -21439,7 +21455,10 @@ mod tests {
                         .iter()
                         .map(|p| p.as_str())
                         .collect::<Vec<_>>()
-                        .join("+")
+                        .join("+"),
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    role = role.raw(),
+                    target = target.raw(),
                 ),
                 Change::Revoke {
                     role,
@@ -21451,7 +21470,10 @@ mod tests {
                         .iter()
                         .map(|p| p.as_str())
                         .collect::<Vec<_>>()
-                        .join("+")
+                        .join("+"),
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    role = role.raw(),
+                    target = target.raw(),
                 ),
                 other => format!("{:?}", std::mem::discriminant(other)),
             }
@@ -21682,7 +21704,7 @@ mod tests {
                 .changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::Revoke { target, .. } => Some(target.to_string()),
+                    Change::Revoke { target, .. } => Some(target.raw().to_string()),
                     _ => None,
                 })
                 .collect();
@@ -21908,8 +21930,8 @@ mod tests {
                     target,
                     permissions,
                 } => {
-                    assert_eq!(role, "app_reader");
-                    assert_eq!(target.to_string(), "app.v");
+                    assert_eq!(role.raw(), "app_reader");
+                    assert_eq!(target.raw().to_string(), "app.v");
                     assert_eq!(permissions, &[Permission::Select].into_iter().collect());
                 }
                 other => panic!("expected a grant, got {other:?}"),
@@ -22481,8 +22503,8 @@ mod tests {
         let drop = |name: &str, members: &[&str]| {
             PlannedChange::new(Change::DropRole {
                 uid: "r_aaaaaa".parse().unwrap(),
-                name: name.to_owned(),
-                members: members.iter().map(|m| (*m).to_owned()).collect(),
+                name: name.to_owned().into(),
+                members: members.iter().map(|m| (*m).into()).collect(),
             })
         };
         // `a` is a member of `z`, and `z` of `top`: the name tiebreaker alone
@@ -22512,8 +22534,8 @@ mod tests {
         let drop = |name: &str, members: &[&str]| {
             PlannedChange::new(Change::DropRole {
                 uid: "r_aaaaaa".parse().unwrap(),
-                name: name.to_owned(),
-                members: members.iter().map(|m| (*m).to_owned()).collect(),
+                name: name.to_owned().into(),
+                members: members.iter().map(|m| (*m).into()).collect(),
             })
         };
         let other = PlannedChange::new(Change::DropTable {
@@ -22542,7 +22564,7 @@ mod tests {
             .changes
             .iter()
             .map(|p| match &p.change {
-                Change::DropRole { name, .. } => name.clone(),
+                Change::DropRole { name, .. } => name.raw().to_owned(),
                 _ => "table".to_owned(),
             })
             .collect();

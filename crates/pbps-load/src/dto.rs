@@ -34,7 +34,7 @@ pub struct KindProbe {
     #[serde(default)]
     pub trigger: Option<String>,
     #[serde(default)]
-    pub role: Option<String>,
+    pub role: Option<pbps_model::RoleName>,
 }
 
 /// One database role and its grants (ADR-0005).
@@ -47,7 +47,7 @@ pub struct KindProbe {
 #[serde(deny_unknown_fields)]
 pub struct RoleDto {
     #[schemars(with = "String")]
-    pub role: Spanned<String>,
+    pub role: Spanned<pbps_model::RoleName>,
 
     #[serde(default)]
     pub description: Option<String>,
@@ -57,7 +57,7 @@ pub struct RoleDto {
     /// drop + add.
     #[serde(default)]
     #[schemars(with = "Option<String>")]
-    pub renamed_from: Option<Spanned<String>>,
+    pub renamed_from: Option<Spanned<pbps_model::RoleName>>,
 
     /// Target to permissions. Order carries no meaning; `fmt` sorts both.
     #[serde(default)]
@@ -473,7 +473,7 @@ pub enum PolicyPublicDto {
 #[serde(untagged)]
 pub enum PolicyRolesDto {
     Public(PolicyPublicDto),
-    Roles(#[schemars(schema_with = "policy_role_list_schema")] Vec<String>),
+    Roles(#[schemars(schema_with = "policy_role_list_schema")] Vec<pbps_model::RoleName>),
 }
 
 fn policy_role_list_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {

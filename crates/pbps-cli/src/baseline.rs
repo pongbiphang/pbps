@@ -423,7 +423,11 @@ pub fn changed_subjects(
     }
     for (uid, role) in before.roles.iter().chain(&now.roles) {
         if before.roles.get(uid) != now.roles.get(uid) {
-            out.insert(format!("role {role}"));
+            out.insert(format!(
+                "role {role}",
+                // Canonical grouping key; it remains raw after #2084 step 5.
+                role = role.raw(),
+            ));
         }
     }
     // The declarations themselves, matched through the uid so a rename does
@@ -447,7 +451,11 @@ pub fn changed_subjects(
             .and_then(|uid| before.roles.get(uid))
             .and_then(|old_name| before_schema.roles.get(old_name));
         if was != Some(role) {
-            out.insert(format!("role {name}"));
+            out.insert(format!(
+                "role {name}",
+                // Canonical grouping key; it remains raw after #2084 step 5.
+                name = name.raw(),
+            ));
         }
     }
     out
@@ -588,6 +596,43 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn role_subject_keys_keep_raw_identity_and_definition_changes_distinct() {
+        use super::*;
+        let raw = "role\nline\\path\u{202e}名前";
+        let shown = r"role\nline\\path\u{202e}名前";
+        let name = pbps_model::RoleName::from(raw);
+        let lookalike = pbps_model::RoleName::from(shown);
+        let before = IdsFile {
+            roles: [("r_aaaaaa".parse().unwrap(), name.clone())].into(),
+            ..Default::default()
+        };
+        let mut now = before.clone();
+        now.roles
+            .insert("r_aaaaaa".parse().unwrap(), lookalike.clone());
+        assert_eq!(
+            changed_subjects(&before, &now, &Default::default(), &Default::default()),
+            [format!("role {raw}"), format!("role {shown}")].into()
+        );
+        let schema = pbps_model::Schema {
+            roles: [
+                (name.clone(), Default::default()),
+                (lookalike, Default::default()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let mut both = before.clone();
+        both.roles.insert("r_bbbbbb".parse().unwrap(), shown.into());
+        let mut changed = schema.clone();
+        changed.roles.get_mut(&name).unwrap().description = Some("changed".into());
+        assert_eq!(
+            changed_subjects(&both, &both, &schema, &changed),
+            [format!("role {raw}")].into()
+        );
+        assert!(changed_subjects(&both, &both, &schema, &schema).is_empty());
+    }
     #[test]
     fn changed_subject_keys_keep_raw_table_and_column_ownership_names() {
         use super::*;

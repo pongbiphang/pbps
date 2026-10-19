@@ -273,7 +273,7 @@ pub struct Statement {
     /// reason: a staged checkpoint after `ALTER ROLE ... WITH NAME` has to
     /// find the role under its new name, or it records the environment
     /// without it and a resume cannot see what changed on it while paused.
-    pub role_renames: Vec<(String, String)>,
+    pub role_renames: Vec<(pbps_model::RoleName, pbps_model::RoleName)>,
 
     /// The objects this statement brings into being. A staged checkpoint
     /// scopes the environment by the identities the catalog had before the
@@ -353,7 +353,7 @@ pub struct IndexBuild {
 pub enum Created {
     Table(TableName),
     Column(TableName, pbps_model::ColumnName),
-    Role(String),
+    Role(pbps_model::RoleName),
 }
 
 /// An object a statement drops, freeing its name ([`Statement::releases`]).
@@ -414,7 +414,11 @@ impl Statement {
     }
 
     /// Records that this statement renames the role `from` to `to`.
-    pub fn renaming_role(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+    pub fn renaming_role(
+        mut self,
+        from: impl Into<pbps_model::RoleName>,
+        to: impl Into<pbps_model::RoleName>,
+    ) -> Self {
         self.role_renames.push((from.into(), to.into()));
         self
     }
@@ -2872,7 +2876,12 @@ pub trait Dialect {
     /// permissions apply to a table, a procedure or a function is the engine's
     /// rule, and a `GRANT` the engine refuses would fail an apply after the
     /// changes before it had run.
-    fn validate_role(&self, _name: &str, _role: &Role, _schema: &Schema) -> Vec<DialectError> {
+    fn validate_role(
+        &self,
+        _name: &pbps_model::RoleName,
+        _role: &Role,
+        _schema: &Schema,
+    ) -> Vec<DialectError> {
         Vec::new()
     }
 

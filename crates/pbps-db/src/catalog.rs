@@ -100,7 +100,7 @@ pub struct Pulled {
     /// statement forever and the apply's closing read refuses it (#261).
     ///
     /// Empty on an engine whose reader does not carry an owner.
-    pub owners: std::collections::BTreeMap<pbps_model::GrantTarget, String>,
+    pub owners: std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::RoleName>,
     /// The role this connection runs its statements as, and therefore the
     /// role that will own whatever the plan creates — measured on 18.6, a
     /// table created in somebody else's schema is owned by its creator, not
@@ -108,7 +108,7 @@ pub struct Pulled {
     /// tomorrow's owner, not the one in [`Pulled::owners`] (#261).
     ///
     /// Empty on an engine whose reader does not carry one.
-    pub session_role: String,
+    pub session_role: pbps_model::RoleName,
     /// Grants this connection can read and could not take away: an entry a
     /// third role granted, where no `REVOKE` this connection runs would
     /// carry that grantor (PostgreSQL; DECISIONS 483, 518).
@@ -133,7 +133,7 @@ pub struct Pulled {
 /// have to happen instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unrevocable {
-    pub role: String,
+    pub role: pbps_model::RoleName,
     pub target: pbps_model::GrantTarget,
     pub permission: pbps_model::Permission,
     pub why: String,
@@ -148,7 +148,7 @@ pub struct Unrevocable {
 /// reason is that it is that table's business (DECISIONS 176).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unexpressible {
-    pub role: String,
+    pub role: pbps_model::RoleName,
     /// The securable, where the permission names one a declaration could.
     /// `None` for a permission on the database itself and for a class the
     /// model cannot name at all — neither is any object's business, and a

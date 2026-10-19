@@ -187,10 +187,22 @@ fn roles_use_the_same_handoff_rules_in_a_separate_namespace() {
         ..IdsFile::default()
     };
     let names = PlanNames::of(&changes, &after).unwrap();
-    assert_eq!(names.role_holder("a", At::Before(0)), Holder::Tracked(&a));
-    assert_eq!(names.role_holder("a", At::After(0)), Holder::Vacant);
-    assert_eq!(names.role_holder("a", At::End), Holder::Tracked(&b));
-    assert_eq!(names.role_at(&b, At::Start), Some("b"));
+    assert_eq!(
+        names.role_holder(&crate::RoleName::from("a"), At::Before(0)),
+        Holder::Tracked(&a)
+    );
+    assert_eq!(
+        names.role_holder(&crate::RoleName::from("a"), At::After(0)),
+        Holder::Vacant
+    );
+    assert_eq!(
+        names.role_holder(&crate::RoleName::from("a"), At::End),
+        Holder::Tracked(&b)
+    );
+    assert_eq!(
+        names.role_at(&b, At::Start).map(crate::RoleName::raw),
+        Some("b")
+    );
     assert_eq!(names.holder(&t("a"), At::End), Holder::Unmanaged);
 }
 

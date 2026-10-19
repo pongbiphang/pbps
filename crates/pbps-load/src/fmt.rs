@@ -567,9 +567,13 @@ pub fn render_module(
 /// A pending `RenameRole` intent for this role is written back as
 /// `renamed_from:`, exactly as a table's is: the annotation survives `fmt`
 /// until the identity file has absorbed it.
-pub fn render_role(name: &str, role: &pbps_model::Role, pending: &[Intent]) -> String {
+pub fn render_role(
+    name: &pbps_model::RoleName,
+    role: &pbps_model::Role,
+    pending: &[Intent],
+) -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "role: {}", scalar(name));
+    let _ = writeln!(s, "role: {}", scalar(name.raw()));
     if let Some(d) = &role.description {
         let _ = writeln!(s, "description: {}", scalar(d.raw()));
     }
@@ -577,7 +581,7 @@ pub fn render_role(name: &str, role: &pbps_model::Role, pending: &[Intent]) -> S
         if let Intent::RenameRole { from, to } = i
             && to == name
         {
-            let _ = writeln!(s, "renamed_from: {}", scalar(from));
+            let _ = writeln!(s, "renamed_from: {}", scalar(from.raw()));
         }
     }
     let grants: Vec<_> = role.declarable_grants().collect();
@@ -585,7 +589,12 @@ pub fn render_role(name: &str, role: &pbps_model::Role, pending: &[Intent]) -> S
         s.push_str("\ngrants:\n");
         for (target, permissions) in grants {
             let names: Vec<String> = permissions.iter().map(|p| p.as_str().to_owned()).collect();
-            let _ = writeln!(s, "  {}: {}", scalar(&target.to_string()), seq(&names));
+            let _ = writeln!(
+                s,
+                "  {}: {}",
+                scalar(&target.raw().to_string()),
+                seq(&names)
+            );
         }
     }
     s
@@ -1352,7 +1361,7 @@ mod tests {
                 description: Some(s.as_str().into()),
                 ..Default::default()
             };
-            let out = render_role("reader", &role, &[]);
+            let out = render_role(&pbps_model::RoleName::from("reader"), &role, &[]);
             let back = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
             assert_eq!(back.role, role, "role description: {s:?}");
             assert_eq!(render_role(&back.name, &back.role, &back.intents), out);
@@ -1399,9 +1408,9 @@ mod tests {
             from: "old\rrole".into(),
             to: "role\nname".into(),
         }];
-        let out = render_role("role\nname", &role, &pending);
+        let out = render_role(&pbps_model::RoleName::from("role\nname"), &role, &pending);
         let back = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
-        assert_eq!(back.name, "role\nname");
+        assert_eq!(back.name, "role\nname".into());
         assert_eq!(back.intents, pending);
         assert_eq!(render_role(&back.name, &back.role, &back.intents), out);
     }
@@ -1434,17 +1443,21 @@ mod tests {
     #[test]
     fn a_role_name_keeps_the_whitespace_the_database_gave_it() {
         for name in [" app_pad ", "trail ", " lead"] {
-            let out = render_role(name, &pbps_model::Role::default(), &[]);
+            let out = render_role(
+                &pbps_model::RoleName::from(name),
+                &pbps_model::Role::default(),
+                &[],
+            );
             let back = crate::load_role_str(Path::new("r.yml"), &out)
                 .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
-            assert_eq!(back.name, name, "output:\n{out}");
+            assert_eq!(back.name, name.into(), "output:\n{out}");
         }
 
         // The rename intent names the *old* spelling, and it is the same kind
         // of name: trimmed, it would ask the database to rename a role that is
         // not there.
         let out = render_role(
-            "kept",
+            &pbps_model::RoleName::from("kept"),
             &pbps_model::Role::default(),
             &[pbps_model::Intent::RenameRole {
                 from: " was ".into(),
@@ -1463,7 +1476,11 @@ mod tests {
         );
 
         // A name that is nothing but whitespace is still no name.
-        let out = render_role("   ", &pbps_model::Role::default(), &[]);
+        let out = render_role(
+            &pbps_model::RoleName::from("   "),
+            &pbps_model::Role::default(),
+            &[],
+        );
         assert!(
             crate::load_role_str(Path::new("r.yml"), &out).is_err(),
             "output:\n{out}"
@@ -1492,7 +1509,7 @@ mod tests {
             .into(),
             ..Role::default()
         };
-        let out = render_role("writer", &role, &[]);
+        let out = render_role(&pbps_model::RoleName::from("writer"), &role, &[]);
         assert!(!out.contains("serial-sequences"), "{out}");
         assert!(!out.contains("hidden"), "{out}");
         let loaded = crate::load_role_str(Path::new("r.yml"), &out).unwrap();
@@ -1512,7 +1529,10 @@ mod tests {
             .into(),
             ..Role::default()
         };
-        assert_eq!(render_role("writer", &only, &[]), "role: writer\n");
+        assert_eq!(
+            render_role(&pbps_model::RoleName::from("writer"), &only, &[]),
+            "role: writer\n"
+        );
         assert!(
             crate::load_role_str(
                 Path::new("r.yml"),
@@ -1536,7 +1556,7 @@ mod tests {
             one(pbps_model::Permission::Insert),
         );
 
-        let out = render_role("r", &role, &[]);
+        let out = render_role(&pbps_model::RoleName::from("r"), &role, &[]);
         let back = crate::load_role_str(Path::new("r.yml"), &out)
             .unwrap_or_else(|e| panic!("the rendered file failed to load: {e:?}\n{out}"));
         assert_eq!(back.role.grants, role.grants, "output:\n{out}");

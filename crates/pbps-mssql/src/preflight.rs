@@ -1934,12 +1934,14 @@ fn stored_columns(
 
 /// A schema a permission names, which has to be there before the statement
 /// runs: one, if it is not.
-fn schema_probe(role: &str, schema: &str) -> Probe {
+fn schema_probe(role: &pbps_model::RoleName, schema: &str) -> Probe {
     Probe::new(
         format!(
             "`{schema}`, the schema this plan grants `{role}` permissions on, is not a schema \
              this database has by that spelling — create it, or write the target the way the \
-             database spells it"
+             database spells it",
+            // Probe descriptions are escaped whole until #2084 step 5.
+            role = role.raw(),
         ),
         // Two failures, one count. Absent is the obvious one; spelt otherwise
         // is the one a case-insensitive database hides, where the GRANT

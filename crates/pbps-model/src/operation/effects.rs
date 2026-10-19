@@ -181,7 +181,7 @@ impl<'a> Cx<'a> {
             .map(|uid| ColumnKey::Recorded(Recorded(uid)))
     }
 
-    fn role(&self, name: &str) -> Result<Recorded, OwnerError> {
+    fn role(&self, name: &crate::RoleName) -> Result<Recorded, OwnerError> {
         self.owners.role(name, self.spelling).map(Recorded)
     }
 
@@ -1027,7 +1027,7 @@ impl Cx<'_> {
 
     fn permission(
         &mut self,
-        role: &str,
+        role: &crate::RoleName,
         target: &GrantTarget,
         gives: bool,
     ) -> Result<(), OwnerError> {

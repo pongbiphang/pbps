@@ -133,13 +133,13 @@ fn modules_section(s: &mut String, modules: &BTreeMap<ModuleId, Module>) {
 
 /// Roles share a name namespace with neither tables nor modules, so their
 /// headings carry no document id that could collide with those objects.
-fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
+fn roles_section(s: &mut String, roles: &BTreeMap<pbps_model::RoleName, Role>) {
     if roles.is_empty() {
         return;
     }
     s.push_str("<h2>Roles</h2>\n");
     for (name, role) in roles {
-        let _ = writeln!(s, "<h3>{}</h3>", code(name));
+        let _ = writeln!(s, "<h3>{}</h3>", code(name.raw()));
         if let Some(description) = &role.description {
             let _ = writeln!(s, "<p>{}</p>", esc(description.raw()));
         }
@@ -154,7 +154,7 @@ fn roles_section(s: &mut String, roles: &BTreeMap<String, Role>) {
             let _ = writeln!(
                 s,
                 "<tr><td>{}</td><td>{}</td></tr>",
-                code(&target.to_string()),
+                code(&target.raw().to_string()),
                 esc(&list.join(", "))
             );
         }

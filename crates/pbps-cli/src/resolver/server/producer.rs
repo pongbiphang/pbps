@@ -497,7 +497,7 @@ mod remap_tests {
             PlannedChange::new(Change::DropRole {
                 uid: uid.clone(),
                 name: name.into(),
-                members: members.iter().map(|&m| m.to_owned()).collect(),
+                members: members.iter().map(|&m| m.into()).collect(),
             })
         };
         let a = role("a");

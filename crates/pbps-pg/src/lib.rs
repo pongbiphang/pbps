@@ -1267,7 +1267,7 @@ impl Dialect for Postgres {
                 }
                 if let pbps_model::PolicyRoles::Roles(roles) = &policy.to {
                     for role in roles {
-                        if let Err(error) = self.quote_ident(role) {
+                        if let Err(error) = self.quote_ident(role.raw()) {
                             found.push(error);
                         }
                     }
@@ -2044,7 +2044,12 @@ impl Dialect for Postgres {
 
     /// Every problem with a role, before anything connects (ADR-0010 §1, §2
     /// and §6). See [`validate::role`].
-    fn validate_role(&self, name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
+    fn validate_role(
+        &self,
+        name: &pbps_model::RoleName,
+        role: &Role,
+        schema: &Schema,
+    ) -> Vec<DialectError> {
         validate::role(name, role, schema)
     }
 
@@ -4622,17 +4627,17 @@ mod tests {
         for change in [
             Change::CreateRole {
                 uid: uid.clone(),
-                name: "analyst".to_owned(),
+                name: "analyst".to_owned().into(),
             },
             Change::DropRole {
                 uid: uid.clone(),
-                name: "analyst".to_owned(),
+                name: "analyst".to_owned().into(),
                 members: Vec::new(),
             },
             Change::RenameRole {
                 uid,
-                from: "analyst".to_owned(),
-                to: "reader".to_owned(),
+                from: "analyst".to_owned().into(),
+                to: "reader".to_owned().into(),
             },
         ] {
             pg.emit(&change, Strategy::default())

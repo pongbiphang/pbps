@@ -40,7 +40,7 @@ fn constraints(drops: &ChangeSet) -> Schedule {
         let Change::DropRole { name, .. } = &p.change else {
             unreachable!("the projection contains only role drops");
         };
-        by_name.insert(name.as_str(), i);
+        by_name.insert(name, i);
         levels.entry(depth[name]).or_default().push(i);
     }
     for (i, p) in drops.changes.iter().enumerate() {
@@ -48,7 +48,7 @@ fn constraints(drops: &ChangeSet) -> Schedule {
             unreachable!("the projection contains only role drops");
         };
         for member in members {
-            if let Some(&j) = by_name.get(member.as_str()) {
+            if let Some(&j) = by_name.get(member) {
                 schedule.edge(i, j, Source::Catalog, OrderReason::Authorization);
             }
         }

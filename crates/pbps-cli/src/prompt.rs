@@ -53,7 +53,7 @@ pub enum ChoiceKind {
     /// the answer everybody accepts.
     DropColumn(ColumnRef),
     DropTable(TableName),
-    DropRole(String),
+    DropRole(pbps_model::RoleName),
 }
 
 /// The candidates for one blocker, best first.
@@ -167,18 +167,22 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
             disappeared,
             appeared,
         } => {
-            let mut pairs: Vec<(&String, &String)> = disappeared
+            let mut pairs: Vec<(&pbps_model::RoleName, &pbps_model::RoleName)> = disappeared
                 .iter()
                 .flat_map(|from| appeared.iter().map(move |to| (from, to)))
                 .collect();
             pairs.sort_by(|a, b| {
-                similarity(b.0, b.1)
-                    .total_cmp(&similarity(a.0, a.1))
+                similarity(b.0.raw(), b.1.raw())
+                    .total_cmp(&similarity(a.0.raw(), a.1.raw()))
                     .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
             });
             for (from, to) in pairs {
                 out.push(Choice {
-                    label: format!("role {from} was renamed to {to}"),
+                    label: format!(
+                        "role {from} was renamed to {to}",
+                        from = from.shown(),
+                        to = to.shown(),
+                    ),
                     kind: ChoiceKind::Rename(Intent::RenameRole {
                         from: from.clone(),
                         to: to.clone(),
@@ -187,13 +191,19 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
             }
             for from in disappeared {
                 out.push(Choice {
-                    label: format!("role {from} was dropped (you will be asked why)"),
+                    label: format!(
+                        "role {from} was dropped (you will be asked why)",
+                        from = from.shown(),
+                    ),
                     kind: ChoiceKind::DropRole(from.clone()),
                 });
             }
         }
         Blocker::DropRoleNeedsReason { role } => out.push(Choice {
-            label: format!("role {role} was dropped (you will be asked why)"),
+            label: format!(
+                "role {role} was dropped (you will be asked why)",
+                role = role.shown(),
+            ),
             kind: ChoiceKind::DropRole(role.clone()),
         }),
         // A stale or misspelled annotation. There is nothing to choose: the
@@ -306,7 +316,7 @@ pub fn ask_from<R: std::io::BufRead>(blockers: &[Blocker], reader: R) -> Option<
             },
             ChoiceKind::DropRole(role) => Intent::DropRole {
                 role: role.clone(),
-                reason: reason(&mut lines, &format!("role {role}"))?,
+                reason: reason(&mut lines, &format!("role {role}", role = role.shown(),))?,
             },
         });
     }
@@ -380,11 +390,14 @@ fn question(b: &Blocker) -> String {
             appeared,
         } => format!(
             "role {} disappeared, {} is new",
-            list(disappeared),
-            list(appeared)
+            list(disappeared.iter().map(pbps_model::RoleName::shown)),
+            list(appeared.iter().map(pbps_model::RoleName::shown))
         ),
         Blocker::DropRoleNeedsReason { role } => {
-            format!("role {role} disappeared from the declarations")
+            format!(
+                "role {role} disappeared from the declarations",
+                role = role.shown(),
+            )
         }
         Blocker::UnusedIntent { intent } => format!("{intent:?}"),
         Blocker::ConflictingRenameIntents { name, intents, .. } => {

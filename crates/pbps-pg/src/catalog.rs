@@ -1264,7 +1264,9 @@ fn policy_roles(row: &serde_json::Value) -> Result<pbps_model::PolicyRoles, DbEr
             if oid.as_u64().is_none_or(|oid| oid == 0) {
                 return Err(bad());
             }
-            name.as_str().map(str::to_owned).ok_or_else(bad)
+            name.as_str()
+                .map(pbps_model::RoleName::from)
+                .ok_or_else(bad)
         })
         .collect::<Result<_, _>>()?;
     Ok(pbps_model::PolicyRoles::Roles(roles))
@@ -1602,7 +1604,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
     }
     for row in batch.get("roles").ok_or_else(|| missing("roles"))? {
         raw.roles.push(RawRole {
-            name: text(row, "name")?,
+            name: text(row, "name")?.into(),
             superuser: flag(row, "superuser")?,
         });
     }
@@ -1616,14 +1618,15 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             .first()
             .ok_or_else(|| DbError::BadRow("catalog batch part session is empty".to_owned()))?,
         "role",
-    )?;
+    )?
+    .into();
     for row in batch.get("owners").ok_or_else(|| missing("owners"))? {
         raw.owners.push(RawOwner {
             schema: text(row, "schema_name")?,
             object: optional_text(row, "object_name")?,
             kind: granted_kind(&text(row, "source")?, &text(row, "kind")?),
             routine_oid: row.integer("routine_oid")?,
-            owner: text(row, "owner")?,
+            owner: text(row, "owner")?.into(),
         });
     }
     for row in batch.get("grants").ok_or_else(|| missing("grants"))? {
@@ -1632,7 +1635,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             // letting `pg_get_userbyid(0)` render its own `unknown (OID=0)`:
             // that string is a name a role could in principle have, and this
             // one distinction must not be a string comparison.
-            grantee: optional_text(row, "grantee")?,
+            grantee: optional_text(row, "grantee")?.map(Into::into),
             schema: text(row, "schema_name")?,
             object: optional_text(row, "object_name")?,
             kind: granted_kind(&text(row, "source")?, &text(row, "kind")?),
@@ -1641,8 +1644,8 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
             grantable: flag(row, "is_grantable")?,
             column: optional_text(row, "column_name")?,
             defaulted: flag(row, "defaulted")?,
-            owner: text(row, "owner")?,
-            grantor: text(row, "grantor")?,
+            owner: text(row, "owner")?.into(),
+            grantor: text(row, "grantor")?.into(),
             revocable: flag(row, "revocable")?,
         });
     }
@@ -1671,12 +1674,12 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         .ok_or_else(|| missing("other_acls"))?
     {
         raw.other_grants.push(RawOtherGrant {
-            grantee: optional_text(row, "grantee")?,
+            grantee: optional_text(row, "grantee")?.map(Into::into),
             class: text(row, "class")?,
             name: text(row, "name")?,
             permission: text(row, "privilege_type")?,
             grantable: flag(row, "is_grantable")?,
-            owner: optional_text(row, "owner")?,
+            owner: optional_text(row, "owner")?.map(Into::into),
             defaulted: flag(row, "defaulted")?,
         });
     }
@@ -1685,7 +1688,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         .ok_or_else(|| missing("held_elsewhere"))?
     {
         raw.held_elsewhere.push(RawSharedDependency {
-            role: text(row, "role_name")?,
+            role: text(row, "role_name")?.into(),
             database: optional_text(row, "in_database")?,
             deptype: first_char(&text(row, "deptype")?).unwrap_or('?'),
             objects: number(row, "objects")?,
@@ -1696,7 +1699,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         .ok_or_else(|| missing("default_acls"))?
     {
         raw.default_acls.push(RawDefaultAcl {
-            grantor: text(row, "grantor")?,
+            grantor: text(row, "grantor")?.into(),
             in_schema: optional_text(row, "in_schema")?,
             objtype: first_char(&text(row, "objtype")?).unwrap_or('?'),
             acl: text(row, "acl")?,
@@ -4460,13 +4463,13 @@ mod tests {
         assert_eq!(policy("upd").with_check, None);
         assert_eq!(
             policy("upd").to,
-            pbps_model::PolicyRoles::Roles([role.clone()].into())
+            pbps_model::PolicyRoles::Roles([role.clone().into()].into())
         );
         assert!(policy("equal").restrictive);
         assert_eq!(policy("equal").using, policy("equal").with_check);
         assert_eq!(
             policy("equal").to,
-            pbps_model::PolicyRoles::Roles(["PUBLIC".into(), role.clone()].into())
+            pbps_model::PolicyRoles::Roles(["PUBLIC".into(), role.clone().into()].into())
         );
         for (name, enabled, forced) in [
             ("disabled", false, false),
@@ -4743,7 +4746,10 @@ mod tests {
     #[test]
     fn the_connections_own_role_cannot_be_read_as_absent() {
         let mut batch = empty_catalog_batch();
-        assert_eq!(decode_batch(&batch).unwrap().0.session_role, "deploy");
+        assert_eq!(
+            decode_batch(&batch).unwrap().0.session_role,
+            "deploy".into()
+        );
         batch.insert("session".to_owned(), Vec::new());
         assert!(decode_batch(&batch).is_err(), "an empty part");
         batch.insert("session".to_owned(), vec![serde_json::json!({})]);

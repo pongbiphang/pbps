@@ -6,15 +6,16 @@ use pbps_model::{Change, ChangeSet, PlannedChange};
 use std::collections::BTreeMap;
 
 #[allow(clippy::wildcard_enum_match_arm)]
-fn member_depth(planned: &[PlannedChange]) -> BTreeMap<String, usize> {
-    let dropped: BTreeMap<&str, &[String]> = planned
+fn member_depth(planned: &[PlannedChange]) -> BTreeMap<pbps_model::RoleName, usize> {
+    let dropped: BTreeMap<&pbps_model::RoleName, &[pbps_model::RoleName]> = planned
         .iter()
         .filter_map(|p| match &p.change {
-            Change::DropRole { name, members, .. } => Some((name.as_str(), members.as_slice())),
+            Change::DropRole { name, members, .. } => Some((name, members.as_slice())),
             _ => None,
         })
         .collect();
-    let mut depth: BTreeMap<String, usize> = dropped.keys().map(|n| ((*n).to_owned(), 0)).collect();
+    let mut depth: BTreeMap<pbps_model::RoleName, usize> =
+        dropped.keys().map(|n| ((*n).to_owned(), 0)).collect();
     for _ in 0..dropped.len() {
         let mut moved = false;
         for (holder, members) in &dropped {

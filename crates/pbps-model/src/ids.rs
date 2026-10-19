@@ -81,7 +81,7 @@ pub struct IdsFile {
     /// Database roles (ADR-0005), `r_`-prefixed. A compatible evolution under
     /// the same version: a file without the section has no managed roles.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub roles: BTreeMap<Uid, String>,
+    pub roles: BTreeMap<Uid, crate::RoleName>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tombstones: BTreeMap<Uid, Tombstone>,
@@ -184,7 +184,8 @@ impl IdsFile {
             if !schema.roles.contains_key(name) {
                 return Err(IdsError::NotHeld {
                     uid: uid.clone(),
-                    name: name.clone(),
+                    // Raw error payload; IdsError escapes it whole until #2084 step 5.
+                    name: name.raw().to_owned(),
                 });
             }
         }
@@ -216,7 +217,7 @@ impl IdsFile {
     /// there, so a role dropped by hand and kept here is never created again
     /// (#1606).
     #[must_use]
-    pub fn without_roles(&self, roles: &[String]) -> Self {
+    pub fn without_roles(&self, roles: &[crate::RoleName]) -> Self {
         let mut kept = self.clone();
         kept.roles.retain(|_, name| !roles.contains(name));
         kept
@@ -232,7 +233,7 @@ impl IdsFile {
         self.columns.iter().find(|(_, n)| *n == r).map(|(u, _)| u)
     }
 
-    pub fn role_uid(&self, name: &str) -> Option<&Uid> {
+    pub fn role_uid(&self, name: &crate::RoleName) -> Option<&Uid> {
         self.roles.iter().find(|(_, n)| *n == name).map(|(u, _)| u)
     }
 
@@ -274,7 +275,7 @@ impl IdsFile {
     /// Moves a role to a new name, keeping its uid — the same operation as
     /// [`Self::rename_table`], for the same reason, and the same no-op when
     /// nothing is called `from`.
-    pub fn rename_role(&mut self, from: &str, to: &str) {
+    pub fn rename_role(&mut self, from: &crate::RoleName, to: &crate::RoleName) {
         let Some(uid) = self.role_uid(from).cloned() else {
             return;
         };
@@ -350,7 +351,8 @@ impl IdsFile {
 
         check_unique(self.tables.iter().map(|(u, n)| (u, n.raw().to_string())))?;
         check_unique(self.columns.iter().map(|(u, n)| (u, n.raw().to_string())))?;
-        check_unique(self.roles.iter().map(|(u, n)| (u, n.clone())))?;
+        // Duplicate keys also feed IdsError, escaped whole until #2084 step 5.
+        check_unique(self.roles.iter().map(|(u, n)| (u, n.raw().to_owned())))?;
 
         // A live column whose table has no entry cannot be produced by the tool:
         // a table rename moves its columns and a table drop tombstones them. So it
@@ -413,7 +415,7 @@ impl<'a> IdsIndex<'a> {
         }
         let mut roles = BTreeMap::new();
         for (uid, name) in &ids.roles {
-            roles.entry(name.as_str()).or_insert(uid);
+            roles.entry(name.raw()).or_insert(uid);
         }
         Self {
             tables,
@@ -434,8 +436,8 @@ impl<'a> IdsIndex<'a> {
     }
 
     /// [`IdsFile::role_uid`], by lookup.
-    pub fn role_uid(&self, name: &str) -> Option<&'a Uid> {
-        self.roles.get(name).copied()
+    pub fn role_uid(&self, name: &crate::RoleName) -> Option<&'a Uid> {
+        self.roles.get(name.raw()).copied()
     }
 
     /// [`IdsFile::resolved_in`], by lookup.
@@ -652,18 +654,21 @@ mod tests {
         let mut f = sample();
         f.roles.insert(uid("r_h5t3pk"), "reader".into());
         f.roles.insert(uid("r_w8n2cd"), "writer".into());
-        let held = f.without_roles(&["reader".to_owned()]);
-        assert!(held.role_uid("reader").is_none());
+        let held = f.without_roles(&[("reader".to_owned()).into()]);
+        assert!(held.role_uid(&crate::RoleName::from("reader")).is_none());
         // Negative: what the database holds keeps its uid, and the tables
         // are not touched by a role going.
-        assert_eq!(held.role_uid("writer"), Some(&uid("r_w8n2cd")));
+        assert_eq!(
+            held.role_uid(&crate::RoleName::from("writer")),
+            Some(&uid("r_w8n2cd"))
+        );
         assert_eq!(held.tables, f.tables);
         assert_eq!(held.columns, f.columns);
         assert_eq!(held.tombstones, f.tombstones);
         held.validate().unwrap();
         // A name the file does not hold removes nothing, and nothing missing
         // removes nothing.
-        assert_eq!(f.without_roles(&["Reader".to_owned()]), f);
+        assert_eq!(f.without_roles(&[("Reader".to_owned()).into()]), f);
         assert_eq!(f.without_roles(&[]), f);
     }
 
@@ -711,15 +716,28 @@ mod tests {
     #[test]
     fn renaming_a_role_keeps_its_uid_and_is_idempotent() {
         let mut f = sample();
-        f.roles.insert(uid("r_q8m2kd"), "reader".to_owned());
-        f.rename_role("reader", "app_reader");
-        assert_eq!(f.roles[&uid("r_q8m2kd")], "app_reader");
-        assert_eq!(f.role_uid("app_reader"), Some(&uid("r_q8m2kd")));
+        f.roles
+            .insert(uid("r_q8m2kd"), ("reader".to_owned()).into());
+        f.rename_role(
+            &crate::RoleName::from("reader"),
+            &crate::RoleName::from("app_reader"),
+        );
+        assert_eq!(f.roles[&uid("r_q8m2kd")], ("app_reader").into());
+        assert_eq!(
+            f.role_uid(&crate::RoleName::from("app_reader")),
+            Some(&uid("r_q8m2kd"))
+        );
         let before = f.clone();
-        f.rename_role("reader", "app_reader");
+        f.rename_role(
+            &crate::RoleName::from("reader"),
+            &crate::RoleName::from("app_reader"),
+        );
         assert_eq!(f, before);
         // A name nobody has is a no-op, not a new role.
-        f.rename_role("ghost", "phantom");
+        f.rename_role(
+            &crate::RoleName::from("ghost"),
+            &crate::RoleName::from("phantom"),
+        );
         assert_eq!(f, before);
     }
 
@@ -892,8 +910,11 @@ mod tests {
         let mut f = sample();
         f.roles.insert(uid("r_aaaaaa"), "app_reader".into());
         f.validate().unwrap();
-        assert_eq!(f.role_uid("app_reader"), Some(&uid("r_aaaaaa")));
-        assert_eq!(f.role_uid("nobody"), None);
+        assert_eq!(
+            f.role_uid(&crate::RoleName::from("app_reader")),
+            Some(&uid("r_aaaaaa"))
+        );
+        assert_eq!(f.role_uid(&crate::RoleName::from("nobody")), None);
         let json = serde_json::to_string(&f).unwrap();
         assert!(json.contains("\"roles\""), "{json}");
         let back: IdsFile = serde_json::from_str(&json).unwrap();
@@ -1011,7 +1032,11 @@ mod tests {
                 }
             }
             for r in roles.iter().chain(&["absent"]) {
-                assert_eq!(index.role_uid(r), f.role_uid(r), "round {round}: {r}");
+                assert_eq!(
+                    index.role_uid(&crate::RoleName::from(*(r))),
+                    f.role_uid(&crate::RoleName::from(*(r))),
+                    "round {round}: {r}"
+                );
             }
             let absent: TableName = "z.absent".parse().unwrap();
             assert_eq!(index.table_uid(&absent), None);

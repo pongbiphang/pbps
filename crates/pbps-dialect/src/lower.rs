@@ -109,7 +109,7 @@ impl Lowered {
     }
 
     /// The same for a role ([`Statement::role_renames`]).
-    pub fn intermediate_roles(&self) -> Vec<&String> {
+    pub fn intermediate_roles(&self) -> Vec<&pbps_model::RoleName> {
         intermediate(self.statements.iter().map(|s| s.role_renames.as_slice()))
     }
 
@@ -275,7 +275,10 @@ mod tests {
             ModuleEdits::InPlace,
         );
         let role = lower_all(&role, &Parking).unwrap();
-        assert_eq!(role[0].intermediate_roles(), [&"parked".to_owned()]);
+        assert_eq!(
+            role[0].intermediate_roles(),
+            [&pbps_model::RoleName::from("parked")]
+        );
     }
 
     #[test]

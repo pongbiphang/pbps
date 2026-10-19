@@ -417,7 +417,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // Roles (ADR-0005). `ALTER ROLE ... WITH NAME` keeps the membership,
         // which is the reason a role rename is intent rather than drop + add.
         Change::CreateRole { name, .. } => Ok(vec![
-            Statement::new(format!("CREATE ROLE {};", quote(name)?))
+            Statement::new(format!("CREATE ROLE {};", quote(name.raw())?))
                 .creating(Created::Role(name.clone())),
         ]),
         // The members go first, each in a statement of its own, and the role
@@ -428,11 +428,11 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             for member in members {
                 out.push(Statement::new(format!(
                     "ALTER ROLE {} DROP MEMBER {};",
-                    quote(name)?,
-                    quote(member)?
+                    quote(name.raw())?,
+                    quote(member.raw())?
                 )));
             }
-            out.push(Statement::new(format!("DROP ROLE {};", quote(name)?)));
+            out.push(Statement::new(format!("DROP ROLE {};", quote(name.raw())?)));
             Ok(out)
         }
         // The statement says what it does to the name (`Statement::renaming_role`),
@@ -440,8 +440,8 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         Change::RenameRole { from, to, .. } => Ok(vec![
             Statement::new(format!(
                 "ALTER ROLE {} WITH NAME = {};",
-                quote(from)?,
-                quote(to)?
+                quote(from.raw())?,
+                quote(to.raw())?
             ))
             .renaming_role(from.clone(), to.clone()),
         ]),
@@ -453,7 +453,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             "GRANT {} ON {} TO {};",
             permission_list(permissions)?,
             securable(target)?,
-            quote(role)?
+            quote(role.raw())?
         )),
         Change::Revoke {
             role,
@@ -463,7 +463,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             "REVOKE {} ON {} FROM {};",
             permission_list(permissions)?,
             securable(target)?,
-            quote(role)?
+            quote(role.raw())?
         )),
 
         // Refused, not silently rendered. This engine grants no principal
@@ -4623,7 +4623,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             stmts[0].role_renames,
-            [("reader".to_owned(), "app_reader".to_owned())]
+            [("reader".into(), "app_reader".into())]
         );
         assert!(stmts[0].renames.is_empty());
         // And a created role says so, for the checkpoint to adopt it

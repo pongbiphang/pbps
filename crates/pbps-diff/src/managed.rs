@@ -54,7 +54,7 @@ pub struct Scoped {
 
     /// Roles the database has that the identity file does not name (ADR-0005).
     /// Left alone: their grants are neither compared nor touched.
-    pub unmanaged_roles: Vec<String>,
+    pub unmanaged_roles: Vec<pbps_model::RoleName>,
 
     /// Facts about the managed set that the model cannot hold and a drift
     /// check must not call clean — a managed role's grant `WITH GRANT OPTION`,
@@ -65,7 +65,7 @@ pub struct Scoped {
     pub unexpressible: Vec<String>,
 
     /// Roles the identity file names that the database does not have.
-    pub missing_roles: Vec<String>,
+    pub missing_roles: Vec<pbps_model::RoleName>,
 
     /// The managed routines this read found `PUBLIC` able to execute
     /// (ADR-0010 §5). Filled by the caller from what introspection reported,
@@ -79,10 +79,10 @@ pub struct Scoped {
     /// the comparison for the same reason as the field above: ownership is
     /// not a grant, and the owner's own ACL entry is the zero point every
     /// object of that kind starts from (DECISIONS 371).
-    pub owners: BTreeMap<pbps_model::GrantTarget, String>,
+    pub owners: BTreeMap<pbps_model::GrantTarget, pbps_model::RoleName>,
     /// The role the deployment connection runs as, and so the owner of
     /// everything this plan creates (see `pbps_db::catalog::Pulled`).
-    pub session_role: String,
+    pub session_role: pbps_model::RoleName,
 }
 
 /// Cuts a live schema down to the managed set.
@@ -200,7 +200,7 @@ pub fn scope(
     // table is that table's business, and comparing it would have the next
     // plan revoke a permission the declarations were never allowed to name.
     // Schema-level grants stay — they are declarable.
-    let managed_roles: BTreeSet<&String> = ids.roles.values().collect();
+    let managed_roles: BTreeSet<&pbps_model::RoleName> = ids.roles.values().collect();
     let mut unmanaged_roles = Vec::new();
     for (name, role) in &schema.roles {
         if !managed_roles.contains(name) {
@@ -259,7 +259,7 @@ pub fn scope(
         unexpressible,
         public_execute: Default::default(),
         owners: BTreeMap::new(),
-        session_role: String::new(),
+        session_role: Default::default(),
     }
 }
 
@@ -366,7 +366,7 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
     // Every recorded uid is off-limits for derivation: reusing one would make
     // the differ match a brand-new column to an unrelated recorded one and
     // report a rename that never happened.
-    let roles_by_name: BTreeMap<&String, &Uid> =
+    let roles_by_name: BTreeMap<&pbps_model::RoleName, &Uid> =
         recorded.roles.iter().map(|(u, n)| (n, u)).collect();
     let mut taken: BTreeSet<Uid> = recorded
         .tables
@@ -397,7 +397,7 @@ pub fn observed_ids(live: &Schema, recorded: &IdsFile) -> IdsFile {
     for name in live.roles.keys() {
         let uid = match roles_by_name.get(name) {
             Some(u) => (*u).clone(),
-            None => free_uid(UidKind::Role, name, &mut taken),
+            None => free_uid(UidKind::Role, name.raw(), &mut taken),
         };
         observed.roles.insert(uid, name.clone());
     }
@@ -420,6 +420,33 @@ fn free_uid(kind: UidKind, seed: &str, taken: &mut BTreeSet<Uid>) -> Uid {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn observed_role_uids_use_raw_seeds_and_preserve_distinct_recorded_holders() {
+        use super::*;
+        let name = pbps_model::RoleName::from("role\nline\\\u{202e}名前");
+        let lookalike = pbps_model::RoleName::from(name.shown().to_string());
+        let live = Schema {
+            roles: [
+                (name.clone(), Default::default()),
+                (lookalike.clone(), Default::default()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let observed = observed_ids(&live, &IdsFile::default());
+        assert_eq!(
+            observed.role_uid(&name),
+            Some(&Uid::derived(UidKind::Role, name.raw(), 0))
+        );
+        assert_eq!(
+            observed.role_uid(&lookalike),
+            Some(&Uid::derived(UidKind::Role, lookalike.raw(), 0))
+        );
+        assert_ne!(observed.role_uid(&name), observed.role_uid(&lookalike));
+        assert_eq!(observed_ids(&live, &observed), observed);
+    }
+
     #[test]
     fn observed_uids_use_raw_table_and_column_seeds() {
         use super::*;
@@ -963,12 +990,18 @@ mod tests {
             .insert("r_bbbbbb".parse().unwrap(), "gone".into());
 
         let scoped = scope(&live, &recorded, &BTreeSet::new(), &BTreeSet::new());
-        assert_eq!(scoped.unmanaged_roles, vec!["someone_elses".to_string()]);
-        assert_eq!(scoped.missing_roles, vec!["gone".to_string()]);
+        assert_eq!(
+            scoped.unmanaged_roles,
+            vec![pbps_model::RoleName::from("someone_elses")]
+        );
+        assert_eq!(
+            scoped.missing_roles,
+            vec![pbps_model::RoleName::from("gone")]
+        );
         let kept: Vec<String> = scoped.schema.roles["app_reader"]
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|name| name.raw().to_string())
             .collect();
         assert_eq!(kept, ["dbo.customer", "schema::app"]);
         assert!(!scoped.schema.roles.contains_key("someone_elses"));
@@ -1003,7 +1036,7 @@ mod tests {
         let kept: Vec<String> = scoped.schema.roles["app_reader"]
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|name| name.raw().to_string())
             .collect();
         assert_eq!(
             kept,
@@ -1025,13 +1058,15 @@ mod tests {
             .insert("r_aaaaaa".parse().unwrap(), "app_reader".into());
         let observed = observed_ids(&live, &recorded);
         assert_eq!(
-            observed.role_uid("app_reader"),
+            observed.role_uid(&pbps_model::RoleName::from("app_reader")),
             Some(&"r_aaaaaa".parse().unwrap())
         );
-        let derived = observed.role_uid("hand_made").unwrap();
+        let derived = observed
+            .role_uid(&pbps_model::RoleName::from("hand_made"))
+            .unwrap();
         assert_eq!(derived.kind(), UidKind::Role);
         assert_eq!(
-            observed_ids(&live, &recorded).role_uid("hand_made"),
+            observed_ids(&live, &recorded).role_uid(&pbps_model::RoleName::from("hand_made")),
             Some(derived),
             "the same database observed twice gets the same identity"
         );
