@@ -58,6 +58,7 @@ pub(crate) type RoleMembers = BTreeMap<pbps_model::RoleName, Vec<pbps_model::Rol
 pub(crate) struct Facts<'a> {
     module_dependents: Option<&'a ModuleDependents>,
     role_members: Option<&'a RoleMembers>,
+    column_policies: Option<&'a crate::row_security::ColumnPolicies>,
 }
 
 impl<'a> Facts<'a> {
@@ -65,6 +66,17 @@ impl<'a> Facts<'a> {
     pub(crate) fn with_module_dependents(self, found: &'a ModuleDependents) -> Self {
         Self {
             module_dependents: Some(found),
+            ..self
+        }
+    }
+
+    /// Exact policies on each edited column, including successful empty reads.
+    pub(crate) fn with_column_policies(
+        self,
+        policies: &'a crate::row_security::ColumnPolicies,
+    ) -> Self {
+        Self {
+            column_policies: Some(policies),
             ..self
         }
     }
@@ -91,6 +103,8 @@ pub(crate) enum Skipped {
     Weave,
     /// Role-drop ordering needs the members of every role the plan drops.
     RoleDrops,
+    /// Referenced column edits wait for a policy owner the plan drops.
+    PolicyColumns,
 }
 
 impl Skipped {
@@ -100,6 +114,7 @@ impl Skipped {
         match self {
             Self::Weave => "plan.module-dependents-unread",
             Self::RoleDrops => "plan.role-members-unread",
+            Self::PolicyColumns => "plan.policy-column-dependents-unread",
         }
     }
 }
@@ -110,6 +125,10 @@ impl fmt::Display for Skipped {
             Self::Weave => {
                 "What depends on a dropped or rebuilt module is removed before it and put back \
                  after; `pbps plan --db` lists it for the target, this preview cannot."
+            }
+            Self::PolicyColumns => {
+                "A policy's table drop precedes edits of columns it references; `pbps plan --db` \
+                 reads those policy dependencies for the target, this preview cannot."
             }
             Self::RoleDrops => {
                 "A dropped role's members are removed first; `pbps plan --db` lists them for \
@@ -311,8 +330,39 @@ pub(crate) fn schedule(
         part.risks = risks;
     }
     let edges = pbps_diff::order::row_security::edges(cs.changes.iter().map(|p| &p.change));
-    if !edges.is_empty() {
+    let releases = if dialect.name() == "postgres" {
+        match facts.column_policies {
+            Some(found) => crate::row_security::policy_releases(&cs, declared.sources.after, found)
+                .map_err(Refusal::module_passes)?,
+            None => {
+                if cs
+                    .changes
+                    .iter()
+                    .any(|p| crate::row_security::column_edit(&p.change).is_some())
+                {
+                    skipped.push(Skipped::PolicyColumns);
+                }
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if !edges.is_empty() || !releases.is_empty() {
         let mut schedule = pbps_diff::order::Schedule::new(cs.changes.len());
+        for release in releases {
+            // Hoist only the whole owner removal, as weave does for a module
+            // dependent removed with its table. Sinking the column instead
+            // could pass a rename or a module drop it already releases.
+            for after in release.after..release.before {
+                schedule.edge(
+                    release.before,
+                    after,
+                    pbps_diff::order::Source::Catalog,
+                    pbps_model::resolver::OrderReason::Structural,
+                );
+            }
+        }
         for (before, after) in edges {
             schedule.edge(
                 before,
@@ -541,6 +591,165 @@ mod tests {
             facts,
             &pg(),
         )
+    }
+
+    #[test]
+    fn policy_owner_drops_preserve_column_name_handovers_and_distinguish_unread_facts() {
+        let input = TableName::new("app", "input");
+        let renamed = TableName::new("app", "renamed");
+        let owner = TableName::new("app", "owner");
+        let input_uid = Uid::derived(UidKind::Table, "input", 0);
+        let owner_uid = Uid::derived(UidKind::Table, "owner", 0);
+        let replacement_uid = Uid::derived(UidKind::Table, "replacement", 0);
+        let target_uid = Uid::derived(UidKind::Column, "target", 0);
+        let mut before = Schema::default();
+        before.tables.insert(
+            input.clone(),
+            Table {
+                columns: [("target".into(), column(ValueSource::None))].into(),
+                ..Default::default()
+            },
+        );
+        before.tables.insert(owner.clone(), Table::default());
+        let mut ids = IdsFile::default();
+        ids.tables.insert(input_uid.clone(), input.clone());
+        ids.tables.insert(owner_uid.clone(), owner.clone());
+        ids.columns
+            .insert(target_uid.clone(), input.column("target"));
+        for retype in [false, true] {
+            let edit = if retype {
+                Change::AlterColumnType {
+                    uid: target_uid.clone(),
+                    column: input.column("target"),
+                    from: "integer".parse().unwrap(),
+                    to: "bigint".parse().unwrap(),
+                    through_external_partitions: false,
+                    from_nullable: true,
+                    to_nullable: true,
+                    from_collation: None,
+                    to_collation: None,
+                }
+            } else {
+                Change::DropColumn {
+                    uid: target_uid.clone(),
+                    column: input.column("target"),
+                }
+            };
+            let changes = ChangeSet {
+                changes: vec![
+                    edit,
+                    Change::RenameTable {
+                        uid: input_uid.clone(),
+                        from: input.clone(),
+                        to: renamed.clone(),
+                        defaults: vec![],
+                    },
+                    Change::DropTable {
+                        uid: owner_uid.clone(),
+                        name: owner.clone(),
+                        detach_from: None,
+                    },
+                    Change::CreateTable {
+                        uid: replacement_uid.clone(),
+                        name: input.clone(),
+                        table: Box::default(),
+                        beside_default: None,
+                        moves_at_most: None,
+                    },
+                ]
+                .into_iter()
+                .map(PlannedChange::new)
+                .collect(),
+            };
+            let mut after = Schema::default();
+            let mut shape = before.tables[&input].clone();
+            if retype {
+                shape.columns["target"].ty = "bigint".parse().unwrap();
+            } else {
+                shape.columns.shift_remove("target");
+            }
+            after.tables.insert(renamed.clone(), shape);
+            after.tables.insert(input.clone(), Table::default());
+            let mut final_ids = ids.clone();
+            final_ids.tables.remove(&owner_uid);
+            final_ids.tables.insert(input_uid.clone(), renamed.clone());
+            final_ids
+                .tables
+                .insert(replacement_uid.clone(), input.clone());
+            if retype {
+                final_ids
+                    .columns
+                    .insert(target_uid.clone(), renamed.column("target"));
+            } else {
+                final_ids.columns.remove(&target_uid);
+            }
+            let declared = Declarations {
+                schema: &after,
+                sources: Sources {
+                    before: pbps_diff::Side {
+                        schema: &before,
+                        ids: &ids,
+                    },
+                    after: &final_ids,
+                },
+                module_deps: &ModuleDeps::new(),
+            };
+            let offline = schedule(changes.clone(), &declared, &Facts::default(), &pg()).unwrap();
+            assert_eq!(offline.skipped, [Skipped::PolicyColumns]);
+            assert_eq!(
+                offline.skipped[0].id(),
+                "plan.policy-column-dependents-unread"
+            );
+            assert_eq!(offline.changes, changes);
+            assert!(
+                schedule(
+                    changes.clone(),
+                    &declared,
+                    &Facts::default().with_column_policies(&BTreeMap::new()),
+                    &pg()
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("were not read")
+            );
+            let empty = [(target_uid.clone(), vec![])].into();
+            let no_policy = schedule(
+                changes.clone(),
+                &declared,
+                &Facts::default().with_column_policies(&empty),
+                &pg(),
+            )
+            .unwrap();
+            assert!(no_policy.skipped.is_empty());
+            assert_eq!(no_policy.changes, changes);
+            let found = [(
+                target_uid.clone(),
+                vec![pbps_pg::modules::PolicyDependent {
+                    table: owner.clone(),
+                    name: "cross_table".into(),
+                }],
+            )]
+            .into();
+            let facts = Facts::default().with_column_policies(&found);
+            let ordered = schedule(changes.clone(), &declared, &facts, &pg()).unwrap();
+            assert_eq!(
+                ordered
+                    .changes
+                    .changes
+                    .iter()
+                    .map(|p| &p.change)
+                    .collect::<Vec<_>>(),
+                [2, 0, 1, 3].map(|i| &changes.changes[i].change)
+            );
+            crate::row_security::check_policy_releases(&ordered.changes, &final_ids, &found)
+                .unwrap();
+            assert!(
+                crate::row_security::check_policy_releases(&changes, &final_ids, &found)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must precede")
+            );
+        }
     }
 
     #[test]

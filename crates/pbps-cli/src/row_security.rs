@@ -7,6 +7,98 @@ use pbps_model::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The exact policy dependents read for each edited column. An absent entry
+/// is unread, while an empty vector records a successful empty catalog read.
+pub(crate) type ColumnPolicies = BTreeMap<Uid, Vec<pbps_pg::modules::PolicyDependent>>;
+
+/// The column changes whose old catalog bindings a policy can hold.
+pub(crate) fn column_edit(change: &Change) -> Option<(&Uid, &pbps_model::ColumnRef, &'static str)> {
+    if let Change::DropColumn { uid, column } = change {
+        Some((uid, column, "dropped"))
+    } else if let Change::AlterColumnType { uid, column, .. } = change {
+        Some((uid, column, "retyped"))
+    } else {
+        None
+    }
+}
+
+/// A whole-table removal releases this policy before a referenced column edit.
+/// Keeping the named refusal beside the edge lets apply check the saved order
+/// without repairing or extending the approved plan.
+pub(crate) struct PolicyRelease {
+    pub before: usize,
+    pub after: usize,
+    refusal: String,
+}
+
+pub(crate) fn policy_releases(
+    changes: &ChangeSet,
+    ids: &IdsFile,
+    found: &ColumnPolicies,
+) -> anyhow::Result<Vec<PolicyRelease>> {
+    let names = PlanNames::of(&changes.changes, ids)?;
+    let mut edges = Vec::new();
+    for (at, step) in changes.changes.iter().enumerate() {
+        let Some((uid, _, what)) = column_edit(&step.change) else {
+            continue;
+        };
+        let policies = found.get(uid).ok_or_else(|| {
+            anyhow::anyhow!("policy dependents of column {uid} were not read from PostgreSQL")
+        })?;
+        if policies.is_empty() {
+            continue;
+        }
+        let (owner, name) = names.column_at(uid, At::Start).ok_or_else(|| {
+            anyhow::anyhow!("policy dependent column {uid} has no opening catalog identity")
+        })?;
+        let table = names.table_at(owner, At::Start).ok_or_else(|| {
+            anyhow::anyhow!("policy dependent column {uid} has no opening table identity")
+        })?;
+        let stored = table.column(name);
+        for policy in policies {
+            let refusal = format!(
+                "{} cannot be {what}: policy `{}` on {} depends on it; planning this policy change arrives with #1173",
+                stored.shown(),
+                pbps_model::escape::Escaped(&policy.name),
+                policy.table.shown()
+            );
+            // Compare opening UID identities, not a later holder of the same
+            // spelling. An individual standing policy is never removed here.
+            let Some(before) = changes.changes.iter().position(|p| {
+                if let Change::DropTable { uid, .. } = &p.change {
+                    names.table_at(uid, At::Start) == Some(&policy.table)
+                } else {
+                    false
+                }
+            }) else {
+                bail!("{refusal}");
+            };
+            edges.push(PolicyRelease {
+                before,
+                after: at,
+                refusal,
+            });
+        }
+    }
+    Ok(edges)
+}
+
+pub(crate) fn check_policy_releases(
+    changes: &ChangeSet,
+    ids: &IdsFile,
+    found: &ColumnPolicies,
+) -> anyhow::Result<()> {
+    for release in policy_releases(changes, ids, found)? {
+        if release.before >= release.after {
+            bail!(
+                "{}; its table drop must precede the column edit. Plan again.",
+                release.refusal
+            );
+        }
+    }
+    Ok(())
+}
+
 /// A checksum authenticates the bytes, not a forged creation origin or an
 /// ignored policy hidden inside CREATE TABLE's descriptive payload.
 pub(crate) fn validate(
@@ -240,6 +332,74 @@ mod tests {
             },
             ids,
         )
+    }
+
+    #[test]
+    fn a_same_named_replacement_drop_does_not_release_an_original_policy() {
+        let input = TableName::new("app", "input");
+        let owner = TableName::new("app", "owner");
+        let kept = TableName::new("app", "kept");
+        let input_uid: Uid = "t_117200".parse().unwrap();
+        let original: Uid = "t_117201".parse().unwrap();
+        let replacement: Uid = "t_117202".parse().unwrap();
+        let target: Uid = "c_117200".parse().unwrap();
+        let mut ids = IdsFile::default();
+        ids.tables.insert(input_uid, input.clone());
+        ids.tables.insert(original.clone(), kept.clone());
+        let mut plan = ChangeSet {
+            changes: vec![
+                Change::DropColumn {
+                    uid: target.clone(),
+                    column: input.column("target"),
+                },
+                Change::RenameTable {
+                    uid: original.clone(),
+                    from: owner.clone(),
+                    to: kept.clone(),
+                    defaults: vec![],
+                },
+                Change::CreateTable {
+                    uid: replacement.clone(),
+                    name: owner.clone(),
+                    table: Box::default(),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+                Change::DropTable {
+                    uid: replacement,
+                    name: owner.clone(),
+                    detach_from: None,
+                },
+            ]
+            .into_iter()
+            .map(PlannedChange::new)
+            .collect(),
+        };
+        let found = [(
+            target,
+            vec![pbps_pg::modules::PolicyDependent {
+                table: owner,
+                name: "original_policy".into(),
+            }],
+        )]
+        .into();
+        let refused = policy_releases(&plan, &ids, &found)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            refused.contains("original_policy") && refused.contains("arrives with #1173"),
+            "{refused}"
+        );
+        plan.changes.push(PlannedChange::new(Change::DropTable {
+            uid: original.clone(),
+            name: kept,
+            detach_from: None,
+        }));
+        ids.tables.remove(&original);
+        let edges = policy_releases(&plan, &ids, &found).unwrap();
+        assert_eq!((edges[0].before, edges[0].after), (4, 0));
+        assert!(check_policy_releases(&plan, &ids, &found).is_err());
     }
 
     #[test]

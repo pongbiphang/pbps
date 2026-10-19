@@ -6844,7 +6844,13 @@ predicates are not captured surfaces, and scratch need not reproduce their
 recipient roles. Exact declared policy catalog rows and their dependency rows
 belong to the UID-proven table for closing ownership; this grants no predicate
 binding proof or ownership of referenced objects. The created-only operations
-have no intrinsic risk.
+have no intrinsic risk. A catalog-proven policy dependency on an edited
+column is released by a whole owner-table drop in the same plan: the central
+schedule hoists that drop before the edit, keeping the other steps in order
+so a released column does not pass a module drop or rename. A retained owner
+still refuses by policy name with #1173. Apply reads the dependency again
+and refuses a saved plan whose owner removal follows the edit; it never
+repairs the approved order.
 
 
 <a id="dec-2104-1"></a>

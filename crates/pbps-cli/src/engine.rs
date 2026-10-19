@@ -1839,14 +1839,8 @@ fn changed_column<'c>(
     &'c pbps_model::ColumnRef,
     &'static str,
 )> {
-    use pbps_model::{Change, plan_names::At};
-    let (uid, column, what) = if let Change::AlterColumnType { uid, column, .. } = change {
-        (uid, column, "retyped")
-    } else if let Change::DropColumn { uid, column } = change {
-        (uid, column, "dropped")
-    } else {
-        return None;
-    };
+    use pbps_model::plan_names::At;
+    let (uid, column, what) = crate::row_security::column_edit(change)?;
     let (owner, name) = names.column_at(uid, At::Start)?;
     Some((
         names.table_at(owner, At::Start)?.clone(),
@@ -3481,7 +3475,6 @@ pub async fn account_for_module_dependents(
     let pg = pbps_pg::Postgres::new()
         .with_server_version(pbps_pg::roles::server_version_num(conn).await?);
     let dialect: &dyn pbps_dialect::Dialect = &pg;
-    refuse_policy_column_dependents(conn, changes, sources.after).await?;
     let mut found = module_dependents(conn, changes).await?;
     let untouched = crate::dependents::untouched_module_dependents(changes, &found, declared);
     if !untouched.is_empty() {
@@ -3491,7 +3484,10 @@ pub async fn account_for_module_dependents(
     // Every reordering pass, in one place (#1955): `weave` over what the
     // catalog just said depends on the modules this plan drops, then the
     // passes that read nothing.
-    let facts = read.with_module_dependents(&found);
+    let policies = policy_column_dependents(conn, changes, sources.after).await?;
+    let facts = read
+        .with_module_dependents(&found)
+        .with_column_policies(&policies);
     let scheduled = crate::dependents::schedule::schedule(
         std::mem::take(changes),
         &declarations,
@@ -3499,6 +3495,7 @@ pub async fn account_for_module_dependents(
         dialect,
     )?;
     *changes = scheduled.changes;
+    crate::row_security::check_policy_releases(changes, sources.after, &policies)?;
     let (added, split, moved) = (scheduled.added, scheduled.split, scheduled.moved);
     let partitions = crate::dependents::standing_partitions(declared, changes);
     // On the final order: every pass above may move what an expression
@@ -5279,41 +5276,43 @@ mod plan_name_tests {
     }
 }
 
-/// A connected column edit cannot silently shed or invalidate a policy.
-/// Use recorded column identities, not lexical guesses about predicate text.
+/// Read old column bindings once, after any module rediff has settled which
+/// columns the plan edits. No policy read is replaced by an empty result.
+async fn policy_column_dependents(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
+) -> anyhow::Result<crate::row_security::ColumnPolicies> {
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+    let mut found = crate::row_security::ColumnPolicies::new();
+    for step in &changes.changes {
+        let Some((uid, _, _)) = crate::row_security::column_edit(&step.change) else {
+            continue;
+        };
+        if found.contains_key(uid) {
+            continue;
+        }
+        let policies = if let Some((table, column, _, _)) = changed_column(&names, &step.change) {
+            pbps_pg::modules::policies_on_column(conn, &table.column(column)).await?
+        } else {
+            // A newly created column has no old catalog bindings.
+            Vec::new()
+        };
+        found.insert(uid.clone(), policies);
+    }
+    Ok(found)
+}
+
+/// Apply validates the approved order against fresh catalog bindings. It
+/// never schedules a newly discovered dependent into the saved plan.
 async fn refuse_policy_column_dependents(
     conn: &mut Conn,
     changes: &ChangeSet,
     ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<()> {
-    if conn.driver() != Driver::Postgres {
-        return Ok(());
-    }
-    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    for (at, p) in changes.changes.iter().enumerate() {
-        let Some((table, column, _, what)) = changed_column(&names, &p.change) else {
-            continue;
-        };
-        let stored = pbps_model::ColumnRef::new(table, column);
-        for policy in pbps_pg::modules::policies_on_column(conn, &stored).await? {
-            // A prior whole-table drop already removed the policy. No C
-            // statement removes or replaces an individual standing policy.
-            let removed = changes.changes[..at].iter().any(|step| {
-                if let pbps_model::Change::DropTable { uid, .. } = &step.change {
-                    names.table_at(uid, pbps_model::plan_names::At::Start) == Some(&policy.table)
-                } else {
-                    false
-                }
-            });
-            if !removed {
-                anyhow::bail!(
-                    "{} cannot be {what}: policy `{}` on {} depends on it; planning this policy change arrives with #1173",
-                    stored.shown(),
-                    pbps_model::escape::Escaped(&policy.name),
-                    policy.table.shown()
-                );
-            }
-        }
+    if conn.driver() == Driver::Postgres {
+        let found = policy_column_dependents(conn, changes, ids).await?;
+        crate::row_security::check_policy_releases(changes, ids, &found)?;
     }
     Ok(())
 }

@@ -338,7 +338,173 @@ async fn check(connection: String, owner: String) {
         error.contains("tenant_rows") && error.contains("arrives with #1173"),
         "{error}"
     );
+    policy_owner_drop_releases_column(&mut conn).await;
     conn.execute("ALTER TABLE app.t DROP COLUMN extra; ROLLBACK")
+        .await
+        .unwrap();
+}
+
+async fn policy_owner_drop_releases_column(conn: &mut Conn) {
+    use pbps_model::{Column, Schema, Table};
+    let input = TableName::new("app", "policy_input");
+    let owner = TableName::new("app", "policy_owner");
+    conn.execute(
+        "CREATE FUNCTION app.policy_value(integer) RETURNS integer LANGUAGE sql IMMUTABLE \
+        AS $value$ SELECT $1 * 2 $value$; \
+        CREATE TABLE app.policy_input (id integer, target integer GENERATED ALWAYS AS (app.policy_value(id)) STORED); \
+        CREATE TABLE app.policy_owner (id integer); \
+        CREATE POLICY cross_table ON app.policy_owner USING \
+        (EXISTS(SELECT FROM app.policy_input WHERE target > 0)); \
+        SAVEPOINT policy_owner_order",
+    )
+    .await
+    .unwrap();
+    let error = conn
+        .execute("ALTER TABLE app.policy_input DROP COLUMN target")
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("other objects depend on it"),
+        "{error}"
+    );
+    conn.execute(
+        "ROLLBACK TO SAVEPOINT policy_owner_order; \
+        DROP TABLE app.policy_owner; ALTER TABLE app.policy_input DROP COLUMN target; \
+        ROLLBACK TO SAVEPOINT policy_owner_order",
+    )
+    .await
+    .unwrap();
+    let input_uid = Uid::derived(UidKind::Table, "policy_input", 0);
+    let owner_uid = Uid::derived(UidKind::Table, "policy_owner", 0);
+    let target_uid = Uid::derived(UidKind::Column, "policy_input.target", 0);
+    let mut ids = IdsFile::default();
+    ids.tables.insert(input_uid.clone(), input.clone());
+    ids.tables.insert(owner_uid.clone(), owner.clone());
+    ids.columns
+        .insert(target_uid.clone(), input.column("target"));
+    for (table, seed) in [(&input, "input.id"), (&owner, "owner.id")] {
+        ids.columns
+            .insert(Uid::derived(UidKind::Column, seed, 0), table.column("id"));
+    }
+    let column = || Column::new("integer".parse().unwrap());
+    let mut before = Schema::default();
+    let function = "app.policy_value(integer)".parse().unwrap();
+    before.modules.insert(
+        function,
+        pbps_model::Module {
+            kind: pbps_model::ModuleKind::Function,
+            description: None,
+            definition:
+                "(integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $value$ SELECT $1 * 2 $value$"
+                    .into(),
+        },
+    );
+    let mut generated = column();
+    generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+        expression: "app.policy_value(id)".into(),
+        stored: true,
+    });
+    before.tables.insert(
+        input.clone(),
+        Table {
+            columns: [("id".into(), column()), ("target".into(), generated)].into(),
+            ..Default::default()
+        },
+    );
+    before.tables.insert(
+        owner.clone(),
+        Table {
+            columns: [("id".into(), column())].into(),
+            row_policies: [(
+                "cross_table".into(),
+                pbps_model::RowPolicy {
+                    using: Some("EXISTS(SELECT FROM app.policy_input WHERE target > 0)".into()),
+                    ..Default::default()
+                },
+            )]
+            .into(),
+            ..Default::default()
+        },
+    );
+    let mut after = before.clone();
+    after.modules.clear();
+    after.tables.remove(&owner);
+    after
+        .tables
+        .get_mut(&input)
+        .unwrap()
+        .columns
+        .shift_remove("target");
+    let mut final_ids = ids.clone();
+    final_ids.tables.remove(&owner_uid);
+    final_ids
+        .columns
+        .retain(|uid, column| uid != &target_uid && column.table != owner);
+    let mut changes = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::DropColumn {
+                uid: target_uid,
+                column: input.column("target"),
+            }),
+            PlannedChange::new(Change::DropModule {
+                id: "app.policy_value(integer)".parse().unwrap(),
+                kind: pbps_model::ModuleKind::Function,
+            }),
+            PlannedChange::new(Change::DropTable {
+                uid: owner_uid,
+                name: owner.clone(),
+                detach_from: None,
+            }),
+        ],
+    };
+    let wrong = crate::engine::check_module_dependents(conn, &changes, &before, &final_ids, &ids)
+        .await
+        .unwrap_err();
+    assert!(wrong.to_string().contains("cross_table"));
+    crate::engine::account_for_module_dependents(
+        conn,
+        &mut changes,
+        &after,
+        crate::dependents::Sources {
+            before: pbps_diff::Side {
+                schema: &before,
+                ids: &ids,
+            },
+            after: &final_ids,
+        },
+        &Default::default(),
+        None,
+        &pbps_pg::Postgres::new(),
+        &|_| panic!("the policy-owner drop needs no module rediff"),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(&changes.changes[0].change, Change::DropTable { name, .. } if name == &owner));
+    assert!(matches!(
+        &changes.changes[1].change,
+        Change::DropColumn { .. }
+    ));
+    assert!(matches!(
+        &changes.changes[2].change,
+        Change::DropModule { .. }
+    ));
+    crate::engine::check_module_dependents(conn, &changes, &before, &final_ids, &ids)
+        .await
+        .unwrap();
+    for step in &changes.changes {
+        for statement in pbps_pg::Postgres::new()
+            .emit(&step.change, Default::default())
+            .unwrap()
+        {
+            conn.execute(&statement.sql).await.unwrap();
+        }
+    }
+    assert!(
+        conn.query("SELECT target FROM app.policy_input")
+            .await
+            .is_err()
+    );
+    conn.execute("ROLLBACK TO SAVEPOINT policy_owner_order")
         .await
         .unwrap();
 }
