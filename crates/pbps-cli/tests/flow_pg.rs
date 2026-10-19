@@ -31177,3 +31177,14 @@ fn row_security_created_policies_follow_routines_and_converge_after_apply_and_bo
         );
     }
 }
+
+#[test]
+#[ignore = "needs both live PostgreSQL versions and the scratch cluster"]
+fn row_security_resolver_plans_apply_and_preserve_adopted_policies() {
+    let older = old_server();
+    resolver_publication::row_security(&older, &older);
+    resolver_publication::row_security(
+        &server(),
+        &std::env::var("PBPS_TEST_PG_SCRATCH_DB").expect("separate live scratch cluster"),
+    );
+}

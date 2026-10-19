@@ -22,7 +22,9 @@
 //!
 //! Grants, roles and rows are not reproduced: none of them changes what a
 //! name binds to. What does — the deployer's schema privileges and path — is
-//! reproduced by the analysis scope before this runs (#610).
+//! reproduced by the analysis scope before this runs (#610). Row-security
+//! setup also stays in the deployment plan: it creates no nameable object,
+//! and policy predicate bindings remain #595's named coverage limitation.
 
 use pbps_db::resolver::capture::ObjectIdentity;
 use pbps_dialect::Dialect;
@@ -505,6 +507,11 @@ impl Reconstruction {
                         None,
                     )?);
                 }
+                // Policies create no nameable object, and their predicates
+                // are not resolver surfaces (#595). Installing them here
+                // would also require recipient roles scratch need not hold.
+                // The typed deployment plan still emits policies and flags.
+                Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => {}
                 // None of these changes what a name resolves to.
                 Change::CreateRole { .. }
                 | Change::Grant { .. }
@@ -531,8 +538,6 @@ impl Reconstruction {
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
                 | Change::SetStorageParameters { .. }
-                | Change::CreatePolicy { .. }
-                | Change::SetRowSecurity { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }

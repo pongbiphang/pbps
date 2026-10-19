@@ -6838,7 +6838,13 @@ Standing-table differences name #1173; unchanged adopted policies do not block
 unrelated migrations. Authored predicates overlay only matching presence;
 untouched catalog predicates remain exact drift state. Predicate binding proof
 is still #595's named limitation, not a reason to omit an otherwise supported
-table. The created-only operations have no intrinsic risk.
+table. Resolver reconstruction explicitly leaves policy/flag setup to the
+deployment plan: neither operation adds a nameable lookup candidate, policy
+predicates are not captured surfaces, and scratch need not reproduce their
+recipient roles. Exact declared policy catalog rows and their dependency rows
+belong to the UID-proven table for closing ownership; this grants no predicate
+binding proof or ownership of referenced objects. The created-only operations
+have no intrinsic risk.
 
 
 <a id="dec-2104-1"></a>
