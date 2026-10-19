@@ -110,3 +110,46 @@ fn contained_defaults_are_not_direct_restoration_steps() {
         );
     }
 }
+
+#[test]
+fn row_security_cases_classify_policy_parts_and_independent_flags() {
+    let mut policies = 0;
+    let mut flags = BTreeSet::new();
+    for (name, change) in corpus::cases() {
+        if let pbps_model::Change::CreatePolicy {
+            table,
+            name: policy_name,
+            policy,
+            ..
+        } = &change
+        {
+            policies += 1;
+            assert!(
+                policy.using.is_some() || policy.with_check.is_some(),
+                "{name}"
+            );
+            assert_eq!(
+                change.part_effects(),
+                vec![pbps_model::part_effects::PartEffect {
+                    part: Part::Named {
+                        table,
+                        kind: pbps_model::Part::Policy,
+                        name: policy_name,
+                    },
+                    effect: Effect::Created,
+                    origin: Origin::Direct,
+                }],
+                "{name}"
+            );
+        } else if let pbps_model::Change::SetRowSecurity { from, to, .. } = &change {
+            assert!(from.is_default(), "{name}");
+            assert_ne!(from, to, "{name}");
+            flags.insert((to.enabled, to.forced));
+            // Flags rewrite state but introduce no predicate definition
+            // for dependency consumers to bind or rebuild.
+            assert!(change.part_effects().is_empty(), "{name}");
+        }
+    }
+    assert_eq!(policies, 3);
+    assert_eq!(flags, [(true, false), (false, true), (true, true)].into());
+}

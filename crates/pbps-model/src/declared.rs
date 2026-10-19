@@ -55,6 +55,27 @@ pub struct DeclaredExpressions {
     /// indexes with an expression key appear (DEC-1169.2).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keys: BTreeMap<TableName, BTreeMap<String, Vec<Option<String>>>>,
+    /// Both predicates independently, without manufacturing omitted clauses.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub policies: BTreeMap<TableName, BTreeMap<String, DeclaredPolicyExpressions>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredPolicyExpressions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub using: Option<crate::Text>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub with_check: Option<crate::Text>,
+}
+
+impl From<&crate::RowPolicy> for DeclaredPolicyExpressions {
+    fn from(policy: &crate::RowPolicy) -> Self {
+        Self {
+            using: policy.using.clone(),
+            with_check: policy.with_check.clone(),
+        }
+    }
 }
 
 impl DeclaredExpressions {
@@ -65,6 +86,7 @@ impl DeclaredExpressions {
             && self.checks.is_empty()
             && self.filters.is_empty()
             && self.keys.is_empty()
+            && self.policies.is_empty()
     }
 }
 
@@ -253,6 +275,16 @@ impl Declared {
                     .or_default()
                     .insert(computed.clone(), spec.expression.clone());
             }
+            if !table.row_policies.is_empty() {
+                d.expressions.policies.insert(
+                    name.clone(),
+                    table
+                        .row_policies
+                        .iter()
+                        .map(|(name, policy)| (name.clone(), policy.into()))
+                        .collect(),
+                );
+            }
             for (check, spec) in &table.checks {
                 d.expressions
                     .checks
@@ -329,6 +361,7 @@ impl Declared {
                     self.expressions.checks.extend(fresh.expressions.checks);
                     self.expressions.filters.extend(fresh.expressions.filters);
                     self.expressions.keys.extend(fresh.expressions.keys);
+                    self.expressions.policies.extend(fresh.expressions.policies);
                 }
                 Change::DropTable { name, .. } => self.forget_table(name),
                 // The detached table holds its parent's expressions, which
@@ -357,6 +390,7 @@ impl Declared {
                     self.expressions.checks.extend(fresh.expressions.checks);
                     self.expressions.filters.extend(fresh.expressions.filters);
                     self.expressions.keys.extend(fresh.expressions.keys);
+                    self.expressions.policies.extend(fresh.expressions.policies);
                     let renamed = |kind: crate::DetachedKind, of: &String| {
                         names
                             .iter()
@@ -429,6 +463,7 @@ impl Declared {
                     rekey_table(&mut self.expressions.checks, from, to);
                     rekey_table(&mut self.expressions.filters, from, to);
                     rekey_table(&mut self.expressions.keys, from, to);
+                    rekey_table(&mut self.expressions.policies, from, to);
                     rekey_table(&mut self.bindings.defaults, from, to);
                     rekey_table(&mut self.bindings.checks, from, to);
                     rekey_table(&mut self.bindings.filters, from, to);
@@ -583,6 +618,18 @@ impl Declared {
                     remove_nested(&mut self.expressions.keys, table, name);
                     remove_nested(&mut self.bindings.filters, table, name);
                 }
+                Change::CreatePolicy {
+                    table,
+                    name,
+                    policy,
+                    ..
+                } => {
+                    self.expressions
+                        .policies
+                        .entry(table.clone())
+                        .or_default()
+                        .insert(name.clone(), policy.into());
+                }
                 Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
                     self.bindings.modules.remove(id);
                     self.modules.insert(id.clone(), module.definition.clone());
@@ -592,7 +639,8 @@ impl Declared {
                     self.bindings.modules.remove(id);
                 }
                 // Nothing these write is compared as text against a declaration.
-                Change::AlterColumnType { .. }
+                Change::SetRowSecurity { .. }
+                | Change::AlterColumnType { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
@@ -627,6 +675,7 @@ impl Declared {
         self.expressions.checks.remove(name);
         self.expressions.filters.remove(name);
         self.expressions.keys.remove(name);
+        self.expressions.policies.remove(name);
         self.bindings.defaults.remove(name);
         self.bindings.checks.remove(name);
         self.bindings.filters.remove(name);
@@ -688,6 +737,18 @@ impl Declared {
                 for (column, spec) in &mut table.computed {
                     if let Some(declared) = computed.get(column) {
                         spec.expression = declared.clone();
+                    }
+                }
+            }
+            if let Some(policies) = self.expressions.policies.get(name) {
+                for (policy, spec) in &mut table.row_policies {
+                    if let Some(declared) = policies.get(policy) {
+                        if spec.using.is_some() == declared.using.is_some() {
+                            spec.using = declared.using.clone();
+                        }
+                        if spec.with_check.is_some() == declared.with_check.is_some() {
+                            spec.with_check = declared.with_check.clone();
+                        }
                     }
                 }
             }

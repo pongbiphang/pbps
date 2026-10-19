@@ -41,7 +41,8 @@ pub enum SchemaKind {
 /// excluding only whitespace, object-key order and the tool-version stamp.
 /// Archive the complete new set; keep previous archives unchanged (SPEC §14.2,
 /// acceptance criterion 6, DECISIONS 465).
-pub const SCHEMA_VERSION: u32 = 51;
+pub const SCHEMA_VERSION: u32 = 52;
+// 52: created-table row-security operations (issue #1172 PR C).
 // 51: a table's `row_security:` and `row_policies:` (issue #1172 PR A).
 // 27: a table's `unlogged:` (issue #1443).
 // 28: a table's `system_time:` (issue #1176).

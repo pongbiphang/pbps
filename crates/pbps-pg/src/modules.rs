@@ -1630,6 +1630,8 @@ pub enum Part {
     /// expression releases the dependency instead, when that change runs
     /// before the module's drop (DEC-1168.1).
     Generated(pbps_model::ColumnName),
+    /// Never automatically rebuilt until #1173. A whole table drop owns it.
+    Policy(String),
 }
 
 /// One object that depends on a module, established by the catalog.
@@ -1686,7 +1688,7 @@ impl Dependent {
                     }
                     // Nothing can put it back, so it is never kept across a
                     // rebuild; only an expression change releases it.
-                    Part::Generated(_) => false,
+                    Part::Generated(_) | Part::Policy(_) => false,
                 }
             }),
             Holds::Unrepresentable(_) => false,
@@ -1950,6 +1952,10 @@ async fn direct_dependents(
                     on: ObjectName::new(&dep_schema, &dep_name),
                     name: part.clone(),
                 }),
+                "policy" => Holds::TablePart {
+                    table: TableName::new(&dep_schema, &dep_name),
+                    part: Part::Policy(part.clone()),
+                },
                 "check" => Holds::TablePart {
                     table: TableName::new(&dep_schema, &dep_name),
                     part: Part::Check(part.clone()),
@@ -2162,6 +2168,14 @@ fn dependents_query(refclass: &str) -> String {
            LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace
           WHERE {edge} AND d.classid = 'pg_catalog.pg_class'::regclass
           UNION ALL
+         SELECT 'policy', {described}, n2.nspname, c2.relname, p2.polname, 0::int8,
+                ''
+           FROM pg_catalog.pg_depend d
+           JOIN pg_catalog.pg_policy p2 ON p2.oid = d.objid
+           JOIN pg_catalog.pg_class c2 ON c2.oid = p2.polrelid
+           JOIN pg_catalog.pg_namespace n2 ON n2.oid = c2.relnamespace
+          WHERE {edge} AND d.classid = 'pg_catalog.pg_policy'::regclass
+          UNION ALL
          SELECT 'other', {described}, '', '', '', 0::int8,
                 'a dependent in `' || d.classid::regclass::text
                   || '`, which this reader has no rule for'
@@ -2227,13 +2241,14 @@ fn reverse_edge(refclass: &str) -> String {
 /// named and refused rather than silently absent.
 ///
 /// Pinned to the arms by `every_known_class_has_an_arm_and_the_rest_fall_through`.
-const KNOWN_DEPENDENT_CLASSES: [&str; 6] = [
+const KNOWN_DEPENDENT_CLASSES: [&str; 7] = [
     "pg_catalog.pg_rewrite",
     "pg_catalog.pg_proc",
     "pg_catalog.pg_trigger",
     "pg_catalog.pg_constraint",
     "pg_catalog.pg_attrdef",
     "pg_catalog.pg_class",
+    "pg_catalog.pg_policy",
 ];
 
 /// A deadlock taking the rebuild's lock, said in words.
@@ -2288,6 +2303,13 @@ pub fn unmanaged_refusal(
         .filter(|d| !d.managed(declared))
         .map(|d| match &d.holds {
             Holds::Unrepresentable(why) => format!("- {} -- {why}", d.described),
+            Holds::TablePart {
+                part: Part::Policy(_),
+                ..
+            } => format!(
+                "- {} -- planning policy removal and recreation arrives with #1173",
+                d.described
+            ),
             Holds::TablePart {
                 part: Part::Generated(_),
                 ..
@@ -3424,4 +3446,41 @@ mod definer_path_tests {
         // A schema literally named "pg_temp, x" is not pg_temp.
         assert!(definer_path_problem(Some("\"x, pg_temp\"")).is_some());
     }
+}
+
+/// Policies that actually bind this stored attribute. Relation-only edges
+/// (including EXISTS SELECT FROM) do not block a column alteration, measured
+/// on 16 and 18, and must not be expanded into every attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDependent {
+    pub table: TableName,
+    pub name: String,
+}
+
+pub async fn policies_on_column(
+    conn: &mut Conn,
+    column: &pbps_model::ColumnRef,
+) -> Result<Vec<PolicyDependent>, DbError> {
+    require_the_callers_transaction(conn).await?;
+    let rows = conn.query_with(
+        "SELECT DISTINCT p.polname, n.nspname, own.relname
+           FROM pg_catalog.pg_attribute a
+           JOIN pg_catalog.pg_class t ON t.oid = a.attrelid
+           JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
+           JOIN pg_catalog.pg_depend d ON d.refclassid = 'pg_catalog.pg_class'::regclass
+                AND d.refobjid = t.oid AND d.refobjsubid = a.attnum
+           JOIN pg_catalog.pg_policy p ON d.classid = 'pg_catalog.pg_policy'::regclass AND p.oid = d.objid
+           JOIN pg_catalog.pg_class own ON own.oid = p.polrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = own.relnamespace
+          WHERE tn.nspname = $1 AND t.relname = $2 AND a.attname = $3 AND a.attnum > 0 AND NOT a.attisdropped
+          ORDER BY 2, 3, 1",
+        &[Param::Str(&column.table.schema), Param::Str(&column.table.name), Param::Str(&column.name)]).await?;
+    rows.iter()
+        .map(|row| {
+            Ok(PolicyDependent {
+                name: text(row, "polname")?,
+                table: TableName::new(text(row, "nspname")?, text(row, "relname")?),
+            })
+        })
+        .collect()
 }

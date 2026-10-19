@@ -310,6 +310,22 @@ pub(crate) fn schedule(
     for (part, risks) in cs.changes.iter_mut().zip(risks) {
         part.risks = risks;
     }
+    let edges = pbps_diff::order::row_security::edges(cs.changes.iter().map(|p| &p.change));
+    if !edges.is_empty() {
+        let mut schedule = pbps_diff::order::Schedule::new(cs.changes.len());
+        for (before, after) in edges {
+            schedule.edge(
+                before,
+                after,
+                pbps_diff::order::Source::Effect,
+                pbps_model::resolver::OrderReason::Structural,
+            );
+        }
+        cs = schedule
+            .settle(cs.clone())
+            .map_err(|why| Refusal(why.describe(&cs)))?
+            .changes;
+    }
     // The verifier runs on the order this entry point settles, in tests and
     // debug builds (#1954, DEC-1954.6). On a connected SQL Server plan the
     // computed-column pass still follows, so that pair is recorded and not
@@ -525,6 +541,56 @@ mod tests {
             facts,
             &pg(),
         )
+    }
+
+    #[test]
+    fn row_security_setup_follows_modules_after_scheduling() {
+        let (mut schema, ids) = declarations();
+        let table = schema
+            .tables
+            .get_mut(&TableName::new("app", "a_plain"))
+            .unwrap();
+        table.row_security.enabled = true;
+        table.row_policies.insert(
+            "p".into(),
+            pbps_model::RowPolicy {
+                using: Some("app.zz() > 0".into()),
+                ..Default::default()
+            },
+        );
+        let mut changes = differ_order(&schema, &ids);
+        // The module passes can move suppliers after the initial class sort.
+        // Start with that adverse order to pin the final scheduling boundary.
+        changes.changes.sort_by_key(|p| {
+            matches!(
+                p.change,
+                Change::CreateModule { .. } | Change::PublicExecution { .. }
+            )
+        });
+        let result = scheduled(changes, &schema, &ids, &Facts::default())
+            .unwrap()
+            .changes;
+        let policy = result
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::CreatePolicy { .. }))
+            .unwrap();
+        let flags = result
+            .changes
+            .iter()
+            .position(|p| matches!(p.change, Change::SetRowSecurity { .. }))
+            .unwrap();
+        for (at, step) in result.changes.iter().enumerate() {
+            if matches!(
+                step.change,
+                Change::CreateModule { .. } | Change::PublicExecution { .. }
+            ) {
+                assert!(at < policy);
+            }
+        }
+        assert!(policy < flags);
+        let again = scheduled(result.clone(), &schema, &ids, &Facts::default()).unwrap();
+        assert_eq!(again.changes, result);
     }
 
     // A test rendering: what each change is, in the plan's order.

@@ -1192,3 +1192,5 @@ unread metadata. Default fields are skipped on serialization, preserving
 ordinary-table schema bytes and checksums. Historical state and plan byte
 fixtures keep their original envelope versions. A new envelope advances its
 version deliberately; prior published schema archives are never rewritten.
+
+PR C advances state/plan/schema-set to 28/45/52 for authored policy predicates and created-table operations (oldest state stays 6); the generated schemas change only their publication stamp.

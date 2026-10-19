@@ -893,7 +893,9 @@ fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. }
         | Change::SetStorageParameters { .. }
-        | Change::SetReplicaIdentity { .. }
+        | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
+            | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
         | Change::DropUnique { .. }
         | Change::AddForeignKey { .. }
@@ -1520,6 +1522,19 @@ pub fn describe(c: &Change) -> String {
             parts.extend(reset.iter().map(|k| format!("{k} reset")));
             format!("~ storage parameters: {}", parts.join(", "))
         }
+        Change::CreatePolicy { name, policy, .. } => format!(
+            "+ create row policy {name} FOR {} AS {}",
+            policy.command.as_str().to_ascii_uppercase(),
+            if policy.restrictive {
+                "RESTRICTIVE"
+            } else {
+                "PERMISSIVE"
+            }
+        ),
+        Change::SetRowSecurity { to, .. } => format!(
+            "~ row security: enabled={}, forced={}",
+            to.enabled, to.forced
+        ),
         Change::SetReplicaIdentity { to, .. } => match to {
             Some(identity) => format!("~ replica identity -> {identity}"),
             None => "~ replica identity -> default".to_owned(),

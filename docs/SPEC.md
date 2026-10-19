@@ -301,10 +301,10 @@ indexes:
   omitted WITH CHECK remains distinct from one equal to USING. A policy
   has no uid. `data:` with either flag or any policy, and RLS on partition
   trees, are refused. SQL Server refuses non-default flags or a nonempty
-  policy map. PRs A and B supply the model, format and catalog read. RLS
-  tables remain named limitations and are excluded from adoption until PR C,
-  so their presence does not block unrelated ordinary-table plans
-  (DEC-1172.4). Planning and saved-plan replay refuse declared RLS meanwhile.
+  policy map. Ordinary RLS tables are adopted. Created tables receive policies
+  after modules and bootstrap inserts, followed by independent ENABLE/FORCE.
+  Unchanged adopted policies are no-ops; standing flag/policy alterations
+  arrive with #1173. Policy predicate bindings remain #595's named limitation.
 - **`system_time:` gives a SQL Server table its `PERIOD FOR SYSTEM_TIME`**:
   `period: [start, end]` names two `datetime2` columns, not nullable, and
   `hidden: true` hides both. Under `versioning:` it gives the table system
@@ -1258,14 +1258,18 @@ plan itself, and refuses to record if either comparison fails. The promise has
 two halves:
 
 1. **Everything the plan does not touch is unchanged.** Every table, column,
-   constraint, index, module, role, grant and declared row that no change of
-   the plan names is the same in the read-back as in the approved baseline.
+   constraint, index, row-security flags, policy, module, role, grant and declared
+   row that no change of the plan names is the same in the read-back as in the approved baseline.
 2. **Everything the plan does touch is what the plan said.** A column the plan
    adds or alters has the type (normalized), nullability, identity and
    default-presence the plan gives it; a constraint or index the plan adds has
    the definition the plan adds it with; a row the plan writes holds the cells
    the plan spelled. Fields the engine rewrites (a default's text, a check's or
-   filter's expression) are compared by presence, not text.
+   filter's or policy's expression) are compared by presence, not text.
+   A created policy retains its exact name, command, permissive/restrictive mode
+   and targets, with USING and WITH CHECK presence checked independently. An
+   untouched policy keeps its exact catalog predicates; both RLS flags remain
+   independently comparable.
 
 **Assumption: one deployer at a time.** The guard is a detector, not a lock
 against other writers. It assumes that no other session is changing the

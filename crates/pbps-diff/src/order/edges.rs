@@ -58,6 +58,8 @@ pub enum Because {
     Replaces(ObjectKey),
     /// A `depends_on:` annotation.
     Declared,
+    /// Created policies follow the build; RLS flags follow policies.
+    RowSecurity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -554,6 +556,9 @@ pub fn graph(
                 );
             }
         }
+    }
+    for (a, b) in super::row_security::edges(operations.iter().map(Operation::change)) {
+        edge(a, b, Source::Effect, Because::RowSecurity);
     }
     declared_edges(operations, declared, &mut |a, b| {
         edge(a, b, Source::Declared, Because::Declared)

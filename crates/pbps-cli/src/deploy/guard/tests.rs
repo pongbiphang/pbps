@@ -25,7 +25,7 @@ fn plan(changes: Vec<Change>) -> ChangeSet {
 }
 
 #[test]
-fn row_security_is_held_exactly_for_kept_and_created_tables() {
+fn row_security_is_exact_when_kept_and_structural_when_created() {
     let pg = pbps_pg::Postgres::new();
     let mut declared = table();
     declared.row_policies.insert(
@@ -72,16 +72,20 @@ fn row_security_is_held_exactly_for_kept_and_created_tables() {
                             Some("id > 0".into())
                     }
                 }
-                let error = refuse_unplanned_movement(
+                let result = refuse_unplanned_movement(
                     &pg,
                     &changes,
                     baseline,
                     &schema(changed),
                     "test",
                     read,
-                )
-                .unwrap_err();
-                assert!(error.to_string().contains("row-security"), "{error:#}");
+                );
+                if baseline.tables.is_empty() && (field == 3 || field == 2 && !read.whole()) {
+                    result.unwrap();
+                } else {
+                    let error = result.unwrap_err();
+                    assert!(error.to_string().contains("row-security"), "{error:#}");
+                }
             }
         }
     }

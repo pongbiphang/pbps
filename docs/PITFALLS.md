@@ -2208,6 +2208,14 @@ Three traps sat inside the fix, and each of them is a measurement:
 
 ## YAML and file-format traps
 
+A PostgreSQL policy target `public` is the scalar target for every role. Inside
+a role list PostgreSQL discards the named roles beside it; the loader refuses
+that form rather than recording permissions the engine did not keep
+(DEC-1172.1). A bare policy's omitted predicates stay absent: do not invent
+`USING (true)` or copy USING into WITH CHECK. Measured on 16 and 18, the bare
+permissive ALL policy and explicit TRUE policy admitted different rows.
+
+
 - **`null` cannot be a YAML key** (it is the null literal); the field is
   `nullable`.
 - **`no` / `yes` / `on` / `off` parse as booleans.** `pbps fmt` must quote

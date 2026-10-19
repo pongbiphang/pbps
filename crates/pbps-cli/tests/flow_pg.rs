@@ -1482,6 +1482,8 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             | change @ pbps_model::Change::SetPartitionDefault { .. }
             | change @ pbps_model::Change::SetPartitionNotNull { .. }
             | change @ pbps_model::Change::SetStorageParameters { .. }
+            | change @ pbps_model::Change::CreatePolicy { .. }
+            | change @ pbps_model::Change::SetRowSecurity { .. }
             | change @ pbps_model::Change::SetReplicaIdentity { .. }
             | change @ pbps_model::Change::AddUnique { .. }
             | change @ pbps_model::Change::DropUnique { .. }
@@ -15083,17 +15085,20 @@ fn unrelated_routine_limitations_do_not_refuse_a_managed_table_or_overload() {
     ]));
     succeeds(d.run(&["verify", "--db", connection]));
 
-    // A real table limitation must still refuse the same managed scope.
-    // Row-level security is one; an unlogged table was until #1443 held it.
-    on_server(connection, "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY");
+    // A real table limitation still refuses the same managed scope. RLS is
+    // adopted now; an INSERT rewrite rule remains unrepresentable.
+    on_server(
+        connection,
+        "CREATE RULE swallow_insert AS ON INSERT TO app.t DO INSTEAD NOTHING",
+    );
     let refused = d.run(&["plan", "--db", connection]);
     assert_ne!(code(&refused), 0);
     assert!(
-        stderr(&refused).contains("row-level security"),
+        stderr(&refused).contains("rewrite rules"),
         "{}",
         stderr(&refused)
     );
-    on_server(connection, "ALTER TABLE app.t DISABLE ROW LEVEL SECURITY");
+    on_server(connection, "DROP RULE swallow_insert ON app.t");
 
     // The exact managed signature becoming unsupported is also a limitation.
     on_server(
@@ -30963,7 +30968,7 @@ fn a_partitions_drop_follows_the_row_changes_that_stop_referencing_it() {
 
 #[test]
 #[ignore = "needs both live PostgreSQL versions"]
-fn row_security_left_out_of_adoption_does_not_block_an_ordinary_plan() {
+fn row_security_adoption_preserves_policies_during_an_unrelated_column_migration() {
     for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
         let base = std::env::var(variable).expect("live PostgreSQL fixture setting");
         let own = OwnDatabase::new(&base, "rls1172");
@@ -30991,12 +30996,16 @@ fn row_security_left_out_of_adoption_does_not_block_an_ordinary_plan() {
         let d = Demo::new("rls1172");
         let pulled = succeeds(d.run(&["pull", "--db", connection]));
         assert!(
-            stderr(&pulled).contains("#1172's later PRs"),
+            !stderr(&pulled).contains("#1172's later PRs"),
             "{}",
             stderr(&pulled)
         );
+        let loaded = pbps_load::load_schema_dir(&d.dir.join("schema"))
+            .unwrap()
+            .schema;
         for name in ["enabled", "forced", "disabled"] {
-            assert!(!d.dir.join(format!("schema/app.{name}.yml")).exists());
+            assert!(d.dir.join(format!("schema/app.{name}.yml")).exists());
+            assert!(loaded.tables[&pbps_model::TableName::new("app", name)].has_row_security());
         }
         d.commit();
         succeeds(d.run(&[
@@ -31004,7 +31013,7 @@ fn row_security_left_out_of_adoption_does_not_block_an_ordinary_plan() {
             "--db",
             connection,
             "--reason",
-            "adopt ordinary table",
+            "adopt ordinary and row-security tables",
         ]));
         let path = d.dir.join("schema/app.t.yml");
         let original = std::fs::read_to_string(&path).unwrap();
@@ -31012,6 +31021,11 @@ fn row_security_left_out_of_adoption_does_not_block_an_ordinary_plan() {
         assert_ne!(edited, original);
         std::fs::write(path, edited).unwrap();
         let plan = connected_artifact(&d, connection, false);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+        assert!(
+            matches!(&saved.changes.changes[..], [step] if matches!(&step.change, pbps_model::Change::AddColumn { table, name, .. } if table == &pbps_model::TableName::new("app", "t") && name == "label"))
+        );
         succeeds(approved_apply(&d, connection, &plan, &[]));
         succeeds(d.run(&["verify", "--db", connection]));
         let next = succeeds(d.run(&["plan", "--db", connection, "--format", "json"]));
@@ -31019,21 +31033,145 @@ fn row_security_left_out_of_adoption_does_not_block_an_ordinary_plan() {
         assert_eq!(next["data"]["changes"], 0, "{next}");
         assert_eq!(text_of(connection, catalog), before);
         let snapshot = latest_snapshot(connection);
-        assert_eq!(snapshot.schema.tables.len(), 1);
-        assert!(
-            snapshot
-                .schema
-                .tables
-                .values()
-                .all(|t| !t.has_row_security())
-        );
-
-        // The same flags on the managed table still refuse before planning.
-        on_server(connection, "ALTER TABLE app.t ENABLE ROW LEVEL SECURITY");
+        assert_eq!(snapshot.schema.tables.len(), 4);
+        for name in ["enabled", "forced", "disabled"] {
+            let name = pbps_model::TableName::new("app", name);
+            assert_eq!(snapshot.schema.tables[&name], loaded.tables[&name]);
+        }
+        // A declaration edit on that adopted table names the future boundary.
+        let path = d.dir.join("schema/app.disabled.yml");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("\nrow_security: {enabled: true}\n");
+        std::fs::write(path, text).unwrap();
         let refused = d.run(&["plan", "--db", connection]);
         assert_ne!(code(&refused), 0);
         assert!(
-            stderr(&refused).contains("row-level security"),
+            stderr(&refused).contains("arrives with #1173"),
+            "{}",
+            stderr(&refused)
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs both live PostgreSQL versions"]
+fn row_security_created_policies_follow_routines_and_converge_after_apply_and_bootstrap() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).unwrap();
+        let own = OwnDatabase::new(&base, "rls_create1172");
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new("rls-create1172");
+        d.keyed(connection);
+        d.table("table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\nprimary_key: [id]\ndata: {mode: ensure, rows: {1: {}}}\n");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        declare_function(&d, "visible", "SELECT x");
+        let path = d.dir.join("schema/app.docs.yml");
+        let declaration = "table: app.docs\ncolumns:\n  id: {type: integer, nullable: false}\n  extra: {type: integer}\nprimary_key: [id]\nchecks: {tenant_rows: 'id > 0'}\nrow_security: {enabled: true, forced: true}\nrow_policies:\n  tenant_rows:\n    using: 'app.visible(id) > 0'\n";
+        std::fs::write(&path, declaration).unwrap();
+        let plan = connected_artifact(&d, connection, false);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+        let at = |check: fn(&pbps_model::Change) -> bool| {
+            saved
+                .changes
+                .changes
+                .iter()
+                .position(|p| check(&p.change))
+                .unwrap()
+        };
+        assert!(
+            at(|c| matches!(c, pbps_model::Change::CreateModule { .. }))
+                < at(|c| matches!(c, pbps_model::Change::CreatePolicy { .. }))
+        );
+        assert!(
+            at(|c| matches!(c, pbps_model::Change::CreatePolicy { .. }))
+                < at(|c| matches!(c, pbps_model::Change::SetRowSecurity { .. }))
+        );
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "grant-widen"],
+        ));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let noop = succeeds(d.run(&["plan", "--db", connection, "--format", "json"]));
+        let json: serde_json::Value = serde_json::from_str(&stdout(&noop)).unwrap();
+        assert_eq!(json["data"]["changes"], 0, "{json}");
+        assert!(json["findings"].to_string().contains("#595"), "{json}");
+        let snapshot = latest_snapshot(connection);
+        let docs = &snapshot.schema.tables[&pbps_model::TableName::new("app", "docs")];
+        assert_eq!(
+            docs.row_security,
+            pbps_model::RowSecurity {
+                enabled: true,
+                forced: true
+            }
+        );
+        assert!(docs.row_policies["tenant_rows"].using.is_some());
+        assert!(docs.row_policies["tenant_rows"].with_check.is_none());
+
+        // The same declarations bootstrap on a second empty target. Its data
+        // inserts precede policy setup as well as every routine creation.
+        let fresh = OwnDatabase::new(&base, "rls_bootstrap1172");
+        on_server(fresh.connection(), "CREATE SCHEMA app");
+        let other = Demo::new("rls-bootstrap1172");
+        other.keyed(fresh.connection());
+        for entry in std::fs::read_dir(d.dir.join("schema")).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(
+                entry.path(),
+                other.dir.join("schema").join(entry.file_name()),
+            )
+            .unwrap();
+        }
+        std::fs::copy(
+            d.dir.join("schema.ids.json"),
+            other.dir.join("schema.ids.json"),
+        )
+        .unwrap();
+        other.commit();
+        let script = other.dir.join("bootstrap.sql");
+        succeeds(other.run(&[
+            "bootstrap",
+            "--db",
+            fresh.connection(),
+            "--sql",
+            script.to_str().unwrap(),
+        ]));
+        let sql = std::fs::read_to_string(script).unwrap();
+        let policy_at = sql.find("CREATE POLICY").unwrap();
+        assert!(sql.find("CREATE FUNCTION").unwrap() < policy_at, "{sql}");
+        assert!(sql.find("INSERT INTO").unwrap() < policy_at, "{sql}");
+        assert!(
+            policy_at < sql.find("ENABLE ROW LEVEL SECURITY").unwrap(),
+            "{sql}"
+        );
+        let noop = succeeds(other.run(&["plan", "--db", fresh.connection(), "--format", "json"]));
+        let json: serde_json::Value = serde_json::from_str(&stdout(&noop)).unwrap();
+        assert_eq!(json["data"]["changes"], 0, "{json}");
+
+        // The connected retype and routine rebuild are refused by policy name.
+        std::fs::write(
+            &path,
+            declaration.replace("id: {type: integer", "id: {type: bigint"),
+        )
+        .unwrap();
+        let refused = d.run(&["plan", "--db", connection]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("tenant_rows") && stderr(&refused).contains("#1173"),
+            "{}",
+            stderr(&refused)
+        );
+        std::fs::write(&path, declaration).unwrap();
+        declare_function(&d, "visible", "SELECT x + 1");
+        let refused = d.run(&["plan", "--db", connection]);
+        assert_ne!(code(&refused), 0);
+        assert!(
+            stderr(&refused).contains("tenant_rows") && stderr(&refused).contains("#1173"),
             "{}",
             stderr(&refused)
         );

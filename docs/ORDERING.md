@@ -33,7 +33,7 @@ The differ sorts every planned change by, in order:
    | 11 | `InsertRow`, `UpdateRow` |
    | 12 | `DeleteRow` |
    | 13 | A partitioned parent's `AddIndex` first (13, 0); `SetPrimaryKey { to: Some }`, `AddUnique`, `AddForeignKey`, `AddCheck`, `AddIndex`; P: the other `SetReplicaIdentity`, last |
-   | 14 | `CreateModule`, `AlterModule`; `PublicExecution` immediately after its routine's create (#687) |
+   | 14 | `CreateModule`, `AlterModule`; `PublicExecution` immediately after its routine's create (#687); P: `CreatePolicy` at (14, 2), then `SetRowSecurity` at (14, 3) |
    | 15 | `CreateRole` |
    | 16 | `Grant` |
    | 17 | `SetDataMode`, `SetEnsureKeys` |
@@ -322,11 +322,22 @@ requirement is common to all of them, so it is listed once,
 | `SetReplicaIdentity` | 0 (0, 1) or 13, last | P: the key, unique constraint or unique index it names, over NOT NULL columns. At (0, 1) when that stands before the plan, before any drop of the old identity's index; after the additions otherwise | The table's replica identity (DEC-1444.1) | Exists, Is |
 | `AddCheck` | 13 | Its columns, valid data. Functions it calls: *content* | A check | Exists, Reads, creates |
 | `CreateModule`, `AlterModule` | 14 | What its definition names: other modules, by lexed name (DECISIONS 315); tables, columns and types | A module. P `AlterModule`: a drop and a create | Exists, creates, rewrites |
+| `CreatePolicy` | 14 (14, 2) | P: a matching table created in this plan; all modules, structural changes and bootstrap inserts first. Predicate bindings remain #595's named limitation | One table-local policy, with its own name namespace | Exists, creates |
+| `SetRowSecurity` | 14 (14, 3) | P: its matching created table and all planned policies; modules and bootstrap inserts first | Rewrites the table's independent RLS flags; no standing transitions until #1173 | Exists, rewrites |
 | `CreateRole` | 15 | The name free | A role | creates |
 | `PublicExecution` | 14, at its routine's create rank | The routine exists | `PUBLIC`'s execute on a routine, settled in the statement after its `CREATE` (#687) | Is, rewrites |
 | `Grant` | 16 | The role and the target exist | A permission | Exists, Is, rewrites |
 | `SetDataMode` | 17 | The table's rows written | The table's data mode | Exists, Reads |
 | `SetEnsureKeys` | 17 | The table's rows written | The table's managed ensure keys | Exists, Reads |
+
+The two created-table RLS kinds share one structural phase rule in
+`pbps_diff::order::row_security::edges`: structural/table changes, module
+creates/alters and their `PublicExecution` decisions precede both kinds;
+every `CreatePolicy` precedes `SetRowSecurity`. The central CLI schedule and
+the resolver graph use the same edges and `Schedule::settle`, preserving
+class 14 without an additional positional reorder pass. These edges express
+the creation boundary, not predicate binding evidence. A policy and check
+may share a name because their table-local namespaces differ.
 
 ## Pairs that interact
 
@@ -338,6 +349,13 @@ tables list:
   a pass, a refusal);
 - every pair the classes get wrong;
 - the pairs a reviewer is likely to ask about.
+
+Created-table policies interact with module creation/alteration, table and
+column construction, constraints and bootstrap inserts through the setup
+phase above. Flag setup follows every policy setup. Standing policy/flag
+changes refuse with #1173; connected column drop/retype and routine rebuild
+under a retained policy refuse by its catalog-proven name. They are not
+silently rebuilt or removed by this slice.
 
 A pair in no category is independent: neither side's effect meets the
 other's requirement in the table above. Columns:
@@ -441,6 +459,8 @@ and the expression-bearing changes that need a function.
 | `CreateRole` → `Grant` to it | fixed | class 15 before 16 | ✓ |
 | `CreateModule` or `AlterModule` → `Grant` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants are restated after it | ✓ ADR-0010 §5 |
 | `CreateModule` or `AlterModule` → `PublicExecution` on the routine | fixed | same class, same create rank and subject: the next statement, so an autocommit `--sql` script never leaves the routine executable by `PUBLIC` past its own `CREATE` | ✓ #687 |
+| Structural/table changes, module creates/alters and `PublicExecution` → `CreatePolicy` or `SetRowSecurity` | fixed | shared `row_security::edges` setup phase, settled by the CLI schedule and resolver graph; bootstrap inserts finish before either kind | ✓ DEC-1172.2 |
+| `CreatePolicy` → `SetRowSecurity` | fixed | shared setup phase: policies at (14, 2), flags at (14, 3). Policies on one table commute with each other; flags on separate created tables commute | ✓ DEC-1172.2 |
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
 | Row writes → `SetDataMode` / `SetEnsureKeys` of their table | fixed | class 11 and 12 before 17 | ✓ |
 | Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315); on SQL Server a schema-bound function caller also requires the callee's `Final` definition, so its in-place rewrite orders the pair in the effects. Releasing a baseline schema binding instead precedes the old callee's rewrite through `BeforeRewrite`, settled by the shared schedule | ✓ DEC-2192.1, DEC-2228.1 |

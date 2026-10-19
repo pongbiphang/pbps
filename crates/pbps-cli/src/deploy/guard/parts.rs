@@ -16,6 +16,7 @@ enum Slot<'a> {
     Unique(&'a str),
     ForeignKey(&'a str),
     Check(&'a str),
+    Policy(&'a str),
     Index(&'a str),
     Computed(&'a str),
 }
@@ -27,6 +28,7 @@ impl<'a> Slot<'a> {
             Part::Unique => Self::Unique(part.name.expect("named unique")),
             Part::ForeignKey => Self::ForeignKey(part.name.expect("named foreign key")),
             Part::Check => Self::Check(part.name.expect("named check")),
+            Part::Policy => Self::Policy(part.name.expect("named policy")),
             Part::Index => Self::Index(part.name.expect("named index")),
             Part::Computed => Self::Computed(part.name.expect("named computed column")),
         }
@@ -45,6 +47,7 @@ impl<'a> Slot<'a> {
             Self::PrimaryKey => "",
             Self::Unique(n)
             | Self::ForeignKey(n)
+            | Self::Policy(n)
             | Self::Check(n)
             | Self::Index(n)
             | Self::Computed(n) => n,
@@ -57,6 +60,7 @@ impl<'a> Slot<'a> {
             Self::Unique(_) => "unique",
             Self::ForeignKey(_) => "foreign key",
             Self::Check(_) => "check",
+            Self::Policy(_) => "row policy",
             Self::Index(_) => "index",
             Self::Computed(_) => "computed column",
         }
@@ -70,6 +74,7 @@ impl<'a> Slot<'a> {
             Self::Unique(n) => PartDefinition::Unique(table.unique.get(n)?, false),
             Self::ForeignKey(n) => PartDefinition::ForeignKey(table.foreign_keys.get(n)?),
             Self::Check(n) => PartDefinition::Check(table.checks.get(n)?),
+            Self::Policy(n) => PartDefinition::Policy(table.row_policies.get(n)?),
             Self::Index(n) => PartDefinition::Index(table.indexes.get(n)?, false),
             Self::Computed(n) => PartDefinition::Computed(table.computed.get(n)?),
         })
@@ -79,6 +84,7 @@ impl<'a> Slot<'a> {
         std::iter::once(Self::PrimaryKey)
             .chain(table.unique.keys().map(|n| Self::Unique(n)))
             .chain(table.foreign_keys.keys().map(|n| Self::ForeignKey(n)))
+            .chain(table.row_policies.keys().map(|n| Self::Policy(n)))
             .chain(table.checks.keys().map(|n| Self::Check(n)))
             .chain(table.indexes.keys().map(|n| Self::Index(n)))
             .chain(table.computed.keys().map(|n| Self::Computed(n.raw())))
@@ -136,6 +142,7 @@ impl<'a> Parameters<'a> {
                 check(PartDefinition::Index(&value, clustered))
             }
             PartDefinition::ForeignKey(_)
+            | PartDefinition::Policy(_)
             | PartDefinition::Check(_)
             | PartDefinition::Computed(_) => check(definition),
         }
@@ -183,7 +190,7 @@ impl<'a> PartChanges<'a> {
             Some(Slot::Unique(n)) => Some(pbps_model::Clustered::Unique(n.to_owned())),
             Some(Slot::Index(n)) => Some(pbps_model::Clustered::Index(n.to_owned())),
             None => Some(pbps_model::Clustered::Heap),
-            Some(Slot::ForeignKey(_) | Slot::Check(_) | Slot::Computed(_)) => {
+            Some(Slot::ForeignKey(_) | Slot::Check(_) | Slot::Computed(_) | Slot::Policy(_)) => {
                 unreachable!("only index-backed parts hold rows")
             }
         };
@@ -201,6 +208,9 @@ impl<'a> PartChanges<'a> {
                             }
                             PartDefinition::ForeignKey(value) => {
                                 table.foreign_keys.insert(name, value.clone());
+                            }
+                            PartDefinition::Policy(value) => {
+                                table.row_policies.insert(name, value.clone());
                             }
                             PartDefinition::Check(value) => {
                                 table.checks.insert(name, value.clone());
@@ -221,6 +231,9 @@ impl<'a> PartChanges<'a> {
                         Slot::ForeignKey(n) => {
                             table.foreign_keys.remove(*n);
                         }
+                        Slot::Policy(n) => {
+                            table.row_policies.remove(*n);
+                        }
                         Slot::Check(n) => {
                             table.checks.remove(*n);
                         }
@@ -240,7 +253,7 @@ impl<'a> PartChanges<'a> {
                     .map(|p| &mut p.storage_parameters),
                 Slot::Unique(n) => table.unique.get_mut(*n).map(|p| &mut p.storage_parameters),
                 Slot::Index(n) => table.indexes.get_mut(*n).map(|p| &mut p.storage_parameters),
-                Slot::ForeignKey(_) | Slot::Check(_) | Slot::Computed(_) => None,
+                Slot::ForeignKey(_) | Slot::Check(_) | Slot::Computed(_) | Slot::Policy(_) => None,
             };
             if let Some(parameters) = parameters {
                 effect.parameters.apply(parameters);
@@ -475,7 +488,10 @@ fn clustered(after: PartAfter<'_>) -> bool {
             | PartDefinition::Index(_, clustered),
         ) => clustered,
         PartAfter::Standing(
-            PartDefinition::ForeignKey(_) | PartDefinition::Check(_) | PartDefinition::Computed(_),
+            PartDefinition::ForeignKey(_)
+            | PartDefinition::Policy(_)
+            | PartDefinition::Check(_)
+            | PartDefinition::Computed(_),
         )
         | PartAfter::Gone(_) => false,
     }
@@ -513,6 +529,7 @@ fn part_as_planned(
         // and the two referential actions — so all of it is comparable (182).
         PartDefinition::ForeignKey(was) => table.foreign_keys.get(name)? == was,
         PartDefinition::Check(_) => return None,
+        PartDefinition::Policy(was) => was.agrees_when_written(table.row_policies.get(name)?),
         PartDefinition::Index(was, clustered) => {
             index_as_declared(was, table.indexes.get(name)?)
                 && (holder(table) == Some(Slot::Index(name))) == clustered

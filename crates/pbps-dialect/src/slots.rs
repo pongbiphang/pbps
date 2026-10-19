@@ -46,6 +46,7 @@ pub enum TableSpace {
     Indexes,
     Constraints,
     Triggers,
+    Policies,
 }
 
 /// One name in one namespace.
@@ -402,6 +403,7 @@ pub fn slots(dialect: &dyn Dialect, address: &Address) -> Vec<SlotKey> {
         NameKind::Index => vec![index()],
         NameKind::Key => vec![index(), constraint()],
         NameKind::Constraint => vec![constraint()],
+        NameKind::Policy => vec![table(TableSpace::Policies)],
         NameKind::Column => vec![table(TableSpace::Columns)],
         NameKind::Role => vec![Namespace::Roles],
     };

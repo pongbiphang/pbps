@@ -28,6 +28,7 @@ pub mod expand;
 pub mod generated;
 mod rewrites;
 pub(crate) mod roles;
+pub mod row_security;
 pub mod schedule;
 pub mod shadow;
 pub mod slots;

@@ -29,6 +29,7 @@ mod pins;
 mod prompt;
 mod report;
 mod resolution;
+mod row_security;
 mod saved_plan;
 mod state_list;
 mod status;
@@ -3205,6 +3206,15 @@ fn cmd_plan(
     }
 
     let mut findings: Vec<output::Finding> = Vec::new();
+    for notice in crate::row_security::binding_notices(&loaded.schema) {
+        if !json {
+            eprintln!("warning: {notice}");
+        }
+        findings.push(output::Finding::warning(
+            "plan.policy-bindings-unchecked",
+            notice,
+        ));
+    }
 
     let res = match resolve_with_intent(project, &loaded, &ids, may_prompt, json)? {
         Ok(r) => r,
@@ -3940,27 +3950,10 @@ pub(crate) fn validate_saved_plan(
         .validate()
         .context("the plan's post-apply identity mapping is inconsistent")?;
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
+    crate::row_security::validate(&plan.changes, &plan.ids, dialect)?;
 
     let risks = pbps_diff::order::generated::risks(&plan.changes, &plan.ids, dialect);
     for (index, planned) in plan.changes.changes.iter().enumerate() {
-        // A saved artifact need not have passed this build's differ. Refuse
-        // every operation carrying a complete table shape (DEC-1172.1).
-        // The other operations carry no Table payload.
-        #[allow(clippy::wildcard_enum_match_arm)]
-        let shape = match &planned.change {
-            pbps_model::Change::CreateTable { name, table, .. } => Some((name, table)),
-            pbps_model::Change::AttachPartition { table, shape, .. }
-            | pbps_model::Change::DetachPartition { table, shape, .. } => Some((table, shape)),
-            _ => None,
-        };
-        if let Some((name, table)) = shape
-            && table.has_row_security()
-        {
-            bail!(
-                "{} has row-security flags or policies; RLS planning arrives with #1172's later PRs",
-                name.shown()
-            );
-        }
         let expected = &risks[index];
         if &planned.risks != expected {
             let names = |risks: &std::collections::BTreeSet<pbps_model::RiskClass>| {
@@ -4838,7 +4831,7 @@ mod tests {
     }
 
     #[test]
-    fn row_security_saved_plans_refuse_every_table_payload_until_later_prs() {
+    fn row_security_saved_plans_refuse_incomplete_creations_and_partition_payloads() {
         use pbps_model::{
             Change, ChangeSet, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, SavedPlan, Table,
         };
@@ -4883,6 +4876,13 @@ mod tests {
                             shape: Box::new(shape),
                         },
                     };
+                    // This tests policy completeness, so its table creation
+                    // needs the ordinary valid final identity mapping first.
+                    let mut ids = IdsFile::default();
+                    if kind == 0 {
+                        ids.tables
+                            .insert("t_117200".parse().unwrap(), "app.t".parse().unwrap());
+                    }
                     let mut planned = PlannedChange::new(change);
                     planned.risks = dialect.change_risks(&planned.change);
                     let plan = SavedPlan::new(
@@ -4898,7 +4898,7 @@ mod tests {
                         ChangeSet {
                             changes: vec![planned],
                         },
-                        IdsFile::default(),
+                        ids,
                     );
                     // Exercise artifact deserialization, not just the builder.
                     let plan =
@@ -4910,7 +4910,7 @@ mod tests {
                         let message = result.unwrap_err().to_string();
                         assert!(message.contains("app.t"), "{message}");
                         assert!(
-                            message.contains("RLS planning arrives with #1172's later PRs"),
+                            message.contains("row-security") || message.contains("row security"),
                             "{message}"
                         );
                     }

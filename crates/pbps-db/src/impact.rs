@@ -142,6 +142,8 @@ pub fn rename_targets(
             | Change::SetIndexStorageParameters { .. }
             | Change::SetTablePersistence { .. }
             | Change::SetStorageParameters { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
             | Change::DropUnique { .. }

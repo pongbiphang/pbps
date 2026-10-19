@@ -6830,6 +6830,17 @@ excluded until PR C (DEC-1172.4). Declared expression tracking, create-only
 change kinds, emission, dependent refusals and filtered-probe wrapping belong
 to PR C.
 
+
+PR C of #1172 implements DEC-1172.1's created-table planning boundary with
+CreatePolicy and SetRowSecurity, checked against their table creation. Policies
+follow modules and bootstrap inserts, then independent ENABLE/FORCE flags.
+Standing-table differences name #1173; unchanged adopted policies do not block
+unrelated migrations. Authored predicates overlay only matching presence;
+untouched catalog predicates remain exact drift state. Predicate binding proof
+is still #595's named limitation, not a reason to omit an otherwise supported
+table. The created-only operations have no intrinsic risk.
+
+
 <a id="dec-2104-1"></a>
 
 **DEC-2104.1. The commutation suite lists no exception for a plan whose

@@ -42,10 +42,10 @@ pub enum DiffError {
     )]
     PartitionDefault { column: ColumnRef, reason: String },
     #[error(
-        "{table} has row-security flags or policies; RLS planning arrives with #1172's later PRs",
+        "{table}: {part} changed on a standing table; RLS alteration planning arrives with #1173",
         table = .table.shown(),
     )]
-    RowSecurityPlanningPending { table: TableName },
+    RowSecurityPlanningPending { table: TableName, part: String },
     /// In most databases IDENTITY cannot be changed with ALTER; the whole table
     /// has to be rebuilt. That is beyond what declarative automation should do on
     /// its own — a human has to choose the migration strategy.
@@ -632,27 +632,6 @@ pub(crate) fn diff_partial_rebuilding(
             .map(|modules| DiffError::DependsOnCycle { modules })
             .collect();
 
-    // Representability must not turn a policy into an ignored CreateTable
-    // field, or erase a standing policy change (DEC-1172.1). Both sides matter:
-    // removing the last policy is just as unsupported as adding the first.
-    let secured: BTreeSet<_> = base
-        .schema
-        .tables
-        .iter()
-        .chain(&declared.schema.tables)
-        .filter(|(_, table)| table.has_row_security())
-        .map(|(name, _)| name.clone())
-        .collect();
-    if !secured.is_empty() {
-        return Diffed {
-            errors: secured
-                .into_iter()
-                .map(|table| DiffError::RowSecurityPlanningPending { table })
-                .collect(),
-            ..Default::default()
-        };
-    }
-
     let base_tables = &base.ids.tables;
     let declared_tables = &declared.ids.tables;
     let index = Indexes {
@@ -748,6 +727,23 @@ pub(crate) fn diff_partial_rebuilding(
                 .as_ref()
                 .and_then(|_| declared.ids.moves.get(uid))
                 .map(|m| m.max_rows);
+            for (policy_name, policy) in &table.row_policies {
+                changes.push(Change::CreatePolicy {
+                    table: name.clone(),
+                    name: policy_name.clone(),
+                    policy: policy.clone(),
+                    origin: pbps_model::RowSecurityOrigin::Created,
+                });
+            }
+            if !table.row_security.is_default() {
+                changes.push(Change::SetRowSecurity {
+                    uid: uid.clone(),
+                    table: name.clone(),
+                    from: Default::default(),
+                    to: table.row_security,
+                    origin: pbps_model::RowSecurityOrigin::Created,
+                });
+            }
             changes.push(Change::CreateTable {
                 uid: uid.clone(),
                 name: name.clone(),
@@ -831,6 +827,27 @@ pub(crate) fn diff_partial_rebuilding(
         ) else {
             continue;
         };
+        // Compare only matched identities: unchanged adopted policies and
+        // unrelated migrations must remain usable before #1173.
+        if base_table.row_security != declared_table.row_security {
+            errs.push(DiffError::RowSecurityPlanningPending {
+                table: declared_name.clone(),
+                part: "row-security flags".into(),
+            });
+        }
+        for name in base_table
+            .row_policies
+            .keys()
+            .chain(declared_table.row_policies.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            if base_table.row_policies.get(name) != declared_table.row_policies.get(name) {
+                errs.push(DiffError::RowSecurityPlanningPending {
+                    table: declared_name.clone(),
+                    part: format!("row policy `{}`", pbps_model::escape::Escaped(name)),
+                });
+            }
+        }
         // A partition declared as an ordinary table is detached, and that is
         // all this plan does to it (#1544, DEC-1544.1): its base holds no
         // columns of its own, so a column-by-column diff would read every one
@@ -1119,6 +1136,8 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1171,6 +1190,8 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1359,6 +1380,8 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1413,6 +1436,8 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::AddUnique { .. }
@@ -1779,6 +1804,14 @@ pub(crate) fn diff_partial_rebuilding(
             .is_some_and(|of| parent_moved.contains(&(of.parent.clone(), column.clone())))
     };
     let sort_class = |c: &Change| -> (u8, usize) {
+        // After every module and its PUBLIC decision, then policies before
+        // either flag. Keep the established class ordinals (DEC-1172.1).
+        if matches!(c, Change::CreatePolicy { .. }) {
+            return (14, 2);
+        }
+        if matches!(c, Change::SetRowSecurity { .. }) {
+            return (14, 3);
+        }
         if let Change::AlterColumnNumbering { column, .. } = c
             && bounds_first.contains(column)
         {
@@ -2493,6 +2526,8 @@ fn recreate_referenced_foreign_keys(
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetReplicaIdentity { .. } => continue,
         };
@@ -3011,6 +3046,8 @@ fn recreate_retyped_dependents(
         | Change::SetTablePersistence { .. }
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. }
+        | Change::CreatePolicy { .. }
+        | Change::SetRowSecurity { .. }
         | Change::SetStorageParameters { .. }
         | Change::SetReplicaIdentity { .. }
         | Change::AddUnique { .. }
@@ -4314,6 +4351,8 @@ fn refuse_partition_changes(
                 | Change::DropForeignKey { .. }
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
+                | Change::CreatePolicy { .. }
+                | Change::SetRowSecurity { .. }
                 | Change::SetStorageParameters { .. }
                 | Change::SetTablePersistence { .. }
         );
@@ -5023,6 +5062,8 @@ fn refuse_computed_dependencies(
                     | Change::SetTablePersistence { .. }
                     | Change::SetPartitionDefault { .. }
                     | Change::SetPartitionNotNull { .. }
+                    | Change::CreatePolicy { .. }
+                    | Change::SetRowSecurity { .. }
                     | Change::SetStorageParameters { .. }
                     | Change::SetReplicaIdentity { .. }
                     | Change::AddUnique { .. }
@@ -6085,6 +6126,8 @@ fn dependency_rank(
         | Change::SetColumnDeprecated { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
+        | Change::CreatePolicy { .. }
+        | Change::SetRowSecurity { .. }
         | Change::SetStorageParameters { .. }
         | Change::DropUnique { .. }
         | Change::AddCheck { .. }
@@ -6817,7 +6860,10 @@ fn order_key(c: &Change) -> u8 {
         // Late, it follows the index it names (DEC-1444.1); `sort_class`
         // moves the rest to the front.
         Change::SetReplicaIdentity { .. } => 13,
-        Change::CreateModule { .. } | Change::AlterModule { .. } => 14,
+        Change::CreatePolicy { .. }
+        | Change::SetRowSecurity { .. }
+        | Change::CreateModule { .. }
+        | Change::AlterModule { .. } => 14,
         // The `PUBLIC` decision for a routine travels with the routine: class
         // 14 at that routine's own create rank (`dependency_rank`), and its
         // subject is the routine's, so the sort puts it immediately after its
@@ -7177,63 +7223,107 @@ mod tests {
     }
 
     #[test]
-    fn row_security_planning_refuses_either_input_until_later_prs() {
-        let empty = Schema::default();
-        let empty_ids = IdsFile::default();
+    fn row_security_creation_is_explicit_and_unchanged_standing_policies_are_noops() {
+        let plain = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
+        for enabled in [false, true] {
+            for forced in [false, true] {
+                let mut secured = plain.clone();
+                let table = secured.tables.values_mut().next().unwrap();
+                table.row_security = pbps_model::RowSecurity { enabled, forced };
+                table.row_policies.insert(
+                    "tenant_rows".into(),
+                    pbps_model::RowPolicy {
+                        using: Some("id>0".into()),
+                        ..Default::default()
+                    },
+                );
+                let created = run(&Schema::default(), &secured, &[]);
+                assert!(matches!(
+                    created.changes[0].change,
+                    Change::CreateTable { .. }
+                ));
+                assert!(matches!(
+                    created.changes[1].change,
+                    Change::CreatePolicy { .. }
+                ));
+                assert_eq!(created.changes.len(), if enabled || forced { 3 } else { 2 });
+                assert!(created.changes.iter().all(|p| p.risks.is_empty()));
+                assert!(run(&secured, &secured, &[]).is_empty());
+                let mut unrelated = secured.clone();
+                unrelated
+                    .tables
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .columns
+                    .insert(
+                        "label".into(),
+                        Column {
+                            nullable: true,
+                            ..Column::new(ty("text"))
+                        },
+                    );
+                let change = run(&secured, &unrelated, &[]);
+                assert!(
+                    matches!(&change.changes[..], [p] if matches!(p.change, Change::AddColumn { .. }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row_security_standing_changes_refuse_both_additions_and_removals_by_name() {
         let plain = schema_of("app.t", table(&[("id", Column::new(ty("integer")))]));
         let ids = crate::resolve(&plain, &IdsFile::default(), &[], &ctx())
             .unwrap()
             .ids;
-        let empty_side = Side {
-            schema: &empty,
-            ids: &empty_ids,
-        };
-        let plain_side = Side {
-            schema: &plain,
-            ids: &ids,
-        };
-        let created = diff(empty_side, plain_side, &MinimalDialect, &Hints::default()).unwrap();
-        assert!(
-            matches!(&created.changes[..], [change] if matches!(change.change, Change::CreateTable { .. }))
-        );
-        assert!(
-            diff(plain_side, plain_side, &MinimalDialect, &Hints::default())
-                .unwrap()
-                .is_empty()
-        );
-        for shape in 0..3 {
+        for field in 0..8 {
             let mut secured = plain.clone();
-            let t = secured.tables.values_mut().next().unwrap();
-            match shape {
-                0 => t.row_security.enabled = true,
-                1 => t.row_security.forced = true,
-                _ => {
-                    t.row_policies
-                        .insert("p".into(), pbps_model::RowPolicy::default());
+            let table = secured.tables.values_mut().next().unwrap();
+            if field < 2 {
+                table.row_security = pbps_model::RowSecurity {
+                    enabled: field == 0,
+                    forced: field == 1,
+                };
+            } else {
+                let mut policy = pbps_model::RowPolicy::default();
+                match field {
+                    3 => policy.command = pbps_model::PolicyCommand::Select,
+                    4 => policy.restrictive = true,
+                    5 => policy.to = pbps_model::PolicyRoles::Roles(["app_user".into()].into()),
+                    6 => policy.using = Some("id>0".into()),
+                    7 => policy.with_check = Some("id>0".into()),
+                    _ => {}
                 }
+                table.row_policies.insert("tenant_rows".into(), policy);
             }
-            let secured_side = Side {
-                schema: &secured,
-                ids: &ids,
-            };
-            for (base, declared) in [
-                (empty_side, secured_side),
-                (plain_side, secured_side),
-                (secured_side, plain_side),
-                (secured_side, secured_side),
-            ] {
-                let errors = diff(base, declared, &MinimalDialect, &Hints::default()).unwrap_err();
+            for (base, after) in [(&plain, &secured), (&secured, &plain)] {
+                let errors = diff(
+                    Side {
+                        schema: base,
+                        ids: &ids,
+                    },
+                    Side {
+                        schema: after,
+                        ids: &ids,
+                    },
+                    &MinimalDialect,
+                    &Hints::default(),
+                )
+                .unwrap_err();
+                let message = errors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(";");
                 assert!(
-                    matches!(&errors[..], [DiffError::RowSecurityPlanningPending { table }] if table == &TableName::new("app", "t"))
+                    message.contains("app.t") && message.contains("arrives with #1173"),
+                    "{message}"
                 );
                 assert!(
-                    errors[0]
-                        .to_string()
-                        .contains("RLS planning arrives with #1172's later PRs")
+                    message.contains(if field < 2 { "flags" } else { "tenant_rows" }),
+                    "{message}"
                 );
-                let partial = diff_partial(base, declared, &MinimalDialect, &Hints::default());
-                assert!(partial.changes.is_empty());
-                assert_eq!(partial.errors, errors);
             }
         }
     }

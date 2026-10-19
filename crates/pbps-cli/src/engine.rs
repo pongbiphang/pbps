@@ -3481,6 +3481,7 @@ pub async fn account_for_module_dependents(
     let pg = pbps_pg::Postgres::new()
         .with_server_version(pbps_pg::roles::server_version_num(conn).await?);
     let dialect: &dyn pbps_dialect::Dialect = &pg;
+    refuse_policy_column_dependents(conn, changes, sources.after).await?;
     let mut found = module_dependents(conn, changes).await?;
     let untouched = crate::dependents::untouched_module_dependents(changes, &found, declared);
     if !untouched.is_empty() {
@@ -3590,6 +3591,7 @@ pub async fn check_module_dependents(
     stored_ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<()> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+    refuse_policy_column_dependents(conn, changes, ids).await?;
     let found = module_dependents(conn, changes).await?;
     // Match the planner's final relation first; each dependency lookup then
     // spells both ends at the statement's boundary (DEC-1875.1).
@@ -5275,4 +5277,43 @@ mod plan_name_tests {
         assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found]).is_err());
         assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[]).is_ok());
     }
+}
+
+/// A connected column edit cannot silently shed or invalidate a policy.
+/// Use recorded column identities, not lexical guesses about predicate text.
+async fn refuse_policy_column_dependents(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
+) -> anyhow::Result<()> {
+    if conn.driver() != Driver::Postgres {
+        return Ok(());
+    }
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+    for (at, p) in changes.changes.iter().enumerate() {
+        let Some((table, column, _, what)) = changed_column(&names, &p.change) else {
+            continue;
+        };
+        let stored = pbps_model::ColumnRef::new(table, column);
+        for policy in pbps_pg::modules::policies_on_column(conn, &stored).await? {
+            // A prior whole-table drop already removed the policy. No C
+            // statement removes or replaces an individual standing policy.
+            let removed = changes.changes[..at].iter().any(|step| {
+                if let pbps_model::Change::DropTable { uid, .. } = &step.change {
+                    names.table_at(uid, pbps_model::plan_names::At::Start) == Some(&policy.table)
+                } else {
+                    false
+                }
+            });
+            if !removed {
+                anyhow::bail!(
+                    "{} cannot be {what}: policy `{}` on {} depends on it; planning this policy change arrives with #1173",
+                    stored.shown(),
+                    pbps_model::escape::Escaped(&policy.name),
+                    policy.table.shown()
+                );
+            }
+        }
+    }
+    Ok(())
 }

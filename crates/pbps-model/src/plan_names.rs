@@ -283,6 +283,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         ),
         Change::SetTablePersistence { uid, table, .. }
         | Change::SetStorageParameters { uid, table, .. }
+        | Change::SetRowSecurity { uid, table, .. }
         | Change::SetReplicaIdentity { uid, table, .. }
         | Change::SetPartitionDefault { uid, table, .. }
         | Change::SetPartitionNotNull { uid, table, .. } => Table(
@@ -335,6 +336,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
         | Change::DropUnique { .. }
         | Change::AddForeignKey { .. }
         | Change::DropForeignKey { .. }
+        | Change::CreatePolicy { .. }
         | Change::AddCheck { .. }
         | Change::DropCheck { .. }
         | Change::AddIndex { .. }

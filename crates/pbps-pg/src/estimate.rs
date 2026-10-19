@@ -994,6 +994,8 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         Change::DropTable {
             detach_from: None, ..
         }
+        | Change::CreatePolicy { .. }
+        | Change::SetRowSecurity { .. }
         | Change::SetColumnDeprecated { .. }
         | Change::SetPrimaryKey { to: None, .. }
         | Change::DropUnique { .. }

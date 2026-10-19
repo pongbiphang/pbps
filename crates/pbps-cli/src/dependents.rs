@@ -490,11 +490,11 @@ fn named_at(sources: &PhysicalSources<'_>, at: At, holds: &Holds) -> Option<Hold
             let part = match part {
                 Part::Default(_) => Part::Default(here.address.name),
                 Part::Generated(_) => Part::Generated(here.address.name),
-                Part::Check(_) | Part::Index(_) => unreachable!(),
+                Part::Check(_) | Part::Index(_) | Part::Policy(_) => unreachable!(),
             };
             (here.address.table, part)
         }
-        Part::Check(_) | Part::Index(_) => {
+        Part::Check(_) | Part::Index(_) | Part::Policy(_) => {
             let Located::Present(table) = sources.locate_table(table, at) else {
                 return None;
             };
@@ -737,6 +737,12 @@ fn removal_of(
             }
             // No statement takes a generation expression off; only the
             // plan's own expression change can, and `weave` looks for that.
+            Part::Policy(_) => {
+                return Err(format!(
+                    "{}: policy rebuild planning arrives with #1173",
+                    d.described
+                ));
+            }
             Part::Generated(_) => {
                 return Err(format!(
                     "{}: a generated column's expression cannot be taken off around the module",
@@ -782,7 +788,7 @@ fn restoration_of(
                     index: Box::new(t.indexes.get(name).ok_or_else(unsupported)?.clone()),
                     clustered: false,
                 },
-                Part::Generated(_) => return Err(unsupported()),
+                Part::Policy(_) | Part::Generated(_) => return Err(unsupported()),
                 Part::Default(column) => {
                     let (to, fallback, origin) = if let Some(of) = &t.partition_of {
                         (
@@ -1753,6 +1759,8 @@ fn before_its_partitions_indexes(
                 | Change::DropCheck { .. }
                 | Change::AddForeignKey { .. }
                 | Change::DropForeignKey { .. }
+                | Change::CreatePolicy { .. }
+                | Change::SetRowSecurity { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::Grant { .. }
                 | Change::Revoke { .. }

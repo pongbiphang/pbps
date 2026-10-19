@@ -307,6 +307,106 @@
     }
   },
   {
+    "name": "CreatePolicy/select-public",
+    "change": {
+      "op": "create_policy",
+      "table": "app.t",
+      "name": "part",
+      "policy": {
+        "command": "select",
+        "to": "public",
+        "using": "n > 0"
+      },
+      "origin": "created"
+    }
+  },
+  {
+    "name": "CreatePolicy/update-restrictive",
+    "change": {
+      "op": "create_policy",
+      "table": "app.t",
+      "name": "part",
+      "policy": {
+        "command": "update",
+        "restrictive": true,
+        "to": {
+          "roles": [
+            "reader",
+            "writer"
+          ]
+        },
+        "using": "n > 0",
+        "with_check": "n < 100"
+      },
+      "origin": "created"
+    }
+  },
+  {
+    "name": "CreatePolicy/insert-check",
+    "change": {
+      "op": "create_policy",
+      "table": "app.t",
+      "name": "part",
+      "policy": {
+        "command": "insert",
+        "to": "public",
+        "with_check": "n > 0"
+      },
+      "origin": "created"
+    }
+  },
+  {
+    "name": "SetRowSecurity/enabled",
+    "change": {
+      "op": "set_row_security",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "from": {
+        "enabled": false,
+        "forced": false
+      },
+      "to": {
+        "enabled": true,
+        "forced": false
+      },
+      "origin": "created"
+    }
+  },
+  {
+    "name": "SetRowSecurity/forced-disabled",
+    "change": {
+      "op": "set_row_security",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "from": {
+        "enabled": false,
+        "forced": false
+      },
+      "to": {
+        "enabled": false,
+        "forced": true
+      },
+      "origin": "created"
+    }
+  },
+  {
+    "name": "SetRowSecurity/enabled-forced",
+    "change": {
+      "op": "set_row_security",
+      "uid": "t_aaaaaa",
+      "table": "app.t",
+      "from": {
+        "enabled": false,
+        "forced": false
+      },
+      "to": {
+        "enabled": true,
+        "forced": true
+      },
+      "origin": "created"
+    }
+  },
+  {
     "name": "SetReplicaIdentity",
     "change": {
       "op": "set_replica_identity",

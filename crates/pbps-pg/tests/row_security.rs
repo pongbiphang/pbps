@@ -108,3 +108,81 @@ fn row_security_validation_refuses_data_and_partition_trees() {
         assert!(pg.validate_partition(&name, &t, &table()).is_empty());
     }
 }
+
+#[test]
+fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags() {
+    use pbps_model::{Change, RowSecurity, RowSecurityOrigin};
+    let pg = pbps_pg::Postgres::new();
+    let table = TableName::new("app", "docs");
+    let emit = |change| {
+        pg.emit(&change, Default::default())
+            .unwrap()
+            .into_iter()
+            .map(|s| s.sql)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for command in [
+        PolicyCommand::All,
+        PolicyCommand::Select,
+        PolicyCommand::Insert,
+        PolicyCommand::Update,
+        PolicyCommand::Delete,
+    ] {
+        for restrictive in [false, true] {
+            let policy = RowPolicy {
+                command,
+                restrictive,
+                ..Default::default()
+            };
+            let sql = emit(Change::CreatePolicy {
+                table: table.clone(),
+                name: "p".into(),
+                policy,
+                origin: RowSecurityOrigin::Created,
+            });
+            assert!(sql.contains(" TO PUBLIC;"), "{sql}");
+            assert!(
+                sql.contains(if restrictive {
+                    "AS RESTRICTIVE"
+                } else {
+                    "AS PERMISSIVE"
+                }),
+                "{sql}"
+            );
+            assert!(
+                !sql.contains("USING") && !sql.contains("WITH CHECK"),
+                "{sql}"
+            );
+        }
+    }
+    let sql = emit(Change::CreatePolicy {
+        table: table.clone(),
+        name: "a\"b".into(),
+        policy: RowPolicy {
+            to: PolicyRoles::Roles(["PUBLIC".into(), "app_user".into()].into()),
+            using: Some("id>0".into()),
+            ..Default::default()
+        },
+        origin: RowSecurityOrigin::Created,
+    });
+    assert!(sql.contains("TO \"PUBLIC\", \"app_user\""), "{sql}");
+    assert!(
+        sql.contains("USING (id>0\n)") && !sql.contains("WITH CHECK"),
+        "{sql}"
+    );
+    let sql = emit(Change::SetRowSecurity {
+        uid: "t_117200".parse().unwrap(),
+        table,
+        from: Default::default(),
+        to: RowSecurity {
+            enabled: false,
+            forced: true,
+        },
+        origin: RowSecurityOrigin::Created,
+    });
+    assert!(
+        sql.contains("FORCE ROW LEVEL SECURITY") && !sql.contains("ENABLE"),
+        "{sql}"
+    );
+}

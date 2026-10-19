@@ -506,6 +506,32 @@ mod effects_of_each_kind {
                 },
             ),
             (
+                "CreatePolicy",
+                Change::CreatePolicy {
+                    table: tn("t"),
+                    name: "policy".into(),
+                    policy: RowPolicy {
+                        using: Some("x > 0".into()),
+                        with_check: Some("x < 100".into()),
+                        ..Default::default()
+                    },
+                    origin: RowSecurityOrigin::Created,
+                },
+            ),
+            (
+                "SetRowSecurity",
+                Change::SetRowSecurity {
+                    uid: t.clone(),
+                    table: tn("t"),
+                    from: RowSecurity::default(),
+                    to: RowSecurity {
+                        enabled: true,
+                        forced: false,
+                    },
+                    origin: RowSecurityOrigin::Created,
+                },
+            ),
+            (
                 "SetReplicaIdentity",
                 Change::SetReplicaIdentity {
                     uid: t.clone(),

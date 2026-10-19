@@ -617,9 +617,11 @@ impl Cx<'_> {
                             PartKey::PrimaryKey => was.primary_key == will.primary_key,
                             PartKey::Unique(n) => was.unique.get(n) == will.unique.get(n),
                             PartKey::Index(n) => was.indexes.get(n) == will.indexes.get(n),
-                            PartKey::ForeignKey(_) | PartKey::Check(_) | PartKey::Computed(_) => {
-                                false
-                            }
+                            PartKey::ForeignKey(_)
+                            | PartKey::Check(_)
+                            | PartKey::Computed(_)
+                            | PartKey::Policy(_)
+                            | PartKey::RowSecurity => false,
                         };
                         same && probe.replica_identity_problems().is_empty()
                     }
@@ -788,6 +790,27 @@ impl Cx<'_> {
                         Incarnation::Base,
                     ));
                 }
+            }
+            Change::CreatePolicy { table, .. } => {
+                let owner = self.table(table)?;
+                self.exists(ObjectKey::Table(owner));
+            }
+            Change::SetRowSecurity { uid, .. } => {
+                let owner = Recorded(uid.clone());
+                self.exists(ObjectKey::Table(owner.clone()));
+                if let Some((_, table)) = self.final_of(&owner) {
+                    let policies: Vec<_> = table.row_policies.keys().cloned().collect();
+                    for name in policies {
+                        self.requires(Requirement::Is(
+                            Self::part(&owner, PartKey::Policy(name)),
+                            Incarnation::Final,
+                        ));
+                    }
+                }
+                self.rewrites(Resource::Object(
+                    Self::part(&owner, PartKey::RowSecurity),
+                    Incarnation::Final,
+                ));
             }
             Change::AddCheck { table, .. } => {
                 let owner = self.table(table)?;
@@ -1130,7 +1153,11 @@ impl Cx<'_> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            PartKey::ForeignKey(_) | PartKey::Check(_) | PartKey::Computed(_) => Vec::new(),
+            PartKey::ForeignKey(_)
+            | PartKey::Check(_)
+            | PartKey::Computed(_)
+            | PartKey::Policy(_)
+            | PartKey::RowSecurity => Vec::new(),
         };
         // A column the plan creates has no producer of its NOT NULL, as in
         // `requires_column`: it is created NOT NULL, before any switch.
@@ -2005,6 +2032,10 @@ impl Cx<'_> {
 /// Every named part a table holds, as keys' parts.
 fn table_parts(table: &Table) -> Vec<PartKey> {
     let mut out = Vec::new();
+    if table.has_row_security() {
+        out.push(PartKey::RowSecurity);
+    }
+    out.extend(table.row_policies.keys().cloned().map(PartKey::Policy));
     if table.primary_key.is_some() {
         out.push(PartKey::PrimaryKey);
     }

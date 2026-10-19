@@ -926,6 +926,12 @@ complete read; without them the batch fails with `42501` rather than claiming
 an empty policy set. Neither the display view nor the table's enable flag can
 stand in for a complete policy read.
 
+PR C of #1172 supersedes DEC-1172.4's temporary ordinary-table adoption guard:
+flags and policies are now adopted together, with coherent trigger selection.
+Unchanged policies are no-ops and unrelated plans remain usable. Only an actual
+standing-table flag/policy difference refuses, naming #1173. RLS partition
+trees remain limitations; unreadable policy metadata still fails the batch.
+
 <a id="dec-2072-1"></a>
 
 **DEC-2072.1. A partition the read cannot take all of its own in leaves its

@@ -252,6 +252,8 @@ pub(crate) fn planned_schema_grants(
             | Change::AddColumn { .. }
             | Change::AddComputedColumn { .. }
             | Change::DropComputedColumn { .. }
+            | Change::CreatePolicy { .. }
+            | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
             | Change::SetStorageParameters { .. }
             | Change::SetIndexStorageParameters { .. }

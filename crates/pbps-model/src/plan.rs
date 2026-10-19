@@ -256,7 +256,8 @@ use crate::zone::SessionZone;
 /// Bumped to 44 for the derived `serial-sequences` permission (DEC-1892.1),
 /// which a `Grant` or `Revoke` can carry and an older build cannot read: it
 /// should refuse the plan as a newer one, not as malformed.
-pub const CURRENT_VERSION: u32 = 44;
+/// 45 adds created-table policy and row-security operations (DEC-1172.2).
+pub const CURRENT_VERSION: u32 = 45;
 
 /// Where a plan came from. Database provenance permits apply in principle;
 /// the executing build must also support its mode and analysis contract.
@@ -730,7 +731,7 @@ mod tests {
             state_checksum(&schema_of(&["id", "note", "email"]), &ids_with("t_a1b2c3")),
             "ea1c85e7867a7a63332cf5f7ca6e8356b64a6d3cbd4c7a503222bc7d3d40f1d9"
         );
-        assert_eq!(CURRENT_VERSION, 44);
+        assert_eq!(CURRENT_VERSION, 45);
     }
 
     /// `None` is written as no field at all, and a plan carrying pins reads

@@ -216,6 +216,8 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::SetIndexStorageParameters { .. }
                 | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
+                | Change::CreatePolicy { .. }
+                | Change::SetRowSecurity { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::AddForeignKey { .. }
@@ -313,6 +315,8 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 | Change::SetIndexStorageParameters { .. }
                 | Change::SetTablePersistence { .. }
                 | Change::SetStorageParameters { .. }
+                | Change::CreatePolicy { .. }
+                | Change::SetRowSecurity { .. }
                 | Change::SetReplicaIdentity { .. }
                 | Change::AddUnique { .. }
                 | Change::DropUnique { .. }

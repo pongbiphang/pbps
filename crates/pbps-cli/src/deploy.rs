@@ -5844,6 +5844,9 @@ pub fn cmd_bootstrap(
             refused
         })?;
     }
+    for notice in crate::row_security::binding_notices(&loaded.schema) {
+        eprintln!("warning: {notice}");
+    }
     let declared_modules = managed_modules(None, Some(&loaded.schema));
 
     // Bootstrap is the plan from nothing: every declared table is created.
@@ -6404,6 +6407,15 @@ pub fn cmd_plan_db(
         // Every declared text, as the engine reads it: a spelling it would
         // read back differently is refused before a plan is written that
         // could never converge (DECISIONS 101).
+        for notice in crate::row_security::binding_notices(&loaded.schema) {
+            if !json {
+                eprintln!("warning: {notice}");
+            }
+            findings.push(crate::output::Finding::warning(
+                "plan.policy-bindings-unchecked",
+                notice,
+            ));
+        }
         let mut unasked = Vec::new();
         let refused = refuse_misspelt(
             &mut conn,
