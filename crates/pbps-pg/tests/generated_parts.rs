@@ -181,13 +181,13 @@ fn generated_creation_requires_recorded_column_identities_and_leaves_uncalled_fu
     };
     let f = vec!["app.f(integer)".parse().unwrap()];
     assert!(
-        pg.generated_table_parts(&change, &IdsFile::default(), &f)
+        pg.generated_table_parts(&change, &IdsFile::default(), &f, false)
             .unwrap_err()
             .to_string()
             .contains("app.a.g")
     );
     assert!(
-        pg.generated_table_parts(&change, &ids, &[])
+        pg.generated_table_parts(&change, &ids, &[], false)
             .unwrap()
             .is_none()
     );
@@ -221,7 +221,7 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
         moves_at_most: None,
     });
     create.strategy.online = true;
-    let parts = generated::parts(&create, &ids, &["app.f(integer)".parse().unwrap()], &pg)
+    let parts = generated::parts(&create, &ids, &planned_functions(&schema), &pg)
         .unwrap()
         .unwrap();
     let index = parts
@@ -240,7 +240,7 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
     let mut standing = index.clone();
     standing.strategy.online = true;
     assert!(
-        generated::parts(&standing, &ids, &["app.f(integer)".parse().unwrap()], &pg)
+        generated::parts(&standing, &ids, &planned_functions(&schema), &pg)
             .unwrap()
             .is_none()
     );
@@ -352,7 +352,7 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
         moves_at_most: None,
     };
     let parts = Postgres::new()
-        .generated_table_parts(&change, &ids, &["app.f(integer)".parse().unwrap()])
+        .generated_table_parts(&change, &ids, &["app.f(integer)".parse().unwrap()], false)
         .unwrap()
         .unwrap();
     let Change::CreateTable { table, .. } = &parts[0] else {
@@ -476,14 +476,14 @@ fn a_prefix_generation_reading_a_removed_column_requires_the_full_creation_shape
         Postgres::new().with_server_version(160_000),
     ] {
         assert!(
-            pg.generated_table_parts(&change, &ids, &f)
+            pg.generated_table_parts(&change, &ids, &f, false)
                 .unwrap()
                 .is_none()
         );
     }
     let parts = Postgres::new()
         .with_server_version(180_000)
-        .generated_table_parts(&change, &ids, &f)
+        .generated_table_parts(&change, &ids, &f, false)
         .unwrap()
         .unwrap();
     let Change::CreateTable { table, .. } = &parts[0] else {
@@ -522,7 +522,7 @@ fn prefix_generation_inputs_kept_in_create_do_not_prevent_the_suffix_split() {
         let (change, ids) = prefix_generation_fixture(expression, input_before_cut);
         let f = ["app.f(integer)".parse().unwrap()];
         let expected = Postgres::new()
-            .generated_table_parts(&change, &ids, &f)
+            .generated_table_parts(&change, &ids, &f, false)
             .unwrap()
             .unwrap();
         for pg in [
@@ -530,7 +530,7 @@ fn prefix_generation_inputs_kept_in_create_do_not_prevent_the_suffix_split() {
             Postgres::new().with_server_version(180_000),
         ] {
             assert_eq!(
-                pg.generated_table_parts(&change, &ids, &f)
+                pg.generated_table_parts(&change, &ids, &f, false)
                     .unwrap()
                     .unwrap(),
                 expected
@@ -582,7 +582,7 @@ fn a_primary_key_using_a_suffix_input_waits_for_its_column() {
             moves_at_most: None,
         };
         let parts = Postgres::new()
-            .generated_table_parts(&change, &ids, &["app.f(integer)".parse().unwrap()])
+            .generated_table_parts(&change, &ids, &["app.f(integer)".parse().unwrap()], false)
             .unwrap()
             .unwrap();
         let Change::CreateTable { table, .. } = &parts[0] else {
@@ -620,7 +620,7 @@ fn generated_expression_installations_keep_their_creation_risks() {
             moves_at_most: None,
         });
         assert!(create.risks.is_empty());
-        let parts = generated::parts(&create, &ids, &["app.f(integer)".parse().unwrap()], &pg)
+        let parts = generated::parts(&create, &ids, &planned_functions(&schema), &pg)
             .unwrap()
             .unwrap();
         assert!(
@@ -707,7 +707,7 @@ fn generated_columns_and_validators_keep_their_creation_risks() {
             beside_default: None,
             moves_at_most: None,
         });
-        let parts = generated::parts(&create, &ids, &["app.f(integer)".parse().unwrap()], &pg)
+        let parts = generated::parts(&create, &ids, &planned_functions(&schema), &pg)
             .unwrap()
             .unwrap();
         for part in &parts {
@@ -736,4 +736,78 @@ fn generated_columns_and_validators_keep_their_creation_risks() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+fn planned_functions(schema: &Schema) -> Vec<pbps_model::PlannedChange> {
+    schema
+        .modules
+        .iter()
+        .map(|(id, module)| {
+            pbps_model::PlannedChange::new(Change::CreateModule {
+                id: id.clone(),
+                module: Box::new(module.clone()),
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn creation_risks_require_all_installations_before_every_row_write() {
+    let (mut schema, _) = fixture();
+    let name = TableName::new("app", "a");
+    if let ValueSource::Generated(g) =
+        &mut schema.tables.get_mut(&name).unwrap().columns["g"].value_source
+    {
+        g.expression = "app.f(z)".into();
+    }
+    let ids = identities(&schema);
+    let pg = Postgres::new().with_server_version(180_000);
+    let create = pbps_model::PlannedChange::new(Change::CreateTable {
+        uid: ids.table_uid(&name).unwrap().clone(),
+        name: name.clone(),
+        table: Box::new(schema.tables[&name].clone()),
+        beside_default: None,
+        moves_at_most: None,
+    });
+    let parts = generated::parts(&create, &ids, &planned_functions(&schema), &pg)
+        .unwrap()
+        .unwrap();
+    let install = parts
+        .iter()
+        .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        .unwrap();
+    let write = pbps_model::PlannedChange::new(Change::InsertRow {
+        table: name.clone(),
+        key_column: "id".into(),
+        identity_key: false,
+        key: "1".into(),
+        row: Default::default(),
+        defaults: Default::default(),
+        types: Default::default(),
+    });
+    let mut cs = pbps_model::ChangeSet {
+        changes: parts.clone(),
+    };
+    cs.changes.insert(install, write.clone());
+    assert!(
+        generated::risks(&cs, &ids, &pg)[install + 1].contains(&pbps_model::RiskClass::Narrowing)
+    );
+    let mut safe = pbps_model::ChangeSet {
+        changes: parts.clone(),
+    };
+    safe.changes.push(write);
+    assert!(generated::risks(&safe, &ids, &pg)[install].is_empty());
+    // A second installation cannot borrow the first one's empty-table proof.
+    safe.changes.push(parts[install].clone());
+    assert!(
+        generated::risks(&safe, &ids, &pg)
+            .last()
+            .unwrap()
+            .contains(&pbps_model::RiskClass::Narrowing)
+    );
+    let mut unrelated = cs;
+    if let Change::InsertRow { table, .. } = &mut unrelated.changes[install].change {
+        *table = TableName::new("app", "other");
+    }
+    assert!(generated::risks(&unrelated, &ids, &pg)[install + 1].is_empty());
 }

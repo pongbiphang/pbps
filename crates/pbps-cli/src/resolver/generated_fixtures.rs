@@ -100,15 +100,31 @@ pub(crate) fn shape(case: &str) -> Schema {
         Module {
             kind: ModuleKind::Function,
             description: None,
-            // The producer must support a generation function that binds
-            // only the prefix, which the old whole-table hold refused.
-            definition: if case == "plain" {
-                "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT id FROM app.a LIMIT 1; END"
-            } else {
-                "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2"
+            definition: match case {
+                "called-table" => "(integer) RETURNS app.a LANGUAGE sql IMMUTABLE BEGIN ATOMIC TABLE app.a; END",
+                "called-insert" => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC INSERT INTO app.a VALUES ($1, DEFAULT, 5); SELECT $1 * 2; END",
+                _ => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2",
             }.into(),
         },
     );
+    if case == "called-table" {
+        schema
+            .tables
+            .get_mut(&TableName::new("app", "a"))
+            .unwrap()
+            .columns["g"] = generated("(app.f(id)).id");
+    }
+    if case == "composite-check" {
+        let mut b = Table::default();
+        b.columns.insert("id".into(), plain());
+        b.checks.insert(
+            "a_shape".into(),
+            pbps_model::CheckConstraint {
+                expression: "(ROW(1,2,3)::app.a).id > 0".into(),
+            },
+        );
+        schema.tables.insert(TableName::new("app", "b"), b);
+    }
     if ["literal", "reverse", "array", "collision"].contains(&case) {
         let mut b = Table::default();
         b.columns.insert("id".into(), plain());

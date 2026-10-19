@@ -161,7 +161,7 @@ Then, in this order:
   - `split_new_tables` splits the parts of a new table whose text names a
     function the plan creates out of it, ahead of that create. A generated
     column calling a planned function starts a declaration-order suffix;
-    its prefix creates the relation at its ordinary position. Only the two
+    its prefix creates the relation at its ordinary position. Only
     unsplittable shapes use a typed placeholder and SET EXPRESSION with a
     known PostgreSQL 17+ capability, or retain the whole-table hold without
     it (DEC-1503.1). Resolver preparation and scratch share the same parts.
@@ -571,8 +571,12 @@ What is left to the engine is recorded on #1350, each with a two-plan remedy:
 - a default a plan row takes calling a rebuilt function (#1030).
 
 New tables use creation parts that preserve column order. A suffix partition
-key or a generation reading a later column instead keeps the whole-table
-hold without a known PostgreSQL 17+ capability (DEC-1503.1).
+key, a generation reading a later column, or a called function naming the
+table or its types instead keeps the whole-table hold without a known
+PostgreSQL 17+ capability. Consumers use the complete shape unless a reference
+is proven to resolve only the relation name; the reverse regclass pair still
+uses prefix edges. Creation risks require every installation before every row
+write into that table identity (DEC-1503.4).
 
 ## Value flow
 

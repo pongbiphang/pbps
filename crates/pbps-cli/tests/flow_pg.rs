@@ -2547,6 +2547,58 @@ fn a_standing_generated_expression_still_requires_narrowing_approval() {
     succeeds(d.run(&["verify", "--db", connection]));
 }
 
+#[test]
+#[ignore = "needs PostgreSQL 18; set PBPS_TEST_PG_DB"]
+fn saved_rows_before_expression_installation_cannot_clear_narrowing() {
+    use pbps_model::{Change, PlannedChange, RiskClass};
+    let own = OwnDatabase::new(&server(), "row-before-expression-1503");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "row-before-expression-1503", ONE_COLUMN);
+    declare_function(&d, "f", "SELECT x * 2");
+    std::fs::write(d.dir.join("schema/app.a.yml"), "table: app.a\ncolumns:\n  id: {type: integer, nullable: false}\n  g: {type: integer, generated: {expression: 'app.f(z)', stored: true}}\n  z: {type: integer}\nprimary_key: [id]\n").unwrap();
+    d.commit();
+    let (plan, _) = connected_plan(&d, connection);
+    let mut saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    let install = saved
+        .changes
+        .changes
+        .iter()
+        .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        .unwrap();
+    saved.changes.changes.insert(
+        install,
+        PlannedChange::new(Change::InsertRow {
+            table: pbps_model::TableName::new("app", "a"),
+            key_column: "id".into(),
+            identity_key: false,
+            key: "1".into(),
+            row: pbps_model::Row([("z".into(), pbps_model::Value::Int(3))].into()),
+            defaults: Default::default(),
+            types: [("z".into(), "integer".parse().unwrap())].into(),
+        }),
+    );
+    let pg = pbps_pg::Postgres::new().with_server_version(180_000);
+    let risks = pbps_diff::order::generated::risks(&saved.changes, &saved.ids, &pg);
+    assert!(risks[install + 1].contains(&RiskClass::Narrowing));
+    std::fs::write(&plan, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
+    let refused = approved_apply(&d, connection, &plan, &[]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("inconsistent risks"),
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app' AND c.relname='a'"
+        ),
+        0
+    );
+}
+
 /// #1364, a corner #1350 recorded: a new column whose default or generation
 /// expression calls a function the same plan rebuilds follows the rebuild.
 /// Ahead of it, the column's call held the old function, and the rebuild's

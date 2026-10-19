@@ -205,10 +205,10 @@ pub(super) fn changes(
 ) -> Result<Prepared, Error> {
     let names = ids.index();
     let mut changes: Vec<(Origin, PlannedChange)> = Vec::new();
-    let functions = crate::order::generated::functions(&ordinary.changes);
     for (position, planned) in ordinary.changes.iter().enumerate() {
-        if let Some(parts) = crate::order::generated::parts(planned, ids, &functions, dialect)
-            .map_err(Error::Names)?
+        if let Some(parts) =
+            crate::order::generated::parts(planned, ids, &ordinary.changes, dialect)
+                .map_err(Error::Names)?
         {
             // Lower the same typed parts before the resolver's ordinary
             // expression splits, retaining their one logical source.

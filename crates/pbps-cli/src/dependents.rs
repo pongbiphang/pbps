@@ -3628,7 +3628,8 @@ fn truncated(mut part: String) -> String {
 /// names a function the plan creates or rebuilds after that function's
 /// create, and whatever may need the column after the column (DEC-1364.1).
 /// New tables normally use creation parts (DEC-1503.1). Only a suffix
-/// partition key or a generation reading a later column reaches this hold
+/// partition key, a generation reading a later column, or a called function
+/// naming the table or its types reaches this hold
 /// without a known PostgreSQL 17+ expression-replacement capability; those
 /// tables keep DEC-1274.2's whole-table order. Returns how many it placed,
 /// or why no order performs them.
@@ -3667,7 +3668,7 @@ fn after_their_functions(
         if pbps_diff::order::generated::is_part(p) {
             continue;
         }
-        // The two unsplittable shapes keep their generation in CREATE
+        // Unsplittable shapes keep their generation in CREATE
         // when expression replacement is unavailable (DEC-1503.1), so the
         // whole table waits. So does a new partition's own default (#1578),
         // which has no column of its own to split into an
@@ -3961,7 +3962,7 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Parti
 /// resolved as the default or check is installed (measured on 16 and 18),
 /// as `may_call` reads a function's (DEC-1364.1).
 fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
-    let named = |text: &str| pbps_pg::generated::may_call(text, &made.name);
+    let named = |text: &str| pbps_pg::Postgres::new().generation_names_table(text, made);
     let typed = |base: &str| base == made.name || base == made.raw().to_string();
     table.columns.values().any(|column| {
         typed(&column.ty.base)
@@ -4010,7 +4011,7 @@ fn reads_column(id: &ModuleId, definition: &str, table: &TableName, column: &str
 fn names_table(id: &ModuleId, definition: &str, table: &TableName) -> bool {
     id.attached_to()
         .is_some_and(|on| on.schema == table.schema && on.name == table.name)
-        || pbps_pg::generated::may_name(definition, &table.name)
+        || pbps_pg::Postgres::new().generation_names_table(definition, table)
 }
 
 /// Whether a change of a table may name the new column `column` of `table`.

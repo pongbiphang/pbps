@@ -181,6 +181,7 @@
       ],
       "cases": [
         "dependents::generated_tests::generated_table_parts_apply_with_the_declared_column_order_values_and_names",
+        "dependents::generated_tests::called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold",
         "deploy::tests::a_probe_cannot_advance_a_sequence_named_in_a_declared_check",
         "deploy::tests::a_probe_is_answered_under_the_settings_the_statement_will_run_under",
         "deploy::tests::a_read_only_probe_still_refuses_a_violating_row",
@@ -524,6 +525,7 @@
         "new_generated_expression_parts_apply_without_alteration_approvals_on_both_servers",
         "split_generated_columns_and_validators_apply_without_alteration_approvals_on_both_servers",
         "a_standing_generated_expression_still_requires_narrowing_approval",
+        "saved_rows_before_expression_installation_cannot_clear_narrowing",
         "a_new_column_calling_a_rebuilt_function_follows_the_rebuild",
         "a_new_tables_expressions_calling_a_rebuilt_function_follow_it",
         "a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan",

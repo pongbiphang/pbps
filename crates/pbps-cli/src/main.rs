@@ -4708,6 +4708,32 @@ mod tests {
                 .contains("inconsistent risks")
         );
         plan.changes.changes[1].risks.clear();
+        let write = PlannedChange::new(Change::InsertRow {
+            table: name.clone(),
+            key_column: "id".into(),
+            identity_key: false,
+            key: "1".into(),
+            row: pbps_model::Row::default(),
+            defaults: Default::default(),
+            types: Default::default(),
+        });
+        let mut reordered = plan.clone();
+        reordered.changes.changes.insert(1, write.clone());
+        assert!(
+            validate_saved_plan(&reordered, &dialect)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent risks")
+        );
+        reordered.changes.changes[2]
+            .risks
+            .insert(RiskClass::Narrowing);
+        validate_saved_plan(&reordered, &dialect)
+            .expect("a row before installation retains narrowing");
+        let mut safe_rows = plan.clone();
+        safe_rows.changes.changes.push(write);
+        validate_saved_plan(&safe_rows, &dialect)
+            .expect("rows after installation retain creation context");
         let mut different = plan.clone();
         let other = TableName::new("app", "other");
         if let Change::CreateTable { uid, name, .. } = &mut different.changes.changes[0].change {

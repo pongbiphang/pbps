@@ -2338,13 +2338,15 @@ pub trait Dialect {
     fn lexicon(&self) -> Lexicon;
 
     /// The parts of a new table whose generation needs a planned function.
-    /// Pure engine policy: callers supply recorded column identities, and
-    /// connection capabilities are immutable inputs to the dialect.
+    /// Pure engine policy: callers supply recorded column identities and
+    /// whether a called reader needs the complete shape. Connection
+    /// capabilities are immutable inputs to the dialect.
     fn generated_table_parts(
         &self,
         _change: &Change,
         _ids: &pbps_model::IdsFile,
         _functions: &[pbps_model::ModuleId],
+        _needs_complete_shape: bool,
     ) -> Result<Option<Vec<Change>>, DialectError> {
         Ok(None)
     }
@@ -2355,10 +2357,16 @@ pub trait Dialect {
         self.may_name(text, name)
     }
 
-    /// A table reader that cannot be proved to use a prefix's shape only.
-    fn generation_needs_whole_row(&self, text: &str, table: &pbps_model::TableName) -> bool {
-        let code = self.lexicon().code_only(text);
-        self.may_name(text, &table.name) && (code.contains('*') || self.may_name(text, "NATURAL"))
+    /// Whether a consumer may name a table, its row type or its array type.
+    /// A positive answer requires the complete creation shape (DEC-1503.4).
+    fn generation_names_table(&self, text: &str, table: &pbps_model::TableName) -> bool {
+        self.generation_may_call(text, &table.name)
+    }
+
+    /// True only when every reference to this table merely resolves its
+    /// relation name. Unknown expression forms require the complete shape.
+    fn generation_table_name_only(&self, _text: &str, _table: &pbps_model::TableName) -> bool {
+        false
     }
 
     /// Whether `text` may name `name` as an identifier: in code, never in a

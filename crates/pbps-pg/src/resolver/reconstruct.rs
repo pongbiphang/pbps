@@ -999,7 +999,7 @@ async fn routines(
 /// What creating a table or view makes nameable before it compiles: the
 /// relation with its row type, which always has its name. Its array type is
 /// read back once it exists ([`array_type`]).
-/// Keeps the legacy whole-table hold for the two unsplittable shapes left
+/// Keeps the legacy whole-table hold for the unsplittable shapes left
 /// by the shared expansion, as the ordinary plan does (DEC-1503.1). The table
 /// and what it holds that runs before the modules join the modules phase
 /// after the last function its generation text names. A module ahead of it
@@ -1077,11 +1077,21 @@ fn after_their_functions(
         let mut kept = Vec::new();
         let mut moved = Vec::new();
         for &at in &modules[..point] {
-            if held.iter().any(|name| names(at, name)) {
+            if held.iter().any(|name| {
+                if name == &table.table.name {
+                    steps[at]
+                        .statements
+                        .iter()
+                        .any(|sql| crate::generated::names_table(sql, &table.table))
+                } else {
+                    names(at, name)
+                }
+            }) {
                 if called.contains(&at) {
                     return Err(ReconstructError::Cycle(format!(
-                        "table {}",
-                        table.table.shown()
+                        "table {} ({})",
+                        table.table.shown(),
+                        steps[at].declaration
                     )));
                 }
                 held.extend(steps[at].names.iter().map(|(_, _, name)| name.clone()));

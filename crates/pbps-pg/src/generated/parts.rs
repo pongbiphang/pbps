@@ -8,6 +8,7 @@ pub(crate) fn parts(
     change: &Change,
     ids: &IdsFile,
     functions: &[ModuleId],
+    needs_complete_shape: bool,
     version: Option<i64>,
 ) -> Result<Option<Vec<Change>>, DialectError> {
     let Change::CreateTable {
@@ -43,7 +44,7 @@ pub(crate) fn parts(
         .partition_by
         .as_ref()
         .is_some_and(|key| key.columns.iter().any(|c| suffix.contains(c)));
-    let placeholder = partition_key || later_input;
+    let placeholder = partition_key || later_input || needs_complete_shape;
     if placeholder && version.is_none_or(|v| v < super::SET_EXPRESSION_ARRIVED_IN) {
         return Ok(None);
     }
@@ -60,8 +61,11 @@ pub(crate) fn parts(
         suffix
     };
     let late_column = |column: &ColumnName| pending.iter().any(|c| c == column);
-    let late_text =
-        |text: &str| calls(text) || pending.iter().any(|c| super::may_read(text, c.raw()));
+    let late_text = |text: &str| {
+        calls(text)
+            || pending.iter().any(|c| super::may_read(text, c.raw()))
+            || (super::names_table(text, name) && !super::table_name_only(text, name))
+    };
     let column_uid = |column: &ColumnName| {
         ids.column_uid(&name.column(column))
             .cloned()

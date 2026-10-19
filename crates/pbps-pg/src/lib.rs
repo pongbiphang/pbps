@@ -781,16 +781,27 @@ impl Dialect for Postgres {
         change: &Change,
         ids: &pbps_model::IdsFile,
         functions: &[pbps_model::ModuleId],
+        needs_complete_shape: bool,
     ) -> Result<Option<Vec<Change>>, DialectError> {
-        generated::parts(change, ids, functions, self.server_version_num)
+        generated::parts(
+            change,
+            ids,
+            functions,
+            needs_complete_shape,
+            self.server_version_num,
+        )
     }
 
     fn generation_may_call(&self, text: &str, name: &str) -> bool {
         generated::may_call(text, name)
     }
 
-    fn generation_needs_whole_row(&self, text: &str, table: &TableName) -> bool {
-        generated::needs_whole_row(text, table)
+    fn generation_names_table(&self, text: &str, table: &TableName) -> bool {
+        generated::names_table(text, table)
+    }
+
+    fn generation_table_name_only(&self, text: &str, table: &TableName) -> bool {
+        generated::table_name_only(text, table)
     }
 
     /// `"…"` alone quotes an identifier: `[` is an array subscript, which is

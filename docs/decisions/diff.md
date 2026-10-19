@@ -7392,6 +7392,7 @@ full column shape, using typed NULL placeholders for generations that call
 planned functions, then the existing AlterColumnExpression installs their
 real expressions. Unknown/offline and
 older capabilities keep DEC-1274.2's whole-table hold for those two shapes.
+DEC-1503.4 additionally covers called functions that name the table or its types.
 The ordinary schedule, resolver preparation and scratch share these typed
 parts. The pure dialect chooses parts; the differ states edges and settles
 them, and scratch lowers the same parts before selecting any chained-fill
@@ -7406,10 +7407,11 @@ Column effects and explicit edges put seed rows after the complete columns
 and real expressions, and keep deferred validators after the rows
 and new triggers after them. Keys, indexes and referencing foreign keys
 follow their inputs. Modules naming the table follow its complete column
-shape, SELECT * included. A function called by the generation may use the
-prefix; a suffix-column or whole-row dependency requires the full shape and
-therefore closes a named cycle. Existing lexical scans supply these
-conservative dependencies. Placeholder binding checks run at the real
+shape, SELECT * included. DEC-1503.4 narrows the prefix exception to proven
+relation-name-only references and a called function that names neither the
+table nor its types. Called readers use a full-shape placeholder, or keep
+the named whole-table cycle without the capability. Existing lexical scans
+supply these conservative dependencies. Placeholder binding checks run at the real
 expression installation, and producer transitions prove their absent opening
 inventory from the preceding typed CREATE and recorded UIDs, never from
 unsealed provenance. Apply's created-table inventory includes the typed added
@@ -7429,7 +7431,7 @@ also unchanged; producer closing measures the partitioned parent, while
 ordinary apply measures its child.
 
 Pinned by `generated_table_parts_keep_names_early_and_columns_in_declaration_order_on_every_version`,
-`generation_functions_may_read_prefix_columns_but_suffix_and_whole_row_cycles_are_named`,
+`called_table_readers_require_full_shape_or_keep_the_named_hold`,
 `generated_table_parts_apply_with_the_declared_column_order_values_and_names`
 (`crates/pbps-cli/src/dependents/generated_tests.rs`),
 `an_offline_plan_creates_what_a_new_table_calls_before_it` and
@@ -7527,3 +7529,50 @@ Pinned by `generated_expression_installations_keep_their_creation_risks`,
 `split_generated_columns_and_validators_apply_without_alteration_approvals_on_both_servers`,
 `a_standing_generated_expression_still_requires_narrowing_approval`, and
 `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.
+
+<a id="dec-1503-4"></a>
+
+**DEC-1503.4. Every creation-part consumer uses the complete shape unless its
+reference is proven to resolve only the relation name; empty-table risks
+require every expression installation before every row write.** A prefix is
+sufficient for a regclass name resolution, but not for a composite cast,
+array or row type use, column read, TABLE, or target-list-free INSERT.
+The dialect explicitly classifies these references. PostgreSQL reuses its
+identifier, literal and code scans: a single literal cast to regclass, with
+parentheses and the supported built-in casts, is proven name-only. An unknown
+form requires the complete shape. Array references include collision suffixes
+seen in the text and conservative truncated-name candidates; no allocated
+array name is predicted. The reverse held pair retains its prefix-to-name
+edges and succeeds. Replacing its CHECK with a composite cast closes a named
+cycle, while a one-way composite consumer waits for the complete columns.
+
+A planned function called by a generation that names the table or its types
+requires full-shape CREATE with placeholders on connected PostgreSQL 17+.
+Unknown/offline and older capabilities keep the whole-table hold and its
+named cycle refusal. A function that names neither still permits the primary
+split. This replaces the NATURAL, star-versus-multiplication and row-alias
+whole-row detectors, rather than adding SQL constructs to them. Ordinary
+planning, resolver preparation and scratch use the same expansion; both
+retained-hold readers use the same table/type reference scan. Every consumer,
+including a new table's CHECK/default/generation, row defaults and types, and
+modules, receives the corresponding name-only or complete-shape edge through
+the existing settle. No ordering pass or rank is added. Capture's existing
+regclass/regtype constant refusal is unchanged.
+
+Creation-risk derivation resolves each row write and expression installation
+through PlanNames at that step, by table UID. If any installation follows an
+InsertRow, UpdateRow or DeleteRow into that identity, the family cannot claim
+empty-table context and retains intrinsic alteration risks, including
+narrowing. Another safe installation cannot certify the later one. Saved-plan
+validation calls the same derivation, so reordered or hand-built artifacts
+cannot suppress the approval with unsealed provenance or a preceding CREATE.
+
+Pinned by `only_proven_relation_name_literals_use_the_prefix`,
+`called_table_readers_require_full_shape_or_keep_the_named_hold`,
+`composite_consumers_and_views_wait_for_the_complete_table`,
+`creation_risks_require_all_installations_before_every_row_write`,
+`saved_creation_part_risks_require_a_preceding_create_of_the_same_table`, and
+the live `called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold`,
+`saved_rows_before_expression_installation_cannot_clear_narrowing`,
+`generated_table_parts_apply_with_the_declared_column_order_values_and_names`
+and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.

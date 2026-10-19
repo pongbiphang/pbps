@@ -1,7 +1,7 @@
 //! Typed creation parts for a new table, shared by ordinary planning,
 //! resolver planning and scratch (DEC-1503.1). This module emits no SQL.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Constraint, Schedule, Source};
 use pbps_dialect::Dialect;
@@ -34,14 +34,33 @@ pub fn is_part(p: &PlannedChange) -> bool {
         .is_some_and(|origin| origin.rule == RULE)
 }
 
+#[allow(clippy::wildcard_enum_match_arm)]
 pub fn parts(
     planned: &PlannedChange,
     ids: &IdsFile,
-    functions: &[ModuleId],
+    changes: &[PlannedChange],
     dialect: &dyn Dialect,
 ) -> Result<Option<Vec<PlannedChange>>, String> {
+    let functions = functions(changes);
+    // A called reader can bind any part of the row shape, including implicit
+    // TABLE/INSERT arity. Full-shape placeholders or the existing hold avoid
+    // exposing the prefix to it (DEC-1503.4).
+    let table_reader = if let Change::CreateTable { name, table, .. } = &planned.change {
+        changes.iter().any(|p| match &p.change {
+            Change::CreateModule { id, module } | Change::AlterModule { id, module }
+                if module.kind == ModuleKind::Function => {
+                table.columns.values().any(|c| matches!(&c.value_source,
+                    ValueSource::Generated(g) if dialect.generation_may_call(&g.expression, id.name())))
+                    && dialect.generation_names_table(&module.definition, name)
+                    && !dialect.generation_table_name_only(&module.definition, name)
+            }
+            _ => false,
+        })
+    } else {
+        false
+    };
     let Some(parts) = dialect
-        .generated_table_parts(&planned.change, ids, functions)
+        .generated_table_parts(&planned.change, ids, &functions, table_reader)
         .map_err(|e| e.to_string())?
     else {
         return Ok(None);
@@ -86,6 +105,18 @@ pub fn risks(cs: &ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Vec<BTreeS
         .any(|p| matches!(p.change, Change::CreateTable { .. }))
         .then(|| PlanNames::of(&cs.changes, ids).ok())
         .flatten();
+    let mut first_write = BTreeMap::new();
+    for (at, p) in cs.changes.iter().enumerate() {
+        if matches!(
+            p.change,
+            Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. }
+        ) && let Some(table) = p.change.table()
+            && let Some(names) = &names
+            && let Holder::Tracked(owner) = names.holder(table, At::Before(at))
+        {
+            first_write.entry(owner.clone()).or_insert(at);
+        }
+    }
     let installations: BTreeSet<_> = cs
         .changes
         .iter()
@@ -98,10 +129,22 @@ pub fn risks(cs: &ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Vec<BTreeS
                 return None;
             }
             match names.as_ref()?.holder(p.change.table()?, At::Before(at)) {
-                Holder::Tracked(owner) => Some(owner.clone()),
+                Holder::Tracked(owner) => Some((owner.clone(), at)),
                 Holder::Unmanaged | Holder::Vacant => None,
             }
         })
+        .collect();
+    // Every installation must precede every write. One safe installation
+    // cannot certify a later recomputation on the same table (DEC-1503.4).
+    let unsafe_owners: BTreeSet<_> = installations
+        .iter()
+        .filter(|(owner, at)| first_write.get(owner).is_some_and(|write| write < at))
+        .map(|(owner, _)| owner.clone())
+        .collect();
+    let installations: BTreeSet<_> = installations
+        .into_iter()
+        .map(|(owner, _)| owner)
+        .filter(|owner| !unsafe_owners.contains(owner))
         .collect();
     cs.changes
         .iter()
@@ -147,11 +190,10 @@ pub fn risks(cs: &ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Vec<BTreeS
 }
 
 pub fn expand(cs: &mut ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Result<usize, String> {
-    let functions = functions(&cs.changes);
     let mut expanded = Vec::new();
     let mut added = 0;
     for p in &cs.changes {
-        match parts(p, ids, &functions, dialect)? {
+        match parts(p, ids, &cs.changes, dialect)? {
             Some(parts) => {
                 added += parts.len() - 1;
                 expanded.extend(parts);
@@ -164,18 +206,21 @@ pub fn expand(cs: &mut ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Resul
 }
 
 fn texts(change: &Change) -> Vec<&str> {
-    fn column(c: &pbps_model::Column) -> Option<&str> {
-        match &c.value_source {
+    fn column(c: &pbps_model::Column) -> Vec<&str> {
+        let expression = match &c.value_source {
             ValueSource::Default(t) => Some(t.as_str()),
             ValueSource::Generated(g) => Some(g.expression.as_str()),
             ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => None,
-        }
+        };
+        std::iter::once(c.ty.base.as_str())
+            .chain(expression)
+            .collect()
     }
     match change {
         Change::CreateTable { table, .. } => table
             .columns
             .values()
-            .filter_map(column)
+            .flat_map(column)
             .chain(table.checks.values().map(|c| c.expression.as_str()))
             .chain(
                 table
@@ -191,11 +236,13 @@ fn texts(change: &Change) -> Vec<&str> {
                     .chain(ix.columns.iter().filter_map(|c| c.key.expression()))
             }))
             .collect(),
-        Change::AddColumn { column: c, .. } => column(c).into_iter().collect(),
+        Change::AddColumn { column: c, .. } => column(c),
         Change::AlterColumnExpression { to, .. } => vec![to],
-        Change::AlterColumnDefault { to, .. } | Change::SetPartitionDefault { to, .. } => {
-            to.as_deref().into_iter().collect()
+        Change::AlterColumnDefault { to, .. } => to.as_deref().into_iter().collect(),
+        Change::SetPartitionDefault { to, fallback, .. } => {
+            to.as_deref().or(fallback.as_deref()).into_iter().collect()
         }
+        Change::AlterColumnType { from, to, .. } => vec![&from.base, &to.base],
         Change::AddCheck { constraint, .. } => vec![&constraint.expression],
         Change::AddIndex { index, .. } => index
             .filter
@@ -203,13 +250,36 @@ fn texts(change: &Change) -> Vec<&str> {
             .into_iter()
             .chain(index.columns.iter().filter_map(|c| c.key.expression()))
             .collect(),
+        Change::InsertRow {
+            defaults, types, ..
+        } => defaults
+            .values()
+            .map(String::as_str)
+            .chain(types.values().map(|t| t.base.as_str()))
+            .collect(),
+        Change::UpdateRow {
+            types,
+            after_types,
+            key_type,
+            ..
+        }
+        | Change::DeleteRow {
+            types,
+            after_types,
+            key_type,
+            ..
+        } => types
+            .values()
+            .chain(after_types.values())
+            .chain(key_type.iter())
+            .map(|t| t.base.as_str())
+            .collect(),
         Change::DropTable { .. }
         | Change::DetachPartition { .. }
         | Change::AttachPartition { .. }
         | Change::RenameTable { .. }
         | Change::DropColumn { .. }
         | Change::RenameColumn { .. }
-        | Change::AlterColumnType { .. }
         | Change::AlterColumnNullability { .. }
         | Change::AlterColumnNumbering { .. }
         | Change::AddComputedColumn { .. }
@@ -227,9 +297,6 @@ fn texts(change: &Change) -> Vec<&str> {
         | Change::DropForeignKey { .. }
         | Change::DropCheck { .. }
         | Change::DropIndex { .. }
-        | Change::InsertRow { .. }
-        | Change::UpdateRow { .. }
-        | Change::DeleteRow { .. }
         | Change::SetDataMode { .. }
         | Change::SetEnsureKeys { .. }
         | Change::CreateModule { .. }
@@ -288,11 +355,6 @@ pub fn constraints(
             .enumerate()
             .filter(|(_, p)| is_part(p) && p.change.table() == Some(name))
             .collect();
-        let suffix: Vec<_> = full
-            .columns
-            .keys()
-            .filter(|c| !prefix.columns.contains_key(*c))
-            .collect();
         let mut previous = first;
         for column in full.columns.keys() {
             for (i, p) in &own {
@@ -305,22 +367,6 @@ pub fn constraints(
             }
         }
         let complete = previous;
-        let called: Vec<_> = modules
-            .iter()
-            .filter(|(_, id, _)| {
-                own.iter().any(|(_, p)| {
-                    let expression = match &p.change {
-                        Change::AddColumn { column, .. } => match &column.value_source {
-                            ValueSource::Generated(g) => Some(g.expression.as_str()),
-                            _ => None,
-                        },
-                        Change::AlterColumnExpression { to, .. } => Some(to.as_str()),
-                        _ => None,
-                    };
-                    expression.is_some_and(|t| dialect.generation_may_call(t, id.name()))
-                })
-            })
-            .collect();
         for (i, p) in &own {
             edge(&mut out, first, *i);
             if !matches!(
@@ -366,7 +412,7 @@ pub fn constraints(
             }
         }
         for (i, p) in cs.changes.iter().enumerate() {
-            if matches!(&p.change, Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } if table == name)
+            if matches!(&p.change, Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } | Change::DeleteRow { table, .. } if table == name)
             {
                 edge(&mut out, complete, i);
                 for (part, p) in &own {
@@ -388,11 +434,20 @@ pub fn constraints(
                     }
                 }
             }
-            if texts(&p.change)
-                .iter()
-                .any(|t| dialect.generation_may_call(t, &name.name))
-            {
-                edge(&mut out, first, i);
+            let references: Vec<_> = texts(&p.change)
+                .into_iter()
+                .filter(|text| dialect.generation_names_table(text, name))
+                .collect();
+            if !references.is_empty() {
+                let name_only = references
+                    .iter()
+                    .all(|text| dialect.generation_table_name_only(text, name));
+                let shape = if name_only || prefix.columns.len() == full.columns.len() {
+                    first
+                } else {
+                    complete
+                };
+                edge(&mut out, shape, i);
             }
             if matches!(&p.change, Change::CreateTable { table, .. } if table.partition_of.as_ref().is_some_and(|of| &of.parent == name))
             {
@@ -421,22 +476,16 @@ pub fn constraints(
                 }
             }
         }
-        for (i, id, module) in &modules {
-            if !dialect.generation_may_call(&module.definition, &name.name) {
-                continue;
-            }
-            if called.iter().any(|(_, called, _)| *called == *id) {
-                edge(&mut out, first, *i);
-                if suffix
-                    .iter()
-                    .any(|c| dialect.may_name(&module.definition, c.raw()))
-                    || !suffix.is_empty()
-                        && dialect.generation_needs_whole_row(&module.definition, name)
-                {
-                    edge(&mut out, complete, *i);
-                }
-            } else {
-                edge(&mut out, complete, *i);
+        for (i, _, module) in &modules {
+            if dialect.generation_names_table(&module.definition, name) {
+                // Called readers already chose a full-shape placeholder or
+                // the whole-table hold; every consumer sees that full shape.
+                let shape = if prefix.columns.len() == full.columns.len() {
+                    first
+                } else {
+                    complete
+                };
+                edge(&mut out, shape, *i);
             }
         }
     }
