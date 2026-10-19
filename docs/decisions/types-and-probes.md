@@ -2296,3 +2296,63 @@ empty), `what_the_model_cannot_hold_is_named_and_never_silently_dropped`,
 `sequence_options_round_trip_and_an_identity_keeps_its_pair_without_them`,
 `an_identity_holds_its_sequences_bounds_cycle_and_cache` and
 `an_identity_with_sequence_options_is_refused_on_sql_server`.
+
+<a id="dec-2217-1"></a>
+
+**DEC-2217.1. A partitioned parent's owned sequence is held as a serial when
+its other callers are only same-column, same-text partition defaults.**
+(#2217; extends DEC-1631.1)
+
+Measured on PostgreSQL 16 and 18: `CREATE TABLE p (id bigserial, v integer)
+PARTITION BY RANGE (v)` owns one sequence. Each `CREATE TABLE ... PARTITION
+OF p` copies the parent's default into its own `pg_attrdef`, with its own
+normal dependency on that sequence. Inserts through the parent and directly
+into a partition created this way number from the same sequence. Attaching
+an ordinary table whose column has no default does not give it one: inserts
+through the parent still number, but direct inserts into that partition fail
+its NOT NULL. `ALTER TABLE p ADD COLUMN n serial` gives every partition the
+new default, including that attached table.
+
+The catalog's serial-user count excludes only defaults on partitions in the
+owning parent's tree, for the same column name and with exactly the parent's
+`pg_get_expr` text. Every other DEC-1631.1 shape check stays. A shared call
+from an ordinary table, another column, or different text still counts; a
+partition's default on another sequence stays a limitation. Matching copies
+stay the parent's under DEC-1578.1 and produce no limitation: otherwise
+DEC-2072.1 would leave the whole tree out of a pull. A partition declares no
+serial or columns of its own. Validation admits a serial on a partitioned
+parent; creation uses the ordinary table's sequence-before-table and
+`OWNED BY`-after-table statement, before the engine copies the default into
+its partitions. No model or saved-format change is needed.
+
+A partition may override that serial's default with an ordinary default of
+its own, held on `PartitionOf::columns` under DEC-1578.1. Measured on 16.15
+and 18.6, both `PARTITION OF p (id DEFAULT 0)` at create and `ALTER TABLE p1
+ALTER COLUMN id SET DEFAULT 0` afterward are accepted. A direct insert takes
+0 without advancing the parent's sequence; an insert through the parent
+still takes its next sequence value, even when routed to that partition.
+Validation therefore allows an own default under a serial parent, and the
+partition emitter's existing post-create `SET DEFAULT` recreates it. The
+identity refusal stays: on 18 that post-create `SET DEFAULT` is refused for
+an identity column; an inline default is accepted but direct inserts still
+take the identity's value instead. A serial's ordinary default has neither
+restriction.
+
+This is #1893 part A, read and create. Part B (#2218) leaves attaching a
+table without the parent's serial default for its own change. Until part C
+(#2219), adding or dropping a serial column on an existing partitioned
+parent, or changing numbering to or from a serial there (including a
+retune), is refused by name citing #2219. Plain tables retain those changes.
+
+Pinned by `a_partitioned_parents_serial_holds_only_its_same_column_same_text_copies`,
+`a_serial_that_is_nullable_defaulted_on_a_partition_or_misnamed_is_refused`,
+`a_created_partitioned_parent_owns_its_serial_and_its_partition_owns_none`,
+`a_standing_parents_serial_column_changes_name_their_partition_support_issue`,
+`a_partitions_own_default_can_override_a_serial_but_not_an_identity`
+and, live on 16 and 18,
+`a_partitioned_parents_serial_round_trips_without_partition_drift` (SQL-created
+tree, connected create into an empty database, empty next plan, byte-identical
+re-pull, numbered inserts, a partition's own non-sequence default used only
+by direct inserts, shared and differing-default limitations, and the
+measured attach/add behavior). Restoring the old reader restriction makes
+the live test fail.

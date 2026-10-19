@@ -771,9 +771,26 @@ fn columns_query() -> String {
                    pg_catalog.min(ss.seqmax)::int8 AS ser_max,
                    pg_catalog.min(ss.seqcache)::int8 AS ser_cache,
                    pg_catalog.bool_or(ss.seqcycle) AS ser_cycle,
+                   -- Copies of this parent's default are still the parent's
+                   -- source (DEC-1578.1, DEC-2217.1). Other columns, texts and
+                   -- tables must keep the shared-sequence limitation.
                    pg_catalog.max((SELECT pg_catalog.count(*) FROM pg_catalog.pg_depend ud
                                     WHERE ud.classid = 'pg_attrdef'::regclass
-                                      AND ud.refobjid = sq.oid))::int8 AS ser_users
+                                      AND ud.refobjid = sq.oid
+                                      AND NOT (c.relkind = 'p' AND NOT c.relispartition
+                                          AND EXISTS (
+                                              SELECT 1 FROM pg_catalog.pg_attrdef cd
+                                              JOIN pg_catalog.pg_class cc ON cc.oid = cd.adrelid
+                                              JOIN pg_catalog.pg_attribute ca
+                                                ON ca.attrelid = cd.adrelid
+                                               AND ca.attnum = cd.adnum
+                                             WHERE cd.oid = ud.objid AND cc.relispartition
+                                               AND ca.attname = a.attname
+                                               AND pg_catalog.pg_get_expr(cd.adbin, cd.adrelid)
+                                                   = pg_catalog.pg_get_expr(d.adbin, d.adrelid)
+                                               AND cc.oid IN (SELECT relid
+                                                   FROM pg_catalog.pg_partition_tree(c.oid))
+                                          ))))::int8 AS ser_users
               FROM pg_catalog.pg_depend od
               JOIN pg_catalog.pg_class sq ON sq.oid = od.objid AND sq.relkind = 'S'
               JOIN pg_catalog.pg_sequence ss ON ss.seqrelid = sq.oid
@@ -2875,7 +2892,8 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
             };
             let Some(parents) = (match &theirs.value_source {
                 ValueSource::Default(value) => Some(value.as_str()),
-                // A `serial` is refused on a partitioned parent (#1893).
+                // A serial's implicit default is not declared text to
+                // compare in a temporary table (DEC-2217.1).
                 ValueSource::None
                 | ValueSource::Identity(_)
                 | ValueSource::Sequence(_)
