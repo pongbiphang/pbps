@@ -7005,3 +7005,105 @@ on 16 and 18, by
 test covers a publication named for an identity and a `serial` added
 together, a table with none left unnamed, a created table not named, the plan
 applying, and the pass once the publication is gone.
+
+<a id="dec-2100-1"></a>
+
+**DEC-2100.1. A constraint trigger's companion constraint names, its clones'
+included, are slots held and released by its module.** Measured on PostgreSQL
+16 and 18: a check or foreign key cannot take the companion's name until the
+trigger is dropped or rebuilt as an ordinary trigger. `AlterModule` was in
+class 14, after a check's class 13, so the valid handover failed at apply.
+
+`pbps_dialect::slots::names` supplements the portable names through the existing
+`declares_a_constraint` and `clones_to_partitions` answers; the model does not
+parse a trigger definition. The companion and each standing partition clone
+hold a `NameKind::Constraint`, scoped by the table's identity and held by the
+parent trigger's `ObjectKey::Module`. The baseline seeds the same names.
+The old kind comes from the baseline and the new kind from the operation's
+payload, so a kept constraint gives up no slot, and an ordinary trigger claims
+none. There is no new object kind or fabricated identity.
+
+Only these module-to-constraint handover edges join `after_the_rebuilds`'
+existing `Schedule::settle`. It keeps DEC-1956.2: the claimer sinks after the
+release. A plan without such a handover keeps its bytes and its existing
+function-ordering behavior. There is no new pass, rank or hoisting mode.
+A cycle is refused through `Refusal::describe` with the steps named and the
+plan unchanged. Before the shared schedule runs, the debug verifier records
+these particular edges as pending; the scheduled and final orders enforce
+them. Generated key-name replay remains #2101's separate question.
+
+Pinned by `a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots`,
+`ordinary_modules_checks_and_rows_without_a_handover_keep_their_bytes`,
+`a_constraint_slot_cycle_is_refused_with_its_steps_named`, and the live
+`a_constraint_trigger_rebuild_frees_its_name_before_a_check_or_foreign_key`.
+
+<a id="dec-2100-2"></a>
+
+**DEC-2100.2. A trigger release covers prospective partition clones, and a
+partition arrival claims only the clones its parent then creates.** Review
+of #2100 found that a new or attached partition with its own check could
+reach the parent's old constraint trigger before its conversion to an ordinary
+trigger. Measured on PostgreSQL 16 and 18: create fails with 42710 for the
+constraint name, and attach with 23505 on the constraint catalog's unique
+index. Releasing the constraint trigger first permits both operations.
+
+The dialect's name analysis reads the operation list as well as the baseline.
+A release includes the clone slots of partitions the plan creates or attaches,
+scoped through the parent's and partition's identities. An arrival reads the
+parent's trigger kind after the preceding module operations: it claims a
+companion only while the trigger is a constraint trigger. A module creation
+claims clones only on partitions already introduced. The baseline still seeds
+only standing clones, never ones whose table does not yet exist.
+
+An attach restates a competing own constraint as it stands at that operation,
+replaying portable names through the prefix. Its final `shape` is not evidence
+that a later check already exists, nor that a removed check still stands.
+Inherited clone claims remain visible to replay, but do not make their
+standing parent trigger a new independent holder: that trigger's release
+still precedes another holder's competing claim.
+
+`CreateTable` and `AttachPartition` join the existing companion handovers in
+`after_the_rebuilds`' sink settle. Across an arrival delayed by such an edge,
+the existing `needs` constraints keep readers behind it. Rows through its
+parent may route into the partition too. A row still precedes module changes,
+so a row that would have to cross the release is a named cycle, refused without
+changing the plan, rather than being run under a different trigger. No new
+ordering pass, rank or hoisting mode is added. Plans without a handover keep
+their existing order. A kept constraint trigger remains a named refusal by
+the connected plan's existing validation; this change adds no intake rule.
+
+Pinned by `an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_releases_it`,
+`an_attach_claims_its_standing_checks_instead_of_its_final_checks`,
+`a_delayed_partition_keeps_its_readers_after_it_and_refuses_a_row_cycle`, and
+the live `a_created_partition_takes_a_constraint_trigger_name_after_its_release`
+and `an_attached_partition_keeps_its_check_after_a_constraint_trigger_releases_its_name`.
+
+<a id="dec-2100-3"></a>
+
+**DEC-2100.3. A constraint-slot claimer that sinks keeps its effects graph's
+dependents behind it.** Review of #2100 found that sinking an added unique
+or primary key after a trigger conversion left its referencing foreign key
+ahead of both. PostgreSQL 16 and 18 refuse that order with 42830: no unique
+constraint matches the referenced columns. A replica identity selecting the
+key is another reader with the same requirement.
+
+Before the existing `after_the_rebuilds` settle, the shared schedule reads
+the portable and dialect effects through `shadow::analyse`, `edges::graph`
+and `Schedule::of_graph`. Starting only at claimers a companion-name handover
+delays, it adds their outgoing constraints and follows their dependents.
+Each reader's `Is(Final)` requirement produces the key's `Creates` edge to
+the FK or replica identity. Identity ownership comes from `PlanNames` and `PlanOwners`,
+including rename history; SQL text is not used to infer these dependencies.
+Unknown ownership is refused rather than read as independence.
+
+This adds constraints to the existing sink settle, not another ordering
+pass. A check has no such readers; a foreign key on another standing key
+keeps its place. A handover already satisfied imports no edges, and plans
+without a companion-name handover keep their existing bytes. The existing
+partition-reader constraints and named cycle refusal remain in force.
+
+Pinned by `a_deferred_key_keeps_its_dependents_without_carrying_unrelated_foreign_keys`
+and the PostgreSQL 16/18 live
+`a_deferred_unique_or_primary_key_keeps_its_referencing_foreign_key_after_it`,
+including check and unrelated-FK controls, a replica identity on each key,
+and an already ordered trigger-drop control in the unit test.

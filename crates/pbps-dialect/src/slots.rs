@@ -15,10 +15,13 @@
 //! know (SPEC 7.3): there the answer is a catalog fact, and without it the
 //! check is skipped and reported, never read as "different names".
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use pbps_model::ModuleKind;
-use pbps_model::operation::{Address, NameKind, ObjectKey};
+use pbps_model::operation::{
+    Address, NameKind, Named, Names, ObjectKey, Operation, OwnerError, Owners, Snapshot,
+    base_table_named,
+};
+use pbps_model::{Change, Module, ModuleId, ModuleKind, TableName};
 
 use crate::Dialect;
 
@@ -97,6 +100,260 @@ pub struct Occupant {
     /// The owner's column it belongs to, by the baseline's name: an owned
     /// sequence, or a column's default constraint.
     pub column: Option<String>,
+}
+
+/// Names whose existence the dialect decides, beside the portable names.
+/// A constraint trigger's companion and clones belong to the trigger, not
+/// to independently declared constraints (DEC-2100.1).
+fn constraint_names(
+    dialect: &dyn Dialect,
+    id: &ModuleId,
+    module: &Module,
+    before: Snapshot<'_>,
+    owners: &dyn Owners,
+    scope: Option<ObjectKey>,
+    introduced: &[Operation],
+) -> Vec<Named> {
+    let ModuleId::Trigger { on, name } = id else {
+        return Vec::new();
+    };
+    if !dialect.declares_a_constraint(module) {
+        return Vec::new();
+    }
+    let Some(ObjectKey::Table(uid)) = scope else {
+        return Vec::new();
+    };
+    let address = |owner, schema: String| Named {
+        address: Address {
+            kind: NameKind::Constraint,
+            schema,
+            table: Some(owner),
+            name: name.clone(),
+            signature: None,
+        },
+        holder: ObjectKey::Module(id.clone()),
+    };
+    let mut out = vec![address(ObjectKey::Table(uid.clone()), on.schema.clone())];
+    if dialect.clones_to_partitions(module) {
+        let ids = before.ids.index();
+        for (table, shape) in &before.schema.tables {
+            if let Some(of) = &shape.partition_of
+                && ids.table_uid(&of.parent) == Some(uid.uid())
+                && let Some(partition) = base_table_named(owners, before, table)
+            {
+                out.push(address(partition.table_key(), table.schema.clone()));
+            }
+        }
+        // A release names prospective clones too: creating or attaching a
+        // partition before the release would create them. Their slots let
+        // the existing settle delay that arrival (DEC-2100.2).
+        for op in introduced {
+            if let Some((table, parent)) = partition(op)
+                && owners.table(parent, op.origin().spelling()).ok() == Some(uid.uid().clone())
+                && let Ok(key) = op.key(owners)
+            {
+                let named = address(key, table.schema.clone());
+                if !out.contains(&named) {
+                    out.push(named);
+                }
+            }
+        }
+    }
+    out
+}
+
+// Other changes introduce no partition into a parent.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn partition(op: &Operation) -> Option<(&TableName, &TableName)> {
+    match op.change() {
+        Change::CreateTable { name, table, .. } => {
+            table.partition_of.as_ref().map(|of| (name, &of.parent))
+        }
+        Change::AttachPartition { table, parent, .. } => Some((table, parent)),
+        _ => None,
+    }
+}
+
+fn preceding<'a>(operations: &'a [Operation], op: &Operation) -> &'a [Operation] {
+    let at = operations
+        .iter()
+        .position(|p| p.id() == op.id())
+        .expect("names are read in the operation list their step belongs to");
+    &operations[..at]
+}
+
+/// Creating or attaching a partition clones the parent's trigger as it
+/// stands then, not as it stood at baseline or will stand in the declaration.
+fn arriving_clones(
+    dialect: &dyn Dialect,
+    op: &Operation,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    operations: &[Operation],
+) -> Result<Vec<Named>, OwnerError> {
+    let Some((table, parent)) = partition(op) else {
+        return Ok(Vec::new());
+    };
+    let parent = owners.table(parent, op.origin().spelling())?;
+    let scope = op.key(owners)?;
+    let mut triggers = BTreeMap::new();
+    for (id, module) in &before.schema.modules {
+        if let ModuleId::Trigger { on, name } = id
+            && let Ok(owner) = owners.table(on, pbps_model::operation::Spelling::Base)
+        {
+            triggers.insert((owner, name.clone()), (id, module));
+        }
+    }
+    let previous = preceding(operations, op);
+    for earlier in previous {
+        if let Some(id @ ModuleId::Trigger { on, name }) = earlier.change().module_id() {
+            let owner = owners.table(on, earlier.origin().spelling())?;
+            let key = (owner, name.clone());
+            if let Change::CreateModule { module, .. } | Change::AlterModule { module, .. } =
+                earlier.change()
+            {
+                triggers.insert(key, (id, module));
+            } else if matches!(earlier.change(), Change::DropModule { .. }) {
+                triggers.remove(&key);
+            }
+        }
+    }
+    let mut clones = Vec::new();
+    for ((owner, name), (id, module)) in triggers {
+        if owner == parent
+            && dialect.declares_a_constraint(module)
+            && dialect.clones_to_partitions(module)
+        {
+            clones.push(Named {
+                address: Address {
+                    kind: NameKind::Constraint,
+                    schema: table.schema.clone(),
+                    table: Some(scope.clone()),
+                    name,
+                    signature: None,
+                },
+                holder: ObjectKey::Module(id.clone()),
+            });
+        }
+    }
+    if !clones.is_empty() && matches!(op.change(), Change::AttachPartition { .. }) {
+        // An attach keeps the table's own constraints. Restate only the
+        // ones a clone would collide with, as they stand at this operation;
+        // using the final shape would also claim checks installed later.
+        let mut held = pbps_model::operation::baseline_names(owners, before);
+        for earlier in previous {
+            let names = pbps_model::operation::names(earlier, owners, before)?;
+            held.retain(|n| !names.releases.contains(n));
+            held.extend(names.claims);
+        }
+        let clone_slots: BTreeSet<_> = clones
+            .iter()
+            .flat_map(|n| slots(dialect, &n.address))
+            .collect();
+        let kept = held.into_iter().filter(|n| {
+            matches!(n.address.kind, NameKind::Constraint | NameKind::Key)
+                && slots(dialect, &n.address)
+                    .iter()
+                    .any(|s| clone_slots.contains(s))
+        });
+        clones.extend(kept);
+    }
+    Ok(clones)
+}
+
+/// An operation's portable names and its dialect's companion names. The
+/// old trigger kind is read from the baseline, never from its replacement.
+/// `operations` is the order containing `op`, so arrivals read the kind in
+/// force at their position rather than guessing it from the final schema.
+pub fn names(
+    dialect: &dyn Dialect,
+    op: &Operation,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+    operations: &[Operation],
+) -> Result<Names, OwnerError> {
+    let mut out = pbps_model::operation::names(op, owners, before)?;
+    out.claims
+        .extend(arriving_clones(dialect, op, owners, before, operations)?);
+    let scope = out
+        .claims
+        .iter()
+        .chain(&out.releases)
+        .find(|n| n.address.kind == NameKind::Module(ModuleKind::Trigger))
+        .and_then(|n| n.address.table.clone())
+        .or_else(|| match op.change().module_id()? {
+            ModuleId::Trigger { on, .. } => owners
+                .table(on, op.origin().spelling())
+                .ok()
+                .and_then(|uid| before.ids.tables.get(&uid))
+                .and_then(|name| base_table_named(owners, before, name))
+                .map(|table| table.table_key()),
+            ModuleId::Named(_) | ModuleId::Routine(_) => None,
+        });
+    if let Change::DropModule { id, .. } | Change::AlterModule { id, .. } = op.change() {
+        let old_id = match id {
+            ModuleId::Trigger { on, name } => owners
+                .table(on, op.origin().spelling())
+                .ok()
+                .and_then(|uid| before.ids.tables.get(&uid))
+                .map(|on| ModuleId::Trigger {
+                    on: on.clone(),
+                    name: name.clone(),
+                }),
+            ModuleId::Named(_) | ModuleId::Routine(_) => None,
+        };
+        if let Some(module) = old_id.as_ref().and_then(|id| before.schema.modules.get(id)) {
+            out.releases.extend(constraint_names(
+                dialect,
+                id,
+                module,
+                before,
+                owners,
+                scope.clone(),
+                operations,
+            ));
+        }
+    }
+    if let Change::CreateModule { id, module } | Change::AlterModule { id, module } = op.change() {
+        out.claims.extend(constraint_names(
+            dialect,
+            id,
+            module,
+            before,
+            owners,
+            scope,
+            preceding(operations, op),
+        ));
+    }
+    Ok(out)
+}
+
+/// The same companion names seed the replay and identify managed catalog
+/// occupants, so a kept constraint trigger cannot be mistaken for absence.
+pub fn baseline_names(
+    dialect: &dyn Dialect,
+    owners: &dyn Owners,
+    before: Snapshot<'_>,
+) -> Vec<Named> {
+    let mut out = pbps_model::operation::baseline_names(owners, before);
+    for (id, module) in &before.schema.modules {
+        let scope = match id {
+            ModuleId::Trigger { on, .. } => {
+                base_table_named(owners, before, on).map(|t| t.table_key())
+            }
+            ModuleId::Named(_) | ModuleId::Routine(_) => None,
+        };
+        out.extend(constraint_names(
+            dialect,
+            id,
+            module,
+            before,
+            owners,
+            scope,
+            &[],
+        ));
+    }
+    out
 }
 
 /// The slots `address` takes, by the dialect's namespace answers: one, or

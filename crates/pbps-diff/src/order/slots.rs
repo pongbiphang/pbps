@@ -27,10 +27,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
-use pbps_dialect::slots::{CatalogFacts, Same, SlotKey, same, slots as slots_of};
+use pbps_dialect::slots::{
+    CatalogFacts, Same, SlotKey, baseline_names, names, same, slots as slots_of,
+};
 use pbps_model::operation::{
     ObjectKey, Operation, OperationId, OwnerError, Owners, Snapshot, base_table_named,
-    baseline_names, names,
 };
 use pbps_model::{Change, TableName};
 
@@ -39,6 +40,9 @@ use pbps_model::{Change, TableName};
 pub struct SlotEffects {
     pub claims: Vec<(SlotKey, ObjectKey)>,
     pub releases: Vec<(SlotKey, ObjectKey)>,
+    /// A partition's arrival inherits these names from a standing module.
+    /// Its arrival does not make that module an independent new holder.
+    pub inherited: Vec<(SlotKey, ObjectKey)>,
     /// The names its statements pass through, which no other operation sees.
     pub intermediate: Vec<SlotKey>,
 }
@@ -63,7 +67,7 @@ pub fn analyse(
     let mut out = Slots::default();
     for op in operations {
         let mut fx = SlotEffects::default();
-        match names(op, owners, before) {
+        match names(dialect, op, owners, before, operations) {
             Ok(n) => {
                 fx.claims = n
                     .claims
@@ -94,6 +98,17 @@ pub fn analyse(
                     .collect();
                 fx.claims.retain(|c| !kept.contains(c));
                 fx.releases.retain(|r| !kept.contains(r));
+                if matches!(
+                    op.change(),
+                    Change::CreateTable { .. } | Change::AttachPartition { .. }
+                ) {
+                    fx.inherited = fx
+                        .claims
+                        .iter()
+                        .filter(|(_, h)| matches!(h, ObjectKey::Module(_)))
+                        .cloned()
+                        .collect();
+                }
             }
             Err(error) => out.unowned.push((op.id(), error)),
         }
@@ -189,7 +204,7 @@ pub fn carried(
     before: Snapshot<'_>,
     dialect: &dyn Dialect,
 ) -> Vec<Carried> {
-    let declared: BTreeSet<SlotKey> = baseline_names(owners, before)
+    let declared: BTreeSet<SlotKey> = baseline_names(dialect, owners, before)
         .into_iter()
         .flat_map(|named| slots_of(dialect, &named.address))
         .collect();
@@ -345,8 +360,17 @@ fn handovers_of(
     // Per name: each holder's claims and releases, by step.
     type Steps = (Vec<usize>, Vec<usize>);
     let mut by_slot: BTreeMap<&SlotKey, BTreeMap<Holder<'_>, Steps>> = BTreeMap::new();
+    let released: BTreeSet<_> = slots.effects.iter().flat_map(|fx| &fx.releases).collect();
     for (i, fx) in slots.effects.iter().enumerate() {
-        for (s, h) in &fx.claims {
+        for claimed in &fx.claims {
+            let (s, h) = claimed;
+            // An inherited clone belongs to its standing parent trigger.
+            // Releasing that trigger must precede a competing claim even
+            // when the partition would otherwise create the clone first.
+            // Replay still sees the actual, operation-local claim below.
+            if fx.inherited.contains(claimed) && released.contains(claimed) {
+                continue;
+            }
             by_slot
                 .entry(&rep[s])
                 .or_default()
@@ -601,7 +625,7 @@ pub fn verify(
         .iter()
         .flat_map(|fx| fx.claims.iter().map(|(s, _)| s).chain(&fx.intermediate))
         .collect();
-    let baseline: Vec<(SlotKey, ObjectKey)> = baseline_names(owners, before)
+    let baseline: Vec<(SlotKey, ObjectKey)> = baseline_names(dialect, owners, before)
         .into_iter()
         .flat_map(|named| {
             slots_of(dialect, &named.address)

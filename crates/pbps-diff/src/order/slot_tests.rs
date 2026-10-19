@@ -25,6 +25,9 @@ struct Slotted {
 }
 
 impl Dialect for Slotted {
+    fn declares_a_constraint(&self, module: &pbps_model::Module) -> bool {
+        module.kind == pbps_model::ModuleKind::Trigger && module.definition == "CONSTRAINT"
+    }
     fn name(&self) -> &'static str {
         if self.exact { "exact" } else { "collated" }
     }
@@ -79,6 +82,80 @@ fn uid(name: &str) -> Uid {
 }
 fn name(qualified: &str) -> TableName {
     qualified.parse().unwrap()
+}
+
+#[test]
+fn a_trigger_handover_is_pending_only_before_the_shared_schedule() {
+    use super::shadow::{Stage, judge_slots};
+    use pbps_model::{CheckConstraint, Module, ModuleId, ModuleKind};
+    let trigger = ModuleId::Trigger {
+        on: name("app.t"),
+        name: "audit".into(),
+    };
+    let module = |definition: &str| Module {
+        kind: ModuleKind::Trigger,
+        description: None,
+        definition: definition.into(),
+    };
+    let mut plan = Plan::new(
+        &[("t", "app.t")],
+        &[("t", "app.t")],
+        vec![
+            Change::AddCheck {
+                table: name("app.t"),
+                name: "audit".into(),
+                constraint: CheckConstraint {
+                    expression: "id > 0".into(),
+                },
+            },
+            Change::AlterModule {
+                id: trigger.clone(),
+                module: Box::new(module("ORDINARY")),
+            },
+        ],
+    );
+    plan.before.modules.insert(trigger, module("CONSTRAINT"));
+    let names = PlanNames::of(&plan.logical, &plan.after_ids).unwrap();
+    let owners = PlanOwners::new(names, &plan.before_ids, &plan.after_ids);
+    let before = Snapshot {
+        schema: &plan.before,
+        ids: &plan.before_ids,
+    };
+    let ops = Operations::of_plan(&plan.logical, ModuleEdits::Rebuilt);
+    let dialect = Slotted { exact: true };
+    let (lines, failed) = judge_slots(
+        ops.as_slice(),
+        &owners,
+        before,
+        &dialect,
+        None,
+        Stage::BeforeSchedule,
+    );
+    assert!(!failed, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("scheduled slot held ")),
+        "{lines:?}"
+    );
+    for stage in [Stage::Differ, Stage::Final] {
+        assert!(
+            judge_slots(ops.as_slice(), &owners, before, &dialect, None, stage).1,
+            "an unsatisfied handover is enforced after scheduling"
+        );
+    }
+    let ordered = ops.reordered(&[1, 0]);
+    assert!(
+        !judge_slots(
+            ordered.as_slice(),
+            &owners,
+            before,
+            &dialect,
+            None,
+            Stage::Final
+        )
+        .1
+    );
 }
 
 /// Tables before and after, by `(uid seed, name)`, and the plan between.
