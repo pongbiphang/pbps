@@ -3484,3 +3484,32 @@ pub async fn policies_on_column(
         })
         .collect()
 }
+
+/// All policy references to a stored table, including relation-only and
+/// attribute edges. Its own policies disappear automatically with the table.
+pub async fn policies_on_table(
+    conn: &mut Conn,
+    table: &TableName,
+) -> Result<Vec<PolicyDependent>, DbError> {
+    require_the_callers_transaction(conn).await?;
+    let rows = conn.query_with(
+        "SELECT DISTINCT p.polname, n.nspname, own.relname
+           FROM pg_catalog.pg_class t
+           JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
+           JOIN pg_catalog.pg_depend d ON d.refclassid = 'pg_catalog.pg_class'::regclass
+                AND d.refobjid = t.oid
+           JOIN pg_catalog.pg_policy p ON d.classid = 'pg_catalog.pg_policy'::regclass AND p.oid = d.objid
+           JOIN pg_catalog.pg_class own ON own.oid = p.polrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid = own.relnamespace
+          WHERE tn.nspname = $1 AND t.relname = $2 AND p.polrelid <> t.oid
+          ORDER BY 2, 3, 1",
+        &[Param::Str(&table.schema), Param::Str(&table.name)]).await?;
+    rows.iter()
+        .map(|row| {
+            Ok(PolicyDependent {
+                name: text(row, "polname")?,
+                table: TableName::new(text(row, "nspname")?, text(row, "relname")?),
+            })
+        })
+        .collect()
+}

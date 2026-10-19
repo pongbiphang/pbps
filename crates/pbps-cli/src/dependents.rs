@@ -1016,6 +1016,29 @@ fn weave(
     Ok(added)
 }
 
+/// Re-state the catalog ordering after other connected edges have been read;
+/// a policy's owner can itself be another policy's referenced table.
+fn module_order(
+    cs: &ChangeSet,
+    found: &BTreeMap<ModuleId, Vec<Dependent>>,
+    declared: &Schema,
+    sources: Sources<'_>,
+    dialect: &dyn Dialect,
+) -> Result<Vec<Order>, String> {
+    Weave {
+        roots: dropped_modules(cs)
+            .into_iter()
+            .map(|(root, _)| root)
+            .collect(),
+        found,
+        declared,
+        sources,
+        dialect,
+        partitions: standing_partitions(declared, cs),
+    }
+    .order(&cs.changes)
+}
+
 /// [`weave`] as an expansion (#1958): for each dependent of each module the
 /// plan drops, the steps that put it on the right side of the drop, one
 /// obligation at a time in `found`'s order.
@@ -1134,6 +1157,19 @@ impl Weave<'_> {
         // no longer have its owner.
         if find(&view, &parts, &d.holds, partitions, removes_with_its_owner)
             .is_some_and(|i| i < at.drop_at)
+        {
+            return Ok(None);
+        }
+        // A policy removed with its table needs ordering, never a synthesized
+        // DROP POLICY. The final catalog edges below place that owner before
+        // the routine even when the differ put the routine first.
+        if matches!(
+            d.holds,
+            Holds::TablePart {
+                part: Part::Policy(_),
+                ..
+            }
+        ) && find(&view, &parts, &d.holds, partitions, removes_with_its_owner).is_some()
         {
             return Ok(None);
         }
@@ -1365,6 +1401,13 @@ impl Expansion for Weave<'_> {
             let Some(at) = span(changes, root) else {
                 continue;
             };
+            // A held routine drop must take its paired create with it.
+            if let Some(create) = at.create_at.filter(|i| *i != at.drop_at) {
+                edges.push(catalog(
+                    expand::Step::Plan(at.drop_at),
+                    expand::Step::Plan(create),
+                ));
+            }
             for d in self.found.get(root).map_or(&[][..], Vec::as_slice) {
                 let release = match &d.holds {
                     Holds::TablePart {
@@ -1374,6 +1417,10 @@ impl Expansion for Weave<'_> {
                         find(&view, &parts, &d.holds, partitions, removes_with_its_owner)
                     }),
                     Holds::Module(_) => find(&view, &parts, &d.holds, partitions, removes),
+                    Holds::TablePart {
+                        part: Part::Policy(_),
+                        ..
+                    } => find(&view, &parts, &d.holds, partitions, removes_with_its_owner),
                     Holds::TablePart { .. } | Holds::Unrepresentable(_) => None,
                 };
                 if let Some(i) = release.filter(|i| *i != at.drop_at) {
@@ -4241,6 +4288,73 @@ mod tests {
     ) -> Result<usize, String> {
         let schedule = Schedule::new(cs.changes.len());
         super::after_the_rebuilds(cs, released, deps, declared, schedule, dialect)
+    }
+
+    #[test]
+    fn policy_owner_teardown_precedes_routine_removal_and_replacement() {
+        let root = id("app.gate()");
+        let table = TableName::new("app", "t");
+        let dependency = Dependent {
+            described: "policy gate_policy on table app.t".into(),
+            holds: Holds::TablePart {
+                table: table.clone(),
+                part: Part::Policy("gate_policy".into()),
+            },
+        };
+        let found = [(root.clone(), vec![dependency])].into();
+        for replace in [false, true] {
+            let mut declared = Schema::default();
+            let mut steps = vec![Change::DropModule {
+                id: root.clone(),
+                kind: ModuleKind::Function,
+            }];
+            if replace {
+                let next = Module {
+                    kind: ModuleKind::Function,
+                    description: None,
+                    definition: "() RETURNS boolean LANGUAGE sql AS 'SELECT false'".into(),
+                };
+                declared.modules.insert(root.clone(), next.clone());
+                steps.push(Change::CreateModule {
+                    id: root.clone(),
+                    module: Box::new(next),
+                });
+            }
+            steps.push(Change::DropTable {
+                uid: "t_117200".parse().unwrap(),
+                name: table.clone(),
+                detach_from: None,
+            });
+            let mut changes = ChangeSet {
+                changes: steps.into_iter().map(PlannedChange::new).collect(),
+            };
+            let mut retained = changes.clone();
+            retained.changes.pop();
+            let refused = weave(&mut retained, &found, &declared, &[], &*pg()).unwrap_err();
+            assert!(
+                refused.contains("gate_policy") && refused.contains("arrives with #1173"),
+                "{refused}"
+            );
+            assert_eq!(
+                weave(&mut changes, &found, &declared, &[], &*pg()).unwrap(),
+                0
+            );
+            assert!(matches!(
+                &changes.changes[0].change,
+                Change::DropTable { .. }
+            ));
+            assert!(matches!(
+                &changes.changes[1].change,
+                Change::DropModule { .. }
+            ));
+            if replace {
+                assert!(matches!(
+                    &changes.changes[2].change,
+                    Change::CreateModule { .. }
+                ));
+            }
+            assert!(unaccounted(&changes, &found, &Partitions::default()).is_empty());
+        }
     }
 
     fn pg() -> Box<dyn Dialect> {

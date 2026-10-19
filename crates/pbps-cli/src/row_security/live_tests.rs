@@ -339,6 +339,7 @@ async fn check(connection: String, owner: String) {
         "{error}"
     );
     policy_owner_drop_releases_column(&mut conn).await;
+    policy_owner_teardowns(&mut conn).await;
     conn.execute("ALTER TABLE app.t DROP COLUMN extra; ROLLBACK")
         .await
         .unwrap();
@@ -507,4 +508,172 @@ async fn policy_owner_drop_releases_column(conn: &mut Conn) {
     conn.execute("ROLLBACK TO SAVEPOINT policy_owner_order")
         .await
         .unwrap();
+}
+
+async fn policy_owner_teardowns(conn: &mut Conn) {
+    use pbps_model::{Column, Schema, Table};
+    let mut failures = Vec::new();
+    for variant in 0..3 {
+        let routine = variant != 2;
+        let replace = variant == 1;
+        conn.execute("SAVEPOINT policy_teardown").await.unwrap();
+        let names: Vec<_> = if routine {
+            vec!["routine_owner"]
+        } else {
+            vec!["a", "m", "z"]
+        }
+        .into_iter()
+        .map(|name| TableName::new("app", name))
+        .collect();
+        let mut before = Schema::default();
+        let mut ids = IdsFile::default();
+        for table in &names {
+            conn.execute(&format!("CREATE TABLE {} (id integer)", table.shown()))
+                .await
+                .unwrap();
+            ids.tables
+                .insert(Uid::derived(UidKind::Table, &table.name, 0), table.clone());
+            ids.columns.insert(
+                Uid::derived(UidKind::Column, &table.name, 0),
+                table.column("id"),
+            );
+            before.tables.insert(
+                table.clone(),
+                Table {
+                    columns: [("id".into(), Column::new("integer".parse().unwrap()))].into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let mut changes = Vec::new();
+        if routine {
+            conn.execute("CREATE FUNCTION app.policy_gate() RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'; CREATE POLICY calls_gate ON app.routine_owner USING (app.policy_gate())").await.unwrap();
+            before.modules.insert(
+                "app.policy_gate()".parse().unwrap(),
+                pbps_model::Module {
+                    kind: pbps_model::ModuleKind::Function,
+                    description: None,
+                    definition: "() RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT true'".into(),
+                },
+            );
+            before
+                .tables
+                .get_mut(&names[0])
+                .unwrap()
+                .row_policies
+                .insert(
+                    "calls_gate".into(),
+                    pbps_model::RowPolicy {
+                        using: Some("app.policy_gate()".into()),
+                        ..Default::default()
+                    },
+                );
+            changes.push(Change::DropModule {
+                id: "app.policy_gate()".parse().unwrap(),
+                kind: pbps_model::ModuleKind::Function,
+            });
+        } else {
+            // Relation-only edges really block DROP TABLE, while a column
+            // drop must not mistake them for references to every attribute.
+            conn.execute("CREATE POLICY reads_a ON app.z USING (EXISTS (SELECT FROM app.a)); CREATE POLICY reads_z ON app.m USING (EXISTS (SELECT FROM app.z))").await.unwrap();
+            for (owner, input, policy) in [
+                (&names[2], &names[0], "reads_a"),
+                (&names[1], &names[2], "reads_z"),
+            ] {
+                before.tables.get_mut(owner).unwrap().row_policies.insert(
+                    policy.into(),
+                    pbps_model::RowPolicy {
+                        using: Some(format!("EXISTS (SELECT FROM {})", input.shown()).into()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        if replace {
+            let id = "app.policy_gate()".parse().unwrap();
+            changes.push(Change::CreateModule {
+                id,
+                module: Box::new(before.modules[&"app.policy_gate()".parse().unwrap()].clone()),
+            });
+        }
+        for table in &names {
+            changes.push(Change::DropTable {
+                uid: Uid::derived(UidKind::Table, &table.name, 0),
+                name: table.clone(),
+                detach_from: None,
+            });
+        }
+        let mut plan = ChangeSet {
+            changes: changes.into_iter().map(PlannedChange::new).collect(),
+        };
+        let mut after = Schema::default();
+        if replace {
+            after.modules = before.modules.clone();
+        }
+        let final_ids = IdsFile::default();
+        let wrong = crate::engine::check_module_dependents(conn, &plan, &before, &final_ids, &ids)
+            .await
+            .unwrap_err();
+        assert!(
+            wrong
+                .to_string()
+                .contains(if routine { "calls_gate" } else { "reads_a" }),
+            "{wrong}"
+        );
+        let result: anyhow::Result<()> = async {
+            crate::engine::account_for_module_dependents(
+                conn,
+                &mut plan,
+                &after,
+                crate::dependents::Sources {
+                    before: pbps_diff::Side {
+                        schema: &before,
+                        ids: &ids,
+                    },
+                    after: &final_ids,
+                },
+                &Default::default(),
+                None,
+                &pbps_pg::Postgres::new(),
+                &|_| panic!("no retained module needs a rediff"),
+            )
+            .await?;
+            crate::engine::check_module_dependents(conn, &plan, &before, &final_ids, &ids).await?;
+            crate::engine::check_drop_blockers(conn, &plan, &final_ids, &before, &ids).await?;
+            let order: Vec<_> = plan
+                .changes
+                .iter()
+                .filter_map(|p| {
+                    if let Change::DropTable { name, .. } = &p.change {
+                        Some(name.name.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                order,
+                if routine {
+                    vec!["routine_owner"]
+                } else {
+                    vec!["m", "z", "a"]
+                }
+            );
+            assert!(matches!(&plan.changes[0].change, Change::DropTable { .. }));
+            for step in &plan.changes {
+                for statement in pbps_pg::Postgres::new().emit(&step.change, Default::default())? {
+                    conn.execute(&statement.sql).await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            failures.push(format!("routine={routine}, replace={replace}: {error:#}"));
+        }
+        conn.execute("ROLLBACK TO SAVEPOINT policy_teardown")
+            .await
+            .unwrap();
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

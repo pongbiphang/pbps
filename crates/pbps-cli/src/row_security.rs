@@ -7,9 +7,9 @@ use pbps_model::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The exact policy dependents read for each edited column. An absent entry
+/// The exact policy dependents read for each edited column or dropped table. An absent entry
 /// is unread, while an empty vector records a successful empty catalog read.
-pub(crate) type ColumnPolicies = BTreeMap<Uid, Vec<pbps_pg::modules::PolicyDependent>>;
+pub(crate) type PolicyDependents = BTreeMap<Uid, Vec<pbps_pg::modules::PolicyDependent>>;
 
 /// The column changes whose old catalog bindings a policy can hold.
 pub(crate) fn column_edit(change: &Change) -> Option<(&Uid, &pbps_model::ColumnRef, &'static str)> {
@@ -22,43 +22,65 @@ pub(crate) fn column_edit(change: &Change) -> Option<(&Uid, &pbps_model::ColumnR
     }
 }
 
+pub(crate) fn policy_target_uid(change: &Change) -> Option<&Uid> {
+    if let Change::DropTable { uid, .. } = change {
+        Some(uid)
+    } else {
+        column_edit(change).map(|(uid, _, _)| uid)
+    }
+}
+
 /// A whole-table removal releases this policy before a referenced column edit.
 /// Keeping the named refusal beside the edge lets apply check the saved order
 /// without repairing or extending the approved plan.
 pub(crate) struct PolicyRelease {
     pub before: usize,
     pub after: usize,
-    refusal: String,
+    pub refusal: String,
 }
 
 pub(crate) fn policy_releases(
     changes: &ChangeSet,
     ids: &IdsFile,
-    found: &ColumnPolicies,
+    found: &PolicyDependents,
 ) -> anyhow::Result<Vec<PolicyRelease>> {
     let names = PlanNames::of(&changes.changes, ids)?;
     let mut edges = Vec::new();
     for (at, step) in changes.changes.iter().enumerate() {
-        let Some((uid, _, what)) = column_edit(&step.change) else {
+        let Some(uid) = policy_target_uid(&step.change) else {
             continue;
         };
         let policies = found.get(uid).ok_or_else(|| {
-            anyhow::anyhow!("policy dependents of column {uid} were not read from PostgreSQL")
+            anyhow::anyhow!("policy dependents of {uid} were not read from PostgreSQL")
         })?;
         if policies.is_empty() {
             continue;
         }
-        let (owner, name) = names.column_at(uid, At::Start).ok_or_else(|| {
-            anyhow::anyhow!("policy dependent column {uid} has no opening catalog identity")
-        })?;
-        let table = names.table_at(owner, At::Start).ok_or_else(|| {
-            anyhow::anyhow!("policy dependent column {uid} has no opening table identity")
-        })?;
-        let stored = table.column(name);
+        let (subject, what, dropped_table) = if let Change::DropTable { .. } = &step.change {
+            let table = names.table_at(uid, At::Start).ok_or_else(|| {
+                anyhow::anyhow!("policy dependent table {uid} has no opening catalog identity")
+            })?;
+            (table.shown().to_string(), "dropped", Some(table))
+        } else {
+            let (_, _, what) =
+                column_edit(&step.change).expect("a policy target is a table or column");
+            let (owner, name) = names.column_at(uid, At::Start).ok_or_else(|| {
+                anyhow::anyhow!("policy dependent column {uid} has no opening catalog identity")
+            })?;
+            let table = names.table_at(owner, At::Start).ok_or_else(|| {
+                anyhow::anyhow!("policy dependent column {uid} has no opening table identity")
+            })?;
+            (table.column(name).shown().to_string(), what, None)
+        };
         for policy in policies {
+            // DROP TABLE takes its own policies automatically, including
+            // normal attribute references in its own predicates.
+            if dropped_table == Some(&policy.table) {
+                continue;
+            }
             let refusal = format!(
                 "{} cannot be {what}: policy `{}` on {} depends on it; planning this policy change arrives with #1173",
-                stored.shown(),
+                subject,
                 pbps_model::escape::Escaped(&policy.name),
                 policy.table.shown()
             );
@@ -86,12 +108,12 @@ pub(crate) fn policy_releases(
 pub(crate) fn check_policy_releases(
     changes: &ChangeSet,
     ids: &IdsFile,
-    found: &ColumnPolicies,
+    found: &PolicyDependents,
 ) -> anyhow::Result<()> {
     for release in policy_releases(changes, ids, found)? {
         if release.before >= release.after {
             bail!(
-                "{}; its table drop must precede the column edit. Plan again.",
+                "{}; its table drop must precede the dependent change. Plan again.",
                 release.refusal
             );
         }
@@ -366,7 +388,7 @@ mod tests {
                     moves_at_most: None,
                 },
                 Change::DropTable {
-                    uid: replacement,
+                    uid: replacement.clone(),
                     name: owner.clone(),
                     detach_from: None,
                 },
@@ -375,13 +397,17 @@ mod tests {
             .map(PlannedChange::new)
             .collect(),
         };
-        let found = [(
-            target,
-            vec![pbps_pg::modules::PolicyDependent {
-                table: owner,
-                name: "original_policy".into(),
-            }],
-        )]
+        let found = [
+            (
+                target,
+                vec![pbps_pg::modules::PolicyDependent {
+                    table: owner,
+                    name: "original_policy".into(),
+                }],
+            ),
+            (replacement, vec![]),
+            (original.clone(), vec![]),
+        ]
         .into();
         let refused = policy_releases(&plan, &ids, &found)
             .err()

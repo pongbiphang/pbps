@@ -3484,10 +3484,10 @@ pub async fn account_for_module_dependents(
     // Every reordering pass, in one place (#1955): `weave` over what the
     // catalog just said depends on the modules this plan drops, then the
     // passes that read nothing.
-    let policies = policy_column_dependents(conn, changes, sources.after).await?;
+    let policies = policy_dependents(conn, changes, sources.after).await?;
     let facts = read
         .with_module_dependents(&found)
-        .with_column_policies(&policies);
+        .with_policy_dependents(&policies);
     let scheduled = crate::dependents::schedule::schedule(
         std::mem::take(changes),
         &declarations,
@@ -3588,7 +3588,7 @@ pub async fn check_module_dependents(
     stored_ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<()> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    refuse_policy_column_dependents(conn, changes, ids).await?;
+    refuse_policy_dependents(conn, changes, ids).await?;
     let found = module_dependents(conn, changes).await?;
     // Match the planner's final relation first; each dependency lookup then
     // spells both ends at the statement's boundary (DEC-1875.1).
@@ -5276,23 +5276,29 @@ mod plan_name_tests {
     }
 }
 
-/// Read old column bindings once, after any module rediff has settled which
-/// columns the plan edits. No policy read is replaced by an empty result.
-async fn policy_column_dependents(
+/// Read old policy bindings once, after any module rediff has settled which
+/// tables and columns the plan removes or edits. No policy read is replaced by an empty result.
+async fn policy_dependents(
     conn: &mut Conn,
     changes: &ChangeSet,
     ids: &pbps_model::IdsFile,
-) -> anyhow::Result<crate::row_security::ColumnPolicies> {
+) -> anyhow::Result<crate::row_security::PolicyDependents> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    let mut found = crate::row_security::ColumnPolicies::new();
+    let mut found = crate::row_security::PolicyDependents::new();
     for step in &changes.changes {
-        let Some((uid, _, _)) = crate::row_security::column_edit(&step.change) else {
+        let Some(uid) = crate::row_security::policy_target_uid(&step.change) else {
             continue;
         };
         if found.contains_key(uid) {
             continue;
         }
-        let policies = if let Some((table, column, _, _)) = changed_column(&names, &step.change) {
+        let policies = if let pbps_model::Change::DropTable { uid, .. } = &step.change {
+            if let Some(table) = names.table_at(uid, pbps_model::plan_names::At::Start) {
+                pbps_pg::modules::policies_on_table(conn, table).await?
+            } else {
+                Vec::new()
+            }
+        } else if let Some((table, column, _, _)) = changed_column(&names, &step.change) {
             pbps_pg::modules::policies_on_column(conn, &table.column(column)).await?
         } else {
             // A newly created column has no old catalog bindings.
@@ -5305,13 +5311,13 @@ async fn policy_column_dependents(
 
 /// Apply validates the approved order against fresh catalog bindings. It
 /// never schedules a newly discovered dependent into the saved plan.
-async fn refuse_policy_column_dependents(
+async fn refuse_policy_dependents(
     conn: &mut Conn,
     changes: &ChangeSet,
     ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<()> {
     if conn.driver() == Driver::Postgres {
-        let found = policy_column_dependents(conn, changes, ids).await?;
+        let found = policy_dependents(conn, changes, ids).await?;
         crate::row_security::check_policy_releases(changes, ids, &found)?;
     }
     Ok(())

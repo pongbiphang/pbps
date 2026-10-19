@@ -354,7 +354,9 @@ Created-table policies interact with module creation/alteration, table and
 column construction, constraints and bootstrap inserts through the setup
 phase above. Flag setup follows every policy setup. Standing policy/flag
 changes refuse with #1173; connected column drop/retype and routine rebuild
-under a retained policy refuse by its catalog-proven name. They are not
+under a retained policy refuse by its catalog-proven name. Whole owner-table
+drops release their policies before referenced table/column/routine teardown;
+cycles still require individual policy planning from #1173. Policies are not
 silently rebuilt or removed by this slice.
 
 A pair in no category is independent: neither side's effect meets the
@@ -460,7 +462,7 @@ and the expression-bearing changes that need a function.
 | `CreateModule` or `AlterModule` → `Grant` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants are restated after it | ✓ ADR-0010 §5 |
 | `CreateModule` or `AlterModule` → `PublicExecution` on the routine | fixed | same class, same create rank and subject: the next statement, so an autocommit `--sql` script never leaves the routine executable by `PUBLIC` past its own `CREATE` | ✓ #687 |
 | Structural/table changes, module creates/alters and `PublicExecution` → `CreatePolicy` or `SetRowSecurity` | fixed | shared `row_security::edges` setup phase, settled by the CLI schedule and resolver graph; bootstrap inserts finish before either kind | ✓ DEC-1172.2 |
-| `DropTable` owning a policy → `DropColumn` or `AlterColumnType` it references | engine | exact `pg_policy`/`pg_depend` column bindings in the central CLI schedule; hoist the whole owner drop, then validate the saved order at apply. A retained owner refuses with #1173 | ✓ DEC-1172.1 |
+| `DropTable` owning a policy → referenced `DropTable`, `DropColumn`, `AlterColumnType` or routine removal | engine | exact `pg_policy`/`pg_depend` bindings, including relation-only references for table drops; catalog edges settle with structural, name-slot and routine constraints. Apply validates the saved order; a retained owner refuses with #1173 | ✓ DEC-1172.1 |
 | `CreatePolicy` → `SetRowSecurity` | fixed | shared setup phase: policies at (14, 2), flags at (14, 3). Policies on one table commute with each other; flags on separate created tables commute | ✓ DEC-1172.2 |
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
 | Row writes → `SetDataMode` / `SetEnsureKeys` of their table | fixed | class 11 and 12 before 17 | ✓ |
