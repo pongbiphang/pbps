@@ -8815,6 +8815,13 @@ fn a_partition_the_read_cannot_hold_all_of_takes_its_tree_out_of_a_pull() {
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
+    const RAW: &str = "n\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+    const SHOWN: &str = r"n\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+    let column_yaml = serde_json::to_string(RAW)
+        .unwrap()
+        .replace('\u{9b}', "\\u009b");
+    let identity =
+        format!("  {column_yaml}: {{type: integer, nullable: false, identity: [1, 1]}}\n");
     let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
     for (k, server) in [old_server, server()].iter().enumerate() {
         let own = OwnDatabase::new(server, &format!("numbered_fill1890_{k}"));
@@ -8857,10 +8864,7 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
             "{server}: {shown}"
         );
 
-        file(
-            "t",
-            "  n: {type: integer, nullable: false, identity: [1, 1]}\n",
-        );
+        file("t", &identity);
         file("q", "  m: {type: serial}\n");
         succeeds(d.run(&["plan"]));
         d.commit();
@@ -8870,7 +8874,7 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
             .find(|l| l.starts_with("numbered_column_fills: "))
             .unwrap_or_else(|| panic!("{server}: {shown}"));
         for said in [
-            "app.t.n",
+            concat!("app.t.", r"n\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前"),
             "app.q.m",
             "numbers the rows already there in a table rewrite, which logical decoding does \
              not stream",
@@ -8881,6 +8885,31 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
         }
         assert!(!line.contains("over app.q"), "{server}: {line}");
         assert!(!line.contains("app.fresh"), "{server}: {line}");
+        let report = json_output(succeeds(
+            d.run(&["plan", "--db", connection, "--format", "json"]),
+        ));
+        let check = report["data"]["connected_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "numbered_column_fills")
+            .unwrap();
+        let raw_message = check["message"].as_str().unwrap();
+        assert!(
+            raw_message.contains(&format!("app.t.{RAW}")),
+            "{server}: {report}"
+        );
+        assert!(
+            !raw_message.contains(&format!("app.t.{SHOWN}")),
+            "{server}: {report}"
+        );
+        assert_eq!(
+            line,
+            format!(
+                "numbered_column_fills: {}",
+                pbps_model::escape::Escaped(raw_message)
+            )
+        );
         on_server(
             connection,
             "SET client_min_messages = error;
@@ -8903,7 +8932,10 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
         succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
         succeeds(approved_apply(&d, connection, &plan, &[]));
         assert_eq!(
-            scalar(connection, "SELECT count(*) FROM app.t WHERE n IS NOT NULL"),
+            scalar(
+                connection,
+                &format!("SELECT count(*) FROM app.t WHERE \"{RAW}\" IS NOT NULL")
+            ),
             3
         );
 
@@ -8912,10 +8944,7 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
             connection,
             "DROP PUBLICATION pbps_fill_t; DROP PUBLICATION pbps_fill_cols;",
         );
-        file(
-            "t",
-            "  n: {type: integer, nullable: false, identity: [1, 1]}\n  w: {type: serial}\n",
-        );
+        file("t", &format!("{identity}  w: {{type: serial}}\n"));
         succeeds(d.run(&["plan"]));
         d.commit();
         let shown = stdout(&succeeds(d.run(&["plan", "--db", connection])));

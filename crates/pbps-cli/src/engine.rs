@@ -2403,7 +2403,7 @@ pub async fn numbered_column_fills(
         });
     }
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    let mut fills: Vec<(TableName, String)> = Vec::new();
+    let mut fills: Vec<(TableName, pbps_model::ColumnName)> = Vec::new();
     for (i, p) in changes.changes.iter().enumerate() {
         let pbps_model::Change::AddColumn {
             table,
@@ -2451,13 +2451,19 @@ pub async fn numbered_column_fills(
 
 /// [`numbered_column_fills`]' answer over what the catalog said.
 fn fills_listed(
-    fills: &[(TableName, String)],
+    fills: &[(TableName, pbps_model::ColumnName)],
     publications: &[(TableName, Vec<(String, bool)>)],
     slots: &[(String, String)],
 ) -> ConnectedCheck {
     let columns = fills
         .iter()
-        .map(|(table, column)| format!("{}.{column}", table.shown()))
+        .map(|(table, column)| {
+            format!(
+                "{}.{}",
+                table.raw(), // #2084 step 5: connected-check JSON stays raw; the human writer escapes once.
+                column.raw()  // #2084 step 5: the shared message is escaped at the human writer.
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let mut streams = Vec::new();
@@ -2469,7 +2475,7 @@ fn fills_listed(
                 clauses.push(format!(
                     "publication {name} over {} lists its columns, so it publishes none of the \
                      added column(s) until they are added to its list",
-                    table.shown()
+                    table.raw() // #2084 step 5: connected-check JSON stays raw until the human writer.
                 ));
             } else {
                 whole.push(name.as_str());
@@ -2479,7 +2485,7 @@ fn fills_listed(
             streams.push(format!(
                 "publication(s) {} over {}",
                 whole.join(", "),
-                table.shown()
+                table.raw() // #2084 step 5: connected-check JSON stays raw until the human writer.
             ));
         }
     }
@@ -4949,6 +4955,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn numbered_column_fill_messages_keep_raw_names_until_the_human_writer() {
+        const RAW: &str = "name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+        const SHOWN: &str = r"name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+        let table = TableName::new("app", RAW);
+        let fills = [(table.clone(), RAW.into())];
+        for listed in [false, true] {
+            let publications = if listed {
+                vec![(
+                    table.clone(),
+                    vec![("whole".into(), false), ("cols".into(), true)],
+                )]
+            } else {
+                Vec::new()
+            };
+            let check = fills_listed(&fills, &publications, &[]);
+            assert_eq!(check.status, if listed { "listed" } else { "passed" });
+            let expected = |name: &str| {
+                if listed {
+                    format!(
+                        "app.{name}.{name} numbers the rows already there in a table rewrite, \
+                         which logical decoding does not stream: publication(s) whole over \
+                         app.{name} will not carry those numbers, and a consumer keeps them \
+                         empty until it takes a new snapshot of the table; publication cols over \
+                         app.{name} lists its columns, so it publishes none of the added \
+                         column(s) until they are added to its list"
+                    )
+                } else {
+                    format!(
+                        "no publication or logical replication slot would miss the numbers \
+                         app.{name}.{name} gives the rows already there"
+                    )
+                }
+            };
+            assert_eq!(check.message, expected(RAW));
+            assert_eq!(
+                serde_json::to_value(&check).unwrap()["message"],
+                expected(RAW)
+            );
+            assert_eq!(
+                pbps_model::escape::Escaped(&check.message).to_string(),
+                expected(SHOWN)
+            );
+            // An escaped-looking identifier is a different column, not an alias.
+            let literal = fills_listed(&[(table.clone(), SHOWN.into())], &publications, &[]);
+            assert_ne!(literal.message, check.message);
+        }
+    }
+
     /// A numbered column added to a table already there names each
     /// publication over the table and each logical slot, and refuses
     /// nothing; with neither it passes, still naming the column (#1890).
@@ -4956,7 +5011,7 @@ mod tests {
     fn a_numbered_column_fill_lists_the_streams_that_miss_it() {
         let t: TableName = "app.t".parse().unwrap();
         let u: TableName = "app.u".parse().unwrap();
-        let fills = vec![(t.clone(), "n".to_owned()), (u.clone(), "m".to_owned())];
+        let fills = vec![(t.clone(), "n".into()), (u.clone(), "m".into())];
         let listed = fills_listed(
             &fills,
             &[

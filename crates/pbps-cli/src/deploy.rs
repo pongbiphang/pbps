@@ -12439,6 +12439,45 @@ mod tests {
     }
 
     #[test]
+    fn identity_handover_matches_raw_column_owners_without_escaped_aliases() {
+        const RAW: &str = "id\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+        const SHOWN: &str = r"id\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+        for owner_column in [RAW, SHOWN] {
+            let mut plan = IdentityHandover::new(pbps_model::ValueSource::None);
+            let owner = TableName::new("app", "t");
+            for schema in [&mut plan.before, &mut plan.after] {
+                let columns = &mut schema.tables.get_mut(&owner).unwrap().columns;
+                let column = columns.shift_remove("id").unwrap();
+                columns.insert(RAW.into(), column);
+            }
+            for ids in [&mut plan.before_ids, &mut plan.after_ids] {
+                for column in ids.columns.values_mut().filter(|c| c.table == owner) {
+                    column.name = RAW.into();
+                }
+            }
+            let pbps_model::Change::AlterColumnNumbering { column, .. } =
+                &mut plan.changes.changes[1].change
+            else {
+                panic!("the fixture gives up an identity");
+            };
+            column.name = RAW.into();
+            plan.occupants[0].owner_column = Some(owner_column.into());
+            let original = plan.changes.changes.clone();
+            plan.order();
+            if owner_column == RAW {
+                assert_eq!(
+                    plan.changes.changes,
+                    vec![original[1].clone(), original[0].clone()]
+                );
+                assert!(!plan.refused());
+            } else {
+                assert_eq!(plan.changes.changes, original);
+                assert!(plan.refused(), "an escaped spelling proves no owner match");
+            }
+        }
+    }
+
+    #[test]
     fn a_retyped_identity_releases_its_catalog_name_before_the_new_holder() {
         use pbps_model::{Change, Identity, OwnedSequence, ValueSource};
 

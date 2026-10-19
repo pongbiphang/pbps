@@ -201,8 +201,8 @@ ALLOWED = {
         'data.adoption messages are shared finding JSON; text output escapes once until #2084 step 5',
     ),
     "crates/pbps-cli/src/engine.rs": (
-        3,
-        'removal descriptions are recorded state and logical-slot labels are connected-check JSON; text boundaries escape once until #2084 step 5',
+        7,
+        'removal descriptions are recorded state and logical-slot/numbered-column labels are connected-check JSON; text boundaries escape once until #2084 step 5',
     ),
     "crates/pbps-mssql/src/estimate.rs": (
         1,
