@@ -66,7 +66,7 @@ pub(super) async fn fill(
             // key set of this map, and a column silently left out would read
             // as vacuously covered rather than as the gap it is.
             for column in columns {
-                let entry = rights.columns.entry(column.clone()).or_default();
+                let entry = rights.columns.entry(column.raw().to_owned()).or_default();
                 if held.get(column).copied().unwrap_or(false) {
                     entry.insert((*permission).to_owned());
                 }
@@ -92,8 +92,8 @@ async fn column_privileges(
     conn: &mut Conn,
     object: &ObjectName,
     permission: &str,
-    columns: &BTreeSet<String>,
-) -> Result<BTreeMap<String, bool>, DbError> {
+    columns: &BTreeSet<pbps_model::ColumnName>,
+) -> Result<BTreeMap<pbps_model::ColumnName, bool>, DbError> {
     let values = (0..columns.len())
         .map(|i| format!("(${}::text)", i + 4))
         .collect::<Vec<_>>()
@@ -125,7 +125,7 @@ async fn column_privileges(
         Param::Str(&object.name),
         Param::Str(permission),
     ];
-    params.extend(columns.iter().map(|c| Param::Str(c)));
+    params.extend(columns.iter().map(|c| Param::Str(c.raw())));
     let mut out = BTreeMap::new();
     for row in conn.query_with(&query, &params).await? {
         let column = text(&row, "column_name")?;
@@ -135,7 +135,7 @@ async fn column_privileges(
         // must not silently drop out of the "every wanted column" count
         // `missing` relies on.
         let held = row.try_get::<bool>("held")?.unwrap_or(false);
-        out.insert(column, held);
+        out.insert(column.into(), held);
     }
     Ok(out)
 }

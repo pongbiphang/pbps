@@ -1018,7 +1018,7 @@ impl<'a> Columns<'a> {
                 .get(object)
                 .into_iter()
                 .flatten()
-                .map(String::as_str)
+                .map(pbps_model::ColumnName::raw)
                 .collect(),
             Self::Catalog => Vec::new(),
         }
@@ -1321,7 +1321,7 @@ async fn delete_children(
             let column: &str = get(row, "column")?;
             out.entry(ObjectName::new(schema, object))
                 .or_default()
-                .insert(column.to_owned());
+                .insert(column.into());
         }
     }
     Ok(out)
@@ -1439,7 +1439,7 @@ fn resolve_for_query<'a>(
 /// a covering grant (`Needed::DataRead`, DECISIONS 510).
 fn resolve_columns(
     declared: &ObjectName,
-    columns: &[String],
+    columns: &[pbps_model::ColumnName],
     ids: &Ids<'_>,
 ) -> Vec<(String, bool)> {
     columns
@@ -1452,7 +1452,10 @@ fn resolve_columns(
             ids.project_names
                 .column_uid(&wanted)
                 .and_then(|uid| ids.recorded.columns.get(uid))
-                .map_or_else(|| (column.clone(), false), |r| (r.name.clone(), true))
+                .map_or_else(
+                    || (column.raw().to_owned(), false),
+                    |r| (r.name.raw().to_owned(), true),
+                )
         })
         .collect()
 }
@@ -1504,7 +1507,7 @@ async fn resolved_column_lists(
         recorded.extend(
             ids.recorded_names
                 .columns_of(query)
-                .map(|(_, c)| (i, c.name.clone())),
+                .map(|(_, c)| (i, c.name.raw().to_owned())),
         );
         rows.push((i, query.clone(), row, read));
     }
@@ -3383,7 +3386,14 @@ mod tests {
             .collect();
         let referenced: ReferencedColumns = objects
             .iter()
-            .map(|o| (o.clone(), (0..100).map(|i| format!("c{i}")).collect()))
+            .map(|o| {
+                (
+                    o.clone(),
+                    (0..100)
+                        .map(|i| pbps_model::ColumnName::from(format!("c{i}")))
+                        .collect(),
+                )
+            })
             .collect();
         let columns = Columns::Referenced(&referenced);
         let perms = ["SELECT", "REFERENCES"];
@@ -3437,7 +3447,7 @@ mod tests {
         let mut t = Table {
             primary_key: Some(pbps_model::schema::PrimaryKey {
                 name: None,
-                columns: vec!["code".to_owned()],
+                columns: vec!["code".into()],
                 storage_parameters: Default::default(),
             }),
             data: Some(pbps_model::TableData {
@@ -3456,10 +3466,10 @@ mod tests {
         };
         let ty: pbps_model::ColumnType = "varchar(20)".parse().expect("a type this crate spells");
         t.columns
-            .insert("code".to_owned(), pbps_model::Column::new(ty.clone()));
+            .insert("code".into(), pbps_model::Column::new(ty.clone()));
         for name in extra {
             t.columns
-                .insert((*name).to_owned(), pbps_model::Column::new(ty.clone()));
+                .insert((*name).into(), pbps_model::Column::new(ty.clone()));
         }
         t
     }
@@ -3658,7 +3668,7 @@ mod tests {
         let table: ObjectName = "app.t".parse().unwrap();
         let column = |name: &str| ColumnRef {
             table: table.clone(),
-            name: name.to_owned(),
+            name: name.into(),
         };
         let (code, label) = (
             Uid::generate(UidKind::Column),
@@ -3673,9 +3683,9 @@ mod tests {
         project
             .columns
             .insert(Uid::generate(UidKind::Column), column("note"));
-        let declared: Vec<String> = ["code", "caption", "note"]
+        let declared: Vec<pbps_model::ColumnName> = ["code", "caption", "note"]
             .iter()
-            .map(|c| (*c).to_owned())
+            .map(|c| (*c).into())
             .collect();
         assert_eq!(
             resolve_columns(&table, &declared, &Ids::new(&project, &recorded)),
@@ -3689,7 +3699,7 @@ mod tests {
         assert_eq!(
             resolve_columns(
                 &table,
-                &["code".to_owned()],
+                &["code".into()],
                 &Ids::new(&IdsFile::default(), &IdsFile::default())
             ),
             [("code".to_owned(), false)]

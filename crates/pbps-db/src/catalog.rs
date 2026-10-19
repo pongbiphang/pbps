@@ -14,6 +14,7 @@
 //! that keeps no such inventory is not "nothing found", and the caller has to
 //! be able to read the difference.
 
+use pbps_model::ColumnName;
 use pbps_model::{ObjectName, RowConflict, RowKey, Schema, TableName};
 
 use crate::DbError;
@@ -266,10 +267,10 @@ pub enum RowsError {
     /// The engine sent a value the mapping cannot hold — an integer column
     /// whose text does not parse, say. A bug in the engine's row reader, not
     /// bad data.
-    #[error("{table}.{column}: the engine sent `{text}`, which is not a {kind}", table = .table.shown())]
+    #[error("{table}.{column}: the engine sent `{text}`, which is not a {kind}", table = .table.shown(), column = .column.shown())]
     BadValue {
         table: TableName,
-        column: String,
+        column: ColumnName,
         text: String,
         kind: &'static str,
     },
@@ -291,7 +292,7 @@ pub enum RowsError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Catalogued {
     pub table: Option<TableName>,
-    pub key_column: Option<String>,
+    pub key_column: Option<ColumnName>,
     /// The key column's collation, schema and name, where it has one that is
     /// not the database default. `None` is not "the default collation" as a
     /// value — it is "nothing to write", which leaves the comparison to
@@ -315,7 +316,7 @@ pub struct Misspelt {
     pub table: TableName,
     pub key: RowKey,
     /// `None` for the key itself.
-    pub column: Option<String>,
+    pub column: Option<ColumnName>,
     pub declared: String,
     /// The column's type, as the engine was asked to read the text.
     pub ty: String,
@@ -333,7 +334,7 @@ pub struct Misspelt {
 pub struct MisspeltBound {
     pub partition: TableName,
     /// The key column the value bounds.
-    pub column: String,
+    pub column: ColumnName,
     pub declared: String,
     pub ty: String,
     /// What the engine reads back; `None` when it cannot convert the text.
@@ -363,7 +364,7 @@ pub struct ListCollision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefaultAsParents {
     pub partition: TableName,
-    pub column: String,
+    pub column: ColumnName,
     /// The partition's own default, as declared.
     pub declared: String,
     /// The text the engine stores for both.
@@ -377,15 +378,18 @@ pub enum LiteralAt {
     Cell {
         table: TableName,
         key: RowKey,
-        column: Option<String>,
+        column: Option<ColumnName>,
     },
     /// One of a partition's bound values on a key column.
     Bound {
         partition: TableName,
-        column: String,
+        column: ColumnName,
     },
     /// A column's default, or a partition's own default for it.
-    Default { table: TableName, column: String },
+    Default {
+        table: TableName,
+        column: ColumnName,
+    },
 }
 
 /// A declared date/time literal whose value is decided by the session that

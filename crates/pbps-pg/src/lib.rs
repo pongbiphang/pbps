@@ -197,7 +197,9 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
         for column in &by.columns {
             if !table.columns.contains_key(column) {
                 found.push(invalid(format!(
-                    "`partition_by` names `{column}`, which is not a declared column"
+                    "`partition_by` names `{column}`, which is not a declared column",
+                    // raw: whole-message escaped until #2084 step 5.
+                    column = column.raw(),
                 )));
             }
         }
@@ -216,7 +218,9 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
                 if !columns.contains(key) {
                     found.push(invalid(format!(
                         "{what} does not include the partition key column `{key}`, which \
-                         PostgreSQL requires of every key on a partitioned table"
+                         PostgreSQL requires of every key on a partitioned table",
+                        // raw: whole-message escaped until #2084 step 5.
+                        key = key.raw(),
                     )));
                 }
             }
@@ -499,7 +503,7 @@ fn options_problems(
 fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
     let mut keys: Vec<String> = Vec::new();
     if let Some(pk) = &table.primary_key
-        && pk.columns.iter().any(|c| c == column)
+        && pk.columns.iter().any(|c| c.raw() == column)
     {
         keys.push(match &pk.name {
             Some(name) => format!("primary key `{name}`"),
@@ -507,12 +511,17 @@ fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
         });
     }
     for (name, unique) in &table.unique {
-        if unique.columns.iter().any(|c| c == column) {
+        if unique.columns.iter().any(|c| c.raw() == column) {
             keys.push(format!("unique constraint `{name}`"));
         }
     }
     for (name, index) in &table.indexes {
-        if index.unique && index.columns.iter().any(|c| c.key.column() == Some(column)) {
+        if index.unique
+            && index
+                .columns
+                .iter()
+                .any(|c| c.key.column().is_some_and(|c| c.raw() == column))
+        {
             keys.push(format!("unique index `{name}`"));
         }
     }
@@ -1137,26 +1146,32 @@ impl Dialect for Postgres {
             let Some(theirs) = parent.columns.get(column) else {
                 found.push(invalid(format!(
                     "column `{column}` is not a column of its parent, whose columns are the \
-                     partition's"
+                     partition's",
+                    // raw: whole-message escaped until #2084 step 5.
+                    column = column.raw(),
                 )));
                 continue;
             };
             if own.not_null && !theirs.nullable {
                 found.push(invalid(format!(
                     "column `{column}` is NOT NULL on its parent already, which the partition \
-                     takes; leave out its `nullable: false`"
+                     takes; leave out its `nullable: false`",
+                    // raw: whole-message escaped until #2084 step 5.
+                    column = column.raw(),
                 )));
             }
             let Some(default) = &own.default else {
                 continue;
             };
             let (mut generated, mut identity, mut serial) = (false, false, false);
-            for source in parent_sources.get(column, theirs) {
+            for source in parent_sources.get(column.raw(), theirs) {
                 match source {
                     pbps_model::ValueSource::Default(parent_default) => {
                         if parent_default == default {
                             found.push(invalid(format!(
-                                "column `{column}`'s default is its parent's, which the partition takes; leave out its `default:`"
+                                "column `{column}`'s default is its parent's, which the partition takes; leave out its `default:`",
+                                // raw: whole-message escaped until #2084 step 5.
+                                column = column.raw(),
                             )));
                         }
                     }
@@ -1178,18 +1193,23 @@ impl Dialect for Postgres {
                     "a `serial`"
                 };
                 found.push(invalid(format!(
-                    "column `{column}` is {kind} on its parent, and takes no default of the partition's own"
+                    "column `{column}` is {kind} on its parent, and takes no default of the partition's own",
+                    // raw: whole-message escaped until #2084 step 5.
+                    column = column.raw(),
                 )));
             }
             if crate::LEXICON.expression_in(default) == pbps_dialect::Expression::Absent {
                 found.push(invalid(format!(
-                    "column `{column}` has an empty default expression"
+                    "column `{column}` has an empty default expression",
+                    // raw: whole-message escaped until #2084 step 5.
+                    column = column.raw(),
                 )));
             }
             // As a column's default is held, against the parent's column,
             // whose type the partition's is.
             if let Ok(normalized) = types::normalize(&theirs.ty) {
-                found.extend(default_problems(column, theirs, &normalized, default));
+                // Raw validation sentence, escaped whole until #2084 step 5.
+                found.extend(default_problems(column.raw(), theirs, &normalized, default));
             }
         }
         found
@@ -1263,7 +1283,9 @@ impl Dialect for Postgres {
                 dialect: crate::types::DIALECT,
                 message: format!(
                     "`{computed}` is a computed column, which this model holds for SQL Server; \
-                     declare it as a column with `generated:` on PostgreSQL"
+                     declare it as a column with `generated:` on PostgreSQL",
+                    // raw: whole-message escaped until #2084 step 5.
+                    computed = computed.raw(),
                 ),
             });
         }
@@ -1279,7 +1301,9 @@ impl Dialect for Postgres {
                             "`data:` cannot be declared on a table with an array column, and \
                              `{column}` is `{}`; declare the rows elsewhere, or leave the block \
                              out",
-                            spec.ty
+                            spec.ty,
+                            // raw: whole-message escaped until #2084 step 5.
+                            column = column.raw(),
                         ),
                     });
                 }
@@ -1407,7 +1431,9 @@ impl Dialect for Postgres {
                             "primary key column `{column}` is nullable; a primary key column must \
                              be NOT NULL. This engine does not refuse the table -- it sets \
                              `NOT NULL` for you -- and then no plan can ever make the column match \
-                             the declaration again."
+                             the declaration again.",
+                            // raw: whole-message escaped until #2084 step 5.
+                            column = column.raw(),
                         ),
                     });
                 }
@@ -1415,10 +1441,11 @@ impl Dialect for Postgres {
         }
 
         for (column_name, column) in &table.columns {
-            if let Err(e) = self.quote_ident(column_name) {
+            if let Err(e) = self.quote_ident(column_name.raw()) {
                 found.push(e);
             }
-            if let Some(named) = types::refuse_serial(&column.ty, Some(column_name)) {
+            // Raw validation sentence, escaped whole until #2084 step 5.
+            if let Some(named) = types::refuse_serial(&column.ty, Some(column_name.raw())) {
                 found.push(named);
                 // Everything below asks a question about the type, and asking
                 // it of one the catalogue has already refused is noise on top
@@ -1432,7 +1459,7 @@ impl Dialect for Postgres {
                     continue;
                 }
             };
-            let supplied = sources.get(column_name, column);
+            let supplied = sources.get(column_name.raw(), column);
             // Sources retain YAML's canonical default/identity/serial/generated
             // order. A valid model supplies one; diagnostic recovery may supply
             // several.
@@ -1454,16 +1481,26 @@ impl Dialect for Postgres {
                 match source {
                     pbps_model::ValueSource::None => {}
                     pbps_model::ValueSource::Default(expr) => {
-                        found.extend(default_problems(column_name, column, &normalized, expr));
+                        found.extend(default_problems(
+                            // Raw validation sentence, escaped whole until #2084 step 5.
+                            column_name.raw(),
+                            column,
+                            &normalized,
+                            expr,
+                        ));
                     }
                     pbps_model::ValueSource::Identity(identity) => {
-                        found.extend(identity_problems(column_name, column, identity));
+                        // Raw validation sentence, escaped whole until #2084 step 5.
+                        found.extend(identity_problems(column_name.raw(), column, identity));
                         if identity.options.cycle {
-                            found.extend(cycle_problems(table, column_name));
+                            // Raw validation sentence, escaped whole until #2084 step 5.
+                            found.extend(cycle_problems(table, column_name.raw()));
                         }
                         if has_default {
                             found.push(invalid(format!(
-                                "column `{column_name}` has an `identity:` and a `default:`. The engine refuses both on one column, and the identity is the one that supplies the value."
+                                "column `{column_name}` has an `identity:` and a `default:`. The engine refuses both on one column, and the identity is the one that supplies the value.",
+                                // raw: whole-message escaped until #2084 step 5.
+                                column_name = column_name.raw(),
                             )));
                         }
                     }
@@ -1473,41 +1510,54 @@ impl Dialect for Postgres {
                         found.extend(sequence_problems(
                             name,
                             table,
-                            column_name,
+                            // Raw validation sentence, escaped whole until #2084 step 5.
+                            column_name.raw(),
                             column,
                             sequence,
                         ));
                         if sequence.options.cycle {
-                            found.extend(cycle_problems(table, column_name));
+                            // Raw validation sentence, escaped whole until #2084 step 5.
+                            found.extend(cycle_problems(table, column_name.raw()));
                         }
                         if has_default {
                             found.push(invalid(format!(
-                                "column `{column_name}` is a `serial` and has a `default:`; its default is its sequence's `nextval`"
+                                "column `{column_name}` is a `serial` and has a `default:`; its default is its sequence's `nextval`",
+                                // raw: whole-message escaped until #2084 step 5.
+                                column_name = column_name.raw(),
                             )));
                         }
                         if has_identity {
                             found.push(invalid(format!(
-                                "column `{column_name}` is both a `serial` and an identity; the engine refuses an identity on a column that has a default"
+                                "column `{column_name}` is both a `serial` and an identity; the engine refuses an identity on a column that has a default",
+                                // raw: whole-message escaped until #2084 step 5.
+                                column_name = column_name.raw(),
                             )));
                         }
                     }
                     pbps_model::ValueSource::Generated(generated) => {
                         if has_sequence {
                             found.push(invalid(format!(
-                                "column `{column_name}` is both a `serial` and a generated column"
+                                "column `{column_name}` is both a `serial` and a generated column",
+                                // raw: whole-message escaped until #2084 step 5.
+                                column_name = column_name.raw(),
                             )));
                         }
                         if has_default {
                             found.push(invalid(format!(
-                                "column `{column_name}` has both a default and a generation expression; a generated column is computed on every write, and a default would never apply"
+                                "column `{column_name}` has both a default and a generation expression; a generated column is computed on every write, and a default would never apply",
+                                // raw: whole-message escaped until #2084 step 5.
+                                column_name = column_name.raw(),
                             )));
                         }
                         if has_identity {
                             found.push(invalid(format!(
-                                "column `{column_name}` is both an identity and a generated column"
+                                "column `{column_name}` is both an identity and a generated column",
+                                // raw: whole-message escaped until #2084 step 5.
+                                column_name = column_name.raw(),
                             )));
                         }
-                        found.extend(generation_problems(column_name, generated));
+                        // Raw validation sentence, escaped whole until #2084 step 5.
+                        found.extend(generation_problems(column_name.raw(), generated));
                     }
                 }
             }
@@ -1647,25 +1697,30 @@ impl Dialect for Postgres {
             });
         }
         for (column, spec) in &table.columns {
-            if sources.get(column, spec).iter().any(|source| match source {
-                pbps_model::ValueSource::Identity(_) => true,
-                // Claimed below, where the declaration names it.
-                pbps_model::ValueSource::None
-                | pbps_model::ValueSource::Default(_)
-                | pbps_model::ValueSource::Sequence(_)
-                | pbps_model::ValueSource::Generated(_) => false,
-            }) {
+            if sources
+                .get(column.raw(), spec)
+                .iter()
+                .any(|source| match source {
+                    pbps_model::ValueSource::Identity(_) => true,
+                    // Claimed below, where the declaration names it.
+                    pbps_model::ValueSource::None
+                    | pbps_model::ValueSource::Default(_)
+                    | pbps_model::ValueSource::Sequence(_)
+                    | pbps_model::ValueSource::Generated(_) => false,
+                })
+            {
                 // Named after the table and the column: naming the key moves
                 // nothing here (#990). Renaming the column does not either
                 // once the sequence exists: `RENAME COLUMN` keeps the owned
                 // sequence's name, so offline validation would predict a new
                 // name that apply never gets.
                 out.push(pbps_dialect::ImplicitRelation {
-                    name: generated_name(&name.name, Some(column), "seq"),
+                    name: generated_name(&name.name, Some(column.raw()), "seq"),
                     descriptor: format!(
                         "the sequence {} generates for identity column `{name}.{column}`",
                         types::DIALECT,
-                        name = name.shown()
+                        name = name.shown(),
+                        column = column.shown(),
                     ),
                     remedy: "Rename the other object.",
                     yields_to_constraints: false,
@@ -1677,7 +1732,7 @@ impl Dialect for Postgres {
             // sequence's, and claiming it refused a valid declaration that
             // used it. The name a plan creates one under is the connected
             // plan's to claim (#1631, #1899).
-            for source in sources.get(column, spec) {
+            for source in sources.get(column.raw(), spec) {
                 let pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
                     name: Some(sequence),
                     ..
@@ -1689,7 +1744,8 @@ impl Dialect for Postgres {
                     name: sequence.clone(),
                     descriptor: format!(
                         "the sequence of `serial` column `{name}.{column}`",
-                        name = name.shown()
+                        name = name.shown(),
+                        column = column.shown(),
                     ),
                     remedy: "Rename the other object, or the sequence's `sequence: {name: ...}`.",
                     yields_to_constraints: false,
@@ -1743,18 +1799,22 @@ impl Dialect for Postgres {
             out.push(generated_name(&name.name, None, &format!("pkey{suffix}")));
         }
         for (column, spec) in &table.columns {
-            if sources.get(column, spec).iter().any(|source| match source {
-                pbps_model::ValueSource::Identity(_) => true,
-                // Created by name, so the engine never retries one, and listed
-                // after every name here (#1631).
-                pbps_model::ValueSource::None
-                | pbps_model::ValueSource::Default(_)
-                | pbps_model::ValueSource::Sequence(_)
-                | pbps_model::ValueSource::Generated(_) => false,
-            }) {
+            if sources
+                .get(column.raw(), spec)
+                .iter()
+                .any(|source| match source {
+                    pbps_model::ValueSource::Identity(_) => true,
+                    // Created by name, so the engine never retries one, and listed
+                    // after every name here (#1631).
+                    pbps_model::ValueSource::None
+                    | pbps_model::ValueSource::Default(_)
+                    | pbps_model::ValueSource::Sequence(_)
+                    | pbps_model::ValueSource::Generated(_) => false,
+                })
+            {
                 out.push(generated_name(
                     &name.name,
-                    Some(column),
+                    Some(column.raw()),
                     &format!("seq{suffix}"),
                 ));
             }
@@ -2101,7 +2161,7 @@ mod tests {
         }
         table.partition_by = Some(pbps_model::PartitionBy {
             external: false,
-            columns: key.iter().map(|c| (*c).to_owned()).collect(),
+            columns: key.iter().map(|c| (*c).into()).collect(),
             strategy: Default::default(),
         });
         table
@@ -2246,7 +2306,7 @@ mod tests {
                         .iter()
                         .map(|(c, d, n)| {
                             (
-                                (*c).to_owned(),
+                                (*c).into(),
                                 pbps_model::PartitionColumn {
                                     default: d.map(str::to_owned),
                                     not_null: *n,
@@ -3622,7 +3682,7 @@ mod tests {
                     .map(|k| {
                         (
                             RowKey::from(*k),
-                            [("label".to_owned(), Value::Text((*k).to_owned()))]
+                            [("label".into(), Value::Text((*k).to_owned()))]
                                 .into_iter()
                                 .collect::<Row>(),
                         )
@@ -3732,7 +3792,7 @@ mod tests {
                 mode: DataMode::Ensure,
                 rows: [(
                     RowKey::from("x"),
-                    [("t_code".to_owned(), Value::Text("c".into()))]
+                    [("t_code".into(), Value::Text("c".into()))]
                         .into_iter()
                         .collect::<Row>(),
                 )]
@@ -4942,10 +5002,10 @@ mod tests {
         let mut table = Table::default();
         table
             .columns
-            .insert("id".to_owned(), pbps_model::Column::new(ty("serial")));
+            .insert("id".into(), pbps_model::Column::new(ty("serial")));
         table
             .columns
-            .insert("note".to_owned(), pbps_model::Column::new(ty("text")));
+            .insert("note".into(), pbps_model::Column::new(ty("text")));
         let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         let serial: Vec<_> = found
             .iter()
@@ -5093,7 +5153,7 @@ mod tests {
         ] {
             table
                 .columns
-                .insert(column.to_owned(), pbps_model::Column::new(ty(&spelling)));
+                .insert(column.into(), pbps_model::Column::new(ty(&spelling)));
         }
         let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         let messages: Vec<String> = found.iter().map(ToString::to_string).collect();
@@ -5125,7 +5185,7 @@ mod tests {
         ] {
             table
                 .columns
-                .insert(column.to_owned(), pbps_model::Column::new(ty(spelling)));
+                .insert(column.into(), pbps_model::Column::new(ty(spelling)));
         }
         let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         let messages: Vec<String> = found.iter().map(ToString::to_string).collect();
@@ -5156,7 +5216,7 @@ mod tests {
         let mut table = Table::default();
         table
             .columns
-            .insert(long.clone(), pbps_model::Column::new(ty("integer")));
+            .insert(long.clone().into(), pbps_model::Column::new(ty("integer")));
         let found =
             Postgres::new().validate_table(&TableName::new(long.clone(), long.clone()), &table);
         // The schema, the table and the column: three names, three refusals.
@@ -5172,7 +5232,7 @@ mod tests {
         // a blanket refusal.
         let mut ok = Table::default();
         ok.columns
-            .insert("id".to_owned(), pbps_model::Column::new(ty("integer")));
+            .insert("id".into(), pbps_model::Column::new(ty("integer")));
         assert!(
             Postgres::new()
                 .validate_table(&"app.t".parse().unwrap(), &ok)
@@ -5302,7 +5362,10 @@ mod tests {
                 let mut table = structural_table();
                 // The nullable-PK rule is independently pinned; isolate type here.
                 table.columns.get_mut("j").unwrap().nullable = false;
-                let columns = columns.into_iter().map(String::from).collect();
+                let columns = columns
+                    .into_iter()
+                    .map(pbps_model::ColumnName::from)
+                    .collect();
                 if primary {
                     table.primary_key = Some(pbps_model::PrimaryKey {
                         name: None,
@@ -5357,9 +5420,15 @@ mod tests {
             table.foreign_keys.insert(
                 "fk".into(),
                 pbps_model::ForeignKey {
-                    columns: local.into_iter().map(String::from).collect(),
+                    columns: local
+                        .into_iter()
+                        .map(pbps_model::ColumnName::from)
+                        .collect(),
                     references_table: TableName::new("app", "parent"),
-                    references_columns: remote.into_iter().map(String::from).collect(),
+                    references_columns: remote
+                        .into_iter()
+                        .map(pbps_model::ColumnName::from)
+                        .collect(),
                     on_delete: Default::default(),
                     on_update: Default::default(),
                 },
@@ -5384,7 +5453,8 @@ mod tests {
             (vec!["a", "a", "b", "b"], vec!["`a`", "`b`"]),
         ] {
             let mut table = structural_table();
-            let local: Vec<String> = (0..remote.len()).map(|i| format!("c{i}")).collect();
+            let local: Vec<pbps_model::ColumnName> =
+                (0..remote.len()).map(|i| format!("c{i}").into()).collect();
             for column in &local {
                 table.columns.insert(
                     column.clone(),
@@ -5396,7 +5466,7 @@ mod tests {
                 pbps_model::ForeignKey {
                     columns: local,
                     references_table: TableName::new("app", "parent"),
-                    references_columns: remote.iter().map(|c| (*c).to_owned()).collect(),
+                    references_columns: remote.iter().map(|c| (*c).into()).collect(),
                     on_delete: Default::default(),
                     on_update: Default::default(),
                 },
@@ -5434,7 +5504,10 @@ mod tests {
                             opclass: None,
                         })
                         .collect(),
-                    include: include.into_iter().map(String::from).collect(),
+                    include: include
+                        .into_iter()
+                        .map(pbps_model::ColumnName::from)
+                        .collect(),
                     unique: false,
                     filter: None,
                     method: Default::default(),
@@ -5463,7 +5536,8 @@ mod tests {
             // gives for the index limit (issue #475).
             for kind in ["primary", "unique", "index", "include", "foreign"] {
                 let mut table = structural_table();
-                let columns: Vec<_> = (0..count).map(|i| format!("c{i}")).collect();
+                let columns: Vec<pbps_model::ColumnName> =
+                    (0..count).map(|i| format!("c{i}").into()).collect();
                 for column in &columns {
                     table.columns.insert(
                         column.clone(),
@@ -5710,20 +5784,20 @@ mod tests {
         let long = "a".repeat(MAX_IDENT_BYTES + 1);
         let mut table = Table::default();
         table.columns.insert(
-            "id".to_owned(),
+            "id".into(),
             // `not_null` because a nullable key column is its own finding, and
             // this test is about names.
             pbps_model::Column::new(ty("integer")).not_null(),
         );
         table.primary_key = Some(pbps_model::PrimaryKey {
             name: Some(long.clone()),
-            columns: vec!["id".to_owned()],
+            columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
         table.unique.insert(
             format!("uq_{long}"),
             pbps_model::UniqueConstraint {
-                columns: vec!["id".to_owned()],
+                columns: vec!["id".into()],
                 storage_parameters: Default::default(),
             },
         );
@@ -5768,7 +5842,7 @@ mod tests {
                 increment: 1,
                 options: Default::default(),
             });
-            table.columns.insert("id".to_owned(), column);
+            table.columns.insert("id".into(), column);
             let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
             assert_eq!(
                 found.is_empty(),
@@ -5870,10 +5944,10 @@ mod tests {
             increment: 0,
             options: Default::default(),
         });
-        table.columns.insert("id".to_owned(), column.clone());
+        table.columns.insert("id".into(), column.clone());
         // A second identity column, which this engine takes: it must not add a
         // refusal of its own, only the three this one already earns.
-        table.columns.insert("other".to_owned(), {
+        table.columns.insert("other".into(), {
             let mut c = pbps_model::Column::new(ty("bigint"));
             c.nullable = false;
             c.value_source = pbps_model::ValueSource::Identity(pbps_model::Identity {
@@ -5932,15 +6006,15 @@ mod tests {
         };
         // The negative case: a plain one, and one under another name.
         let mut table = Table::default();
-        table.columns.insert("id".to_owned(), serial(None));
+        table.columns.insert("id".into(), serial(None));
         table
             .columns
-            .insert("other".to_owned(), serial(Some("other_numbers")));
+            .insert("other".into(), serial(Some("other_numbers")));
         assert_eq!(found(&table), Vec::<String>::new());
 
         let mut bad = serial(Some("t_id_seq"));
         bad.nullable = true;
-        table.columns.insert("id".to_owned(), bad.clone());
+        table.columns.insert("id".into(), bad.clone());
         let refused = found(&table);
         assert_eq!(refused.len(), 2, "{refused:?}");
         assert!(
@@ -5953,8 +6027,11 @@ mod tests {
         );
         // A `default:` beside it is a second source, which the loader keeps
         // beside the column for the dialect to name.
-        let sources: std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>> = [(
-            "id".to_owned(),
+        let sources: std::collections::BTreeMap<
+            pbps_model::ColumnName,
+            Vec<pbps_model::ValueSource>,
+        > = [(
+            "id".into(),
             vec![
                 pbps_model::ValueSource::Default("7".to_owned()),
                 bad.value_source.clone(),
@@ -5979,10 +6056,10 @@ mod tests {
         );
 
         let mut parent = Table::default();
-        parent.columns.insert("id".to_owned(), serial(None));
+        parent.columns.insert("id".into(), serial(None));
         parent.partition_by = Some(pbps_model::PartitionBy {
             external: false,
-            columns: vec!["id".to_owned()],
+            columns: vec!["id".into()],
             strategy: Default::default(),
         });
         assert!(
@@ -5996,9 +6073,7 @@ mod tests {
         // A name the emitter could not write is refused here, before a plan.
         for unwritable in ["", "a\0b"] {
             let mut table = Table::default();
-            table
-                .columns
-                .insert("id".to_owned(), serial(Some(unwritable)));
+            table.columns.insert("id".into(), serial(Some(unwritable)));
             let refused = found(&table);
             assert!(
                 refused
@@ -6023,7 +6098,7 @@ mod tests {
             let mut c = pbps_model::Column::new(ty("integer")).not_null();
             c.value_source = source;
             let mut table = Table::default();
-            table.columns.insert("id".to_owned(), c);
+            table.columns.insert("id".into(), c);
             Postgres::new()
                 .validate_table(&t, &table)
                 .into_iter()
@@ -6163,10 +6238,10 @@ mod tests {
         };
         for kind in ["identity", "serial"] {
             let mut table = Table::default();
-            table.columns.insert("id".to_owned(), cycling(kind));
+            table.columns.insert("id".into(), cycling(kind));
             table
                 .columns
-                .insert("v".to_owned(), pbps_model::Column::new(ty("integer")));
+                .insert("v".into(), pbps_model::Column::new(ty("integer")));
             assert_eq!(found(&table), Vec::<String>::new(), "{kind} under no key");
 
             let mut keyed = table.clone();
@@ -6366,7 +6441,7 @@ mod tests {
                 options: Default::default(),
             });
             let mut table = Table::default();
-            table.columns.insert("id".to_owned(), c);
+            table.columns.insert("id".into(), c);
             Postgres::new().validate_table(&t, &table)
         };
         assert!(refused("integer", 1, 1).is_empty());
@@ -6410,7 +6485,7 @@ mod tests {
                 increment,
                 options: Default::default(),
             });
-            table.columns.insert("id".to_owned(), column);
+            table.columns.insert("id".into(), column);
             let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
             assert_eq!(
                 found.is_empty(),
@@ -6548,7 +6623,7 @@ mod tests {
         ] {
             table
                 .columns
-                .insert(name.to_owned(), pbps_model::Column::new(ty(ty_)));
+                .insert(name.into(), pbps_model::Column::new(ty(ty_)));
         }
         let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &table);
         assert_eq!(found.len(), 2, "{found:?}");

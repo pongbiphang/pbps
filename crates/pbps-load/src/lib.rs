@@ -502,14 +502,14 @@ indexes:
     fn column_order_follows_the_document() {
         let t = load(FULL);
         assert_eq!(
-            t.table.columns.keys().collect::<Vec<_>>(),
+            t.table.columns.keys().cloned().collect::<Vec<_>>(),
             [
-                "customer_id",
-                "full_name",
-                "email",
-                "region_id",
-                "balance",
-                "legacy_code"
+                pbps_model::ColumnName::from("customer_id"),
+                pbps_model::ColumnName::from("full_name"),
+                pbps_model::ColumnName::from("email"),
+                pbps_model::ColumnName::from("region_id"),
+                pbps_model::ColumnName::from("balance"),
+                pbps_model::ColumnName::from("legacy_code")
             ]
         );
     }
@@ -621,20 +621,29 @@ indexes:
         let t = load(FULL);
         assert_eq!(
             t.table.primary_key.as_ref().unwrap().columns,
-            ["customer_id"]
+            [pbps_model::ColumnName::from("customer_id")]
         );
-        assert_eq!(t.table.unique["uq_customer_email"].columns, ["email"]);
+        assert_eq!(
+            t.table.unique["uq_customer_email"].columns,
+            [pbps_model::ColumnName::from("email")]
+        );
 
         let fk = &t.table.foreign_keys["fk_customer_region"];
         assert_eq!(fk.references_table.raw().to_string(), "dbo.region");
-        assert_eq!(fk.references_columns, ["region_id"]);
+        assert_eq!(
+            fk.references_columns,
+            [pbps_model::ColumnName::from("region_id")]
+        );
         assert_eq!(fk.on_delete, ReferentialAction::Cascade);
 
         let ix = &t.table.indexes["ix_customer_name"];
         assert!(ix.unique);
-        assert_eq!(ix.include, ["email"]);
+        assert_eq!(ix.include, [pbps_model::ColumnName::from("email")]);
         assert_eq!(ix.filter.as_deref(), Some("legacy_code IS NULL"));
-        assert_eq!(ix.columns[0].key.column(), Some("full_name"));
+        assert_eq!(
+            ix.columns[0].key.column().map(pbps_model::ColumnName::raw),
+            Some("full_name")
+        );
         assert!(!ix.columns[0].descending);
         assert!(
             ix.columns[1].descending,

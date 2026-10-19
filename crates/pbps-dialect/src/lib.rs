@@ -331,7 +331,7 @@ pub enum RowOperation {
     Insert,
     /// Exactly the columns named in the emitted SET list.
     Update {
-        columns: std::collections::BTreeSet<String>,
+        columns: std::collections::BTreeSet<pbps_model::ColumnName>,
     },
     Delete,
 }
@@ -352,7 +352,7 @@ pub struct IndexBuild {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Created {
     Table(TableName),
-    Column(TableName, String),
+    Column(TableName, pbps_model::ColumnName),
     Role(String),
 }
 
@@ -2869,7 +2869,9 @@ pub trait Dialect {
             found.push(DialectError::Invalid {
                 dialect: self.name(),
                 message: format!(
-                    "column `{column}` can have only one of default, identity, a `serial` type or generated"
+                    "column `{column}` can have only one of default, identity, a `serial` type or generated",
+                    // raw: whole-message escaped until #2084 step 5.
+                    column = column.raw(),
                 ),
             });
         }
@@ -3657,7 +3659,7 @@ pub fn name_read_sequences(schema: &mut Schema, dialect: &dyn Dialect) {
             if let pbps_model::ValueSource::Sequence(sequence) = &mut spec.value_source
                 && sequence.name.is_none()
             {
-                sequence.name = dialect.owned_sequence_name(name, column, sequence);
+                sequence.name = dialect.owned_sequence_name(name, column.raw(), sequence);
             }
         }
     }
@@ -4947,7 +4949,7 @@ mod tests {
         let partitioned = |key: &[&str]| Table {
             partition_by: Some(pbps_model::PartitionBy {
                 external: false,
-                columns: key.iter().map(|k| (*k).to_owned()).collect(),
+                columns: key.iter().map(|k| (*k).into()).collect(),
                 strategy: Default::default(),
             }),
             ..Default::default()
@@ -5047,7 +5049,7 @@ mod tests {
         let partitioned = |strategy: S, key: &[&str]| Table {
             partition_by: Some(pbps_model::PartitionBy {
                 external: false,
-                columns: key.iter().map(|k| (*k).to_owned()).collect(),
+                columns: key.iter().map(|k| (*k).into()).collect(),
                 strategy,
             }),
             ..Default::default()
@@ -5510,7 +5512,7 @@ mod tests {
             name.to_owned(),
             Index {
                 columns: vec![IndexColumn {
-                    key: pbps_model::IndexKey::Column("n".to_owned()),
+                    key: pbps_model::IndexKey::Column("n".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -5527,7 +5529,7 @@ mod tests {
     fn with_primary_key(mut table: Table, name: &str) -> Table {
         table.primary_key = Some(PrimaryKey {
             name: Some(name.to_owned()),
-            columns: vec!["n".to_owned()],
+            columns: vec!["n".into()],
             storage_parameters: Default::default(),
         });
         table
@@ -5537,7 +5539,7 @@ mod tests {
         table.unique.insert(
             name.to_owned(),
             UniqueConstraint {
-                columns: vec!["n".to_owned()],
+                columns: vec!["n".into()],
                 storage_parameters: Default::default(),
             },
         );
@@ -5566,9 +5568,9 @@ mod tests {
         table.foreign_keys.insert(
             name.to_owned(),
             pbps_model::ForeignKey {
-                columns: vec!["n".to_owned()],
+                columns: vec!["n".into()],
                 references_table: "coll.parent".parse().unwrap(),
-                references_columns: vec!["n".to_owned()],
+                references_columns: vec!["n".into()],
                 on_delete: Default::default(),
                 on_update: Default::default(),
             },

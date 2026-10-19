@@ -1,3 +1,4 @@
+use pbps_model::ColumnName;
 use pbps_model::{
     CheckConstraint, Clustered, Column, ComputedColumn, ForeignKey, Index, PartitionBy,
     PartitionColumn, PartitionOf, PrimaryKey, ReplicaIdentity, Schema, SystemTime, Table,
@@ -16,8 +17,8 @@ use super::{
 /// A new model field therefore needs an explicit policy here (DEC-1774.1).
 #[derive(Clone, Copy)]
 pub(crate) struct Fields<'a> {
-    pub(crate) columns: &'a indexmap::IndexMap<String, Column>,
-    pub(crate) computed: &'a BTreeMap<String, ComputedColumn>,
+    pub(crate) columns: &'a indexmap::IndexMap<ColumnName, Column>,
+    pub(crate) computed: &'a BTreeMap<ColumnName, ComputedColumn>,
     pub(crate) primary_key: &'a Option<PrimaryKey>,
     pub(crate) unique: &'a BTreeMap<String, UniqueConstraint>,
     pub(crate) foreign_keys: &'a BTreeMap<String, ForeignKey>,
@@ -338,12 +339,12 @@ pub(crate) fn columns_after(
             (pbps_model::Presence::Present, false) => moved.push(format!(
                 "{} column `{}` is not there, and this plan writes it",
                 column.table.shown(),
-                column.name
+                column.name.shown()
             )),
             (pbps_model::Presence::Absent, true) => moved.push(format!(
                 "{} column `{}` is still there, and this plan removes it",
                 column.table.shown(),
-                column.name
+                column.name.shown()
             )),
             _ => {}
         }
@@ -379,7 +380,7 @@ pub(crate) fn columns_after(
             moved.push(format!(
                 "{} column `{}` does not have the {what} this plan gives it",
                 column.table.shown(),
-                column.name
+                column.name.shown()
             ));
         }
     }
@@ -422,10 +423,14 @@ pub(crate) fn columns(
         let column = &required.name;
         let observed = now.columns.get(column);
         if !required.present.accepts(&observed.is_some()) {
-            moved.push(format!("{name} column `{column}` is not on both sides, and no change of this plan adds or removes it", name = name.shown()));
+            moved.push(format!("{name} column `{column}` is not on both sides, and no change of this plan adds or removes it", name = name.shown(),
+                column = column.shown(),
+            ));
         } else if let (Some(fields), Some(observed)) = (&required.fields, observed) {
             for what in self::column(fields, observed) {
-                moved.push(format!("{name} column `{column}` has a different {what} from the one the plan was approved over, and no change of this plan moves it", name = name.shown()));
+                moved.push(format!("{name} column `{column}` has a different {what} from the one the plan was approved over, and no change of this plan moves it", name = name.shown(),
+                    column = column.shown(),
+                ));
             }
         }
     }

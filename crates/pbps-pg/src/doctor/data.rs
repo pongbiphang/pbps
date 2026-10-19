@@ -60,7 +60,7 @@ pub(super) async fn missing(
                     Param::Str(&current.name),
                     Param::Str(permission),
                 ];
-                params.extend(columns.iter().flatten().map(|c| Param::Str(c)));
+                params.extend(columns.iter().flatten().map(|c| Param::Str(c.raw())));
                 let rows = conn.query_with(&query, &params).await?;
                 if let Some(row) = rows.first() {
                     answer = Some(flag(row, "held")?);

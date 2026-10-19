@@ -73,7 +73,7 @@ fn parse_pair(flag: &str, first: &str, second: &str) -> anyhow::Result<Intent> {
             Intent::RenameColumn {
                 table: column.table,
                 from: column.name,
-                to: second.to_owned(),
+                to: second.to_owned().into(),
             }
         }
         "--rename-table" => Intent::RenameTable {

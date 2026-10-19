@@ -560,14 +560,18 @@ fn inspect(req: &RangeSeriesRequest<'_>) -> Result<Declared, DialectError> {
     let ty = table.columns.get(column).map(|c| &c.ty).ok_or_else(|| {
         invalid(format!(
             "`{parent}` is partitioned by `{column}`, which it does not declare",
-            parent = parent.raw()
+            parent = parent.raw(),
+            // raw: whole-message escaped until #2084 step 5.
+            column = column.raw(),
         ))
     })?;
     let key = Key::of(ty).ok_or_else(|| {
         invalid(format!(
             "`{parent}` is partitioned by `{column}`, a {ty}: a series is generated for a \
              `date`, `timestamp`, `timestamptz`, `smallint`, `integer` or `bigint` key",
-            parent = parent.raw()
+            parent = parent.raw(),
+            // raw: whole-message escaped until #2084 step 5.
+            column = column.raw(),
         ))
     })?;
 

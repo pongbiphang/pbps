@@ -595,7 +595,7 @@ mod tests {
                     columns: own
                         .map(|default| {
                             (
-                                "id".to_owned(),
+                                "id".into(),
                                 pbps_model::PartitionColumn {
                                     default: Some(default.to_owned()),
                                     not_null: false,

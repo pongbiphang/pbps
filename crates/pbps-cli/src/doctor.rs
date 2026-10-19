@@ -2142,9 +2142,7 @@ mod tests {
         // the target's whole catalog: two keys, two columns, one entry.
         assert_eq!(
             columns[&"app.parent".parse::<pbps_model::ObjectName>().unwrap()],
-            ["code".to_owned(), "label".to_owned()]
-                .into_iter()
-                .collect()
+            ["code".into(), "label".into()].into_iter().collect()
         );
         // The declared half is the whole map, both classifications together:
         // the question it answers is which keys this environment holds that
@@ -2304,7 +2302,7 @@ mod tests {
         let mut t = pbps_model::schema::Table {
             primary_key: Some(pbps_model::schema::PrimaryKey {
                 name: None,
-                columns: vec!["code".to_owned()],
+                columns: vec!["code".into()],
                 storage_parameters: Default::default(),
             }),
             data: Some(pbps_model::TableData {
@@ -2323,7 +2321,7 @@ mod tests {
         };
         for name in std::iter::once(&"code").chain(columns) {
             t.columns
-                .insert((*name).to_owned(), pbps_model::Column::new(ty.clone()));
+                .insert((*name).into(), pbps_model::Column::new(ty.clone()));
         }
         t
     }

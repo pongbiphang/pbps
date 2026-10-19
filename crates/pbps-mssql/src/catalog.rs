@@ -914,14 +914,14 @@ pub struct ExpressionEdge {
     /// module.
     pub from: TableName,
     /// The computed column whose expression this is, for a table's edge.
-    pub from_column: Option<String>,
+    pub from_column: Option<pbps_model::ColumnName>,
     /// Whether the referencing module is `WITH SCHEMABINDING`
     /// (`sys.sql_modules.is_schema_bound`). False for a table's edge.
     pub from_schema_bound: bool,
     /// The referenced object.
     pub to: TableName,
     /// The referenced column, where the edge names one.
-    pub to_column: Option<String>,
+    pub to_column: Option<pbps_model::ColumnName>,
     /// The referenced object's `sys.objects.type`, trimmed: `U` for a table,
     /// `FN` for a scalar function, `V` for a view.
     pub to_kind: String,
@@ -987,13 +987,13 @@ pub async fn expression_edges(
                 get::<&str>(&row, "from_schema")?,
                 get::<&str>(&row, "from_name")?,
             ),
-            from_column: opt::<&str>(&row, "from_column")?.map(str::to_owned),
+            from_column: opt::<&str>(&row, "from_column")?.map(Into::into),
             from_schema_bound: get(&row, "from_schema_bound")?,
             to: TableName::new(
                 get::<&str>(&row, "to_schema")?,
                 get::<&str>(&row, "to_name")?,
             ),
-            to_column: opt::<&str>(&row, "to_column")?.map(str::to_owned),
+            to_column: opt::<&str>(&row, "to_column")?.map(Into::into),
             to_kind: get::<&str>(&row, "to_kind")?.to_owned(),
         });
     }
@@ -1055,7 +1055,7 @@ pub async fn may_hold_computed_columns(
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReferrerTargets {
     pub functions: Vec<TableName>,
-    pub computed_columns: Vec<(TableName, String)>,
+    pub computed_columns: Vec<(TableName, pbps_model::ColumnName)>,
 }
 
 /// Proves the connected pass may read [`expression_edges`] as complete
@@ -1159,7 +1159,7 @@ fn hidden_referrers_query(targets: &ReferrerTargets) -> Option<String> {
                 "({}, {}, CONVERT(sysname, {}))",
                 lit(&n.schema),
                 lit(&n.name),
-                lit(c)
+                lit(c.raw())
             )
         }))
         .collect::<Vec<_>>();
@@ -1205,7 +1205,7 @@ pub struct NameOccupant {
     pub parent: Option<TableName>,
     /// The column a default constraint belongs to, which goes with the
     /// column and with the default it is.
-    pub parent_column: Option<String>,
+    pub parent_column: Option<pbps_model::ColumnName>,
 }
 
 /// Whether everything in `schemas` is visible to this connection, which an
@@ -1390,7 +1390,7 @@ pub async fn object_name_occupants(
                 .to_lowercase()
                 .replace('_', " "),
             parent,
-            parent_column: row.try_get::<&str>("parent_column")?.map(str::to_owned),
+            parent_column: row.try_get::<&str>("parent_column")?.map(Into::into),
         });
     }
     Ok(out)

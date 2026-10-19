@@ -172,7 +172,7 @@ struct Continues {
 enum CatalogSource {
     Stored {
         table: TableName,
-        column: Option<String>,
+        column: Option<pbps_model::ColumnName>,
     },
     Created,
 }
@@ -1098,7 +1098,11 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
             SHAPE,
             &[
                 relation.as_str().into(),
-                column.as_deref().unwrap_or_default().into(),
+                column
+                    .as_ref()
+                    .map(pbps_model::ColumnName::raw)
+                    .unwrap_or_default()
+                    .into(),
                 removed_checks.as_str().into(),
             ],
         )
@@ -1181,7 +1185,8 @@ async fn continues_at(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), Db
     else {
         return Ok(());
     };
-    let (Ok(relation), Ok(quoted)) = (crate::emit::qualified(table), crate::quote(column)) else {
+    let (Ok(relation), Ok(quoted)) = (crate::emit::qualified(table), crate::quote(column.raw()))
+    else {
         return Ok(());
     };
     let led = conn
@@ -1195,7 +1200,7 @@ async fn continues_at(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), Db
                  AND m.amname OPERATOR(pg_catalog.=) 'btree'
                  AND a.attname OPERATOR(pg_catalog.=) $2 AND i.indpred IS NULL
                  AND i.indisvalid) AS led",
-            &[relation.as_str().into(), column.as_str().into()],
+            &[relation.as_str().into(), column.raw().into()],
         )
         .await?
         .first()
@@ -1204,7 +1209,9 @@ async fn continues_at(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), Db
     if !led {
         estimate.about.push_str(&format!(
             "; no b-tree index leads with {column}, so its greatest value is read at apply, under the \
-             lock, and not here, where it would scan every row"
+             lock, and not here, where it would scan every row",
+            // raw: whole-message escaped until #2084 step 5.
+            column = column.raw(),
         ));
         return Ok(());
     }
@@ -1223,7 +1230,7 @@ async fn continues_at(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), Db
             .query_with(
                 "SELECT s FROM pg_catalog.pg_get_serial_sequence($1, $2) AS s
                   WHERE s IS NOT NULL AND pg_catalog.has_sequence_privilege(s, 'SELECT')",
-                &[relation.as_str().into(), column.as_str().into()],
+                &[relation.as_str().into(), column.raw().into()],
             )
             .await?
             .first()

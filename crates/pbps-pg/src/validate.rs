@@ -19,6 +19,7 @@
 //! granted — the failure this project exists to make loud — so it is refused
 //! where the user has the file open, with the line to add.
 
+use pbps_model::ColumnName;
 use std::collections::BTreeSet;
 
 use pbps_dialect::{DialectError, Expression};
@@ -59,7 +60,9 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         if let Some(collation) = &column.collation {
             found.push(invalid(format!(
                 "column `{name}` names collation `{collation}`; column collations are modelled \
-                 for SQL Server only, so remove the line"
+                 for SQL Server only, so remove the line",
+                // raw: whole-message escaped until #2084 step 5.
+                name = name.raw(),
             )));
         }
     }
@@ -116,7 +119,9 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         for column in &fk.references_columns {
             if !seen.insert(column) && said.insert(column) {
                 found.push(invalid(format!(
-                    "{what} names `{column}` twice on the referenced table;                      the referenced columns must be distinct"
+                    "{what} names `{column}` twice on the referenced table;                      the referenced columns must be distinct",
+                    // raw: whole-message escaped until #2084 step 5.
+                    column = column.raw(),
                 )));
             }
         }
@@ -177,7 +182,7 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         let keys: Vec<_> = index
             .columns
             .iter()
-            .filter_map(|c| c.key.column().map(str::to_owned))
+            .filter_map(|c| c.key.column().cloned())
             .collect();
         if index.columns.is_empty() || !keys.is_empty() {
             found.extend(key_columns(&what, &keys, table, false));
@@ -192,7 +197,9 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         for column in &index.include {
             if !table.columns.contains_key(column) {
                 found.push(invalid(format!(
-                    "{what} includes `{column}`, which is not a column of this table"
+                    "{what} includes `{column}`, which is not a column of this table",
+                    // raw: whole-message escaped until #2084 step 5.
+                    column = column.raw(),
                 )));
             }
         }
@@ -269,6 +276,8 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                     found.push(invalid(format!(
                         "{what} is a GIN index over `{column}`, and this model holds GIN only over \
                          `jsonb` columns",
+                        // raw: whole-message escaped until #2084 step 5.
+                        column = column.raw(),
                     )));
                 }
                 match key.opclass.as_deref() {
@@ -276,11 +285,15 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
                     Some("jsonb_ops") => found.push(invalid(format!(
                         "{what} names `jsonb_ops` for `{column}`, which is GIN's default for \
                          `jsonb`; leave the class out",
+                        // raw: whole-message escaped until #2084 step 5.
+                        column = column.raw(),
                     ))),
                     Some(class) => found.push(invalid(format!(
                         "{what} indexes `{column}` with operator class `{class}`; a GIN index \
                          over `jsonb` here takes `jsonb_path_ops` or, by leaving it out, the \
                          default `jsonb_ops`",
+                        // raw: whole-message escaped until #2084 step 5.
+                        column = column.raw(),
                     ))),
                 }
             }
@@ -289,7 +302,12 @@ fn index_method(what: &str, index: &Index, table: &Table) -> Vec<DialectError> {
     found
 }
 
-fn key_columns(what: &str, columns: &[String], table: &Table, distinct: bool) -> Vec<DialectError> {
+fn key_columns(
+    what: &str,
+    columns: &[ColumnName],
+    table: &Table,
+    distinct: bool,
+) -> Vec<DialectError> {
     let mut found = Vec::new();
     if columns.is_empty() {
         found.push(invalid(format!("{what} names no columns")));
@@ -298,11 +316,17 @@ fn key_columns(what: &str, columns: &[String], table: &Table, distinct: bool) ->
     for name in columns {
         if !table.columns.contains_key(name) {
             found.push(invalid(format!(
-                "{what} references `{name}`, which is not a column of this table"
+                "{what} references `{name}`, which is not a column of this table",
+                // raw: whole-message escaped until #2084 step 5.
+                name = name.raw(),
             )));
         }
         if distinct && !seen.insert(name) {
-            found.push(invalid(format!("{what} names `{name}` twice")));
+            found.push(invalid(format!(
+                "{what} names `{name}` twice",
+                // raw: whole-message escaped until #2084 step 5.
+                name = name.raw(),
+            )));
         }
     }
     found

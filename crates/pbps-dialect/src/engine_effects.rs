@@ -45,11 +45,11 @@ pub fn text_dependents(
     for (name, check) in &table.table.checks {
         if replaced
             .and_then(|t| t.checks.get(name))
-            .is_some_and(|c| !dialect.may_name(&c.expression, &column.name))
+            .is_some_and(|c| !dialect.may_name(&c.expression, column.name.raw()))
         {
             continue;
         }
-        if dialect.may_name(&check.expression, &column.name) {
+        if dialect.may_name(&check.expression, column.name.raw()) {
             fx.requires.push(Requirement::Absent(
                 table.part(PartKey::Check(name.clone())),
             ));
@@ -59,18 +59,18 @@ pub fn text_dependents(
         let filtered = index
             .filter
             .as_deref()
-            .is_some_and(|f| dialect.may_name(f, &column.name));
+            .is_some_and(|f| dialect.may_name(f, column.name.raw()));
         let expression = index.columns.iter().any(|c| match &c.key {
-            IndexKey::Expression(text) => dialect.may_name(text, &column.name),
+            IndexKey::Expression(text) => dialect.may_name(text, column.name.raw()),
             IndexKey::Column(_) => false,
         });
         let names = |index: &pbps_model::Index| {
             index
                 .filter
                 .as_deref()
-                .is_some_and(|f| dialect.may_name(f, &column.name))
+                .is_some_and(|f| dialect.may_name(f, column.name.raw()))
                 || index.columns.iter().any(|c| match &c.key {
-                    IndexKey::Expression(text) => dialect.may_name(text, &column.name),
+                    IndexKey::Expression(text) => dialect.may_name(text, column.name.raw()),
                     IndexKey::Column(_) => false,
                 })
         };
@@ -147,7 +147,7 @@ pub fn retype_blockers(
     };
     // The column as the baseline spells it: the step may name it after a
     // rename.
-    let Some(name) = before.ids.columns.get(uid).map(|c| c.name.as_str()) else {
+    let Some(name) = before.ids.columns.get(uid).map(|c| c.name.raw()) else {
         return Ok(fx);
     };
     let t = table.table;
@@ -156,12 +156,12 @@ pub fn retype_blockers(
     if dependents.keys_and_indexes {
         if t.primary_key
             .as_ref()
-            .is_some_and(|pk| pk.columns.iter().any(|c| c == name))
+            .is_some_and(|pk| pk.columns.iter().any(|c| c.raw() == name))
         {
             gone.push(PartKey::PrimaryKey);
         }
         for (n, u) in &t.unique {
-            if u.columns.iter().any(|c| c == name) {
+            if u.columns.iter().any(|c| c.raw() == name) {
                 gone.push(PartKey::Unique(n.clone()));
             }
         }
@@ -169,8 +169,8 @@ pub fn retype_blockers(
             let keyed = index
                 .columns
                 .iter()
-                .any(|c| matches!(&c.key, IndexKey::Column(k) if k == name));
-            if keyed || index.include.iter().any(|c| c == name) {
+                .any(|c| matches!(&c.key, IndexKey::Column(k) if k.raw() == name));
+            if keyed || index.include.iter().any(|c| c.raw() == name) {
                 gone.push(PartKey::Index(n.clone()));
             }
         }
@@ -215,9 +215,9 @@ pub fn retype_blockers(
                 continue;
             };
             for (n, fk) in &other.table.foreign_keys {
-                let local = other_name == table.name && fk.columns.iter().any(|c| c == name);
+                let local = other_name == table.name && fk.columns.iter().any(|c| c.raw() == name);
                 let referenced = fk.references_table == *table.name
-                    && fk.references_columns.iter().any(|c| c == name);
+                    && fk.references_columns.iter().any(|c| c.raw() == name);
                 if local || referenced {
                     fx.requires.push(Requirement::Absent(
                         other.part(PartKey::ForeignKey(n.clone())),

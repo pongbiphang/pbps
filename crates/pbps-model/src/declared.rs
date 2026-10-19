@@ -20,6 +20,7 @@
 //! On an engine that stores what it was given that is the same answer as
 //! before; on one that respells, the object is restated once, and the apply
 //! records what it declared (DECISIONS 208).
+use crate::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::change::{Change, ChangeSet};
@@ -36,13 +37,13 @@ use crate::schema::{Schema, ValueSource};
 pub struct DeclaredExpressions {
     /// `ValueSource::Default`, by table and column.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub defaults: BTreeMap<TableName, BTreeMap<String, String>>,
+    pub defaults: BTreeMap<TableName, BTreeMap<ColumnName, String>>,
     /// `Generated::expression`, by table and column (DEC-1168.1).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub generated: BTreeMap<TableName, BTreeMap<String, String>>,
+    pub generated: BTreeMap<TableName, BTreeMap<ColumnName, String>>,
     /// `ComputedColumn::expression`, by table and computed column (#1174).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub computed: BTreeMap<TableName, BTreeMap<String, String>>,
+    pub computed: BTreeMap<TableName, BTreeMap<ColumnName, String>>,
     /// `CheckConstraint::expression`, by table and constraint name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checks: BTreeMap<TableName, BTreeMap<String, String>>,
@@ -109,7 +110,7 @@ pub struct Bindings {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub modules: BTreeMap<ModuleId, Binding>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub defaults: BTreeMap<TableName, BTreeMap<String, Binding>>,
+    pub defaults: BTreeMap<TableName, BTreeMap<ColumnName, Binding>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checks: BTreeMap<TableName, BTreeMap<String, Binding>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -145,10 +146,10 @@ pub struct Declared {
     pub bindings: Bindings,
 }
 
-fn remove_nested<V>(
-    map: &mut BTreeMap<TableName, BTreeMap<String, V>>,
+fn remove_nested<K: Ord, V>(
+    map: &mut BTreeMap<TableName, BTreeMap<K, V>>,
     table: &TableName,
-    name: &str,
+    name: &K,
 ) {
     if let Some(inner) = map.get_mut(table) {
         inner.remove(name);
@@ -159,24 +160,24 @@ fn remove_nested<V>(
 }
 
 /// `from`'s records copied to `to`, each key passed through `rename`.
-fn copy_table<V: Clone>(
-    map: &mut BTreeMap<TableName, BTreeMap<String, V>>,
+fn copy_table<K: Ord, V: Clone>(
+    map: &mut BTreeMap<TableName, BTreeMap<K, V>>,
     from: &TableName,
     to: &TableName,
-    rename: impl Fn(&String) -> String,
+    rename: impl Fn(&K) -> K,
 ) {
     let Some(records) = map.get(from) else {
         return;
     };
-    let copied: BTreeMap<String, V> = records
+    let copied: BTreeMap<K, V> = records
         .iter()
         .map(|(k, v)| (rename(k), v.clone()))
         .collect();
     map.insert(to.clone(), copied);
 }
 
-fn rekey_table<V>(
-    map: &mut BTreeMap<TableName, BTreeMap<String, V>>,
+fn rekey_table<K, V>(
+    map: &mut BTreeMap<TableName, BTreeMap<K, V>>,
     from: &TableName,
     to: &TableName,
 ) {
@@ -185,16 +186,16 @@ fn rekey_table<V>(
     }
 }
 
-fn rekey_nested<V>(
-    map: &mut BTreeMap<TableName, BTreeMap<String, V>>,
+fn rekey_nested<K: Ord + Clone, V>(
+    map: &mut BTreeMap<TableName, BTreeMap<K, V>>,
     table: &TableName,
-    from: &str,
-    to: &str,
+    from: &K,
+    to: &K,
 ) {
     if let Some(inner) = map.get_mut(table)
         && let Some(v) = inner.remove(from)
     {
-        inner.insert(to.to_owned(), v);
+        inner.insert(to.clone(), v);
     }
 }
 
@@ -363,7 +364,12 @@ impl Declared {
                             .and_then(|n| n.name.clone())
                             .unwrap_or_else(|| of.clone())
                     };
-                    copy_table(&mut self.bindings.defaults, parent, table, String::clone);
+                    copy_table(
+                        &mut self.bindings.defaults,
+                        parent,
+                        table,
+                        ColumnName::clone,
+                    );
                     copy_table(&mut self.bindings.checks, parent, table, |of| {
                         renamed(crate::DetachedKind::Check, of)
                     });
@@ -391,11 +397,19 @@ impl Declared {
                                 key: &String| {
                         map.get(table).is_some_and(|m| m.contains_key(key))
                     };
-                    defaults.retain(|column, _| held(&fresh.expressions.defaults, column));
+                    defaults.retain(|column, _| {
+                        fresh
+                            .expressions
+                            .defaults
+                            .get(table)
+                            .is_some_and(|m| m.contains_key(column))
+                    });
+                    if !defaults.is_empty() {
+                        self.bindings.defaults.insert(table.clone(), defaults);
+                    }
                     checks.retain(|name, _| held(&fresh.expressions.checks, name));
                     filters.retain(|name, _| held(&fresh.expressions.filters, name));
                     for (map, kept) in [
-                        (&mut self.bindings.defaults, defaults),
                         (&mut self.bindings.checks, checks),
                         (&mut self.bindings.filters, filters),
                     ] {
@@ -740,7 +754,7 @@ mod tests {
                 parent: "app.ev".parse().unwrap(),
                 bound: crate::PartitionBound::Default,
                 columns: [(
-                    "v".to_owned(),
+                    "v".into(),
                     crate::PartitionColumn {
                         default: default.map(str::to_owned),
                         not_null: true,
@@ -775,10 +789,10 @@ mod tests {
         let mut table = Table::default();
         let mut n = Column::new("int".parse().unwrap());
         n.value_source = crate::ValueSource::Default("0".to_owned());
-        table.columns.insert("n".to_owned(), n);
+        table.columns.insert("n".into(), n);
         table
             .columns
-            .insert("m".to_owned(), Column::new("int".parse().unwrap()));
+            .insert("m".into(), Column::new("int".parse().unwrap()));
         table.checks.insert(
             "ck_n".to_owned(),
             CheckConstraint {
@@ -789,7 +803,7 @@ mod tests {
             "ix_n".to_owned(),
             Index {
                 columns: vec![IndexColumn {
-                    key: crate::IndexKey::Column("n".to_owned()),
+                    key: crate::IndexKey::Column("n".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -804,7 +818,7 @@ mod tests {
             "ix_m".to_owned(),
             Index {
                 columns: vec![IndexColumn {
-                    key: crate::IndexKey::Column("m".to_owned()),
+                    key: crate::IndexKey::Column("m".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -856,7 +870,7 @@ mod tests {
         let expression_index = |text: &str| Index {
             columns: vec![
                 key(IndexKey::Expression(text.to_owned())),
-                key(IndexKey::Column("n".to_owned())),
+                key(IndexKey::Column("n".into())),
             ],
             include: Vec::new(),
             unique: false,
@@ -897,8 +911,8 @@ mod tests {
             "ix_expr".to_owned(),
             Index {
                 columns: vec![
-                    key(IndexKey::Column("m".to_owned())),
-                    key(IndexKey::Column("n".to_owned())),
+                    key(IndexKey::Column("m".into())),
+                    key(IndexKey::Column("n".into())),
                 ],
                 ..expression_index("unused")
             },
@@ -906,7 +920,7 @@ mod tests {
         let base = d.overlay(&changed);
         assert_eq!(
             base.tables[&t()].indexes["ix_expr"].columns[0].key,
-            IndexKey::Column("m".to_owned())
+            IndexKey::Column("m".into())
         );
 
         // A plan's index changes and a table rename carry the record.
@@ -977,7 +991,7 @@ mod tests {
         };
         d.bindings
             .defaults
-            .insert(t(), [("n".to_owned(), bound())].into_iter().collect());
+            .insert(t(), [("n".into(), bound())].into_iter().collect());
         d.bindings
             .checks
             .insert(t(), [("ck_n".to_owned(), bound())].into_iter().collect());
@@ -986,14 +1000,12 @@ mod tests {
             .insert(t(), [("ix_n".to_owned(), bound())].into_iter().collect());
         let shape = Table {
             checks: table().checks,
-            indexes: [("ix_expr".to_owned(), expression_index)]
-                .into_iter()
-                .collect(),
+            indexes: [("ix_expr".into(), expression_index)].into_iter().collect(),
             partition_of: Some(crate::PartitionOf {
                 parent: "dbo.p".parse().unwrap(),
                 bound: crate::PartitionBound::Default,
                 columns: [(
-                    "n".to_owned(),
+                    "n".into(),
                     crate::PartitionColumn {
                         default: Some("0".to_owned()),
                         not_null: false,
@@ -1052,16 +1064,13 @@ mod tests {
             for t in [&partition, &other] {
                 d.expressions.defaults.insert(
                     t.clone(),
-                    [
-                        ("m".to_owned(), "1+2".to_owned()),
-                        ("n".to_owned(), "3".to_owned()),
-                    ]
-                    .into_iter()
-                    .collect(),
+                    [("m".into(), "1+2".to_owned()), ("n".into(), "3".to_owned())]
+                        .into_iter()
+                        .collect(),
                 );
                 d.bindings.defaults.insert(
                     t.clone(),
-                    [("m".to_owned(), Binding::default())].into_iter().collect(),
+                    [("m".into(), Binding::default())].into_iter().collect(),
                 );
             }
             d
@@ -1178,7 +1187,7 @@ mod tests {
             Change::AddColumn {
                 uid: "c_bbbbbb".parse().unwrap(),
                 table: t(),
-                name: "k".to_owned(),
+                name: "k".into(),
                 column: Box::new({
                     let mut c = Column::new("int".parse().unwrap());
                     c.value_source = crate::ValueSource::Default("GETDATE()".to_owned());
@@ -1199,8 +1208,8 @@ mod tests {
             Change::RenameColumn {
                 uid: "c_bbbbbb".parse().unwrap(),
                 table: t(),
-                from: "k".to_owned(),
-                to: "kk".to_owned(),
+                from: "k".into(),
+                to: "kk".into(),
                 table_was: None,
             },
             Change::RenameTable {

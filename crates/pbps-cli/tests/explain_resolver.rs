@@ -884,7 +884,7 @@ fn changes_naming(text: &str) -> (ChangeSet, IdsFile) {
     let mut added = planned(Change::AddColumn {
         uid: uid("c_aaaaaa"),
         table: table.clone(),
-        name: kept.clone(),
+        name: kept.clone().into(),
         column: Box::new(Column::new("int".parse().unwrap())),
     });
     added.findings = vec![Finding::new(text, Severity::Warning, text, None)];
@@ -1275,7 +1275,7 @@ fn a_refusal_naming_an_object_shows_the_name_escaped_on_explain_and_apply() {
                 let Change::DropColumn { column, .. } = &mut plan.changes.changes[1].change else {
                     unreachable!()
                 };
-                column.name = format!("\0{}", column.name);
+                column.name = ["\0", column.name.raw()].concat().into();
             },
             fragment: "the identifier `\\u{0}".to_owned(),
         },

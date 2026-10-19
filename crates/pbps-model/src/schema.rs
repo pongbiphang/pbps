@@ -14,6 +14,7 @@
 //! intent would make the same state compare unequal depending on whether an
 //! annotation happened to be present.
 
+use crate::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
@@ -125,6 +126,10 @@ impl Schema {
                             fk.references_table.shown(),
                             say(&r.collation),
                             name = name.shown(),
+
+                            local = local.shown(),
+
+                            referenced = referenced.shown(),
                         ));
                     }
                 }
@@ -146,7 +151,7 @@ impl Table {
     /// that every inventory of binding surfaces sees the same rows; a
     /// partition declares no column, and an inventory reading `columns`
     /// alone read its own defaults as nothing there.
-    pub fn expression_columns(&self) -> impl Iterator<Item = &str> {
+    pub fn expression_columns(&self) -> impl Iterator<Item = &ColumnName> {
         self.columns
             .iter()
             .filter(|(_, c)| match c.value_source {
@@ -155,13 +160,13 @@ impl Table {
                 // declaration holds (#1631).
                 ValueSource::None | ValueSource::Identity(_) | ValueSource::Sequence(_) => false,
             })
-            .map(|(name, _)| name.as_str())
+            .map(|(name, _)| name)
             .chain(
                 self.partition_of
                     .iter()
                     .flat_map(|of| &of.columns)
                     .filter(|(_, own)| own.default.is_some())
-                    .map(|(name, _)| name.as_str()),
+                    .map(|(name, _)| name),
             )
     }
 
@@ -272,14 +277,14 @@ impl Table {
     /// constraint, or a unique index that is not partial, over columns that
     /// are all NOT NULL (measured on 16 and 18, #1444).
     pub fn replica_identity_problems(&self) -> Vec<String> {
-        let nullable = |columns: &[String]| -> Vec<String> {
+        let nullable = |columns: &[ColumnName]| -> Vec<ColumnName> {
             columns
                 .iter()
                 .filter(|c| self.columns.get(*c).is_some_and(|col| col.nullable))
                 .cloned()
                 .collect()
         };
-        let over = |what: String, columns: &[String]| -> Vec<String> {
+        let over = |what: String, columns: &[ColumnName]| -> Vec<String> {
             let open = nullable(columns);
             if open.is_empty() {
                 Vec::new()
@@ -287,7 +292,10 @@ impl Table {
                 vec![format!(
                     "`replica_identity` names {what}, over nullable column(s) `{}`, which \
                      PostgreSQL does not take as a replica identity; declare them NOT NULL",
-                    open.join("`, `")
+                    open.iter()
+                        .map(|n| n.shown().to_string())
+                        .collect::<Vec<_>>()
+                        .join("`, `")
                 )]
             }
         };
@@ -353,9 +361,9 @@ impl Table {
     /// `None` is not "no key": it is a primary key that is absent or composite,
     /// which a `data:` block cannot be written against at all — the differ
     /// refuses it (`DataWithoutKey`) rather than emitting anything.
-    pub fn data_key_column(&self) -> Option<&str> {
+    pub fn data_key_column(&self) -> Option<&ColumnName> {
         match &self.primary_key {
-            Some(pk) if pk.columns.len() == 1 => Some(pk.columns[0].as_str()),
+            Some(pk) if pk.columns.len() == 1 => Some(&pk.columns[0]),
             _ => None,
         }
     }
@@ -379,11 +387,11 @@ impl Table {
     pub fn row_columns<'a>(
         &'a self,
         key_column: &'a str,
-    ) -> impl Iterator<Item = (&'a String, &'a Column)> {
+    ) -> impl Iterator<Item = (&'a ColumnName, &'a Column)> {
         self.columns
             .iter()
             .filter(move |(c, spec)| {
-                c.as_str() != key_column
+                c.raw() != key_column
                     && !(match spec.value_source {
                         // A `serial` is the engine's to number, as an
                         // identity is (#1631).
@@ -398,7 +406,7 @@ impl Table {
                 !self
                     .system_time
                     .as_ref()
-                    .is_some_and(|p| p.is_period_column(c))
+                    .is_some_and(|p| p.is_period_column(c.raw()))
             })
     }
 }
@@ -414,7 +422,7 @@ pub struct Table {
     /// mistaken for a schema change — and neither is it by
     /// [`state_checksum`](crate::state_checksum), which sorts these keys before
     /// hashing them for that reason (DECISIONS 238).
-    pub columns: IndexMap<String, Column>,
+    pub columns: IndexMap<ColumnName, Column>,
 
     /// SQL Server computed columns (#1174): a name, an expression, and
     /// whether the value is stored. Not [`Column`]s. The engine infers their
@@ -427,7 +435,7 @@ pub struct Table {
     /// (an expression change re-adds it there, measured on 17.0), so no
     /// declared order could be kept.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub computed: BTreeMap<String, ComputedColumn>,
+    pub computed: BTreeMap<ColumnName, ComputedColumn>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary_key: Option<PrimaryKey>,
@@ -643,7 +651,7 @@ pub struct PartitionBy {
     #[serde(default, skip_serializing_if = "PartitionStrategy::is_range")]
     pub strategy: PartitionStrategy,
     /// The key's columns, in order.
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnName>,
     /// Its partitions are another tool's to create and drop: pg_partman, a
     /// scheduled job (#1533, DEC-1533.1). pbps manages the parent alone,
     /// declares no partition, and holds each it finds only as the parent
@@ -695,7 +703,7 @@ pub struct PartitionOf {
     /// `columns`, which a partition never has: its columns, types included,
     /// are its parent's, and only a partition can hold one of these.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub columns: BTreeMap<String, PartitionColumn>,
+    pub columns: BTreeMap<ColumnName, PartitionColumn>,
 }
 
 /// One column's own default and NOT NULL on a partition (#1578). Each is an
@@ -815,9 +823,9 @@ impl BoundDatum {
 #[serde(deny_unknown_fields)]
 pub struct SystemTime {
     /// `GENERATED ALWAYS AS ROW START`.
-    pub start: String,
+    pub start: ColumnName,
     /// `GENERATED ALWAYS AS ROW END`.
-    pub end: String,
+    pub end: ColumnName,
     /// Both period columns `HIDDEN`: left out of `SELECT *`. One flag for the
     /// pair; a table with one hidden and one visible is read as a limitation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -831,7 +839,7 @@ pub struct SystemTime {
 impl SystemTime {
     /// Whether `column` is one of the period's two columns.
     pub fn is_period_column(&self, column: &str) -> bool {
-        self.start == column || self.end == column
+        self.start.raw() == column || self.end.raw() == column
     }
 }
 
@@ -1297,7 +1305,7 @@ pub struct PrimaryKey {
     /// The constraint name. `None` leaves the database to name it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnName>,
 
     /// PostgreSQL index storage parameters (#1442), by name, each in its
     /// canonical spelling ([`crate::storage::canonical_index`]). A key's and
@@ -1310,7 +1318,7 @@ pub struct PrimaryKey {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UniqueConstraint {
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnName>,
 
     /// PostgreSQL index storage parameters (#1442), by name, each in its
     /// canonical spelling ([`crate::storage::canonical_index`]). A key's and
@@ -1323,9 +1331,9 @@ pub struct UniqueConstraint {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForeignKey {
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnName>,
     pub references_table: TableName,
-    pub references_columns: Vec<String>,
+    pub references_columns: Vec<ColumnName>,
 
     #[serde(default)]
     pub on_delete: ReferentialAction,
@@ -1379,7 +1387,7 @@ pub struct Index {
 
     /// Payload columns that are not part of the key (SQL Server's INCLUDE).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub include: Vec<String>,
+    pub include: Vec<ColumnName>,
 
     #[serde(default)]
     pub unique: bool,
@@ -1414,10 +1422,10 @@ impl Index {
         self.filter.is_some() || self.columns.iter().any(|c| c.key.expression().is_some())
     }
 
-    pub fn column_keys(&self) -> Option<Vec<String>> {
+    pub fn column_keys(&self) -> Option<Vec<ColumnName>> {
         self.columns
             .iter()
-            .map(|c| c.key.column().map(str::to_owned))
+            .map(|c| c.key.column().cloned())
             .collect()
     }
 }
@@ -1525,13 +1533,13 @@ pub struct IndexColumn {
 /// with an expression rather than read one as a column named `lower(email)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum IndexKey {
-    Column(String),
+    Column(ColumnName),
     Expression(String),
 }
 
 impl IndexKey {
     /// The column this key is, or `None` for an expression.
-    pub fn column(&self) -> Option<&str> {
+    pub fn column(&self) -> Option<&ColumnName> {
         match self {
             IndexKey::Column(name) => Some(name),
             IndexKey::Expression(_) => None,
@@ -1550,7 +1558,8 @@ impl IndexKey {
     /// of the two it is does not survive this.
     pub fn text(&self) -> &str {
         match self {
-            IndexKey::Column(text) | IndexKey::Expression(text) => text,
+            IndexKey::Column(name) => name.raw(),
+            IndexKey::Expression(text) => text,
         }
     }
 }
@@ -1558,7 +1567,7 @@ impl IndexKey {
 impl IndexColumn {
     /// An ascending key on `name` under its default class: what most
     /// indexes are made of.
-    pub fn column(name: impl Into<String>) -> Self {
+    pub fn column(name: impl Into<ColumnName>) -> Self {
         IndexColumn {
             key: IndexKey::Column(name.into()),
             descending: false,
@@ -1575,7 +1584,7 @@ impl IndexColumn {
 #[serde(deny_unknown_fields)]
 struct RawIndexColumn {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
+    name: Option<ColumnName>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expression: Option<String>,
     #[serde(default)]
@@ -1655,7 +1664,7 @@ mod tests {
         }
         let row_columns = |t: &Table| -> Vec<String> {
             t.row_columns("customer_id")
-                .map(|(c, _)| c.clone())
+                .map(|(c, _)| c.raw().to_owned())
                 .collect()
         };
         // Negative first: without a period they are ordinary columns.
@@ -1713,13 +1722,10 @@ mod tests {
             stored: true,
         });
         t.columns.insert("total".into(), total);
-        let columns: Vec<&String> = t.row_columns("customer_id").map(|(c, _)| c).collect();
-        assert!(
-            !columns.iter().any(|c| c.as_str() == "total"),
-            "{columns:?}"
-        );
+        let columns: Vec<&str> = t.row_columns("customer_id").map(|(c, _)| c.raw()).collect();
+        assert!(!columns.contains(&"total"), "{columns:?}");
         // Negative: an ordinary column is one.
-        assert!(columns.iter().any(|c| c.as_str() == "email"), "{columns:?}");
+        assert!(columns.contains(&"email"), "{columns:?}");
     }
 
     #[test]
@@ -2122,8 +2128,11 @@ mod tests {
     fn column_order_is_preserved() {
         let t = sample();
         assert_eq!(
-            t.columns.keys().collect::<Vec<_>>(),
-            ["customer_id", "email"]
+            t.columns.keys().cloned().collect::<Vec<_>>(),
+            [
+                crate::ColumnName::from("customer_id"),
+                crate::ColumnName::from("email")
+            ]
         );
     }
 
@@ -2200,21 +2209,24 @@ mod tests {
         table
             .columns
             .insert("plain".into(), Column::new("int".parse().unwrap()));
-        assert_eq!(table.expression_columns().collect::<Vec<_>>(), ["d", "g"]);
+        assert_eq!(
+            table.expression_columns().cloned().collect::<Vec<_>>(),
+            [crate::ColumnName::from("d"), crate::ColumnName::from("g")]
+        );
         let partition = Table {
             partition_of: Some(PartitionOf {
                 parent: "app.t".parse().unwrap(),
                 bound: PartitionBound::Default,
                 columns: [
                     (
-                        "d".to_owned(),
+                        "d".into(),
                         PartitionColumn {
                             default: Some("1".into()),
                             not_null: false,
                         },
                     ),
                     (
-                        "plain".to_owned(),
+                        "plain".into(),
                         PartitionColumn {
                             default: None,
                             not_null: true,
@@ -2225,6 +2237,9 @@ mod tests {
             }),
             ..Table::default()
         };
-        assert_eq!(partition.expression_columns().collect::<Vec<_>>(), ["d"]);
+        assert_eq!(
+            partition.expression_columns().cloned().collect::<Vec<_>>(),
+            [crate::ColumnName::from("d")]
+        );
     }
 }

@@ -2833,7 +2833,7 @@ pub async fn misspelt(
 struct OwnDefault<'a> {
     partition: &'a TableName,
     parent: &'a TableName,
-    column: &'a str,
+    column: &'a pbps_model::ColumnName,
     own: &'a str,
     parents: &'a str,
     ty: String,
@@ -2900,7 +2900,8 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
                 out.defaults_unasked.push(format!(
                     "partition {partition} column `{column}`: its declared text may name a \
                      temporary schema, whose objects another session can change",
-                    partition = partition.shown()
+                    partition = partition.shown(),
+                    column = column.shown(),
                 ));
                 continue;
             }
@@ -2917,7 +2918,8 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
                     "partition {partition} column `{column}`: its type `{}` is not one this \
                      check can create a column of",
                     theirs.ty,
-                    partition = partition.shown()
+                    partition = partition.shown(),
+                    column = column.shown(),
                 )),
             }
         }
@@ -2975,7 +2977,7 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
             format!(
                 "partition {} column `{}`: {why}",
                 d.partition.shown(),
-                d.column
+                d.column.shown()
             )
         }));
         return;
@@ -3000,7 +3002,7 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
                     Err(why) => out.defaults_unasked.push(format!(
                         "partition {} column `{}`: {why}",
                         d.partition.shown(),
-                        d.column
+                        d.column.shown()
                     )),
                 }
             }
@@ -3009,7 +3011,7 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
             format!(
                 "partition {} column `{}`: {why}",
                 d.partition.shown(),
-                d.column
+                d.column.shown()
             )
         })),
     }
@@ -3453,7 +3455,7 @@ pub struct NameOccupant {
     /// The table an index is on, or the table whose column owns a sequence.
     pub owner: Option<TableName>,
     /// The column that owns a sequence, which dropping frees its name.
-    pub owner_column: Option<String>,
+    pub owner_column: Option<pbps_model::ColumnName>,
 }
 
 /// The [`NameOccupant`]s at `names`, and those `owners` own (their indexes
@@ -3542,7 +3544,7 @@ pub async fn relation_name_occupants(
             name: TableName::new(text("schema_name")?, text("relation_name")?),
             kind,
             owner,
-            owner_column: row.try_get::<&str>("owner_column")?.map(str::to_owned),
+            owner_column: row.try_get::<&str>("owner_column")?.map(Into::into),
         });
     }
     Ok(out)
@@ -3902,7 +3904,7 @@ pub async fn key_collations(
     schema: &Schema,
 ) -> Result<(), DbError> {
     let as_declared = crate::rows::Catalogued::default();
-    let mut wanted: Vec<(TableName, TableName, String)> = Vec::new();
+    let mut wanted: Vec<(TableName, TableName, pbps_model::ColumnName)> = Vec::new();
     for (name, table) in &schema.tables {
         if table.data.is_none() {
             continue;
@@ -3937,7 +3939,7 @@ pub async fn key_collations(
                 quote_for_regclass(&stored.schema),
                 quote_for_regclass(&stored.name)
             )),
-            crate::emit::value_literal(&column),
+            crate::emit::value_literal(column.raw()),
         );
         let rows = conn.query(&sql).await?;
         let Some(row) = rows.first() else { continue };

@@ -1551,7 +1551,7 @@ mod generated_surface_coverage {
             let created = at(&|c| matches!(c, Change::CreateModule { id, .. } if id == &function));
             let generation = at(&|c| {
                 matches!(c, Change::CreateTable { .. })
-                    || matches!(c, Change::AddColumn { name, .. } if name == "g")
+                    || matches!(c, Change::AddColumn { name, .. } if name.raw() == "g")
             });
             assert!(created < generation, "new_table={new_table}");
             ordered.proof.validate(&ordered.changes).unwrap();
@@ -1639,9 +1639,7 @@ mod generated_surface_coverage {
                 mode: DataMode::Exact,
                 rows: [(
                     RowKey::from("1"),
-                    [("n".to_owned(), Value::Int(n))]
-                        .into_iter()
-                        .collect::<Row>(),
+                    [("n".into(), Value::Int(n))].into_iter().collect::<Row>(),
                 )]
                 .into_iter()
                 .collect(),
@@ -1879,7 +1877,7 @@ mod generated_surface_coverage {
         let grant = at(&ordered, &|c| matches!(c, Change::Grant { .. }));
         let column = at(
             &ordered,
-            &|c| matches!(c, Change::AddColumn { name, .. } if name == "g"),
+            &|c| matches!(c, Change::AddColumn { name, .. } if name.raw() == "g"),
         );
         assert!(grant < column, "{:?}", ordered.changes.changes);
         ordered.proof.validate(&ordered.changes).unwrap();
@@ -3019,7 +3017,7 @@ mod generated_surface_coverage {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("missing from {:?}", ordered.changes.changes))
         };
-        let rename = |from: &'static str| move |c: &Change| matches!(c, Change::RenameColumn { from: f, .. } if f == from);
+        let rename = |from: &'static str| move |c: &Change| matches!(c, Change::RenameColumn { from: f, .. } if f.raw() == from);
         let removal = |c: &Change| matches!(c, Change::AlterColumnDefault { to: None, .. });
         let attrdef = |binds: &str| Some(bound("pg_attrdef", "app.t.d", &[], binds));
 
@@ -3196,7 +3194,7 @@ mod generated_surface_coverage {
         schema.tables.insert(
             "app.t".parse().unwrap(),
             Table {
-                columns: [("d".to_owned(), d)].into(),
+                columns: [("d".into(), d)].into(),
                 partition_by: Some(PartitionBy {
                     external: false,
                     columns: vec!["d".into()],
@@ -3214,7 +3212,7 @@ mod generated_surface_coverage {
                     columns: own
                         .map(|own| {
                             (
-                                "d".to_owned(),
+                                "d".into(),
                                 PartitionColumn {
                                     default: Some(own.into()),
                                     not_null: false,
@@ -3312,11 +3310,11 @@ mod generated_surface_coverage {
         let ordered = sided(&base, &desired, &[keeps("app.t"), own, dropped, created]);
         let release = at(&ordered, &|c| {
             matches!(c, Change::SetPartitionDefault { table, column, from: Some(from), to: None, fallback: None, .. }
-                if *table == p && column == "d" && from == "app.f(1)")
+                if *table == p && column.raw() == "d" && from == "app.f(1)")
         });
         let restore = at(&ordered, &|c| {
             matches!(c, Change::SetPartitionDefault { table, column, from: None, to: Some(to), fallback: Some(fallback), .. }
-                if *table == p && column == "d" && to == "app.f(1)" && fallback == "0")
+                if *table == p && column.raw() == "d" && to == "app.f(1)" && fallback == "0")
         });
         assert!(release < restore, "{:?}", ordered.changes.changes);
         let drop = at(
@@ -3581,7 +3579,7 @@ mod generated_surface_coverage {
                 Table {
                     columns: columns
                         .iter()
-                        .map(|c| ((*c).to_owned(), Column::new("int".parse().unwrap())))
+                        .map(|c| ((*c).into(), Column::new("int".parse().unwrap())))
                         .collect(),
                     partition_by: Some(PartitionBy {
                         external: false,
@@ -3598,7 +3596,7 @@ mod generated_surface_coverage {
                         parent: t.clone(),
                         bound: PartitionBound::Default,
                         columns: [(
-                            "d".to_owned(),
+                            "d".into(),
                             PartitionColumn {
                                 default: Some("app.f(1)".into()),
                                 not_null: false,
@@ -3656,7 +3654,7 @@ mod generated_surface_coverage {
                 Table {
                     columns: columns
                         .iter()
-                        .map(|c| ((*c).to_owned(), Column::new("int".parse().unwrap())))
+                        .map(|c| ((*c).into(), Column::new("int".parse().unwrap())))
                         .collect(),
                     partition_by: Some(PartitionBy {
                         external: false,
@@ -3676,7 +3674,7 @@ mod generated_surface_coverage {
                             .iter()
                             .map(|(c, default)| {
                                 (
-                                    (*c).to_owned(),
+                                    (*c).into(),
                                     PartitionColumn {
                                         default: Some((*default).into()),
                                         not_null: false,
@@ -3713,15 +3711,15 @@ mod generated_surface_coverage {
         .unwrap_or_else(|error| panic!("a kept override is refused: {error:?}"));
         let rename = at(&ordered, &|c| {
             matches!(c, Change::RenameColumn { table, from, to, .. }
-                if *table == t && from == "e" && to == "d")
+                if *table == t && from.raw() == "e" && to.raw() == "d")
         });
         let release = at(&ordered, &|c| {
             matches!(c, Change::SetPartitionDefault { table, column, to: None, fallback: None, .. }
-                if *table == p && column == "e")
+                if *table == p && column.raw() == "e")
         });
         let restore = at(&ordered, &|c| {
             matches!(c, Change::SetPartitionDefault { table, column, to: Some(to), .. }
-                if *table == p && column == "d" && to == "app.f(2)")
+                if *table == p && column.raw() == "d" && to == "app.f(2)")
         });
         assert!(
             release < rename && rename < restore,
@@ -3741,7 +3739,7 @@ mod generated_surface_coverage {
             Table {
                 columns: columns
                     .iter()
-                    .map(|c| ((*c).to_owned(), Column::new("int".parse().unwrap())))
+                    .map(|c| ((*c).into(), Column::new("int".parse().unwrap())))
                     .collect(),
                 partition_by: Some(PartitionBy {
                     external: false,
@@ -3761,7 +3759,7 @@ mod generated_surface_coverage {
                         .iter()
                         .map(|(c, default)| {
                             (
-                                (*c).to_owned(),
+                                (*c).into(),
                                 PartitionColumn {
                                     default: Some((*default).into()),
                                     not_null: false,
@@ -3803,12 +3801,12 @@ mod generated_surface_coverage {
         let renamed = |from: &str| {
             at(
                 &ordered,
-                &|c| matches!(c, Change::RenameColumn { table, from: f, .. } if *table == t && f == from),
+                &|c| matches!(c, Change::RenameColumn { table, from: f, .. } if *table == t && f.raw() == from),
             )
         };
         let removal = at(&ordered, &|c| {
             matches!(c, Change::SetPartitionDefault { table, column, from: Some(_), to: None, .. }
-                if *table == p && column == "e")
+                if *table == p && column.raw() == "e")
         });
         assert!(
             renamed("e") < removal && renamed("d") < removal,
@@ -3862,15 +3860,15 @@ mod generated_surface_coverage {
         .unwrap_or_else(|error| panic!("a renamed parent is refused: {error:?}"));
         let rename = at(
             &ordered,
-            &|c| matches!(c, Change::RenameColumn { from, to, .. } if from == "e" && to == "d"),
+            &|c| matches!(c, Change::RenameColumn { from, to, .. } if from.raw() == "e" && to.raw() == "d"),
         );
         let release = at(&ordered, &|c| {
             matches!(c, Change::SetPartitionDefault { table, column, to: None, fallback: None, .. }
-                if *table == p && column == "e")
+                if *table == p && column.raw() == "e")
         });
         let restore = at(&ordered, &|c| {
             matches!(c, Change::SetPartitionDefault { table, column, to: Some(_), .. }
-                if *table == p && column == "d")
+                if *table == p && column.raw() == "d")
         });
         assert!(
             release < rename && rename < restore,
@@ -3992,7 +3990,7 @@ mod generated_surface_coverage {
         base.tables.insert(
             p.clone(),
             Table {
-                columns: [("d".to_owned(), d)].into(),
+                columns: [("d".into(), d)].into(),
                 ..Default::default()
             },
         );
@@ -4215,7 +4213,7 @@ mod generated_surface_coverage {
         desired.tables.insert(
             p.clone(),
             Table {
-                columns: [("d".to_owned(), d)].into(),
+                columns: [("d".into(), d)].into(),
                 ..Default::default()
             },
         );
@@ -5105,7 +5103,7 @@ fn two_reference_tables_referencing_each_other_plan_and_settle_in_the_differs_or
             mode: DataMode::Exact,
             rows: [(
                 RowKey::from("1"),
-                [(column.to_owned(), Value::Int(1))]
+                [(column.into(), Value::Int(1))]
                     .into_iter()
                     .collect::<Row>(),
             )]

@@ -18,9 +18,9 @@ pub const SET_EXPRESSION_ARRIVED_IN: i64 = 170_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dependence {
     /// The column the expression reads.
-    pub base: String,
+    pub base: pbps_model::ColumnName,
     /// The generated column computed from it.
-    pub generated: String,
+    pub generated: pbps_model::ColumnName,
     /// The input is `NOT NULL` with no default and no identity, and no
     /// enabled row-level `BEFORE INSERT` trigger on the table could fill it:
     /// while it stands, a row inserted without it is refused (#1397). Where a
@@ -89,8 +89,8 @@ pub async fn dependences(conn: &mut Conn, table: &TableName) -> Result<Vec<Depen
         };
         let (strict, triggered) = (flag("strict")?, flag("triggered")?);
         out.push(Dependence {
-            base: text("base")?,
-            generated: text("generated")?,
+            base: text("base")?.into(),
+            generated: text("generated")?.into(),
             base_required: strict && !triggered,
             filled_by_trigger: strict && triggered,
         });

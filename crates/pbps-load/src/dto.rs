@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 use serde_saphyr::Spanned;
 use std::collections::BTreeMap;
 
-use pbps_model::ReferentialAction;
+use pbps_model::{ColumnName, ReferentialAction};
 
 /// Which kind of declaration a file holds.
 ///
@@ -287,7 +287,7 @@ pub struct ModuleDto {
 pub struct SystemTimeDto {
     /// The period's start and end columns, in that order, each declared
     /// under `columns:` as `datetime2(p)`, not nullable.
-    pub period: [String; 2],
+    pub period: [ColumnName; 2],
 
     /// Both period columns `HIDDEN`, left out of `SELECT *`.
     #[serde(default)]
@@ -335,12 +335,12 @@ pub struct TableDto {
 
     /// `IndexMap` preserves the declaration order in the document, which decides
     /// the column layout of `CREATE TABLE`.
-    pub columns: IndexMap<String, ColumnDto>,
+    pub columns: IndexMap<ColumnName, ColumnDto>,
 
     /// SQL Server computed columns: `{expression: "a * 2", persisted: true}`.
     /// No type: the engine infers it (#1174).
     #[serde(default)]
-    pub computed: BTreeMap<String, ComputedDto>,
+    pub computed: BTreeMap<ColumnName, ComputedDto>,
 
     #[serde(default)]
     pub primary_key: Option<PrimaryKeyDto>,
@@ -537,7 +537,7 @@ pub struct DataDto {
     /// is why an integer key (`1:`) works: the primary-key column's declared
     /// type is what says how to render it, and it says so in one place
     /// (`pbps_model::RowKey`).
-    pub rows: BTreeMap<String, BTreeMap<String, ValueDto>>,
+    pub rows: BTreeMap<String, BTreeMap<ColumnName, ValueDto>>,
 }
 
 /// One cell, as written: `null`, a boolean, an integer, or text. A decimal
@@ -632,7 +632,7 @@ pub struct ColumnDto {
     /// One-shot intent, as for [`TableDto::renamed_from`].
     #[serde(default)]
     #[schemars(with = "Option<String>")]
-    pub renamed_from: Option<Spanned<String>>,
+    pub renamed_from: Option<Spanned<ColumnName>>,
 }
 
 /// A primary key may be written as a bare column list, leaving the name to the
@@ -644,7 +644,7 @@ pub struct ColumnDto {
 #[derive(Debug, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum PrimaryKeyDto {
-    Columns(Vec<String>),
+    Columns(Vec<ColumnName>),
     Spec(PrimaryKeySpecDto),
 }
 
@@ -656,7 +656,7 @@ pub enum PrimaryKeyDto {
 pub struct PrimaryKeySpecDto {
     #[serde(default)]
     pub name: Option<String>,
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnName>,
     #[serde(default)]
     #[schemars(with = "BTreeMap<String, StorageValueDto>")]
     pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
@@ -668,7 +668,7 @@ pub struct PrimaryKeySpecDto {
 #[derive(Debug, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum UniqueDto {
-    Columns(Vec<String>),
+    Columns(Vec<ColumnName>),
     Spec(UniqueSpecDto),
 }
 
@@ -692,7 +692,7 @@ macro_rules! list_or_spec {
                         mut seq: A,
                     ) -> Result<$dto, A::Error> {
                         let mut columns = Vec::new();
-                        while let Some(column) = seq.next_element::<String>()? {
+                        while let Some(column) = seq.next_element::<ColumnName>()? {
                             columns.push(column);
                         }
                         Ok($dto::Columns(columns))
@@ -807,7 +807,7 @@ pub struct PartitionEntryDto {
     /// parent: a default, a NOT NULL (#1578). Never a type, which is the
     /// parent's.
     #[serde(default)]
-    pub columns: BTreeMap<String, PartitionColumnDto>,
+    pub columns: BTreeMap<ColumnName, PartitionColumnDto>,
     /// The partition's own persistence, as a table's (#1580): the parent
     /// has none to give it.
     #[serde(default)]
@@ -1004,7 +1004,7 @@ impl<'de> serde::Deserialize<'de> for ListValueDto {
 #[derive(Debug, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum PartitionByDto {
-    Range(Vec<String>),
+    Range(Vec<ColumnName>),
     Strategy(PartitionStrategyDto),
 }
 
@@ -1026,9 +1026,9 @@ pub enum PartitionByDto {
 ]))]
 pub struct PartitionStrategyDto {
     #[serde(default)]
-    pub list: Option<Vec<String>>,
+    pub list: Option<Vec<ColumnName>>,
     #[serde(default)]
-    pub hash: Option<Vec<String>>,
+    pub hash: Option<Vec<ColumnName>>,
 }
 
 impl<'de> serde::Deserialize<'de> for PartitionByDto {
@@ -1074,7 +1074,7 @@ list_or_spec!(
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UniqueSpecDto {
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnName>,
     #[serde(default)]
     #[schemars(with = "BTreeMap<String, StorageValueDto>")]
     pub storage_parameters: BTreeMap<String, Spanned<StorageValueDto>>,
@@ -1131,7 +1131,7 @@ pub enum ReplicaIdentityDto {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForeignKeyDto {
-    pub columns: Vec<String>,
+    pub columns: Vec<ColumnName>,
 
     /// `dbo.region(region_id)` or `dbo.region(a, b)`.
     #[schemars(with = "String")]
@@ -1281,7 +1281,7 @@ pub struct IndexDto {
     pub keys: Vec<Spanned<IndexKeyDto>>,
 
     #[serde(default)]
-    pub include: Vec<String>,
+    pub include: Vec<ColumnName>,
 
     #[serde(default)]
     pub unique: bool,
@@ -1314,7 +1314,7 @@ pub struct IndexDto {
 pub struct IndexKeyDto {
     /// A column of the table.
     #[serde(default)]
-    pub column: Option<String>,
+    pub column: Option<ColumnName>,
     /// An expression over the table's columns, kept verbatim.
     #[serde(default)]
     pub expression: Option<String>,

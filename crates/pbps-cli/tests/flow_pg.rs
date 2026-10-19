@@ -1163,11 +1163,17 @@ CREATE EVENT TRIGGER replace_part ON ddl_command_end WHEN TAG IN ('{tag}') EXECU
         let recorded = &checkpoint.schema.tables[&"app.u".parse().unwrap()];
         if index {
             assert_eq!(
-                recorded.indexes["ix"].columns[0].key.column(),
+                recorded.indexes["ix"].columns[0]
+                    .key
+                    .column()
+                    .map(pbps_model::ColumnName::raw),
                 Some("other")
             );
         } else {
-            assert_eq!(recorded.unique["uq"].columns, ["other"]);
+            assert_eq!(
+                recorded.unique["uq"].columns,
+                [pbps_model::ColumnName::from("other")]
+            );
         }
         // An unchanged bad checkpoint is still not the CREATE's declaration.
         let still_bad = approved_apply(&d, connection, &plan, &["--staged", "--resume"]);
@@ -1426,7 +1432,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             pbps_model::Change::AlterColumnType { column, .. } => {
                 assert_eq!(c["lock"], "AccessExclusiveLock");
                 assert_eq!(c["blocks"], "reads and writes");
-                match column.name.as_str() {
+                match column.name.raw() {
                     "i" => {
                         assert_eq!(c["rewrite"]["value"], "yes");
                         assert_eq!(c["reads"]["value"], "every_row");
@@ -1442,7 +1448,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
                     "v" => assert_eq!(c["rows"]["status"], "never_analyzed"),
                     name => panic!("unexpected column {name}"),
                 }
-                if column.name != "v" {
+                if column.name != "v".into() {
                     assert_eq!(c["rows"]["status"], "estimated");
                     assert_eq!(c["rows"]["count"], 3);
                 }
@@ -1590,7 +1596,7 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
             let c = &costs[i];
             assert_eq!(c["change_index"], i);
             if let Change::AlterColumnType { column, .. } = &p.change
-                && column.name == "amount"
+                && column.name == "amount".into()
             {
                 assert_eq!(c["rewrite"]["value"], "unknown", "{report:#}");
                 assert!(c["rewrite"]["reason"].as_str().unwrap().contains("index"));
@@ -1598,7 +1604,7 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
                 verified += 1;
             }
             if let Change::AlterColumnNullability { column, .. } = &p.change
-                && column.name == "required"
+                && column.name == "required".into()
             {
                 // The renamed CHECK is replaced after tightening. Its old
                 // catalog definition is gone before the statement (479).
@@ -1607,7 +1613,7 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
                 verified += 1;
             }
             if let Change::AlterColumnType { column, .. } = &p.change
-                && column.name == "plain"
+                && column.name == "plain".into()
             {
                 assert_eq!(c["rewrite"]["value"], "yes");
                 assert_eq!(c["reads"]["value"], "every_row");
@@ -18038,7 +18044,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "t"),
                 operation: RowOperation::Update {
-                    columns: [column.to_owned()].into(),
+                    columns: [pbps_model::ColumnName::from(column)].into(),
                 },
             };
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
@@ -18062,7 +18068,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
         assert_eq!(rows[0].try_get::<i64>("n").unwrap(), Some(1));
         let write = RowWrite {
             table: pbps_model::TableName::new("app", "t"),
-            operation: RowOperation::Update { columns: ["audit".to_owned()].into() },
+            operation: RowOperation::Update { columns: ["audit".into()].into() },
         };
         conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let checked = pbps_pg::data_triggers::prepare(&mut conn, &[write], &Default::default(), &Default::default()).await;
@@ -18072,7 +18078,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
         // the row statement the widener is gone and `size` is not touched.
         let write = RowWrite {
             table: pbps_model::TableName::new("app", "t"),
-            operation: RowOperation::Update { columns: ["audit".to_owned()].into() },
+            operation: RowOperation::Update { columns: ["audit".into()].into() },
         };
         let removed = pbps_pg::data_triggers::Dropped {
             modules: [pbps_model::ModuleId::Trigger {
@@ -18966,7 +18972,7 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
         "CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$",
     );
     let update = |columns: &[&str]| RowOperation::Update {
-        columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+        columns: columns.iter().map(|c| (*c).into()).collect(),
     };
     // Every case declares `{s}.p`, writes it, and puts one trigger somewhere a
     // referential action may or may not reach. `p` always keeps the same shape
@@ -19366,7 +19372,7 @@ fn a_cascade_reached_table_is_held_until_the_write_finishes() {
         let dialect = pbps_pg::Postgres::new();
         let write = RowWrite {
             table: pbps_model::TableName::new("app", "p"),
-            operation: RowOperation::Update { columns: ["ukey".to_owned()].into() },
+            operation: RowOperation::Update { columns: ["ukey".into()].into() },
         };
         writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let guard = pbps_pg::data_triggers::prepare(&mut writer, std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
@@ -19596,7 +19602,7 @@ fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "p"),
                 operation: RowOperation::Update {
-                    columns: ["ukey".to_owned()].into(),
+                    columns: ["ukey".into()].into(),
                 },
             };
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
@@ -19714,7 +19720,7 @@ fn referential_action_locks(admin: &str) {
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "p"),
                 operation: RowOperation::Update {
-                    columns: ["id".to_owned()].into(),
+                    columns: ["id".into()].into(),
                 },
             };
             let guard = pbps_pg::data_triggers::prepare(
@@ -19771,7 +19777,7 @@ fn referential_action_locks(admin: &str) {
             let direct = RowWrite {
                 table: pbps_model::TableName::new("app", "c"),
                 operation: RowOperation::Update {
-                    columns: ["id".to_owned()].into(),
+                    columns: ["id".into()].into(),
                 },
             };
             let refused = pbps_pg::data_triggers::prepare(
@@ -19952,7 +19958,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "p"),
                 operation: RowOperation::Update {
-                    columns: ["ukey".to_owned()].into(),
+                    columns: ["ukey".into()].into(),
                 },
             };
             let key = Dropped {
@@ -20221,7 +20227,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "p"),
                 operation: RowOperation::Update {
-                    columns: ["ukey".to_owned()].into(),
+                    columns: ["ukey".into()].into(),
                 },
             };
             // Both baselines are recorded while `rewrite` is the only trigger
@@ -20382,7 +20388,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
                 operation,
             };
             let updates = write(RowOperation::Update {
-                columns: ["ukey".to_owned()].into(),
+                columns: ["ukey".into()].into(),
             });
             for (label, write, refused) in [
                 ("the event the rule is on", updates.clone(), true),

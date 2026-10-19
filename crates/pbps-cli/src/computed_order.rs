@@ -84,7 +84,12 @@ pub(crate) fn spellings(cs: &ChangeSet, edges: &[ExpressionEdge]) -> BTreeSet<St
     for e in edges {
         object(&e.from, &mut out);
         object(&e.to, &mut out);
-        out.extend(e.from_column.iter().chain(&e.to_column).cloned());
+        out.extend(
+            e.from_column
+                .iter()
+                .chain(&e.to_column)
+                .map(|c| c.raw().to_owned()),
+        );
     }
     for p in &cs.changes {
         match &p.change {
@@ -96,19 +101,19 @@ pub(crate) fn spellings(cs: &ChangeSet, edges: &[ExpressionEdge]) -> BTreeSet<St
                 table, from, to, ..
             } => {
                 object(table, &mut out);
-                out.insert(from.clone());
-                out.insert(to.clone());
+                out.insert(from.raw().to_owned());
+                out.insert(to.raw().to_owned());
             }
             Change::DropColumn { column, .. }
             | Change::AlterColumnType { column, .. }
             | Change::AlterColumnNullability { column, .. } => {
                 object(&column.table, &mut out);
-                out.insert(column.name.clone());
+                out.insert(column.name.raw().to_owned());
             }
             Change::AddComputedColumn { table, name, .. }
             | Change::DropComputedColumn { table, name, .. } => {
                 object(table, &mut out);
-                out.insert(name.clone());
+                out.insert(name.raw().to_owned());
             }
             Change::DropTable { name, .. } => object(name, &mut out),
             Change::AlterModule { id, .. } | Change::DropModule { id, .. } => {
@@ -133,7 +138,7 @@ fn catalog_table(names: &PlanNames<'_>, table: &TableName, at: usize) -> TableNa
 fn input_change(
     change: &Change,
     names: &PlanNames<'_>,
-) -> Option<(TableName, String, &'static str)> {
+) -> Option<(TableName, pbps_model::ColumnName, &'static str)> {
     let (uid, what) = if let Change::RenameColumn { uid, .. } = change {
         (uid, "renames")
     } else if let Change::DropColumn { uid, .. } = change {
@@ -148,7 +153,7 @@ fn input_change(
     let (owner, column) = names.column_at(uid, At::Start)?;
     Some((
         names.table_at(owner, At::Start)?.clone(),
-        column.into(),
+        column.clone(),
         what,
     ))
 }
@@ -165,8 +170,8 @@ pub(crate) fn order_by_edges(
 ) -> Result<usize, String> {
     let names = PlanNames::of(&cs.changes, ids).map_err(|e| e.to_string())?;
     // A computed column by its catalog table and name.
-    let mut dropped: Vec<(TableName, String)> = Vec::new();
-    let mut added: Vec<(TableName, String)> = Vec::new();
+    let mut dropped: Vec<(TableName, pbps_model::ColumnName)> = Vec::new();
+    let mut added: Vec<(TableName, pbps_model::ColumnName)> = Vec::new();
     let mut tables_dropped: Vec<TableName> = Vec::new();
     let mut modules_dropped: Vec<TableName> = Vec::new();
     for (at, p) in cs.changes.iter().enumerate() {
@@ -183,13 +188,15 @@ pub(crate) fn order_by_edges(
             modules_dropped.push(id.object_name());
         }
     }
-    let is = |list: &[(TableName, String)], table: &TableName, column: &str| {
+    let is = |list: &[(TableName, pbps_model::ColumnName)],
+              table: &TableName,
+              column: &pbps_model::ColumnName| {
         list.iter()
-            .any(|(t, c)| alike.object(t, table) && alike.same(c, column))
+            .any(|(t, c)| alike.object(t, table) && alike.same(c.raw(), column.raw()))
     };
     let table_gone = |table: &TableName| tables_dropped.iter().any(|t| alike.object(t, table));
     // There before the plan and there throughout.
-    let standing = |table: &TableName, column: &str| {
+    let standing = |table: &TableName, column: &pbps_model::ColumnName| {
         !table_gone(table) && !is(&dropped, table, column) && !is(&added, table, column)
     };
     let computed_edges = || edges.iter().filter(|e| e.from_column.is_some());
@@ -198,12 +205,13 @@ pub(crate) fn order_by_edges(
     for (at, p) in cs.changes.iter().enumerate() {
         if let Some((table, column, what)) = input_change(&p.change, &names) {
             for e in computed_edges() {
-                let computed = e.from_column.as_deref().unwrap_or_default();
+                let computed = e.from_column.as_ref().expect("computed edge has a column");
                 if alike.object(&e.from, &table)
                     && alike.object(&e.to, &table)
                     && e.to_column
-                        .as_deref()
-                        .is_some_and(|c| alike.same(c, &column))
+                        .as_ref()
+                        .map(pbps_model::ColumnName::raw)
+                        .is_some_and(|c| alike.same(c, column.raw()))
                     && standing(&table, computed)
                 {
                     refused.push(format!(
@@ -211,7 +219,9 @@ pub(crate) fn order_by_edges(
                          and SQL Server refuses that while the computed column stands. Drop the \
                          computed column, or change its expression, in a plan of its own first, \
                          then this one.",
-                        e.from.shown()
+                        e.from.shown(),
+                        computed = computed.shown(),
+                        column = column.shown(),
                     ));
                 }
             }
@@ -225,7 +235,7 @@ pub(crate) fn order_by_edges(
         };
         if let Some((function, what)) = module {
             for e in computed_edges() {
-                let computed = e.from_column.as_deref().unwrap_or_default();
+                let computed = e.from_column.as_ref().expect("computed edge has a column");
                 // Dropped, for good or to add again, the column is out of the
                 // way first: the function's drop is moved after it below, and
                 // its alter runs in class 14, after the drop's class 2.
@@ -235,7 +245,8 @@ pub(crate) fn order_by_edges(
                          and SQL Server refuses that while the column calls it. Apply the \
                          function change and the computed column change in separate plans.",
                         e.from.shown(),
-                        function = function.shown()
+                        function = function.shown(),
+                        computed = computed.shown(),
                     ));
                 }
             }
@@ -246,7 +257,10 @@ pub(crate) fn order_by_edges(
                 if e.from_column.is_none()
                     && e.from_schema_bound
                     && alike.object(&e.to, &table)
-                    && e.to_column.as_deref().is_some_and(|c| alike.same(c, name))
+                    && e.to_column
+                        .as_ref()
+                        .map(pbps_model::ColumnName::raw)
+                        .is_some_and(|c| alike.same(c, name.raw()))
                     && !modules_dropped.iter().any(|m| alike.object(m, &e.from))
                 {
                     refused.push(format!(
@@ -255,7 +269,8 @@ pub(crate) fn order_by_edges(
                          SCHEMABINDING, in a plan of its own first, then this one.",
                         e.from.shown(),
                         e.from.shown(),
-                        table = table.shown()
+                        table = table.shown(),
+                        name = name.shown(),
                     ));
                 }
             }
@@ -298,12 +313,12 @@ fn functions_changed(cs: &ChangeSet) -> Vec<(TableName, &'static str)> {
 /// its expression calls.
 struct AddedCall {
     table: TableName,
-    column: String,
+    column: pbps_model::ColumnName,
     names: Vec<(String, String)>,
     /// The table's columns a call can be a method of, when the computed
     /// column is added: the declared ones, since a column the plan drops is
     /// gone first and one it adds comes first, of a type with methods.
-    receivers: Vec<String>,
+    receivers: Vec<pbps_model::ColumnName>,
 }
 
 /// The types SQL Server gives methods, which a call `column.method()` binds
@@ -313,7 +328,7 @@ struct AddedCall {
 const METHOD_TYPES: [&str; 4] = ["geography", "geometry", "hierarchyid", "xml"];
 
 /// `table`'s columns of a type with methods.
-fn method_receivers(table: &pbps_model::Table) -> Vec<String> {
+fn method_receivers(table: &pbps_model::Table) -> Vec<pbps_model::ColumnName> {
     table
         .columns
         .iter()
@@ -390,7 +405,11 @@ pub(crate) fn added_call_spellings(
             out.insert(schema);
             out.insert(name);
         }
-        out.extend(call.receivers);
+        out.extend(
+            call.receivers
+                .into_iter()
+                .map(pbps_model::ColumnName::into_raw),
+        );
     }
     out
 }
@@ -427,7 +446,7 @@ pub(crate) fn refuse_added_calls(
     } in added_calls(cs, declared, dialect)
     {
         for (schema, name) in &names {
-            let a_method = receivers.iter().any(|c| alike.same(schema, c));
+            let a_method = receivers.iter().any(|c| alike.same(schema, c.raw()));
             for (function, what) in &functions {
                 if *what == "drops" && a_method {
                     continue;
@@ -438,6 +457,7 @@ pub(crate) fn refuse_added_calls(
                          under the database's collation, and this plan {what} it. Apply the \
                          function change and the computed column change in separate plans.",
                         table = table.shown(),
+                        column = column.shown(),
                         function = function.shown()
                     ));
                 }
@@ -492,7 +512,7 @@ fn waits_for(
                     && e.from_schema_bound
                     && alike.object(&e.from, &id.object_name())
                     && alike.object(&e.to, &table)
-                    && e.to_column.as_deref().is_some_and(|x| alike.same(x, name))
+                    && e.to_column.as_ref().map(pbps_model::ColumnName::raw).is_some_and(|x| alike.same(x, name.raw()))
             }))
         });
     }
@@ -506,9 +526,9 @@ fn waits_for(
             if alike.object(&catalog_table(names, t, position), &table)
                 && edges.iter().any(|e| {
                     alike.object(&e.from, &table)
-                        && e.from_column.as_deref().is_some_and(|f| alike.same(f, computed))
+                        && e.from_column.as_ref().map(pbps_model::ColumnName::raw).is_some_and(|f| alike.same(f, computed.raw()))
                         && alike.object(&e.to, &table)
-                        && e.to_column.as_deref().is_some_and(|x| alike.same(x, &read))
+                        && e.to_column.as_ref().map(pbps_model::ColumnName::raw).is_some_and(|x| alike.same(x, read.raw()))
                 }))
         });
     }
@@ -523,7 +543,7 @@ fn waits_for(
                 && alike.object(&e.to, &object)
                 && (matches!(change, Change::DropComputedColumn { table, name, .. }
                     if alike.object(&catalog_table(names, table, position), &e.from)
-                        && e.from_column.as_deref().is_some_and(|c| alike.same(c, name)))
+                        && e.from_column.as_ref().map(pbps_model::ColumnName::raw).is_some_and(|c| alike.same(c, name.raw())))
                     || matches!(change, Change::DropTable { name, .. } if alike.object(name, &e.from)))
         })
     };
@@ -635,6 +655,40 @@ mod tests {
         s.parse().unwrap()
     }
 
+    #[test]
+    fn computed_column_catalog_matches_use_raw_names_and_refusals_show_once() {
+        const RAW: &str = "computed\n\r\u{1b}[31m\\\u{200b}名前";
+        const SHOWN: &str = r"computed\n\r\u{1b}[31m\\\u{200b}名前";
+        let edges = [computed_edge("dbo.t", RAW, "dbo.f", None)];
+        let refused = order(vec![drop_module("dbo.f")], &edges).unwrap_err();
+        assert_eq!(
+            refused,
+            format!(
+                "computed column dbo.t.{SHOWN} calls `dbo.f`, which this plan drops, and SQL Server refuses that while the column calls it. Apply the function change and the computed column change in separate plans."
+            )
+        );
+        assert!(
+            order(
+                vec![drop_module("dbo.f"), drop_computed("dbo.t", RAW)],
+                &edges
+            )
+            .is_ok()
+        );
+        assert!(
+            order(
+                vec![drop_module("dbo.f"), drop_computed("dbo.t", SHOWN)],
+                &edges
+            )
+            .is_err()
+        );
+        let cs = ChangeSet {
+            changes: vec![drop_module("dbo.f")],
+        };
+        let names = spellings(&cs, &edges);
+        assert!(names.contains(RAW));
+        assert!(!names.contains(SHOWN));
+    }
+
     fn computed_edge(
         table: &str,
         computed: &str,
@@ -737,10 +791,9 @@ mod tests {
             let mut table = pbps_model::Table::default();
             for column in columns {
                 let (name, ty) = column.split_once(' ').unwrap_or((column, "int"));
-                table.columns.insert(
-                    name.to_owned(),
-                    pbps_model::Column::new(ty.parse().unwrap()),
-                );
+                table
+                    .columns
+                    .insert(name.into(), pbps_model::Column::new(ty.parse().unwrap()));
             }
             let mut schema = pbps_model::Schema::default();
             schema.tables.insert(t("dbo.t"), table);

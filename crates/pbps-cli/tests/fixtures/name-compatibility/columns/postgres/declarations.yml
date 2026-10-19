@@ -1,0 +1,57 @@
+table: app.child
+
+columns:
+  "col\nline\r\e[31m\x9B\\‮名前":
+    type: int
+    nullable: false
+  "col\nline\r\e[31m\x9B\\‮名前payload":
+    type: int
+    nullable: false
+    default: "2"
+
+primary_key:
+  name: pk_child
+  columns: ["col\nline\r\e[31m\x9B\\‮名前"]
+
+unique:
+  uq_child: ["col\nline\r\e[31m\x9B\\‮名前payload"]
+
+foreign_keys:
+  fk_parent:
+    columns: ["col\nline\r\e[31m\x9B\\‮名前payload"]
+    references: "app.parent(col\nline\r\e[31m\x9B\\‮名前)"
+
+indexes:
+  ix_child:
+    columns: ["col\nline\r\e[31m\x9B\\‮名前"]
+    include: ["col\nline\r\e[31m\x9B\\‮名前payload"]
+
+data:
+  mode: ensure
+  rows:
+    "1": {"col\nline\r\e[31m\x9B\\‮名前payload": 2}
+
+---
+table: app.parent
+
+columns:
+  "col\nline\r\e[31m\x9B\\‮名前":
+    type: int
+    nullable: false
+
+---
+table: app.partitioned
+
+columns:
+  "col\nline\r\e[31m\x9B\\‮名前":
+    type: int
+    nullable: false
+
+partition_by: ["col\nline\r\e[31m\x9B\\‮名前"]
+
+partitions:
+  part:
+    from: ["1"]
+    to: ["9"]
+    columns:
+      "col\nline\r\e[31m\x9B\\‮名前": {default: "3", nullable: false}

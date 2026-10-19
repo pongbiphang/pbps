@@ -1,3 +1,4 @@
+use pbps_model::ColumnName;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -100,11 +101,11 @@ pub(crate) struct TableChanges<'a> {
 
 #[derive(Clone, Copy)]
 enum OwnEffect<'a> {
-    Drop(&'a str),
-    Default(&'a str, bool),
+    Drop(&'a ColumnName),
+    Default(&'a ColumnName, bool),
     // Relaxing the parent changes no kept local NOT NULL, but it still
     // owns that field between statements (DEC-1581.1).
-    NotNull(&'a str, Option<bool>),
+    NotNull(&'a ColumnName, Option<bool>),
 }
 
 #[derive(Clone)]
@@ -122,11 +123,11 @@ impl Default for Own<'_> {
     }
 }
 
-pub(crate) struct OwnExpected<'a>(pub(super) BTreeMap<String, Own<'a>>);
+pub(crate) struct OwnExpected<'a>(pub(super) BTreeMap<ColumnName, Own<'a>>);
 
 pub(crate) struct OwnNames<'a, 'p> {
     pub(crate) parent: Option<&'a TableName>,
-    pub(crate) handoff: Option<&'a BTreeMap<String, Option<String>>>,
+    pub(crate) handoff: Option<&'a BTreeMap<ColumnName, Option<ColumnName>>>,
     pub(crate) undo: &'a Renames,
     pub(crate) index: &'a pbps_model::plan_names::PlanNames<'p>,
 }
@@ -388,7 +389,7 @@ impl<'a> TableChanges<'a> {
             undo,
             index,
         } = names;
-        let mut kept: BTreeMap<String, Own<'b>> = was
+        let mut kept: BTreeMap<ColumnName, Own<'b>> = was
             .partition_of
             .iter()
             .flat_map(|of| &of.columns)
@@ -430,7 +431,7 @@ impl<'a> TableChanges<'a> {
             )
             .collect();
         effects.sort_by_key(|(at, _)| *at);
-        let column_at = |column: &str, at, boundary| {
+        let column_at = |column: &ColumnName, at, boundary| {
             use pbps_model::plan_names::{At, Holder};
             let Some(parent) = parent else {
                 return Some(column.to_owned());
@@ -516,7 +517,7 @@ impl<'a> TableChanges<'a> {
         now_name: &TableName,
         was: &'b Table,
         whole: bool,
-        key_handoff: Option<&BTreeMap<String, Option<String>>>,
+        key_handoff: Option<&BTreeMap<ColumnName, Option<ColumnName>>>,
     ) -> Expected<'b> {
         let identity = Req::at_close(
             was.replica_identity.as_ref(),
@@ -547,10 +548,7 @@ impl<'a> TableChanges<'a> {
         // baseline brought forward with the unrewound later read (#1692).
         if let (Some(by), Some(net)) = (&mut place.1, key_handoff) {
             for column in &mut by.columns {
-                if let Some((now, _)) = net
-                    .iter()
-                    .find(|(_, was)| was.as_deref() == Some(column.as_str()))
-                {
+                if let Some((now, _)) = net.iter().find(|(_, was)| was.as_ref() == Some(column)) {
                     *column = now.clone();
                 }
             }
@@ -581,13 +579,13 @@ pub(super) fn place(table: &Table) -> Place {
 /// under the final spelling. A vacated name never lends its old occupant's
 /// requirements to a replacement (DECISIONS 474).
 pub(crate) struct ColumnChanges<'a> {
-    changed: BTreeMap<TableName, BTreeMap<String, BTreeSet<pbps_model::ColumnField>>>,
+    changed: BTreeMap<TableName, BTreeMap<ColumnName, BTreeSet<pbps_model::ColumnField>>>,
     pub(super) presence: BTreeMap<pbps_model::ColumnRef, pbps_model::Presence>,
     pub(super) promises:
         BTreeMap<(pbps_model::ColumnRef, pbps_model::ColumnField), pbps_model::ColumnPromise<'a>>,
-    pub(crate) renamed: BTreeMap<TableName, BTreeMap<String, String>>,
-    pub(crate) handoffs: BTreeMap<TableName, BTreeMap<String, Option<String>>>,
-    pub(crate) partition_handoffs: BTreeMap<TableName, BTreeMap<String, Option<String>>>,
+    pub(crate) renamed: BTreeMap<TableName, BTreeMap<ColumnName, ColumnName>>,
+    pub(crate) handoffs: BTreeMap<TableName, BTreeMap<ColumnName, Option<ColumnName>>>,
+    pub(crate) partition_handoffs: BTreeMap<TableName, BTreeMap<ColumnName, Option<ColumnName>>>,
     replaced: BTreeSet<pbps_model::ColumnRef>,
 }
 
@@ -625,7 +623,7 @@ impl<'a> ColumnChanges<'a> {
             let (owner, name) = names.column_at(uid, At::End)?;
             Some(names.table_at(owner, At::End)?.column(name))
         };
-        let mut touched_names: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
+        let mut touched_names: BTreeMap<TableName, BTreeSet<ColumnName>> = BTreeMap::new();
         for (i, p) in changes.changes.iter().enumerate() {
             for (column, field) in p.change.columns_redefined() {
                 let final_column = if field == ColumnField::Whole {
@@ -723,7 +721,7 @@ impl<'a> ColumnChanges<'a> {
 
 /// Derivation chooses the observed identity; comparison only checks fields.
 pub(super) struct ColumnObservation<'a> {
-    pub(super) name: String,
+    pub(super) name: ColumnName,
     pub(super) present: Req<bool>,
     pub(super) fields: Option<ColumnExpected<'a>>,
 }
@@ -754,7 +752,7 @@ impl ColumnChanges<'_> {
             }
         }
         let empty = BTreeSet::new();
-        let changed = |column: &String| {
+        let changed = |column: &ColumnName| {
             self.changed
                 .get(name)
                 .and_then(|c| c.get(column))

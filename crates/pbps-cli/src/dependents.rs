@@ -787,7 +787,7 @@ fn restoration_of(
                     let (to, fallback, origin) = if let Some(of) = &t.partition_of {
                         (
                             of.columns.get(column).and_then(|own| own.default.clone()),
-                            parent_default(declared, table, column),
+                            parent_default(declared, table, column.raw()),
                             Some(of.parent.clone()),
                         )
                     } else {
@@ -2109,7 +2109,7 @@ fn after_their_parents_defaults(
                             partition = partition.shown()
                         )
                     })?;
-                let fallback = parent_default(declared, &partition, &column.name);
+                let fallback = parent_default(declared, &partition, column.name.raw());
                 cs.changes.insert(
                     i + 1,
                     planned(
@@ -2413,7 +2413,7 @@ fn split_moving_defaults(cs: &mut ChangeSet, declared: &Schema, dialect: &dyn Di
                         column: column.clone(),
                         from: None,
                         to: Some(to),
-                        fallback: parent_default(declared, name, column),
+                        fallback: parent_default(declared, name, column.raw()),
                     },
                 ));
             }
@@ -3346,7 +3346,7 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
         let mut out: Vec<(Step, String, String)> = table
             .columns
             .iter()
-            .filter_map(|(n, c)| column(name, n, c))
+            .filter_map(|(n, c)| column(name, n.raw(), c))
             .map(at(AT_CREATE))
             .collect();
         // A partition's own defaults, as a column's (#1578).
@@ -3397,7 +3397,7 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
             name,
             column: c,
             ..
-        } => column(table, name, c).into_iter().collect(),
+        } => column(table, name.raw(), c).into_iter().collect(),
         Change::AlterColumnDefault {
             column,
             to: Some(to),
@@ -3731,7 +3731,9 @@ fn cycle(
             .into();
     };
     let column = match &cs.changes[at].change {
-        Change::AddColumn { table, name, .. } => format!("{table}.{name}", table = table.shown()),
+        Change::AddColumn { table, name, .. } => {
+            format!("{table}.{name}", table = table.shown(), name = name.shown(),)
+        }
         Change::CreateTable { name, table, .. } => table
             .columns
             .iter()
@@ -3744,7 +3746,13 @@ fn cycle(
             })
             .map_or_else(
                 || name.shown().to_string(),
-                |(column, _)| format!("{name}.{column}", name = name.shown()),
+                |(column, _)| {
+                    format!(
+                        "{name}.{column}",
+                        name = name.shown(),
+                        column = column.shown(),
+                    )
+                },
             ),
         other => format!("{other:?}"),
     };
@@ -3810,7 +3818,7 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Parti
         Change::AddColumn { table, name, .. } => match later {
             Change::CreateModule { id, module } | Change::AlterModule { id, module } => partitions
                 .holding(table)
-                .any(|t| reads_column(id, &module.definition, t, name)),
+                .any(|t| reads_column(id, &module.definition, t, name.raw())),
             Change::DropModule { .. } | Change::DeleteRow { .. } => false,
             Change::InsertRow {
                 table: t,
@@ -3819,7 +3827,7 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Parti
                 ..
             } => {
                 partitions.holding(table).any(|p| p == t)
-                    && (row.get(name).is_some() || defaults.contains_key(name))
+                    && (row.get(name.raw()).is_some() || defaults.contains_key(name))
             }
             Change::UpdateRow {
                 table: t,
@@ -3830,7 +3838,7 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Parti
                 partitions.holding(table).any(|p| p == t)
                     && (columns.contains_key(name) || unchanged.contains_key(name))
             }
-            other => names_column(other, table, name, partitions),
+            other => names_column(other, table, name.raw(), partitions),
         },
         Change::CreateModule { id: before, .. } | Change::AlterModule { id: before, .. } => {
             match later {
@@ -3931,7 +3939,7 @@ fn names_table(id: &ModuleId, definition: &str, table: &TableName) -> bool {
 #[allow(clippy::wildcard_enum_match_arm)]
 fn names_column(change: &Change, table: &TableName, column: &str, partitions: &Partitions) -> bool {
     let named = |text: &str| pbps_pg::generated::may_read(text, column);
-    let listed = |columns: &[String]| columns.iter().any(|c| c == column);
+    let listed = |columns: &[pbps_model::ColumnName]| columns.iter().any(|c| c.raw() == column);
     if let Change::AddForeignKey { constraint, .. } = change
         && &constraint.references_table == table
         && listed(&constraint.references_columns)
@@ -3947,7 +3955,10 @@ fn names_column(change: &Change, table: &TableName, column: &str, partitions: &P
         && &of.parent == table
         && (of.columns.contains_key(column)
             || t.indexes.values().any(|index| {
-                index.columns.iter().any(|c| c.key.column() == Some(column))
+                index
+                    .columns
+                    .iter()
+                    .any(|c| c.key.column().is_some_and(|c| c.raw() == column))
                     || listed(&index.include)
                     || named(&index_text(index))
             })
@@ -3974,22 +3985,25 @@ fn names_column(change: &Change, table: &TableName, column: &str, partitions: &P
     match change {
         Change::AddColumn { column: c, .. } => column_expression(c).is_some_and(named),
         Change::AlterColumnDefault { column: c, to, .. } => {
-            c.name == column || to.as_deref().is_some_and(named)
+            c.name == column.into() || to.as_deref().is_some_and(named)
         }
         Change::SetPartitionDefault {
             column: c,
             to,
             fallback,
             ..
-        } => c == column || to.as_deref().or(fallback.as_deref()).is_some_and(named),
-        Change::SetPartitionNotNull { column: c, .. } => c == column,
-        Change::AlterColumnExpression { column: c, to, .. } => c.name == column || named(to),
+        } => c.raw() == column || to.as_deref().or(fallback.as_deref()).is_some_and(named),
+        Change::SetPartitionNotNull { column: c, .. } => c.raw() == column,
+        Change::AlterColumnExpression { column: c, to, .. } => c.name == column.into() || named(to),
         Change::AlterColumnType { column: c, .. }
         | Change::AlterColumnNullability { column: c, .. }
-        | Change::SetColumnDeprecated { column: c, .. } => c.name == column,
+        | Change::SetColumnDeprecated { column: c, .. } => c.name == column.into(),
         Change::AddCheck { constraint, .. } => named(&constraint.expression),
         Change::AddIndex { index, .. } => {
-            index.columns.iter().any(|c| c.key.column() == Some(column))
+            index
+                .columns
+                .iter()
+                .any(|c| c.key.column().is_some_and(|c| c.raw() == column))
                 || listed(&index.include)
                 || named(&index_text(index))
         }
@@ -4220,7 +4234,7 @@ mod tests {
                 Change::DropCheck { name, .. } => format!("drop check {name}"),
                 Change::AddCheck { name, .. } => format!("add check {name}"),
                 Change::AlterColumnDefault { column, to, .. } => {
-                    format!("default {} -> {to:?}", column.name)
+                    format!("default {} -> {to:?}", column.name.shown())
                 }
                 Change::SetPartitionDefault {
                     table,
@@ -4230,7 +4244,8 @@ mod tests {
                     ..
                 } => format!(
                     "default {}.{column} -> {to:?} else {fallback:?}",
-                    table.name
+                    table.name,
+                    column = column.shown(),
                 ),
                 other => format!("{other:?}"),
             })
@@ -4445,7 +4460,7 @@ mod tests {
             table: t.clone(),
             name: format!("uq_{column}"),
             constraint: pbps_model::UniqueConstraint {
-                columns: vec![column.to_owned()],
+                columns: vec![column.into()],
                 storage_parameters: Default::default(),
             },
             clustered: false,
@@ -4471,8 +4486,10 @@ mod tests {
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let rebuilt = at(&|c| matches!(c, Change::AlterModule { .. }));
         let expression = at(&|c| matches!(c, Change::AlterColumnExpression { .. }));
-        let generated_add = at(&|c| matches!(c, Change::AddColumn { name, .. } if name == "g"));
-        let plain_add = at(&|c| matches!(c, Change::AddColumn { name, .. } if name == "plain"));
+        let generated_add =
+            at(&|c| matches!(c, Change::AddColumn { name, .. } if name.raw() == "g"));
+        let plain_add =
+            at(&|c| matches!(c, Change::AddColumn { name, .. } if name.raw() == "plain"));
         assert!(rebuilt < expression, "{:?}", names(&cs));
         assert!(
             rebuilt < generated_add && plain_add < rebuilt,
@@ -4481,7 +4498,7 @@ mod tests {
         );
         let tightened = |name: &str| {
             at(
-                &|c| matches!(c, Change::AlterColumnNullability { column, .. } if column.name == name),
+                &|c| matches!(c, Change::AlterColumnNullability { column, .. } if column.name == name.into()),
             )
         };
         assert!(expression < tightened("n"), "{:?}", names(&cs));
@@ -4518,7 +4535,7 @@ mod tests {
         let at = |name: &str| {
             cs.changes
                 .iter()
-                .position(|p| matches!(&p.change, Change::AlterColumnExpression { column, .. } if column.name == name))
+                .position(|p| matches!(&p.change, Change::AlterColumnExpression { column, .. } if column.name == name.into()))
                 .unwrap()
         };
         let rebuilt = cs
@@ -4706,7 +4723,7 @@ mod tests {
                 parent: n.clone(),
                 bound: pbps_model::PartitionBound::Default,
                 columns: [(
-                    column.to_owned(),
+                    column.into(),
                     pbps_model::PartitionColumn {
                         default: Some("7".into()),
                         not_null: false,
@@ -4753,7 +4770,7 @@ mod tests {
             });
             let own = cs.changes.iter().position(|p| {
                 matches!(&p.change, Change::SetPartitionDefault { table, column: c, to: Some(to), .. }
-                    if *table == p1 && c == "v" && to == "7")
+                    if *table == p1 && c.raw() == "v" && to == "7")
             });
             if again {
                 assert_eq!(own, parents.map(|i| i + 1), "{:?}", cs.changes);
@@ -4769,7 +4786,7 @@ mod tests {
             identity_key: false,
             key: pbps_model::RowKey::from("1"),
             row: pbps_model::Row::default(),
-            defaults: BTreeMap::from([("v".to_owned(), "app.f(1)".to_owned())]),
+            defaults: BTreeMap::from([("v".into(), "app.f(1)".to_owned())]),
             types: BTreeMap::new(),
         };
         let mut cs = plan(vec![create.clone(), insert, alter(&s, "app.f(integer)")]);
@@ -4959,8 +4976,9 @@ mod tests {
             assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
             let at =
                 |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
-            let column =
-                |name: &str| at(&|c| matches!(c, Change::AddColumn { name: n, .. } if n == name));
+            let column = |name: &str| {
+                at(&|c| matches!(c, Change::AddColumn { name: n, .. } if n.raw() == name))
+            };
             let created = |name: &str| {
                 at(&|c| matches!(c, Change::CreateModule { id: i, .. } if *i == id(name)))
             };
@@ -5018,7 +5036,13 @@ mod tests {
         #[allow(clippy::wildcard_enum_match_arm)]
         match &cs.changes[table_at("app.n")].change {
             Change::CreateTable { table, .. } => {
-                assert_eq!(table.columns.keys().collect::<Vec<_>>(), ["id", "g"]);
+                assert_eq!(
+                    table.columns.keys().cloned().collect::<Vec<_>>(),
+                    [
+                        pbps_model::ColumnName::from("id"),
+                        pbps_model::ColumnName::from("g")
+                    ]
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -5037,7 +5061,7 @@ mod tests {
                     parent: "app.ev".parse().unwrap(),
                     bound: pbps_model::PartitionBound::Default,
                     columns: [(
-                        "v".to_owned(),
+                        "v".into(),
                         pbps_model::PartitionColumn {
                             default: Some(default.to_owned()),
                             not_null: false,
@@ -5107,14 +5131,14 @@ mod tests {
                 },
                 columns: [
                     (
-                        "v".to_owned(),
+                        "v".into(),
                         pbps_model::PartitionColumn {
                             default: Some("app.f(1)".to_owned()),
                             not_null: false,
                         },
                     ),
                     (
-                        "w".to_owned(),
+                        "w".into(),
                         pbps_model::PartitionColumn {
                             default: default.map(str::to_owned),
                             not_null: true,
@@ -5196,12 +5220,7 @@ mod tests {
             unreachable!()
         };
         assert_eq!(
-            (
-                table.raw().to_string(),
-                column.as_str(),
-                from,
-                to.as_deref()
-            ),
+            (table.raw().to_string(), column.raw(), from, to.as_deref()),
             ("app.ev_1".to_owned(), "v", &None, Some("app.f(1)")),
         );
         // The create no longer carries the default it hands over; a default
@@ -5254,7 +5273,7 @@ mod tests {
                         to: vec![pbps_model::BoundDatum::Value("2".into())],
                     },
                     columns: [(
-                        "extra".to_owned(),
+                        "extra".into(),
                         pbps_model::PartitionColumn {
                             default: Some("9".to_owned()),
                             not_null: true,
@@ -5320,11 +5339,11 @@ mod tests {
         );
         let own_default = at(&|c| {
             matches!(c, Change::SetPartitionDefault { table, column, to, .. }
-            if table.name == "ev_1" && column == "extra" && to.as_deref() == Some("9"))
+            if table.name == "ev_1" && column.raw() == "extra" && to.as_deref() == Some("9"))
         });
         let own_not_null = at(&|c| {
             matches!(c, Change::SetPartitionNotNull { table, column, not_null: true, .. }
-            if table.name == "ev_1" && column == "extra")
+            if table.name == "ev_1" && column.raw() == "extra")
         });
         assert!(create < tightened && tightened < function, "{order:?}");
         assert!(function < added, "{order:?}");
@@ -5436,7 +5455,7 @@ mod tests {
                     parent: "app.ev".parse().unwrap(),
                     bound: pbps_model::PartitionBound::Default,
                     columns: [(
-                        column.to_owned(),
+                        column.into(),
                         pbps_model::PartitionColumn {
                             default: Some("5".to_owned()),
                             not_null: false,
@@ -5647,7 +5666,7 @@ mod tests {
                     parent: "app.other".parse().unwrap(),
                     bound: pbps_model::PartitionBound::Default,
                     columns: [(
-                        "id".to_owned(),
+                        "id".into(),
                         pbps_model::PartitionColumn {
                             default: Some("'app.n'::regclass::oid::integer".into()),
                             not_null: false,
@@ -6041,12 +6060,12 @@ mod tests {
             key: pbps_model::RowKey::from("1"),
             row: pbps_model::Row(
                 row.iter()
-                    .map(|c| ((*c).to_owned(), pbps_model::Value::Null))
+                    .map(|c| ((*c).into(), pbps_model::Value::Null))
                     .collect(),
             ),
             defaults: defaults
                 .iter()
-                .map(|c| ((*c).to_owned(), "app.f(1)".to_owned()))
+                .map(|c| ((*c).into(), "app.f(1)".to_owned()))
                 .collect(),
             types: BTreeMap::new(),
         };
@@ -6099,7 +6118,7 @@ mod tests {
                 identity_key: false,
                 key: pbps_model::RowKey::from("1"),
                 row: pbps_model::Row::default(),
-                defaults: BTreeMap::from([("n".to_owned(), "app.f(1)".to_owned())]),
+                defaults: BTreeMap::from([("n".into(), "app.f(1)".to_owned())]),
                 types: BTreeMap::new(),
             },
             add_check("ck"),
@@ -6132,7 +6151,7 @@ mod tests {
             row: pbps_model::Row::default(),
             defaults: defaults
                 .iter()
-                .map(|c| ((*c).to_owned(), "app.f(1)".to_owned()))
+                .map(|c| ((*c).into(), "app.f(1)".to_owned()))
                 .collect(),
             types: BTreeMap::new(),
         };
@@ -6141,7 +6160,7 @@ mod tests {
             key_column: "id".into(),
             key: pbps_model::RowKey::from("1"),
             columns: BTreeMap::from([(
-                column.to_owned(),
+                column.into(),
                 (pbps_model::Cell::Value(pbps_model::Value::Null), after),
             )]),
             unchanged: BTreeMap::new(),
@@ -6872,7 +6891,7 @@ mod tests {
                     .iter()
                     .map(|(c, d)| {
                         (
-                            (*c).to_owned(),
+                            (*c).into(),
                             pbps_model::PartitionColumn {
                                 default: Some((*d).to_owned()),
                                 not_null: false,
@@ -7445,7 +7464,7 @@ mod tests {
                 columns: own
                     .map(|default| {
                         (
-                            "n".to_owned(),
+                            "n".into(),
                             pbps_model::PartitionColumn {
                                 default: Some(default.to_owned()),
                                 not_null: false,
@@ -8274,7 +8293,7 @@ mod tests {
                     parent: "app.ev".parse().unwrap(),
                     bound: pbps_model::PartitionBound::Default,
                     columns: [(
-                        "n".to_owned(),
+                        "n".into(),
                         pbps_model::PartitionColumn {
                             default: Some(named.to_owned()),
                             not_null: false,

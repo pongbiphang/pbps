@@ -29,6 +29,7 @@
 //! - **Reducing a `decimal`'s scale** rounds rather than failing, so no count
 //!   exists to take. The `narrowing` class still flags it for approval.
 
+use pbps_model::ColumnName;
 use pbps_model::ValueSource;
 use std::cell::LazyCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -172,7 +173,7 @@ type Moved = RowWrites<String, AssignmentMetadata>;
 /// saved plans; typed omissions also distinguish NULL from engine assignment.
 #[derive(Debug, Default)]
 struct AssignmentMetadata {
-    untyped_defaults: BTreeMap<RowKey, BTreeSet<String>>,
+    untyped_defaults: BTreeMap<RowKey, BTreeSet<ColumnName>>,
 }
 
 /// The SQL the engine compares a written cell by: the literal, or `None` for
@@ -548,7 +549,7 @@ fn build<'v, 'p: 'v>(
                 out.push(null_probe(
                     column,
                     &qualified(&stored.table)?,
-                    &quote(&stored.name)?,
+                    &quote(stored.name.raw())?,
                 )?);
             }
             // A `timestamp` on either end is asked nothing. The engine refuses
@@ -626,7 +627,7 @@ fn build<'v, 'p: 'v>(
                     m.deleted.iter().map(|k| literal(k.as_str())).collect();
                 sql.push_str(&format!(
                     " AND {} NOT IN ({})",
-                    quote(&key_column.name)?,
+                    quote(key_column.name.raw())?,
                     gone.into_iter().collect::<Vec<_>>().join(", ")
                 ));
             }
@@ -981,7 +982,7 @@ fn delete_probe(
     // statement.
     let parent_row = format!(
         "SELECT 1 FROM {parent} AS p WHERE p.{} = @key",
-        quote(&stored.name)?
+        quote(stored.name.raw())?
     );
     let mut exclusions = Vec::new();
     let mut arrivals = Vec::new();
@@ -992,11 +993,12 @@ fn delete_probe(
         let Some(stored_key) = names.view().column(&child.column(&moved.key_column)) else {
             continue;
         };
-        let key_sql = format!("ch.{}", quote(&stored_key.name)?);
+        let key_sql = format!("ch.{}", quote(stored_key.name.raw())?);
         let child_sql = qualified(&stored_child)?;
         // A column the database does not have yet cannot be in a foreign
         // key it has; one it names differently is asked about by that name.
-        let stored_name = |column: &str| names.view().column(&child.column(column)).map(|r| r.name);
+        let stored_name =
+            |column: &ColumnName| names.view().column(&child.column(column)).map(|r| r.name);
         // A quoted identifier may itself hold a `'` — `quote` escapes `]`,
         // not quotes — so every fragment carrying one into the generated
         // statement goes through `literal`, never straight into the outer
@@ -1042,7 +1044,7 @@ fn delete_probe(
                 .get(row_key)
                 .into_iter()
                 .flatten()
-                .filter_map(|c| stored_name(c))
+                .filter_map(&stored_name)
                 .collect();
             let after = side(&comparable, &untyped);
             let row = literal(row_key.as_str());
@@ -1075,7 +1077,7 @@ fn delete_probe(
             terms.push(guarded(&uncomparable, &comparable, &arrived));
         }
         for (row_key, columns) in &moved.inserted {
-            let known: BTreeMap<String, String> = columns
+            let known: BTreeMap<ColumnName, String> = columns
                 .iter()
                 .filter_map(|(column, sql)| stored_name(column).map(|name| (name, sql.clone())))
                 .collect();
@@ -1092,7 +1094,7 @@ fn delete_probe(
                 .get(row_key)
                 .into_iter()
                 .flatten()
-                .filter_map(|c| stored_name(c))
+                .filter_map(&stored_name)
                 .collect();
             let arrived = format!(
                 "{} + {} + {}",
@@ -1345,7 +1347,7 @@ fn tuple(child_side: &str) -> String {
 /// A row's tuple as the plan writes it: the value written in each column
 /// the plan spells, the stored cell in any other. Spelled for the engine as
 /// a `CASE` over the key's columns.
-fn side(values: &BTreeMap<String, String>, untyped_defaults: &BTreeSet<String>) -> String {
+fn side(values: &BTreeMap<ColumnName, String>, untyped_defaults: &BTreeSet<ColumnName>) -> String {
     let whens: Vec<String> = values
         .iter()
         .map(|(name, sql)| {
@@ -1363,15 +1365,15 @@ fn side(values: &BTreeMap<String, String>, untyped_defaults: &BTreeSet<String>) 
                     WHEN TYPE_NAME(c.system_type_id) IN (N'decimal',N'numeric') THEN N'(' + CONVERT(nvarchar(10),c.precision) + N',' + CONVERT(nvarchar(10),c.scale) + N')' \
                     WHEN TYPE_NAME(c.system_type_id) IN (N'time',N'datetime2',N'datetimeoffset') THEN N'(' + CONVERT(nvarchar(10),c.scale) + N')' ELSE N'' END + {}", literal(&format!(", {sql})")))
             };
-            format!("WHEN {} THEN {value}", literal(name))
+            format!("WHEN {} THEN {value}", literal(name.raw()))
         })
         .collect();
     format!("CASE c.name {} ELSE {STORED} END", whens.join(" "))
 }
 
 /// Whether the key spans one of `columns`.
-fn touches<'a>(columns: impl Iterator<Item = &'a String>) -> String {
-    let list: Vec<String> = columns.map(|c| literal(c)).collect();
+fn touches<'a>(columns: impl Iterator<Item = &'a ColumnName>) -> String {
+    let list: Vec<String> = columns.map(|c| literal(c.raw())).collect();
     if list.is_empty() {
         return "1 = 0".to_owned();
     }
@@ -1382,8 +1384,8 @@ fn touches<'a>(columns: impl Iterator<Item = &'a String>) -> String {
 }
 
 /// Whether the key spans a column outside `columns`.
-fn reaches_beyond<'a>(columns: impl Iterator<Item = &'a String>) -> String {
-    let list: Vec<String> = columns.map(|c| literal(c)).collect();
+fn reaches_beyond<'a>(columns: impl Iterator<Item = &'a ColumnName>) -> String {
+    let list: Vec<String> = columns.map(|c| literal(c.raw())).collect();
     if list.is_empty() {
         return "1 = 1".to_owned();
     }
@@ -1397,14 +1399,14 @@ fn reaches_beyond<'a>(columns: impl Iterator<Item = &'a String>) -> String {
 /// does not touch — and nothing, so the row stays counted, for a key it sets
 /// a cell of to something the probe cannot compare.
 fn guarded(
-    uncomparable: &BTreeSet<String>,
-    comparable: &BTreeMap<String, String>,
+    uncomparable: &BTreeSet<ColumnName>,
+    comparable: &BTreeMap<ColumnName, String>,
     fragment: &str,
 ) -> String {
     let mut arms = String::new();
     // SQL Server exempts a tuple with any NULL from its foreign key. This
     // decides the tuple even when another cell cannot be evaluated yet.
-    let nulls: Vec<&String> = comparable
+    let nulls: Vec<&ColumnName> = comparable
         .iter()
         .filter(|(_, sql)| is_null_default(sql))
         .map(|(column, _)| column)
@@ -1453,8 +1455,9 @@ fn unprobeable_probe(
         Removal::Table => return Ok(None),
         Removal::Keys(keys) => keys,
     };
-    let stored_name = |column: &str| names.view().column(&child.column(column)).map(|r| r.name);
-    let mut rows: BTreeMap<&RowKey, BTreeSet<String>> = BTreeMap::new();
+    let stored_name =
+        |column: &ColumnName| names.view().column(&child.column(column)).map(|r| r.name);
+    let mut rows: BTreeMap<&RowKey, BTreeSet<ColumnName>> = BTreeMap::new();
     let mut described = Vec::new();
     for (column, keys) in &moved.unprobeable {
         let Some(name) = stored_name(column) else {
@@ -1467,7 +1470,9 @@ fn unprobeable_probe(
         described.push(format!(
             "{column} (row{} {})",
             if listed.len() == 1 { "" } else { "s" },
-            listed.join(", ")
+            listed.join(", "),
+            // raw: whole-message escaped until #2084 step 5.
+            column = column.raw(),
         ));
     }
     if rows.is_empty() {
@@ -1482,7 +1487,7 @@ fn unprobeable_probe(
                 "(c.name IN ({}) AND NOT {})",
                 columns
                     .iter()
-                    .map(|c| literal(c))
+                    .map(|c| literal(c.raw()))
                     .collect::<Vec<_>>()
                     .join(", "),
                 touches(
@@ -1591,7 +1596,7 @@ enum Applies<'a> {
 fn rows_after(
     names: &AsStored,
     table: &TableName,
-    columns: &[String],
+    columns: &[ColumnName],
     moved: Option<&Moved>,
     alias: &str,
     applies: &Applies<'_>,
@@ -1647,7 +1652,7 @@ fn rows_after(
     // One column of one branch: named `k{i}` so the derived table has names
     // whichever branch comes first, and converted to the type the column will
     // have when the constraint is created, where this plan decides that type.
-    let projected = |i: usize, column: &String, sql: String| {
+    let projected = |i: usize, column: &ColumnName, sql: String| {
         let ty = names.types.get(&table.column(column));
         // `TRY_CONVERT`, not `CONVERT`: a stored value the new type cannot
         // hold makes `CONVERT` throw, and a probe that throws is reported as
@@ -1691,7 +1696,7 @@ fn rows_after(
         // (DECISIONS 171).
         let mut selected: Vec<String> = Vec::new();
         for (i, (stored_column, column)) in stored_columns.iter().zip(columns).enumerate() {
-            let read = format!("{alias}.{}", quote(stored_column)?);
+            let read = format!("{alias}.{}", quote(stored_column.raw())?);
             match names.reads(&table.column(column), read) {
                 Some(read) => selected.push(projected(i, column, read)?),
                 None => {
@@ -1732,7 +1737,7 @@ fn rows_after(
                     };
                     where_clauses.push(format!(
                         "{alias}.{} NOT IN ({})",
-                        quote(&key_column.name)?,
+                        quote(key_column.name.raw())?,
                         gone.into_iter().collect::<Vec<_>>().join(", ")
                     ));
                 }
@@ -1746,7 +1751,7 @@ fn rows_after(
 
     // And what this plan puts there.
     if let Some(m) = moved {
-        let unprobeable = |column: &String, key: &RowKey| {
+        let unprobeable = |column: &ColumnName, key: &RowKey| {
             m.unprobeable
                 .get(column)
                 .is_some_and(|rows| rows.contains(key))
@@ -1755,7 +1760,7 @@ fn rows_after(
         // absence is the signal. The key column is excluded because an insert
         // always spells it — including into an identity key, which ADR-0004
         // writes under `SET IDENTITY_INSERT`, so its value *is* known.
-        let engine_assigned = |column: &String, key: &RowKey| {
+        let engine_assigned = |column: &ColumnName, key: &RowKey| {
             column != &m.key_column
                 && m.typed
                     .get(key)
@@ -1818,7 +1823,7 @@ fn rows_after(
                     None => values.push(projected(
                         i,
                         column,
-                        format!("{alias}.{}", quote(stored_column)?),
+                        format!("{alias}.{}", quote(stored_column.raw())?),
                     )?),
                 }
             }
@@ -1827,7 +1832,7 @@ fn rows_after(
                     "SELECT {} FROM {} AS {alias} WHERE {alias}.{} = {}",
                     values.join(", "),
                     qualified(&stored)?,
-                    quote(&key_column.name)?,
+                    quote(key_column.name.raw())?,
                     literal(key.as_str())
                 ));
             }
@@ -1897,7 +1902,7 @@ fn keys(n: usize) -> Vec<String> {
 fn collated_keys(
     names: &AsStored,
     table: &TableName,
-    columns: &[String],
+    columns: &[ColumnName],
 ) -> Result<Vec<String>, DialectError> {
     columns
         .iter()
@@ -1917,8 +1922,8 @@ fn collated_keys(
 fn stored_columns(
     names: &AsStored,
     table: &TableName,
-    columns: &[String],
-) -> Option<(TableName, Vec<String>)> {
+    columns: &[ColumnName],
+) -> Option<(TableName, Vec<ColumnName>)> {
     let stored = names.view().table(table)?;
     let columns = columns
         .iter()
@@ -2010,7 +2015,7 @@ fn conversion_probe(
     probes_capacity: bool,
 ) -> Result<Vec<Probe>, DialectError> {
     let table = qualified(&stored.table)?;
-    let col = quote(&stored.name)?;
+    let col = quote(stored.name.raw())?;
     let from = types::normalize(from)?;
     let to = types::normalize(to)?;
     let character_to_non_unicode = matches!(
@@ -3133,7 +3138,7 @@ mod tests {
             key_column: "code".into(),
             key: RowKey::from("fixed"),
             columns: [(
-                "region_id".to_owned(),
+                "region_id".into(),
                 (
                     Cell::Value(Value::Text("nowhere".into())),
                     Cell::Value(Value::Text("eu".into())),
@@ -3153,7 +3158,7 @@ mod tests {
             key_column: "code".into(),
             key: RowKey::from("untouched"),
             columns: [(
-                "note".to_owned(),
+                "note".into(),
                 (
                     Cell::Value(Value::Text("a".into())),
                     Cell::Value(Value::Text("b".into())),
@@ -3200,7 +3205,7 @@ mod tests {
     fn a_foreign_key_to_a_table_this_plan_creates_names_its_literal_columns() {
         let mut region = pbps_model::Table::default();
         region.columns.insert(
-            "region_id".to_owned(),
+            "region_id".into(),
             pbps_model::Column::new(ty("varchar(10)")),
         );
         let sql = probes(&plan(vec![
@@ -3260,7 +3265,7 @@ mod tests {
                 key_column: "code".into(),
                 key: RowKey::from("moved"),
                 columns: [(
-                    "region_id".to_owned(),
+                    "region_id".into(),
                     (
                         Cell::Value(Value::Text("1".into())),
                         Cell::Value(Value::Text("01".into())),
@@ -3311,7 +3316,7 @@ mod tests {
         // A default the probe cannot evaluate: not a literal (117).
         code.value_source =
             pbps_model::ValueSource::Default("CONVERT(varchar(10), 'eu')".to_owned());
-        region.columns.insert("region_id".to_owned(), code);
+        region.columns.insert("region_id".into(), code);
         let sql = probes(&plan(vec![
             Change::CreateTable {
                 uid: uid("t_bbbbbb"),
@@ -3328,12 +3333,9 @@ mod tests {
                 identity_key: false,
                 key: RowKey::from("r1"),
                 row: pbps_model::Row::default(),
-                defaults: [(
-                    "region_id".to_owned(),
-                    "CONVERT(varchar(10), 'eu')".to_owned(),
-                )]
-                .into_iter()
-                .collect(),
+                defaults: [("region_id".into(), "CONVERT(varchar(10), 'eu')".to_owned())]
+                    .into_iter()
+                    .collect(),
                 types: Default::default(),
             },
             fk(),
@@ -3361,14 +3363,11 @@ mod tests {
         let mut code = pbps_model::Column::new(ty("varchar(10)"));
         code.value_source =
             pbps_model::ValueSource::Default("CONVERT(varchar(10), 'eu')".to_owned());
-        region.columns.insert("region_id".to_owned(), code);
+        region.columns.insert("region_id".into(), code);
         let spelled = pbps_model::Row(
-            [(
-                "region_id".to_owned(),
-                pbps_model::Value::Text("us".to_owned()),
-            )]
-            .into_iter()
-            .collect(),
+            [("region_id".into(), pbps_model::Value::Text("us".to_owned()))]
+                .into_iter()
+                .collect(),
         );
         let sql = probes(&plan(vec![
             Change::CreateTable {
@@ -3395,12 +3394,9 @@ mod tests {
                 identity_key: false,
                 key: RowKey::from("r1"),
                 row: pbps_model::Row::default(),
-                defaults: [(
-                    "region_id".to_owned(),
-                    "CONVERT(varchar(10), 'eu')".to_owned(),
-                )]
-                .into_iter()
-                .collect(),
+                defaults: [("region_id".into(), "CONVERT(varchar(10), 'eu')".to_owned())]
+                    .into_iter()
+                    .collect(),
                 types: Default::default(),
             },
             fk(),
@@ -3479,7 +3475,7 @@ mod tests {
                 columns: columns
                     .iter()
                     .map(|c| pbps_model::IndexColumn {
-                        key: pbps_model::IndexKey::Column((*c).to_owned()),
+                        key: pbps_model::IndexKey::Column((*c).into()),
                         descending: false,
                         opclass: None,
                     })
@@ -3737,7 +3733,7 @@ mod tests {
                 key_column: "code".into(),
                 key: RowKey::from("old"),
                 columns: [(
-                    "amount".to_owned(),
+                    "amount".into(),
                     (
                         pbps_model::Cell::Value(pbps_model::Value::Int(1)),
                         pbps_model::Cell::Value(pbps_model::Value::Int(2)),
@@ -3774,9 +3770,7 @@ mod tests {
             key: RowKey::from(key),
             row: pbps_model::Row::default(),
             defaults: Default::default(),
-            types: [("label".to_owned(), ty("nvarchar(50)"))]
-                .into_iter()
-                .collect(),
+            types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
         };
         let unique = Change::AddUnique {
             table: tname("dbo.setting"),
@@ -3843,9 +3837,7 @@ mod tests {
             key: RowKey::from(key),
             row: pbps_model::Row::default(),
             defaults: Default::default(),
-            types: [("label".to_owned(), ty("nvarchar(50)"))]
-                .into_iter()
-                .collect(),
+            types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
         };
         let fk = Change::AddForeignKey {
             table: tname("dbo.customer"),
@@ -4000,7 +3992,7 @@ mod tests {
     fn a_foreign_key_to_an_empty_new_parent_is_still_probed() {
         let mut region = pbps_model::Table::default();
         region.columns.insert(
-            "region_id".to_owned(),
+            "region_id".into(),
             pbps_model::Column::new(ty("varchar(10)")),
         );
         let sql = probes(&plan(vec![
@@ -4183,7 +4175,7 @@ mod tests {
             identity_key: false,
             key: RowKey::from("9"),
             row: pbps_model::Row::default(),
-            defaults: [("status_code".to_owned(), default.to_owned())]
+            defaults: [("status_code".into(), default.to_owned())]
                 .into_iter()
                 .collect(),
             types: Default::default(),
@@ -4264,7 +4256,7 @@ mod tests {
             key_column: "id".into(),
             key: RowKey::from("7"),
             columns: [(
-                "status_code".to_owned(),
+                "status_code".into(),
                 (
                     Cell::Value(pbps_model::Value::Text("new".into())),
                     Cell::Default("('old')".into()),
@@ -4297,7 +4289,7 @@ mod tests {
             key_column: "id".into(),
             key: key.clone(),
             columns: [(
-                "k".to_owned(),
+                "k".into(),
                 (
                     Cell::Value(Value::Null),
                     Cell::Default("-CAST('01' AS int)".into()),
@@ -4306,8 +4298,8 @@ mod tests {
             .into_iter()
             .collect(),
             unchanged: Default::default(),
-            types: [("k".to_owned(), ty("integer"))].into_iter().collect(),
-            after_types: [("k".to_owned(), ty("varchar(10)"))].into_iter().collect(),
+            types: [("k".into(), ty("integer"))].into_iter().collect(),
+            after_types: [("k".into(), ty("varchar(10)"))].into_iter().collect(),
             key_type: None,
         };
         let changes = plan(vec![update]);
@@ -4379,7 +4371,7 @@ mod tests {
                 .iter()
                 .map(|(c, v)| {
                     (
-                        (*c).to_owned(),
+                        (*c).into(),
                         (Cell::Value(Value::Null), Cell::Value(v.clone())),
                     )
                 })
@@ -4394,7 +4386,7 @@ mod tests {
                 key_column: "id".into(),
                 identity_key: false,
                 key: RowKey::from("5"),
-                row: [("grp".to_owned(), Value::Int(1))].into_iter().collect(),
+                row: [("grp".into(), Value::Int(1))].into_iter().collect(),
                 defaults: Default::default(),
                 types: Default::default(),
             },
@@ -4463,7 +4455,7 @@ mod tests {
                 key_column: "id".into(),
                 key: RowKey::from("7"),
                 columns: [(
-                    "status_code".to_owned(),
+                    "status_code".into(),
                     (
                         pbps_model::Cell::Value(pbps_model::Value::Text("old".into())),
                         pbps_model::Cell::Value(pbps_model::Value::Text("new".into())),
@@ -4531,7 +4523,7 @@ mod tests {
                 key_column: "id".into(),
                 key: RowKey::from("7"),
                 columns: [(
-                    "note".to_owned(),
+                    "note".into(),
                     (
                         pbps_model::Cell::Value(pbps_model::Value::Null),
                         pbps_model::Cell::Value(pbps_model::Value::Text("x".into())),
@@ -4782,7 +4774,7 @@ mod tests {
             identity_key: false,
             key: RowKey::from(key),
             row: pbps_model::Row(
-                [("id".to_owned(), pbps_model::Value::Int(id))]
+                [("id".into(), pbps_model::Value::Int(id))]
                     .into_iter()
                     .collect(),
             ),

@@ -198,7 +198,7 @@ pub async fn key_drop_blockers(
         retypes.push(Retyped {
             change_index: index,
             table: stored.table,
-            column: stored.name,
+            column: stored.name.into_raw(),
         });
     }
     if keys.is_empty() && retypes.is_empty() {
@@ -716,7 +716,7 @@ pub async fn rename_impact_reading(
             conn.query_with(by_table, &[table.as_str().into()]).await?
         }
         RenameTarget::Column(c) => {
-            conn.query_with(by_column, &[table.as_str().into(), c.name.as_str().into()])
+            conn.query_with(by_column, &[table.as_str().into(), c.name.raw().into()])
                 .await?
         }
     };
@@ -752,7 +752,7 @@ pub async fn rename_impact_reading(
         .await?
     {
         let definition: Option<&str> = opt(&row, "definition")?;
-        if mentions(definition.unwrap_or_default(), &column.name) {
+        if mentions(definition.unwrap_or_default(), column.name.raw()) {
             report.advisory.push(Referrer {
                 kind: "computed column".to_owned(),
                 name: format!(
@@ -771,7 +771,7 @@ pub async fn rename_impact_reading(
         .await?
     {
         let definition: Option<&str> = opt(&row, "definition")?;
-        if mentions(definition.unwrap_or_default(), &column.name) {
+        if mentions(definition.unwrap_or_default(), column.name.raw()) {
             report.advisory.push(Referrer {
                 kind: get::<&str>(&row, "kind")?.to_owned(),
                 name: get::<&str>(&row, "name")?.to_owned(),
@@ -786,7 +786,7 @@ pub async fn rename_impact_reading(
         .await?
     {
         let name = get::<&str>(&row, "name")?;
-        if name.contains(column.name.as_str()) {
+        if name.contains(column.name.raw()) {
             report.advisory.push(Referrer {
                 kind: get::<&str>(&row, "kind")?.to_owned(),
                 name: name.to_owned(),

@@ -96,7 +96,7 @@ pub struct Occupant {
     pub owner: Option<pbps_model::TableName>,
     /// The owner's column it belongs to, by the baseline's name: an owned
     /// sequence, or a column's default constraint.
-    pub column: Option<String>,
+    pub column: Option<pbps_model::ColumnName>,
 }
 
 /// The slots `address` takes, by the dialect's namespace answers: one, or

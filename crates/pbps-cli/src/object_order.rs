@@ -96,7 +96,7 @@ pub(crate) fn order_occupied_objects_under(
 }
 
 /// A column by its table and name.
-pub(crate) type Column = (TableName, String);
+pub(crate) type Column = (TableName, pbps_model::ColumnName);
 
 /// The columns whose names the database is asked about before column renames
 /// are ordered: each rename's source and target, on every table that renames
@@ -110,7 +110,7 @@ pub(crate) fn renamed_column_names(cs: &ChangeSet) -> Vec<Column> {
             *per_table.entry(table).or_default() += 1;
         }
     }
-    let mut out: Vec<(TableName, String)> = cs
+    let mut out: Vec<Column> = cs
         .changes
         .iter()
         .filter_map(|p| match &p.change {
@@ -290,7 +290,12 @@ fn addressed(change: &Change, table: &TableName) -> Change {
 type Seen = BTreeSet<(
     usize,
     BTreeSet<usize>,
-    Vec<(TableName, String, Option<TableName>, Option<String>)>,
+    Vec<(
+        TableName,
+        String,
+        Option<TableName>,
+        Option<pbps_model::ColumnName>,
+    )>,
 )>;
 
 struct Search<'c> {
@@ -639,7 +644,7 @@ mod tests {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, from, 0),
             from: name(from),
             to: name(to),
-            defaults: defaults.iter().map(|d| (*d).to_owned()).collect(),
+            defaults: defaults.iter().map(|d| (*d).into()).collect(),
         })
     }
 
@@ -657,7 +662,7 @@ mod tests {
             name: name(at),
             kind: kind.into(),
             parent: parent.map(name),
-            parent_column: column.map(str::to_owned),
+            parent_column: column.map(Into::into),
         }
     }
 
@@ -989,7 +994,11 @@ mod tests {
                     table, from, to, ..
                 } = &p.change
                 {
-                    Some((table.raw().to_string(), from.clone(), to.clone()))
+                    Some((
+                        table.raw().to_string(),
+                        from.raw().to_owned(),
+                        to.raw().to_owned(),
+                    ))
                 } else {
                     None
                 }
@@ -998,7 +1007,7 @@ mod tests {
     }
 
     fn column(table: &str, column: &str) -> Column {
-        (name(table), column.to_owned())
+        (name(table), column.into())
     }
 
     /// DEC-1366.3: which column names are one is the collation's. On

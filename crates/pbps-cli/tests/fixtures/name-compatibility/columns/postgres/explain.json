@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.0.0",
+  "command": "explain",
+  "result": "ok",
+  "findings": [
+    {
+      "id": "plan.risk",
+      "severity": "warning",
+      "message": "data-update: a reference row's current values are overwritten, and the plan does not record what they were (1 change(s))"
+    }
+  ],
+  "data": {
+    "applyable": true,
+    "dialect": "postgres",
+    "created_at": "2026-10-19T00:00:00Z",
+    "baseline": "column-name master fixture",
+    "mode": "transactional",
+    "checksum": "9347c4076b3ff54e8b2d57cc66b84a5648e8ebffda6f05a83b5242819b15389c",
+    "change_count": 5,
+    "table_count": 4,
+    "module_count": 0,
+    "role_count": 0,
+    "risks": [
+      {
+        "class": "data-update",
+        "why": "a reference row's current values are overwritten, and the plan does not record what they were",
+        "changes": [
+          "app.child  ~ row 1: col\nline\r\u001b[31m\\‮名前payload 1 -> 2"
+        ]
+      }
+    ],
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 9347c4076b3ff54e8b2d57cc66b84a5648e8ebffda6f05a83b5242819b15389c --allow data-update",
+    "probes": [
+      "foreign keys with incompatible collations for app.child.fk_parent",
+      "rows of app.partitioned inside the range of its new partition app.part: they are in its DEFAULT partition now, and the engine will not create a partition over them; move or delete them first, then plan again"
+    ],
+    "unchecked": [],
+    "statement_count": 9
+  }
+}

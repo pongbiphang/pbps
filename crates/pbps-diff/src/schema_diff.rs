@@ -21,6 +21,7 @@
 //! preview) or from querying the database itself (Phase 3's authoritative plan).
 //! This layer does not care which; it does the comparison and nothing else.
 
+use pbps_model::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::Dialect;
@@ -120,11 +121,11 @@ pub enum DiffError {
         "computed column {computed} may read `{column}`, which this plan {change}, and SQL \
          Server refuses that while the computed column stands. Drop the computed column, or \
          change its expression, in a plan of its own first, then this one.",
-        computed = .computed.shown(),
+        computed = .computed.shown(), column = .column.shown(),
     )]
     ComputedInputChanged {
         computed: ColumnRef,
-        column: String,
+        column: ColumnName,
         change: &'static str,
     },
 
@@ -277,12 +278,14 @@ pub enum DiffError {
         "{table} renames columns {} into each other's names in a cycle, and no order of those \
          renames is one the engine performs. Apply the revisions that form it in separate \
          deployments, or rename one of the columns through a temporary name first",
-        columns.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "),
+        columns.iter().map(|c| format!("`{c}`",
+            c = c.shown(),
+)).collect::<Vec<_>>().join(", "),
         table = .table.shown(),
     )]
     ColumnRenameCycle {
         table: TableName,
-        columns: BTreeSet<String>,
+        columns: BTreeSet<ColumnName>,
     },
 
     /// Table renames that each wait for a name another of them still holds,
@@ -334,21 +337,30 @@ pub enum DiffError {
          the baseline does not have, so the recorded data rows cannot be matched to the declared \
          ones. Restore the key on a column the table already has, or remove the block, apply \
          the key change, then declare the rows again",
+        table = .table.shown(), column = .column.shown(),
+    )]
+    DataBaselineKeyOnNewColumn {
+        table: TableName,
+        column: ColumnName,
+    },
+
+    #[error(
+        "{table} has a baseline primary key with {} columns ({:?}); pbps matches data rows only on a single-column key",
+        columns.len(),
+        // Debug already escaped the former Vec<String>; preserve that spelling.
+        columns.iter().map(ColumnName::raw).collect::<Vec<_>>(),
         table = .table.shown(),
     )]
-    DataBaselineKeyOnNewColumn { table: TableName, column: String },
-
-    #[error("{table} has a baseline primary key with {} columns ({columns:?}); pbps matches data rows only on a single-column key", columns.len(), table = .table.shown())]
     DataBaselineKeyNotSingle {
         table: TableName,
-        columns: Vec<String>,
+        columns: Vec<ColumnName>,
     },
 }
 
 enum BaselineDataKey<'a> {
     Absent,
-    Single(&'a str),
-    Multiple(&'a [String]),
+    Single(&'a ColumnName),
+    Multiple(&'a [ColumnName]),
 }
 
 impl<'a> BaselineDataKey<'a> {
@@ -705,7 +717,7 @@ pub(crate) fn diff_partial_rebuilding(
                         | ValueSource::Generated(_) => false,
                     });
                     for (key, row) in &data.rows {
-                        let (defaults, types) = omitted_defaults(&table, &pk.columns[0], row);
+                        let (defaults, types) = omitted_defaults(&table, pk.columns[0].raw(), row);
                         changes.push(Change::InsertRow {
                             table: name.clone(),
                             key_column: pk.columns[0].clone(),
@@ -1022,10 +1034,11 @@ pub(crate) fn diff_partial_rebuilding(
         // this same plan means the two sides know one column by two names.
         // The uid is what says they are the same column.
         let base_cols = columns_of(&index.base, base_name);
-        let base_name_of: BTreeMap<String, String> = columns_of(&index.declared, declared_name)
-            .iter()
-            .filter_map(|(uid, d)| base_cols.get(uid).map(|b| (d.name.clone(), b.name.clone())))
-            .collect();
+        let base_name_of: BTreeMap<ColumnName, ColumnName> =
+            columns_of(&index.declared, declared_name)
+                .iter()
+                .filter_map(|(uid, d)| base_cols.get(uid).map(|b| (d.name.clone(), b.name.clone())))
+                .collect();
         diff_data(
             declared_name,
             base_table,
@@ -1425,7 +1438,7 @@ pub(crate) fn diff_partial_rebuilding(
     // links it waits on; the chain's far end, whose target is free, goes
     // first. A cycle, two columns trading names, has no order an engine takes
     // without a temporary name, so the plan says so instead of emitting one.
-    let vacates: BTreeMap<(TableName, String), String> = planned
+    let vacates: BTreeMap<(TableName, ColumnName), ColumnName> = planned
         .iter()
         .filter_map(|p| {
             if let Change::RenameColumn {
@@ -1438,7 +1451,7 @@ pub(crate) fn diff_partial_rebuilding(
             }
         })
         .collect();
-    let mut cycles: BTreeSet<(TableName, BTreeSet<String>)> = BTreeSet::new();
+    let mut cycles: BTreeSet<(TableName, BTreeSet<ColumnName>)> = BTreeSet::new();
     for ((table, from), to) in &vacates {
         let mut path = vec![from.clone()];
         let mut next = to.clone();
@@ -1458,7 +1471,7 @@ pub(crate) fn diff_partial_rebuilding(
     // every exact one and only where it closes no cycle: on a case-sensitive
     // database `a -> B` beside `b -> A` is a valid pair, not a swap, and a
     // folded link must not hide an exact one it would loop through.
-    type Rename = (TableName, String);
+    type Rename = (TableName, ColumnName);
     let mut waits: BTreeMap<&Rename, BTreeSet<&Rename>> = vacates
         .iter()
         .map(|(rename, to)| {
@@ -1484,12 +1497,12 @@ pub(crate) fn diff_partial_rebuilding(
         false
     }
     for (rename, to) in &vacates {
-        let folded = crate::rename_order::case_folded(to);
+        let folded = crate::rename_order::case_folded(to.raw());
         for vacating in vacates.keys() {
             if vacating != rename
                 && vacating.0 == rename.0
                 && vacating.1 != *to
-                && crate::rename_order::case_folded(&vacating.1) == folded
+                && crate::rename_order::case_folded(vacating.1.raw()) == folded
                 && !reaches(&waits, vacating, rename)
             {
                 waits
@@ -1690,7 +1703,7 @@ pub(crate) fn diff_partial_rebuilding(
     // A parent's column default or NULL-ness this plan changes, which the
     // engine recurses into every partition: a partition's own on that
     // column is set after it, or the parent's would overwrite it (#1687).
-    let parent_moved: BTreeSet<(TableName, String)> = planned
+    let parent_moved: BTreeSet<(TableName, ColumnName)> = planned
         .iter()
         .filter_map(|p| {
             // A retype carries its NOT NULL change with it (#1692 review).
@@ -3030,7 +3043,7 @@ fn recreate_retyped_dependents(
             continue;
         };
         let before = renames.apply(old, old_name);
-        let key_column = |column: &str| {
+        let key_column = |column: &ColumnName| {
             retyped
                 .get(&name.column(column))
                 .is_some_and(|d| d.keys_and_indexes)
@@ -3040,7 +3053,7 @@ fn recreate_retyped_dependents(
             .iter()
             .any(|(c, d)| &c.table == name && d.filtered_indexes);
         if let (Some(key), Some(wanted)) = (&before.primary_key, &after.primary_key)
-            && key.columns.iter().any(|c| key_column(c))
+            && key.columns.iter().any(&key_column)
             && !changes
                 .iter()
                 .any(|c| matches!(c, Change::SetPrimaryKey { table, .. } if table == name))
@@ -3064,7 +3077,7 @@ fn recreate_retyped_dependents(
         for (n, key) in &before.unique {
             if after.unique.get(n) == Some(key)
                 && before.unique_is_clustered(n) == after.unique_is_clustered(n)
-                && key.columns.iter().any(|c| key_column(c))
+                && key.columns.iter().any(&key_column)
             {
                 changes.push(Change::DropUnique {
                     table: name.clone(),
@@ -3098,7 +3111,7 @@ fn recreate_retyped_dependents(
                     .columns
                     .iter()
                     .any(|c| c.key.column().is_some_and(key_column))
-                    || index.include.iter().any(|c| key_column(c))
+                    || index.include.iter().any(&key_column)
                     // An expression names its columns inside text this does
                     // not parse, so it is treated as a filter is: rebuilt
                     // wherever the dialect rebuilds filtered indexes
@@ -3155,22 +3168,22 @@ fn input_change<'a>(change: &'a Change, table: &TableName) -> Option<(&'a str, &
     if let Change::RenameColumn { table: t, from, .. } = change
         && t == table
     {
-        return Some((from, "renames"));
+        return Some((from.raw(), "renames"));
     }
     if let Change::DropColumn { column, .. } = change
         && column.table == *table
     {
-        return Some((&column.name, "drops"));
+        return Some((column.name.raw(), "drops"));
     }
     if let Change::AlterColumnType { column, .. } = change
         && column.table == *table
     {
-        return Some((&column.name, "retypes or recollates"));
+        return Some((column.name.raw(), "retypes or recollates"));
     }
     if let Change::AlterColumnNullability { column, .. } = change
         && column.table == *table
     {
-        return Some((&column.name, "changes the nullability of"));
+        return Some((column.name.raw(), "changes the nullability of"));
     }
     None
 }
@@ -3374,7 +3387,7 @@ fn detached_names(
     // parent's base reads `integer` back where its file says `int`. A
     // description is prose `diff` does not compare, and a connected base
     // never holds one, so it is not compared here either.
-    let columns = |t: &Table| -> Vec<(String, pbps_model::Column)> {
+    let columns = |t: &Table| -> Vec<(ColumnName, pbps_model::Column)> {
         t.columns
             .iter()
             .map(|(name, c)| {
@@ -3496,7 +3509,7 @@ fn detached_names(
 /// own, and its columns without a default where the parent's has one.
 struct Attached {
     table: Table,
-    defaultless: Vec<String>,
+    defaultless: Vec<ColumnName>,
     /// The table's indexes dropped before the attach: every one the engine
     /// could adopt but for the one left to it.
     displaced: Vec<String>,
@@ -3557,7 +3570,7 @@ fn attached(
     }
     // Types in the engine's spelling, as `diff_columns` compares them. A
     // default and NOT NULL may be its own, and are compared below.
-    let columns = |t: &Table| -> Vec<(String, pbps_model::Column)> {
+    let columns = |t: &Table| -> Vec<(ColumnName, pbps_model::Column)> {
         t.columns
             .iter()
             .map(|(name, c)| {
@@ -3636,9 +3649,9 @@ fn attached(
     };
     let (table_spelled, parent_spelled) = (spelled(table, base_name), spelled(parent, &of.parent));
     let (mine, theirs) = (columns(&table_spelled), columns(&parent_spelled));
-    let names = |c: &[(String, pbps_model::Column)]| {
+    let names = |c: &[(ColumnName, pbps_model::Column)]| {
         c.iter()
-            .map(|(n, _)| n.as_str())
+            .map(|(n, _)| n.raw())
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -3659,7 +3672,8 @@ fn attached(
             if a != b {
                 what.push(format!(
                     "its column `{name}` is not its parent's in type, collation, identity or \
-                     generation"
+                     generation",
+                    name = name.shown(),
                 ));
             } else if (match &a.value_source {
                 ValueSource::Generated(_) => true,
@@ -3677,7 +3691,8 @@ fn attached(
                 what.push(format!(
                     "its column `{name}` is generated, and in another schema than its parent \
                      the same expression may call another function; move the table to its \
-                     parent's schema first"
+                     parent's schema first",
+                    name = name.shown(),
                 ));
             }
         }
@@ -3690,7 +3705,8 @@ fn attached(
         };
         if c.nullable && !p.nullable {
             what.push(format!(
-                "its column `{name}` is nullable, and its parent's is NOT NULL"
+                "its column `{name}` is nullable, and its parent's is NOT NULL",
+                name = name.shown(),
             ));
         }
         let own = pbps_model::PartitionColumn {
@@ -3873,7 +3889,7 @@ fn attached(
     // refuses. Which comes first is the oid order no plan knows, so the
     // table's key or unique constraint such an index could take is dropped
     // before the attach, and the engine builds both clones (#1642 review).
-    let backing = |columns: &[String]| Index {
+    let backing = |columns: &[ColumnName]| Index {
         columns: columns
             .iter()
             .map(|c| pbps_model::IndexColumn {
@@ -3888,7 +3904,8 @@ fn attached(
         method: Default::default(),
         storage_parameters: Default::default(),
     };
-    let contested = |columns: &[String]| parents_indexes.values().any(|i| *i == backing(columns));
+    let contested =
+        |columns: &[ColumnName]| parents_indexes.values().any(|i| *i == backing(columns));
     let mut released = Vec::new();
     if let Some(key) = &table.primary_key
         && contested(&key.columns)
@@ -4547,7 +4564,7 @@ fn refuse_parent_index(
     };
     // A key holds every partition-key column, or the engine refuses it, as
     // it does a unique index (#1689).
-    let missing_key = |columns: &[String]| {
+    let missing_key = |columns: &[ColumnName]| {
         parent.partition_by.as_ref().and_then(|by| {
             by.columns
                 .iter()
@@ -4555,11 +4572,12 @@ fn refuse_parent_index(
                 .cloned()
         })
     };
-    let without_key = |missing: String| {
+    let without_key = |missing: ColumnName| {
         format!(
             "{} without the partition key column `{missing}`, which PostgreSQL refuses on a \
              partitioned table; add `{missing}` to its columns",
-            change_in_words(change)
+            change_in_words(change),
+            missing = missing.shown(),
         )
     };
     if let Change::SetPrimaryKey { to: Some(pk), .. } = change {
@@ -4591,16 +4609,15 @@ fn refuse_parent_index(
     };
     if index.unique
         && let Some(by) = &parent.partition_by
-        && let Some(missing) = by.columns.iter().find(|key| {
-            !index
-                .columns
-                .iter()
-                .any(|c| c.key.column() == Some(key.as_str()))
-        })
+        && let Some(missing) = by
+            .columns
+            .iter()
+            .find(|key| !index.columns.iter().any(|c| c.key.column() == Some(*key)))
     {
         return Some(format!(
             "add unique index `{name}` without the partition key column `{missing}`, which \
-             PostgreSQL refuses on a partitioned table; add `{missing}` to its columns"
+             PostgreSQL refuses on a partitioned table; add `{missing}` to its columns",
+            missing = missing.shown(),
         ));
     }
     // Only an own index standing when the parent's is built: one the
@@ -4672,7 +4689,7 @@ pub fn adopts(parent: &pbps_model::Index, own: &pbps_model::Index) -> bool {
 /// partition key holds it.
 // The complement is every change that names no column of a table.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn parent_column(change: &Change) -> Option<&String> {
+fn parent_column(change: &Change) -> Option<&ColumnName> {
     match change {
         Change::AddColumn { name, .. } => Some(name),
         Change::RenameColumn { from, .. } => Some(from),
@@ -4690,7 +4707,7 @@ fn renamed_columns(
     index: &Indexes<'_>,
     base_name: &TableName,
     declared_name: &TableName,
-) -> BTreeMap<String, String> {
+) -> BTreeMap<ColumnName, ColumnName> {
     let now = columns_of(&index.declared, declared_name);
     columns_of(&index.base, base_name)
         .into_iter()
@@ -4739,22 +4756,22 @@ fn diff_partition_columns(
     // one plan can drop a column and rename another into its name (#1692
     // review). A column no identity names is taken as it stands.
     let now_by_uid = columns_of(&index.declared, &now.parent);
-    let fate: BTreeMap<String, Option<String>> = columns_of(&index.base, &was.parent)
+    let fate: BTreeMap<ColumnName, Option<ColumnName>> = columns_of(&index.base, &was.parent)
         .into_iter()
         .map(|(uid, c)| (c.name, now_by_uid.get(&uid).map(|d| d.name.clone())))
         .collect();
-    let is_now = |c: &String| -> Option<String> {
+    let is_now = |c: &ColumnName| -> Option<ColumnName> {
         match fate.get(c) {
             Some(now) => now.clone(),
             None => Some(c.clone()),
         }
     };
-    let was_columns: BTreeMap<String, &pbps_model::PartitionColumn> = was
+    let was_columns: BTreeMap<ColumnName, &pbps_model::PartitionColumn> = was
         .columns
         .iter()
         .filter_map(|(c, own)| Some((is_now(c)?, own)))
         .collect();
-    let base_of: BTreeMap<String, &pbps_model::Column> = base_parent
+    let base_of: BTreeMap<ColumnName, &pbps_model::Column> = base_parent
         .map(|p| {
             p.columns
                 .iter()
@@ -4763,7 +4780,7 @@ fn diff_partition_columns(
         })
         .unwrap_or_default();
     let none = pbps_model::PartitionColumn::default();
-    let loosened: BTreeSet<String> = parent
+    let loosened: BTreeSet<ColumnName> = parent
         .map(|p| {
             p.columns
                 .iter()
@@ -4774,7 +4791,7 @@ fn diff_partition_columns(
                 .collect()
         })
         .unwrap_or_default();
-    let columns: BTreeSet<&String> = was_columns
+    let columns: BTreeSet<&ColumnName> = was_columns
         .keys()
         .chain(now.columns.keys())
         .chain(&loosened)
@@ -4862,7 +4879,7 @@ fn refuse_computed_dependencies(
                 .is_some_and(|m| m.kind == pbps_model::ModuleKind::Function)
         })
     };
-    let dropped = |table: &TableName, name: &str| {
+    let dropped = |table: &TableName, name: &ColumnName| {
         changes.iter().any(|c| {
             matches!(c, Change::DropComputedColumn { table: t, name: n, .. }
                 if t == table && n == name)
@@ -4870,7 +4887,7 @@ fn refuse_computed_dependencies(
     };
     // Added by an `ADD`, or with its table by a `CREATE TABLE`: both come
     // before a module this plan creates (class 7 and 9, before 14).
-    let added = |table: &TableName, name: &str| {
+    let added = |table: &TableName, name: &ColumnName| {
         changes.iter().any(|c| {
             matches!(c, Change::AddComputedColumn { table: t, name: n, .. }
                 if t == table && n == name)
@@ -4898,7 +4915,7 @@ fn refuse_computed_dependencies(
                 {
                     errs.push(DiffError::ComputedInputChanged {
                         computed: at.clone(),
-                        column: column.to_owned(),
+                        column: column.into(),
                         change: what,
                     });
                 }
@@ -5556,7 +5573,7 @@ fn diff_data(
     name: &TableName,
     base: &Table,
     declared: &Table,
-    base_name_of: &BTreeMap<String, String>,
+    base_name_of: &BTreeMap<ColumnName, ColumnName>,
     changes: &mut Vec<Change>,
     errs: &mut Vec<DiffError>,
 ) {
@@ -5646,11 +5663,11 @@ fn diff_data(
                 columns: columns.to_vec(),
             }),
             BaselineDataKey::Single(base_key) => {
-                (base_name_of.get(&key_column).map(String::as_str) != Some(base_key)).then(|| {
-                    DiffError::DataKeyColumnChanged {
+                (base_name_of.get(&key_column).map(ColumnName::raw) != Some(base_key.raw())).then(
+                    || DiffError::DataKeyColumnChanged {
                         table: name.clone(),
-                    }
-                })
+                    },
+                )
             }
         };
         if let Some(error) = error {
@@ -5662,7 +5679,7 @@ fn diff_data(
     for (key, row) in &declared_data.rows {
         match base_rows.and_then(|r| r.get(key)) {
             None => {
-                let (defaults, types) = omitted_defaults(declared, &key_column, row);
+                let (defaults, types) = omitted_defaults(declared, key_column.raw(), row);
                 changes.push(Change::InsertRow {
                     table: name.clone(),
                     key_column: key_column.clone(),
@@ -5721,11 +5738,11 @@ fn diff_data(
                         .and_then(|base_column| base.columns.get(base_column));
                     let b = match base_name_of.get(column) {
                         Some(base_column) => {
-                            cell(before, base_column, base.columns.get(base_column))
+                            cell(before, base_column.raw(), base.columns.get(base_column))
                         }
                         None => Cell::Value(Value::Null),
                     };
-                    let d = cell(row, column, Some(spec));
+                    let d = cell(row, column.raw(), Some(spec));
                     // The base column's type, so the emitter can compare each
                     // cell by the rendering that read it (DECISIONS 122). A
                     // column the base lacks has no recorded cell to hold the
@@ -5797,7 +5814,7 @@ fn diff_data(
         // the table: the answer is the same for every deleted row, and a scan
         // per baseline column of every row made an `exact` table's deletes
         // cost rows × columns × columns in string comparisons (#402).
-        let surviving: BTreeSet<&str> = base_name_of.values().map(String::as_str).collect();
+        let surviving: BTreeSet<&str> = base_name_of.values().map(ColumnName::raw).collect();
         for (key, before) in base_rows {
             if !declared_data.rows.contains_key(key) {
                 // The recorded row travels with the delete, so the statement
@@ -5837,7 +5854,7 @@ fn diff_data(
                     }
                     row.insert(
                         declared_column.clone(),
-                        cell(before, base_column, Some(spec)),
+                        cell(before, base_column.raw(), Some(spec)),
                     );
                     // The type the recorded text was read in, and — where
                     // this plan retypes the column — the type the column has
@@ -5874,11 +5891,14 @@ fn diff_data(
                         pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) => {
                             false
                         }
-                    }) || surviving.contains(base_column.as_str())
+                    }) || surviving.contains(base_column.raw())
                     {
                         continue;
                     }
-                    dropped.insert(base_column.clone(), cell(before, base_column, Some(spec)));
+                    dropped.insert(
+                        base_column.clone(),
+                        cell(before, base_column.raw(), Some(spec)),
+                    );
                 }
                 changes.push(Change::DeleteRow {
                     table: name.clone(),
@@ -6794,7 +6814,10 @@ fn omitted_defaults(
     table: &Table,
     key_column: &str,
     row: &pbps_model::Row,
-) -> (BTreeMap<String, String>, BTreeMap<String, ColumnType>) {
+) -> (
+    BTreeMap<ColumnName, String>,
+    BTreeMap<ColumnName, ColumnType>,
+) {
     let types = table
         .row_columns(key_column)
         .map(|(c, spec)| (c.clone(), spec.ty.clone()))
@@ -6817,7 +6840,7 @@ fn omitted_columns<'a>(
     table: &'a Table,
     key_column: &'a str,
     row: &'a pbps_model::Row,
-) -> impl Iterator<Item = (&'a String, &'a pbps_model::Column)> {
+) -> impl Iterator<Item = (&'a ColumnName, &'a pbps_model::Column)> {
     table
         .row_columns(key_column)
         .filter(move |(c, _)| !row.0.contains_key(*c))
@@ -6847,7 +6870,7 @@ mod tests {
                     options: Default::default(),
                 });
             }
-            t.columns.insert(name.to_owned(), c);
+            t.columns.insert(name.into(), c);
         };
         col("id", "int", Some("(1)"), false);
         col("status_code", "varchar(10)", Some("('old')"), false);
@@ -6859,7 +6882,7 @@ mod tests {
         let (defaults, types) = omitted_defaults(&t, "id", &row);
         assert_eq!(
             defaults.into_iter().collect::<Vec<_>>(),
-            [("status_code".to_owned(), "('old')".to_owned())]
+            [(ColumnName::from("status_code"), "('old')".to_owned())]
         );
         // And the type of every non-key column, so the emitter can hold the
         // row to the default it left a column at (DECISIONS 133), to NULL
@@ -6869,9 +6892,9 @@ mod tests {
         assert_eq!(
             types.keys().collect::<Vec<_>>(),
             [
-                &"label".to_owned(),
-                &"rank".to_owned(),
-                &"status_code".to_owned()
+                &pbps_model::ColumnName::from("label").to_owned(),
+                &pbps_model::ColumnName::from("rank").to_owned(),
+                &pbps_model::ColumnName::from("status_code").to_owned()
             ]
         );
     }
@@ -6904,7 +6927,7 @@ mod tests {
                     options: Default::default(),
                 });
             }
-            t.columns.insert(name.to_owned(), c);
+            t.columns.insert(name.into(), c);
         };
         col("code", "varchar(10)", false);
         col("label", "nvarchar(50)", false);
@@ -6913,11 +6936,11 @@ mod tests {
         row.0.insert("label".into(), Value::Text("spelled".into()));
 
         let (_, types) = omitted_defaults(&t, "code", &row);
-        let expected: BTreeSet<String> = t
+        let expected: BTreeSet<ColumnName> = t
             .columns
             .iter()
             .filter(|(c, spec)| {
-                c.as_str() != "code"
+                c.raw() != "code"
                     && (match &spec.value_source {
                         ValueSource::Identity(_) | ValueSource::Sequence(_) => false,
                         ValueSource::None | ValueSource::Default(_) | ValueSource::Generated(_) => {
@@ -6945,6 +6968,84 @@ mod tests {
         PrimaryKey, ReferentialAction, RiskClass, Row, Uid, UniqueConstraint,
     };
 
+    #[test]
+    fn row_reconciliation_distinguishes_raw_columns_from_their_shown_spelling() {
+        let raw = ColumnName::from("cell\n\r\u{1b}[31m\\\u{200b}名前");
+        let literal = ColumnName::from(raw.shown().to_string());
+        let base = Table {
+            columns: [
+                ("id".into(), Column::new(ty("int")).not_null()),
+                (raw.clone(), Column::new(ty("int"))),
+                (literal.clone(), Column::new(ty("int"))),
+            ]
+            .into(),
+            primary_key: Some(PrimaryKey {
+                name: None,
+                columns: vec!["id".into()],
+                storage_parameters: Default::default(),
+            }),
+            data: Some(pbps_model::TableData {
+                mode: DataMode::Ensure,
+                rows: [(
+                    "1".into(),
+                    Row([
+                        (raw.clone(), Value::Int(1)),
+                        (literal.clone(), Value::Int(9)),
+                    ]
+                    .into()),
+                )]
+                .into(),
+            }),
+            ..Default::default()
+        };
+        let mut declared = base.clone();
+        declared
+            .data
+            .as_mut()
+            .unwrap()
+            .rows
+            .get_mut(&pbps_model::RowKey::from("1"))
+            .unwrap()
+            .0
+            .insert(raw.clone(), Value::Int(2));
+        let mapping = base
+            .columns
+            .keys()
+            .map(|c| (c.clone(), c.clone()))
+            .collect();
+        let (mut changes, mut errors) = (Vec::new(), Vec::new());
+        diff_data(
+            &TableName::new("app", "t"),
+            &base,
+            &declared,
+            &mapping,
+            &mut changes,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let [
+            Change::UpdateRow {
+                columns,
+                unchanged,
+                types,
+                ..
+            },
+        ] = changes.as_slice()
+        else {
+            panic!("one cell update: {changes:?}");
+        };
+        assert_eq!(
+            columns.get(raw.raw()),
+            Some(&(Cell::Value(Value::Int(1)), Cell::Value(Value::Int(2))))
+        );
+        assert!(!columns.contains_key(literal.raw()));
+        assert_eq!(
+            unchanged.get(literal.raw()),
+            Some(&Cell::Value(Value::Int(9)))
+        );
+        assert!(types.contains_key(raw.raw()) && types.contains_key(literal.raw()));
+    }
+
     fn ctx() -> Context {
         Context {
             operator: "leon".into(),
@@ -6959,7 +7060,7 @@ mod tests {
     fn table(cols: &[(&str, Column)]) -> Table {
         let mut columns = IndexMap::new();
         for (n, c) in cols {
-            columns.insert((*n).to_string(), c.clone());
+            columns.insert((*n).into(), c.clone());
         }
         Table {
             columns,
@@ -7433,7 +7534,7 @@ mod tests {
         ] {
             let errors = errors_of(&base, &shaped(changed, "a2 * 2"), &[]);
             assert!(
-                matches!(errors.as_slice(), [DiffError::ComputedInputChanged { column, .. }] if column == "A2"),
+                matches!(errors.as_slice(), [DiffError::ComputedInputChanged { column, .. }] if column.raw() == "A2"),
                 "{what}: {errors:?}"
             );
         }
@@ -7835,11 +7936,13 @@ mod tests {
                 .tables
                 .get_mut(&format!("public.{from}").parse::<TableName>().unwrap())
                 .unwrap();
-            table.columns.insert(column.clone(), Column::new(ty("int")));
+            table
+                .columns
+                .insert(column.clone().into(), Column::new(ty("int")));
             table.foreign_keys.insert(
                 format!("fk{k}"),
                 pbps_model::ForeignKey {
-                    columns: vec![column],
+                    columns: vec![column.into()],
                     references_table: format!("public.{to}").parse().unwrap(),
                     references_columns: vec!["id".into()],
                     on_delete: Default::default(),
@@ -8867,7 +8970,12 @@ mod tests {
         let check = |e: &str| CheckConstraint {
             expression: e.into(),
         };
-        let key = |columns: &[&str]| columns.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        let key = |columns: &[&str]| {
+            columns
+                .iter()
+                .map(|c| ColumnName::from(*c))
+                .collect::<Vec<_>>()
+        };
         let tree = |edit: &dyn Fn(&mut Table, &mut Table, &mut Schema)| {
             let mut parent = table(&[
                 ("id", Column::new(ty("int")).not_null()),
@@ -9094,10 +9202,7 @@ mod tests {
                     from: vec![BoundDatum::Value(from.into())],
                     to: vec![BoundDatum::Value(to.into())],
                 },
-                columns: own
-                    .iter()
-                    .map(|(c, o)| ((*c).to_owned(), o.clone()))
-                    .collect(),
+                columns: own.iter().map(|(c, o)| ((*c).into(), o.clone())).collect(),
             }),
             ..Default::default()
         };
@@ -9183,7 +9288,7 @@ mod tests {
             &[],
         );
         assert!(
-            matches!(added.as_slice(), [Change::AddColumn { name, .. }] if name == "note"),
+            matches!(added.as_slice(), [Change::AddColumn { name, .. }] if name.raw() == "note"),
             "{added:?}"
         );
         // Retyped: the parent's change alone.
@@ -9242,9 +9347,9 @@ mod tests {
                     // In place: a rename keeps the column's position.
                     p.columns = std::mem::take(&mut p.columns)
                         .into_iter()
-                        .map(|(c, column)| match c.as_str() {
-                            "m" => ("m2".to_owned(), column),
-                            "ts" => ("at".to_owned(), column),
+                        .map(|(c, column)| match c.raw() {
+                            "m" => ("m2".into(), column),
+                            "ts" => ("at".into(), column),
                             _ => (c, column),
                         })
                         .collect();
@@ -9319,7 +9424,7 @@ mod tests {
                     column,
                     not_null,
                     ..
-                } if column == "n" => Some((table.raw().to_string(), *not_null)),
+                } if column.raw() == "n" => Some((table.raw().to_string(), *not_null)),
                 _ => None,
             })
             .collect();
@@ -9455,7 +9560,7 @@ mod tests {
             let changes = outcome.unwrap_or_else(|e| panic!("refused: {e:?}"));
             assert!(
                 changes.iter().any(|c| matches!(c,
-                    Change::RenameColumn { from: f, to: t, .. } if f == from && t == to)),
+                    Change::RenameColumn { from: f, to: t, .. } if f.raw() == from && t.raw() == to)),
                 "{changes:?}"
             );
         };
@@ -9470,7 +9575,7 @@ mod tests {
                 p.columns.shift_remove("n");
                 p.columns = std::mem::take(&mut p.columns)
                     .into_iter()
-                    .map(|(c, col)| (if c == "m" { "n".to_owned() } else { c }, col))
+                    .map(|(c, col)| (if c == "m".into() { "n".into() } else { c }, col))
                     .collect();
             },
             &[("n", own_default("8"))],
@@ -9571,7 +9676,7 @@ mod tests {
             &|p| {
                 p.columns = std::mem::take(&mut p.columns)
                     .into_iter()
-                    .map(|(c, col)| (if c == "ts" { "spare".to_owned() } else { c }, col))
+                    .map(|(c, col)| (if c == "ts".into() { "spare".into() } else { c }, col))
                     .collect();
                 p.partition_by = Some(PartitionBy {
                     external: false,
@@ -9612,7 +9717,7 @@ mod tests {
         let rename = |p: &mut Table, from: &str, to: &str| {
             p.columns = std::mem::take(&mut p.columns)
                 .into_iter()
-                .map(|(c, col)| (if c == from { to.to_owned() } else { c }, col))
+                .map(|(c, col)| (if c == from.into() { to.into() } else { c }, col))
                 .collect();
         };
         let moved_key = with(
@@ -10299,7 +10404,7 @@ mod tests {
                 bound,
                 columns: if not_null {
                     [(
-                        "v".to_owned(),
+                        "v".into(),
                         PartitionColumn {
                             default: None,
                             not_null: true,
@@ -10431,7 +10536,7 @@ mod tests {
         use pbps_model::{BoundDatum, PartitionBound, PartitionBy, PartitionColumn, PartitionOf};
         let index_on = |column: &str| Index {
             columns: vec![pbps_model::IndexColumn {
-                key: pbps_model::IndexKey::Column(column.to_owned()),
+                key: pbps_model::IndexKey::Column(column.into()),
                 descending: false,
                 opclass: None,
             }],
@@ -10453,7 +10558,7 @@ mod tests {
         };
         let key = |name: &str, columns: &[&str]| PrimaryKey {
             name: Some(name.into()),
-            columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            columns: columns.iter().map(|c| (*c).into()).collect(),
             storage_parameters: Default::default(),
         };
         let columns = || {
@@ -10527,12 +10632,12 @@ mod tests {
             declared.tables.insert(
                 "app.t".parse().unwrap(),
                 Table {
-                    checks: [("t_small".to_owned(), check("n < 100"))].into(),
+                    checks: [("t_small".into(), check("n < 100"))].into(),
                     partition_of: Some(PartitionOf {
                         parent: "app.ev".parse().unwrap(),
                         bound,
                         columns: [(
-                            "n".to_owned(),
+                            "n".into(),
                             PartitionColumn {
                                 default: None,
                                 not_null: true,
@@ -10609,7 +10714,7 @@ mod tests {
         assert!(matches!(
             &planned.changes[2].change,
             Change::SetPartitionDefault { column, from: None, to: None, fallback: Some(f), .. }
-                if column == "n" && f == "0"
+                if column.raw() == "n" && f == "0"
         ));
         assert!(planned.changes[1].risks.contains(&RiskClass::Constraint));
         // The table keeps its uid, its columns' leave, and the parent's stay.
@@ -10737,8 +10842,8 @@ mod tests {
             q.data = Some(rows(vec![(
                 "1",
                 [
-                    ("eid".to_owned(), Value::Int(1)),
-                    ("ets".to_owned(), Value::Text("2024-06-01".into())),
+                    ("eid".into(), Value::Int(1)),
+                    ("ets".into(), Value::Text("2024-06-01".into())),
                 ]
                 .into_iter()
                 .collect(),
@@ -10798,7 +10903,7 @@ mod tests {
             columns: columns
                 .iter()
                 .map(|c| pbps_model::IndexColumn {
-                    key: pbps_model::IndexKey::Column((*c).to_owned()),
+                    key: pbps_model::IndexKey::Column((*c).into()),
                     descending: false,
                     opclass: None,
                 })
@@ -11298,7 +11403,7 @@ mod tests {
             set_back.changes.iter().any(|p| matches!(
                 &p.change,
                 Change::SetPartitionDefault { table, column, from: Some(f), to: None, .. }
-                    if table.raw().to_string() == "x.t" && column == "n" && f == "0"
+                    if table.raw().to_string() == "x.t" && column.raw() == "n" && f == "0"
             )),
             "{:?}",
             set_back.changes
@@ -11525,7 +11630,7 @@ mod tests {
             "ev_n".into(),
             Index {
                 columns: vec![pbps_model::IndexColumn {
-                    key: pbps_model::IndexKey::Column("n".to_owned()),
+                    key: pbps_model::IndexKey::Column("n".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -11868,7 +11973,7 @@ mod tests {
                 parent: "app.ev".parse().unwrap(),
                 bound: PartitionBound::Default,
                 columns: [(
-                    "n".to_owned(),
+                    "n".into(),
                     PartitionColumn {
                         default: Some(default.to_owned()),
                         not_null: true,
@@ -11920,7 +12025,7 @@ mod tests {
                 planned.changes.as_slice(),
                 [c] if matches!(&c.change, Change::SetPartitionDefault {
                     table, column, from: Some(from), to: Some(to), fallback: None, ..
-                } if *table == p && column == "n" && from == "7" && to == "8")
+                } if *table == p && column.raw() == "n" && from == "7" && to == "8")
             ),
             "{:?}",
             planned.changes
@@ -12076,7 +12181,7 @@ mod tests {
         use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
         let index = |column: &str| Index {
             columns: vec![pbps_model::IndexColumn {
-                key: pbps_model::IndexKey::Column(column.to_owned()),
+                key: pbps_model::IndexKey::Column(column.into()),
                 descending: false,
                 opclass: None,
             }],
@@ -13232,7 +13337,7 @@ mod tests {
                     Change::AddIndex { name, .. } => format!("add {name}"),
                     Change::DropIndex { name, .. } => format!("drop {name}"),
                     Change::AlterColumnNullability { column, .. } => {
-                        format!("tighten {}", column.name)
+                        format!("tighten {}", column.name.shown())
                     }
                     other => format!("{other:?}"),
                 })
@@ -13653,7 +13758,7 @@ mod tests {
         ]);
         t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
-            columns: vec!["code".to_owned()],
+            columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });
         t.data = Some(pbps_model::TableData {
@@ -13663,7 +13768,7 @@ mod tests {
                 .map(|(k, label)| {
                     (
                         pbps_model::RowKey::from(*k),
-                        [("label".to_owned(), Value::Text((*label).to_owned()))]
+                        [("label".into(), Value::Text((*label).to_owned()))]
                             .into_iter()
                             .collect::<Row>(),
                     )
@@ -13912,10 +14017,10 @@ mod tests {
         let mut base_t = lookup(DataMode::Exact, &[("new", "New")]);
         base_t
             .columns
-            .insert("note".to_owned(), Column::new(ty("nvarchar(50)")));
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
         let mut sort = Column::new(ty("int"));
         sort.value_source = pbps_model::ValueSource::Default("(0)".to_owned());
-        base_t.columns.insert("sort".to_owned(), sort);
+        base_t.columns.insert("sort".into(), sort);
         // The engine's own: never read back, so never a cell to hold the
         // row to (DECISIONS 94) — holding it to NULL would refuse every
         // update on the table.
@@ -13925,7 +14030,7 @@ mod tests {
             increment: 1,
             options: Default::default(),
         });
-        base_t.columns.insert("seq".to_owned(), seq);
+        base_t.columns.insert("seq".into(), seq);
         base_t
             .data
             .as_mut()
@@ -13934,7 +14039,7 @@ mod tests {
             .get_mut(&pbps_model::RowKey::from("new"))
             .unwrap()
             .0
-            .insert("note".to_owned(), Value::Text("kept".to_owned()));
+            .insert("note".into(), Value::Text("kept".to_owned()));
         let mut declared_t = base_t.clone();
         declared_t
             .data
@@ -13944,7 +14049,7 @@ mod tests {
             .get_mut(&pbps_model::RowKey::from("new"))
             .unwrap()
             .0
-            .insert("label".to_owned(), Value::Text("Opened".to_owned()));
+            .insert("label".into(), Value::Text("Opened".to_owned()));
 
         let cs = run(
             &schema_of("dbo.s", base_t),
@@ -13964,20 +14069,30 @@ mod tests {
         else {
             panic!("{:?}", row_ops(&cs));
         };
-        assert_eq!(columns.keys().collect::<Vec<_>>(), ["label"]);
+        assert_eq!(
+            columns.keys().cloned().collect::<Vec<_>>(),
+            [pbps_model::ColumnName::from("label")]
+        );
         assert_eq!(
             unchanged.iter().collect::<Vec<_>>(),
             [
                 (
-                    &"note".to_owned(),
+                    &ColumnName::from("note"),
                     &Cell::Value(Value::Text("kept".to_owned()))
                 ),
-                (&"sort".to_owned(), &Cell::Default("(0)".to_owned())),
+                (&ColumnName::from("sort"), &Cell::Default("(0)".to_owned())),
             ]
         );
         // The key is neither: it lives in the map key, not in the row. Nor
         // is the identity column.
-        assert_eq!(types.keys().collect::<Vec<_>>(), ["label", "note", "sort"]);
+        assert_eq!(
+            types.keys().cloned().collect::<Vec<_>>(),
+            [
+                pbps_model::ColumnName::from("label"),
+                pbps_model::ColumnName::from("note"),
+                pbps_model::ColumnName::from("sort")
+            ]
+        );
         assert!(!unchanged.contains_key("seq"), "{unchanged:?}");
     }
 
@@ -13999,11 +14114,11 @@ mod tests {
         // Added and populated in this same revision.
         declared_t
             .columns
-            .insert("note".to_owned(), Column::new(ty("nvarchar(50)")));
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
         // Retyped in this same revision, and its cell left alone.
         declared_t
             .columns
-            .insert("label".to_owned(), Column::new(ty("nvarchar(80)")));
+            .insert("label".into(), Column::new(ty("nvarchar(80)")));
         let row = declared_t
             .data
             .as_mut()
@@ -14011,8 +14126,7 @@ mod tests {
             .rows
             .get_mut(&pbps_model::RowKey::from("new"))
             .unwrap();
-        row.0
-            .insert("note".to_owned(), Value::Text("fresh".to_owned()));
+        row.0.insert("note".into(), Value::Text("fresh".to_owned()));
 
         let cs = run(
             &schema_of("dbo.s", base_t),
@@ -14035,12 +14149,21 @@ mod tests {
         // the type below, which is what lets the emitter ask the engine for
         // the conversion instead of spelling it (DECISIONS 149, where 146
         // carried neither and held nothing).
-        assert_eq!(types.keys().collect::<Vec<_>>(), ["label"]);
+        assert_eq!(
+            types.keys().cloned().collect::<Vec<_>>(),
+            [pbps_model::ColumnName::from("label")]
+        );
         assert_eq!(types["label"], ty("nvarchar(50)"));
         // Both the added column and the retyped one carry what they will be;
         // a column neither added nor retyped carries nothing here, and the
         // emitter falls back to `types`.
-        assert_eq!(after_types.keys().collect::<Vec<_>>(), ["label", "note"]);
+        assert_eq!(
+            after_types.keys().cloned().collect::<Vec<_>>(),
+            [
+                pbps_model::ColumnName::from("label"),
+                pbps_model::ColumnName::from("note")
+            ]
+        );
         assert_eq!(after_types["label"], ty("nvarchar(80)"));
         assert_eq!(after_types["note"], ty("nvarchar(50)"));
     }
@@ -14109,9 +14232,7 @@ mod tests {
         let mut declared_t = lookup(DataMode::Exact, &[("new", "x")]);
         declared_t.data.as_mut().unwrap().rows = [(
             pbps_model::RowKey::from("new"),
-            [("label".to_owned(), Value::Null)]
-                .into_iter()
-                .collect::<Row>(),
+            [("label".into(), Value::Null)].into_iter().collect::<Row>(),
         )]
         .into_iter()
         .collect();
@@ -14144,16 +14265,14 @@ mod tests {
     fn rows_follow_the_foreign_keys_between_their_tables() {
         let status = lookup(DataMode::Exact, &[("new", "New")]);
         let mut sub = lookup(DataMode::Exact, &[("a", "A")]);
-        sub.columns.insert(
-            "parent".to_owned(),
-            Column::new(ty("varchar(20)")).not_null(),
-        );
+        sub.columns
+            .insert("parent".into(), Column::new(ty("varchar(20)")).not_null());
         sub.foreign_keys.insert(
             "fk_sub_status".to_owned(),
             pbps_model::ForeignKey {
-                columns: vec!["parent".to_owned()],
+                columns: vec!["parent".into()],
                 references_table: "dbo.status".parse().unwrap(),
-                references_columns: vec!["code".to_owned()],
+                references_columns: vec!["code".into()],
                 on_delete: Default::default(),
                 on_update: Default::default(),
             },
@@ -14269,7 +14388,7 @@ mod tests {
                 "ix_n".to_owned(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
-                        key: pbps_model::IndexKey::Column("n".to_owned()),
+                        key: pbps_model::IndexKey::Column("n".into()),
                         descending: false,
                         opclass: None,
                     }],
@@ -14371,8 +14490,8 @@ mod tests {
     fn rename_column(from: &str, to: &str) -> Intent {
         Intent::RenameColumn {
             table: "dbo.s".parse().unwrap(),
-            from: from.to_owned(),
-            to: to.to_owned(),
+            from: from.into(),
+            to: to.into(),
         }
     }
 
@@ -14452,10 +14571,10 @@ mod tests {
         let base_t = lookup(DataMode::Exact, &[("new", "New")]);
         let mut declared_t = base_t.clone();
         let label = declared_t.columns.shift_remove("label").unwrap();
-        declared_t.columns.insert("caption".to_owned(), label);
+        declared_t.columns.insert("caption".into(), label);
         declared_t.data.as_mut().unwrap().rows = [(
             pbps_model::RowKey::from("new"),
-            [("caption".to_owned(), Value::Text("New".to_owned()))]
+            [("caption".into(), Value::Text("New".to_owned()))]
                 .into_iter()
                 .collect::<Row>(),
         )]
@@ -14497,8 +14616,8 @@ mod tests {
         let mut declared = lookup(DataMode::Exact, &[("new", "New")]);
         declared
             .columns
-            .insert("new_code".to_owned(), declared.columns["code"].clone());
-        declared.primary_key.as_mut().unwrap().columns = vec!["new_code".to_owned()];
+            .insert("new_code".into(), declared.columns["code"].clone());
+        declared.primary_key.as_mut().unwrap().columns = vec!["new_code".into()];
         let name: TableName = "dbo.s".parse().unwrap();
         let mut changes = vec![Change::SetPrimaryKey {
             table: name.clone(),
@@ -14508,8 +14627,8 @@ mod tests {
         }];
         let mut errors = Vec::new();
         let mapping = [
-            ("code".to_owned(), "code".to_owned()),
-            ("label".to_owned(), "label".to_owned()),
+            ("code".into(), "code".into()),
+            ("label".into(), "label".into()),
         ]
         .into();
         diff_data(&name, &base, &declared, &mapping, &mut changes, &mut errors);
@@ -14517,7 +14636,7 @@ mod tests {
             errors,
             vec![DiffError::DataBaselineKeyOnNewColumn {
                 table: name,
-                column: "new_code".to_owned(),
+                column: "new_code".into(),
             }]
         );
         // The baseline had no key, so nothing moved: the diagnostic must not
@@ -14537,12 +14656,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .columns
-            .push("label".to_owned());
+            .push("label".into());
         let mut changes = Vec::new();
         let mut errors = Vec::new();
         let mapping = [
-            ("code".to_owned(), "code".to_owned()),
-            ("label".to_owned(), "label".to_owned()),
+            ("code".into(), "code".into()),
+            ("label".into(), "label".into()),
         ]
         .into();
         diff_data(
@@ -14557,7 +14676,7 @@ mod tests {
             errors,
             vec![DiffError::DataBaselineKeyNotSingle {
                 table: "dbo.s".parse().unwrap(),
-                columns: vec!["code".to_owned(), "label".to_owned()],
+                columns: vec!["code".into(), "label".into()],
             }]
         );
         let message = errors[0].to_string();
@@ -14603,7 +14722,7 @@ mod tests {
         let mut declared_t = base_t.clone();
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
-            columns: vec!["label".to_owned()],
+            columns: vec!["label".into()],
             storage_parameters: Default::default(),
         });
         // The rows now key on `label`, and say nothing about `code`.
@@ -14651,15 +14770,15 @@ mod tests {
         let base_t = lookup(DataMode::Exact, &[("new", "New")]);
         let mut declared_t = base_t.clone();
         let code = declared_t.columns.shift_remove("code").unwrap();
-        declared_t.columns.insert("kode".to_owned(), code);
+        declared_t.columns.insert("kode".into(), code);
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
-            columns: vec!["kode".to_owned()],
+            columns: vec!["kode".into()],
             storage_parameters: Default::default(),
         });
         declared_t.data.as_mut().unwrap().rows = [(
             pbps_model::RowKey::from("new"),
-            [("label".to_owned(), Value::Text("Renamed".to_owned()))]
+            [("label".into(), Value::Text("Renamed".to_owned()))]
                 .into_iter()
                 .collect::<Row>(),
         )]
@@ -14680,7 +14799,11 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!(key_column, "kode", "the statement runs after the rename");
+        assert_eq!(
+            key_column,
+            &pbps_model::ColumnName::from("kode"),
+            "the statement runs after the rename"
+        );
     }
 
     /// The third review's P1. A parent row leaves an `exact` table while a
@@ -14693,16 +14816,15 @@ mod tests {
     fn a_child_row_moves_away_before_its_former_parent_is_deleted() {
         let parent = lookup(DataMode::Exact, &[("p1", "P1"), ("p2", "P2")]);
         let mut child = lookup(DataMode::Exact, &[("c", "C")]);
-        child.columns.insert(
-            "parent".to_owned(),
-            Column::new(ty("varchar(20)")).not_null(),
-        );
+        child
+            .columns
+            .insert("parent".into(), Column::new(ty("varchar(20)")).not_null());
         child.foreign_keys.insert(
             "fk_child_parent".to_owned(),
             pbps_model::ForeignKey {
-                columns: vec!["parent".to_owned()],
+                columns: vec!["parent".into()],
                 references_table: "dbo.parent".parse().unwrap(),
-                references_columns: vec!["code".to_owned()],
+                references_columns: vec!["code".into()],
                 on_delete: Default::default(),
                 on_update: Default::default(),
             },
@@ -14712,8 +14834,8 @@ mod tests {
             t.data.as_mut().unwrap().rows = [(
                 pbps_model::RowKey::from("c"),
                 [
-                    ("label".to_owned(), Value::Text("C".to_owned())),
-                    ("parent".to_owned(), Value::Text(p.to_owned())),
+                    ("label".into(), Value::Text("C".to_owned())),
+                    ("parent".into(), Value::Text(p.to_owned())),
                 ]
                 .into_iter()
                 .collect::<Row>(),
@@ -14787,10 +14909,10 @@ mod tests {
         let with_label = |label: &str, extra: Option<&str>| {
             let mut t = lookup(DataMode::Exact, &[]);
             let held = t.columns.shift_remove("label").expect("the lookup's label");
-            t.columns.insert(label.to_owned(), held);
+            t.columns.insert(label.into(), held);
             if let Some(extra) = extra {
                 t.columns
-                    .insert(extra.to_owned(), Column::new(ty("nvarchar(50)")));
+                    .insert(extra.into(), Column::new(ty("nvarchar(50)")));
             }
             t
         };
@@ -14800,8 +14922,8 @@ mod tests {
             rows: [(
                 pbps_model::RowKey::from("old"),
                 [
-                    ("label".to_owned(), Value::Text("Old".to_owned())),
-                    ("note".to_owned(), Value::Text("dropped".to_owned())),
+                    ("label".into(), Value::Text("Old".to_owned())),
+                    ("note".into(), Value::Text("dropped".to_owned())),
                 ]
                 .into_iter()
                 .collect::<Row>(),
@@ -14904,12 +15026,12 @@ mod tests {
         )
         .unwrap();
         assert!(cs.changes.iter().any(
-            |p| matches!(&p.change, Change::DropColumn { column, .. } if column.name == "label")
+            |p| matches!(&p.change, Change::DropColumn { column, .. } if column.name == "label".into())
         ));
         assert!(
-            cs.changes
-                .iter()
-                .any(|p| matches!(&p.change, Change::AddColumn { name, .. } if name == "label"))
+            cs.changes.iter().any(
+                |p| matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "label")
+            )
         );
         let (row, types, dropped) = cs
             .changes
@@ -14947,23 +15069,23 @@ mod tests {
         for i in 0..SURVIVING {
             base_table
                 .columns
-                .insert(format!("keep{i}"), Column::new(ty("nvarchar(50)")));
+                .insert(format!("keep{i}").into(), Column::new(ty("nvarchar(50)")));
         }
         for i in 0..DROPPED {
             base_table
                 .columns
-                .insert(format!("gone{i}"), Column::new(ty("nvarchar(50)")));
+                .insert(format!("gone{i}").into(), Column::new(ty("nvarchar(50)")));
         }
         let rows = &mut base_table.data.as_mut().unwrap().rows;
         for r in 0..ROWS {
             let mut row = Row::default();
             for i in 0..SURVIVING {
                 row.0
-                    .insert(format!("keep{i}"), Value::Text(format!("k{r}")));
+                    .insert(format!("keep{i}").into(), Value::Text(format!("k{r}")));
             }
             for i in 0..DROPPED {
                 row.0
-                    .insert(format!("gone{i}"), Value::Text(format!("g{r}")));
+                    .insert(format!("gone{i}").into(), Value::Text(format!("g{r}")));
             }
             rows.insert(pbps_model::RowKey::from(format!("row{r}").as_str()), row);
         }
@@ -14971,7 +15093,9 @@ mod tests {
         let mut declared_table = base_table;
         declared_table.data.as_mut().unwrap().rows.clear();
         for i in 0..DROPPED {
-            declared_table.columns.shift_remove(&format!("gone{i}"));
+            declared_table
+                .columns
+                .shift_remove(format!("gone{i}").as_str());
         }
         let declared = schema_of("dbo.s", declared_table);
         let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
@@ -15006,7 +15130,7 @@ mod tests {
                 continue;
             };
             deleted += 1;
-            let gone: Vec<&str> = dropped.keys().map(String::as_str).collect();
+            let gone: Vec<&str> = dropped.keys().map(pbps_model::ColumnName::raw).collect();
             let mut expected: Vec<String> = (0..DROPPED).map(|i| format!("gone{i}")).collect();
             expected.sort();
             assert_eq!(
@@ -15016,10 +15140,13 @@ mod tests {
             for i in 0..SURVIVING {
                 let keep = format!("keep{i}");
                 assert!(
-                    !dropped.contains_key(&keep),
+                    !dropped.contains_key(keep.as_str()),
                     "{keep} moved to the reviewer map"
                 );
-                assert!(row.contains_key(&keep), "{keep} missing from the predicate");
+                assert!(
+                    row.contains_key(keep.as_str()),
+                    "{keep} missing from the predicate"
+                );
             }
         }
         assert_eq!(deleted, ROWS);
@@ -15191,8 +15318,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{:?}", kinds(&cs)))
         };
         let drop_at =
-            at(|c| matches!(c, Change::DropColumn { column, .. } if column.name == "note"));
-        let rename_at = at(|c| matches!(c, Change::RenameColumn { to, .. } if to == "note"));
+            at(|c| matches!(c, Change::DropColumn { column, .. } if column.name == "note".into()));
+        let rename_at = at(|c| matches!(c, Change::RenameColumn { to, .. } if to.raw() == "note"));
         assert!(
             drop_at < rename_at,
             "the drop must free the name first: {:?}",
@@ -15286,8 +15413,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{:?}", kinds(&cs)))
         };
         let drop_at =
-            at(|c| matches!(c, Change::DropColumn { column, .. } if column.name == "note"));
-        let rename_at = at(|c| matches!(c, Change::RenameColumn { to, .. } if to == "Note"));
+            at(|c| matches!(c, Change::DropColumn { column, .. } if column.name == "note".into()));
+        let rename_at = at(|c| matches!(c, Change::RenameColumn { to, .. } if to.raw() == "Note"));
         assert!(
             drop_at < rename_at,
             "the engine reads one name where the model reads two: {:?}",
@@ -16282,7 +16409,11 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::RenameColumn { from, to, .. } => Some(format!("{from} -> {to}")),
+                    Change::RenameColumn { from, to, .. } => Some(format!(
+                        "{from} -> {to}",
+                        from = from.shown(),
+                        to = to.shown(),
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -16387,8 +16518,8 @@ mod tests {
                 cols(&names),
                 vec![Intent::RenameColumn {
                     table: "dbo.t".parse().unwrap(),
-                    from: name(from),
-                    to: name(from + 1),
+                    from: name(from).into(),
+                    to: name(from + 1).into(),
                 }],
             ));
         }
@@ -16397,7 +16528,7 @@ mod tests {
             .changes
             .iter()
             .filter_map(|p| match &p.change {
-                Change::RenameColumn { from, .. } => Some(from.clone()),
+                Change::RenameColumn { from, .. } => Some(from.raw().to_owned()),
                 _ => None,
             })
             .collect();
@@ -16458,7 +16589,11 @@ mod tests {
             cs.changes
                 .iter()
                 .filter_map(|p| match &p.change {
-                    Change::RenameColumn { from, to, .. } => Some(format!("{from} -> {to}")),
+                    Change::RenameColumn { from, to, .. } => Some(format!(
+                        "{from} -> {to}",
+                        from = from.shown(),
+                        to = to.shown(),
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -16527,7 +16662,7 @@ mod tests {
             diffed.errors.iter().any(|e| matches!(e,
                 DiffError::ColumnRenameCycle { table, columns }
                     if table.raw().to_string() == "dbo.t"
-                        && columns == &BTreeSet::from(["a".to_owned(), "b".to_owned()]))),
+                        && columns == &BTreeSet::from([ColumnName::from("a"), ColumnName::from("b")]))),
             "{:?}",
             diffed.errors
         );
@@ -17101,7 +17236,7 @@ mod tests {
         let mut declared_t = lookup(DataMode::Exact, &[]);
         declared_t
             .columns
-            .insert("label".to_owned(), Column::new(ty("varchar(50)")));
+            .insert("label".into(), Column::new(ty("varchar(50)")));
         let declared = schema_of("dbo.s", declared_t);
 
         let cs = run(&base, &declared, &[]);
@@ -17136,7 +17271,7 @@ mod tests {
         let mut declared_t = lookup(DataMode::Exact, &[("kept", "After")]);
         declared_t
             .columns
-            .insert("code".to_owned(), Column::new(ty("varchar(40)")).not_null());
+            .insert("code".into(), Column::new(ty("varchar(40)")).not_null());
         let declared = schema_of("dbo.s", declared_t);
 
         let cs = run(&base, &declared, &[]);
@@ -17407,7 +17542,7 @@ mod tests {
         let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
         base_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
-            columns: vec!["id".to_owned()],
+            columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
         let base = schema_of("dbo.t", base_t);
@@ -17432,7 +17567,7 @@ mod tests {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                     column: pbps_model::ColumnRef {
                         table: "dbo.t".parse().unwrap(),
-                        name: "id".to_owned(),
+                        name: "id".into(),
                     },
                     ty: ty("int"),
                     to_nullable: true,
@@ -17536,7 +17671,7 @@ mod tests {
         let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
         base_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
-            columns: vec!["id".to_owned()],
+            columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
         let base = schema_of("dbo.t", base_t);
@@ -17549,7 +17684,7 @@ mod tests {
         ]);
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
-            columns: vec!["other".to_owned()],
+            columns: vec!["other".into()],
             storage_parameters: Default::default(),
         });
         let declared = schema_of("dbo.t", declared_t);
@@ -17628,7 +17763,11 @@ mod tests {
             "dbo.clients".parse::<TableName>().unwrap(),
             "the drop must name the table the rename has already produced"
         );
-        assert_eq!(column.name, "doomed", "the column itself is not renamed");
+        assert_eq!(
+            column.name,
+            "doomed".into(),
+            "the column itself is not renamed"
+        );
 
         // And the rename really does sort first, which is what makes the name
         // above the only correct one — the assertion is worthless if the
@@ -17893,16 +18032,16 @@ mod tests {
 
     fn unique(columns: &[&str]) -> UniqueConstraint {
         UniqueConstraint {
-            columns: columns.iter().map(|c| (*c).to_string()).collect(),
+            columns: columns.iter().map(|c| (*c).into()).collect(),
             storage_parameters: Default::default(),
         }
     }
 
     fn fk(columns: &[&str], to: &str, to_columns: &[&str]) -> ForeignKey {
         ForeignKey {
-            columns: columns.iter().map(|c| (*c).to_string()).collect(),
+            columns: columns.iter().map(|c| (*c).into()).collect(),
             references_table: to.parse().unwrap(),
-            references_columns: to_columns.iter().map(|c| (*c).to_string()).collect(),
+            references_columns: to_columns.iter().map(|c| (*c).into()).collect(),
             on_delete: ReferentialAction::default(),
             on_update: ReferentialAction::default(),
         }
@@ -18776,7 +18915,7 @@ mod tests {
                     | ValueSource::Sequence(_)
                     | ValueSource::Generated(_) => false,
                 })
-                .map(|(column, _)| format!("df_{}_{column}", name.name))
+                .map(|(column, _)| format!("df_{}_{column}", name.name, column = column.shown(),))
                 .collect()
         }
         fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
@@ -19081,7 +19220,7 @@ mod tests {
         let Change::RenameTable { defaults, .. } = &cs.changes[0].change else {
             panic!("{cs:?}");
         };
-        assert_eq!(defaults, &["a".to_owned()]);
+        assert_eq!(defaults, &[pbps_model::ColumnName::from("a").to_owned()]);
     }
 
     /// A column rename in a plan that also renames its table names the old
@@ -19917,7 +20056,7 @@ mod tests {
             .iter()
             .filter_map(|p| {
                 if let Change::AddColumn { name, .. } = &p.change {
-                    Some(name.clone())
+                    Some(name.raw().to_owned())
                 } else {
                     None
                 }
@@ -19975,11 +20114,11 @@ mod tests {
             .iter()
             .filter_map(|p| {
                 if let Change::AddColumn { name, .. } = &p.change {
-                    Some(format!("+{name}"))
+                    Some(format!("+{name}", name = name.shown(),))
                 } else if let Change::DropColumn { column, .. } = &p.change {
-                    Some(format!("-{}", column.name))
+                    Some(format!("-{}", column.name.shown()))
                 } else if let Change::AlterColumnType { column, .. } = &p.change {
-                    Some(format!("~{}", column.name))
+                    Some(format!("~{}", column.name.shown()))
                 } else {
                     None
                 }
@@ -20713,7 +20852,7 @@ mod tests {
             let mut s = Schema::default();
             let mut t = Table::default();
             t.columns
-                .insert("id".to_owned(), Column::new("int".parse().unwrap()));
+                .insert("id".into(), Column::new("int".parse().unwrap()));
             s.tables.insert("dbo.customer".parse().unwrap(), t);
             let mut ids = IdsFile::default();
             ids.tables
@@ -21457,7 +21596,7 @@ mod tests {
                 .unwrap();
             t.columns.clear();
             t.columns
-                .insert("row_id".to_owned(), Column::new("int".parse().unwrap()));
+                .insert("row_id".into(), Column::new("int".parse().unwrap()));
             declared.1.columns.insert(
                 "c_aaaaaa".parse().unwrap(),
                 "dbo.customer.row_id".parse().unwrap(),
@@ -21497,7 +21636,7 @@ mod tests {
             ]);
             let mut t = Table::default();
             t.columns
-                .insert("id".to_owned(), Column::new("int".parse().unwrap()));
+                .insert("id".into(), Column::new("int".parse().unwrap()));
             declared.0.tables.insert("dbo.extra".parse().unwrap(), t);
             declared
                 .1
@@ -21910,16 +22049,16 @@ mod tests {
         let mut base_t = Table::default();
         base_t
             .columns
-            .insert("id".to_owned(), Column::new("int".parse().unwrap()));
+            .insert("id".into(), Column::new("int".parse().unwrap()));
         base_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("PK__t__357D4CF8312E0151".to_owned()),
-            columns: vec!["id".to_owned()],
+            columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
         let mut declared_t = base_t.clone();
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
-            columns: vec!["id".to_owned()],
+            columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
         let mut changes = Vec::new();
@@ -21934,7 +22073,7 @@ mod tests {
         // The negative cases: other columns, or a name of its own.
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: None,
-            columns: vec!["other".to_owned()],
+            columns: vec!["other".into()],
             storage_parameters: Default::default(),
         });
         let mut changes = Vec::new();
@@ -21956,7 +22095,7 @@ mod tests {
         );
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
             name: Some("pk_t".to_owned()),
-            columns: vec!["id".to_owned()],
+            columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
         let mut changes = Vec::new();

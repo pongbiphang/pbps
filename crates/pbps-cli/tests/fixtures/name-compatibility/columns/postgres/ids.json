@@ -1,0 +1,1 @@
+{"version":1,"tables":{"t_000000":"app.child","t_000001":"app.parent","t_000002":"app.part","t_000003":"app.partitioned"},"columns":{"c_aaaaaa":"app.child.col\nline\r\u001b[31m\\‮名前","c_bbbbbb":"app.child.col\nline\r\u001b[31m\\‮名前payload"}}

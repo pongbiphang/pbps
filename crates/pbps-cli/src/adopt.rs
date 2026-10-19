@@ -720,8 +720,8 @@ mod tests {
         ] {
             let mut invalid = table("int", Some(Identity::new(1, 0)));
             let column = invalid.columns.shift_remove("id").unwrap();
-            invalid.columns.insert(part.to_owned(), column);
-            invalid.primary_key.as_mut().unwrap().columns = vec![part.to_owned()];
+            invalid.columns.insert(part.into(), column);
+            invalid.primary_key.as_mut().unwrap().columns = vec![part.into()];
             let mut pulled = Pulled::default();
             pulled
                 .schema

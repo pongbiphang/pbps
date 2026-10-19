@@ -131,10 +131,10 @@ pub fn complete(dialect: &str) {
         if scenario == "drops" {
             assert_eq!(after.tombstones[email_uid].reason, first_value);
         } else {
-            assert_eq!(after.columns[email_uid].name, "email");
+            assert_eq!(after.columns[email_uid].name, "email".into());
         }
         if scenario == "renames" {
-            assert_eq!(after.columns[phone_uid].name, "Phone Current");
+            assert_eq!(after.columns[phone_uid].name, "Phone Current".into());
         } else {
             assert_eq!(after.tombstones[phone_uid].reason, second_value);
         }
@@ -307,7 +307,7 @@ pub fn annotations_and_single_edits(dialect: &str) {
     let uid = old
         .column_uid(&format!("{schema}.t.a").parse().unwrap())
         .unwrap();
-    assert_eq!(recorded.columns[uid].name, "next_a");
+    assert_eq!(recorded.columns[uid].name, "next_a".into());
     success(&d, &["plan", "--check"]);
     table(&d, schema, &["next_a"]);
     success(

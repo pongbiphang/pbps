@@ -481,6 +481,8 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
                     spelling.push(format!(
                         "row {key} of {table}, column {column}: declared {to}, the engine stores {from}",
                         table = table.shown(),
+
+                        column = column.shown(),
                     ));
                 }
             }

@@ -1184,7 +1184,7 @@ fn create_and_add_stored_generation_keep_the_attrdef_child_inventory() {
                     !matches!(
                         &record.ownership,
                         ObjectOwnership::Surface(Surface::Column(c) | Surface::Default(c))
-                            if c.name == "g"
+                            if c.name == "g".into()
                     )
                 })
                 .collect()
@@ -1733,7 +1733,7 @@ mod column_vector_parent {
                 !matches!(
                     &record.ownership,
                     ObjectOwnership::Surface(Surface::Column(c) | Surface::Default(c))
-                        if c.name == name
+                        if c.name == name.into()
                 )
             })
             .collect()
@@ -2086,7 +2086,7 @@ fn a_partitions_own_default_needs_its_catalog_record() {
                 columns: own
                     .then(|| {
                         (
-                            "id".to_owned(),
+                            "id".into(),
                             pbps_model::PartitionColumn {
                                 default: Some("app.f(1)".into()),
                                 not_null: false,

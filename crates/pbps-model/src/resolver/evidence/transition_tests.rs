@@ -2088,7 +2088,7 @@ mod inline_binding_floor {
         else {
             panic!("add column fixture")
         };
-        let owner = Surface::Column(table.column(name.as_str()));
+        let owner = Surface::Column(table.column(name.raw()));
         column.value_source = crate::ValueSource::None;
         let mut compiled = serde_json::to_value(&compiled).unwrap();
         compiled["prerequisites"]

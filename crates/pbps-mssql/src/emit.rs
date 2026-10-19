@@ -19,6 +19,7 @@
 //! [`Statement::own_batch`] — the block declares a variable, and two of them in
 //! one batch would collide on the name.
 
+use pbps_model::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Created, DialectError, Statement};
@@ -326,7 +327,15 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             row,
             defaults,
             types,
-        } => insert_row(table, key_column, *identity_key, key, row, defaults, types),
+        } => insert_row(
+            table,
+            key_column.raw(),
+            *identity_key,
+            key,
+            row,
+            defaults,
+            types,
+        ),
 
         Change::UpdateRow {
             table,
@@ -341,7 +350,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             key_type: _,
         } => update_row(
             table,
-            key_column,
+            key_column.raw(),
             key,
             columns,
             unchanged,
@@ -373,10 +382,10 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             // old type has no way back from its own rendering: `image`, which
             // has no conversion from text at all, and the two spatial types,
             // whose text leaves out the SRID (DECISIONS 143 and 471).
-            let mut predicates = vec![format!("{} = {}", quote(key_column)?, row_key(key))];
+            let mut predicates = vec![format!("{} = {}", quote(key_column.raw())?, row_key(key))];
             for (column, cell) in row {
                 predicates.extend(recorded_cell(
-                    column,
+                    column.raw(),
                     cell,
                     Held::of(types.get(column), after_types.get(column)),
                 )?);
@@ -390,13 +399,13 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                  DELETE FROM {} WHERE {};\n\
                  {}\n\
                  {}",
-                crate::preflight::still_referenced(table, key_column, key)?,
+                crate::preflight::still_referenced(table, key_column.raw(), key)?,
                 qualified(table)?,
                 predicates.join(" AND "),
                 exactly_one_row(table, key),
                 // And the row stayed gone: a trigger that put it back would
                 // otherwise be read back and recorded as this plan's result.
-                gone_row(table, key, key_column)?
+                gone_row(table, key, key_column.raw())?
             )))
         }
 
@@ -539,7 +548,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
                 Statement::new(format!(
                     "ALTER TABLE {} ADD {};",
                     qualified(table)?,
-                    column_definition(table, name, column)?
+                    column_definition(table, name.raw(), column)?
                 ))
                 .own_batch()
                 .creating(Created::Column(table.clone(), name.clone())),
@@ -549,9 +558,9 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         Change::DropColumn { column, .. } => Ok(vec![
             Statement::new(format!(
                 "{}\nALTER TABLE {} DROP COLUMN {};",
-                drop_default_block(&column.table, &column.name)?,
+                drop_default_block(&column.table, column.name.raw())?,
                 qualified(&column.table)?,
-                quote(&column.name)?
+                quote(column.name.raw())?
             ))
             .own_batch(),
         ]),
@@ -573,17 +582,19 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         } => {
             let mut sql = format!(
                 "EXEC sp_rename {}, {}, 'COLUMN';",
-                literal(&format!("{}.{}", qualified(table)?, quote(from)?)),
-                literal(to)
+                literal(&format!("{}.{}", qualified(table)?, quote(from.raw())?)),
+                literal(to.raw())
             );
-            let new = default_constraint_name(table, to);
-            let fallback = fallback_default_constraint_name(table, to);
+            let new = default_constraint_name(table, to.raw());
+            let fallback = fallback_default_constraint_name(table, to.raw());
             let olds = std::iter::once(table)
                 .chain(table_was)
-                .flat_map(|t| generated_default_names(t, from));
+                .flat_map(|t| generated_default_names(t, from.raw()));
             for old in olds {
                 // After `sp_rename`, so the column is found by its new name.
-                if let Some(rename) = rename_generated_default(table, to, &old, &new, &fallback)? {
+                if let Some(rename) =
+                    rename_generated_default(table, to.raw(), &old, &new, &fallback)?
+                {
                     sql.push('\n');
                     sql.push_str(&rename);
                 }
@@ -602,7 +613,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             let alter = format!(
                 "ALTER TABLE {} ALTER COLUMN {} {}{} {}{};",
                 qualified(&column.table)?,
-                quote(&column.name)?,
+                quote(column.name.raw())?,
                 normalized,
                 collate_clause(to_collation.as_ref())?,
                 null_clause(*to_nullable),
@@ -611,7 +622,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             Ok(vec![
                 Statement::new(preserve_default_during_retype(
                     &column.table,
-                    &column.name,
+                    column.name.raw(),
                     &alter,
                 )?)
                 .own_batch(),
@@ -643,7 +654,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             one(format!(
                 "ALTER TABLE {} ALTER COLUMN {} {}{} {}{};",
                 qualified(&column.table)?,
-                quote(&column.name)?,
+                quote(column.name.raw())?,
                 normalized,
                 collate_clause(collation.as_ref())?,
                 null_clause(*to_nullable),
@@ -664,13 +675,13 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         } => one(format!(
             "ALTER TABLE {} ADD {};",
             qualified(table)?,
-            computed_definition(name, computed)?
+            computed_definition(name.raw(), computed)?
         )),
         // No default can stand on a computed column, so none is looked for.
         Change::DropComputedColumn { table, name, .. } => one(format!(
             "ALTER TABLE {} DROP COLUMN {};",
             qualified(table)?,
-            quote(name)?
+            quote(name.raw())?
         )),
 
         // Refused by validation: this model holds generated columns for
@@ -703,15 +714,15 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             let table = qualified(&column.table)?;
             let mut sql = String::new();
             if from.is_some() {
-                sql.push_str(&drop_default_block(&column.table, &column.name)?);
+                sql.push_str(&drop_default_block(&column.table, column.name.raw())?);
                 sql.push('\n');
             }
             if let Some(expr) = to {
                 sql.push_str(&format!(
                     "ALTER TABLE {table} ADD CONSTRAINT {} DEFAULT ({}) FOR {};",
-                    quote(&default_constraint_name(&column.table, &column.name))?,
+                    quote(&default_constraint_name(&column.table, column.name.raw()))?,
                     verbatim(expr),
-                    quote(&column.name)?
+                    quote(column.name.raw())?
                 ));
             }
             let sql = sql.trim_end().to_owned();
@@ -961,13 +972,13 @@ fn insert_row(
     identity_key: bool,
     key: &RowKey,
     row: &Row,
-    defaults: &BTreeMap<String, String>,
-    types: &BTreeMap<String, ColumnType>,
+    defaults: &BTreeMap<ColumnName, String>,
+    types: &BTreeMap<ColumnName, ColumnType>,
 ) -> Sql {
     let mut columns = vec![quote(key_column)?];
     let mut values = vec![row_key(key)];
     for (column, v) in row.columns() {
-        columns.push(quote(column)?);
+        columns.push(quote(column.raw())?);
         values.push(value_literal(v));
     }
     // What the row must hold afterwards: a trigger that deleted it again,
@@ -981,15 +992,15 @@ fn insert_row(
     let mut cells = Vec::new();
     for (column, v) in row.columns() {
         let held = recorded_cell(
-            column,
+            column.raw(),
             &Cell::Value(v.clone()),
             types.get(column).map(Held::same),
         )?;
         cells.push(match (held, v) {
             (Some(held), _) => held,
-            (None, Value::Null) => format!("{} IS NULL", quote(column)?),
+            (None, Value::Null) => format!("{} IS NULL", quote(column.raw())?),
             (None, v @ (Value::Bool(_) | Value::Int(_) | Value::Text(_))) => {
-                format!("{} = {}", quote(column)?, value_literal(v))
+                format!("{} = {}", quote(column.raw())?, value_literal(v))
             }
         });
     }
@@ -1003,12 +1014,12 @@ fn insert_row(
     // above; a plan made before it travelled names none, and holds nothing
     // here.
     for (column, ty) in types {
-        if row.get(column).is_some() {
+        if row.get(column.raw()).is_some() {
             continue;
         }
         cells.extend(match defaults.get(column) {
-            Some(default) => defaulted_cell(column, default, Some(Held::same(ty)))?,
-            None => Some(format!("{} IS NULL", quote(column)?)),
+            Some(default) => defaulted_cell(column.raw(), default, Some(Held::same(ty)))?,
+            None => Some(format!("{} IS NULL", quote(column.raw())?)),
         });
     }
     let wrote = wrote_the_row(table, key, key_column, KeySpelling::Inserted, &cells)?;
@@ -1063,10 +1074,10 @@ fn update_row(
     table: &TableName,
     key_column: &str,
     key: &RowKey,
-    columns: &BTreeMap<String, (Cell, Cell)>,
-    unchanged: &BTreeMap<String, Cell>,
-    types: &BTreeMap<String, ColumnType>,
-    after_types: &BTreeMap<String, ColumnType>,
+    columns: &BTreeMap<ColumnName, (Cell, Cell)>,
+    unchanged: &BTreeMap<ColumnName, Cell>,
+    types: &BTreeMap<ColumnName, ColumnType>,
+    after_types: &BTreeMap<ColumnName, ColumnType>,
 ) -> Sql {
     // The type the *precondition* reads a cell by is the one the recorded
     // state holds it in; the type the *postcondition* reads it by is the one
@@ -1077,8 +1088,8 @@ fn update_row(
     // *and* the type the column has by the time the `UPDATE` runs, which are
     // two types where this plan retypes the column (DECISIONS 149). The
     // postcondition asks only what the row holds afterwards, which is one.
-    let before_ty = |column: &String| Held::of(types.get(column), after_types.get(column));
-    let after_ty = |column: &String| {
+    let before_ty = |column: &ColumnName| Held::of(types.get(column), after_types.get(column));
+    let after_ty = |column: &ColumnName| {
         after_types
             .get(column)
             .or_else(|| types.get(column))
@@ -1087,7 +1098,7 @@ fn update_row(
     let mut sets = Vec::with_capacity(columns.len());
     let mut recorded = Vec::new();
     for (column, (from, to)) in columns {
-        let quoted = quote(column)?;
+        let quoted = quote(column.raw())?;
         // `DEFAULT` is the keyword: it asks the engine to evaluate the
         // column's default, which is the one thing a literal cannot say.
         let rhs = match to {
@@ -1095,10 +1106,10 @@ fn update_row(
             Cell::Default(_) => "DEFAULT".to_owned(),
         };
         sets.push(format!("{quoted} = {rhs}"));
-        recorded.extend(recorded_cell(column, from, before_ty(column))?);
+        recorded.extend(recorded_cell(column.raw(), from, before_ty(column))?);
     }
     for (column, held) in unchanged {
-        recorded.extend(recorded_cell(column, held, before_ty(column))?);
+        recorded.extend(recorded_cell(column.raw(), held, before_ty(column))?);
     }
     // An empty SET is not valid T-SQL, and the differ never produces one — it
     // emits an `UpdateRow` only for columns that differ. Refusing rather than
@@ -1140,10 +1151,10 @@ fn update_row(
     // application's business.
     let mut cells = Vec::new();
     for (column, (_, to)) in columns {
-        cells.extend(recorded_cell(column, to, after_ty(column))?);
+        cells.extend(recorded_cell(column.raw(), to, after_ty(column))?);
     }
     for (column, held) in unchanged {
-        cells.extend(recorded_cell(column, held, after_ty(column))?);
+        cells.extend(recorded_cell(column.raw(), held, after_ty(column))?);
     }
     sql.push('\n');
     sql.push_str(&wrote_the_row(
@@ -1605,10 +1616,10 @@ pub(crate) fn verbatim(expression: &str) -> String {
     format!("{expression}\n")
 }
 
-fn column_list(columns: &[String]) -> Result<String, DialectError> {
+fn column_list(columns: &[ColumnName]) -> Result<String, DialectError> {
     Ok(columns
         .iter()
-        .map(|c| quote(c))
+        .map(|c| quote(c.raw()))
         .collect::<Result<Vec<_>, _>>()?
         .join(", "))
 }
@@ -1817,7 +1828,7 @@ fn create_index(
             };
             Ok(format!(
                 "{} {}",
-                quote(column)?,
+                quote(column.raw())?,
                 if c.descending { "DESC" } else { "ASC" }
             ))
         })
@@ -1941,7 +1952,7 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
         });
         body.push(generated_column_definition(
             name,
-            col_name,
+            col_name.raw(),
             column,
             generated.as_deref(),
         )?);
@@ -1950,7 +1961,7 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     // end, so a table created here and one changed in place agree on where a
     // computed column stands (#1174).
     for (col_name, computed) in &table.computed {
-        body.push(computed_definition(col_name, computed)?);
+        body.push(computed_definition(col_name.raw(), computed)?);
     }
     // The primary key goes inline; every other constraint is added afterwards,
     // so that creating a table and altering one take the same code path and cannot
@@ -1966,8 +1977,8 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     if let Some(st) = &table.system_time {
         body.push(format!(
             "PERIOD FOR SYSTEM_TIME ({}, {})",
-            quote(&st.start)?,
-            quote(&st.end)?
+            quote(st.start.raw())?,
+            quote(st.end.raw())?
         ));
         if let Some(v) = &st.versioning {
             let retention = match &v.retention {
@@ -2111,7 +2122,7 @@ pub fn generated_default_names(table: &TableName, column: &str) -> Vec<String> {
 /// Renames a table, then each default `pbps` generated for it to the name the
 /// new table would generate (#975). `defaults` are the columns that carry one,
 /// by the names they have at this point in the plan.
-fn rename_table(from: &TableName, to: &TableName, defaults: &[String]) -> Sql {
+fn rename_table(from: &TableName, to: &TableName, defaults: &[ColumnName]) -> Sql {
     let mut out = Vec::new();
     // `sp_rename` cannot move a table between schemas, and `ALTER SCHEMA
     // TRANSFER` cannot rename it. A rename that does both therefore needs both,
@@ -2152,17 +2163,17 @@ fn rename_table(from: &TableName, to: &TableName, defaults: &[String]) -> Sql {
     let renames: Vec<String> = defaults
         .iter()
         .flat_map(|column| {
-            generated_default_names(from, column)
+            generated_default_names(from, column.raw())
                 .into_iter()
                 .map(move |old| (column, old))
         })
         .map(|(column, old)| {
             rename_generated_default(
                 to,
-                column,
+                column.raw(),
                 &old,
-                &default_constraint_name(to, column),
-                &fallback_default_constraint_name(to, column),
+                &default_constraint_name(to, column.raw()),
+                &fallback_default_constraint_name(to, column.raw()),
             )
         })
         .collect::<Result<Vec<_>, _>>()?
@@ -3108,7 +3119,7 @@ mod tests {
         let mut column = Column::new(ty("int")).not_null();
         column.value_source = pbps_model::ValueSource::Default("0".into());
         let mut t = Table::default();
-        t.columns.insert(long_column.clone(), column);
+        t.columns.insert(long_column.clone().into(), column);
         let created = sql_of(&Change::CreateTable {
             uid: uid("t_k7x2mq"),
             name: table.clone(),
@@ -3796,7 +3807,7 @@ mod tests {
     fn row(cells: &[(&str, Value)]) -> Row {
         cells
             .iter()
-            .map(|(c, v)| ((*c).to_owned(), v.clone()))
+            .map(|(c, v)| ((*c).into(), v.clone()))
             .collect()
     }
 
@@ -3804,7 +3815,7 @@ mod tests {
     fn an_insert_names_its_columns_and_leads_with_the_key() {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.order_status"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             identity_key: false,
             key: RowKey::from("new"),
             defaults: Default::default(),
@@ -3845,22 +3856,22 @@ mod tests {
     fn an_insert_holds_the_columns_it_left_to_their_defaults() {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             identity_key: false,
             key: RowKey::from("a"),
             row: row(&[("label", Value::Text("New".to_owned()))]),
             defaults: [
-                ("sort".to_owned(), "((0))".to_owned()),
-                ("note".to_owned(), "(NULL)".to_owned()),
+                ("sort".into(), "((0))".to_owned()),
+                ("note".into(), "(NULL)".to_owned()),
                 // Nothing the engine has to run is asked about: it has no
                 // value before it runs, and a sequence would be consumed.
-                ("seq".to_owned(), "(NEXT VALUE FOR dbo.s)".to_owned()),
-                ("stamp".to_owned(), "(getdate())".to_owned()),
+                ("seq".into(), "(NEXT VALUE FOR dbo.s)".to_owned()),
+                ("stamp".into(), "(getdate())".to_owned()),
                 // A type with no native `=` is held like any other: the
                 // comparison is of the text the read-back renders.
-                ("doc".to_owned(), "('<a/>')".to_owned()),
+                ("doc".into(), "('<a/>')".to_owned()),
                 // A plan made before the types travelled carries none.
-                ("old".to_owned(), "((1))".to_owned()),
+                ("old".into(), "((1))".to_owned()),
             ]
             .into_iter()
             .collect(),
@@ -3881,7 +3892,7 @@ mod tests {
                 ("body", "xml"),
             ]
             .into_iter()
-            .map(|(c, t)| (c.to_owned(), ty(t)))
+            .map(|(c, t)| (c.into(), ty(t)))
             .collect(),
         });
         let sql = sql[0].replace("\n)", ")");
@@ -3924,7 +3935,7 @@ mod tests {
     fn an_identity_key_is_pinned_inside_one_statement_that_turns_the_switch_off_again() {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.t"),
-            key_column: "id".to_owned(),
+            key_column: "id".into(),
             identity_key: true,
             key: RowKey::from("7"),
             defaults: Default::default(),
@@ -3956,7 +3967,7 @@ mod tests {
     fn a_plain_key_gets_no_identity_switch() {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             identity_key: false,
             key: RowKey::from("a"),
             defaults: Default::default(),
@@ -3973,7 +3984,7 @@ mod tests {
     fn an_insert_always_writes_the_column_list() {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             identity_key: false,
             key: RowKey::from("a"),
             defaults: Default::default(),
@@ -3990,10 +4001,10 @@ mod tests {
             types: Default::default(),
             after_types: Default::default(),
             table: tname("dbo.order_status"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("new"),
             columns: [(
-                "label".to_owned(),
+                "label".into(),
                 (
                     Cell::Value(Value::Text("New".to_owned())),
                     Cell::Value(Value::Text("Opened".to_owned())),
@@ -4046,44 +4057,38 @@ mod tests {
         let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
         let sql = sql_of(&Change::UpdateRow {
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("a"),
             columns: [
-                ("label".to_owned(), cell(text("Old"), text("New"))),
+                ("label".into(), cell(text("Old"), text("New"))),
+                ("since".into(), cell(text("2026-09-03"), text("2026-09-04"))),
                 (
-                    "since".to_owned(),
-                    cell(text("2026-09-03"), text("2026-09-04")),
-                ),
-                (
-                    "flag".to_owned(),
+                    "flag".into(),
                     cell(
                         Cell::Value(Value::Bool(true)),
                         Cell::Value(Value::Bool(false)),
                     ),
                 ),
                 (
-                    "rank".to_owned(),
+                    "rank".into(),
                     cell(Cell::Value(Value::Null), Cell::Value(Value::Int(2))),
                 ),
                 (
-                    "sort".to_owned(),
+                    "sort".into(),
                     cell(
                         Cell::Default("((0))".to_owned()),
                         Cell::Value(Value::Int(3)),
                     ),
                 ),
                 (
-                    "stamp".to_owned(),
+                    "stamp".into(),
                     cell(Cell::Default("(getdate())".to_owned()), text("x")),
                 ),
                 (
-                    "doc".to_owned(),
+                    "doc".into(),
                     cell(Cell::Default("('')".to_owned()), text("<a/>")),
                 ),
-                (
-                    "added".to_owned(),
-                    cell(Cell::Value(Value::Null), text("y")),
-                ),
+                ("added".into(), cell(Cell::Value(Value::Null), text("y"))),
             ]
             .into_iter()
             .collect(),
@@ -4098,7 +4103,7 @@ mod tests {
                 ("doc", "xml"),
             ]
             .into_iter()
-            .map(|(c, t)| (c.to_owned(), t.parse::<ColumnType>().unwrap()))
+            .map(|(c, t)| (c.into(), t.parse::<ColumnType>().unwrap()))
             .collect(),
             after_types: Default::default(),
             key_type: None,
@@ -4165,17 +4170,17 @@ mod tests {
         let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
         let sql = sql_of(&Change::UpdateRow {
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("a"),
-            columns: [("label".to_owned(), (text("Old"), text("New")))]
+            columns: [("label".into(), (text("Old"), text("New")))]
                 .into_iter()
                 .collect(),
             unchanged: [
-                ("note".to_owned(), text("kept")),
-                ("rank".to_owned(), Cell::Value(Value::Null)),
-                ("sort".to_owned(), Cell::Default("((0))".to_owned())),
-                ("stamp".to_owned(), Cell::Default("(getdate())".to_owned())),
-                ("added".to_owned(), text("z")),
+                ("note".into(), text("kept")),
+                ("rank".into(), Cell::Value(Value::Null)),
+                ("sort".into(), Cell::Default("((0))".to_owned())),
+                ("stamp".into(), Cell::Default("(getdate())".to_owned())),
+                ("added".into(), text("z")),
             ]
             .into_iter()
             .collect(),
@@ -4187,7 +4192,7 @@ mod tests {
                 ("stamp", "datetime2"),
             ]
             .into_iter()
-            .map(|(c, t)| (c.to_owned(), ty(t)))
+            .map(|(c, t)| (c.into(), ty(t)))
             .collect(),
             after_types: Default::default(),
             key_type: None,
@@ -4241,19 +4246,19 @@ mod tests {
         ] {
             let retyped = sql_of(&Change::UpdateRow {
                 table: tname("dbo.t"),
-                key_column: "code".to_owned(),
+                key_column: "code".into(),
                 key: RowKey::from("a"),
-                columns: [("label".to_owned(), (text("Old"), text("New")))]
+                columns: [("label".into(), (text("Old"), text("New")))]
                     .into_iter()
                     .collect(),
-                unchanged: [("blob".to_owned(), text(recorded))].into_iter().collect(),
+                unchanged: [("blob".into(), text(recorded))].into_iter().collect(),
                 types: [("label", "nvarchar(50)"), ("blob", before)]
                     .into_iter()
-                    .map(|(c, t)| (c.to_owned(), ty(t)))
+                    .map(|(c, t)| (c.into(), ty(t)))
                     .collect(),
                 after_types: [("blob", after)]
                     .into_iter()
-                    .map(|(c, t)| (c.to_owned(), ty(t)))
+                    .map(|(c, t)| (c.into(), ty(t)))
                     .collect(),
                 key_type: None,
             });
@@ -4272,19 +4277,19 @@ mod tests {
         }
         let retyped = sql_of(&Change::UpdateRow {
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("a"),
-            columns: [("label".to_owned(), (text("Old"), text("New")))]
+            columns: [("label".into(), (text("Old"), text("New")))]
                 .into_iter()
                 .collect(),
-            unchanged: [("blob".to_owned(), text("0x02"))].into_iter().collect(),
+            unchanged: [("blob".into(), text("0x02"))].into_iter().collect(),
             types: [("label", "nvarchar(50)"), ("blob", "image")]
                 .into_iter()
-                .map(|(c, t)| (c.to_owned(), ty(t)))
+                .map(|(c, t)| (c.into(), ty(t)))
                 .collect(),
             after_types: [("blob", "varbinary(max)")]
                 .into_iter()
-                .map(|(c, t)| (c.to_owned(), ty(t)))
+                .map(|(c, t)| (c.into(), ty(t)))
                 .collect(),
             key_type: None,
         });
@@ -4301,15 +4306,15 @@ mod tests {
         // read-back rendered, and no conversion stands between them.
         let held = sql_of(&Change::UpdateRow {
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("a"),
-            columns: [("label".to_owned(), (text("Old"), text("New")))]
+            columns: [("label".into(), (text("Old"), text("New")))]
                 .into_iter()
                 .collect(),
-            unchanged: [("blob".to_owned(), text("0x02"))].into_iter().collect(),
+            unchanged: [("blob".into(), text("0x02"))].into_iter().collect(),
             types: [("label", "nvarchar(50)"), ("blob", "image")]
                 .into_iter()
-                .map(|(c, t)| (c.to_owned(), ty(t)))
+                .map(|(c, t)| (c.into(), ty(t)))
                 .collect(),
             after_types: Default::default(),
             key_type: None,
@@ -4336,31 +4341,31 @@ mod tests {
         let text = |s: &str| Cell::Value(Value::Text(s.to_owned()));
         let sql = sql_of(&Change::UpdateRow {
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("a"),
             columns: [
-                ("label".to_owned(), (text("Old"), text("New"))),
+                ("label".into(), (text("Old"), text("New"))),
                 // Added by this same plan: the differ's `before` is NULL by
                 // convention, not something the base recorded.
-                ("added".to_owned(), (Cell::Value(Value::Null), text("y"))),
+                ("added".into(), (Cell::Value(Value::Null), text("y"))),
                 // Retyped by this same plan: `varchar` before, `date` after,
                 // and the two render differently.
-                ("since".to_owned(), (text("2026-09-03"), text("2026-09-04"))),
+                ("since".into(), (text("2026-09-03"), text("2026-09-04"))),
             ]
             .into_iter()
             .collect(),
-            unchanged: [("note".to_owned(), text("kept"))].into_iter().collect(),
+            unchanged: [("note".into(), text("kept"))].into_iter().collect(),
             types: [
                 ("label", "nvarchar(50)"),
                 ("note", "nvarchar(50)"),
                 ("since", "varchar(10)"),
             ]
             .into_iter()
-            .map(|(c, t)| (c.to_owned(), ty(t)))
+            .map(|(c, t)| (c.into(), ty(t)))
             .collect(),
             after_types: [("added", "nvarchar(50)"), ("since", "date")]
                 .into_iter()
-                .map(|(c, t)| (c.to_owned(), ty(t)))
+                .map(|(c, t)| (c.into(), ty(t)))
                 .collect(),
             key_type: None,
         });
@@ -4421,10 +4426,10 @@ mod tests {
             types: Default::default(),
             after_types: Default::default(),
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("a"),
             columns: [(
-                "sort".to_owned(),
+                "sort".into(),
                 (Cell::Value(Value::Int(3)), Cell::Default("0".to_owned())),
             )]
             .into_iter()
@@ -4455,7 +4460,7 @@ mod tests {
                     types: Default::default(),
                     after_types: Default::default(),
                     table: tname("dbo.t"),
-                    key_column: "code".to_owned(),
+                    key_column: "code".into(),
                     key: RowKey::from("a"),
                     columns: BTreeMap::new(),
                     key_type: None,
@@ -4473,35 +4478,32 @@ mod tests {
     fn a_delete_holds_the_row_to_what_the_plan_recorded() {
         let sql = sql_of(&Change::DeleteRow {
             table: tname("dbo.order_status"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
             dropped: [
                 (
-                    "label".to_owned(),
+                    "label".into(),
                     Cell::Value(Value::Text("Dropped baseline".into())),
                 ),
-                ("dropped_only".to_owned(), Cell::Value(Value::Null)),
+                ("dropped_only".into(), Cell::Value(Value::Null)),
             ]
             .into_iter()
             .collect(),
             row: [
-                (
-                    "label".to_owned(),
-                    Cell::Value(Value::Text("Old".to_owned())),
-                ),
-                ("rank".to_owned(), Cell::Value(Value::Null)),
+                ("label".into(), Cell::Value(Value::Text("Old".to_owned()))),
+                ("rank".into(), Cell::Value(Value::Null)),
                 // No type, so nothing to compare it by: carried, not held.
                 (
-                    "shape".to_owned(),
+                    "shape".into(),
                     Cell::Value(Value::Text("POINT (1 1)".to_owned())),
                 ),
             ]
             .into_iter()
             .collect(),
             types: [
-                ("label".to_owned(), ty("nvarchar(50)")),
-                ("rank".to_owned(), ty("int")),
+                ("label".into(), ty("nvarchar(50)")),
+                ("rank".into(), ty("int")),
             ]
             .into_iter()
             .collect(),
@@ -4529,7 +4531,7 @@ mod tests {
     fn a_delete_is_keyed_on_the_primary_key_column() {
         let sql = sql_of(&Change::DeleteRow {
             table: tname("dbo.order_status"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
             dropped: Default::default(),
@@ -4765,7 +4767,7 @@ mod tests {
     fn a_quote_in_a_value_cannot_escape_the_literal() {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             identity_key: false,
             key: RowKey::from("o'brien"),
             defaults: Default::default(),
@@ -4813,7 +4815,7 @@ mod tests {
     fn a_boolean_goes_out_as_a_word_and_an_integer_bare() {
         let sql = sql_of(&Change::InsertRow {
             table: tname("dbo.t"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             identity_key: false,
             key: RowKey::from("a"),
             defaults: Default::default(),
@@ -4851,7 +4853,7 @@ mod tests {
         for c in [
             Change::InsertRow {
                 table: tname("dbo.t"),
-                key_column: "code".to_owned(),
+                key_column: "code".into(),
                 identity_key: false,
                 key: RowKey::from("a"),
                 defaults: Default::default(),
@@ -4860,7 +4862,7 @@ mod tests {
             },
             Change::DeleteRow {
                 table: tname("dbo.t"),
-                key_column: "code".to_owned(),
+                key_column: "code".into(),
                 key: RowKey::from("a"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
                 dropped: Default::default(),

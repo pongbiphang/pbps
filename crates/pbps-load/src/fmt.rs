@@ -83,7 +83,7 @@ pub fn render_partitioned(
 
     s.push_str("\ncolumns:\n");
     for (col_name, c) in &table.columns {
-        let _ = writeln!(s, "  {}:", scalar(col_name));
+        let _ = writeln!(s, "  {}:", scalar(col_name.raw()));
         // A column with an owned sequence is written as the `serial` it was
         // declared as, which also says NOT NULL (DEC-1631.1).
         let serial = match &c.value_source {
@@ -162,7 +162,7 @@ pub fn render_partitioned(
         if let Some(Intent::RenameColumn { from, .. }) = intents.iter().find(|i| {
             matches!(i, Intent::RenameColumn { table: t, to, .. } if t == name && to == col_name)
         }) {
-            let _ = writeln!(s, "    renamed_from: {}", scalar(from));
+            let _ = writeln!(s, "    renamed_from: {}", scalar(from.raw()));
         }
     }
 
@@ -172,7 +172,7 @@ pub fn render_partitioned(
             let _ = writeln!(
                 s,
                 "  {}: {{expression: {}{}{}}}",
-                scalar(col_name),
+                scalar(col_name.raw()),
                 scalar(&c.expression),
                 if c.persisted { ", persisted: true" } else { "" },
                 if c.not_null { ", not_null: true" } else { "" }
@@ -359,8 +359,12 @@ pub fn render_partitioned(
                             if own.not_null {
                                 fields.push("nullable: false".to_owned());
                             }
-                            let _ =
-                                writeln!(s, "      {}: {{{}}}", scalar(column), fields.join(", "));
+                            let _ = writeln!(
+                                s,
+                                "      {}: {{{}}}",
+                                scalar(column.raw()),
+                                fields.join(", ")
+                            );
                         }
                     }
                     render_foreign_keys(&mut s, t, "    ", "");
@@ -450,7 +454,7 @@ pub fn render_partitioned(
         for (key, row) in &d.rows {
             let cells: Vec<String> = row
                 .columns()
-                .map(|(c, v)| format!("{}: {}", scalar(c), value(v)))
+                .map(|(c, v)| format!("{}: {}", scalar(c.raw()), value(v)))
                 .collect();
             // The key goes through `scalar`, so a code that looks like a number
             // or a boolean (`no`, `1`, `on` — all real status codes) comes back
@@ -598,12 +602,12 @@ fn action(a: pbps_model::ReferentialAction) -> &'static str {
     }
 }
 
-fn seq(items: &[String]) -> String {
+fn seq(items: &[impl std::borrow::Borrow<str>]) -> String {
     format!(
         "[{}]",
         items
             .iter()
-            .map(|s| scalar(s))
+            .map(|s| scalar(s.borrow()))
             .collect::<Vec<_>>()
             .join(", ")
     )
@@ -750,7 +754,11 @@ fn render_foreign_keys(s: &mut String, table: &Table, pad: &str, lead: &str) {
             scalar(&format!(
                 "{}({})",
                 fk.references_table.raw(),
-                fk.references_columns.join(", ")
+                fk.references_columns
+                    .iter()
+                    .map(pbps_model::ColumnName::raw)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))
         );
         if fk.on_delete != Default::default() {
@@ -807,8 +815,8 @@ fn render_checks_and_indexes(s: &mut String, table: &Table, pad: &str, lead: &st
                 let _ = writeln!(s, "{pad}    keys:");
                 for c in &ix.columns {
                     let (field, text) = match &c.key {
-                        pbps_model::IndexKey::Column(name) => ("column", name),
-                        pbps_model::IndexKey::Expression(text) => ("expression", text),
+                        pbps_model::IndexKey::Column(name) => ("column", name.raw()),
+                        pbps_model::IndexKey::Expression(text) => ("expression", text.as_str()),
                     };
                     let _ = write!(s, "{pad}      - {field}: {}", scalar(text));
                     if let Some(class) = &c.opclass {
@@ -1073,7 +1081,7 @@ mod tests {
                 column.description = Some(text(0).as_str().into());
                 column.value_source = pbps_model::ValueSource::Default(text(1).clone());
                 column.deprecated = Some(text(2).as_str().into());
-                expected.table.columns.insert(key.clone(), column);
+                expected.table.columns.insert(key.clone().into(), column);
                 let mut generated = base.table.columns["g"].clone();
                 match &mut generated.value_source {
                     pbps_model::ValueSource::Generated(g) => g.expression = text(3).clone(),
@@ -1082,7 +1090,10 @@ mod tests {
                     | pbps_model::ValueSource::Identity(_)
                     | pbps_model::ValueSource::Sequence(_) => panic!("generated fixture"),
                 }
-                expected.table.columns.insert(format!("+{i}"), generated);
+                expected
+                    .table
+                    .columns
+                    .insert(format!("+{i}").into(), generated);
                 let mut check = base.table.checks["ck"].clone();
                 check.expression = text(4).clone();
                 expected.table.checks.insert(key.clone(), check);
@@ -1091,7 +1102,10 @@ mod tests {
                 expected.table.indexes.insert(key, index);
                 let mut computed = base.table.computed["c"].clone();
                 computed.expression = text(6).clone();
-                expected.table.computed.insert(format!("-{i}"), computed);
+                expected
+                    .table
+                    .computed
+                    .insert(format!("-{i}").into(), computed);
                 let mut row = base
                     .table
                     .data
@@ -1143,8 +1157,8 @@ mod tests {
         for i in 0..cases.len() {
             let text = |offset: usize| &cases[(i + offset) % cases.len()];
             let key = i.to_string();
-            let a = &expected.table.columns[&key];
-            let b = back.table.columns.get(&key).unwrap_or_else(|| {
+            let a = &expected.table.columns[key.as_str()];
+            let b = back.table.columns.get(key.as_str()).unwrap_or_else(|| {
                 panic!(
                     "missing column for description {:?}, default {:?}, deprecated {:?}",
                     text(0),
@@ -1161,8 +1175,8 @@ mod tests {
             assert_eq!(a.value_source, b.value_source, "default: {:?}", text(1));
             assert_eq!(a.deprecated, b.deprecated, "deprecated: {:?}", text(2));
             assert_eq!(
-                expected.table.columns.get(&format!("+{i}")),
-                back.table.columns.get(&format!("+{i}")),
+                expected.table.columns.get(format!("+{i}").as_str()),
+                back.table.columns.get(format!("+{i}").as_str()),
                 "generated: {:?}",
                 text(3)
             );
@@ -1179,8 +1193,8 @@ mod tests {
                 text(5)
             );
             assert_eq!(
-                expected.table.computed.get(&format!("-{i}")),
-                back.table.computed.get(&format!("-{i}")),
+                expected.table.computed.get(format!("-{i}").as_str()),
+                back.table.computed.get(format!("-{i}").as_str()),
                 "computed: {:?}",
                 text(6)
             );
@@ -1764,7 +1778,7 @@ indexes:
                 expected
                     .table
                     .columns
-                    .insert(name.clone(), base.table.columns["v"].clone());
+                    .insert(name.clone().into(), base.table.columns["v"].clone());
                 let mut row = base
                     .table
                     .data
@@ -1776,7 +1790,8 @@ indexes:
                     .unwrap()
                     .clone();
                 row.0.clear();
-                row.0.insert(name, pbps_model::Value::Text(text.clone()));
+                row.0
+                    .insert(name.into(), pbps_model::Value::Text(text.clone()));
                 assert!(
                     expected
                         .table
@@ -2151,10 +2166,7 @@ indexes:
             round_trip(&yaml);
             let t = crate::load_table_str(Path::new("t.yml"), &yaml).unwrap();
             let st = t.table.system_time.clone().expect(block);
-            assert_eq!(
-                (st.start.as_str(), st.end.as_str()),
-                ("valid_from", "valid_to")
-            );
+            assert_eq!((st.start.raw(), st.end.raw()), ("valid_from", "valid_to"));
             assert_eq!(st.hidden, hidden, "{block}");
             assert_eq!(
                 st.versioning.as_ref().map(|v| v.history.raw().to_string()),
@@ -2257,7 +2269,7 @@ indexes:
                 .1
         };
         let fk = &own("ev_old").foreign_keys["old_w_fk"];
-        assert_eq!(fk.columns, ["w"]);
+        assert_eq!(fk.columns, [pbps_model::ColumnName::from("w")]);
         assert_eq!(fk.references_table.raw().to_string(), "app.archive");
         assert_eq!(fk.on_delete, pbps_model::ReferentialAction::Cascade);
         assert!(own("ev_plain").foreign_keys.is_empty());
@@ -2335,7 +2347,13 @@ indexes:
                 .columns
         };
         let old = own("ev_old");
-        assert_eq!(old.keys().collect::<Vec<_>>(), ["v", "w"]);
+        assert_eq!(
+            old.keys().cloned().collect::<Vec<_>>(),
+            [
+                pbps_model::ColumnName::from("v"),
+                pbps_model::ColumnName::from("w")
+            ]
+        );
         assert_eq!(old["v"].default.as_deref(), Some("7"));
         assert!(old["v"].not_null);
         assert_eq!(old["w"].default.as_deref(), Some("'y'::text"));
@@ -2424,7 +2442,7 @@ indexes:
         let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
         assert_eq!(
             t.table.partition_by.as_ref().map(|p| p.columns.clone()),
-            Some(vec!["ts".to_owned()])
+            Some(vec![pbps_model::ColumnName::from("ts")])
         );
         let bounds: Vec<(String, B)> = t
             .partitions
@@ -2510,7 +2528,7 @@ indexes:
             let parent = pbps_model::Table {
                 partition_by: Some(pbps_model::PartitionBy {
                     external: false,
-                    columns: vec!["a".to_owned()],
+                    columns: vec!["a".into()],
                     strategy: Default::default(),
                 }),
                 ..crate::load_table_str(
@@ -2909,9 +2927,18 @@ indexes:
     fn a_boolean_looking_column_is_a_column_in_every_key_form() {
         let yaml = "table: public.t\ncolumns:\n  n: {type: int, nullable: false}\n  y: {type: int}\n  on: {type: int}\n\nprimary_key: [n]\n\nunique:\n  uq_y: [y]\n  uq_on: {columns: [on], storage_parameters: {fillfactor: 70}}\n";
         let t = crate::load_table_str(Path::new("t.yml"), yaml).unwrap();
-        assert_eq!(t.table.primary_key.as_ref().unwrap().columns, ["n"]);
-        assert_eq!(t.table.unique["uq_y"].columns, ["y"]);
-        assert_eq!(t.table.unique["uq_on"].columns, ["on"]);
+        assert_eq!(
+            t.table.primary_key.as_ref().unwrap().columns,
+            [pbps_model::ColumnName::from("n")]
+        );
+        assert_eq!(
+            t.table.unique["uq_y"].columns,
+            [pbps_model::ColumnName::from("y")]
+        );
+        assert_eq!(
+            t.table.unique["uq_on"].columns,
+            [pbps_model::ColumnName::from("on")]
+        );
         let named = "table: public.t\ncolumns:\n  n: {type: int, nullable: false}\nprimary_key: {name: t_pkey, columns: [n]}\n";
         let t = crate::load_table_str(Path::new("t.yml"), named).unwrap();
         assert_eq!(

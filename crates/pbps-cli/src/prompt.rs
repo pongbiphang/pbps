@@ -71,7 +71,7 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
             disappeared,
             appeared,
         } => {
-            let mut pairs: Vec<(&String, &String)> = disappeared
+            let mut pairs: Vec<(&pbps_model::ColumnName, &pbps_model::ColumnName)> = disappeared
                 .iter()
                 .flat_map(|from| appeared.iter().map(move |to| (from, to)))
                 .collect();
@@ -81,13 +81,17 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
             // depend on hash iteration, and "press 1" would mean different
             // things on two machines.
             pairs.sort_by(|a, b| {
-                similarity(b.0, b.1)
-                    .total_cmp(&similarity(a.0, a.1))
+                similarity(b.0.raw(), b.1.raw())
+                    .total_cmp(&similarity(a.0.raw(), a.1.raw()))
                     .then_with(|| (a.0, a.1).cmp(&(b.0, b.1)))
             });
             for (from, to) in pairs {
                 out.push(Choice {
-                    label: format!("{from} was renamed to {to}"),
+                    label: format!(
+                        "{from} was renamed to {to}",
+                        from = from.shown(),
+                        to = to.shown()
+                    ),
                     kind: ChoiceKind::Rename(Intent::RenameColumn {
                         table: table.clone(),
                         from: from.clone(),
@@ -97,7 +101,10 @@ pub fn choices(b: &Blocker) -> Vec<Choice> {
             }
             for from in disappeared {
                 out.push(Choice {
-                    label: format!("{from} was dropped (you will be asked why)"),
+                    label: format!(
+                        "{from} was dropped (you will be asked why)",
+                        from = from.shown(),
+                    ),
                     kind: ChoiceKind::DropColumn(ColumnRef {
                         table: table.clone(),
                         name: from.clone(),
@@ -336,8 +343,16 @@ fn question(b: &Blocker) -> String {
             appeared,
         } => format!(
             "{table}: {} disappeared, {} is new",
-            disappeared.join(", "),
-            appeared.join(", "),
+            disappeared
+                .iter()
+                .map(|c| c.shown().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            appeared
+                .iter()
+                .map(|c| c.shown().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
             table = table.shown()
         ),
         Blocker::AmbiguousTables {
@@ -406,6 +421,33 @@ fn list(v: impl IntoIterator<Item = impl std::fmt::Display>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn column_choices_rank_raw_names_and_show_each_name_once() {
+        let from = pbps_model::ColumnName::from("a\nb\\c\u{200b}");
+        let closer = pbps_model::ColumnName::from("a\nb\\c");
+        let farther = pbps_model::ColumnName::from("\n\\c\u{200b}");
+        let blocker = Blocker::AmbiguousColumns {
+            table: TableName::new("app", "t"),
+            disappeared: vec![from.clone()],
+            appeared: vec![farther, closer.clone()],
+        };
+        let offered = choices(&blocker);
+        assert_eq!(
+            offered[0].kind,
+            ChoiceKind::Rename(Intent::RenameColumn {
+                table: TableName::new("app", "t"),
+                from,
+                to: closer,
+            })
+        );
+        assert_eq!(offered[0].label, r"a\nb\\c\u{200b} was renamed to a\nb\\c");
+        assert_eq!(
+            question(&blocker),
+            r"app.t: a\nb\\c\u{200b} disappeared, \n\\c\u{200b}, a\nb\\c is new"
+        );
+        assert_eq!(offered.len(), 3);
+    }
+
     #[test]
     fn table_rename_similarity_uses_raw_names_while_labels_are_shown() {
         let from = TableName::new("app", "a\nb\\c\u{200b}");

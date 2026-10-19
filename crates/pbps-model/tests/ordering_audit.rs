@@ -116,7 +116,7 @@ mod effects_of_each_kind {
         Table {
             columns: columns
                 .iter()
-                .map(|(n, c)| ((*n).to_owned(), c.clone()))
+                .map(|(n, c)| ((*n).into(), c.clone()))
                 .collect::<IndexMap<_, _>>(),
             ..Table::default()
         }
@@ -211,7 +211,7 @@ mod effects_of_each_kind {
                 parent: tn("t"),
                 bound: bound(),
                 columns: [(
-                    "x".to_owned(),
+                    "x".into(),
                     PartitionColumn {
                         default: Some("2".into()),
                         not_null: false,
@@ -651,13 +651,10 @@ mod effects_of_each_kind {
                     key_column: "id".into(),
                     identity_key: false,
                     key: key.clone(),
-                    row: [
-                        ("id".to_owned(), Value::Int(1)),
-                        ("x".to_owned(), Value::Int(2)),
-                    ]
-                    .into_iter()
-                    .collect(),
-                    defaults: [("y".to_owned(), "1".to_owned())].into(),
+                    row: [("id".into(), Value::Int(1)), ("x".into(), Value::Int(2))]
+                        .into_iter()
+                        .collect(),
+                    defaults: [("y".into(), "1".to_owned())].into(),
                     types: BTreeMap::new(),
                 },
             ),
@@ -667,7 +664,7 @@ mod effects_of_each_kind {
                     table: tn("t"),
                     key_column: "id".into(),
                     key: key.clone(),
-                    columns: [("x".to_owned(), (cell(1), cell(2)))].into(),
+                    columns: [("x".into(), (cell(1), cell(2)))].into(),
                     unchanged: BTreeMap::new(),
                     types: BTreeMap::new(),
                     after_types: BTreeMap::new(),
@@ -681,7 +678,7 @@ mod effects_of_each_kind {
                     key_column: "id".into(),
                     key,
                     cause: pbps_model::change::DeleteCause::Undeclared,
-                    row: [("x".to_owned(), cell(1))].into(),
+                    row: [("x".into(), cell(1))].into(),
                     dropped: BTreeMap::new(),
                     types: BTreeMap::new(),
                     after_types: BTreeMap::new(),

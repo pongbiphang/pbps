@@ -705,10 +705,10 @@ struct Parts<'a> {
 
 impl Parts<'_> {
     /// The names behind a list of attnums, or the first attnum that has none.
-    fn names(&self, attnums: &[i32]) -> Result<Vec<String>, i32> {
+    fn names(&self, attnums: &[i32]) -> Result<Vec<pbps_model::ColumnName>, i32> {
         attnums
             .iter()
-            .map(|n| self.by_attnum.get(n).map(|s| (*s).to_owned()).ok_or(*n))
+            .map(|n| self.by_attnum.get(n).map(|s| (*s).into()).ok_or(*n))
             .collect()
     }
 }
@@ -885,7 +885,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     sequence_limitations(column, &parts, None, &mut pulled);
                 }
                 if own != pbps_model::PartitionColumn::default() {
-                    own_columns.insert(column.name.clone(), own);
+                    own_columns.insert(column.name.clone().into(), own);
                 }
             }
             let mut table = Table {
@@ -924,7 +924,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 .iter()
                 .map(|c| {
                     let ty = stored_type(&c.ty).unwrap_or_else(|opaque| opaque);
-                    (c.name.clone(), pbps_model::Column::new(ty))
+                    (c.name.clone().into(), pbps_model::Column::new(ty))
                 })
                 .collect();
             for index in indexes_by_table
@@ -971,14 +971,14 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         let mut table = Table {
             columns: raw_columns
                 .iter()
-                .map(|c| (c.name.clone(), column(c, &parts, &mut pulled)))
+                .map(|c| (c.name.clone().into(), column(c, &parts, &mut pulled)))
                 .collect(),
             partition_by: raw_table
                 .partition_key
                 .clone()
                 .map(|columns| pbps_model::PartitionBy {
                     external: false,
-                    columns,
+                    columns: columns.into_iter().map(Into::into).collect(),
                     strategy: raw_table.partition_strategy,
                 }),
             ..Table::default()
@@ -1115,7 +1115,7 @@ fn implied_sequence_targets(
         let accepted = schema
             .tables
             .get(table)
-            .and_then(|t| t.columns.get(&column.name));
+            .and_then(|t| t.columns.get(column.name.as_str()));
         if accepted.is_some_and(|c| matches!(c.value_source, pbps_model::ValueSource::Sequence(_)))
             && let Some(serial) = &column.serial
         {
@@ -3329,14 +3329,14 @@ fn add_foreign_key(
 fn reference_columns(
     raw: &RawConstraint,
     by_table_and_attnum: &HashMap<(i64, i32), &str>,
-) -> Option<Vec<String>> {
+) -> Option<Vec<pbps_model::ColumnName>> {
     let table = raw.ref_table?;
     raw.ref_columns
         .iter()
         .map(|attnum| {
             by_table_and_attnum
                 .get(&(table, *attnum))
-                .map(|name| (*name).to_owned())
+                .map(|name| (*name).into())
         })
         .collect()
 }
@@ -5462,7 +5462,7 @@ mod tests {
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
         assert_eq!(
             only(&pulled).primary_key.as_ref().unwrap().columns,
-            ["d"],
+            [pbps_model::ColumnName::from("d")],
             "attnum 4 is the third column, and taking it as the fourth would \
              have found nothing at all"
         );
@@ -5636,7 +5636,13 @@ mod tests {
         };
         let pulled = assemble(&raw);
         let key = &pulled.schema.tables[&TableName::new("app", "t")].foreign_keys["t_fk"];
-        assert_eq!(key.references_columns, ["a)b", "z"]);
+        assert_eq!(
+            key.references_columns,
+            [
+                pbps_model::ColumnName::from("a)b"),
+                pbps_model::ColumnName::from("z")
+            ]
+        );
         assert_eq!(key.on_update, ReferentialAction::Cascade);
         assert!(pulled.warnings.is_empty(), "{:?}", pulled.warnings);
     }
@@ -5691,10 +5697,22 @@ mod tests {
         };
         let pulled = assemble(&raw);
         let read = &only(&pulled).indexes["t_ix"];
-        assert_eq!(read.columns[0].key.column(), Some("c"));
+        assert_eq!(
+            read.columns[0]
+                .key
+                .column()
+                .map(pbps_model::ColumnName::raw),
+            Some("c")
+        );
         assert!(read.columns[0].descending, "indoption bit 0 is DESC");
-        assert_eq!(read.columns[1].key.column(), Some("a"));
-        assert_eq!(read.include, ["b"]);
+        assert_eq!(
+            read.columns[1]
+                .key
+                .column()
+                .map(pbps_model::ColumnName::raw),
+            Some("a")
+        );
+        assert_eq!(read.include, [pbps_model::ColumnName::from("b")]);
         assert_eq!(read.filter.as_deref(), Some("(c IS NOT NULL)"));
     }
 
@@ -6076,7 +6094,14 @@ mod tests {
         assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
         let p1 = &pulled.schema.tables[&TableName::new("app", "p1")];
         let own = &p1.partition_of.as_ref().unwrap().columns;
-        assert_eq!(own.keys().collect::<Vec<_>>(), ["g", "v", "w"]);
+        assert_eq!(
+            own.keys().cloned().collect::<Vec<_>>(),
+            [
+                pbps_model::ColumnName::from("g"),
+                pbps_model::ColumnName::from("v"),
+                pbps_model::ColumnName::from("w")
+            ]
+        );
         assert_eq!(
             own["g"],
             pbps_model::PartitionColumn {

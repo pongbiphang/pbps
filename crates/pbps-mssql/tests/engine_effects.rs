@@ -22,7 +22,7 @@ fn setup() -> (Schema, IdsFile, ModuleId, Module) {
         description: None,
     };
     let mut table = Table {
-        columns: IndexMap::from([("a".to_owned(), Column::new("int".parse().unwrap()))]),
+        columns: IndexMap::from([("a".into(), Column::new("int".parse().unwrap()))]),
         ..Table::default()
     };
     table.computed.insert(
@@ -108,7 +108,7 @@ fn altering_a_function_while_a_computed_column_calling_it_stands_is_refused_by_n
             Violation::StillPresent {
                 key: ObjectKey::Part { part: PartKey::Computed(name), .. },
                 operation,
-            } if name == "c" && operation.source() == 1
+            } if name.raw() == "c" && operation.source() == 1
         )),
         "{refused:?}"
     );
@@ -125,8 +125,8 @@ fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
     let table = |with_key: bool| {
         let mut table = Table {
             columns: IndexMap::from([
-                ("id".to_owned(), Column::new("int".parse().unwrap())),
-                ("pid".to_owned(), Column::new("int".parse().unwrap())),
+                ("id".into(), Column::new("int".parse().unwrap())),
+                ("pid".into(), Column::new("int".parse().unwrap())),
             ]),
             primary_key: Some(PrimaryKey {
                 name: None,
@@ -165,8 +165,8 @@ fn rows_written_while_a_foreign_key_is_rebuilt_do_not_wait_for_it() {
             identity_key: false,
             key: RowKey::from(id.to_string().as_str()),
             row: [
-                ("id".to_owned(), Value::Int(id)),
-                ("pid".to_owned(), parent.map_or(Value::Null, Value::Int)),
+                ("id".into(), Value::Int(id)),
+                ("pid".into(), parent.map_or(Value::Null, Value::Int)),
             ]
             .into_iter()
             .collect::<Row>(),
@@ -374,9 +374,9 @@ fn retyped(a: &str, b: &str) -> Schema {
     use pbps_model::{CheckConstraint, ForeignKey, Index, IndexColumn, UniqueConstraint};
     let mut table = Table {
         columns: IndexMap::from([
-            ("id".to_owned(), Column::new(ty("int")).not_null()),
-            ("a".to_owned(), Column::new(ty(a))),
-            ("b".to_owned(), Column::new(ty(b))),
+            ("id".into(), Column::new(ty("int")).not_null()),
+            ("a".into(), Column::new(ty(a))),
+            ("b".into(), Column::new(ty(b))),
         ]),
         ..Table::default()
     };
@@ -405,7 +405,7 @@ fn retyped(a: &str, b: &str) -> Schema {
         },
     );
     let mut child = Table {
-        columns: IndexMap::from([("x".to_owned(), Column::new(ty(a)))]),
+        columns: IndexMap::from([("x".into(), Column::new(ty(a)))]),
         ..Table::default()
     };
     child.foreign_keys.insert(
@@ -441,7 +441,7 @@ fn a_storage_type_change_waits_for_every_key_and_index_over_its_column() {
     });
     let own: Vec<usize> = (0..plan.changes.len()).collect();
     assert_eq!(plan.verify(&own), []);
-    let retype = plan.at(|c| matches!(c, Change::AlterColumnType { column, .. } if column.table == t() && column.name == "a"));
+    let retype = plan.at(|c| matches!(c, Change::AlterColumnType { column, .. } if column.table == t() && column.name == "a".into()));
     for (drop, part) in [
         (
             plan.at(|c| matches!(c, Change::DropIndex { name, .. } if name == "ix_a")),
@@ -470,8 +470,9 @@ fn a_varchar_widening_requires_no_check_gone_and_a_base_type_change_does() {
         let plan = Diffed::new(&retyped("int", "varchar(10)"), &retyped("int", to));
         let own: Vec<usize> = (0..plan.changes.len()).collect();
         assert_eq!(plan.verify(&own), [], "{to}");
-        let retype =
-            plan.at(|c| matches!(c, Change::AlterColumnType { column, .. } if column.name == "b"));
+        let retype = plan.at(
+            |c| matches!(c, Change::AlterColumnType { column, .. } if column.name == "b".into()),
+        );
         plan.effects[retype].requires.iter().any(|r| {
             matches!(
                 r,

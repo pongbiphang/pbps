@@ -14,6 +14,7 @@
 //! [`Renames::apply`] rewrites, and they are the only ones it may, with a
 //! partition's parent on PostgreSQL, which a parent's rename carries (#1690).
 
+use crate::ColumnName;
 use crate::name::{ColumnRef, TableName};
 use crate::schema::Table;
 use std::borrow::Cow;
@@ -23,7 +24,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Renames {
     tables: BTreeMap<TableName, TableName>,
-    columns: BTreeMap<ColumnRef, String>,
+    columns: BTreeMap<ColumnRef, ColumnName>,
 }
 
 impl Renames {
@@ -34,7 +35,7 @@ impl Renames {
 
     /// A column renamed by this plan, under the table's **pre-rename** name —
     /// which is how every base-side constraint spells it.
-    pub fn rename_column(&mut self, from: ColumnRef, to: impl Into<String>) {
+    pub fn rename_column(&mut self, from: ColumnRef, to: impl Into<ColumnName>) {
         self.columns.insert(from, to.into());
     }
 
@@ -48,14 +49,14 @@ impl Renames {
     }
 
     /// The name this plan leaves the column under.
-    pub fn column(&self, table: &TableName, name: &str) -> String {
+    pub fn column(&self, table: &TableName, name: &ColumnName) -> ColumnName {
         self.columns
             .get(&ColumnRef::new(table.clone(), name))
             .cloned()
-            .unwrap_or_else(|| name.to_string())
+            .unwrap_or_else(|| name.clone())
     }
 
-    fn column_list(&self, table: &TableName, names: &[String]) -> Vec<String> {
+    fn column_list(&self, table: &TableName, names: &[ColumnName]) -> Vec<ColumnName> {
         names.iter().map(|n| self.column(table, n)).collect()
     }
 
@@ -198,12 +199,27 @@ mod tests {
 
         let table = sample();
         let out = r.apply(&table, &t("dbo.t"));
-        assert_eq!(out.primary_key.as_ref().unwrap().columns, ["row_id"]);
-        assert_eq!(out.unique["uq"].columns, ["label"]);
-        assert_eq!(out.indexes["ix"].columns[0].key.column(), Some("label"));
-        assert_eq!(out.indexes["ix"].include, ["remark"]);
+        assert_eq!(
+            out.primary_key.as_ref().unwrap().columns,
+            [crate::ColumnName::from("row_id")]
+        );
+        assert_eq!(out.unique["uq"].columns, [crate::ColumnName::from("label")]);
+        assert_eq!(
+            out.indexes["ix"].columns[0]
+                .key
+                .column()
+                .map(crate::ColumnName::raw),
+            Some("label")
+        );
+        assert_eq!(
+            out.indexes["ix"].include,
+            [crate::ColumnName::from("remark")]
+        );
         assert_eq!(out.foreign_keys["fk"].references_table, t("dbo.ancestor"));
-        assert_eq!(out.foreign_keys["fk"].references_columns, ["parent_id"]);
+        assert_eq!(
+            out.foreign_keys["fk"].references_columns,
+            [crate::ColumnName::from("parent_id")]
+        );
     }
 
     /// A parent's key and a partition's own column entries follow its
@@ -229,7 +245,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .columns,
-            ["at"]
+            [crate::ColumnName::from("at")]
         );
         let own = |not_null| crate::PartitionColumn {
             default: None,
@@ -239,14 +255,21 @@ mod tests {
             partition_of: Some(crate::PartitionOf {
                 parent: t("app.ev"),
                 bound: crate::PartitionBound::Default,
-                columns: [("m".to_owned(), own(true)), ("n".to_owned(), own(true))]
+                columns: [("m".into(), own(true)), ("n".into(), own(true))]
                     .into_iter()
                     .collect(),
             }),
             ..Default::default()
         };
         let out = r.apply(&partition, &t("app.ev_rest"));
-        let keys: Vec<&String> = out.partition_of.as_ref().unwrap().columns.keys().collect();
+        let keys: Vec<&str> = out
+            .partition_of
+            .as_ref()
+            .unwrap()
+            .columns
+            .keys()
+            .map(crate::ColumnName::raw)
+            .collect();
         assert_eq!(keys, ["m2", "n"]);
         // Its own index's key and `INCLUDE` columns too (#1692 review).
         let mut indexed = partition.clone();
@@ -267,8 +290,14 @@ mod tests {
         );
         let out = r.apply(&indexed, &t("app.ev_rest"));
         let index = &out.indexes["ev_rest_m"];
-        assert_eq!(index.columns[0].key.column(), Some("m2"));
-        assert_eq!(index.include, ["n", "at"]);
+        assert_eq!(
+            index.columns[0].key.column().map(crate::ColumnName::raw),
+            Some("m2")
+        );
+        assert_eq!(
+            index.include,
+            [crate::ColumnName::from("n"), crate::ColumnName::from("at")]
+        );
     }
 
     /// The negative case, and the one that matters: a filtered index's
@@ -295,6 +324,6 @@ mod tests {
         r.rename_column(ColumnRef::new(t("dbo.other"), "tag"), "label");
         let table = sample();
         let out = r.apply(&table, &t("dbo.t"));
-        assert_eq!(out.unique["uq"].columns, ["tag"]);
+        assert_eq!(out.unique["uq"].columns, [crate::ColumnName::from("tag")]);
     }
 }

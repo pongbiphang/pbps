@@ -166,7 +166,7 @@ pub(super) fn classify(
                     "declared column lacks its recorded UID",
                 ));
             }
-            let column_id = column(&table_id, declared);
+            let column_id = column(&table_id, declared.raw());
             if capture.inputs.contains_key(&column_id) {
                 assign(
                     &mut owned,
@@ -195,7 +195,7 @@ pub(super) fn classify(
             }
         }
         for computed in table.computed.keys() {
-            let column_id = column(&table_id, computed);
+            let column_id = column(&table_id, computed.raw());
             if capture.inputs.contains_key(&column_id) {
                 assign(
                     &mut owned,

@@ -4,7 +4,7 @@
 A name or a free text that can come from an artifact has no `Display`: it is
 used as text only through `.shown()`, which escapes it, or `.raw()`, which does
 not (`pbps_model::Text`, `TableName`/`ObjectName`, `ColumnRef`, `RoutineArg`,
-`RoutineId` and `ModuleId` today; the remaining name types follow in #2084). The compiler forces that choice but cannot
+`RoutineId`, `ModuleId` and `ColumnName` today; the remaining name types follow in #2084). The compiler forces that choice but cannot
 stop `.raw()` being the one chosen for a message, and an unescaped line break in
 a message starts a line the tool never wrote. This is the one hole the types
 leave, so this check closes it.
@@ -96,7 +96,7 @@ ALLOWED = {
     # adapters and fixture builders are counted too, so a new raw message in
     # those files cannot hide behind their non-message uses.
     "crates/pbps-cli/src/report.rs": (
-        24,
+        47,
         "Canonical shell arguments and describe() names stay raw: the latter is "
         "the JSON `risks[].changes` text too and the report escapes it whole; "
         "#2084 step 5 removes that cover",
@@ -107,9 +107,9 @@ ALLOWED = {
         "#2084 step 5 removes the shared-sentence boundary",
     ),
     "crates/pbps-dialect/src/lib.rs": (
-        21,
-        "Unchecked::for_change labels are shared JSON and explain prose, "
-        "escaped at rendering until #2084 step 5",
+        22,
+        "Unchecked::for_change labels are shared JSON/explain prose, and column "
+        "validation feeds whole-escaped DialectError fields until #2084 step 5",
     ),
     "crates/pbps-mssql/src/lib.rs": (
         3,
@@ -117,35 +117,35 @@ ALLOWED = {
         "until #2084 step 5",
     ),
     "crates/pbps-mssql/src/validate.rs": (
-        14,
+        46,
         "validation sentences, including the #2084 routine-argument refusal, "
         "feed whole-escaped DialectError fields; the #1450 declaration note "
         "feeds the whole-escaped `dialect.not-checked` note "
         "until #2084 step 5",
     ),
     "crates/pbps-pg/src/lib.rs": (
-        3,
-        "reserved-schema/table refusals feed whole-escaped DialectError::Invalid "
+        19,
+        "schema/table/column validation feeds whole-escaped DialectError::Invalid "
         "until #2084 step 5",
     ),
     "crates/pbps-pg/src/validate.rs": (
-        2,
-        "target-kind refusals feed whole-escaped DialectError::Invalid "
+        10,
+        "structural and target-kind refusals feed whole-escaped DialectError::Invalid "
         "until #2084 step 5",
     ),
     "crates/pbps-pg/src/partition_series.rs": (
-        22,
+        24,
         "series refusals and frontier descriptions feed whole-escaped "
         "DialectError::Invalid until #2084 step 5",
     ),
     "crates/pbps-policy/src/evaluate.rs": (
-        6,
+        7,
         "policy sentences are shared JSON and findings that report::changes "
         "escapes whole until #2084 step 5; subjects remain raw identity keys",
     ),
     "crates/pbps-model/src/name.rs": (
-        1,
-        "the raw ColumnRef adapter delegates to the raw TableName adapter; "
+        2,
+        "the canonical ColumnRef adapter writes raw TableName and ColumnName; "
         "serialization remains raw after #2084 step 5",
     ),
     "crates/pbps-model/src/module.rs": (
@@ -157,6 +157,12 @@ ALLOWED = {
         1,
         "builds a dropped routine signature as SQL; its names and arguments "
         "remain raw after #2084 step 5",
+    ),
+    "crates/pbps-diff/src/schema_diff.rs": (
+        1,
+        "a baseline-key refusal projects ColumnName to str before Rust Debug, "
+        "preserving the prior escaped string-list diagnostic without a type wrapper; "
+        "Rust Debug remains the escaping boundary after #2084 step 5",
     ),
     "crates/pbps-diff/src/identity.rs": (
         1,
@@ -201,7 +207,7 @@ ALLOWED = {
         'raw onboarding notices are escaped at their boundary until #2084 step 5 (DEC-2084.1)',
     ),
     "crates/pbps-pg/src/estimate.rs": (
-        29,
+        30,
         'Estimate.about feeds cost JSON; cost::render escapes the shared description until #2084 step 5',
     ),
     "crates/pbps-pg/src/impact.rs": (

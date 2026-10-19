@@ -621,7 +621,7 @@ mod tests {
     fn schema_with(ty: &str) -> Schema {
         let mut columns = IndexMap::new();
         columns.insert(
-            "email".to_string(),
+            "email".into(),
             Column::new(ty.parse::<ColumnType>().unwrap()),
         );
         let mut s = Schema::default();
@@ -778,7 +778,7 @@ mod tests {
             .defaults
             .entry(t.clone())
             .or_default()
-            .insert("n".to_owned(), "GETDATE()".to_owned());
+            .insert("n".into(), "GETDATE()".to_owned());
         snap.declared
             .expressions
             .checks

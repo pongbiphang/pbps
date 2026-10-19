@@ -104,7 +104,7 @@ pub struct Estimate {
     // A created identity or an earlier retype has no measured stored context.
     // The table as the catalog names it before this plan, with the column's
     // name for a column change.
-    source: Option<(TableName, Option<String>)>,
+    source: Option<(TableName, Option<pbps_model::ColumnName>)>,
     work: Work,
     online: bool,
 }
@@ -459,7 +459,7 @@ pub async fn against(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), DbE
         }
     };
     let rows = conn
-        .query_with(SHAPE, &[relation.as_str().into(), column.as_str().into()])
+        .query_with(SHAPE, &[relation.as_str().into(), column.raw().into()])
         .await?;
     let Some(row) = rows.first() else {
         let why = "this database has no visible table by that name to measure";

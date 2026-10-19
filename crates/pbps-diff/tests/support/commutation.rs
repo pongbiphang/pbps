@@ -285,7 +285,12 @@ pub async fn outcome<E: Engine>(
     let columns = catalog
         .tables
         .iter()
-        .map(|(name, t)| (name.raw().to_string(), t.columns.keys().cloned().collect()))
+        .map(|(name, t)| {
+            (
+                name.raw().to_string(),
+                t.columns.keys().map(|c| c.raw().to_owned()).collect(),
+            )
+        })
         .collect();
     // The next plan is about what the declarations converge on. A module's
     // text is the engine's own respelling once read back, which `plan --db`

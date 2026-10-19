@@ -19553,7 +19553,7 @@ fn sql_server_cost_reports_row_work_without_changing_the_saved_plan_or_gate() {
             assert_eq!(c["blocks"], "reads and writes");
             let rewrites =
                 if let pbps_model::Change::AlterColumnType { column, .. } = &change.change {
-                    match column.name.as_str() {
+                    match column.name.raw() {
                         "i" => !compressed,
                         "w" => false,
                         other => panic!("unexpected column {other}"),

@@ -465,7 +465,7 @@ mod tests {
         for n in names {
             let mut columns = IndexMap::new();
             columns.insert(
-                "id".to_string(),
+                "id".into(),
                 Column::new("int".parse::<ColumnType>().unwrap()),
             );
             s.tables.insert(
@@ -617,7 +617,7 @@ mod tests {
             "ev_p2_i".into(),
             pbps_model::Index {
                 columns: vec![pbps_model::IndexColumn {
-                    key: pbps_model::IndexKey::Column("id".to_owned()),
+                    key: pbps_model::IndexKey::Column("id".into()),
                     descending: false,
                     opclass: None,
                 }],
@@ -737,7 +737,7 @@ mod tests {
             let mut columns = IndexMap::new();
             for c in *cols {
                 columns.insert(
-                    (*c).to_string(),
+                    (*c).into(),
                     Column::new("int".parse::<ColumnType>().unwrap()),
                 );
             }
@@ -801,7 +801,7 @@ mod tests {
         names.sort();
         assert_eq!(names, ["dbo.customer.email", "dbo.customer.nickname"]);
         assert!(
-            !observed.columns.values().any(|c| c.name == "gone"),
+            !observed.columns.values().any(|c| c.name == "gone".into()),
             "a dropped column must not appear, or the differ cannot see the drop"
         );
         assert!(
