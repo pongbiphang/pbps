@@ -7219,3 +7219,77 @@ read-back and an empty next plan. The audit keeps
 `held_a_function_edited_before_a_bound_caller` without a gap listing, so
 removing the callee's rewrite now exposes its failure on SQL Server and
 it is no longer `UNSHOWABLE` in `scripts/effect-mutations.py` (DEC-2091.1).
+
+<a id="dec-1558-1"></a>
+
+**DEC-1558.1. A connected PostgreSQL plan hands a detached clone's catalog
+name to its next holder through exact release facts and the existing slots
+and effects schedule; each detach keeps its own block and guards.** (#1558.)
+Two detaches may hand over a name the declarations never held: a pure
+partition records no name for its parent's index clone. Measured on 16 and
+18, the differ's alphabetical order can give the name to the first detach
+while the second still holds it. DEC-1565.1 rolls that apply back by name;
+the final declarations are valid if the second detach runs first.
+
+The connected name inventory reads each detached table's index-inheritance
+links, as its DO block does. The same read covers the indexes behind primary
+and unique keys through their constraint-parent links. Only a unique match
+whose declared name differs releases a slot. A retained name, an unnamed
+key, a missing clone or an ambiguous match supplies no release: the existing
+occupied-name refusal and per-detach guards remain the answer. Actual query
+failures remain errors. Foreign keys and checks are table-local and supply
+no schema relation-name release.
+
+These catalog facts bind slots to the detaching table's recorded uid, never
+to an operation position a later module pass may change. The same facts
+feed `slots::carried`, the slot replay and the connected name replay. The
+`Catalog` handover edges join the effects in the existing
+`order_carried_moves` route from DEC-1986.1, so the delayed claimant carries
+its consumers after it and other steps keep their relative order. A cycle
+keeps the occupied-name refusal, naming the detaches and their held name
+with the two-plan remedy, before either plan artifact is published.
+
+No generated name is predicted, no class rank or ordering pass is added,
+and no multi-detach DO block changes the statement or checkpoint boundary.
+The original blocks still choose their own temporaries and guard actual
+names under the parent's lock, including exchanges within one detach.
+Pinned by `catalog_clone_releases_order_detaches_before_their_claimants`,
+`the_slot_replay_refuses_a_detach_before_its_catalog_release`,
+`only_uniquely_identified_renamed_clones_release_their_names`, and the CLI
+live flows `detaches_follow_their_catalog_clone_name_handovers_on_both_servers`
+and `cyclic_or_retained_clone_claims_refuse_before_plan_publication_on_both_servers`.
+The flows cover renamed index, primary-key and unique clones, a handover
+chain, a per-detach exchange, cycles, retained and unnamed-key holders,
+row preservation, verify and an empty next plan on both server versions.
+
+<a id="dec-1558-2"></a>
+
+**DEC-1558.2. A rename claiming a detached clone's name joins the existing
+Catalog handover's effect closure, whether the partition stays or is
+dropped.** (#1558, PR #2214 ready review.) Measured on PostgreSQL 16 and 18,
+a table rename can take a clone's old relation name directly, or carry an
+index there through `SET SCHEMA`. Both plans are valid when the partition
+releases the name first. The same is true of a partition drop with
+`detach_from`: its detach and drop free the clone before the rename.
+These plans pass the differ's guards because the partitioned parent stands
+unchanged; DEC-1690.1's parent-rename refusal still applies to the parent.
+
+`relation_names_created` deliberately excludes renames. Using only that
+creation list to seed the handover's effect closure kept the rename fixed,
+so the existing slots edge could not settle across the detach or partition
+drop. `order_carried_moves` now also seeds a `RenameTable` claimant from that
+exact Catalog edge and recognizes a partition drop that frees its occupants.
+It still requires the catalog release, settles the same slots and effects,
+keeps other steps in their relative order, and keeps each detach's block and
+guards. No new ordering pass, rank or predicted clone name is needed.
+A clone kept under its old name, attached or detached, supplies no release;
+the existing occupied-name refusal remains the answer.
+
+Pinned by the unit tests
+`a_table_rename_follows_the_partition_releasing_its_target_name`,
+`a_schema_move_follows_the_partition_releasing_its_carried_index_name`, and
+`rename_claims_cannot_take_a_retained_partition_clone_name`, and their
+`_on_both_servers` CLI flows. Both release forms preserve the renamed table's
+rows, the surviving detached table's rows and its declared index; verify and
+the next plan agree after apply. The negatives publish neither plan artifact
+and leave the rows and partition membership untouched.

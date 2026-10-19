@@ -783,12 +783,34 @@ pub async fn refuse_created_name_occupants(
             // their way (#1785 review).
             let mut asked = crate::deploy::created_relation_names(cs);
             asked.extend(crate::deploy::rename_claims(cs));
-            let mut occupants = pbps_pg::catalog::relation_name_occupants(
-                conn,
-                &asked,
-                &crate::deploy::transferred_tables(cs),
-            )
-            .await?;
+            let mut owners = crate::deploy::transferred_tables(cs);
+            let mut detach_releases = std::collections::BTreeMap::new();
+            for change in &cs.changes {
+                if let pbps_model::Change::DetachPartition {
+                    uid, parent, names, ..
+                } = &change.change
+                {
+                    let Some(table) = plan.base.ids.tables.get(uid) else {
+                        continue;
+                    };
+                    owners.push(table.clone());
+                    let Some(parent) = plan
+                        .desired
+                        .ids
+                        .tables
+                        .iter()
+                        .find(|(_, name)| *name == parent)
+                        .and_then(|(id, _)| plan.base.ids.tables.get(id))
+                    else {
+                        continue;
+                    };
+                    let clones = pbps_pg::catalog::detach_clone_names(conn, table, parent).await?;
+                    detach_releases
+                        .extend(crate::deploy::detach_release_slots(uid, names, &clones));
+                }
+            }
+            let mut occupants =
+                pbps_pg::catalog::relation_name_occupants(conn, &asked, &owners).await?;
             // What a cross-schema rename carries lands on names of its own,
             // which something else may hold there now (#1749), a table or a
             // view included (#1765).
@@ -805,9 +827,16 @@ pub async fn refuse_created_name_occupants(
             }
             let mut at_names = carried;
             at_names.extend(crate::deploy::rename_claims(cs));
+            at_names.extend(
+                cs.changes
+                    .iter()
+                    .filter(|p| matches!(p.change, pbps_model::Change::DetachPartition { .. }))
+                    .flat_map(|p| crate::deploy::relation_names_created(&p.change)),
+            );
             let facts = NameFacts {
                 relations: pbps_pg::catalog::relations_at(conn, &at_names).await?,
                 occupants,
+                detach_releases,
             };
             facts.order_and_refuse(cs, label, plan)?;
             Ok(Some(facts))
@@ -822,6 +851,7 @@ pub async fn refuse_created_name_occupants(
 pub struct NameFacts {
     occupants: Vec<pbps_pg::catalog::NameOccupant>,
     relations: Vec<(TableName, &'static str)>,
+    detach_releases: std::collections::BTreeMap<pbps_dialect::slots::SlotKey, pbps_model::Uid>,
 }
 
 /// What the name passes read the plan's names through: its two sides and the
@@ -843,21 +873,29 @@ impl NameFacts {
         label: &str,
         plan: Planned<'_>,
     ) -> anyhow::Result<()> {
+        let slots = self.slots();
         crate::deploy::order_carried_moves(
             cs,
             &self.occupants,
             &self.relations,
             (plan.base, plan.desired),
             plan.dialect,
+            &slots,
         );
-        crate::deploy::refuse_uninventoried_occupants(cs, &self.occupants, &self.relations, label)
+        crate::deploy::refuse_uninventoried_occupants(
+            cs,
+            &self.occupants,
+            &self.relations,
+            label,
+            &slots,
+        )
     }
 
     /// The occupants as name slots, for the slot replay (#1964, DEC-1964.2).
-    // Debug assertions alone, like its one caller (#2089).
-    #[cfg(debug_assertions)]
     pub fn slots(&self) -> pbps_dialect::slots::CatalogFacts {
-        crate::deploy::occupant_slots(&self.occupants)
+        let mut slots = crate::deploy::occupant_slots(&self.occupants);
+        slots.detach_releases.clone_from(&self.detach_releases);
+        slots
     }
 }
 
@@ -1216,6 +1254,7 @@ fn object_slots(
             .collect(),
         compared: candidates.iter().map(key).collect(),
         alike: alike.iter().map(|(a, b)| (key(a), key(b))).collect(),
+        ..CatalogFacts::default()
     }
 }
 

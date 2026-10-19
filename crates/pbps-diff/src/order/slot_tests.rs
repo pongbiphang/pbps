@@ -1000,3 +1000,109 @@ fn a_tables_move_frees_its_occupant_before_a_later_drop_of_its_column() {
         .collect();
     assert_eq!(found, [(1, 0)]);
 }
+
+/// A key clone occupies the same schema relation slot as an ordinary index.
+fn detach_handover(cyclic: bool) -> (Plan, CatalogFacts) {
+    use pbps_dialect::slots::Occupant;
+    use pbps_model::{DetachedKind, DetachedName};
+    let detach = |seed: &str, wanted: &str| Change::DetachPartition {
+        uid: uid(seed),
+        table: name(&format!("app.{seed}")),
+        parent: name("app.p"),
+        names: vec![DetachedName {
+            kind: DetachedKind::PrimaryKey,
+            parent: "p_pk".into(),
+            name: Some(wanted.into()),
+        }],
+        shape: Box::new(Table::default()),
+    };
+    let tables = [("p", "app.p"), ("a", "app.a"), ("z", "app.z")];
+    let plan = Plan::new(
+        &tables,
+        &tables,
+        vec![
+            detach("a", "z_pk"),
+            detach("z", if cyclic { "a_pk" } else { "released" }),
+        ],
+    );
+    let slot = |name: &str| SlotKey {
+        namespace: Namespace::Relations("app".into()),
+        name: name.into(),
+    };
+    let facts = CatalogFacts {
+        occupants: ["a", "z"]
+            .map(|seed| Occupant {
+                slot: slot(&format!("{seed}_pk")),
+                kind: "index".into(),
+                owner: Some(name(&format!("app.{seed}"))),
+                column: None,
+            })
+            .into(),
+        detach_releases: [(slot("a_pk"), uid("a")), (slot("z_pk"), uid("z"))].into(),
+        ..CatalogFacts::default()
+    };
+    (plan, facts)
+}
+
+#[test]
+fn catalog_clone_releases_order_detaches_before_their_claimants() {
+    let dialect = Slotted { exact: true };
+    let (plan, facts) = detach_handover(false);
+    let edges = plan.handovers(&dialect, &facts);
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.before == 1 && e.after == 0 && e.catalog),
+        "{edges:?}"
+    );
+    let mut schedule = super::Schedule::new(2);
+    super::slots::schedule(&mut schedule, &edges);
+    assert_eq!(schedule.sequence().unwrap(), [1, 0]);
+    let (violations, skipped, _) = plan.run(&[1, 0], &dialect, Some(&facts));
+    assert!(violations.is_empty(), "{violations:?}");
+    assert!(skipped.is_empty());
+
+    // No exact release: ownership alone does not mean a detach renames it.
+    let mut kept = facts.clone();
+    kept.detach_releases.clear();
+    assert!(plan.handovers(&dialect, &kept).is_empty());
+    let mut other_owner = facts.clone();
+    other_owner
+        .detach_releases
+        .values_mut()
+        .for_each(|owner| *owner = uid("p"));
+    assert!(plan.handovers(&dialect, &other_owner).is_empty());
+    let mut elsewhere = facts;
+    elsewhere.detach_releases = elsewhere
+        .detach_releases
+        .into_iter()
+        .map(|(mut slot, owner)| {
+            slot.namespace = Namespace::Relations("archive".into());
+            (slot, owner)
+        })
+        .collect();
+    assert!(plan.handovers(&dialect, &elsewhere).is_empty());
+}
+
+#[test]
+fn the_slot_replay_refuses_a_detach_before_its_catalog_release() {
+    let dialect = Slotted { exact: true };
+    let (plan, facts) = detach_handover(false);
+    let (violations, _, _) = plan.run(&[0, 1], &dialect, Some(&facts));
+    assert!(
+        violations
+            .iter()
+            .any(|v| matches!(v, SlotViolation::Held { .. })),
+        "{violations:?}"
+    );
+    let (clear, _, _) = plan.run(&[1, 0], &dialect, Some(&facts));
+    assert!(clear.is_empty(), "{clear:?}");
+
+    let (cycle, facts) = detach_handover(true);
+    let mut schedule = super::Schedule::new(2);
+    super::slots::schedule(&mut schedule, &cycle.handovers(&dialect, &facts));
+    assert!(
+        schedule.sequence().is_err(),
+        "two detaches cannot both claim first"
+    );
+}

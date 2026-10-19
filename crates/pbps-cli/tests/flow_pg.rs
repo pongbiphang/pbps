@@ -10809,6 +10809,399 @@ fn a_partition_is_detached_and_kept_through_the_cli() {
     );
 }
 
+/// Catalog names, not generated-name guesses, order clone handovers.
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn detaches_follow_their_catalog_clone_name_handovers_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        for scenario in ["pair", "chain", "exchange"] {
+            let (own, d) = detach_clone_demo(server, &format!("{scenario}-{k}"));
+            let connection = own.connection();
+            declare_detach_parent(&d, false, scenario != "chain");
+            let a = if scenario == "exchange" {
+                (Some("a_unique"), "a_key", "z_index")
+            } else {
+                (Some("z_key"), "z_unique", "z_index")
+            };
+            declare_detached_clone(&d, "a", a.0, a.1, a.2);
+            let z = if scenario == "chain" {
+                ("c_key", "c_unique", "c_index")
+            } else {
+                ("released_key", "released_unique", "released_index")
+            };
+            declare_detached_clone(&d, "z", Some(z.0), z.1, z.2);
+            if scenario == "chain" {
+                declare_detached_clone(
+                    &d,
+                    "c",
+                    Some("released_key"),
+                    "released_unique",
+                    "released_index",
+                );
+            }
+            let (plan, script) = connected_plan(&d, connection);
+            let at = |table: &str| {
+                script
+                    .find(&format!("DETACH PARTITION \"app\".\"{table}\""))
+                    .unwrap_or_else(|| panic!("missing detach of {table}: {script}"))
+            };
+            assert!(at("z") < at("a"), "{script}");
+            if scenario == "chain" {
+                assert!(at("c") < at("z"), "{script}");
+            }
+            succeeds(approved_apply(
+                &d,
+                connection,
+                &plan,
+                &["--allow", "destructive"],
+            ));
+            for (table, value, key, unique, index) in
+                [("a", 1, a.0.unwrap(), a.1, a.2), ("z", 11, z.0, z.1, z.2)]
+            {
+                assert_eq!(
+                    scalar(connection, &format!("SELECT n::bigint FROM app.{table}")),
+                    value
+                );
+                assert_eq!(
+                    scalar(
+                        connection,
+                        &format!(
+                            "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                     WHERE i.indrelid = 'app.{table}'::regclass AND c.relname IN ('{key}', '{unique}', '{index}')"
+                        )
+                    ),
+                    3
+                );
+            }
+            assert_eq!(
+                scalar(connection, "SELECT count(*) FROM app.p"),
+                if scenario == "chain" { 1 } else { 2 }
+            );
+            succeeds(d.run(&["verify", "--db", connection]));
+            let next = succeeds(d.run(&["plan", "--db", connection]));
+            assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn cyclic_or_retained_clone_claims_refuse_before_plan_publication_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        for scenario in ["cycle", "retained", "unnamed"] {
+            let (own, d) = detach_clone_demo(server, &format!("{scenario}-{k}"));
+            let connection = own.connection();
+            declare_detach_parent(&d, scenario == "retained", true);
+            declare_detached_clone(
+                &d,
+                "a",
+                Some("a_key"),
+                "a_unique",
+                if scenario == "unnamed" {
+                    "z_key"
+                } else {
+                    "z_index"
+                },
+            );
+            if scenario == "cycle" {
+                declare_detached_clone(&d, "z", Some("z_key"), "z_unique", "a_index");
+            } else if scenario == "unnamed" {
+                declare_detached_clone(&d, "z", None, "z_unique", "z_index");
+            }
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let plan = d.dir.join("refused.json");
+            let sql = d.dir.join("refused.sql");
+            let output = d.run(&[
+                "plan",
+                "--db",
+                connection,
+                "--out",
+                plan.to_str().unwrap(),
+                "--sql",
+                sql.to_str().unwrap(),
+            ]);
+            assert_ne!(code(&output), 0, "{}{}", stdout(&output), stderr(&output));
+            let message = format!("{}{}", stdout(&output), stderr(&output));
+            assert!(
+                message.contains("app.a")
+                    && message.contains("app.z")
+                    && message.contains("plan of its own"),
+                "{message}"
+            );
+            assert!(
+                !plan.exists() && !sql.exists(),
+                "a refusal publishes neither artifact"
+            );
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_inherits \
+                WHERE inhparent = 'app.p'::regclass AND inhrelid IN ('app.a'::regclass, 'app.z'::regclass)"
+                ),
+                2
+            );
+            assert_eq!(scalar(connection, "SELECT count(*) FROM app.p"), 4);
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                WHERE i.indrelid IN ('app.a'::regclass, 'app.z'::regclass) \
+                AND c.relname IN ('a_key', 'a_unique', 'a_index', 'z_key', 'z_unique', 'z_index')"
+                ),
+                6
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_table_rename_follows_the_partition_releasing_its_target_name_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        for dropped in [false, true] {
+            check_clone_rename_applies(server, &format!("target-{k}-{dropped}"), false, dropped);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_schema_move_follows_the_partition_releasing_its_carried_index_name_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        for dropped in [false, true] {
+            check_clone_rename_applies(server, &format!("carried-{k}-{dropped}"), true, dropped);
+        }
+    }
+}
+
+fn check_clone_rename_applies(server: &str, slug: &str, carried: bool, dropped: bool) {
+    let (own, d) = clone_rename_demo(server, slug, carried);
+    let connection = own.connection();
+    declare_detach_parent(&d, true, true);
+    if dropped {
+        succeeds(d.run(&["drop-table", "app.a", "--reason", "retired"]));
+    } else {
+        declare_detached_clone(&d, "a", Some("a_key"), "a_unique", "released_index");
+    }
+    declare_clone_rename(&d, carried);
+    let (plan, script) = connected_plan(&d, connection);
+    let detach = script.find("DETACH PARTITION \"app\".\"a\"").unwrap();
+    let claim = script
+        .find(if carried {
+            "SET SCHEMA \"app\""
+        } else {
+            "RENAME TO \"a_index\""
+        })
+        .unwrap();
+    assert!(detach < claim, "{script}");
+    if dropped {
+        let drop = script.find("DROP TABLE \"app\".\"a\"").unwrap();
+        assert!(detach < drop && drop < claim, "{script}");
+    }
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "rename", "--allow", "destructive"],
+    ));
+    let target = if carried { "source" } else { "a_index" };
+    assert_eq!(
+        scalar(connection, &format!("SELECT n::bigint FROM app.{target}")),
+        41
+    );
+    assert_eq!(scalar(connection, "SELECT count(*) FROM app.p"), 3);
+    if dropped {
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_class WHERE oid = to_regclass('app.a')"
+            ),
+            0
+        );
+    } else {
+        assert_eq!(scalar(connection, "SELECT n::bigint FROM app.a"), 1);
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 WHERE i.indrelid = 'app.a'::regclass AND c.relname = 'released_index'"
+            ),
+            1
+        );
+    }
+    if carried {
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE i.indrelid = 'app.source'::regclass AND n.nspname = 'app' AND c.relname = 'a_index'"
+            ),
+            1
+        );
+    }
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn rename_claims_cannot_take_a_retained_partition_clone_name_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        for carried in [false, true] {
+            for detached in [false, true] {
+                let (own, d) =
+                    clone_rename_demo(server, &format!("kept-{k}-{carried}-{detached}"), carried);
+                let connection = own.connection();
+                if detached {
+                    declare_detach_parent(&d, true, true);
+                    declare_detached_clone(&d, "a", Some("a_key"), "a_unique", "a_index");
+                }
+                declare_clone_rename(&d, carried);
+                succeeds(d.run(&["plan"]));
+                d.commit();
+                let plan = d.dir.join("refused.json");
+                let sql = d.dir.join("refused.sql");
+                let output = d.run(&[
+                    "plan",
+                    "--db",
+                    connection,
+                    "--out",
+                    plan.to_str().unwrap(),
+                    "--sql",
+                    sql.to_str().unwrap(),
+                ]);
+                assert_ne!(code(&output), 0, "{}{}", stdout(&output), stderr(&output));
+                let message = format!("{}{}", stdout(&output), stderr(&output));
+                assert!(
+                    message.contains("app.a_index")
+                        && (message.contains("already is") || message.contains("both named")),
+                    "{message}"
+                );
+                assert!(!plan.exists() && !sql.exists());
+                assert_eq!(scalar(connection, "SELECT count(*) FROM app.p"), 4);
+                let source = if carried { "src.source" } else { "app.source" };
+                assert_eq!(
+                    scalar(connection, &format!("SELECT n::bigint FROM {source}")),
+                    41
+                );
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT count(*) FROM pg_inherits \
+                         WHERE inhparent = 'app.p'::regclass AND inhrelid = 'app.a'::regclass"
+                    ),
+                    1
+                );
+            }
+        }
+    }
+}
+
+fn clone_rename_demo(server: &str, slug: &str, carried: bool) -> (OwnDatabase, Demo) {
+    let source = if carried { "src.source" } else { "app.source" };
+    let index = if carried {
+        "CREATE INDEX a_index ON src.source (v);"
+    } else {
+        ""
+    };
+    detach_clone_demo_beside(
+        server,
+        slug,
+        &format!(
+            "CREATE SCHEMA src; CREATE TABLE {source} (n integer NOT NULL, v integer NOT NULL); \
+             INSERT INTO {source} VALUES (41, 8); {index}"
+        ),
+    )
+}
+
+fn declare_clone_rename(d: &Demo, carried: bool) {
+    let source = if carried { "src.source" } else { "app.source" };
+    let target = if carried { "app.source" } else { "app.a_index" };
+    let index = if carried {
+        "indexes:\n  a_index: {columns: [v]}\n"
+    } else {
+        ""
+    };
+    std::fs::remove_file(d.dir.join(format!("schema/{source}.yml"))).unwrap();
+    std::fs::write(
+        d.dir.join(format!("schema/{target}.yml")),
+        format!(
+            "table: {target}\nrenamed_from: {source}\ncolumns:\n  n: {{type: integer, nullable: false}}\n  v: {{type: integer, nullable: false}}\n{index}"
+        ),
+    )
+    .unwrap();
+}
+
+fn detach_clone_demo(server: &str, slug: &str) -> (OwnDatabase, Demo) {
+    detach_clone_demo_beside(server, slug, "")
+}
+
+fn detach_clone_demo_beside(server: &str, slug: &str, beside: &str) -> (OwnDatabase, Demo) {
+    let own = OwnDatabase::new(server, &format!("detach-clones-{slug}"));
+    on_server(
+        own.connection(),
+        r#"
+        CREATE SCHEMA app;
+        CREATE TABLE app.p (n integer NOT NULL, v integer NOT NULL,
+            CONSTRAINT p_pk PRIMARY KEY (n), CONSTRAINT p_uq UNIQUE (n, v)) PARTITION BY RANGE (n);
+        CREATE INDEX p_v ON app.p (v);
+        CREATE TABLE app.a PARTITION OF app.p FOR VALUES FROM (0) TO (10);
+        CREATE TABLE app.z PARTITION OF app.p FOR VALUES FROM (10) TO (20);
+        CREATE TABLE app.c PARTITION OF app.p FOR VALUES FROM (20) TO (30);
+        CREATE TABLE app.kept PARTITION OF app.p FOR VALUES FROM (30) TO (40);
+        INSERT INTO app.p VALUES (1, 4), (11, 5), (21, 6), (31, 7);
+        DO $rename$ DECLARE r record; BEGIN
+            FOR r IN SELECT ci.relname AS was, t.relname AS owner,
+                CASE pi.relname WHEN 'p_pk' THEN 'key' WHEN 'p_uq' THEN 'unique' ELSE 'index' END AS kind
+                FROM pg_inherits h JOIN pg_class ci ON ci.oid = h.inhrelid
+                JOIN pg_index i ON i.indexrelid = ci.oid JOIN pg_class t ON t.oid = i.indrelid
+                JOIN pg_class pi ON pi.oid = h.inhparent
+                JOIN pg_index x ON x.indexrelid = pi.oid
+                WHERE x.indrelid = 'app.p'::regclass AND t.relname IN ('a', 'z', 'c')
+            LOOP EXECUTE format('ALTER INDEX app.%I RENAME TO %I', r.was, r.owner || '_' || r.kind);
+            END LOOP;
+        END $rename$;
+    "#,
+    );
+    if !beside.is_empty() {
+        on_server(own.connection(), beside);
+    }
+    let d = Demo::new(&format!("detach-clones-{slug}"));
+    succeeds(d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", own.connection(), "--reason", "adopt"]));
+    (own, d)
+}
+
+fn declare_detach_parent(d: &Demo, keep_z: bool, keep_c: bool) {
+    let mut partitions = "  kept: {from: [30], to: [40]}\n".to_owned();
+    if keep_z {
+        partitions.push_str("  z: {from: [10], to: [20]}\n");
+    }
+    if keep_c {
+        partitions.push_str("  c: {from: [20], to: [30]}\n");
+    }
+    std::fs::write(d.dir.join("schema/app.p.yml"), format!(
+        "table: app.p\ncolumns:\n  n: {{type: integer, nullable: false}}\n  v: {{type: integer, nullable: false}}\n\
+         primary_key: {{name: p_pk, columns: [n]}}\nunique:\n  p_uq: [n, v]\n\
+         indexes:\n  p_v: {{columns: [v]}}\npartition_by: [n]\npartitions:\n{partitions}"
+    )).unwrap();
+}
+
+fn declare_detached_clone(d: &Demo, table: &str, key: Option<&str>, unique: &str, index: &str) {
+    let key = key.map_or_else(
+        || "primary_key: [n]\n".to_owned(),
+        |name| format!("primary_key: {{name: {name}, columns: [n]}}\n"),
+    );
+    std::fs::write(d.dir.join(format!("schema/app.{table}.yml")), format!(
+        "table: app.{table}\ncolumns:\n  n: {{type: integer, nullable: false}}\n  v: {{type: integer, nullable: false}}\n\
+         {key}unique:\n  {unique}: [n, v]\nindexes:\n  {index}: {{columns: [v]}}\n"
+    )).unwrap();
+}
+
 /// An ordinary managed table moved into its parent's `partitions:` is
 /// attached through the CLI and keeps its rows (#1545): refused by name while
 /// it holds a column its parent does not, then behind `--allow constraint`,

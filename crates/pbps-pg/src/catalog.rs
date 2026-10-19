@@ -3486,6 +3486,77 @@ pub struct NameOccupant {
     pub owner_column: Option<pbps_model::ColumnName>,
 }
 
+/// An attached index clone, including an index behind a key or unique
+/// constraint. The parent object's name identifies it without predicting
+/// the engine's spelling of the clone (DEC-1558.1).
+#[derive(Debug, Clone)]
+pub struct DetachClone {
+    pub kind: pbps_model::DetachedKind,
+    pub parent: String,
+    pub name: TableName,
+}
+
+/// Reads the same index-inheritance links the detach block follows. Missing
+/// or ambiguous matches are left to that block's existing guard by the
+/// caller; they are not evidence that a name becomes free.
+pub async fn detach_clone_names(
+    conn: &mut Conn,
+    table: &TableName,
+    parent: &TableName,
+) -> Result<Vec<DetachClone>, DbError> {
+    let rows = conn
+        .query_with(
+            "SELECT ci.relname AS clone_name,
+                COALESCE(pk.conname, pi.relname) AS parent_name,
+                COALESCE(k.contype::text, 'i') AS kind
+           FROM pg_catalog.pg_namespace tn
+           JOIN pg_catalog.pg_class t ON t.relnamespace = tn.oid
+           JOIN pg_catalog.pg_index i ON i.indrelid = t.oid
+           JOIN pg_catalog.pg_class ci ON ci.oid = i.indexrelid
+           JOIN pg_catalog.pg_inherits h ON h.inhrelid = ci.oid
+           JOIN pg_catalog.pg_class pi ON pi.oid = h.inhparent
+           JOIN pg_catalog.pg_index x ON x.indexrelid = pi.oid
+           JOIN pg_catalog.pg_class p ON p.oid = x.indrelid
+           JOIN pg_catalog.pg_namespace pn ON pn.oid = p.relnamespace
+           LEFT JOIN pg_catalog.pg_constraint k
+             ON k.conrelid = t.oid AND k.conindid = ci.oid AND k.contype IN ('p', 'u')
+           LEFT JOIN pg_catalog.pg_constraint pk ON pk.oid = k.conparentid
+          WHERE tn.nspname = $1 AND t.relname = $2
+            AND pn.nspname = $3 AND p.relname = $4
+            AND (k.contype IS DISTINCT FROM 'u' OR pk.conrelid = p.oid)
+          ORDER BY ci.relname",
+            &[
+                Param::Str(&table.schema),
+                Param::Str(&table.name),
+                Param::Str(&parent.schema),
+                Param::Str(&parent.name),
+            ],
+        )
+        .await?;
+    let mut clones = Vec::new();
+    for row in &rows {
+        let text = |column: &str| -> Result<String, DbError> {
+            row.try_get::<&str>(column)?
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    DbError::BadRow(format!("the detach-clone query returned a NULL {column}"))
+                })
+        };
+        let kind = match text("kind")?.as_str() {
+            "p" => pbps_model::DetachedKind::PrimaryKey,
+            "u" => pbps_model::DetachedKind::Unique,
+            "i" => pbps_model::DetachedKind::Index,
+            _ => continue,
+        };
+        clones.push(DetachClone {
+            kind,
+            parent: text("parent_name")?,
+            name: TableName::new(&table.schema, text("clone_name")?),
+        });
+    }
+    Ok(clones)
+}
+
 /// The [`NameOccupant`]s at `names`, and those `owners` own (their indexes
 /// and owned sequences), read in the caller's transaction. The owners' are
 /// what a cross-schema rename carries into its destination (#1084).

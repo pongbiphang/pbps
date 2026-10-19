@@ -356,7 +356,7 @@ pub(crate) fn created_relation_names(cs: &pbps_model::ChangeSet) -> Vec<TableNam
 /// names of [`index_names_created`].
 // The complement is every change that creates no relation.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn relation_names_created(change: &pbps_model::Change) -> Vec<TableName> {
+pub(crate) fn relation_names_created(change: &pbps_model::Change) -> Vec<TableName> {
     use pbps_model::Change;
     let mut out = match change {
         Change::CreateTable { name, .. } => vec![name.clone()],
@@ -400,6 +400,19 @@ fn index_names_created(change: &pbps_model::Change) -> Vec<TableName> {
             to: Some(key),
             ..
         } => key.name.iter().map(|name| in_schema(table, name)).collect(),
+        Change::DetachPartition { table, names, .. } => names
+            .iter()
+            .filter(|n| {
+                matches!(
+                    n.kind,
+                    pbps_model::DetachedKind::PrimaryKey
+                        | pbps_model::DetachedKind::Unique
+                        | pbps_model::DetachedKind::Index
+                )
+            })
+            .filter_map(|n| n.name.as_deref())
+            .map(|name| in_schema(table, name))
+            .collect(),
         Change::CreateTable { name, table, .. } => table
             .primary_key
             .iter()
@@ -430,25 +443,34 @@ pub(crate) fn refuse_uninventoried_occupants(
     occupants: &[pbps_pg::catalog::NameOccupant],
     relations: &[(TableName, &'static str)],
     label: &str,
+    catalog: &pbps_dialect::slots::CatalogFacts,
 ) -> anyhow::Result<()> {
-    let taken: Vec<String> = name_clashes(&cs.changes, occupants, relations)
+    let taken: Vec<String> = name_clashes(&cs.changes, occupants, relations, catalog)
         .into_iter()
         .map(|(_, clash)| clash)
         .collect();
     if taken.is_empty() {
         return Ok(());
     }
-    // A clash with a holder a later rename moves away is left here only when
-    // the handovers did not clear it ([`order_carried_moves`]): a cycle, or a
-    // change other than a table rename between them. The remedy is that
-    // rename in a plan of its own.
-    bail!(
-        "`{label}` already uses {} name(s) this plan would create or move an object onto, for \
-         objects that share PostgreSQL's relation namespace with tables and views:\n  {}\nEach \
-         `CREATE`, or the `SET SCHEMA` of each cross-schema rename, would be refused at apply. \
+    // Keep the existing rename remedy unchanged. A detach's clone-name
+    // claim needs the same separate-deployment remedy, naming the detach.
+    let remedy = if cs
+        .changes
+        .iter()
+        .any(|p| matches!(p.change, pbps_model::Change::DetachPartition { .. }))
+    {
+        "Each creation, schema move, or detach name change above would be refused at apply. \
+         Free that name in a plan of its own first (another partition's clone: detach that \
+         partition first), or declare another name (DEC-1565.1)."
+    } else {
+        "Each `CREATE`, or the `SET SCHEMA` of each cross-schema rename, would be refused at apply. \
          Rename the declaration, or drop or rename the object in the database. Where a later \
          rename in this plan moves the holder away, apply that rename in a plan of its own \
-         first.",
+         first."
+    };
+    bail!(
+        "`{label}` already uses {} name(s) this plan would create or move an object onto, for \
+         objects that share PostgreSQL's relation namespace with tables and views:\n  {}\n{remedy}",
         taken.len(),
         taken.join("\n  ")
     );
@@ -468,20 +490,24 @@ pub(crate) fn refuse_uninventoried_occupants(
 /// keep the order, and [`refuse_uninventoried_occupants`] refuses it. A
 /// creation taking an identity sequence's catalog name also follows its
 /// release, with the effects holding its dependents after it (DEC-1986.1).
+/// Detached partitions hand over their exact catalog clone names the same
+/// way, retaining each detach's own block and guards (DEC-1558.1).
 pub(crate) fn order_carried_moves(
     cs: &mut pbps_model::ChangeSet,
     occupants: &[pbps_pg::catalog::NameOccupant],
     relations: &[(TableName, &'static str)],
     sides: (pbps_diff::Side<'_>, pbps_diff::Side<'_>),
     dialect: &dyn pbps_dialect::Dialect,
+    catalog: &pbps_dialect::slots::CatalogFacts,
 ) {
     use pbps_model::{Change, ValueSource};
 
-    let clashes = name_clashes(&cs.changes, occupants, relations);
+    let clashes = name_clashes(&cs.changes, occupants, relations, catalog);
     if clashes.is_empty() {
         return;
     }
-    let facts = occupant_slots(occupants);
+    let mut facts = occupant_slots(occupants);
+    facts.detach_releases.clone_from(&catalog.detach_releases);
     let Ok(mut schedule) =
         pbps_diff::order::slots::handovers(&cs.changes, sides.0, sides.1, dialect, &facts)
     else {
@@ -491,8 +517,17 @@ pub(crate) fn order_carried_moves(
     // generic slots. The PostgreSQL identity release is exact, so state its
     // own handover instead of requiring a unique generic edge (DEC-1986.2).
     let mut moving = vec![false; cs.changes.len()];
-    let mut present = Occupant::all(occupants);
+    let mut detach_steps = vec![false; cs.changes.len()];
+    let mut present = Occupant::with_detaches(occupants, catalog);
     for (before, release) in cs.changes.iter().enumerate() {
+        detach_steps[before] = matches!(
+            &release.change,
+            Change::DetachPartition { .. }
+                | Change::DropTable {
+                    detach_from: Some(_),
+                    ..
+                }
+        ) && present.iter().any(|o| o.freed_by(&release.change));
         if matches!(&release.change, Change::AlterColumnNumbering {
             from: ValueSource::Identity(_), to, ..
         } if !matches!(to, ValueSource::Identity(_)))
@@ -524,6 +559,18 @@ pub(crate) fn order_carried_moves(
             {
                 o.column_renamed(table, from, to);
             }
+        }
+    }
+    // Detach handovers already have exact catalog edges. Renames can claim
+    // the clone's name directly or carry an index onto it; neither is a
+    // creation, but both need the same effect closure (DEC-1558.2).
+    for edge in schedule.constraints() {
+        if edge.source == pbps_diff::order::Source::Catalog
+            && detach_steps[edge.before]
+            && (matches!(cs.changes[edge.after].change, Change::RenameTable { .. })
+                || !relation_names_created(&cs.changes[edge.after].change).is_empty())
+        {
+            moving[edge.after] = true;
         }
     }
     let Ok(mut settled) = schedule.settle(cs.clone()) else {
@@ -565,7 +612,7 @@ pub(crate) fn order_carried_moves(
             Checks::ALL,
         );
         let effects = Schedule::of_graph(&graph, operations.as_slice());
-        // A delayed creation carries its consumers with it. Other steps
+        // A delayed claimant carries its consumers with it. Other steps
         // retain their relative order: this is not permission to reorder
         // the rest of the plan using an incomplete set of catalog facts.
         loop {
@@ -587,7 +634,7 @@ pub(crate) fn order_carried_moves(
                     schedule.keep(
                         previous,
                         at,
-                        "only the identity name's new holder and its dependents may move".into(),
+                        "only a catalog name's new holder and its dependents may move".into(),
                     );
                 }
                 previous = Some(at);
@@ -601,7 +648,7 @@ pub(crate) fn order_carried_moves(
         };
         settled = ordered;
     }
-    if name_clashes(&settled.changes.changes, occupants, relations).len() < clashes.len() {
+    if name_clashes(&settled.changes.changes, occupants, relations, catalog).len() < clashes.len() {
         *cs = settled.changes;
     }
 }
@@ -651,6 +698,39 @@ pub(crate) fn occupant_slots(
     }
 }
 
+/// Names a detach certainly vacates, not every index on its table. An
+/// unnamed key keeps its engine name, and ambiguity keeps the DO guard's
+/// existing refusal instead of inventing a release (DEC-1558.1).
+pub(crate) fn detach_release_slots(
+    uid: &pbps_model::Uid,
+    names: &[pbps_model::DetachedName],
+    clones: &[pbps_pg::catalog::DetachClone],
+) -> BTreeMap<pbps_dialect::slots::SlotKey, pbps_model::Uid> {
+    use pbps_dialect::slots::{Namespace, SlotKey};
+    let mut releases = BTreeMap::new();
+    for wanted in names {
+        let Some(to) = &wanted.name else { continue };
+        let matching: Vec<_> = clones
+            .iter()
+            .filter(|c| {
+                c.kind == wanted.kind
+                    && (c.kind == pbps_model::DetachedKind::PrimaryKey || c.parent == wanted.parent)
+            })
+            .collect();
+        let [clone] = matching[..] else { continue };
+        if clone.name.name != *to {
+            releases.insert(
+                SlotKey {
+                    namespace: Namespace::Relations(clone.name.schema.clone()),
+                    name: clone.name.name.clone(),
+                },
+                uid.clone(),
+            );
+        }
+    }
+    releases
+}
+
 /// The names a table rename takes as it runs: its target and, on its way
 /// across schemas under a new name, its old name in the target schema, which
 /// `SET SCHEMA` lands it on before `RENAME TO` (as `rename_order` claims).
@@ -689,8 +769,9 @@ fn name_clashes(
     changes: &[pbps_model::PlannedChange],
     occupants: &[pbps_pg::catalog::NameOccupant],
     relations: &[(TableName, &'static str)],
+    catalog: &pbps_dialect::slots::CatalogFacts,
 ) -> Vec<(Option<usize>, String)> {
-    let mut present = Occupant::all(occupants);
+    let mut present = Occupant::with_detaches(occupants, catalog);
     let mut held: Vec<(TableName, String)> = relations
         .iter()
         .map(|(name, kind)| {
@@ -814,12 +895,50 @@ fn name_clashes(
             ));
         }
         for name in relation_names_created(&p.change) {
+            let detaching = if let pbps_model::Change::DetachPartition { table, .. } = &p.change {
+                Some(table)
+            } else {
+                None
+            };
+            // A detach vacates its own changing names inside one DO block.
+            // Its guard owns intra-detach exchanges and retained clone names.
             taken.extend(
                 present
                     .iter()
-                    .filter(|o| o.name == name)
-                    .map(|o| (None, o.taken())),
+                    .filter(|o| {
+                        o.name == name && !(detaching.is_some() && o.owner.as_ref() == detaching)
+                    })
+                    .map(|o| {
+                        (
+                            None,
+                            match detaching {
+                                Some(table) => format!(
+                                    "detach of `{}` claims `{}`: {}",
+                                    table.shown(),
+                                    name.shown(),
+                                    o.taken()
+                                ),
+                                None => o.taken(),
+                            },
+                        )
+                    }),
             );
+            if let Some(table) = detaching {
+                taken.extend(
+                    held.iter()
+                        .filter(|(at, _)| at == &name)
+                        .map(|(_, holder)| {
+                            (
+                                None,
+                                format!(
+                                    "detach of `{}` claims `{}` where {holder}",
+                                    table.shown(),
+                                    name.shown()
+                                ),
+                            )
+                        }),
+                );
+            }
             created.insert(name);
         }
     }
@@ -881,6 +1000,7 @@ struct Occupant<'a> {
     owner_column: Option<pbps_model::ColumnName>,
     /// The cross-schema rename that last carried it, by its two names.
     carried: Option<(TableName, TableName)>,
+    detached_by: Option<pbps_model::Uid>,
 }
 
 impl<'a> Occupant<'a> {
@@ -894,8 +1014,27 @@ impl<'a> Occupant<'a> {
                 owner: found.owner.clone(),
                 owner_column: found.owner_column.clone(),
                 carried: None,
+                detached_by: None,
             })
             .collect()
+    }
+
+    fn with_detaches(
+        occupants: &'a [pbps_pg::catalog::NameOccupant],
+        facts: &pbps_dialect::slots::CatalogFacts,
+    ) -> Vec<Self> {
+        use pbps_dialect::slots::{Namespace, SlotKey};
+        let mut present = Self::all(occupants);
+        for o in &mut present {
+            o.detached_by = facts
+                .detach_releases
+                .get(&SlotKey {
+                    namespace: Namespace::Relations(o.name.schema.clone()),
+                    name: o.name.name.clone(),
+                })
+                .cloned();
+        }
+        present
     }
 
     /// Whether `change` takes it away: an index it drops, a unique
@@ -931,6 +1070,9 @@ impl<'a> Occupant<'a> {
                         })
                 }
             },
+            Change::DetachPartition { uid, table, .. } => {
+                owned_by(table) && self.detached_by.as_ref() == Some(uid)
+            }
             Change::DropTable { name, .. } => owned_by(name),
             Change::DropColumn { column, .. } => {
                 owned_by(&column.table) && self.owner_column.as_ref() == Some(&column.name)
@@ -11787,6 +11929,7 @@ mod tests {
                 std::slice::from_ref(occupant),
                 &[],
                 "prod",
+                &Default::default(),
             )
             .map_err(|e| e.to_string())
         };
@@ -11997,8 +12140,14 @@ mod tests {
         };
         let occupants = [held(&a), held(&b)];
         let refused = |changes: Vec<PlannedChange>| {
-            refuse_uninventoried_occupants(&ChangeSet { changes }, &occupants, &[], "prod")
-                .map_err(|e| e.to_string())
+            refuse_uninventoried_occupants(
+                &ChangeSet { changes },
+                &occupants,
+                &[],
+                "prod",
+                &Default::default(),
+            )
+            .map_err(|e| e.to_string())
         };
 
         let mut in_s3 = moves();
@@ -12056,8 +12205,14 @@ mod tests {
             owner_column: None,
         };
         let refused = |changes: Vec<PlannedChange>, occupants: &[NameOccupant]| {
-            refuse_uninventoried_occupants(&ChangeSet { changes }, occupants, &[], "prod")
-                .map_err(|e| e.to_string())
+            refuse_uninventoried_occupants(
+                &ChangeSet { changes },
+                occupants,
+                &[],
+                "prod",
+                &Default::default(),
+            )
+            .map_err(|e| e.to_string())
         };
         let (a, x) = (TableName::new("s1", "a"), TableName::new("s4", "x"));
         let (a_to, x_to) = (TableName::new("s2", "b"), TableName::new("s2", "y"));
@@ -12141,6 +12296,7 @@ mod tests {
                 std::slice::from_ref(&index),
                 relations,
                 "prod",
+                &Default::default(),
             )
             .map_err(|e| e.to_string())
         };
@@ -12278,8 +12434,206 @@ mod tests {
                 },
             ),
             &pbps_pg::Postgres::new(),
+            &Default::default(),
         );
         cs
+    }
+
+    #[test]
+    fn only_uniquely_identified_renamed_clones_release_their_names() {
+        use pbps_model::{DetachedKind, DetachedName, Uid, UidKind};
+        let uid = Uid::derived(UidKind::Table, "partition", 0);
+        for kind in [
+            DetachedKind::Index,
+            DetachedKind::PrimaryKey,
+            DetachedKind::Unique,
+        ] {
+            let clone = pbps_pg::catalog::DetachClone {
+                kind,
+                parent: "parent_object".into(),
+                name: TableName::new("app", "engine_name"),
+            };
+            let wanted = DetachedName {
+                kind,
+                parent: "parent_object".into(),
+                name: Some("declared".into()),
+            };
+            let read = detach_release_slots(
+                &uid,
+                std::slice::from_ref(&wanted),
+                std::slice::from_ref(&clone),
+            );
+            assert_eq!(read.len(), 1);
+            assert_eq!(read.values().next(), Some(&uid));
+            assert!(detach_release_slots(&uid, std::slice::from_ref(&wanted), &[]).is_empty());
+            assert!(
+                detach_release_slots(
+                    &uid,
+                    std::slice::from_ref(&wanted),
+                    &[clone.clone(), clone.clone()]
+                )
+                .is_empty()
+            );
+            for kept in [None, Some("engine_name".into())] {
+                let wanted = DetachedName {
+                    name: kept,
+                    ..wanted.clone()
+                };
+                assert!(
+                    detach_release_slots(&uid, &[wanted], std::slice::from_ref(&clone)).is_empty()
+                );
+            }
+            let another = pbps_pg::catalog::DetachClone {
+                kind: DetachedKind::Check,
+                ..clone
+            };
+            assert!(detach_release_slots(&uid, &[wanted], &[another]).is_empty());
+        }
+    }
+
+    enum CloneRelease {
+        Detach,
+        Drop,
+        Retain,
+    }
+
+    fn check_rename_clone_handover(carried: bool, release: CloneRelease) {
+        use pbps_dialect::slots::{CatalogFacts, Namespace, SlotKey};
+        use pbps_model::{
+            Change, ChangeSet, DetachedKind, DetachedName, PlannedChange, Uid, UidKind,
+        };
+        use pbps_pg::catalog::NameOccupant;
+
+        let child = TableName::new("app", "a");
+        let parent = TableName::new("app", "p");
+        let held = TableName::new("app", "held");
+        let from = TableName::new(if carried { "src" } else { "app" }, "source");
+        let to = if carried {
+            TableName::new("app", "source")
+        } else {
+            held.clone()
+        };
+        let child_uid = Uid::derived(UidKind::Table, &child.raw().to_string(), 0);
+        let releases = !matches!(release, CloneRelease::Retain);
+        let drops = matches!(release, CloneRelease::Drop);
+        let rename = PlannedChange::new(Change::RenameTable {
+            uid: Uid::derived(UidKind::Table, &from.raw().to_string(), 0),
+            from: from.clone(),
+            to,
+            defaults: Vec::new(),
+        });
+        let freeing = PlannedChange::new(if drops {
+            Change::DropTable {
+                uid: child_uid.clone(),
+                name: child.clone(),
+                detach_from: Some(parent.clone()),
+            }
+        } else {
+            Change::DetachPartition {
+                uid: child_uid.clone(),
+                table: child.clone(),
+                parent: parent.clone(),
+                names: vec![DetachedName {
+                    kind: DetachedKind::Index,
+                    parent: "p_n".into(),
+                    name: Some(if releases { "released" } else { "held" }.into()),
+                }],
+                shape: Box::default(),
+            }
+        });
+        let mut changes = ChangeSet {
+            changes: vec![rename, freeing],
+        };
+        let (before, before_ids, mut after, mut after_ids) =
+            carried_sides(&changes.changes, &[parent, child.clone()]);
+        if drops {
+            after.tables.remove(&child);
+            after_ids.tables.remove(&child_uid);
+        }
+        let mut occupants = vec![NameOccupant {
+            name: held.clone(),
+            kind: "index",
+            owner: Some(child),
+            owner_column: None,
+        }];
+        if carried {
+            occupants.push(NameOccupant {
+                name: TableName::new("src", "held"),
+                kind: "index",
+                owner: Some(from),
+                owner_column: None,
+            });
+        }
+        let mut facts = CatalogFacts::default();
+        if releases && !drops {
+            facts.detach_releases.insert(
+                SlotKey {
+                    namespace: Namespace::Relations(held.schema.clone()),
+                    name: held.name.clone(),
+                },
+                child_uid,
+            );
+        }
+        let refused = |changes: &ChangeSet| {
+            refuse_uninventoried_occupants(changes, &occupants, &[], "prod", &facts).is_err()
+        };
+        assert!(refused(&changes), "the original order meets the clone");
+        let original = changes.clone();
+        let order = |changes: &mut ChangeSet| {
+            order_carried_moves(
+                changes,
+                &occupants,
+                &[],
+                (
+                    pbps_diff::Side {
+                        schema: &before,
+                        ids: &before_ids,
+                    },
+                    pbps_diff::Side {
+                        schema: &after,
+                        ids: &after_ids,
+                    },
+                ),
+                &pbps_pg::Postgres::new(),
+                &facts,
+            );
+        };
+        order(&mut changes);
+        if releases {
+            assert_eq!(
+                changes.changes,
+                [original.changes[1].clone(), original.changes[0].clone()],
+                "the partition releases the rename's claim first"
+            );
+            assert!(!refused(&changes));
+        } else {
+            assert_eq!(changes, original, "a retained clone supplies no release");
+            assert!(refused(&changes));
+        }
+        let settled = changes.clone();
+        order(&mut changes);
+        assert_eq!(changes, settled, "settling again changes nothing");
+    }
+
+    #[test]
+    fn a_table_rename_follows_the_partition_releasing_its_target_name() {
+        for release in [CloneRelease::Detach, CloneRelease::Drop] {
+            check_rename_clone_handover(false, release);
+        }
+    }
+
+    #[test]
+    fn a_schema_move_follows_the_partition_releasing_its_carried_index_name() {
+        for release in [CloneRelease::Detach, CloneRelease::Drop] {
+            check_rename_clone_handover(true, release);
+        }
+    }
+
+    #[test]
+    fn rename_claims_cannot_take_a_retained_partition_clone_name() {
+        for carried in [false, true] {
+            check_rename_clone_handover(carried, CloneRelease::Retain);
+        }
     }
 
     struct IdentityHandover {
@@ -12379,11 +12733,19 @@ mod tests {
                     },
                 ),
                 &pbps_pg::Postgres::new(),
+                &Default::default(),
             );
         }
 
         fn refused(&self) -> bool {
-            refuse_uninventoried_occupants(&self.changes, &self.occupants, &[], "prod").is_err()
+            refuse_uninventoried_occupants(
+                &self.changes,
+                &self.occupants,
+                &[],
+                "prod",
+                &Default::default(),
+            )
+            .is_err()
         }
     }
 
@@ -12685,8 +13047,9 @@ mod tests {
         let b_out = || rename(t("s2", "b"), t("s3", "b"));
         let ordered = |changes: Vec<PlannedChange>, others: &[TableName]| {
             let cs = carried_moves(changes, &occupants, others);
-            let refused = refuse_uninventoried_occupants(&cs, &occupants, &[], "prod")
-                .map_err(|e| e.to_string());
+            let refused =
+                refuse_uninventoried_occupants(&cs, &occupants, &[], "prod", &Default::default())
+                    .map_err(|e| e.to_string());
             (cs.changes, refused)
         };
 
@@ -12724,7 +13087,7 @@ mod tests {
         let b_to_z = || rename(t("s2", "b"), t("s3", "z"));
         let cs = carried_moves(vec![a_in(), b_to_z(), x_out()], &with_index, &[]);
         assert_eq!(cs.changes, vec![x_out(), b_to_z(), a_in()]);
-        refuse_uninventoried_occupants(&cs, &with_index, &[], "prod")
+        refuse_uninventoried_occupants(&cs, &with_index, &[], "prod", &Default::default())
             .expect("each occupant has moved away before its name is taken");
 
         // `s5.a -> s1.q` passes through `s1.a` (`SET SCHEMA` first), which
@@ -12733,7 +13096,7 @@ mod tests {
         let at_a = [(t("s1", "a"), "table")];
         let cs = carried_moves_beside(vec![a_in(), through_a(), b_out()], &occupants, &at_a, &[]);
         assert_eq!(cs.changes, vec![b_out(), a_in(), through_a()]);
-        refuse_uninventoried_occupants(&cs, &occupants, &at_a, "prod")
+        refuse_uninventoried_occupants(&cs, &occupants, &at_a, "prod", &Default::default())
             .expect("`s1.a` has moved away before the rename passes through it");
 
         // Negatives.
@@ -12760,7 +13123,7 @@ mod tests {
         ];
         let cs = carried_moves(vec![a_in(), swap()], &cyclic, &[]);
         assert_eq!(cs.changes, vec![a_in(), swap()], "a cycle keeps its order");
-        refuse_uninventoried_occupants(&cs, &cyclic, &[], "prod")
+        refuse_uninventoried_occupants(&cs, &cyclic, &[], "prod", &Default::default())
             .expect_err("each move waits for the other");
 
         // The move would pass a change other than a table rename, which a
@@ -12782,6 +13145,7 @@ mod tests {
             &with_index,
             &[],
             "prod",
+            &Default::default(),
         )
         .unwrap_err()
         .to_string();
@@ -12803,6 +13167,7 @@ mod tests {
             &[with_index[2].clone()],
             &[],
             "prod",
+            &Default::default(),
         )
         .expect("the index is dropped before the rename takes its name");
     }
@@ -12910,6 +13275,7 @@ mod tests {
             std::slice::from_ref(&sequence),
             &[],
             "prod",
+            &Default::default(),
         )
         .unwrap_err()
         .to_string();
@@ -12925,7 +13291,8 @@ mod tests {
                 &plan(vec![to_archive(), create(&carried)]),
                 std::slice::from_ref(&index),
                 &[],
-                "prod"
+                "prod",
+                &Default::default()
             )
             .is_err(),
             "an index is carried too"
@@ -12937,6 +13304,7 @@ mod tests {
             std::slice::from_ref(&sequence),
             &[],
             "prod",
+            &Default::default(),
         )
         .expect("a same-schema rename carries nothing into archive");
         // Dropped first: the column takes its sequence, the drop its index.
@@ -12955,6 +13323,7 @@ mod tests {
             std::slice::from_ref(&sequence),
             &[],
             "prod",
+            &Default::default(),
         )
         .expect("the column's drop takes its sequence");
         refuse_uninventoried_occupants(
@@ -12969,6 +13338,7 @@ mod tests {
             std::slice::from_ref(&index),
             &[],
             "prod",
+            &Default::default(),
         )
         .expect("the index is dropped before the table is created");
         // A view the plan rebuilds in the destination: its drop frees the
@@ -12994,6 +13364,7 @@ mod tests {
             std::slice::from_ref(&sequence),
             &[],
             "prod",
+            &Default::default(),
         )
         .unwrap_err()
         .to_string();
@@ -13009,6 +13380,7 @@ mod tests {
             std::slice::from_ref(&sequence),
             &[],
             "prod",
+            &Default::default(),
         )
         .expect("a name nothing lands on is free");
         assert_eq!(
@@ -13057,6 +13429,7 @@ mod tests {
             &[occupant("sequence", None)],
             &[],
             "prod",
+            &Default::default(),
         )
         .unwrap_err()
         .to_string();
@@ -13066,6 +13439,7 @@ mod tests {
             &[occupant("index", Some(&owner))],
             &[],
             "prod",
+            &Default::default(),
         )
         .unwrap_err()
         .to_string();
@@ -13080,7 +13454,8 @@ mod tests {
                 &plan(vec![new_view.clone()]),
                 &[occupant("composite type", None)],
                 &[],
-                "prod"
+                "prod",
+                &Default::default()
             )
             .is_err()
         );
@@ -13095,6 +13470,7 @@ mod tests {
             &[occupant("index", Some(&owner))],
             &[],
             "prod",
+            &Default::default(),
         )
         .expect("an index the plan drops first");
         let drop_table = PlannedChange::new(Change::DropTable {
@@ -13108,6 +13484,7 @@ mod tests {
                 &[occupant(kind, Some(&owner))],
                 &[],
                 "prod",
+                &Default::default(),
             )
             .expect("it goes with the table the plan drops");
         }
@@ -13135,6 +13512,7 @@ mod tests {
                 &[occupant("index", Some(&owner))],
                 &[],
                 "prod",
+                &Default::default(),
             )
             .expect("a constraint's index the plan drops first");
         }
@@ -13145,7 +13523,8 @@ mod tests {
                 &plan(vec![drop_key(None), create_table()]),
                 &[occupant("index", Some(&owner))],
                 &[],
-                "prod"
+                "prod",
+                &Default::default()
             )
             .is_err()
         );
@@ -13167,6 +13546,7 @@ mod tests {
             &[occupant("index", Some(&owner))],
             &[],
             "prod",
+            &Default::default(),
         )
         .expect("the index moves to `archive` with its table");
         assert!(
@@ -13174,7 +13554,8 @@ mod tests {
                 &plan(vec![rename(TableName::new("app", "older")), create_table()]),
                 &[occupant("index", Some(&owner))],
                 &[],
-                "prod"
+                "prod",
+                &Default::default()
             )
             .is_err()
         );
@@ -13193,6 +13574,7 @@ mod tests {
             &[owned_by("id")],
             &[],
             "prod",
+            &Default::default(),
         )
         .expect("the sequence goes with its column");
         assert!(
@@ -13200,7 +13582,8 @@ mod tests {
                 &plan(vec![drop_column, create_table()]),
                 &[owned_by("other")],
                 &[],
-                "prod"
+                "prod",
+                &Default::default()
             )
             .is_err()
         );
@@ -13245,6 +13628,7 @@ mod tests {
             &[at("old_pkey", "index", None)],
             &[],
             "prod",
+            &Default::default(),
         )
         .expect("the key's index is still `old_pkey`, and the plan drops it");
         assert!(
@@ -13252,7 +13636,8 @@ mod tests {
                 &plan(vec![unnamed_key_on(&renamed), create_at("old_pkey")]),
                 &[at("old_pkey", "index", None)],
                 &[],
-                "prod"
+                "prod",
+                &Default::default()
             )
             .is_err(),
             "without the rename, dropping `renamed`'s key frees `renamed_pkey`"
@@ -13270,6 +13655,7 @@ mod tests {
             &[at("old_n_seq", "sequence", Some("n"))],
             &[],
             "prod",
+            &Default::default(),
         )
         .expect("the sequence's owning column is dropped under its new table name");
 
