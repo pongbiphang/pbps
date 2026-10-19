@@ -166,6 +166,8 @@ Every referenced type must have an eligible potential input path, independent
 of change kind, fill or row presence (DEC-2181.1). `pin_type_routines: true`
 admits user-written roots only through a saved plan showing their complete
 source and pinning them; apply refuses a changed setting (DEC-2181.2–3).
+`bootstrap --sql` refuses declarations with type references; use connected
+bootstrap or plan/apply against the target.
 
 The `policies:` block selects built-in rules and their severities and records
 suppressions — a rule id, a reason and an optional expiry — with parameters

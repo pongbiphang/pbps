@@ -479,6 +479,8 @@
         "a_table_a_publication_lists_is_refused_unlogged_by_name",
         "type_refs::existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays",
         "type_refs::missing_and_shell_types_refuse_before_bootstrap_creates_a_ledger_or_table",
+        "type_refs::bootstrap_scripts_refuse_type_references_on_postgres_16",
+        "type_refs::bootstrap_scripts_refuse_type_references_on_postgres_18",
         "type_refs::enum_label_domain_constraint_and_composite_changes_invalidate_saved_type_pins",
         "type_refs::adding_a_domain_over_rows_checks_builtin_code_and_the_saved_trust_list",
         "type_refs::a_user_domain_check_is_never_evaluated_by_planning_an_add_over_rows",

@@ -60,14 +60,7 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
         d.table(&declarations("  mood: {type: app.mood, default: \"'happy'::app.mood\"}\n  moods: {type: 'app.mood[]', default: \"'{}'::app.mood[]\"}\n  n: {type: app.positive}\n  ns: {type: 'app.positive[]'}\n  pair: {type: app.pair}\n  pairs: {type: 'app.pair[]'}\n  quoted: {type: '\"App\".\"Mood\"'}\n"));
         succeeds(d.run(&["plan"]));
         d.commit();
-        let script = d.dir.join("bootstrap.sql");
-        let offline = d.run(&["bootstrap", "--sql", script.to_str().unwrap()]);
-        assert_ne!(code(&offline), 0);
-        assert!(stderr(&offline).contains("offline bootstrap cannot validate"));
-        succeeds(d.run(&["bootstrap", "--db", db, "--sql", script.to_str().unwrap()]));
-        let sql = std::fs::read_to_string(&script).unwrap();
-        assert!(sql.find("DO $pbps$").unwrap() < sql.find("CREATE TABLE").unwrap());
-        assert!(sql.contains("\"app\".\"mood\"[]"), "{sql}");
+        succeeds(d.run(&["bootstrap", "--db", db]));
         succeeds(d.run(&["verify", "--db", db]));
         let path = plan(&d, db);
         let saved: pbps_model::SavedPlan =
@@ -121,7 +114,7 @@ fn missing_and_shell_types_refuse_before_bootstrap_creates_a_ledger_or_table() {
         let out = d.run(&["bootstrap", "--sql", script.to_str().unwrap()]);
         assert_ne!(code(&out), 0);
         assert!(
-            stderr(&out).contains("offline bootstrap cannot validate"),
+            stderr(&out).contains("bootstrap --sql cannot validate"),
             "{}",
             stderr(&out)
         );
@@ -134,6 +127,108 @@ fn missing_and_shell_types_refuse_before_bootstrap_creates_a_ledger_or_table() {
             0
         );
     }
+}
+
+fn bootstrap_script_boundary(server: &str) {
+    let role = UntrustedRole::new(server, "bootstrap_script");
+    let own = OwnDatabase::new(server, "refs_script");
+    let db = own.connection();
+    on_server(
+        db,
+        &format!(
+            "CREATE SCHEMA app; CREATE DOMAIN app.positive AS integer DEFAULT 1 CHECK (VALUE > 0); ALTER DOMAIN app.positive OWNER TO {}",
+            role.name
+        ),
+    );
+    let d = Demo::new("refs-script");
+    opt_in(&d, db, false);
+    let config = d.dir.join("pbps.yml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{text}trusted_roles: [{}]\n", role.name)).unwrap();
+    let typed = declarations("  n: {type: app.positive, default: \"'1'::app.positive\"}\n");
+    d.table(&typed);
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    for connected in [true, false] {
+        for existing in [false, true] {
+            let script = d.dir.join(format!("bootstrap-{connected}-{existing}.sql"));
+            let previous = b"keep the previous script\n";
+            if existing {
+                std::fs::write(&script, previous).unwrap();
+            }
+            let mut args = vec!["bootstrap", "--sql", script.to_str().unwrap()];
+            if connected {
+                args.extend(["--db", db]);
+            }
+            let out = d.run(&args);
+            assert_ne!(
+                code(&out),
+                0,
+                "referenced-type script must refuse; connected={connected}; script_exists={}",
+                script.exists()
+            );
+            let why = stderr(&out);
+            assert!(
+                why.contains("bootstrap --sql cannot validate")
+                    && why.contains("connected bootstrap without --sql")
+                    && why.contains("plan/apply against the target"),
+                "{why}"
+            );
+            if existing {
+                assert_eq!(std::fs::read(&script).unwrap(), previous);
+            } else {
+                assert!(!script.exists());
+            }
+        }
+    }
+    assert_eq!(
+        scalar(
+            db,
+            "SELECT count(*)::bigint FROM pg_catalog.pg_class WHERE relname IN ('__pbps_state','t')"
+        ),
+        0
+    );
+
+    // Reference-free scripts still carry the existing prerequisite guard.
+    let plain = OwnDatabase::new(server, "refs_script_plain");
+    on_server(plain.connection(), "CREATE SCHEMA app");
+    let plain_demo = Demo::new("refs-script-plain");
+    opt_in(&plain_demo, plain.connection(), false);
+    let config = plain_demo.dir.join("pbps.yml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{text}trusted_roles: [{}]\n", role.name)).unwrap();
+    plain_demo.table(&declarations(""));
+    succeeds(plain_demo.run(&["plan"]));
+    plain_demo.commit();
+    for connected in [false, true] {
+        let script = plain_demo.dir.join(format!("plain-{connected}.sql"));
+        let mut args = vec!["bootstrap", "--sql", script.to_str().unwrap()];
+        if connected {
+            args.extend(["--db", plain.connection()]);
+        }
+        succeeds(plain_demo.run(&args));
+        let sql = std::fs::read_to_string(&script).unwrap();
+        assert!(sql.contains("CREATE TABLE"), "{sql}");
+        assert!(sql.contains("pg_catalog.pg_roles"), "{sql}");
+        assert!(sql.contains(&role.name), "{sql}");
+    }
+    succeeds(plain_demo.run(&["verify", "--db", plain.connection()]));
+
+    // Owner trust still admits connected execution of a builtin-only domain.
+    succeeds(d.run(&["bootstrap", "--db", db]));
+    succeeds(d.run(&["verify", "--db", db]));
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn bootstrap_scripts_refuse_type_references_on_postgres_16() {
+    bootstrap_script_boundary(&std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"));
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn bootstrap_scripts_refuse_type_references_on_postgres_18() {
+    bootstrap_script_boundary(&server());
 }
 
 #[test]

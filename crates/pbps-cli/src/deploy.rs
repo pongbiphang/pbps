@@ -5892,6 +5892,14 @@ pub fn cmd_bootstrap(
     let ids = crate::read_ids(project)?;
     refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
 
+    // A connected generation proves nothing about a later replay target.
+    // Keep the input-path proof in connected execution (DEC-2181.1).
+    if sql_out.is_some() && !crate::engine::type_references(&loaded.schema).is_empty() {
+        bail!(
+            "bootstrap --sql cannot validate referenced type input paths for its replay target; run connected bootstrap without --sql, or use plan/apply against the target (DEC-2181.1)"
+        );
+    }
+
     // Every declared object needs its identity, not just "some": a role the
     // ids file does not know is skipped by the differ, and a bootstrap that
     // skipped it built less than the declarations say and recorded that as
@@ -6093,13 +6101,6 @@ pub fn cmd_bootstrap(
     };
 
     let Some(target) = target else {
-        if dialect.name() == "postgres"
-            && !crate::engine::type_references(&loaded.schema).is_empty()
-        {
-            bail!(
-                "offline bootstrap cannot validate referenced type input paths; use a connected target (DEC-2181.1)"
-            );
-        }
         if sql_out.is_none() {
             bail!(
                 "bootstrap needs somewhere to go: pass --sql {}, --db or --env",
