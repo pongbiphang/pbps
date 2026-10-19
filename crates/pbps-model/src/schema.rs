@@ -293,7 +293,8 @@ impl Table {
                     "`replica_identity` names {what}, over nullable column(s) `{}`, which \
                      PostgreSQL does not take as a replica identity; declare them NOT NULL",
                     open.iter()
-                        .map(|n| n.shown().to_string())
+                        // raw: whole-message escaped by dialect validation until #2084 step 5.
+                        .map(ColumnName::raw)
                         .collect::<Vec<_>>()
                         .join("`, `")
                 )]

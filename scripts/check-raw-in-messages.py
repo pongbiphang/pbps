@@ -148,6 +148,11 @@ ALLOWED = {
         "the canonical ColumnRef adapter writes raw TableName and ColumnName; "
         "serialization remains raw after #2084 step 5",
     ),
+    "crates/pbps-model/src/schema.rs": (
+        1,
+        "replica-identity validation feeds whole-escaped DialectError::Invalid "
+        "until #2084 step 5",
+    ),
     "crates/pbps-model/src/module.rs": (
         2,
         "raw routine/trigger adapters for canonical serialization; "

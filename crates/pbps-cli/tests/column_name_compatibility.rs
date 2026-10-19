@@ -332,6 +332,63 @@ fn column_validation_preserves_the_whole_message_escape_boundary() {
 }
 
 #[test]
+fn replica_identity_column_diagnostics_escape_once_at_dialect_validation() {
+    let dialect = pbps_pg::Postgres::new();
+    for (column, shown) in [
+        (NAME, SHOWN),
+        (r"path\part", r"path\\part"),
+        ("ordinary", "ordinary"),
+        ("名前", "名前"),
+    ] {
+        for kind in ["unique constraint", "index"] {
+            let mut table = Table {
+                columns: [(column.into(), Column::new("int".parse().unwrap()))].into(),
+                ..Default::default()
+            };
+            if kind == "unique constraint" {
+                table.unique.insert(
+                    "ri".into(),
+                    UniqueConstraint {
+                        columns: vec![column.into()],
+                        storage_parameters: Default::default(),
+                    },
+                );
+                table.replica_identity = Some(ReplicaIdentity::Unique("ri".into()));
+            } else {
+                table.indexes.insert(
+                    "ri".into(),
+                    Index {
+                        columns: vec![IndexColumn::column(column)],
+                        include: Vec::new(),
+                        unique: true,
+                        filter: None,
+                        method: Default::default(),
+                        storage_parameters: Default::default(),
+                    },
+                );
+                table.replica_identity = Some(ReplicaIdentity::Index("ri".into()));
+            }
+            let name = TableName::new("app", "t");
+            let found: Vec<_> = dialect
+                .validate_table(&name, &table)
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect();
+            assert_eq!(
+                found,
+                [format!(
+                    "postgres: `replica_identity` names {kind} `ri`, over nullable column(s) `{shown}`, which \
+                     PostgreSQL does not take as a replica identity; declare them NOT NULL"
+                )],
+                "{kind}, {column:?}"
+            );
+            table.columns.get_mut(column).unwrap().nullable = false;
+            assert!(dialect.validate_table(&name, &table).is_empty());
+        }
+    }
+}
+
+#[test]
 fn baseline_key_diagnostics_keep_the_previous_escaped_string_list() {
     let error = pbps_diff::DiffError::DataBaselineKeyNotSingle {
         table: TableName::new("app", "t"),
