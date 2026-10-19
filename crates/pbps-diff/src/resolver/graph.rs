@@ -186,9 +186,41 @@ pub(super) fn constraints(
     let made: Vec<_> = steps
         .iter()
         .zip(&parts)
-        .map(|(c, facts)| {
+        .enumerate()
+        .map(|(at, (c, facts))| {
             let mut surfaces = provides(facts);
             match c {
+                Change::CreateTable {
+                    uid, name, table, ..
+                } if desired_names.table_uid(name) == Some(uid) => {
+                    // A placeholder creates an attrdef, but not its desired
+                    // binding. That observation belongs to the installation
+                    // from the same logical CREATE (DEC-1503.5).
+                    for (column, spec) in &table.columns {
+                        let ValueSource::Generated(current) = &spec.value_source else {
+                            continue;
+                        };
+                        let reference = name.column(column);
+                        let Some(ValueSource::Generated(wanted)) = desired
+                            .schema
+                            .tables
+                            .get(name)
+                            .and_then(|t| t.columns.get(column))
+                            .map(|c| &c.value_source)
+                        else {
+                            continue;
+                        };
+                        if current != wanted && steps.iter().zip(origins).any(|(step, origin)| {
+                            matches!(step, Change::AlterColumnExpression { uid, column, from, to }
+                                if column == &reference
+                                    && desired_names.column_uid(column) == Some(uid)
+                                    && from == &current.expression && to == &wanted.expression
+                                    && origin.source() == origins[at].source())
+                        }) {
+                            surfaces.remove(&Surface::Default(reference));
+                        }
+                    }
+                }
                 Change::RenameTable { to, .. } => {
                     surfaces.insert(Surface::Table(to.clone()));
                     if let Some(table) = desired.schema.tables.get(to) {

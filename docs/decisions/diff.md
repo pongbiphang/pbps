@@ -7576,3 +7576,36 @@ the live `called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold
 `saved_rows_before_expression_installation_cannot_clear_narrowing`,
 `generated_table_parts_apply_with_the_declared_column_order_values_and_names`
 and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.
+
+
+<a id="dec-1503-5"></a>
+
+**DEC-1503.5. Creation-part selection follows the same transitive module
+relation as settlement.** A generation calling a planned function can reach
+a table reader through any number of new or altered modules. Selection walks
+the provider edges built by the same helper as ordering: the dialect's
+`generation_may_call` scan or a declared module dependency, with the same
+self and same-name exclusions. A visited set terminates cycles without
+hiding them from settlement. Every reachable complete-shape reader selects
+the existing placeholder on connected PostgreSQL 17+; unknown/offline and
+older servers keep the whole-table hold. A reachable function cycle still
+receives the existing named refusal. Unreachable readers and name-independent
+chains retain the primary split.
+
+Ordinary planning, resolver preparation and scratch reconstruction pass the
+same declared module dependencies into the shared expansion. A placeholder's
+provisional attrdef does not claim the final expression's observed binding:
+only an installation with matching column identity, from/to expressions and
+logical source certifies that distinction. A CREATE already containing the
+final expression, or an unrelated later rewrite, keeps its own binding edges.
+This changes
+neither capture's regclass/regtype constant refusal nor transaction boundaries,
+and adds no ordering pass or rank. The direct-only selection was wrong because
+its graph differed from the constraints it later asked settle to satisfy.
+
+Pinned by `transitive_table_readers_use_placeholders_and_keep_old_holds`,
+`declared_callee_dependencies_share_the_ordering_closure`,
+`scratch_transitive_readers_share_lexical_and_declared_dependency_closures`,
+`placeholder_creates_do_not_claim_the_installed_expressions_bindings`,
+and the live `transitive_table_readers_apply_placeholders_or_keep_the_named_hold`
+and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.

@@ -83,7 +83,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
             &Default::default(),
         )
         .unwrap();
-        generated::expand(&mut cs, &ids, &pg).unwrap();
+        generated::expand(&mut cs, &ids, &Default::default(), &pg).unwrap();
         cs.changes
             .push(pbps_model::PlannedChange::new(Change::InsertRow {
                 table: TableName::new("app", "a"),
@@ -221,9 +221,15 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
         moves_at_most: None,
     });
     create.strategy.online = true;
-    let parts = generated::parts(&create, &ids, &planned_functions(&schema), &pg)
-        .unwrap()
-        .unwrap();
+    let parts = generated::parts(
+        &create,
+        &ids,
+        &planned_functions(&schema),
+        &Default::default(),
+        &pg,
+    )
+    .unwrap()
+    .unwrap();
     let index = parts
         .iter()
         .find(|p| matches!(p.change, Change::AddIndex { .. }))
@@ -240,9 +246,15 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
     let mut standing = index.clone();
     standing.strategy.online = true;
     assert!(
-        generated::parts(&standing, &ids, &planned_functions(&schema), &pg)
-            .unwrap()
-            .is_none()
+        generated::parts(
+            &standing,
+            &ids,
+            &planned_functions(&schema),
+            &Default::default(),
+            &pg
+        )
+        .unwrap()
+        .is_none()
     );
     assert!(
         pg.emit(&standing.change, standing.strategy)
@@ -620,9 +632,15 @@ fn generated_expression_installations_keep_their_creation_risks() {
             moves_at_most: None,
         });
         assert!(create.risks.is_empty());
-        let parts = generated::parts(&create, &ids, &planned_functions(&schema), &pg)
-            .unwrap()
-            .unwrap();
+        let parts = generated::parts(
+            &create,
+            &ids,
+            &planned_functions(&schema),
+            &Default::default(),
+            &pg,
+        )
+        .unwrap()
+        .unwrap();
         assert!(
             parts
                 .iter()
@@ -707,9 +725,15 @@ fn generated_columns_and_validators_keep_their_creation_risks() {
             beside_default: None,
             moves_at_most: None,
         });
-        let parts = generated::parts(&create, &ids, &planned_functions(&schema), &pg)
-            .unwrap()
-            .unwrap();
+        let parts = generated::parts(
+            &create,
+            &ids,
+            &planned_functions(&schema),
+            &Default::default(),
+            &pg,
+        )
+        .unwrap()
+        .unwrap();
         for part in &parts {
             assert_eq!(part.risks, create.risks, "{:?}", part.change);
         }
@@ -769,9 +793,15 @@ fn creation_risks_require_all_installations_before_every_row_write() {
         beside_default: None,
         moves_at_most: None,
     });
-    let parts = generated::parts(&create, &ids, &planned_functions(&schema), &pg)
-        .unwrap()
-        .unwrap();
+    let parts = generated::parts(
+        &create,
+        &ids,
+        &planned_functions(&schema),
+        &Default::default(),
+        &pg,
+    )
+    .unwrap()
+    .unwrap();
     let install = parts
         .iter()
         .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))

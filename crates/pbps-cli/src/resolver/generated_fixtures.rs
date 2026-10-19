@@ -101,12 +101,27 @@ pub(crate) fn shape(case: &str) -> Schema {
             kind: ModuleKind::Function,
             description: None,
             definition: match case {
+                "chain" | "chain-pure" | "chain-cycle" => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN app.g($1)",
                 "called-table" => "(integer) RETURNS app.a LANGUAGE sql IMMUTABLE BEGIN ATOMIC TABLE app.a; END",
                 "called-insert" => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC INSERT INTO app.a VALUES ($1, DEFAULT, 5); SELECT $1 * 2; END",
                 _ => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2",
             }.into(),
         },
     );
+    if ["chain", "chain-pure", "chain-cycle"].contains(&case) {
+        schema.modules.insert(
+            "app.g(integer)".parse().unwrap(),
+            Module {
+                kind: ModuleKind::Function,
+                description: None,
+                definition: match case {
+                    "chain-pure" => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2",
+                    "chain-cycle" => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT z FROM app.a LIMIT 1; SELECT app.f($1); END",
+                    _ => "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT z FROM app.a LIMIT 1; SELECT $1 * 2; END",
+                }.into(),
+            },
+        );
+    }
     if case == "called-table" {
         schema
             .tables

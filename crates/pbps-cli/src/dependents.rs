@@ -1585,11 +1585,16 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
 fn split_new_tables(
     cs: &mut ChangeSet,
     ids: &[&IdsFile],
+    deps: &ModuleDeps,
     dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let empty = IdsFile::default();
-    let generated =
-        pbps_diff::order::generated::expand(cs, ids.first().copied().unwrap_or(&empty), dialect)?;
+    let generated = pbps_diff::order::generated::expand(
+        cs,
+        ids.first().copied().unwrap_or(&empty),
+        deps,
+        dialect,
+    )?;
     let Some(last) = last_function_create(cs) else {
         return Ok(0);
     };
@@ -4206,6 +4211,14 @@ mod tests {
     use super::fixture::{unaccounted, weave};
     use super::*;
     use pbps_model::{CheckConstraint, Column, Module, Table, TableName, Uid, UidKind};
+
+    fn split_new_tables(
+        cs: &mut ChangeSet,
+        ids: &[&IdsFile],
+        dialect: &dyn Dialect,
+    ) -> Result<usize, String> {
+        super::split_new_tables(cs, ids, &ModuleDeps::new(), dialect)
+    }
 
     fn after_the_rebuilds(
         cs: &mut ChangeSet,

@@ -10,6 +10,15 @@ pub(crate) fn ordinary(
     ids: &IdsFile,
     dialect: &dyn Dialect,
 ) -> Result<ChangeSet, String> {
+    ordinary_with_dependencies(schema, ids, &ModuleDeps::new(), dialect)
+}
+
+fn ordinary_with_dependencies(
+    schema: &Schema,
+    ids: &IdsFile,
+    deps: &ModuleDeps,
+    dialect: &dyn Dialect,
+) -> Result<ChangeSet, String> {
     let empty = Schema::default();
     let before_ids = IdsFile::default();
     let cs = pbps_diff::diff(
@@ -19,7 +28,10 @@ pub(crate) fn ordinary(
         },
         pbps_diff::Side { schema, ids },
         dialect,
-        &pbps_model::Hints::default(),
+        &pbps_model::Hints {
+            module_deps: deps.clone(),
+            ..Default::default()
+        },
     )
     .unwrap();
     super::schedule::schedule(
@@ -33,7 +45,7 @@ pub(crate) fn ordinary(
                 },
                 after: ids,
             },
-            module_deps: &ModuleDeps::new(),
+            module_deps: deps,
         },
         &super::schedule::Facts::default(),
         dialect,
@@ -421,6 +433,132 @@ async fn called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold(
                 .await
                 .unwrap();
             result.unwrap_or_else(|e| panic!("{case}: {e:#}"));
+        }
+    }
+}
+
+#[test]
+fn transitive_table_readers_use_placeholders_and_keep_old_holds() {
+    for case in ["chain", "chain-pure", "chain-cycle"] {
+        let schema = shape(case);
+        let ids = identities(&schema);
+        for version in [None, Some(160_000), Some(180_000)] {
+            // The retained hold keeps its existing offline preview limits.
+            // The connected placeholder must not hide a real module cycle.
+            if case == "chain-cycle" && version != Some(180_000) {
+                continue;
+            }
+            let pg = version.map_or_else(pbps_pg::Postgres::new, |v| {
+                pbps_pg::Postgres::new().with_server_version(v)
+            });
+            let result = ordinary(&schema, &ids, &pg);
+            if case == "chain-cycle" || (case == "chain" && version != Some(180_000)) {
+                let why = result.unwrap_err();
+                assert!(
+                    why.contains("app.f") && why.contains("app.g"),
+                    "{case}, {version:?}: {why}"
+                );
+            } else {
+                let cs = result.unwrap();
+                let placeholder = cs
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }));
+                assert_eq!(placeholder, case == "chain", "{case}, {version:?}");
+                assert_eq!(
+                    cs.changes
+                        .iter()
+                        .any(|p| matches!(p.change, Change::AddColumn { .. })),
+                    case == "chain-pure"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn declared_callee_dependencies_share_the_ordering_closure() {
+    let mut schema = shape("chain");
+    let f = "app.f(integer)".parse().unwrap();
+    let g = "app.g(integer)".parse().unwrap();
+    schema.modules.get_mut(&f).unwrap().definition =
+        "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2".into();
+    let ids = identities(&schema);
+    let pg = pbps_pg::Postgres::new().with_server_version(180_000);
+    for deps in [ModuleDeps::new(), [(f, [g].into())].into()] {
+        let cs = ordinary_with_dependencies(&schema, &ids, &deps, &pg).unwrap();
+        assert_eq!(
+            cs.changes
+                .iter()
+                .any(|p| matches!(p.change, Change::AlterColumnExpression { .. })),
+            !deps.is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn transitive_table_readers_apply_placeholders_or_keep_the_named_hold() {
+    use pbps_db::{Conn, Driver};
+    for endpoint in ["PBPS_TEST_PG_DB", "PBPS_TEST_PG_OLD_DB"] {
+        let server = std::env::var(endpoint).unwrap();
+        for case in ["chain", "chain-pure", "chain-cycle"] {
+            let database = format!("pbps_1503_{:016x}", rand::random::<u64>());
+            let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
+            admin
+                .execute(&format!("CREATE DATABASE {database} TEMPLATE template0"))
+                .await
+                .unwrap();
+            let result: anyhow::Result<()> = async {
+                let mut conn =
+                    Conn::connect(Driver::Postgres, &format!("{server} dbname={database}")).await?;
+                conn.execute("CREATE SCHEMA app").await?;
+                let pg = crate::engine::planning_dialect(&mut conn).await?;
+                let version = conn.query("SHOW server_version_num").await?;
+                let modern = version[0]
+                    .try_get::<&str>("server_version_num")?
+                    .unwrap()
+                    .parse::<i64>()?
+                    >= 170_000;
+                let schema = shape(case);
+                let ids = identities(&schema);
+                if case == "chain-cycle" {
+                    if !modern {
+                        return Ok(());
+                    }
+                } else {
+                    let offline = ordinary(&schema, &ids, &pbps_pg::Postgres::new());
+                    assert_eq!(offline.is_ok(), case == "chain-pure");
+                }
+                let result = ordinary(&schema, &ids, pg.as_ref());
+                if case == "chain-cycle" || (case == "chain" && !modern) {
+                    let why = result.unwrap_err();
+                    assert!(why.contains("app.f") && why.contains("app.g"), "{why}");
+                    return Ok(());
+                }
+                let cs = result.map_err(anyhow::Error::msg)?;
+                assert_eq!(
+                    cs.changes
+                        .iter()
+                        .any(|p| matches!(p.change, Change::AlterColumnExpression { .. })),
+                    case == "chain"
+                );
+                for p in &cs.changes {
+                    for sql in pg.emit(&p.change, p.strategy)? {
+                        conn.execute(&sql.sql).await?;
+                    }
+                }
+                conn.execute("INSERT INTO app.a(id,z) VALUES (3,5)").await?;
+                let rows = conn.query("SELECT g FROM app.v").await?;
+                assert_eq!(rows[0].try_get::<i32>("g")?, Some(6));
+                Ok(())
+            }
+            .await;
+            admin
+                .execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+                .await
+                .unwrap();
+            result.unwrap_or_else(|e| panic!("{endpoint}, {case}: {e:#}"));
         }
     }
 }

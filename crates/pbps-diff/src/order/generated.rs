@@ -7,7 +7,7 @@ use super::{Constraint, Schedule, Source};
 use pbps_dialect::Dialect;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{
-    AddedRole, Change, ChangeSet, IdsFile, ModuleDeps, ModuleId, ModuleKind, PlannedChange,
+    AddedRole, Change, ChangeSet, IdsFile, Module, ModuleDeps, ModuleId, ModuleKind, PlannedChange,
     Provenance, RiskClass, Schema, ValueSource,
 };
 
@@ -28,6 +28,44 @@ pub fn functions(changes: &[PlannedChange]) -> Vec<ModuleId> {
         .collect()
 }
 
+type ModuleStep<'a> = (usize, &'a ModuleId, &'a Module);
+
+#[allow(clippy::wildcard_enum_match_arm)]
+fn modules(changes: &[PlannedChange]) -> Vec<ModuleStep<'_>> {
+    changes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| match &p.change {
+            Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
+                Some((i, id, module.as_ref()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Keep selection and settlement on exactly the same relation, including
+/// declared dependencies and the existing same-name exclusions (DEC-1503.5).
+fn module_dependencies(
+    modules: &[ModuleStep<'_>],
+    deps: &ModuleDeps,
+    dialect: &dyn Dialect,
+) -> Vec<(usize, usize)> {
+    let mut edges = Vec::new();
+    for (i, id, module) in modules {
+        for (j, provider, _) in modules {
+            if i != j
+                && id.name() != provider.name()
+                && (dialect.generation_may_call(&module.definition, provider.name())
+                    || deps.get(*id).is_some_and(|needs| needs.contains(*provider)))
+            {
+                edges.push((*j, *i));
+            }
+        }
+    }
+    edges
+}
+
 pub fn is_part(p: &PlannedChange) -> bool {
     p.provenance
         .as_ref()
@@ -39,22 +77,41 @@ pub fn parts(
     planned: &PlannedChange,
     ids: &IdsFile,
     changes: &[PlannedChange],
+    deps: &ModuleDeps,
     dialect: &dyn Dialect,
 ) -> Result<Option<Vec<PlannedChange>>, String> {
     let functions = functions(changes);
-    // A called reader can bind any part of the row shape, including implicit
-    // TABLE/INSERT arity. Full-shape placeholders or the existing hold avoid
-    // exposing the prefix to it (DEC-1503.4).
+    // A reader can be behind any number of callees. Walk the very edges
+    // settlement uses rather than predicting a different call graph here.
     let table_reader = if let Change::CreateTable { name, table, .. } = &planned.change {
-        changes.iter().any(|p| match &p.change {
-            Change::CreateModule { id, module } | Change::AlterModule { id, module }
-                if module.kind == ModuleKind::Function => {
-                table.columns.values().any(|c| matches!(&c.value_source,
-                    ValueSource::Generated(g) if dialect.generation_may_call(&g.expression, id.name())))
-                    && dialect.generation_names_table(&module.definition, name)
-                    && !dialect.generation_table_name_only(&module.definition, name)
+        let modules = modules(changes);
+        let edges = module_dependencies(&modules, deps, dialect);
+        let mut pending: Vec<_> = modules
+            .iter()
+            .filter(|(_, id, module)| {
+                module.kind == ModuleKind::Function
+                    && table.columns.values().any(|c| {
+                        matches!(&c.value_source,
+                ValueSource::Generated(g) if dialect.generation_may_call(&g.expression, id.name()))
+                    })
+            })
+            .map(|(i, _, _)| *i)
+            .collect();
+        let mut reached = BTreeSet::new();
+        while let Some(at) = pending.pop() {
+            if reached.insert(at) {
+                pending.extend(
+                    edges
+                        .iter()
+                        .filter(|(_, consumer)| *consumer == at)
+                        .map(|(provider, _)| *provider),
+                );
             }
-            _ => false,
+        }
+        modules.iter().any(|(i, _, module)| {
+            reached.contains(i)
+                && dialect.generation_names_table(&module.definition, name)
+                && !dialect.generation_table_name_only(&module.definition, name)
         })
     } else {
         false
@@ -189,11 +246,16 @@ pub fn risks(cs: &ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Vec<BTreeS
         .collect()
 }
 
-pub fn expand(cs: &mut ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Result<usize, String> {
+pub fn expand(
+    cs: &mut ChangeSet,
+    ids: &IdsFile,
+    deps: &ModuleDeps,
+    dialect: &dyn Dialect,
+) -> Result<usize, String> {
     let mut expanded = Vec::new();
     let mut added = 0;
     for p in &cs.changes {
-        match parts(p, ids, &cs.changes, dialect)? {
+        match parts(p, ids, &cs.changes, deps, dialect)? {
             Some(parts) => {
                 added += parts.len() - 1;
                 expanded.extend(parts);
@@ -326,17 +388,7 @@ pub fn constraints(
             out.edge(a, b, Source::Lexical, OrderReason::Structural);
         }
     };
-    let modules: Vec<_> = cs
-        .changes
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| match &p.change {
-            Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
-                Some((i, id, module))
-            }
-            _ => None,
-        })
-        .collect();
+    let modules = modules(&cs.changes);
     for (first, p) in cs.changes.iter().enumerate().filter(|(_, p)| is_part(p)) {
         let Change::CreateTable {
             name,
@@ -494,16 +546,8 @@ pub fn constraints(
     }
     // A function moved past a held table reader must not pass a module it
     // calls. Keep the same lexical and declared prerequisites as the differ.
-    for (i, id, module) in &modules {
-        for (j, provider, _) in &modules {
-            if i != j
-                && id.name() != provider.name()
-                && (dialect.generation_may_call(&module.definition, provider.name())
-                    || deps.get(*id).is_some_and(|needs| needs.contains(*provider)))
-            {
-                edge(&mut out, *j, *i);
-            }
-        }
+    for (provider, consumer) in module_dependencies(&modules, deps, dialect) {
+        edge(&mut out, provider, consumer);
     }
     out.constraints().iter().cloned().collect()
 }

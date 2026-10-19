@@ -5716,6 +5716,9 @@ async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_s
     for server in SERVERS {
         for case in [
             "plain",
+            "chain",
+            "chain-pure",
+            "chain-cycle",
             "partition",
             "later",
             "rows",
@@ -5739,14 +5742,41 @@ async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_s
             let inputs = Inputs::from_pair((pbps_model::Schema::default(), desired));
             let key = ProjectKey::new(true);
             let result: anyhow::Result<()> = async {
-                let plan = produce(
+                let mut target = Conn::connect(Driver::Postgres, &fixture.on(&target_db)).await?;
+                let version = target.query("SHOW server_version_num").await?;
+                let modern = version[0]
+                    .try_get::<&str>("server_version_num")?
+                    .unwrap()
+                    .parse::<i64>()?
+                    >= 170_000;
+                let planned = produce(
                     &fixture.as_login(&scratch_db, &login),
                     &fixture.on(&target_db),
                     &inputs,
                     &key,
                 )
-                .await
-                .map_err(|e| anyhow::anyhow!("{case}: {e}"))?;
+                .await;
+                if case == "chain-cycle" || (case == "chain" && !modern) {
+                    let Err(why) = planned else {
+                        panic!("{case}: a named cycle must be refused")
+                    };
+                    let why = why.to_string();
+                    assert!(
+                        why.contains("app.a") || (why.contains("app.f") && why.contains("app.g")),
+                        "{why}"
+                    );
+                    return Ok(());
+                }
+                let plan = planned.map_err(|e| anyhow::anyhow!("{case}: {e}"))?;
+                if case == "chain" || case == "chain-pure" {
+                    assert_eq!(
+                        plan.changes.changes.iter().any(|p| matches!(
+                            p.change,
+                            pbps_model::Change::AlterColumnExpression { .. }
+                        )),
+                        case == "chain"
+                    );
+                }
                 plan.evidence.validate(&plan.changes)?;
                 let saved = pbps_model::SavedPlan::new(
                     pbps_model::PlanOrigin::Database,

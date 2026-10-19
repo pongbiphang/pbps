@@ -5276,3 +5276,111 @@ fn preparing_generated_creation_parts_preserves_their_creation_risks() {
             .contains(&pbps_model::RiskClass::Constraint)
     );
 }
+
+#[test]
+fn placeholder_creates_do_not_claim_the_installed_expressions_bindings() {
+    use pbps_model::operation::{Origin, PlanOwners};
+    use pbps_model::resolver::{BoundSurface, ObjectIdentity};
+    use pbps_model::{
+        Column, Generated, IdsFile, Module, ModuleKind, Schema, Table, TableName, ValueSource,
+    };
+    let name = TableName::new("app", "a");
+    let column = name.column("g");
+    let function: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
+    let mut spec = Column::new("integer".parse().unwrap());
+    spec.value_source = ValueSource::Generated(Generated {
+        expression: "app.f(1)".into(),
+        stored: true,
+    });
+    let mut table = Table::default();
+    table.columns.insert("g".into(), spec);
+    let module = Module {
+        kind: ModuleKind::Function,
+        description: None,
+        definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+    };
+    let desired = Schema {
+        tables: [(name.clone(), table.clone())].into(),
+        modules: [(function.clone(), module.clone())].into(),
+        ..Default::default()
+    };
+    let before_ids = IdsFile::default();
+    let ids = ids(&desired, &before_ids);
+    let base = Schema::default();
+    let observation = SurfaceResolution {
+        surface: Surface::Default(column.clone()),
+        current: None,
+        desired: Some(BoundSurface {
+            object: ObjectIdentity {
+                class: "pg_attrdef".into(),
+                name: vec!["app".into(), "a".into(), "g".into()],
+                signature: Vec::new(),
+            },
+            bindings: Vec::new(),
+            managed_inputs: [Surface::Module(function.clone())].into(),
+        }),
+    };
+    for placeholder in [true, false] {
+        let from = if placeholder {
+            "NULL::integer"
+        } else {
+            "app.f(1)"
+        };
+        let mut created = table.clone();
+        if let ValueSource::Generated(g) = &mut created.columns["g"].value_source {
+            g.expression = from.into();
+        }
+        let changes = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::CreateTable {
+                    uid: ids.table_uid(&name).unwrap().clone(),
+                    name: name.clone(),
+                    table: Box::new(created),
+                    beside_default: None,
+                    moves_at_most: None,
+                }),
+                PlannedChange::new(Change::CreateModule {
+                    id: function.clone(),
+                    module: Box::new(module.clone()),
+                }),
+                PlannedChange::new(Change::AlterColumnExpression {
+                    uid: ids.column_uid(&column).unwrap().clone(),
+                    column: column.clone(),
+                    from: from.into(),
+                    to: "app.f(1)".into(),
+                }),
+            ],
+        };
+        let owners = PlanOwners::new(
+            pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap(),
+            &before_ids,
+            &ids,
+        );
+        for same_source in [true, false] {
+            let origins = [
+                Origin::SplitPart(0),
+                Origin::Whole(1),
+                Origin::SplitPart(if same_source { 0 } else { 2 }),
+            ];
+            let edges = super::graph::constraints(
+                &changes,
+                &origins,
+                &owners,
+                std::slice::from_ref(&observation),
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &ids,
+                },
+            );
+            assert!(edges.iter().any(|e| e.before == 1 && e.after == 2));
+            assert_eq!(
+                edges.iter().any(|e| e.before == 1 && e.after == 0),
+                !(placeholder && same_source)
+            );
+        }
+    }
+}

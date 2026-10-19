@@ -195,7 +195,7 @@ impl Reconstruction {
                 .map(pbps_model::PlannedChange::new)
                 .collect(),
         };
-        pbps_diff::order::generated::expand(&mut expanded, ids, dialect)
+        pbps_diff::order::generated::expand(&mut expanded, ids, dependencies, dialect)
             .map_err(ReconstructError::Cycle)?;
         pbps_diff::order::generated::settle(&mut expanded, &declared, dependencies, dialect)
             .map_err(ReconstructError::Cycle)?;

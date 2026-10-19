@@ -1077,3 +1077,78 @@ fn placeholder_bindings_are_measured_at_the_real_expression_and_fill_uses_the_co
             .any(|s| s.declaration == "generation of app.a.g")
     );
 }
+
+#[test]
+fn scratch_transitive_readers_share_lexical_and_declared_dependency_closures() {
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let mut column = Column::new("integer".parse().unwrap());
+    column.value_source = ValueSource::Generated(pbps_model::Generated {
+        expression: "app.f(id)".into(),
+        stored: true,
+    });
+    table.columns.insert("g".into(), column);
+    table
+        .columns
+        .insert("z".into(), Column::new("integer".parse().unwrap()));
+    for declared in [false, true] {
+        let changes = vec![
+            Change::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: TableName::new("app", "a"),
+                table: Box::new(table.clone()),
+                beside_default: None,
+                moves_at_most: None,
+            },
+            module(
+                "app.g(integer)",
+                ModuleKind::Function,
+                "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT z FROM app.a LIMIT 1; SELECT $1 * 2; END",
+            ),
+            module(
+                "app.f(integer)",
+                ModuleKind::Function,
+                if declared {
+                    "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2"
+                } else {
+                    "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN app.g($1)"
+                },
+            ),
+        ];
+        let deps = if declared {
+            [(
+                "app.f(integer)".parse().unwrap(),
+                ["app.g(integer)".parse().unwrap()].into(),
+            )]
+            .into()
+        } else {
+            Default::default()
+        };
+        let ids = crate::resolver::reconstruct::fixture_ids(&changes);
+        let pg = crate::Postgres::new().with_server_version(180_000);
+        let reconstruction = Reconstruction::with_dependencies(&pg, &changes, &ids, &deps).unwrap();
+        let sql = reconstruction
+            .steps
+            .iter()
+            .flat_map(|s| &s.statements)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("SET EXPRESSION"), "{sql}");
+        // An unrelated reader does not make the generation's callee a reader.
+        if declared {
+            let reconstruction =
+                Reconstruction::with_dependencies(&pg, &changes, &ids, &Default::default())
+                    .unwrap();
+            assert!(
+                reconstruction
+                    .steps
+                    .iter()
+                    .flat_map(|s| &s.statements)
+                    .all(|sql| !sql.contains("SET EXPRESSION"))
+            );
+        }
+    }
+}

@@ -571,12 +571,13 @@ What is left to the engine is recorded on #1350, each with a two-plan remedy:
 - a default a plan row takes calling a rebuilt function (#1030).
 
 New tables use creation parts that preserve column order. A suffix partition
-key, a generation reading a later column, or a called function naming the
-table or its types instead keeps the whole-table hold without a known
+key, a generation reading a later column, or a transitively called module
+naming the table or its types instead keeps the whole-table hold without a known
 PostgreSQL 17+ capability. Consumers use the complete shape unless a reference
 is proven to resolve only the relation name; the reverse regclass pair still
 uses prefix edges. Creation risks require every installation before every row
-write into that table identity (DEC-1503.4).
+write into that table identity (DEC-1503.4). Selection walks the same lexical
+and declared module dependency edges as settlement (DEC-1503.5).
 
 ## Value flow
 

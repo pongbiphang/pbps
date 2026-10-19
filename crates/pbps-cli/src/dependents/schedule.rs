@@ -184,7 +184,8 @@ pub(crate) fn schedule(
             None => {}
         }
         let ids = [declared.sources.after, declared.sources.before.ids];
-        split += split_new_tables(&mut cs, &ids, dialect).map_err(Refusal::module_passes)?;
+        split += split_new_tables(&mut cs, &ids, declared.module_deps, dialect)
+            .map_err(Refusal::module_passes)?;
         let releases = match facts.module_dependents {
             Some(found) => {
                 let partitions = standing_partitions(declared.schema, &cs);
@@ -810,7 +811,7 @@ mod tests {
 
         pub(super) fn bootstrap(mut cs: ChangeSet, schema: &Schema, ids: &IdsFile) -> ChangeSet {
             let decisions = take_public_execution(&mut cs);
-            split_new_tables(&mut cs, &[ids], &pg()).unwrap();
+            split_new_tables(&mut cs, &[ids], &ModuleDeps::new(), &pg()).unwrap();
             after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema, &pg())
                 .unwrap();
             after_their_parents_defaults(&mut cs, schema, &[ids], &pg()).unwrap();
@@ -821,7 +822,7 @@ mod tests {
         pub(super) fn connected(mut cs: ChangeSet, schema: &Schema, ids: &IdsFile) -> ChangeSet {
             let decisions = take_public_execution(&mut cs);
             let both = [ids, &IdsFile::default()];
-            split_new_tables(&mut cs, &both, &pg()).unwrap();
+            split_new_tables(&mut cs, &both, &ModuleDeps::new(), &pg()).unwrap();
             split_moving_defaults(&mut cs, schema, &pg());
             after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema, &pg())
                 .unwrap();
