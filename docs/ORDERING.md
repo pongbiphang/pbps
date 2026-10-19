@@ -97,7 +97,13 @@ Then, in this order:
   the same evidence. The order settled is kept only where table renames
   alone pass one another and the replay finds fewer clashes in it; a cycle,
   or any other change the move would pass, keeps the order and the refusal
-  (DEC-1957.2). `refuse_created_name_occupants` calls it before the module
+  (DEC-1957.2). A creation taking an identity sequence's catalog name also
+  follows the numbering change that gives up or converts the identity. The
+  exact identity release states that handover even when a retype leaves
+  the generic slot release ambiguous (DEC-1986.2). That
+  handover is settled with the effects, carrying the creation's consumers
+  after it while keeping other steps in their relative order (DEC-1986.1).
+  `refuse_created_name_occupants` calls it before the module
   passes. It runs again, over the same catalog reads, after the last pass
   that reorders, because a module pass may plan the revision again in the
   differ's order (DEC-1767.1).
@@ -333,6 +339,7 @@ rows below list each.
 | A table rename chain | fixed | `rename_order` | ✓ DEC-536.1 |
 | A table rename cycle (a swap, a rotation, or a cycle through a cross-schema move's intermediate name) | — | left out of `rename_order`'s graph; refused at diff time, `TableRenameCycle` | ✓ refused by design, DEC-1966.1 |
 | An owned sequence rename chain | fixed | (6, 1 + chain depth), `sequence_release_depths` | ✓ DEC-1889.1 |
+| P: an identity given up or converted → a new relation claiming its sequence's catalog name | engine-sourced | the connected name handover is settled with the effects; a kept or retuned identity keeps its name | ✓ DEC-1986.1 |
 | An owned sequence rename cycle (a swap or a rotation) | — | refused at diff time, `SequenceRenameCycle` | ✓ refused by design, DEC-1889.1 |
 | A catalog-only holder (adopted or fallback default, unrecorded object, collation pair) → `RenameTable` into its name | engine-sourced | `object_order` on a connected SQL Server plan | ✓ DEC-1366.1 |
 | A table rename moving a holder away (P) → a cross-schema rename carrying an index or owned sequence onto the held name | engine-sourced | on a connected PostgreSQL plan, `order_carried_moves` settles the plan over the name handovers, the catalog's occupants included, where only table renames pass one another; refused at `plan --db` with the remedy otherwise | ✓ DEC-1767.1, DEC-1957.2 |

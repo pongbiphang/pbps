@@ -6878,3 +6878,74 @@ Pinned by `a_released_input_is_retyped_or_dropped_after_its_release`
 (`crates/pbps-cli/tests/flow_pg.rs`) and
 `a_generated_columns_inputs_leave_out_its_own_column`
 (`crates/pbps-pg/tests/live.rs`).
+
+<a id="dec-1986-1"></a>
+
+**DEC-1986.1. A connected PostgreSQL plan settles the handover of an identity
+sequence's catalog name with the effects, delaying the new holder and its
+consumers while keeping other steps in their relative order.** (#1986.)
+An identity's backing sequence goes with `DROP IDENTITY`, whether the column
+then has no source or takes an owned sequence under another name. The differ
+cannot order a creation taking that name: the engine named the sequence,
+and may since have renamed it. Measured on PostgreSQL 16 and 18, dropping
+the identity first lets a table take that name; creating the table first is
+refused. The existing connected `order_carried_moves` only accepted table
+renames passing one another, so it refused this valid plan.
+
+The same pass reads the existing slots' `Catalog` handover edges. Only a
+numbering change that actually gives up an identity and frees the catalog
+occupant admits a creation to the additional route. A kept or retuned
+identity frees nothing. The owners' table and column renames are replayed
+before matching, as in `name_clashes`; no generated sequence name is guessed.
+The portable and dialect effect edges join the handovers in `settle`, so a
+creation delayed past its consumers carries them after it. Other operations
+keep their relative order through `Keep`; unknown owners, a cycle or a
+reversed kept order retain the original order and refusal. The existing
+rename-only route is unchanged, and the final name replay must still find
+fewer clashes. Both existing calls run it, before and after module passes.
+
+A new rank would encode a catalog fact in the offline differ. Another hoist
+or reorder pass would duplicate the handover mechanism and could undo the
+existing order. Neither is needed. Pinned by
+`an_identity_release_precedes_the_relation_claiming_its_catalog_name`,
+`settling_an_identity_handover_preserves_the_claims_dependents`, and the CLI
+live flows `an_identity_release_hands_its_catalog_name_to_a_new_table_on_both_servers`
+and `an_identity_conversion_hands_its_catalog_name_to_a_new_table_on_both_servers`.
+The live flows check the original and renamed backing names, kept and
+retuned negatives, apply, row preservation, verify and an empty next plan.
+
+
+<a id="dec-1986-2"></a>
+
+**DEC-1986.2. A PostgreSQL identity release states its catalog-name
+handover directly, including when the column is also retyped.** (#1986,
+PR #2212 ready review.) The generic slot walk conservatively treats both
+`AlterColumnType` and `AlterColumnNumbering` as possible releases of a
+column's catalog occupant. With both in the plan it cannot select a
+unique leaver and supplies no `Catalog` edge. Requiring that edge to seed
+DEC-1986.1's additional settlement route refused a valid plan: widen the
+identity column from integer to bigint, give up or convert its identity,
+and create a table at the backing sequence's name.
+
+`order_carried_moves` already knows which numbering change actually gives
+up the identity and which catalog sequence belongs to its owner and
+column. Its existing name replay now connects that exact release to each
+creation claiming the released name before the first settlement, and
+seeds the delayed creation from the same evidence. Table and column
+renames are followed as before; no generated name is inferred. The
+existing effects, dependent closure, `Keep` constraints and final clash
+replay still decide whether the order is retained. The generic slots
+remain conservative; a retype alone, a kept identity and a retune prove
+no identity-name release.
+
+Measured on PostgreSQL 16 and 18. Pinned by
+`a_retyped_identity_releases_its_catalog_name_before_the_new_holder` and
+the CLI live flows
+`a_retyped_identity_release_hands_its_catalog_name_to_a_new_table_on_both_servers`
+and
+`a_retyped_identity_conversion_hands_its_catalog_name_to_a_new_table_on_both_servers`:
+integer to bigint, the renamed catalog sequence, kept and retuned
+negatives, release before creation, dependent index ordering, row
+preservation, continued numbering after conversion, verify and empty
+replanning. The unit pin also checks the generic edge is absent,
+idempotency and the retype/numbering steps' relative order.
