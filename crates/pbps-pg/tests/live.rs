@@ -13379,58 +13379,93 @@ async fn drop_crowd_roles(conn: &mut Conn, stem: &str) -> Result<(), String> {
 /// The ledger's trust check stays linear in the cluster's roles (#1529). Its
 /// editor branches asked every login role about every role in the cluster,
 /// `pg_has_role` roles² times: about 1.9 s a call on a 2285-role cluster, paid
-/// by every command that checks the ledger. With ten thousand login roles it
-/// finishes well inside a bound the quadratic shape cannot meet, both when
+/// by every command that checks the ledger. Growing from one thousand login
+/// roles to ten thousand distinguishes that shape from linear work, both when
 /// they hold nothing on the ledger (it names none of them) and when `TRIGGER`
 /// or the sequence's `UPDATE` is granted to `PUBLIC`, the dense case where
 /// every role is an editor (it names them all; review on #1531).
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
 async fn the_ledger_trust_check_stays_linear_in_the_clusters_roles() {
-    let mut db = TestDb::create("ledger_many_roles").await;
-    state::ensure_tables(&mut db.conn).await.unwrap();
-    let mut admin = Conn::connect(Driver::Postgres, &conn_str()).await.unwrap();
-    // Armed before the first role exists, so a panic anywhere below, a failed
-    // creation included, still removes whatever was made (#2050).
-    let mut crowd = RoleCrowd::arm();
-    let prefix = crowd.prefix.clone();
-    crowd.create(&mut admin, 10000).await.unwrap();
-    // How long one check takes, and how many of the crowd it names.
-    let check = async |conn: &mut Conn| {
-        let started = std::time::Instant::now();
-        let problems = state::ledger_problems(conn).await;
-        (started.elapsed(), problems)
-    };
-    let mut results = Vec::new();
-    // Nobody holds anything: the editor sets are a handful of roles.
-    results.push(("no grant", check(&mut db.conn).await, 0));
-    // The grants this check exists to report make every role an editor of
-    // its own, which the hashed membership test answers without a walk
-    // (review on #1531).
-    db.conn
-        .execute("GRANT TRIGGER ON public.__pbps_lock TO PUBLIC")
-        .await
-        .unwrap();
-    results.push(("TRIGGER to PUBLIC", check(&mut db.conn).await, 10000));
-    db.conn
-        .execute(
-            "REVOKE TRIGGER ON public.__pbps_lock FROM PUBLIC;
-             GRANT UPDATE ON SEQUENCE public.__pbps_state_id_seq TO PUBLIC",
-        )
-        .await
-        .unwrap();
-    results.push(("UPDATE to PUBLIC", check(&mut db.conn).await, 10000));
-    crowd.remove(&mut admin).await.unwrap();
-    for (case, (took, problems), named) in results {
-        let problems = problems.unwrap();
-        let crowd = problems.iter().filter(|p| p.contains(&prefix)).count();
-        assert_eq!(crowd, named, "{case}: {problems:#?}");
-        assert!(
-            took < std::time::Duration::from_secs(2),
-            "{case}: the ledger check took {took:?} with ten thousand login roles"
+    async fn measure(count: u32) -> Vec<(&'static str, std::time::Duration)> {
+        let mut db = TestDb::create("ledger_many_roles").await;
+        state::ensure_tables(&mut db.conn).await.unwrap();
+        let mut admin = Conn::connect(Driver::Postgres, &conn_str()).await.unwrap();
+        // Armed before the first role exists, so a panic anywhere below, a failed
+        // creation included, still removes whatever was made (#2050).
+        let mut crowd = RoleCrowd::arm();
+        let prefix = crowd.prefix.clone();
+        crowd.create(&mut admin, count).await.unwrap();
+        // Only the check is timed; role creation and removal are outside it.
+        let check = async |conn: &mut Conn| {
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                let problems = state::ledger_problems(conn).await;
+                samples.push((started.elapsed(), problems));
+            }
+            samples
+        };
+        let mut results = Vec::new();
+        // Nobody holds anything: the editor sets are a handful of roles.
+        results.push(("no grant", check(&mut db.conn).await, 0));
+        // The grants this check exists to report make every role an editor of
+        // its own, which the hashed membership test answers without a walk
+        // (review on #1531).
+        db.conn
+            .execute("GRANT TRIGGER ON public.__pbps_lock TO PUBLIC")
+            .await
+            .unwrap();
+        results.push(("TRIGGER to PUBLIC", check(&mut db.conn).await, count));
+        db.conn
+            .execute(
+                "REVOKE TRIGGER ON public.__pbps_lock FROM PUBLIC;
+                 GRANT UPDATE ON SEQUENCE public.__pbps_state_id_seq TO PUBLIC",
+            )
+            .await
+            .unwrap();
+        results.push(("UPDATE to PUBLIC", check(&mut db.conn).await, count));
+        crowd.remove(&mut admin).await.unwrap();
+        db.drop().await;
+        results
+            .into_iter()
+            .map(|(case, samples, named)| {
+                let took = samples
+                    .into_iter()
+                    .map(|(took, problems)| {
+                        let problems = problems.unwrap();
+                        let crowd = problems.iter().filter(|p| p.contains(&prefix)).count();
+                        assert_eq!(
+                            crowd, named as usize,
+                            "{count} roles, {case}: {problems:#?}"
+                        );
+                        eprintln!("ledger sample, {count} roles, {case}: {took:?}");
+                        took
+                    })
+                    .min()
+                    .unwrap();
+                (case, took)
+            })
+            .collect()
+    }
+
+    let small = measure(1000).await;
+    let large = measure(10000).await;
+    for ((case, small), (_, large)) in small.iter().zip(&large) {
+        eprintln!(
+            "ledger growth, {case}: 1000 roles {small:?}, 10000 roles {large:?}, {:.2}x",
+            large.as_secs_f64() / small.as_secs_f64()
         );
     }
-    db.drop().await;
+    for ((case, small), (_, large)) in small.into_iter().zip(large) {
+        // A transient load spike inflates a sample; the minimum of three on
+        // each unchanged crowd keeps it out of the growth comparison. The
+        // quadratic walks inflate every sample (DEC-2166.1).
+        assert!(
+            large < small * 25,
+            "{case}: the ledger check grew from {small:?} with 1000 roles to {large:?} with 10000 roles"
+        );
+    }
 }
 
 /// How many roles in the cluster have a name starting with `prefix`.
