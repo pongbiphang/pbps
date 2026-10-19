@@ -59,6 +59,8 @@ impl Dialect for Mssql {
     /// What SQL Server's catalog refuses beyond the portable effects
     /// (DEC-1954.3):
     ///
+    /// - a schema-bound caller needs each module it may reference as the
+    ///   plan leaves it, before binding prevents the callee's edit (3729);
     /// - a computed column that may call a function stands in the way of
     ///   altering or dropping it (3729, measured on 17.0, even without
     ///   SCHEMABINDING);
@@ -82,13 +84,75 @@ impl Dialect for Mssql {
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         use pbps_model::Change;
         use pbps_model::operation::{
-            PartKey, Requirement, base_table, base_table_named, final_table,
+            Incarnation, ObjectKey, PartKey, Requirement, base_table, base_table_named, final_table,
         };
         let mut fx =
             pbps_dialect::engine_effects::text_dependents(self, op, owners, before, after, true)?
                 .merged(pbps_dialect::engine_effects::retype_blockers(
                     self, op, owners, before, after,
                 )?);
+        if let Change::CreateModule { id, module } | Change::AlterModule { id, module } = op.change()
+            // Functions retain their header options in the model; views do
+            // not (DECISIONS 29). Read this step's payload, not its endpoint.
+            && module.kind == pbps_model::ModuleKind::Function
+            && introspect::function_is_schema_bound(&module.definition)
+        {
+            // A function is bound by a call, `schema.name(`: a two-part name
+            // alone may be an alias's column, `app.g` under alias `app`,
+            // and two edited functions spelling each other's names that way
+            // would read as a cycle the engine does not have. Any other
+            // module is bound by its name, as a view in FROM is.
+            let calls = self.qualified_calls(&module.definition);
+            let managed: Vec<_> = after
+                .schema
+                .modules
+                .keys()
+                .filter_map(ModuleId::referenced_name)
+                .collect();
+            for (callee, callee_module) in after
+                .schema
+                .modules
+                .iter()
+                .filter(|(callee, _)| *callee != id)
+            {
+                let Some(name) = callee.referenced_name() else {
+                    continue;
+                };
+                // Case-only neighbours prove that this catalog distinguishes
+                // them. Keep the case-insensitive fallback for a unique name,
+                // including the caller among its possible exact holders.
+                let folded = |other: &TableName| {
+                    other.schema.to_lowercase() == name.schema.to_lowercase()
+                        && other.name.to_lowercase() == name.name.to_lowercase()
+                };
+                let unambiguous = !managed.iter().any(|other| other != &name && folded(other));
+                let bound = if callee_module.kind == pbps_model::ModuleKind::Function {
+                    calls.iter().any(|(schema, leaf)| {
+                        (schema == &name.schema && leaf == &name.name)
+                            || (unambiguous
+                                && schema.to_lowercase() == name.schema.to_lowercase()
+                                && leaf.to_lowercase() == name.name.to_lowercase())
+                    })
+                } else {
+                    self.may_name_qualified_exact(&module.definition, &name.schema, &name.name)
+                        || (unambiguous
+                            && self.may_name_qualified(
+                                &module.definition,
+                                &name.schema,
+                                &name.name,
+                            ))
+                };
+                if bound {
+                    // Exists alone does not state which definition a binding
+                    // needs. Final joins the callee's in-place rewrite without
+                    // a new pass or a positional dependency (DEC-2192.1).
+                    fx.requires.push(Requirement::Is(
+                        ObjectKey::Module(callee.clone()),
+                        Incarnation::Final,
+                    ));
+                }
+            }
+        }
         // A computed column the plan replaces under its own name with an
         // expression that no longer reads what the step changes does not
         // stand in its way: its baseline incarnation goes, and a requirement

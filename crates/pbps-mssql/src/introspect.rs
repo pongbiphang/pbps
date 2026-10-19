@@ -760,6 +760,59 @@ pub fn split_module(
     }
 }
 
+/// Whether a function header enables schema binding. Reuse the module
+/// reader's name scanner after the dialect blanks literals and comments:
+/// an option is not a quoted identifier, a parameter, or body text.
+pub(crate) fn function_is_schema_bound(definition: &str) -> bool {
+    use pbps_dialect::Dialect;
+
+    let lexicon = crate::Mssql.lexicon();
+    let code = lexicon.code_only(definition);
+    let continues = lexicon.identifier_continues;
+    let (mut at, mut depth) = (0, 0usize);
+    let (mut options, mut option_start, mut execute) = (false, false, false);
+    while at < code.len() {
+        at = skip_ws(&code, at);
+        let Some(ch) = code[at..].chars().next() else {
+            break;
+        };
+        if let Some((parts, end)) = qualified_name(&code, at) {
+            let bare = !matches!(ch, '[' | '"')
+                && parts.len() == 1
+                && !code[..at].chars().next_back().is_some_and(continues)
+                && !code[end..].chars().next().is_some_and(continues);
+            if depth == 0 && bare {
+                let word = &parts[0];
+                if word.eq_ignore_ascii_case("as") {
+                    if !execute {
+                        return false;
+                    }
+                    // EXECUTE AS is an option, not the start of the body.
+                    execute = false;
+                } else if word.eq_ignore_ascii_case("with") {
+                    options = true;
+                    option_start = true;
+                } else if options && option_start && word.eq_ignore_ascii_case("schemabinding") {
+                    return true;
+                } else {
+                    execute = options && word.eq_ignore_ascii_case("execute");
+                    option_start = false;
+                }
+            }
+            at = end;
+        } else {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 && options => option_start = true,
+                _ => {}
+            }
+            at += ch.len_utf8();
+        }
+    }
+    false
+}
+
 /// Whitespace plus the two comment forms, which may sit anywhere the emitter's
 /// prefix has a gap.
 fn skip_ws(s: &str, mut i: usize) -> usize {

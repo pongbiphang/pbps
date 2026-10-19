@@ -1046,17 +1046,14 @@ data:
 /// The audit's plans that hold a dependency an effect states which only
 /// this engine plans (#2091): a module edited in place, and a computed
 /// column. PostgreSQL's list holds the rest; what neither engine can show is
-/// said there. The module's pair waits on #2192: no effect yet makes a
-/// caller need the callee it binds to, so the audit leaves that listed gap
-/// out, as the sample does.
+/// said there. A bound caller requires its callee's final definition, so
+/// removing the callee's rewrite lets the audit run the order SQL Server
+/// refuses (DEC-2192.1).
 const HELD: &[Scenario] = &[
     Scenario {
         name: "held_a_function_edited_before_a_bound_caller",
         pair: ["AlterModule", "CreateModule"],
-        // The effects do not yet see the caller's reference, so the pair
-        // shows as independent and the engine refuses it swapped; once they
-        // do, `AlterModule`'s rewrite orders it here.
-        gap: Some(2192),
+        gap: None,
         base: r#"
 table: app.t
 columns:
@@ -1234,6 +1231,56 @@ impl Engine for Ms {
 #[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
 async fn pairs_the_effects_call_independent_commute_on_the_engine() {
     core::suite(&Ms, SCENARIOS, HELD, "pbps_commute").await;
+}
+
+/// A binding must follow the callee's edit: the engine distinguishes the
+/// forced order, while an ordinary caller is an independent control.
+#[tokio::test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+async fn schema_bound_callers_block_reversed_edits_and_plain_callers_commute() {
+    let bound = &HELD[0];
+    match core::check(&Ms, bound, "pbps_commute").await.pair {
+        Err(core::Finding::Stale(_)) => {}
+        other => panic!("the effects must order the bound caller: {other:?}"),
+    }
+    let (swaps, failures) = core::audit(&Ms, bound, "pbps_commute").await;
+    assert_eq!(swaps, 0, "a bound caller is not an independent pair");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    match core::forced(&Ms, bound, "pbps_commute").await {
+        Err(core::Finding::Differs(error)) => {
+            assert!(error.contains("3729") && error.contains("g"), "{error}");
+        }
+        other => panic!("the engine must refuse the callee's late edit: {other:?}"),
+    }
+    let plain = Scenario {
+        name: "an_unbound_caller_and_its_callees_edit",
+        pair: bound.pair,
+        gap: None,
+        base: bound.base,
+        desired: r#"
+table: app.t
+columns:
+  id: {type: int, nullable: false}
+primary_key: {name: pk_t, columns: [id]}
+
+---
+function: app.f(int)
+definition: |-
+  (@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @a + 1 END
+
+---
+function: app.g(int)
+definition: |-
+  (@a int) RETURNS int /* WITH SCHEMABINDING */ AS
+  BEGIN
+    DECLARE @note nvarchar(100) = N'WITH SCHEMABINDING';
+    RETURN app.f(@a)
+  END
+"#,
+    };
+    let checked = core::check(&Ms, &plain, "pbps_commute").await;
+    assert!(checked.pair.is_ok(), "{:?}", checked.pair);
+    assert!(checked.reminted.is_none(), "{:?}", checked.reminted);
 }
 
 /// A column added with a default the insert's postcondition cannot hold it

@@ -7152,3 +7152,70 @@ shared descendants, peers, mixed non-role slots, external members, empty
 and single-role plans, and varied role uids pin the same output. The live
 `roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan`
 also compares the connected artifact with the old order before applying it.
+
+
+<a id="dec-2192-1"></a>
+
+**DEC-2192.1. A SQL Server schema-bound function caller requires the final
+incarnation of each managed module its own definition may reference.**
+(#2192.) The differ already ranks a callee's in-place edit before a caller
+that binds to it. The effects did not state the reference, so the verifier
+accepted the reverse order and the commutation audit found SQL Server's
+3729: creating the bound caller prevents the callee's later alter.
+
+`Mssql::engine_effects` reads `CreateModule` and `AlterModule` payloads and
+adds `Is(Module, Final)` for referenced modules in the desired model,
+excluding the caller itself. The callee's existing `Rewrites` supplies the
+edge; the ordinary verifier and `settle` consume it. No rank, pass,
+statement or sealed format changes. A module with no creation or edit in
+the plan remains a baseline instance and adds no ordering edge.
+
+The function header keeps its authored options, whereas the model cannot
+hold a schema-bound view's options (DECISIONS 29). The header check reuses
+`Mssql::code_only` and the module reader's `qualified_name` and `skip_ws`:
+parenthesized parameters and returns, quoted names, and `EXECUTE AS` cannot
+masquerade as a binding option or the body boundary. A function callee
+counts only where it is called, `schema.name(`, through
+`Dialect::qualified_calls`: a bare two-part name may be an alias's column,
+`app.g` under alias `app`, and two edited functions spelling each other's
+names that way would otherwise read as a cycle the engine does not have.
+Matching preserves exact schema and leaf spellings. If the desired model
+holds distinct qualified module names that lowercase to the same pair,
+that is evidence of a case-sensitive catalog: only an exact spelling binds
+one of those neighbours. For a unique qualified name, a case-insensitive
+fallback still binds `APP.F(` to the sole managed `app.f`. The candidate
+set includes the caller, so its own exact spelling cannot bind a neighbour.
+This is an offline refinement, not a collation claim; accent-insensitive
+matching that needs connected facts remains #2221.
+
+Any other callee, a view in `FROM`, uses the same exact-first, unique-fold
+rule. `Dialect::may_name_qualified_exact` reuses the existing code/boundary
+scan while preserving case; the unambiguous fallback still uses
+`Dialect::may_name_qualified`, already used for SQL Server's computed-column
+effects. No second lexer is introduced.
+Neither check treats a literal or comment as code. Reading the desired
+module's definition instead of the operation's payload would state the
+wrong requirement for a split or replaced step.
+
+Only binding callers add these requirements. Requiring every ordinary
+caller's callee to be final would manufacture cycles between unbound
+procedures that may call one another. No catalog query can answer for a
+caller the plan has not created yet; this pure lexical effect complements,
+and does not replace, the existing catalog dependency reads (DEC-1431.1).
+
+Pinned by `schema_bound_callers_require_their_callees_final_definition`,
+`a_callers_binding_requirement_reads_its_own_payload`,
+`case_distinct_callees_do_not_invent_a_schema_bound_cycle`,
+`an_unambiguous_case_insensitive_callee_still_binds`, and
+`an_exact_callee_spelling_wins_over_a_case_only_neighbour` in
+`crates/pbps-mssql/tests/engine_effects.rs`: creates and alters, backwards
+refusal, settling, self-reference, other schemas, non-code text and unbound
+callers. The case tests cover stable `app.F`, edited `app.A` and `app.f`
+without an invented cycle, A-before-f verification, the single-name fallback,
+and exact winners for both functions and views. The live
+`schema_bound_callers_block_reversed_edits_and_plain_callers_commute`
+checks the engine's 3729, successful ordinary order, unbound commutation,
+read-back and an empty next plan. The audit keeps
+`held_a_function_edited_before_a_bound_caller` without a gap listing, so
+removing the callee's rewrite now exposes its failure on SQL Server and
+it is no longer `UNSHOWABLE` in `scripts/effect-mutations.py` (DEC-2091.1).
