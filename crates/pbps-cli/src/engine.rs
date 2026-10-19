@@ -1880,13 +1880,35 @@ pub(crate) fn order_after_releases(
     let names =
         pbps_model::plan_names::PlanNames::of(&changes.changes, ids).map_err(|e| e.to_string())?;
     // Inputs a row cannot be inserted without while they stand, by their
-    // live table and name (#1397).
-    let required: std::collections::BTreeSet<(TableName, String)> = dependences
+    // live table and name (#1397), each with the position from which on it
+    // is: `None` from the start, or `Some(j)` past the plan's first change
+    // at `j` that drops or rewrites a trigger on its table, for an input
+    // only a trigger fills. The catalog read the trigger as it stands before
+    // the plan; once such a change has run, the one that would fill it may
+    // be gone when the row is written. A trigger rewritten after the row
+    // still fills it (#2178).
+    let trigger_change_at = |table: &TableName| {
+        changes.changes.iter().position(|p| {
+            matches!(&p.change,
+                Change::DropModule { id: pbps_model::ModuleId::Trigger { on, .. }, .. }
+                | Change::AlterModule { id: pbps_model::ModuleId::Trigger { on, .. }, .. }
+                    if on.schema == table.schema && on.name == table.name)
+        })
+    };
+    let required: BTreeMap<(TableName, String), Option<usize>> = dependences
         .iter()
         .flat_map(|(table, ds)| {
-            ds.iter()
-                .filter(|d| d.base_required)
-                .map(move |d| (table.clone(), d.base.clone()))
+            let from = trigger_change_at(table);
+            ds.iter().filter_map(move |d| {
+                let at = if d.base_required {
+                    None
+                } else if d.filled_by_trigger {
+                    Some(from?)
+                } else {
+                    return None;
+                };
+                Some(((table.clone(), d.base.clone()), at))
+            })
         })
         .collect();
     use pbps_diff::order::{Refusal, Schedule, Source};
@@ -2086,7 +2108,7 @@ fn keep_ahead(
     schedule: &mut pbps_diff::order::Schedule,
     changes: &ChangeSet,
     names: &pbps_model::plan_names::PlanNames<'_>,
-    required: &std::collections::BTreeSet<(TableName, String)>,
+    required: &BTreeMap<(TableName, String), Option<usize>>,
     held: usize,
     reach: usize,
 ) {
@@ -2109,10 +2131,11 @@ fn keep_ahead(
     // cannot both follow the release and precede the insert (#1397). A
     // nullable or defaulted input lets the row in, and that plan applies.
     if matches!(change, pbps_model::Change::DropColumn { .. })
-        && required.contains(&(table, live))
-        && let Some((i, insert)) = later().find(
-            |(_, c)| matches!(c, pbps_model::Change::InsertRow { table, .. } if *table == column.table),
-        )
+        && let Some(&from) = required.get(&(table, live))
+        && let Some((i, insert)) = later().find(|(i, c)| {
+            matches!(c, pbps_model::Change::InsertRow { table, .. } if *table == column.table)
+                && from.is_none_or(|j| j < *i)
+        })
     {
         schedule.keep(
             held,
@@ -3666,6 +3689,7 @@ mod tests {
                 base: "a".into(),
                 generated: "g".into(),
                 base_required: false,
+                filled_by_trigger: false,
             }],
         )]);
         let kinds = |cs: &ChangeSet| -> Vec<&'static str> {
@@ -3773,11 +3797,13 @@ mod tests {
                     generated: "g".into(),
                     base: "a".into(),
                     base_required: false,
+                    filled_by_trigger: false,
                 },
                 pbps_pg::generated::Dependence {
                     generated: "h".into(),
                     base: "b".into(),
                     base_required: false,
+                    filled_by_trigger: false,
                 },
             ],
         )]);
@@ -3843,6 +3869,7 @@ mod tests {
                 base: "a".into(),
                 generated: "g".into(),
                 base_required: true,
+                filled_by_trigger: false,
             }],
         )]);
         let mut cs = plan(vec![drop("a"), insert(&t), recompute("b * 2")]);
@@ -3863,6 +3890,61 @@ mod tests {
         assert_eq!(order_after_releases(&mut cs, &requires_a), Ok(1));
         let mut cs = plan(vec![drop("a"), recompute("b * 2"), insert(&t)]);
         assert_eq!(order_after_releases(&mut cs, &requires_a), Ok(1));
+        // An input a trigger on the table may fill passes the row, unless
+        // the plan drops or rewrites a trigger there: the one that would
+        // fill it may be gone when the row is written, so it counts as
+        // required (#2178). A trigger on another table changes nothing.
+        let filled_a = BTreeMap::from([(
+            t.clone(),
+            vec![pbps_pg::generated::Dependence {
+                base: "a".into(),
+                generated: "g".into(),
+                base_required: false,
+                filled_by_trigger: true,
+            }],
+        )]);
+        let trigger_on = |table: &str| pbps_model::ModuleId::Trigger {
+            on: table.parse().unwrap(),
+            name: "fill".into(),
+        };
+        let drop_trigger = |table: &str| Change::DropModule {
+            id: trigger_on(table),
+            kind: pbps_model::ModuleKind::Trigger,
+        };
+        let mut cs = plan(vec![drop("a"), insert(&t), recompute("b * 2")]);
+        assert_eq!(order_after_releases(&mut cs, &filled_a), Ok(1));
+        let alter_trigger = || Change::AlterModule {
+            id: trigger_on("app.t"),
+            module: Box::new(pbps_model::Module {
+                kind: pbps_model::ModuleKind::Trigger,
+                description: None,
+                definition: "BEFORE INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()".into(),
+            }),
+        };
+        for change in [drop_trigger("app.t"), alter_trigger()] {
+            let mut cs = plan(vec![change, drop("a"), insert(&t), recompute("b * 2")]);
+            let refusal = order_after_releases(&mut cs, &filled_a).unwrap_err();
+            assert!(
+                refusal.contains("app.t.a is dropped after the expression change"),
+                "{refusal}"
+            );
+        }
+        // A trigger rewritten after the row still stands when the row is
+        // written, as the differ puts a module change after the rows.
+        let mut cs = plan(vec![
+            drop("a"),
+            insert(&t),
+            alter_trigger(),
+            recompute("b * 2"),
+        ]);
+        assert_eq!(order_after_releases(&mut cs, &filled_a), Ok(1));
+        let mut cs = plan(vec![
+            drop_trigger("app.other"),
+            drop("a"),
+            insert(&t),
+            recompute("b * 2"),
+        ]);
+        assert_eq!(order_after_releases(&mut cs, &filled_a), Ok(1));
         // So does any row in between, of another column as much, and a
         // module; a moved drop of another input does not hold it back.
         let mut cs = plan(vec![retype("a"), update("b"), recompute("b * 2")]);
@@ -3984,11 +4066,13 @@ mod tests {
                     generated: "g".into(),
                     base: "a".into(),
                     base_required: false,
+                    filled_by_trigger: false,
                 },
                 pbps_pg::generated::Dependence {
                     generated: "h".into(),
                     base: "b".into(),
                     base_required: false,
+                    filled_by_trigger: false,
                 },
             ],
         )]);
@@ -4087,14 +4171,7 @@ mod tests {
             let ids = crate::plan_fixture::ids(&cs);
             let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &ids).unwrap();
             let mut schedule = pbps_diff::order::Schedule::new(cs.changes.len());
-            keep_ahead(
-                &mut schedule,
-                &cs,
-                &names,
-                &std::collections::BTreeSet::new(),
-                held,
-                reach,
-            );
+            keep_ahead(&mut schedule, &cs, &names, &BTreeMap::new(), held, reach);
             schedule.kept_orders().to_vec()
         };
         // Released first: the retype waits for nothing after it.
@@ -4771,6 +4848,7 @@ mod plan_name_tests {
                 base: "original_column".into(),
                 generated: "g".into(),
                 base_required: false,
+                filled_by_trigger: false,
             }],
         )]);
         assert_eq!(

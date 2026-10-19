@@ -11707,6 +11707,134 @@ fn a_released_input_dropped_past_an_inserted_row_is_refused_only_when_required()
     );
 }
 
+/// The same plan as above, on a `NOT NULL` input a `BEFORE INSERT` trigger
+/// fills (#2178). The trigger kept, the row is let in and the plan applies.
+/// The trigger dropped by the same plan, the one that would fill `a` may be
+/// gone when the row is written, so the plan is refused by name as for an
+/// input nothing fills, before anything runs.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_released_input_a_trigger_fills_is_required_once_the_plan_drops_the_trigger() {
+    let server = server();
+    let own = OwnDatabase::new(&server, "released-drop-trigger");
+    let connection = own.connection().to_owned();
+    let table = |name: &str| {
+        format!(
+            "CREATE TABLE app.{name} (id integer PRIMARY KEY, a integer NOT NULL, b integer, \
+                                     g integer GENERATED ALWAYS AS (a * 2) STORED); \
+             CREATE FUNCTION app.fill_{name}() RETURNS trigger LANGUAGE plpgsql AS \
+               $$ BEGIN NEW.a := 0; RETURN NEW; END $$; \
+             CREATE TRIGGER fill BEFORE INSERT ON app.{name} \
+               FOR EACH ROW EXECUTE FUNCTION app.fill_{name}();"
+        )
+    };
+    on_server(
+        &connection,
+        &format!("CREATE SCHEMA app; {} {}", table("kept"), table("gone")),
+    );
+    let d = Demo::new("released-drop-trigger");
+    succeeds(d.run(&["pull", "--db", &connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", &connection, "--reason", "adopt"]));
+    // As above: `a` gone, `g` computed by `function` from `b`, created by the
+    // same revision, and a row inserted without `a`.
+    let revise = |table: &str, function: &str| {
+        std::fs::write(
+            d.dir
+                .join(format!("schema/app.{function}%28integer%29.function.yml")),
+            format!(
+                "function: app.{function}(integer)\npublic_execute: true\n\ndefinition: |-\n  \
+                 (x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x * 3 $$\n"
+            ),
+        )
+        .unwrap();
+        let path = d.dir.join(format!("schema/app.{table}.yml"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut in_a = false;
+        let edited: String = text
+            .lines()
+            .filter_map(|l| {
+                if !l.starts_with("   ") {
+                    in_a = l == "  a:";
+                }
+                if in_a {
+                    None
+                } else if l.trim_start().starts_with("generated:") {
+                    Some(format!(
+                        "    generated: {{expression: 'app.{function}(b)', stored: true}}"
+                    ))
+                } else {
+                    Some(l.to_owned())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\ndata:\n  mode: exact\n  rows:\n    1: {b: 3}\n";
+        assert!(!edited.contains("  a:\n"), "{edited}");
+        std::fs::write(&path, edited).unwrap();
+        succeeds(d.run(&[
+            "drop",
+            &format!("app.{table}.a"),
+            "--reason",
+            "computed from b now",
+        ]));
+    };
+    let plan = d.dir.join("plan.json");
+    revise("kept", "f");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["plan", "--db", &connection, "--out", plan.to_str().unwrap()]));
+    succeeds(approved_apply(
+        &d,
+        &connection,
+        &plan,
+        &["--allow", "narrowing", "--allow", "destructive"],
+    ));
+    assert_eq!(
+        scalar(&connection, "SELECT g::int8 FROM app.kept WHERE id = 1"),
+        9
+    );
+
+    // The trigger on `gone` and its function dropped by the same revision.
+    revise("gone", "h");
+    let mut removed = Vec::new();
+    for entry in std::fs::read_dir(d.dir.join("schema")).unwrap() {
+        let path = entry.unwrap().path();
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        if text.contains("fill_gone") {
+            removed.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    // The trigger, and the function only it calls.
+    assert_eq!(removed.len(), 2, "{removed:?}");
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let refused = d.run(&["plan", "--db", &connection]);
+    assert_eq!(
+        code(&refused),
+        1,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("app.gone.a is dropped after the expression change")
+            && stderr(&refused).contains("NOT NULL with no default"),
+        "{}",
+        stderr(&refused)
+    );
+    // Nothing ran: the trigger and `a` stand as they were.
+    assert_eq!(
+        scalar(
+            &connection,
+            "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'app.gone'::regclass \
+             AND NOT tgisinternal"
+        ),
+        1
+    );
+}
+
 /// One revision changes a generated column's expression to stop reading `a`
 /// and drops or retypes `a`: the expression change runs first, releasing `a`,
 /// and the plan applies (DEC-1316.1). A view over the generated column stays:
