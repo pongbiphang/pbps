@@ -6967,9 +6967,10 @@ rewrite reaches no stream. Measured on 18.6 with `wal_level = logical`:
 - a row inserted afterwards arrives with its number.
 
 So the check names the column, each publication that covers the table or
-any of its partitions, and each logical slot. It says that a consumer keeps
-those numbers empty until it takes a new snapshot of the table. With neither
-a publication nor a slot it passes.
+any of its partitions, and each logical slot. For a publication without a
+column list or a slot, it says that a consumer keeps those numbers empty
+until it takes a new snapshot of the table. With neither a publication nor
+a slot it passes.
 
 - **A table the plan creates is never named.** It is a `CreateTable`, empty
   when made, and its rows stream as they come. The table is found under the
@@ -6988,6 +6989,14 @@ a publication nor a slot it passes.
   `pg_partition_tree`, which measured on 18 is empty for a plain table. A
   partition's publication and one under `publish_via_partition_root` are
   both found.
+- **A publication with an explicit column list needs the new columns added
+  to its list first.** A new snapshot alone cannot publish them. Measured on
+  16 and 18, after `ALTER TABLE t ADD COLUMN n serial`,
+  `pg_publication_tables.attnames` stays `{v,w}` for a publication listing
+  `(v, w)` and becomes `{v,w,n}` for a whole-table publication;
+  `pg_publication_rel.prattrs IS NOT NULL` is true exactly for the listed
+  one. The check gives each listed publication its own clause, and promises
+  no snapshot remedy when only listed publications exist.
 
 Pinned by `a_numbered_column_fill_lists_the_streams_that_miss_it` (unit:
 publications and slots listed, slots alone listed, neither passes) and, live

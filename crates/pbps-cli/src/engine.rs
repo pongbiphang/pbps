@@ -2446,7 +2446,7 @@ pub async fn numbered_column_fills(
 /// [`numbered_column_fills`]' answer over what the catalog said.
 fn fills_listed(
     fills: &[(TableName, String)],
-    publications: &[(TableName, Vec<String>)],
+    publications: &[(TableName, Vec<(String, bool)>)],
     slots: &[(String, String)],
 ) -> ConnectedCheck {
     let columns = fills
@@ -2454,11 +2454,29 @@ fn fills_listed(
         .map(|(table, column)| format!("{}.{column}", table.shown()))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut streams: Vec<String> = publications
-        .iter()
-        .filter(|(_, found)| !found.is_empty())
-        .map(|(table, found)| format!("publication(s) {} over {}", found.join(", "), table.shown()))
-        .collect();
+    let mut streams = Vec::new();
+    let mut clauses = Vec::new();
+    for (table, found) in publications {
+        let mut whole = Vec::new();
+        for (name, lists_columns) in found {
+            if *lists_columns {
+                clauses.push(format!(
+                    "publication {name} over {} lists its columns, so it publishes none of the \
+                     added column(s) until they are added to its list",
+                    table.shown()
+                ));
+            } else {
+                whole.push(name.as_str());
+            }
+        }
+        if !whole.is_empty() {
+            streams.push(format!(
+                "publication(s) {} over {}",
+                whole.join(", "),
+                table.shown()
+            ));
+        }
+    }
     if !slots.is_empty() {
         streams.push(format!(
             "logical replication slot(s) {} on this database",
@@ -2469,7 +2487,17 @@ fn fills_listed(
                 .join(", ")
         ));
     }
-    let (status, message) = if streams.is_empty() {
+    if !streams.is_empty() {
+        clauses.insert(
+            0,
+            format!(
+                "{} will not carry those numbers, and a consumer keeps them empty until it takes \
+                 a new snapshot of the table",
+                streams.join("; ")
+            ),
+        );
+    }
+    let (status, message) = if clauses.is_empty() {
         (
             "passed",
             format!(
@@ -2482,9 +2510,8 @@ fn fills_listed(
             "listed",
             format!(
                 "{columns} numbers the rows already there in a table rewrite, which logical \
-                 decoding does not stream: {} will not carry those numbers, and a consumer keeps \
-                 them empty until it takes a new snapshot of the table",
-                streams.join("; ")
+                 decoding does not stream: {}",
+                clauses.join("; ")
             ),
         )
     };
@@ -4927,7 +4954,14 @@ mod tests {
         let listed = fills_listed(
             &fills,
             &[
-                (t.clone(), vec!["cdc".into(), "every".into()]),
+                (
+                    t.clone(),
+                    vec![
+                        ("cdc".into(), false),
+                        ("cols".into(), true),
+                        ("every".into(), false),
+                    ],
+                ),
                 (u.clone(), Vec::new()),
             ],
             &[("debezium".to_owned(), "pgoutput".to_owned())],
@@ -4938,8 +4972,21 @@ mod tests {
             "app.t.n, app.u.m numbers the rows already there in a table rewrite, which logical \
              decoding does not stream: publication(s) cdc, every over app.t; logical \
              replication slot(s) debezium (pgoutput) on this database will not carry those \
-             numbers, and a consumer keeps them empty until it takes a new snapshot of the table"
+             numbers, and a consumer keeps them empty until it takes a new snapshot of the table; \
+             publication cols over app.t lists its columns, so it publishes none of the added \
+             column(s) until they are added to its list"
         );
+        let columns_only = fills_listed(
+            &fills[..1],
+            &[(t.clone(), vec![("cols".into(), true)])],
+            &[],
+        );
+        assert_eq!(columns_only.status, "listed");
+        assert!(columns_only.message.contains(
+            "publication cols over app.t lists its columns, so it publishes none of the added \
+             column(s) until they are added to its list"
+        ));
+        assert!(!columns_only.message.contains("new snapshot"));
         let slots_only = fills_listed(
             &fills[..1],
             &[(t.clone(), Vec::new())],

@@ -8875,6 +8875,24 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
         }
         assert!(!line.contains("over app.q"), "{server}: {line}");
         assert!(!line.contains("app.fresh"), "{server}: {line}");
+        on_server(
+            connection,
+            "SET client_min_messages = error;
+             CREATE PUBLICATION pbps_fill_cols FOR TABLE app.t (v);",
+        );
+        let shown = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+        let line = shown
+            .lines()
+            .find(|l| l.starts_with("numbered_column_fills: "))
+            .unwrap_or_else(|| panic!("{server}: {shown}"));
+        for said in [
+            "publication(s) pbps_fill_t over app.t",
+            "until it takes a new snapshot of the table",
+            "publication pbps_fill_cols over app.t lists its columns, so it publishes none of \
+             the added column(s) until they are added to its list",
+        ] {
+            assert!(line.contains(said), "{server}: {said}: {line}");
+        }
         // Listed, never refused: the plan applies.
         succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
         succeeds(approved_apply(&d, connection, &plan, &[]));
@@ -8884,7 +8902,10 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
         );
 
         // Negative: with no publication and no slot, the add passes.
-        on_server(connection, "DROP PUBLICATION pbps_fill_t");
+        on_server(
+            connection,
+            "DROP PUBLICATION pbps_fill_t; DROP PUBLICATION pbps_fill_cols;",
+        );
         file(
             "t",
             "  n: {type: integer, nullable: false, identity: [1, 1]}\n  w: {type: serial}\n",

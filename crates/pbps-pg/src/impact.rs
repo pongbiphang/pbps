@@ -567,14 +567,23 @@ pub async fn logical_slots(conn: &mut Conn) -> Result<Vec<(String, String)>, DbE
 /// since measured on 18 `pg_partition_tree` of a plain table is empty, the
 /// rows of its tree. A table the catalog does not have reads as none: the
 /// caller asks only of a table the plan found there.
+/// The flag says whether any part of the tree uses an explicit column list:
+/// a snapshot cannot publish a new column until it is added to that list.
 pub async fn publications_of(
     conn: &mut Conn,
     table: &pbps_model::TableName,
-) -> Result<Vec<String>, DbError> {
+) -> Result<Vec<(String, bool)>, DbError> {
     let mut out = Vec::new();
     for row in conn
         .query_with(
-            "SELECT DISTINCT pt.pubname::text AS pubname
+            "SELECT pt.pubname::text AS pubname,
+                    pg_catalog.bool_or(EXISTS (
+                        SELECT 1
+                          FROM pg_catalog.pg_publication_rel pr
+                          JOIN pg_catalog.pg_publication p ON p.oid = pr.prpubid
+                         WHERE p.pubname = pt.pubname AND pr.prrelid = tc.oid
+                           AND pr.prattrs IS NOT NULL
+                    )) AS lists_columns
                FROM pg_catalog.pg_class c
                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
                JOIN pg_catalog.pg_class tc
@@ -585,12 +594,16 @@ pub async fn publications_of(
                JOIN pg_catalog.pg_publication_tables pt
                  ON pt.schemaname = tn.nspname AND pt.tablename = tc.relname
               WHERE n.nspname = $1 AND c.relname = $2
+              GROUP BY pt.pubname
               ORDER BY 1",
             &[table.schema.as_str().into(), table.name.as_str().into()],
         )
         .await?
     {
-        out.push(text(&row, "pubname")?);
+        let lists_columns = row
+            .try_get::<bool>("lists_columns")?
+            .ok_or_else(|| DbError::BadRow("catalog column `lists_columns` is null".to_owned()))?;
+        out.push((text(&row, "pubname")?, lists_columns));
     }
     Ok(out)
 }
