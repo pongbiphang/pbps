@@ -245,6 +245,7 @@ pub(crate) fn schedule(
                     handovers.edge(edge.before, edge.after, edge.source, edge.reason);
                 }
             }
+            keep_handover_dependents(&cs, declared, dialect, &mut handovers)?;
         }
         moved += after_the_rebuilds(
             &mut cs,
@@ -319,6 +320,68 @@ pub(crate) fn schedule(
         moved,
         skipped,
     })
+}
+
+/// A sinking claimer must take its dependents with it. Read those edges from
+/// the effects rather than listing FK/key pairs: the same requirement can
+/// belong to another operation, or itself have readers (DEC-2100.3).
+fn keep_handover_dependents(
+    cs: &ChangeSet,
+    declared: &Declarations<'_>,
+    dialect: &dyn Dialect,
+    handovers: &mut pbps_diff::order::Schedule,
+) -> Result<(), Refusal> {
+    use pbps_diff::order::{Schedule, edges, shadow};
+    use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+
+    let mut pending: BTreeSet<_> = handovers
+        .constraints()
+        .iter()
+        .filter(|edge| edge.after < edge.before)
+        .map(|edge| edge.after)
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let operations = Operations::of_plan(&cs.changes, ModuleEdits::Rebuilt);
+    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, declared.sources.after)
+        .map_err(|error| Refusal(error.to_string()))?;
+    let owners = PlanOwners::new(names, declared.sources.before.ids, declared.sources.after);
+    let before = Snapshot {
+        schema: declared.sources.before.schema,
+        ids: declared.sources.before.ids,
+    };
+    let after = Snapshot {
+        schema: declared.schema,
+        ids: declared.sources.after,
+    };
+    let effects = shadow::analyse(&operations, &owners, before, after, dialect);
+    if let Some((_, error)) = effects.unowned.first() {
+        return Err(Refusal(error.to_string()));
+    }
+    let graph = edges::graph(
+        operations.as_slice(),
+        &effects.effects,
+        &edges::Baseline::of(before, &owners),
+        declared.module_deps,
+        edges::Checks::ALL,
+    );
+    let dependencies = Schedule::of_graph(&graph, operations.as_slice());
+    let mut seen = BTreeSet::new();
+    while let Some(before) = pending.pop_first() {
+        if !seen.insert(before) {
+            continue;
+        }
+        for edge in dependencies
+            .constraints()
+            .iter()
+            .filter(|e| e.before == before)
+        {
+            handovers.edge(edge.before, edge.after, edge.source, edge.reason);
+            pending.insert(edge.after);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -466,6 +529,172 @@ mod tests {
             .iter()
             .position(|n| n == what)
             .unwrap_or_else(|| panic!("{what} is not in {order:?}"))
+    }
+
+    #[test]
+    fn a_deferred_key_keeps_its_dependents_without_carrying_unrelated_foreign_keys() {
+        use pbps_model::{
+            CheckConstraint, ForeignKey, PrimaryKey, ReplicaIdentity, UniqueConstraint,
+        };
+
+        for drop_trigger in [false, true] {
+            for kind in ["unique", "primary", "check"] {
+                let mut before = Schema::default();
+                let mut ids = IdsFile::default();
+                let t = TableName::new("app", "t");
+                let c = TableName::new("app", "c");
+                let r = TableName::new("app", "r");
+                for table in [&t, &c, &r] {
+                    let mut shape = Table::default();
+                    let mut id = column(ValueSource::None);
+                    id.nullable = false;
+                    shape.columns.insert("id".into(), id);
+                    before.tables.insert(table.clone(), shape);
+                    ids.tables.insert(
+                        Uid::derived(UidKind::Table, &table.shown().to_string(), 0),
+                        table.clone(),
+                    );
+                    ids.columns.insert(
+                        Uid::derived(UidKind::Column, &format!("{}.id", table.shown()), 0),
+                        table.column("id"),
+                    );
+                }
+                let key = |name: &str| PrimaryKey {
+                    name: Some(name.into()),
+                    columns: vec!["id".into()],
+                    storage_parameters: BTreeMap::new(),
+                };
+                before.tables.get_mut(&r).unwrap().primary_key = Some(key("pk_r"));
+                let trigger = ModuleId::Trigger {
+                    on: t.clone(),
+                    name: "audit".into(),
+                };
+                before.modules.insert(
+                    id("app.f()"),
+                    function("() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"),
+                );
+                before.modules.insert(
+                    trigger.clone(),
+                    Module {
+                        kind: ModuleKind::Trigger,
+                        description: None,
+                        definition:
+                            "CONSTRAINT AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()"
+                                .into(),
+                    },
+                );
+                let mut after = before.clone();
+                if drop_trigger {
+                    after.modules.remove(&trigger);
+                } else {
+                    after.modules.get_mut(&trigger).unwrap().definition =
+                        "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()".into();
+                }
+                let target = after.tables.get_mut(&t).unwrap();
+                match kind {
+                    "unique" => {
+                        target.unique.insert(
+                            "audit".into(),
+                            UniqueConstraint {
+                                columns: vec!["id".into()],
+                                storage_parameters: BTreeMap::new(),
+                            },
+                        );
+                        target.replica_identity = Some(ReplicaIdentity::Unique("audit".into()));
+                    }
+                    "primary" => {
+                        target.primary_key = Some(key("audit"));
+                        target.replica_identity = Some(ReplicaIdentity::PrimaryKey);
+                    }
+                    _ => {
+                        target.checks.insert(
+                            "audit".into(),
+                            CheckConstraint {
+                                expression: "id >= 0".into(),
+                            },
+                        );
+                    }
+                }
+                let fk = |target| ForeignKey {
+                    columns: vec!["id".into()],
+                    references_table: target,
+                    references_columns: vec!["id".into()],
+                    on_delete: Default::default(),
+                    on_update: Default::default(),
+                };
+                let child = after.tables.get_mut(&c).unwrap();
+                child.foreign_keys.insert(
+                    "dependent".into(),
+                    fk(if kind == "check" {
+                        r.clone()
+                    } else {
+                        t.clone()
+                    }),
+                );
+                child.foreign_keys.insert("unrelated".into(), fk(r.clone()));
+                let base = pbps_diff::Side {
+                    schema: &before,
+                    ids: &ids,
+                };
+                let desired = pbps_diff::Side {
+                    schema: &after,
+                    ids: &ids,
+                };
+                let raw = pbps_diff::diff(base, desired, &pg(), &Default::default()).unwrap();
+                let result = schedule(
+                    raw.clone(),
+                    &Declarations {
+                        schema: &after,
+                        sources: Sources {
+                            before: base,
+                            after: &ids,
+                        },
+                        module_deps: &ModuleDeps::new(),
+                    },
+                    &Facts::default(),
+                    &pg(),
+                )
+                .unwrap();
+                let changes = &result.changes.changes;
+                let at = |predicate: &dyn Fn(&Change) -> bool| {
+                    changes.iter().position(|p| predicate(&p.change)).unwrap()
+                };
+                let release = at(&|change| {
+                    matches!(
+                        change,
+                        Change::AlterModule { .. } | Change::DropModule { .. }
+                    )
+                });
+                let claim = at(&|change| {
+                    matches!(
+                        change,
+                        Change::AddUnique { .. }
+                            | Change::SetPrimaryKey { .. }
+                            | Change::AddCheck { .. }
+                    )
+                });
+                let dependent = at(
+                    &|change| matches!(change, Change::AddForeignKey { name, .. } if name == "dependent"),
+                );
+                let unrelated = at(
+                    &|change| matches!(change, Change::AddForeignKey { name, .. } if name == "unrelated"),
+                );
+                assert!(release < claim, "{kind}, drop={drop_trigger}: {changes:?}");
+                if kind != "check" {
+                    let identity =
+                        at(&|change| matches!(change, Change::SetReplicaIdentity { .. }));
+                    assert!(claim < identity, "{kind}: {changes:?}");
+                }
+                if drop_trigger {
+                    // A drop already precedes the additions; importing its
+                    // dependents must not perturb that satisfied handover.
+                    assert_eq!(result.changes, raw);
+                } else {
+                    assert!(unrelated < release, "{kind}: {changes:?}");
+                    assert_eq!(claim < dependent, kind != "check", "{kind}: {changes:?}");
+                }
+            }
+        }
     }
 
     /// #1598: the differ puts a table (class 7) ahead of every function

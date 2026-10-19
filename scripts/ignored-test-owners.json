@@ -487,6 +487,7 @@
         "a_numbered_column_added_to_rows_names_the_publications_that_miss_it",
         "declared_insert_grants_serial_usage_and_keeps_it_on_new_sequences",
         "a_constraint_trigger_rebuild_frees_its_name_before_a_check_or_foreign_key",
+        "a_deferred_unique_or_primary_key_keeps_its_referencing_foreign_key_after_it",
         "a_created_partition_takes_a_constraint_trigger_name_after_its_release",
         "an_attached_partition_keeps_its_check_after_a_constraint_trigger_releases_its_name",
         "a_cross_schema_cli_rename_requires_approval_and_records_only_its_declared_destination",

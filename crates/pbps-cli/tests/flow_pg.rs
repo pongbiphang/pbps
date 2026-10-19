@@ -14099,6 +14099,77 @@ fn a_constraint_trigger_rebuild_frees_its_name_before_a_check_or_foreign_key() {
     }
 }
 
+/// A key delayed by a constraint-trigger handover keeps the foreign keys
+/// that need it, without carrying keys that reference another standing key.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_deferred_unique_or_primary_key_keeps_its_referencing_foreign_key_after_it() {
+    for kind in ["unique", "primary", "check"] {
+        let slug = format!("trigger-slot-key-readers-{kind}");
+        let own = OwnDatabase::new(&server(), &slug);
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app;
+            CREATE TABLE app.t (id integer NOT NULL);
+            CREATE TABLE app.c (id integer);
+            CREATE TABLE app.r (id integer PRIMARY KEY);
+            CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+            CREATE CONSTRAINT TRIGGER audit AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f();");
+        let d = Demo::new(&slug);
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let table = d.dir.join("schema/app.t.yml");
+        let original = std::fs::read_to_string(&table).unwrap();
+        let claimer = match kind {
+            "unique" => "unique:\n  audit: [id]\nreplica_identity: {unique: audit}\n",
+            "primary" => {
+                "primary_key: {name: audit, columns: [id]}\nreplica_identity: primary_key\n"
+            }
+            _ => "checks:\n  audit: id >= 0\n",
+        };
+        std::fs::write(table, format!("{original}{claimer}")).unwrap();
+        let child = d.dir.join("schema/app.c.yml");
+        let original = std::fs::read_to_string(&child).unwrap();
+        let target = if kind == "check" { "r" } else { "t" };
+        std::fs::write(child, format!("{original}foreign_keys:\n  dependent:\n    columns: [id]\n    references: app.{target}(id)\n  unrelated:\n    columns: [id]\n    references: app.r(id)\n")).unwrap();
+        let trigger = d.dir.join("schema/app.t%2Eaudit.trigger.yml");
+        let original = std::fs::read_to_string(&trigger).unwrap();
+        let ordinary = original
+            .replace("CONSTRAINT AFTER", "AFTER")
+            .replace(" NOT DEFERRABLE INITIALLY IMMEDIATE", "");
+        assert_ne!(ordinary, original);
+        std::fs::write(trigger, ordinary).unwrap();
+        let (plan, script) = connected_plan(&d, connection);
+        let release = script.find("DROP TRIGGER \"audit\"").unwrap();
+        let claim = script.find("ADD CONSTRAINT \"audit\"").unwrap();
+        let dependent = script.find("ADD CONSTRAINT \"dependent\"").unwrap();
+        let unrelated = script.find("ADD CONSTRAINT \"unrelated\"").unwrap();
+        assert!(release < claim, "{script}");
+        assert!(unrelated < release, "{script}");
+        assert_eq!(claim < dependent, kind != "check", "{script}");
+        if kind != "check" {
+            assert!(
+                claim < script.find("REPLICA IDENTITY USING INDEX").unwrap(),
+                "{script}"
+            );
+        }
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive,constraint"],
+        ));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        on_server(
+            connection,
+            "INSERT INTO app.r VALUES (1); INSERT INTO app.t VALUES (1); INSERT INTO app.c VALUES (1)",
+        );
+        assert_eq!(scalar(connection, "SELECT count(*)::bigint FROM app.c"), 1);
+    }
+}
+
 fn a_partition_takes_a_released_constraint_trigger_name(attach: bool) {
     for was_constraint in [true, false] {
         let slug = format!("partition-trigger-slot-{attach}-{was_constraint}");

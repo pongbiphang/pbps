@@ -7077,3 +7077,33 @@ Pinned by `an_arriving_partition_claims_a_constraint_clone_only_until_its_parent
 `a_delayed_partition_keeps_its_readers_after_it_and_refuses_a_row_cycle`, and
 the live `a_created_partition_takes_a_constraint_trigger_name_after_its_release`
 and `an_attached_partition_keeps_its_check_after_a_constraint_trigger_releases_its_name`.
+
+<a id="dec-2100-3"></a>
+
+**DEC-2100.3. A constraint-slot claimer that sinks keeps its effects graph's
+dependents behind it.** Review of #2100 found that sinking an added unique
+or primary key after a trigger conversion left its referencing foreign key
+ahead of both. PostgreSQL 16 and 18 refuse that order with 42830: no unique
+constraint matches the referenced columns. A replica identity selecting the
+key is another reader with the same requirement.
+
+Before the existing `after_the_rebuilds` settle, the shared schedule reads
+the portable and dialect effects through `shadow::analyse`, `edges::graph`
+and `Schedule::of_graph`. Starting only at claimers a companion-name handover
+delays, it adds their outgoing constraints and follows their dependents.
+Each reader's `Is(Final)` requirement produces the key's `Creates` edge to
+the FK or replica identity. Identity ownership comes from `PlanNames` and `PlanOwners`,
+including rename history; SQL text is not used to infer these dependencies.
+Unknown ownership is refused rather than read as independence.
+
+This adds constraints to the existing sink settle, not another ordering
+pass. A check has no such readers; a foreign key on another standing key
+keeps its place. A handover already satisfied imports no edges, and plans
+without a companion-name handover keep their existing bytes. The existing
+partition-reader constraints and named cycle refusal remain in force.
+
+Pinned by `a_deferred_key_keeps_its_dependents_without_carrying_unrelated_foreign_keys`
+and the PostgreSQL 16/18 live
+`a_deferred_unique_or_primary_key_keeps_its_referencing_foreign_key_after_it`,
+including check and unrelated-FK controls, a replica identity on each key,
+and an already ordered trigger-drop control in the unit test.

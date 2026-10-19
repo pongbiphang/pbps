@@ -159,7 +159,10 @@ Then, in this order:
     releasing it. A partition inherits a constraint clone only while the
     parent still has that constraint trigger; what needs the delayed
     partition follows it, or is refused by name when rows would have to
-    cross a module change (DEC-2100.1, DEC-2100.2).
+    cross a module change (DEC-2100.1, DEC-2100.2). A delayed claimer also
+    takes its effects graph's dependents with it, including a key's foreign
+    keys and replica identity; unrelated additions retain their places
+    (DEC-2100.3).
   - `after_their_parents_defaults` then sets each partition's own default
     again after a parent's default the plan sets, which reaches every
     partition (DEC-1581.1).
@@ -405,8 +408,8 @@ and the expression-bearing changes that need a function.
 | S: `AddComputedColumn` → the index, unique or check over it | fixed | class 9 before 13 | ✓ DEC-1174.1 |
 | S: function created → `AddComputedColumn` calling it | content, over-approximated | refused by name (`may_name`): the function is class 14 | ✓ DEC-1174.1 |
 | Retype of a generated column → its `AlterColumnExpression` | fixed | rank −1 before 0: the new expression is computed in the final type | ✓ DEC-1168.1 (`a_generated_columns_nullability_relaxes_before_and_tightens_after_its_expression`) |
-| Referenced key → `AddForeignKey` | fixed | rank inside class 13 | ✓ |
-| P: `SetPrimaryKey`, `AddUnique` or `AddIndex` of the identity's index, new or rebuilt → `SetReplicaIdentity` | fixed | rank 2, last in class 13. A rebuilt index is not the identity until it is set again, so the differ plans the identity wherever the plan re-adds its index | ✓ DEC-1444.1 |
+| Referenced key → `AddForeignKey` | fixed | rank inside class 13; P: a key delayed by a constraint-trigger name handover keeps its effects edge to the FK in the same settle | ✓ DEC-2100.3 |
+| P: `SetPrimaryKey`, `AddUnique` or `AddIndex` of the identity's index, new or rebuilt → `SetReplicaIdentity` | fixed | rank 2, last in class 13. A rebuilt index is not the identity until it is set again, so the differ plans the identity wherever the plan re-adds its index. A key delayed by a constraint-trigger name handover keeps its effects edge to the identity in the same settle | ✓ DEC-1444.1, DEC-2100.3 |
 | P: `SetReplicaIdentity` to a target that stands → `DropIndex`, `DropUnique` or `SetPrimaryKey { to: None }` of the old identity's index | fixed | (0, 1) before class 2. Dropped first, the old index leaves the table identifying no row until the identity is set | ✓ DEC-1444.1 |
 | `CreateRole` → `Grant` to it | fixed | class 15 before 16 | ✓ |
 | `CreateModule` or `AlterModule` → `Grant` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants are restated after it | ✓ ADR-0010 §5 |
