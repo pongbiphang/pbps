@@ -3457,6 +3457,16 @@ pub struct PolicyDependent {
     pub name: String,
 }
 
+impl PolicyDependent {
+    /// Named membership in the already scoped schema, not binding proof.
+    pub fn is_declared_in(&self, schema: &Schema) -> bool {
+        schema
+            .tables
+            .get(&self.table)
+            .is_some_and(|table| table.row_policies.contains_key(&self.name))
+    }
+}
+
 pub async fn policies_on_column(
     conn: &mut Conn,
     column: &pbps_model::ColumnRef,
@@ -3512,4 +3522,94 @@ pub async fn policies_on_table(
             })
         })
         .collect()
+}
+
+/// Only policies whose catalog-deparsed predicates a table rename changes.
+/// Local scalar columns stay bare. Whole rows and correlated references use
+/// the owner alias; relation literals, FROM entries and explicit row-type
+/// casts carry catalog names. A schema-only move keeps the owner alias.
+pub async fn policies_affected_by_table_rename(
+    conn: &mut Conn,
+    table: &TableName,
+    to: &TableName,
+    managed: &Schema,
+) -> Result<Vec<PolicyDependent>, DbError> {
+    require_the_callers_transaction(conn).await?;
+    let rows = conn
+        .query_with(
+            "SELECT p.polname,n.nspname,own.relname,
+                t.oid::text AS relation,t.reltype::text AS row_type,
+                rt.typarray::text AS array_type,
+                (pg_catalog.current_setting('server_version_num')::int / 10000)::text AS major,
+                p.polrelid=t.oid AS local,
+                EXISTS (SELECT FROM pg_catalog.pg_depend d
+                    WHERE d.classid='pg_catalog.pg_policy'::regclass AND d.objid=p.oid
+                      AND d.refclassid='pg_catalog.pg_class'::regclass
+                      AND d.refobjid=t.oid AND d.refobjsubid=0 AND d.deptype='n') AS regclass,
+                p.polqual::text AS using_tree,p.polwithcheck::text AS check_tree
+           FROM pg_catalog.pg_class t
+           JOIN pg_catalog.pg_namespace tn ON tn.oid=t.relnamespace
+           JOIN pg_catalog.pg_type rt ON rt.oid=t.reltype
+           JOIN pg_catalog.pg_policy p ON p.polrelid=t.oid OR EXISTS (
+               SELECT FROM pg_catalog.pg_depend d
+                WHERE d.classid='pg_catalog.pg_policy'::regclass AND d.objid=p.oid
+                  AND ((d.refclassid='pg_catalog.pg_class'::regclass AND d.refobjid=t.oid)
+                    OR (d.refclassid='pg_catalog.pg_type'::regclass
+                        AND d.refobjid IN (t.reltype,rt.typarray))))
+           JOIN pg_catalog.pg_class own ON own.oid=p.polrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid=own.relnamespace
+          WHERE tn.nspname=$1 AND t.relname=$2
+          ORDER BY 2,3,1",
+            &[Param::Str(&table.schema), Param::Str(&table.name)],
+        )
+        .await?;
+    let mut found = Vec::new();
+    for row in &rows {
+        let policy = PolicyDependent {
+            name: text(row, "polname")?,
+            table: TableName::new(text(row, "nspname")?, text(row, "relname")?),
+        };
+        // Unmanaged owners follow a rename without entering the typed
+        // closing comparison. Do not require their trees to be decodable.
+        if !policy.is_declared_in(managed) {
+            continue;
+        }
+        let number = |field| -> Result<u32, DbError> {
+            text(row, field)?.parse().map_err(|_| {
+                DbError::BadRow(format!("policy rename {field} is not an oid or version"))
+            })
+        };
+        let boolean = |field| -> Result<bool, DbError> {
+            row.try_get::<bool>(field)?
+                .ok_or_else(|| DbError::BadRow(format!("policy rename {field} is NULL")))
+        };
+        let rename = crate::resolver::capture::policy_names::Rename {
+            relation: number("relation")?,
+            row_types: [number("row_type")?, number("array_type")?],
+            owner: boolean("local")?,
+            alias_changes: table.name != to.name,
+            regclass: boolean("regclass")?,
+        };
+        let mut affected = false;
+        for field in ["using_tree", "check_tree"] {
+            if let Some(tree) = row.try_get::<&str>(field)? {
+                affected |= crate::resolver::capture::policy_names::affected(
+                    tree,
+                    number("major")?,
+                    &rename,
+                )
+                .map_err(|why| {
+                    DbError::Refused(format!(
+                        "policy `{}` on {}: {why}",
+                        pbps_model::escape::Escaped(&policy.name),
+                        policy.table.shown()
+                    ))
+                })?;
+            }
+        }
+        if affected {
+            found.push(policy);
+        }
+    }
+    Ok(found)
 }

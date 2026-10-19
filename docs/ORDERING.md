@@ -291,11 +291,11 @@ requirement is common to all of them, so it is listed once,
 |---|---|---|---|---|
 | `DropModule` | 0 | Its dependents gone. P: views, routines, triggers, defaults, checks, indexes and generated columns, found in the catalog. S: schema-bound views | Removes the module, frees its name | removes |
 | `DropRole` | 0 | P: performed by hand (ADR-0010 §3). S: no members, no owned objects | Removes the role | removes |
-| `RenameTable` | 1 | The target name free | The table's new name | Exists, rewrites |
+| `RenameTable` | 1 | The target name free. P: no retained managed policy whose deparsed predicate changes | The table's new name | Exists, rewrites |
 | `RenameRole` | 1 | P: performed by hand. S: the target name free | The role's new name | Exists, rewrites |
 | `DropIndex`, `DropUnique`, `DropForeignKey`, `DropCheck`, `SetPrimaryKey { to: None }` | 2 | A foreign key on a key is dropped before the key | Frees names; releases columns for a rename, drop or retype; is gone before a row of its table is written (DEC-1968.2) | Exists, Is, creates, removes |
 | `DropComputedColumn` | 2 (2, 4) | S: the indexes, uniques and checks over it gone (4922); a check by its text, lexed | Removes a computed column, frees its name and releases the columns and functions it reads (DEC-1174.1) | Exists, removes |
-| `RenameColumn` | 3 | The target name free. S: no check and no filtered index naming the column (DECISIONS 474) | The column's new name. P: dependents' text follows the rename | Exists, rewrites |
+| `RenameColumn` | 3 | The target name free. P: no retained managed policy bound to the column. S: no check and no filtered index naming the column (DECISIONS 474) | The column's new name. P: other dependents' text follows the rename | Exists, rewrites |
 | `Revoke` | 4 | The target exists (a revoke on an object the plan drops is not emitted) | Removes a permission | Exists, rewrites |
 | `DropColumn` | 5 | Its indexes, constraints, inbound foreign keys and modules gone. P: generated columns reading it gone | Removes the column, frees its name | Absent, Exists, removes |
 | `DropTable` | 6 | Inbound foreign keys and dependent modules gone | Removes the table, frees its name | Absent, Exists, removes |
@@ -353,8 +353,12 @@ tables list:
 Created-table policies interact with module creation/alteration, table and
 column construction, constraints and bootstrap inserts through the setup
 phase above. Flag setup follows every policy setup. Standing policy/flag
-changes refuse with #1173; connected column drop/retype and routine rebuild
-under a retained policy refuse by its catalog-proven name. Whole owner-table
+changes refuse with #1173; connected column drop/retype/rename and routine
+rebuild under a retained policy refuse by its catalog-proven name. A table
+rename refuses only where it changes a retained policy's deparsed predicate:
+ordinary local scalar predicates and schema-only moves keeping a whole-row
+alias apply cleanly. Table/column renames under unmanaged policy owners also
+apply cleanly and do not enter these rename refusals. Whole owner-table
 drops release their policies before referenced table/column/routine teardown;
 cycles still require individual policy planning from #1173. Policies are not
 silently rebuilt or removed by this slice.
@@ -462,7 +466,7 @@ and the expression-bearing changes that need a function.
 | `CreateModule` or `AlterModule` → `Grant` on the routine | fixed | class 14 before 16. P: a rebuild's lost grants are restated after it | ✓ ADR-0010 §5 |
 | `CreateModule` or `AlterModule` → `PublicExecution` on the routine | fixed | same class, same create rank and subject: the next statement, so an autocommit `--sql` script never leaves the routine executable by `PUBLIC` past its own `CREATE` | ✓ #687 |
 | Structural/table changes, module creates/alters and `PublicExecution` → `CreatePolicy` or `SetRowSecurity` | fixed | shared `row_security::edges` setup phase, settled by the CLI schedule and resolver graph; bootstrap inserts finish before either kind | ✓ DEC-1172.2 |
-| `DropTable` owning a policy → referenced `DropTable`, `DropColumn`, `AlterColumnType` or routine removal | engine | exact `pg_policy`/`pg_depend` bindings, including relation-only references for table drops; catalog edges settle with structural, name-slot and routine constraints. Apply validates the saved order; a retained owner refuses with #1173 | ✓ DEC-1172.1 |
+| `DropTable` owning a policy → referenced `DropTable`, `DropColumn`, `AlterColumnType`, policy-changing table/column rename or routine removal | engine | exact `pg_policy`/`pg_depend` bindings, including relation-only references for table drops; catalog edges settle with structural, name-slot and routine constraints. Apply validates the saved order; a retained owner refuses with #1173 | ✓ DEC-1172.1 |
 | `CreatePolicy` → `SetRowSecurity` | fixed | shared setup phase: policies at (14, 2), flags at (14, 3). Policies on one table commute with each other; flags on separate created tables commute | ✓ DEC-1172.2 |
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
 | Row writes → `SetDataMode` / `SetEnsureKeys` of their table | fixed | class 11 and 12 before 17 | ✓ |

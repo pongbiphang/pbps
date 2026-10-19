@@ -31188,3 +31188,273 @@ fn row_security_resolver_plans_apply_and_preserve_adopted_policies() {
         &std::env::var("PBPS_TEST_PG_SCRATCH_DB").expect("separate live scratch cluster"),
     );
 }
+
+fn policy_rename_project(base: &str, slug: &str, policy: &str) -> (OwnDatabase, Demo) {
+    let own = OwnDatabase::new(base, slug);
+    on_server(own.connection(),&format!("CREATE SCHEMA app; CREATE SCHEMA archive;
+        CREATE TABLE app.t(id integer, checked integer, unused integer);
+        CREATE TABLE app.owner(id integer);
+        CREATE FUNCTION app.visible(x integer) RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT x $$;
+        {policy}"));
+    let d = Demo::new(slug);
+    succeeds(d.run(&["pull", "--db", own.connection()]));
+    d.commit();
+    succeeds(d.run(&[
+        "baseline",
+        "--db",
+        own.connection(),
+        "--reason",
+        "adopt policy rename fixture",
+    ]));
+    (own, d)
+}
+
+fn policy_rename_is_refused(d: &Demo, connection: &str) {
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    let snapshot = latest_snapshot(connection);
+    let path = d.dir.join("keep-plan.json");
+    std::fs::write(&path, "keep the previous artifact").unwrap();
+    let refused = d.run(&["plan", "--db", connection, "--out", path.to_str().unwrap()]);
+    assert_ne!(
+        code(&refused),
+        0,
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    let said = stderr(&refused);
+    assert!(
+        said.contains("gate") && said.contains("arrives with #1173"),
+        "{said}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "keep the previous artifact"
+    );
+    assert_eq!(latest_snapshot(connection), snapshot);
+}
+
+fn policy_rename_applies_and_replans_empty(d: &Demo, connection: &str) {
+    let plan = connected_artifact(d, connection, false);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    assert!(!saved.changes.changes.is_empty());
+    assert!(!saved.changes.changes.iter().any(|p| matches!(
+        p.change,
+        pbps_model::Change::CreatePolicy { .. } | pbps_model::Change::SetRowSecurity { .. }
+    )));
+    succeeds(approved_apply(
+        d,
+        connection,
+        &plan,
+        &["--allow", "rename,destructive,grant-widen"],
+    ));
+    succeeds(d.run(&["verify", "--db", connection]));
+    let noop = succeeds(d.run(&["plan", "--db", connection, "--format", "json"]));
+    let json: serde_json::Value = serde_json::from_str(&stdout(&noop)).unwrap();
+    assert_eq!(json["data"]["changes"], 0, "{json}");
+}
+
+fn rename_pulled_policy_column(original: &str, from: &str, to: &str) -> String {
+    let mut changed = false;
+    let mut result = String::new();
+    for line in original.lines() {
+        if line.starts_with(&format!("  {from}:")) {
+            changed = true;
+            let renamed = line.replacen(&format!("  {from}:"), &format!("  {to}:"), 1);
+            // pull emits a column mapping. Keep the predicates byte-for-byte
+            // rather than replacing occurrences of the column name in SQL.
+            assert!(renamed.trim_end().ends_with(':'), "{original}");
+            result.push_str(&format!("{renamed}\n    renamed_from: {from}\n"));
+        } else {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+    assert!(changed, "{original}");
+    result
+}
+
+#[test]
+#[ignore = "needs both live PostgreSQL versions"]
+fn row_security_column_renames_refuse_only_bound_policies() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).unwrap();
+        for (at, (column, policy, bound)) in [
+            (
+                "id",
+                "CREATE POLICY gate ON app.t USING (id > 0) WITH CHECK (checked < 10)",
+                true,
+            ),
+            (
+                "checked",
+                "CREATE POLICY gate ON app.t USING (id > 0) WITH CHECK (checked < 10)",
+                true,
+            ),
+            (
+                "unused",
+                "CREATE POLICY gate ON app.t USING (id > 0) WITH CHECK (checked < 10)",
+                false,
+            ),
+            (
+                "id",
+                "CREATE POLICY gate ON app.owner USING (EXISTS (SELECT FROM app.t WHERE t.id > 0))",
+                true,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (own, d) = policy_rename_project(&base, &format!("rls_column1172_{at}"), policy);
+            let path = d.dir.join("schema/app.t.yml");
+            let original = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                path,
+                rename_pulled_policy_column(&original, column, "renamed"),
+            )
+            .unwrap();
+            if bound {
+                policy_rename_is_refused(&d, own.connection());
+            } else {
+                policy_rename_applies_and_replans_empty(&d, own.connection());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs both live PostgreSQL versions"]
+fn row_security_table_renames_refuse_only_changed_policy_predicates() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).unwrap();
+        for (at,(policy,schema_move,changed)) in [
+            ("CREATE POLICY gate ON app.t USING (id > 0) WITH CHECK (checked < 10)",false,false),
+            ("CREATE POLICY gate ON app.t",false,false),
+            ("CREATE POLICY gate ON app.t USING (row_to_json(t.*) IS NOT NULL)",false,true),
+            ("CREATE POLICY gate ON app.t FOR INSERT WITH CHECK (row_to_json(t.*) IS NOT NULL)",false,true),
+            ("CREATE POLICY gate ON app.owner USING (EXISTS (SELECT FROM app.t))",false,true),
+            ("CREATE POLICY gate ON app.t USING ('app.t'::regclass IS NOT NULL)",false,true),
+            ("CREATE POLICY gate ON app.owner USING ('app.t'::regclass IS NOT NULL)",false,true),
+            ("CREATE POLICY gate ON app.t USING (EXISTS (SELECT FROM app.owner WHERE owner.id=t.id))",false,true),
+            ("CREATE POLICY gate ON app.t USING (ROW(id,checked,unused)::app.t IS NOT NULL)",false,true),
+            ("CREATE POLICY gate ON app.owner USING (ROW(id,1,2)::app.t IS NOT NULL)",false,true),
+            ("CREATE POLICY gate ON app.t USING (row_to_json(t.*) IS NOT NULL)",true,false),
+            ("CREATE POLICY gate ON app.t USING ('app.t'::regclass IS NOT NULL)",true,true),
+        ].into_iter().enumerate() {
+            let (own,d)=policy_rename_project(&base,&format!("rls_table1172_{at}"),policy);
+            let path=d.dir.join("schema/app.t.yml");
+            let original=std::fs::read_to_string(&path).unwrap();
+            let renamed=original.replace("table: app.t\n",if schema_move {"table: archive.t\nrenamed_from: app.t\n"} else {"table: app.renamed\nrenamed_from: app.t\n"});
+            assert_ne!(original,renamed);
+            std::fs::write(path,renamed).unwrap();
+            if changed { policy_rename_is_refused(&d,own.connection()); }
+            else { policy_rename_applies_and_replans_empty(&d,own.connection()); }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs both live PostgreSQL versions"]
+fn row_security_routine_renames_and_rebuilds_refuse_only_policy_callers() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).unwrap();
+        for (at, (rename, bound)) in [(true, true), (false, true), (true, false), (false, false)]
+            .into_iter()
+            .enumerate()
+        {
+            let policy = if bound {
+                "CREATE POLICY gate ON app.t USING (id > 0) WITH CHECK (app.visible(checked) < 10)"
+            } else {
+                "CREATE POLICY gate ON app.t USING (id > 0)"
+            };
+            let (own, d) = policy_rename_project(&base, &format!("rls_routine1172_{at}"), policy);
+            if rename {
+                // Routine identity is its name/signature (no UID rename).
+                // Declaring its new name removes the old routine and creates
+                // the new one, so the existing dependent refusal must apply.
+                let path = std::fs::read_dir(d.dir.join("schema"))
+                    .unwrap()
+                    .map(|p| p.unwrap().path())
+                    .find(|p| {
+                        std::fs::read_to_string(p)
+                            .unwrap()
+                            .contains("function: app.visible(integer)")
+                    })
+                    .unwrap();
+                std::fs::remove_file(path).unwrap();
+                declare_function(&d, "renamed_visible", "SELECT x");
+            } else {
+                declare_function(&d, "visible", "SELECT x + 1");
+            }
+            if bound {
+                policy_rename_is_refused(&d, own.connection());
+            } else {
+                policy_rename_applies_and_replans_empty(&d, own.connection());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs both live PostgreSQL versions"]
+fn row_security_renames_preserve_unmanaged_policy_owners() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).unwrap();
+        for table in [true, false] {
+            let slug = if table {
+                "rls_scope_table1172"
+            } else {
+                "rls_scope_column1172"
+            };
+            let own = OwnDatabase::new(&base, slug);
+            let connection = own.connection();
+            on_server(
+                connection,
+                "CREATE SCHEMA app; CREATE TABLE app.t(id integer,other integer)",
+            );
+            let d = Demo::new(slug);
+            std::fs::write(
+                d.dir.join("pbps.yml"),
+                "dialect: postgres\nunmanaged: ignore\n",
+            )
+            .unwrap();
+            succeeds(d.run(&["pull", "--db", connection]));
+            d.commit();
+            succeeds(d.run(&[
+                "baseline",
+                "--db",
+                connection,
+                "--reason",
+                "adopt only the managed table",
+            ]));
+            on_server(
+                connection,
+                "CREATE SCHEMA outside; CREATE TABLE outside.owner(id integer); CREATE POLICY external_gate ON outside.owner USING (EXISTS(SELECT FROM app.t WHERE t.id>0))",
+            );
+            let path = d.dir.join("schema/app.t.yml");
+            let original = std::fs::read_to_string(&path).unwrap();
+            let edited = if table {
+                original.replace(
+                    "table: app.t\n",
+                    "table: app.renamed\nrenamed_from: app.t\n",
+                )
+            } else {
+                rename_pulled_policy_column(&original, "id", "renamed")
+            };
+            std::fs::write(path, edited).unwrap();
+            let catalog = "SELECT pg_get_expr(polqual,polrelid) FROM pg_policy WHERE polrelid='outside.owner'::regclass AND polname='external_gate'";
+            let before = text_of(connection, catalog);
+            policy_rename_applies_and_replans_empty(&d, connection);
+            assert_ne!(text_of(connection, catalog), before);
+            let snapshot = latest_snapshot(connection);
+            assert_eq!(snapshot.schema.tables.len(), 1);
+            assert!(
+                snapshot.schema.tables
+                    [&pbps_model::TableName::new("app", if table { "renamed" } else { "t" })]
+                    .row_policies
+                    .is_empty()
+            );
+        }
+    }
+}

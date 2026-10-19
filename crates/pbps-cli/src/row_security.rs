@@ -7,11 +7,12 @@ use pbps_model::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The exact policy dependents read for each edited column or dropped table. An absent entry
-/// is unread, while an empty vector records a successful empty catalog read.
+/// Exact policy dependents of edited columns and dropped or renamed tables.
+/// An absent entry is unread; an empty vector records a successful empty read.
 pub(crate) type PolicyDependents = BTreeMap<Uid, Vec<pbps_pg::modules::PolicyDependent>>;
 
-/// The column changes whose old catalog bindings a policy can hold.
+/// Destructive column edits shared with engine probes. Rename dependencies
+/// are read separately, without invoking drop/retype-only probes.
 pub(crate) fn column_edit(change: &Change) -> Option<(&Uid, &pbps_model::ColumnRef, &'static str)> {
     if let Change::DropColumn { uid, column } = change {
         Some((uid, column, "dropped"))
@@ -23,7 +24,10 @@ pub(crate) fn column_edit(change: &Change) -> Option<(&Uid, &pbps_model::ColumnR
 }
 
 pub(crate) fn policy_target_uid(change: &Change) -> Option<&Uid> {
-    if let Change::DropTable { uid, .. } = change {
+    if let Change::DropTable { uid, .. }
+    | Change::RenameTable { uid, .. }
+    | Change::RenameColumn { uid, .. } = change
+    {
         Some(uid)
     } else {
         column_edit(change).map(|(uid, _, _)| uid)
@@ -56,14 +60,26 @@ pub(crate) fn policy_releases(
         if policies.is_empty() {
             continue;
         }
-        let (subject, what, dropped_table) = if let Change::DropTable { .. } = &step.change {
+        let (subject, what, dropped_table) = if matches!(
+            &step.change,
+            Change::DropTable { .. } | Change::RenameTable { .. }
+        ) {
             let table = names.table_at(uid, At::Start).ok_or_else(|| {
                 anyhow::anyhow!("policy dependent table {uid} has no opening catalog identity")
             })?;
-            (table.shown().to_string(), "dropped", Some(table))
+            if matches!(&step.change, Change::DropTable { .. }) {
+                (table.shown().to_string(), "dropped", Some(table))
+            } else {
+                (table.shown().to_string(), "renamed", None)
+            }
         } else {
-            let (_, _, what) =
-                column_edit(&step.change).expect("a policy target is a table or column");
+            let what = if matches!(&step.change, Change::RenameColumn { .. }) {
+                "renamed"
+            } else {
+                column_edit(&step.change)
+                    .expect("a policy target is a table or column")
+                    .2
+            };
             let (owner, name) = names.column_at(uid, At::Start).ok_or_else(|| {
                 anyhow::anyhow!("policy dependent column {uid} has no opening catalog identity")
             })?;
@@ -426,6 +442,88 @@ mod tests {
         let edges = policy_releases(&plan, &ids, &found).unwrap();
         assert_eq!((edges[0].before, edges[0].after), (4, 0));
         assert!(check_policy_releases(&plan, &ids, &found).is_err());
+    }
+
+    #[test]
+    fn rename_refusals_follow_opening_column_identity_and_exact_owner_release() {
+        let before = TableName::new("app", "before");
+        let after = TableName::new("app", "after");
+        let owner = TableName::new("app", "owner");
+        let table_uid: Uid = "t_117210".parse().unwrap();
+        let column_uid: Uid = "c_117210".parse().unwrap();
+        let owner_uid: Uid = "t_117211".parse().unwrap();
+        let mut ids = IdsFile::default();
+        ids.tables.insert(table_uid.clone(), after.clone());
+        ids.tables.insert(owner_uid.clone(), owner.clone());
+        ids.columns
+            .insert(column_uid.clone(), after.column("renamed"));
+        let mut plan = ChangeSet {
+            changes: vec![
+                Change::RenameTable {
+                    uid: table_uid.clone(),
+                    from: before,
+                    to: after.clone(),
+                    defaults: vec![],
+                },
+                Change::RenameColumn {
+                    uid: column_uid.clone(),
+                    table: after,
+                    from: "original".into(),
+                    to: "renamed".into(),
+                    table_was: Some(TableName::new("app", "before")),
+                },
+            ]
+            .into_iter()
+            .map(PlannedChange::new)
+            .collect(),
+        };
+        let mut found: PolicyDependents = [(table_uid, vec![])].into();
+        assert!(
+            policy_releases(&plan, &ids, &found)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("were not read")
+        );
+        found.insert(column_uid.clone(), vec![]);
+        assert!(policy_releases(&plan, &ids, &found).unwrap().is_empty());
+        found.insert(
+            column_uid,
+            vec![pbps_pg::modules::PolicyDependent {
+                table: owner.clone(),
+                name: "gate".into(),
+            }],
+        );
+        let error = policy_releases(&plan, &ids, &found)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("app.before.original cannot be renamed")
+                && error.contains("policy `gate`")
+                && error.contains("arrives with #1173"),
+            "{error}"
+        );
+        ids.tables.remove(&owner_uid);
+        found.insert(owner_uid.clone(), vec![]);
+        plan.changes.insert(
+            0,
+            PlannedChange::new(Change::DropTable {
+                uid: owner_uid,
+                name: owner,
+                detach_from: None,
+            }),
+        );
+        let edges = policy_releases(&plan, &ids, &found).unwrap();
+        assert_eq!((edges[0].before, edges[0].after), (0, 2));
+        check_policy_releases(&plan, &ids, &found).unwrap();
+        plan.changes.rotate_left(1);
+        assert!(
+            check_policy_releases(&plan, &ids, &found)
+                .unwrap_err()
+                .to_string()
+                .contains("its table drop must precede")
+        );
     }
 
     #[test]

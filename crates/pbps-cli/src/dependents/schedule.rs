@@ -694,7 +694,20 @@ mod tests {
                 ..Default::default()
             },
         );
-        before.tables.insert(owner.clone(), Table::default());
+        before.tables.insert(
+            owner.clone(),
+            Table {
+                row_policies: [(
+                    "cross_table".into(),
+                    pbps_model::RowPolicy {
+                        using: Some("EXISTS(SELECT FROM app.input WHERE target > 0)".into()),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+        );
         let mut ids = IdsFile::default();
         ids.tables.insert(input_uid.clone(), input.clone());
         ids.tables.insert(owner_uid.clone(), owner.clone());
@@ -793,7 +806,12 @@ mod tests {
                 .to_string()
                 .contains("were not read")
             );
-            let empty = [(target_uid.clone(), vec![]), (owner_uid.clone(), vec![])].into();
+            let empty = [
+                (target_uid.clone(), vec![]),
+                (input_uid.clone(), vec![]),
+                (owner_uid.clone(), vec![]),
+            ]
+            .into();
             let no_policy = schedule(
                 changes.clone(),
                 &declared,
@@ -806,6 +824,16 @@ mod tests {
             let found = [
                 (
                     target_uid.clone(),
+                    vec![pbps_pg::modules::PolicyDependent {
+                        table: owner.clone(),
+                        name: "cross_table".into(),
+                    }],
+                ),
+                // The same external policy also changes its deparse when
+                // the referenced table is renamed, so its owner releases
+                // both catalog bindings before either edit.
+                (
+                    input_uid.clone(),
                     vec![pbps_pg::modules::PolicyDependent {
                         table: owner.clone(),
                         name: "cross_table".into(),

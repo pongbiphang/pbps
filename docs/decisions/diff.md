@@ -6855,6 +6855,22 @@ and refuses cycles that need individual policy removal. A retained owner still
 refuses by policy name with #1173. Apply reads dependencies again and refuses
 a saved plan whose owner removal follows the dependent change; it never
 repairs the approved order.
+Column renames with managed policy bindings join that named #1173 refusal: offering a
+plan the closing guard must roll back is not useful. A table rename refuses
+only the policies whose catalog deparse changes: relation references, explicit
+row-type casts, and owner whole-row or correlated aliases. Ordinary local
+scalar predicates remain valid, as does a schema-only move of a whole-row
+predicate whose owner alias stays the same. This reads engine node trees with
+the existing versioned decoder, without parsing authored SQL or certifying
+policy bindings for #595. Renaming a routine's declaration is a drop/create,
+and a retained policy caller already refuses it, just like a routine rebuild;
+unbound column renames and unrelated routine changes remain applicable.
+Policies on unmanaged owners also follow table and column renames cleanly:
+those predicates are outside the typed closing comparison. Only rename facts
+are scoped to the managed policy names; drops, retypes and routine rebuilds
+still read every physical policy dependency. The table-rename reader skips
+unmanaged policy trees before decoding, so unrelated expression coverage
+cannot become a refusal.
 
 
 <a id="dec-2104-1"></a>

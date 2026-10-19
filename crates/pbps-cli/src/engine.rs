@@ -3484,7 +3484,7 @@ pub async fn account_for_module_dependents(
     // Every reordering pass, in one place (#1955): `weave` over what the
     // catalog just said depends on the modules this plan drops, then the
     // passes that read nothing.
-    let policies = policy_dependents(conn, changes, sources.after).await?;
+    let policies = policy_dependents(conn, changes, sources.after, sources.before.schema).await?;
     let facts = read
         .with_module_dependents(&found)
         .with_policy_dependents(&policies);
@@ -3588,7 +3588,7 @@ pub async fn check_module_dependents(
     stored_ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<()> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    refuse_policy_dependents(conn, changes, ids).await?;
+    refuse_policy_dependents(conn, changes, ids, stored).await?;
     let found = module_dependents(conn, changes).await?;
     // Match the planner's final relation first; each dependency lookup then
     // spells both ends at the statement's boundary (DEC-1875.1).
@@ -5276,12 +5276,14 @@ mod plan_name_tests {
     }
 }
 
-/// Read old policy bindings once, after any module rediff has settled which
-/// tables and columns the plan removes or edits. No policy read is replaced by an empty result.
+/// Read old policy bindings after module rediff settles the edits. A UID may
+/// be renamed and then edited; accumulate its facts instead of letting the
+/// first edit hide a later one. No failed read becomes an empty result.
 async fn policy_dependents(
     conn: &mut Conn,
     changes: &ChangeSet,
     ids: &pbps_model::IdsFile,
+    managed: &pbps_model::Schema,
 ) -> anyhow::Result<crate::row_security::PolicyDependents> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
     let mut found = crate::row_security::PolicyDependents::new();
@@ -5289,22 +5291,40 @@ async fn policy_dependents(
         let Some(uid) = crate::row_security::policy_target_uid(&step.change) else {
             continue;
         };
-        if found.contains_key(uid) {
-            continue;
-        }
-        let policies = if let pbps_model::Change::DropTable { uid, .. } = &step.change {
+        let mut policies = if let pbps_model::Change::DropTable { uid, .. } = &step.change {
             if let Some(table) = names.table_at(uid, pbps_model::plan_names::At::Start) {
                 pbps_pg::modules::policies_on_table(conn, table).await?
             } else {
                 Vec::new()
             }
-        } else if let Some((table, column, _, _)) = changed_column(&names, &step.change) {
+        } else if let pbps_model::Change::RenameTable { to, .. } = &step.change {
+            if let Some(table) = names.table_at(uid, pbps_model::plan_names::At::Start) {
+                pbps_pg::modules::policies_affected_by_table_rename(conn, table, to, managed)
+                    .await?
+            } else {
+                Vec::new()
+            }
+        } else if let Some((owner, column)) =
+            names.column_at(uid, pbps_model::plan_names::At::Start)
+            && let Some(table) = names.table_at(owner, pbps_model::plan_names::At::Start)
+        {
             pbps_pg::modules::policies_on_column(conn, &table.column(column)).await?
         } else {
             // A newly created column has no old catalog bindings.
             Vec::new()
         };
-        found.insert(uid.clone(), policies);
+        if matches!(&step.change, pbps_model::Change::RenameColumn { .. }) {
+            // A rename carries unmanaged policies cleanly; only a modeled
+            // policy's changed deparse fails the typed closing guard. Drops
+            // and retypes still need every physical catalog dependency.
+            policies.retain(|policy| policy.is_declared_in(managed));
+        }
+        let all = found.entry(uid.clone()).or_default();
+        for policy in policies {
+            if !all.contains(&policy) {
+                all.push(policy);
+            }
+        }
     }
     Ok(found)
 }
@@ -5315,9 +5335,10 @@ async fn refuse_policy_dependents(
     conn: &mut Conn,
     changes: &ChangeSet,
     ids: &pbps_model::IdsFile,
+    managed: &pbps_model::Schema,
 ) -> anyhow::Result<()> {
     if conn.driver() == Driver::Postgres {
-        let found = policy_dependents(conn, changes, ids).await?;
+        let found = policy_dependents(conn, changes, ids, managed).await?;
         crate::row_security::check_policy_releases(changes, ids, &found)?;
     }
     Ok(())
