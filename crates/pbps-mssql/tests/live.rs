@@ -32,6 +32,9 @@ use pbps_model::{
 };
 use pbps_mssql::Mssql;
 
+#[path = "live/binding_releases.rs"]
+mod binding_releases;
+
 #[path = "support/commutation.rs"]
 mod commutation;
 

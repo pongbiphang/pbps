@@ -325,12 +325,7 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
                 before,
                 after,
                 edge,
-            } if (module_op(*before) || module_op(*after))
-                && matches!(
-                    &edge.because,
-                    Because::Frees(key) | Because::Precedes(key) if computed(key)
-                ) =>
-            {
+            } if stage != Stage::Final && super::edges::connected_module_release(edge, ops) => {
                 format!(
                     "connected {} must precede {} because {:?}",
                     name(*before),

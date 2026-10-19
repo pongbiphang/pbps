@@ -7326,11 +7326,16 @@ settle path as other effects, including when incarnation checks are off.
 The shared CLI schedule calls `order::before_rewrites` after its existing
 expansions. That generic entry analyses effects and returns the original
 plan unless it carries this requirement and has a corresponding rewrite
-edge. When active, it gives the full effect graph to `Schedule::settle`,
-with Keep entries preserving the relative order of every step that is not
-an endpoint of a BeforeRewrite edge. The callee rewrite sinks after the
-release under DEC-1956.2; no SQL Server rank, standalone reorder pass or
-hoisting policy is added. A conflicting Keep or cycle uses the existing
+edge. When active, it settles only edges incident to a BeforeRewrite
+participant: the release, the rewrites of its key, and their transitive
+dependents. Incoming prerequisites still constrain those participants.
+Keep entries preserve the relative order of every other step. Edges owned
+by the later connected computed-column pass are excluded before finding
+dependents, using the same predicate as the observer's deferrals; an
+independent computed rebuild must not reverse a Keep or run before its
+catalog read merely because this plan also releases a binding. The callee
+rewrite sinks after the release under DEC-1956.2; no SQL Server rank,
+standalone reorder pass or hoisting policy is added. A conflicting Keep or cycle uses the existing
 named refusal. The class-order observer records BeforeRewrite edges as
 pending only before the shared schedule; its output and the final order
 must satisfy them. Plans without the requirement retain identical steps,
@@ -7341,7 +7346,7 @@ in `pbps-diff`, and `releasing_a_baseline_binding_precedes_the_old_callees_rewri
 `a_split_caller_releases_its_binding_at_teardown_and_rebinds_after_the_rewrite`,
 `only_an_actual_old_binding_that_the_step_releases_adds_before_rewrite`,
 `baseline_bindings_preserve_case_and_allow_only_unambiguous_folding`,
-`binding_release_settle_refuses_to_reverse_nonparticipants`,
+`binding_release_settle_keeps_unrelated_steps_outside_its_scope`,
 `incompatible_binding_releases_are_refused_with_the_cycle_members_named`, and
 `plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes`
 in `pbps-mssql`. The CLI live
@@ -7349,3 +7354,18 @@ in `pbps-mssql`. The CLI live
 baseline's 3729 before planning, checks offline and connected release-first
 order for all three release forms, applies the saved plan, verifies the
 results and read-back, and requires an empty next plan.
+
+The draft review's combined case is pinned by
+`binding_releases_leave_computed_column_rebuilds_for_the_connected_stage`
+(independent and incident computed edges),
+`binding_release_dependents_follow_the_rewrite_transitively`, and the live
+`binding_release_and_an_independent_computed_rebuild_both_apply`. The live
+case confirms 3729 and the computed binding in the catalog, preserves the
+computed steps at the shared stage, then applies the combined revision
+with its catalog release edges and checks the recomputed persisted value.
+
+The CLI live `binding_releases_preserve_independent_connected_computed_releases`
+also covers the ordinary connected path: a separate function drop follows
+its computed column's drop through the existing catalog pass, while the
+binding release precedes its own callee rewrite. The saved plan applies,
+verifies and leaves an empty next plan.

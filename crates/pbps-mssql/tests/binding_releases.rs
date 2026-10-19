@@ -239,7 +239,7 @@ fn baseline_bindings_preserve_case_and_allow_only_unambiguous_folding() {
 }
 
 #[test]
-fn binding_release_settle_refuses_to_reverse_nonparticipants() {
+fn binding_release_settle_keeps_unrelated_steps_outside_its_scope() {
     let (before, mut after) = ends(function(false, "@x"));
     after.modules.insert(id("m"), function(true, "@x + 1"));
     after.modules.insert(id("n"), function(true, "app.m(@x)"));
@@ -254,13 +254,11 @@ fn binding_release_settle_refuses_to_reverse_nonparticipants() {
         alter("m", &after.modules[&id("m")]),
         alter("g", &after.modules[&id("g")]),
     ]);
-    let refusal = settle(&before, &after, changes).unwrap_err();
-    assert!(
-        refusal.contains("dependency release")
-            && refusal.contains("app.n")
-            && refusal.contains("app.m"),
-        "{refusal}"
-    );
+    let expected = ChangeSet {
+        changes: [1, 2, 3, 0].map(|at| changes.changes[at].clone()).to_vec(),
+    };
+    // This stage must neither repair nor refuse the unrelated m/n order.
+    assert_eq!(settle(&before, &after, changes).unwrap(), expected);
 }
 
 #[test]
@@ -371,4 +369,72 @@ fn incompatible_binding_releases_are_refused_with_the_cycle_members_named() {
     for text in ["wait on one another", "app.f", "app.g", "app.h"] {
         assert!(refusal.contains(text), "{refusal}");
     }
+}
+
+#[path = "support/binding_release_plan.rs"]
+mod binding_release_plan;
+
+#[test]
+fn binding_releases_leave_computed_column_rebuilds_for_the_connected_stage() {
+    for callee in ["z", "f"] {
+        let (before, after, ids, input) = binding_release_plan::combined(callee);
+        let expected = ChangeSet {
+            changes: [1, 0, 2, 3, 4].map(|i| input.changes[i].clone()).to_vec(),
+        };
+        let result = order::before_rewrites(
+            input,
+            Side {
+                schema: &before,
+                ids: &ids,
+            },
+            Side {
+                schema: &after,
+                ids: &ids,
+            },
+            &Mssql,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result, expected,
+            "the connected stage owns the {callee}/computed pair"
+        );
+    }
+}
+
+#[test]
+fn binding_release_dependents_follow_the_rewrite_transitively() {
+    let (mut before, mut after) = ends(function(false, "@x"));
+    before.modules.remove(&id("h"));
+    for (name, body) in [
+        ("h", "app.f(@x)"),
+        ("i", "app.h(@x)"),
+        ("u", "@x"),
+        ("v", "@x"),
+    ] {
+        after.modules.insert(id(name), function(true, body));
+    }
+    let create = |name: &str| Change::CreateModule {
+        id: id(name),
+        module: Box::new(after.modules[&id(name)].clone()),
+    };
+    let changes = plan(vec![
+        alter("f", &after.modules[&id("f")]),
+        create("h"),
+        create("u"),
+        create("i"),
+        create("v"),
+        alter("g", &after.modules[&id("g")]),
+    ]);
+    let expected = ChangeSet {
+        changes: [2, 4, 5, 0, 1, 3]
+            .map(|i| changes.changes[i].clone())
+            .to_vec(),
+    };
+    assert_eq!(settle(&before, &after, changes).unwrap(), expected);
+    let (ops, effects, base) = analysed(&before, &after, &expected);
+    assert_eq!(
+        order::verify(ops.as_slice(), &effects, &base, &Default::default()),
+        []
+    );
 }

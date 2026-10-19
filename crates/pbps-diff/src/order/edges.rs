@@ -122,6 +122,27 @@ impl Graph {
     }
 }
 
+/// The connected computed-column pass owns these release edges. An earlier
+/// schedule cannot apply their lexical approximation before that pass reads
+/// the catalog (DEC-1431.1, DEC-2228.1).
+pub(crate) fn connected_module_release(edge: &Edge, operations: &[Operation]) -> bool {
+    matches!(
+        &edge.because,
+        Because::Frees(ObjectKey::Part {
+            part: pbps_model::operation::PartKey::Computed(_),
+            ..
+        }) | Because::Precedes(ObjectKey::Part {
+            part: pbps_model::operation::PartKey::Computed(_),
+            ..
+        })
+    ) && [edge.before, edge.after].into_iter().any(|at| {
+        matches!(
+            operations[at].change(),
+            pbps_model::Change::AlterModule { .. } | pbps_model::Change::DropModule { .. }
+        )
+    })
+}
+
 /// What the baseline holds. Rows and permissions are not in it, and
 /// [`Baseline::holds`] says "not known" for them rather than "no".
 #[derive(Debug, Clone, Default)]

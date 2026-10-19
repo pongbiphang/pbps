@@ -22826,6 +22826,12 @@ fn baseline_schema_bindings_are_released_before_callee_rewrites() {
     binding_releases::check();
 }
 
+#[test]
+#[ignore = "needs a live SQL Server; set PBPS_TEST_DB"]
+fn binding_releases_preserve_independent_connected_computed_releases() {
+    binding_releases::check_independent_connected_release();
+}
+
 #[path = "support/abrupt_recovery.rs"]
 mod abrupt_recovery;
 

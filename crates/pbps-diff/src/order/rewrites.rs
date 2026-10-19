@@ -5,8 +5,8 @@ use pbps_dialect::Dialect;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Requirement, Snapshot};
 use pbps_model::{ChangeSet, ModuleDeps};
 
-/// Apply only orders requested by BeforeRewrite. Non-participants retain
-/// their relative order, rather than letting an incomplete graph sort them.
+/// Settle BeforeRewrite and the dependencies of its participants. Unrelated
+/// steps retain their relative order, and later stages keep their own edges.
 pub fn before_rewrites(
     changes: ChangeSet,
     before: crate::Side<'_>,
@@ -44,7 +44,7 @@ pub fn before_rewrites(
     if let Some((_, error)) = effects.unowned.first() {
         return Err(error.to_string());
     }
-    let graph = graph(
+    let mut graph = graph(
         operations.as_slice(),
         &effects.effects,
         &Baseline::of(base, &owners),
@@ -61,6 +61,30 @@ pub fn before_rewrites(
     if !moving.iter().any(|m| *m) {
         return Ok(changes);
     }
+    // Only the release and its delayed rewrites may disturb this order.
+    // Their dependents have to follow them, transitively. Do not let the
+    // connected pass's computed-column edges extend or constrain that set.
+    graph
+        .edges
+        .retain(|edge| !super::edges::connected_module_release(edge, operations.as_slice()));
+    let mut outgoing = vec![Vec::new(); moving.len()];
+    for edge in &graph.edges {
+        outgoing[edge.before].push(edge.after);
+    }
+    let mut pending: Vec<_> = (0..moving.len()).filter(|&at| moving[at]).collect();
+    while let Some(at) = pending.pop() {
+        for &dependent in &outgoing[at] {
+            if !moving[dependent] {
+                moving[dependent] = true;
+                pending.push(dependent);
+            }
+        }
+    }
+    // Incoming prerequisites still constrain a participant. Edges between
+    // unrelated steps belong to their current or later ordering stage.
+    graph
+        .edges
+        .retain(|edge| moving[edge.before] || moving[edge.after]);
     let mut schedule = Schedule::of_graph(&graph, operations.as_slice());
     let mut previous = None;
     for (at, moves) in moving.into_iter().enumerate() {

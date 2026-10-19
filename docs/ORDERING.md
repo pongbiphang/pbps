@@ -124,10 +124,11 @@ Then, in this order:
   ahead of it as `plan --db` does (#1598). The resolver's answer is scheduled
   by `plan --db` before it is sealed (#1516).
 - **Binding releases, `order::before_rewrites`**: the shared schedule gives
-  the full effects graph to `settle` only when a `BeforeRewrite` requirement
-  orders a release before another step rewrites its key. Keep entries retain
-  every non-participant's relative order; other plans return unchanged
-  (DEC-2228.1).
+  the effects incident to `BeforeRewrite` participants to `settle`: a
+  release, its key's rewrites and their transitive dependents. Edges owned by
+  the later connected computed-column pass stay deferred. Keep entries retain
+  every other step's relative order; plans without the requirement return
+  unchanged (DEC-2228.1).
 - **With the members read, `order::role_drops`** (`schedule` calls it once
   `plan --db` has supplied the memberships) settles a role-only projection
   over holder-before-member catalog edges and the existing depth policy.
