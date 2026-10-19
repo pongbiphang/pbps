@@ -3090,8 +3090,9 @@ pub(crate) async fn refuse_misspelt(
     schema: &Schema,
     at: &pbps_db::catalog::CatalogNames,
     unasked: &mut Vec<String>,
+    type_routines_need_review: bool,
 ) -> anyhow::Result<Schema> {
-    let mut found = crate::engine::misspelt(conn, schema, at)
+    let mut found = crate::engine::misspelt(conn, schema, at, type_routines_need_review)
         .await
         .context("cannot ask the engine how it reads the declared rows")?;
     unasked.extend(found.defaults_unasked.iter().map(|why| {
@@ -5848,6 +5849,39 @@ fn refuse_invalid_declarations(
     );
 }
 
+// Immediate bootstrap has no reviewed source artifact, including before its
+// spelling probes. Recheck before execution too (DEC-2181.2).
+async fn bootstrap_type_pins(
+    conn: &mut Conn,
+    schema: &Schema,
+    changes: &pbps_model::ChangeSet,
+    project: &Project,
+) -> anyhow::Result<Vec<pbps_model::TypePin>> {
+    let pins = crate::engine::seal_type_pins(
+        conn,
+        &[schema],
+        changes,
+        &project.config.trusted_roles,
+        project.config.pin_type_routines,
+    )
+    .await?;
+    if !crate::engine::type_input_routines(
+        conn,
+        &pins,
+        &project.config.trusted_roles,
+        project.config.pin_type_routines,
+        false,
+    )
+    .await?
+    .is_empty()
+    {
+        bail!(
+            "immediate bootstrap cannot run type routines without a reviewed saved plan; baseline an empty target, then plan, review and apply (DEC-2181.2)"
+        );
+    }
+    Ok(pins)
+}
+
 pub fn cmd_bootstrap(
     project: &Project,
     target: Option<&Target>,
@@ -5906,9 +5940,16 @@ pub fn cmd_bootstrap(
         loaded.schema = db::runtime()?.block_on(async {
             let mut conn = db::connect(target).await?;
             dialect = crate::engine::planning_dialect(&mut conn).await?;
+            bootstrap_type_pins(&mut conn, &loaded.schema, &Default::default(), project).await?;
             let mut unasked = Vec::new();
-            let refused =
-                refuse_misspelt(&mut conn, &loaded.schema, &Default::default(), &mut unasked).await;
+            let refused = refuse_misspelt(
+                &mut conn,
+                &loaded.schema,
+                &Default::default(),
+                &mut unasked,
+                false,
+            )
+            .await;
             // Printed before the refusal, beside it, as the plan prints them.
             warn_unasked(&unasked);
             refused
@@ -6074,17 +6115,7 @@ pub fn cmd_bootstrap(
 
     db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        let bootstrap_pins = crate::engine::seal_type_pins(
-            &mut conn,
-            &[&loaded.schema],
-            &cs,
-            &project.config.trusted_roles,
-            project.config.pin_type_routines,
-        )
-        .await?;
-        if !crate::engine::type_input_routines(&mut conn, &bootstrap_pins, &project.config.trusted_roles, project.config.pin_type_routines, false).await?.is_empty() {
-            bail!("immediate bootstrap cannot run type routines without a reviewed saved plan; baseline an empty target, then plan, review and apply (DEC-2181.2)");
-        }
+        let bootstrap_pins = bootstrap_type_pins(&mut conn, &loaded.schema, &cs, project).await?;
         // A collation the server lacks is refused here, by name, rather than
         // by the `CREATE TABLE` that names it after the ones before it ran
         // (#1175).
@@ -6218,8 +6249,14 @@ pub fn cmd_bootstrap(
                 );
             }
 
-            crate::engine::recheck_type_prerequisites(&mut conn, &bootstrap_pins, &cs, &project.config.trusted_roles, false)
-                .await?;
+            crate::engine::recheck_type_prerequisites(
+                &mut conn,
+                &bootstrap_pins,
+                &cs,
+                &project.config.trusted_roles,
+                false,
+            )
+            .await?;
             transaction_attempted = true;
             execute_transaction_body(
                 &mut conn,
@@ -6279,8 +6316,14 @@ pub fn cmd_bootstrap(
             crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
             let gone = crate::engine::absent_roles(&mut conn, &built.missing_roles).await?;
             let held = ids.without(&built.missing).without_roles(&gone);
-            crate::engine::recheck_type_prerequisites(&mut conn, &bootstrap_pins, &cs, &project.config.trusted_roles, true)
-                .await?;
+            crate::engine::recheck_type_prerequisites(
+                &mut conn,
+                &bootstrap_pins,
+                &cs,
+                &project.config.trusted_roles,
+                true,
+            )
+            .await?;
             let mut snapshot = with_provenance(
                 project.root(),
                 StateSnapshot::new(StateKind::Bootstrap, built.schema, held, &operator),
@@ -6478,7 +6521,7 @@ pub fn cmd_plan_db(
 
     let connected = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
-        crate::engine::seal_type_pins(
+        let initial_types = crate::engine::seal_type_pins(
             &mut conn,
             &[&loaded.schema],
             &Default::default(),
@@ -6486,6 +6529,10 @@ pub fn cmd_plan_db(
             project.config.pin_type_routines,
         )
         .await?;
+        let type_routines_need_review = !crate::engine::type_input_routines(
+            &mut conn, &initial_types, &project.config.trusted_roles,
+            project.config.pin_type_routines, false,
+        ).await?.is_empty();
         let mut findings = Vec::new();
 
         let Some(mut entry) = crate::engine::latest(&mut conn).await? else {
@@ -6541,6 +6588,7 @@ pub fn cmd_plan_db(
             &loaded.schema,
             &catalogued_as(&loaded.schema, &resolved.ids, &recorded_ids),
             &mut unasked,
+            type_routines_need_review,
         )
         .await;
         // In the envelope, not beside it: a warning-only result of a

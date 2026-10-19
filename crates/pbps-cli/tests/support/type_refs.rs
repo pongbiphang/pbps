@@ -2042,6 +2042,134 @@ fn immediate_bootstrap_requires_reviewed_plans_for_user_written_type_roots() {
     }
 }
 
+fn partition_review_declarations(own: &str) -> String {
+    format!(
+        "{}partition_by: [id]\npartitions:\n  low:\n    from: ['0']\n    to: ['10']\n{own}",
+        declarations("  n: {type: 'app.checked[]', default: \"'{}'::app.checked[]\"}\n")
+    )
+}
+
+fn partition_review_demo(db: &str) -> Demo {
+    on_server(
+        db,
+        "CREATE SCHEMA app; CREATE SEQUENCE app.calls;
+         CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$
+         BEGIN PERFORM nextval('app.calls'); RETURN true; END $$;
+         CREATE DOMAIN app.checked AS varchar CHECK(app.root(VALUE))",
+    );
+    let d = Demo::new("partition-source-review");
+    opt_in(&d, db, true);
+    d.table(&partition_review_declarations(""));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    d
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn partition_default_parsing_runs_domain_checks_only_after_source_approval() {
+    let mut observed = Vec::new();
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "partition_source_review");
+        let db = own.connection();
+        let d = partition_review_demo(db);
+        on_server(
+            db,
+            "CREATE TABLE app.t(id integer PRIMARY KEY, n app.checked[] DEFAULT '{}'::app.checked[]) PARTITION BY RANGE(id);
+             CREATE TABLE app.low PARTITION OF app.t FOR VALUES FROM (0) TO (10)",
+        );
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            db,
+            "--reason",
+            "existing partition tree",
+        ]));
+        d.table(&partition_review_declarations(
+            "    columns:\n      n: {default: \"'{x}'::app.checked[]\"}\n",
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        opt_in(&d, db, false);
+        refused_plan(&d, db, "pin_type_routines");
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            0
+        );
+        opt_in(&d, db, true);
+        let path = d.dir.join("partition-review.plan.json");
+        let out = d.run(&["plan", "--db", db, "--out", path.to_str().unwrap()]);
+        succeeds(out);
+        observed.push((
+            text_scalar(db, "SELECT current_setting('server_version')"),
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+        ));
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.type_routines.len(), 1);
+        assert!(saved.type_routines[0].definition.contains("nextval"));
+        succeeds(apply_plan(&d, db, &path, false));
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            1
+        );
+        succeeds(d.run(&["verify", "--db", db]));
+    }
+    assert!(
+        observed.iter().all(|(_, called)| *called == 0),
+        "before source approval: {observed:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn bootstrap_refuses_before_partition_default_parsing_can_advance_a_sequence() {
+    let mut observed = Vec::new();
+    for server in servers() {
+        let own = OwnDatabase::new(&server, "bootstrap_partition_review");
+        let db = own.connection();
+        let d = partition_review_demo(db);
+        d.table(&partition_review_declarations(
+            "    columns:\n      n: {default: \"'{x}'::app.checked[]\"}\n",
+        ));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let rehearsal = d.run(&["plan", "--dev", db]);
+        assert_ne!(code(&rehearsal), 0);
+        assert!(
+            stderr(&rehearsal).contains("dev rehearsal is not supported"),
+            "{}",
+            stderr(&rehearsal)
+        );
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            0
+        );
+        let out = d.run(&["bootstrap", "--db", db]);
+        assert_ne!(code(&out), 0);
+        assert!(
+            stderr(&out).contains("immediate bootstrap cannot run type routines"),
+            "{}",
+            stderr(&out)
+        );
+        observed.push((
+            text_scalar(db, "SELECT current_setting('server_version')"),
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+        ));
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_class WHERE relname IN ('t','low','__pbps_state')"
+            ),
+            0
+        );
+    }
+    assert!(
+        observed.iter().all(|(_, called)| *called == 0),
+        "before bootstrap refusal: {observed:?}"
+    );
+}
+
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn reviewed_domain_defaults_execute_at_ddl_time_but_sql_running_builtins_stay_refused() {

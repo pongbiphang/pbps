@@ -727,10 +727,13 @@ pub async fn misspelt(
     conn: &mut Conn,
     schema: &Schema,
     at: &CatalogNames,
+    type_routines_need_review: bool,
 ) -> Result<Spellings, RowsError> {
     match conn.driver() {
         Driver::Mssql => pbps_mssql::catalog::misspelt(conn, schema, at).await,
-        Driver::Postgres => pbps_pg::catalog::misspelt(conn, schema, at).await,
+        Driver::Postgres => {
+            pbps_pg::catalog::misspelt(conn, schema, at, type_routines_need_review).await
+        }
     }
 }
 

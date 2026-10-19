@@ -3605,10 +3605,14 @@ async fn a_declared_xml_or_network_value_is_read_under_the_pins_and_not_the_sess
         .await
         .expect("a session on document");
     assert_eq!(text(&mut conn, "SHOW xmloption").await, "document");
-    let found =
-        pbps_pg::catalog::misspelt(&mut conn, &declared, &pbps_pg::rows::CatalogNames::new())
-            .await
-            .expect("ask the engine");
+    let found = pbps_pg::catalog::misspelt(
+        &mut conn,
+        &declared,
+        &pbps_pg::rows::CatalogNames::new(),
+        false,
+    )
+    .await
+    .expect("ask the engine");
     assert_eq!(
         text(&mut conn, "SHOW xmloption").await,
         "document",
@@ -5582,7 +5586,7 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
                 end[0] = value(to);
             }
         }
-        let found = pbps_pg::catalog::misspelt(&mut conn, &misspelt, &Default::default())
+        let found = pbps_pg::catalog::misspelt(&mut conn, &misspelt, &Default::default(), false)
             .await
             .expect("ask");
         let mut bounds: Vec<_> = found
@@ -5604,7 +5608,7 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
                 ("ev_old", "2025-13-01", None)
             ]
         );
-        let clean = pbps_pg::catalog::misspelt(&mut conn, &held, &Default::default())
+        let clean = pbps_pg::catalog::misspelt(&mut conn, &held, &Default::default(), false)
             .await
             .expect("ask");
         assert!(clean.bounds.is_empty(), "{:?}", clean.bounds);
@@ -5820,7 +5824,7 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
             },
             columns: Default::default(),
         });
-        let found = pbps_pg::catalog::misspelt(&mut conn, &misspelt, &Default::default())
+        let found = pbps_pg::catalog::misspelt(&mut conn, &misspelt, &Default::default(), false)
             .await
             .expect("ask");
         let bounds: Vec<_> = found
@@ -5845,7 +5849,7 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
             },
             columns: Default::default(),
         });
-        let found = pbps_pg::catalog::misspelt(&mut conn, &ambiguous, &Default::default())
+        let found = pbps_pg::catalog::misspelt(&mut conn, &ambiguous, &Default::default(), false)
             .await
             .expect("ask");
         let listed: Vec<_> = found
@@ -5864,7 +5868,7 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
             )],
             "{found:#?}"
         );
-        let clean = pbps_pg::catalog::misspelt(&mut conn, &held, &Default::default())
+        let clean = pbps_pg::catalog::misspelt(&mut conn, &held, &Default::default(), false)
             .await
             .expect("ask");
         assert!(clean.bounds.is_empty(), "{:?}", clean.bounds);
@@ -20460,7 +20464,7 @@ async fn two_keys_a_collation_calls_one_row_are_found_by_the_engine_and_not_offl
         at[&TableName::new(&s, "keys")].key_collation,
         Some((s.clone(), "ci".to_owned()))
     );
-    let found = pbps_pg::catalog::misspelt(&mut conn, &declared, &at)
+    let found = pbps_pg::catalog::misspelt(&mut conn, &declared, &at, false)
         .await
         .expect("ask the engine");
     assert_eq!(found.conflicts.len(), 1, "{found:#?}");
@@ -20575,10 +20579,14 @@ async fn a_value_the_engine_spells_differently_is_refused_before_it_is_written()
     );
     declared.tables.insert(alone.clone(), single);
 
-    let found =
-        pbps_pg::catalog::misspelt(&mut conn, &declared, &pbps_pg::rows::CatalogNames::new())
-            .await
-            .expect("ask the engine");
+    let found = pbps_pg::catalog::misspelt(
+        &mut conn,
+        &declared,
+        &pbps_pg::rows::CatalogNames::new(),
+        false,
+    )
+    .await
+    .expect("ask the engine");
     let misspelt: Vec<String> = found
         .misspelt
         .iter()
@@ -37345,7 +37353,7 @@ async fn a_date_or_time_literal_read_two_ways_is_found_on_both_versions() {
 
     for connection in [conn_str(), old] {
         let mut conn = Conn::connect(Driver::Postgres, &connection).await.unwrap();
-        let found = pbps_pg::catalog::misspelt(&mut conn, &declared, &Default::default())
+        let found = pbps_pg::catalog::misspelt(&mut conn, &declared, &Default::default(), false)
             .await
             .expect("ask the engine");
         let mut listed: Vec<(String, Option<String>)> = found

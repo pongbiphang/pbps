@@ -2833,6 +2833,7 @@ pub async fn misspelt(
     conn: &mut Conn,
     schema: &Schema,
     at: &crate::rows::CatalogNames,
+    type_routines_need_review: bool,
 ) -> Result<Spellings, crate::rows::RowsError> {
     let any = TableName::new("", "");
     let read = |table: &TableName, source: DbError| crate::rows::RowsError::Read {
@@ -2864,7 +2865,7 @@ pub async fn misspelt(
             return Err(e);
         }
     };
-    ask_about_partition_defaults(conn, schema, &mut out).await;
+    ask_about_partition_defaults(conn, schema, &mut out, type_routines_need_review).await;
     // A literal that reads two ways is reported as that, and not also as a
     // misspelling: "write the engine's spelling" names the pinned reading,
     // which is the very guess the refusal exists not to make (#1756).
@@ -2919,7 +2920,12 @@ struct OwnDefault<'a> {
 /// under one; #1669), a text that names an object the plan has yet to
 /// create, one that may name a temporary schema (#1706) — is listed in
 /// `defaults_unasked`, never read as an answer.
-async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mut Spellings) {
+async fn ask_about_partition_defaults(
+    conn: &mut Conn,
+    schema: &Schema,
+    out: &mut Spellings,
+    type_routines_need_review: bool,
+) {
     let mut asked: Vec<OwnDefault<'_>> = Vec::new();
     for (partition, table) in &schema.tables {
         let Some(of) = &table.partition_of else {
@@ -3004,14 +3010,23 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let mut refused = match enabled_ddl_event_triggers(conn).await {
-        Ok(names) if names.is_empty() => None,
-        Ok(names) => Some(format!(
-            "the target has the enabled DDL event trigger(s) {}, which this check's \
+    // Storing a typed constant can run a domain CHECK even without rows, and
+    // rollback cannot undo a sequence it advances (16 and 18, DEC-2181.2).
+    let mut refused = if type_routines_need_review {
+        Some(
+            "input-path routines require source review of the saved plan before this probe"
+                .to_owned(),
+        )
+    } else {
+        match enabled_ddl_event_triggers(conn).await {
+            Ok(names) if names.is_empty() => None,
+            Ok(names) => Some(format!(
+                "the target has the enabled DDL event trigger(s) {}, which this check's \
              temporary table would fire",
-            listed(names)
-        )),
-        Err(e) => Some(format!("cannot read the target's event triggers: {e}")),
+                listed(names)
+            )),
+            Err(e) => Some(format!("cannot read the target's event triggers: {e}")),
+        }
     };
     // A domain's CHECK runs when the parse reads a literal as a composite,
     // array or range over that domain, and it runs as this role: storing
