@@ -520,8 +520,14 @@ pub(crate) fn order_carried_moves(
     let mut detach_steps = vec![false; cs.changes.len()];
     let mut present = Occupant::with_detaches(occupants, catalog);
     for (before, release) in cs.changes.iter().enumerate() {
-        detach_steps[before] = matches!(&release.change, Change::DetachPartition { .. })
-            && present.iter().any(|o| o.freed_by(&release.change));
+        detach_steps[before] = matches!(
+            &release.change,
+            Change::DetachPartition { .. }
+                | Change::DropTable {
+                    detach_from: Some(_),
+                    ..
+                }
+        ) && present.iter().any(|o| o.freed_by(&release.change));
         if matches!(&release.change, Change::AlterColumnNumbering {
             from: ValueSource::Identity(_), to, ..
         } if !matches!(to, ValueSource::Identity(_)))
@@ -555,12 +561,14 @@ pub(crate) fn order_carried_moves(
             }
         }
     }
-    // Detach handovers already have exact catalog edges. Add their claimant
-    // seeds to the same set before either route follows the effect closure.
+    // Detach handovers already have exact catalog edges. Renames can claim
+    // the clone's name directly or carry an index onto it; neither is a
+    // creation, but both need the same effect closure (DEC-1558.2).
     for edge in schedule.constraints() {
         if edge.source == pbps_diff::order::Source::Catalog
             && detach_steps[edge.before]
-            && !relation_names_created(&cs.changes[edge.after].change).is_empty()
+            && (matches!(cs.changes[edge.after].change, Change::RenameTable { .. })
+                || !relation_names_created(&cs.changes[edge.after].change).is_empty())
         {
             moving[edge.after] = true;
         }
@@ -604,7 +612,7 @@ pub(crate) fn order_carried_moves(
             Checks::ALL,
         );
         let effects = Schedule::of_graph(&graph, operations.as_slice());
-        // A delayed creation carries its consumers with it. Other steps
+        // A delayed claimant carries its consumers with it. Other steps
         // retain their relative order: this is not permission to reorder
         // the rest of the plan using an incomplete set of catalog facts.
         loop {
@@ -12480,6 +12488,151 @@ mod tests {
                 ..clone
             };
             assert!(detach_release_slots(&uid, &[wanted], &[another]).is_empty());
+        }
+    }
+
+    enum CloneRelease {
+        Detach,
+        Drop,
+        Retain,
+    }
+
+    fn check_rename_clone_handover(carried: bool, release: CloneRelease) {
+        use pbps_dialect::slots::{CatalogFacts, Namespace, SlotKey};
+        use pbps_model::{
+            Change, ChangeSet, DetachedKind, DetachedName, PlannedChange, Uid, UidKind,
+        };
+        use pbps_pg::catalog::NameOccupant;
+
+        let child = TableName::new("app", "a");
+        let parent = TableName::new("app", "p");
+        let held = TableName::new("app", "held");
+        let from = TableName::new(if carried { "src" } else { "app" }, "source");
+        let to = if carried {
+            TableName::new("app", "source")
+        } else {
+            held.clone()
+        };
+        let child_uid = Uid::derived(UidKind::Table, &child.raw().to_string(), 0);
+        let releases = !matches!(release, CloneRelease::Retain);
+        let drops = matches!(release, CloneRelease::Drop);
+        let rename = PlannedChange::new(Change::RenameTable {
+            uid: Uid::derived(UidKind::Table, &from.raw().to_string(), 0),
+            from: from.clone(),
+            to,
+            defaults: Vec::new(),
+        });
+        let freeing = PlannedChange::new(if drops {
+            Change::DropTable {
+                uid: child_uid.clone(),
+                name: child.clone(),
+                detach_from: Some(parent.clone()),
+            }
+        } else {
+            Change::DetachPartition {
+                uid: child_uid.clone(),
+                table: child.clone(),
+                parent: parent.clone(),
+                names: vec![DetachedName {
+                    kind: DetachedKind::Index,
+                    parent: "p_n".into(),
+                    name: Some(if releases { "released" } else { "held" }.into()),
+                }],
+                shape: Box::default(),
+            }
+        });
+        let mut changes = ChangeSet {
+            changes: vec![rename, freeing],
+        };
+        let (before, before_ids, mut after, mut after_ids) =
+            carried_sides(&changes.changes, &[parent, child.clone()]);
+        if drops {
+            after.tables.remove(&child);
+            after_ids.tables.remove(&child_uid);
+        }
+        let mut occupants = vec![NameOccupant {
+            name: held.clone(),
+            kind: "index",
+            owner: Some(child),
+            owner_column: None,
+        }];
+        if carried {
+            occupants.push(NameOccupant {
+                name: TableName::new("src", "held"),
+                kind: "index",
+                owner: Some(from),
+                owner_column: None,
+            });
+        }
+        let mut facts = CatalogFacts::default();
+        if releases && !drops {
+            facts.detach_releases.insert(
+                SlotKey {
+                    namespace: Namespace::Relations(held.schema.clone()),
+                    name: held.name.clone(),
+                },
+                child_uid,
+            );
+        }
+        let refused = |changes: &ChangeSet| {
+            refuse_uninventoried_occupants(changes, &occupants, &[], "prod", &facts).is_err()
+        };
+        assert!(refused(&changes), "the original order meets the clone");
+        let original = changes.clone();
+        let order = |changes: &mut ChangeSet| {
+            order_carried_moves(
+                changes,
+                &occupants,
+                &[],
+                (
+                    pbps_diff::Side {
+                        schema: &before,
+                        ids: &before_ids,
+                    },
+                    pbps_diff::Side {
+                        schema: &after,
+                        ids: &after_ids,
+                    },
+                ),
+                &pbps_pg::Postgres::new(),
+                &facts,
+            );
+        };
+        order(&mut changes);
+        if releases {
+            assert_eq!(
+                changes.changes,
+                [original.changes[1].clone(), original.changes[0].clone()],
+                "the partition releases the rename's claim first"
+            );
+            assert!(!refused(&changes));
+        } else {
+            assert_eq!(changes, original, "a retained clone supplies no release");
+            assert!(refused(&changes));
+        }
+        let settled = changes.clone();
+        order(&mut changes);
+        assert_eq!(changes, settled, "settling again changes nothing");
+    }
+
+    #[test]
+    fn a_table_rename_follows_the_partition_releasing_its_target_name() {
+        for release in [CloneRelease::Detach, CloneRelease::Drop] {
+            check_rename_clone_handover(false, release);
+        }
+    }
+
+    #[test]
+    fn a_schema_move_follows_the_partition_releasing_its_carried_index_name() {
+        for release in [CloneRelease::Detach, CloneRelease::Drop] {
+            check_rename_clone_handover(true, release);
+        }
+    }
+
+    #[test]
+    fn rename_claims_cannot_take_a_retained_partition_clone_name() {
+        for carried in [false, true] {
+            check_rename_clone_handover(carried, CloneRelease::Retain);
         }
     }
 

@@ -7261,3 +7261,35 @@ and `cyclic_or_retained_clone_claims_refuse_before_plan_publication_on_both_serv
 The flows cover renamed index, primary-key and unique clones, a handover
 chain, a per-detach exchange, cycles, retained and unnamed-key holders,
 row preservation, verify and an empty next plan on both server versions.
+
+<a id="dec-1558-2"></a>
+
+**DEC-1558.2. A rename claiming a detached clone's name joins the existing
+Catalog handover's effect closure, whether the partition stays or is
+dropped.** (#1558, PR #2214 ready review.) Measured on PostgreSQL 16 and 18,
+a table rename can take a clone's old relation name directly, or carry an
+index there through `SET SCHEMA`. Both plans are valid when the partition
+releases the name first. The same is true of a partition drop with
+`detach_from`: its detach and drop free the clone before the rename.
+These plans pass the differ's guards because the partitioned parent stands
+unchanged; DEC-1690.1's parent-rename refusal still applies to the parent.
+
+`relation_names_created` deliberately excludes renames. Using only that
+creation list to seed the handover's effect closure kept the rename fixed,
+so the existing slots edge could not settle across the detach or partition
+drop. `order_carried_moves` now also seeds a `RenameTable` claimant from that
+exact Catalog edge and recognizes a partition drop that frees its occupants.
+It still requires the catalog release, settles the same slots and effects,
+keeps other steps in their relative order, and keeps each detach's block and
+guards. No new ordering pass, rank or predicted clone name is needed.
+A clone kept under its old name, attached or detached, supplies no release;
+the existing occupied-name refusal remains the answer.
+
+Pinned by the unit tests
+`a_table_rename_follows_the_partition_releasing_its_target_name`,
+`a_schema_move_follows_the_partition_releasing_its_carried_index_name`, and
+`rename_claims_cannot_take_a_retained_partition_clone_name`, and their
+`_on_both_servers` CLI flows. Both release forms preserve the renamed table's
+rows, the surviving detached table's rows and its declared index; verify and
+the next plan agree after apply. The negatives publish neither plan artifact
+and leave the rows and partition membership untouched.

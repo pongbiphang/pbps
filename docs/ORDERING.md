@@ -105,7 +105,10 @@ Then, in this order:
   after it while keeping other steps in their relative order (DEC-1986.1).
   A detach taking another detached partition's clone name uses the same
   handover, from exact catalog releases for the clones the detach renames
-  (DEC-1558.1). Its per-detach block still owns temporary names and guards.
+  (DEC-1558.1). A table rename taking the released name directly or through
+  a carried index joins that same effect closure, including when a partition
+  drop detaches and drops the clone first (DEC-1558.2). Its per-detach block
+  still owns temporary names and guards.
   `refuse_created_name_occupants` calls it before the module
   passes. It runs again, over the same catalog reads, after the last pass
   that reorders, because a module pass may plan the revision again in the
