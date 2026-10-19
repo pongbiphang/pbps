@@ -5479,6 +5479,12 @@ fn row_statement(
         .collect())
 }
 
+/// Keep the complete declared type, including modifiers and array dimensions,
+/// when temporarily creating a generated column (DEC-1503.1).
+pub(crate) fn generation_placeholder(ty: &pbps_model::ColumnType) -> Result<String, DialectError> {
+    Ok(format!("NULL::{}", types::normalize(ty)?))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

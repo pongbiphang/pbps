@@ -47,8 +47,8 @@ impl<'a> CreatedChanges<'a> {
                 Change::DetachPartition { table, shape, .. } => {
                     Some((table, shape.as_ref(), Kind::Detach, At::Before(i)))
                 }
-                // Only these changes declare a complete shape; new kinds
-                // still enter through their own model effect accessors.
+                // These changes establish or adopt a shape. A CREATE's
+                // typed column parts complete its inventory below.
                 _ => None,
             };
             if let Some((address, declared, kind, at)) = shape
@@ -74,6 +74,22 @@ impl<'a> CreatedChanges<'a> {
         }
         for (i, p) in changes.changes.iter().enumerate() {
             let at = At::Before(i);
+            if let Change::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            } = &p.change
+                && let Some(table_name) = final_table(names, table, at)
+                && let Some(created) = tables.get_mut(&table_name)
+                && matches!(created.kind, Kind::Create(_))
+                && let Some(name) = final_column(names, table, name, At::After(i))
+            {
+                // A new table may be a prefix followed by ADD COLUMN
+                // parts (DEC-1503.1). This adds only their declared names;
+                // columns_after still checks each part's field promises.
+                created.finished.columns.insert(name, (**column).clone());
+            }
             if let Change::AlterColumnDefault { column, to, .. } = &p.change
                 && let Some(table) = final_table(names, &column.table, at)
                 && let Some(created) = tables.get_mut(&table)
@@ -200,12 +216,11 @@ impl Created<'_> {
                 }
             }
         };
-        // No `Part` for the columns: the differ never splits one out of a
-        // `CREATE`, and `AddColumn` is not emitted for a table this plan
-        // also creates.
+        // The complete inventory includes typed ADD COLUMN parts without
+        // granting ownership of any other arriving column.
         named(
             "column",
-            declared.columns.keys().map(ColumnName::raw).collect(),
+            self.finished.columns.keys().map(ColumnName::raw).collect(),
             now.columns.keys().map(ColumnName::raw).collect(),
         );
         named(

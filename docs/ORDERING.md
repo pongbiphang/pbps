@@ -159,7 +159,12 @@ Then, in this order:
     one of the passes that read the catalog themselves and so stay
     `plan --db`'s own calls after `schedule` (DEC-1955.1).
   - `split_new_tables` splits the parts of a new table whose text names a
-    function the plan creates out of it, ahead of that create.
+    function the plan creates out of it, ahead of that create. A generated
+    column calling a planned function starts a declaration-order suffix;
+    its prefix creates the relation at its ordinary position. Only the two
+    unsplittable shapes use a typed placeholder and SET EXPRESSION with a
+    known PostgreSQL 17+ capability, or retain the whole-table hold without
+    it (DEC-1503.1). Resolver preparation and scratch share the same parts.
   - `split_moving_defaults` sets a create's own default after the last
     function its text may call, where the create moves rows out of a DEFAULT
     partition (DEC-1547.1).
@@ -178,6 +183,9 @@ Then, in this order:
     takes its effects graph's dependents with it, including a key's foreign
     keys and replica identity; unrelated additions retain their places
     (DEC-2100.3).
+    New-table creation parts state column-order, function, complete-shape,
+    row and validator edges through the same settlement mechanism
+    (DEC-1503.1).
   - `after_their_parents_defaults` then sets each partition's own default
     again after a parent's default the plan sets, which reaches every
     partition (DEC-1581.1).

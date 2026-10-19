@@ -2384,3 +2384,72 @@ fn a_completed_drop_requires_the_table_to_be_absent() {
         }
     }
 }
+
+#[test]
+fn a_created_prefix_accepts_its_added_columns_and_rejects_unplanned_names_or_fields() {
+    let name = TableName::new("app", "t");
+    let prefix = table();
+    let mut generated = Column::new("integer".parse().unwrap());
+    generated.value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+        expression: "app.f(id)".into(),
+        stored: true,
+    });
+    let mut complete = prefix.clone();
+    complete.columns.insert("g".into(), generated.clone());
+    complete
+        .columns
+        .insert("z".into(), Column::new("integer".parse().unwrap()));
+    let changes = plan(vec![
+        Change::CreateTable {
+            uid: "t_015030".parse().unwrap(),
+            name: name.clone(),
+            table: Box::new(prefix),
+            beside_default: None,
+            moves_at_most: None,
+        },
+        Change::AddColumn {
+            uid: "c_015031".parse().unwrap(),
+            table: name.clone(),
+            name: "g".into(),
+            column: Box::new(generated),
+        },
+        Change::AddColumn {
+            uid: "c_015032".parse().unwrap(),
+            table: name,
+            name: "z".into(),
+            column: Box::new(Column::new("integer".parse().unwrap())),
+        },
+    ]);
+    let check = |table: Table| {
+        refuse_unplanned_movement(
+            &pbps_pg::Postgres::new(),
+            &changes,
+            &Schema::default(),
+            &schema(table),
+            "test",
+            Settled::Whole,
+        )
+    };
+    check(complete.clone()).expect("typed additions complete the created shape");
+    for field in ["missing", "type", "source", "extra", "prefix"] {
+        let mut wrong = complete.clone();
+        match field {
+            "missing" => {
+                wrong.columns.shift_remove("z");
+            }
+            "type" => wrong.columns.get_mut("g").unwrap().ty = "bigint".parse().unwrap(),
+            "source" => {
+                wrong.columns.get_mut("g").unwrap().value_source =
+                    pbps_model::ValueSource::Default("1".into())
+            }
+            "extra" => {
+                wrong
+                    .columns
+                    .insert("rogue".into(), Column::new("integer".parse().unwrap()));
+            }
+            "prefix" => wrong.columns.get_mut("id").unwrap().nullable = false,
+            _ => unreachable!(),
+        }
+        assert!(check(wrong).is_err(), "{field} must remain refused");
+    }
+}

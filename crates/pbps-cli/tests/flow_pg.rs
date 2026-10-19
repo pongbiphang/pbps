@@ -2291,9 +2291,9 @@ fn a_new_column_calling_a_new_function_follows_its_create() {
 }
 
 /// A new table whose generated column calls a function the same plan creates
-/// follows that `CREATE FUNCTION` whole, with its column order, and a new
-/// function reading the table follows the table. One plan applies; DEC-1364.1
-/// used to leave this to the engine, which refused the table.
+/// creates its prefix first and adds its suffix after that `CREATE FUNCTION`,
+/// keeping column order. A new function reading the table follows its full
+/// shape (DEC-1503.1).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_new_table_generating_from_a_new_function_follows_its_create() {
@@ -2306,7 +2306,8 @@ fn a_new_table_generating_from_a_new_function_follows_its_create() {
         d.dir.join("schema/app.n.yml"),
         "table: app.n\ncolumns:\n  id: {type: integer, nullable: false}\n  \
          c: {type: integer, generated: {expression: 'app.g(id)', stored: true}}\n  \
-         after: {type: integer}\nprimary_key: [id]\n",
+         after: {type: integer}\nprimary_key: [id]\n\
+         data:\n  mode: ensure\n  rows:\n    1: {after: 7}\n",
     )
     .unwrap();
     let (plan, script) = connected_plan(&d, connection);
@@ -2316,11 +2317,13 @@ fn a_new_table_generating_from_a_new_function_follows_its_create() {
             .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
     };
     assert!(
-        at("CREATE FUNCTION \"app\".\"g\"") < at("CREATE TABLE \"app\".\"n\""),
+        at("CREATE TABLE \"app\".\"n\"") < at("CREATE FUNCTION \"app\".\"g\"")
+            && at("CREATE FUNCTION \"app\".\"g\"") < at("ADD COLUMN \"c\"")
+            && at("ADD COLUMN \"c\"") < at("ADD COLUMN \"after\""),
         "{script}"
     );
     assert!(
-        at("CREATE TABLE \"app\".\"n\"") < at("CREATE FUNCTION \"app\".\"a_reader\""),
+        at("ADD COLUMN \"after\"") < at("CREATE FUNCTION \"app\".\"a_reader\""),
         "{script}"
     );
     succeeds(approved_apply(
@@ -2329,6 +2332,13 @@ fn a_new_table_generating_from_a_new_function_follows_its_create() {
         &plan,
         &["--allow", "grant-widen"],
     ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT (c + after)::int8 FROM app.n WHERE id = 1"
+        ),
+        9
+    );
     on_server(connection, "INSERT INTO app.n (id, after) VALUES (3, 9)");
     assert_eq!(scalar(connection, "SELECT app.a_reader(3)::int8"), 6);
     assert_eq!(

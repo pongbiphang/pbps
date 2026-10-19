@@ -612,6 +612,7 @@ fn cycle_expression_notes(schema: &Schema) -> Vec<String> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Postgres {
     write_path_extras: Vec<String>,
+    server_version_num: Option<i64>,
 }
 
 impl Postgres {
@@ -633,7 +634,16 @@ impl Postgres {
     pub fn with_write_path_extras(extras: Vec<String>) -> Self {
         Self {
             write_path_extras: extras,
+            server_version_num: None,
         }
+    }
+
+    /// A connected planner's observed capability. Unknown callers use the
+    /// same split as PG16; only an unsplittable shape needs this observation.
+    #[must_use]
+    pub fn with_server_version(mut self, version: i64) -> Self {
+        self.server_version_num = Some(version);
+        self
     }
 
     /// The configured extras, before the emitter moves `pg_temp` to the end.
@@ -764,6 +774,23 @@ fn default_problems(
 impl Dialect for Postgres {
     fn name(&self) -> &'static str {
         "postgres"
+    }
+
+    fn generated_table_parts(
+        &self,
+        change: &Change,
+        ids: &pbps_model::IdsFile,
+        functions: &[pbps_model::ModuleId],
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        generated::parts(change, ids, functions, self.server_version_num)
+    }
+
+    fn generation_may_call(&self, text: &str, name: &str) -> bool {
+        generated::may_call(text, name)
+    }
+
+    fn generation_needs_whole_row(&self, text: &str, table: &TableName) -> bool {
+        generated::needs_whole_row(text, table)
     }
 
     /// `"…"` alone quotes an identifier: `[` is an array subscript, which is

@@ -2337,6 +2337,30 @@ pub trait Dialect {
     /// [`normalize_definition`]: Dialect::normalize_definition
     fn lexicon(&self) -> Lexicon;
 
+    /// The parts of a new table whose generation needs a planned function.
+    /// Pure engine policy: callers supply recorded column identities, and
+    /// connection capabilities are immutable inputs to the dialect.
+    fn generated_table_parts(
+        &self,
+        _change: &Change,
+        _ids: &pbps_model::IdsFile,
+        _functions: &[pbps_model::ModuleId],
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        Ok(None)
+    }
+
+    /// A creation-time reference, including OID-alias string literals on
+    /// engines that bind them. This is a lexical constraint, not a parser.
+    fn generation_may_call(&self, text: &str, name: &str) -> bool {
+        self.may_name(text, name)
+    }
+
+    /// A table reader that cannot be proved to use a prefix's shape only.
+    fn generation_needs_whole_row(&self, text: &str, table: &pbps_model::TableName) -> bool {
+        let code = self.lexicon().code_only(text);
+        self.may_name(text, &table.name) && (code.contains('*') || self.may_name(text, "NATURAL"))
+    }
+
     /// Whether `text` may name `name` as an identifier: in code, never in a
     /// literal or a comment, ignoring case, and bounded by what cannot
     /// continue an identifier, so `[a]` and `a*2` name `a` and `amount` does

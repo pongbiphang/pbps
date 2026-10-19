@@ -143,6 +143,84 @@ pub fn may_call(expression: &str, name: &str) -> bool {
             .any(|contents| crate::impact::mentions_in_literal(contents, name))
 }
 
+mod parts;
+pub(crate) use parts::parts;
+
+/// A bound whole-row expression cannot use a temporarily incomplete row
+/// type. Reuse the engine's code masking and identifier delimiters; this is
+/// deliberately conservative about `*` and NATURAL joins (DEC-1503.1).
+pub(crate) fn needs_whole_row(text: &str, table: &pbps_model::TableName) -> bool {
+    let code = crate::LEXICON.code_only(text);
+    let mut rest = code.as_str();
+    let mut tokens = Vec::new();
+    while let Some(c) = rest.chars().next() {
+        if c == '"' {
+            let Some(len) = crate::types::quoted_len(rest) else {
+                return true;
+            };
+            tokens.push(rest[..len].to_owned());
+            rest = &rest[len..];
+        } else if pbps_dialect::continues_ident(c) {
+            let len = rest
+                .find(|c| !pbps_dialect::continues_ident(c))
+                .unwrap_or(rest.len());
+            tokens.push(rest[..len].to_ascii_lowercase());
+            rest = &rest[len..];
+        } else {
+            if !c.is_ascii_whitespace() {
+                tokens.push(c.to_string());
+            }
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    let operand =
+        |t: &str| t.starts_with('"') || t.chars().next().is_some_and(pbps_dialect::continues_ident);
+    if tokens.iter().enumerate().any(|(i, t)| {
+        t == "natural"
+            || t == "*"
+                && !(i > 0
+                    && tokens.get(i + 1).is_some_and(|next| operand(next))
+                    && operand(&tokens[i - 1])
+                    && !crate::types::is_reserved(&tokens[i - 1]))
+    }) {
+        return true;
+    }
+    let quoted = crate::quote(&table.name).unwrap_or_default();
+    let is_table = |t: &str| t == quoted || t == table.name && t == table.name.to_ascii_lowercase();
+    let mut aliases = vec![quoted.clone(), table.name.clone()];
+    let mut declarations = std::collections::BTreeSet::new();
+    for (i, _) in tokens.iter().enumerate().filter(|(_, t)| is_table(t)) {
+        let start = if i >= 2 && tokens[i - 1] == "." {
+            i - 2
+        } else {
+            i
+        };
+        let source = if start > 0 && tokens[start - 1] == "only" {
+            start - 1
+        } else {
+            start
+        };
+        if source == 0 || !matches!(tokens[source - 1].as_str(), "from" | "join" | ",") {
+            continue;
+        }
+        declarations.insert(i);
+        let alias = i + 1 + usize::from(tokens.get(i + 1).is_some_and(|t| t == "as"));
+        if let Some(t) = tokens.get(alias)
+            && (t.starts_with('"') || t.chars().next().is_some_and(char::is_alphabetic))
+            && !crate::types::is_reserved(t)
+        {
+            aliases.push(t.clone());
+            declarations.insert(alias);
+        }
+    }
+    tokens.iter().enumerate().any(|(i, t)| {
+        aliases.contains(t)
+            && !declarations.contains(&i)
+            && tokens.get(i.wrapping_sub(1)).is_none_or(|t| t != ".")
+            && tokens.get(i + 1).is_none_or(|t| t != ".")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{may_call, may_name, may_read};

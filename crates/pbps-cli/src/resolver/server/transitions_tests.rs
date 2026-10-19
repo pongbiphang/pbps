@@ -2115,3 +2115,70 @@ fn a_partitions_own_default_needs_its_catalog_record() {
             .unwrap();
     assert!(resolved.is_empty(), "{resolved:?}");
 }
+
+#[test]
+fn a_generated_placeholder_created_in_the_plan_has_no_opening_inventory() {
+    use pbps_model::PlannedChange;
+    let name = pbps_model::TableName::new("app", "t");
+    let desired = generation_schema(&name);
+    let recorded = ids(&desired, &IdsFile::default());
+    let compiled = generation_records(&name, "g");
+    let mut placeholder = desired.tables[&name].clone();
+    let pbps_model::ValueSource::Generated(g) =
+        &mut placeholder.columns.get_mut("g").unwrap().value_source
+    else {
+        unreachable!()
+    };
+    let to = std::mem::replace(&mut g.expression, "NULL::integer".into());
+    let create = PlannedChange::new(Change::CreateTable {
+        uid: recorded.table_uid(&name).unwrap().clone(),
+        name: name.clone(),
+        table: Box::new(placeholder),
+        beside_default: None,
+        moves_at_most: None,
+    });
+    let install = PlannedChange::new(Change::AlterColumnExpression {
+        uid: recorded.column_uid(&name.column("g")).unwrap().clone(),
+        column: name.column("g"),
+        from: "NULL::integer".into(),
+        to,
+    });
+    let empty = Schema::default();
+    let no_ids = IdsFile::default();
+    let derive = |changes: &ChangeSet| {
+        super::transitions::derive(
+            changes,
+            pbps_diff::Side {
+                schema: &empty,
+                ids: &no_ids,
+            },
+            pbps_diff::Side {
+                schema: &desired,
+                ids: &recorded,
+            },
+            &[],
+            &compiled,
+        )
+    };
+    let cs = ChangeSet {
+        changes: vec![create.clone(), install.clone()],
+    };
+    let transitions = derive(&cs).unwrap();
+    let generated = transitions
+        .iter()
+        .find(|t| t.surface == Surface::Default(name.column("g")))
+        .unwrap();
+    assert!(generated.before.is_empty());
+    assert!(!generated.after.is_empty());
+    // An absent opening UID is not authority unless the plan itself creates
+    // that exact generated column first, with the stated placeholder.
+    for changes in [vec![install.clone()], vec![install.clone(), create.clone()]] {
+        assert!(derive(&ChangeSet { changes }).is_err());
+    }
+    let mut wrong = cs;
+    let Change::AlterColumnExpression { from, .. } = &mut wrong.changes[1].change else {
+        unreachable!()
+    };
+    *from = "0".into();
+    assert!(derive(&wrong).is_err());
+}

@@ -952,8 +952,12 @@ mod tests {
         let managed = Managed::from_schema(&schema);
         // Nothing compiled or identified: a declared routine holds no
         // overload by its name alone. Identities are pinned on real engines.
-        let order = crate::resolver::reconstruct::Reconstruction::new(&crate::Postgres::new(), &[])
-            .unwrap();
+        let order = crate::resolver::reconstruct::Reconstruction::new(
+            &crate::Postgres::new(),
+            &[],
+            &pbps_model::IdsFile::default(),
+        )
+        .unwrap();
         let relation = id("pg_class", &["app", "t"], Vec::new());
         assert!(managed.holds(CandidateClass::Relation, &relation, &order));
         assert!(managed.holds(

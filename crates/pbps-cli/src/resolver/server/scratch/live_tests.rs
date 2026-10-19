@@ -5706,3 +5706,138 @@ async fn resolver_draft_lists_a_routine_and_a_chain_and_writes_neither() {
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes() {
+    use crate::resolver::generated_fixtures::shape;
+    use pbps_dialect::Dialect;
+    for server in SERVERS {
+        for case in ["plain", "partition", "later", "rows"] {
+            let mut fixture = Fixture::new(server);
+            let target_db = fixture.database("g1503", None).await;
+            fixture.run(&target_db, &["CREATE SCHEMA app"]).await;
+            let (login, scratch_db) = fixture.confined().await;
+            let mut desired = shape(case);
+            // Bound-node capture qualification is independent of creation
+            // parts. Ordinary apply below also measures a real child.
+            if case == "partition" {
+                desired
+                    .tables
+                    .remove(&pbps_model::TableName::new("app", "a_default"));
+            }
+            let inputs = Inputs::from_pair((pbps_model::Schema::default(), desired));
+            let key = ProjectKey::new(true);
+            let result: anyhow::Result<()> = async {
+                let plan = produce(
+                    &fixture.as_login(&scratch_db, &login),
+                    &fixture.on(&target_db),
+                    &inputs,
+                    &key,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{case}: {e}"))?;
+                plan.evidence.validate(&plan.changes)?;
+                let saved = pbps_model::SavedPlan::new(
+                    pbps_model::PlanOrigin::Database,
+                    "postgres",
+                    "2026-10-19",
+                    pbps_model::PlanBaseline {
+                        description: "empty fixture".into(),
+                        checksum: String::new(),
+                        database_collation: None,
+                        time_zone: None,
+                    },
+                    plan.changes,
+                    inputs.desired().ids.clone(),
+                )
+                .with_resolution(plan.evidence)?;
+                let saved: pbps_model::SavedPlan =
+                    serde_json::from_slice(&serde_json::to_vec(&saved)?)?;
+                let keyed = crate::resolver::apply::Keyed::check(
+                    &saved,
+                    crate::resolver::sealing::environment_key(&key.project, Some(ENVIRONMENT)),
+                    "issue-1503",
+                )?
+                .unwrap();
+                let mut conn = Conn::connect(Driver::Postgres, &fixture.on(&target_db)).await?;
+                let guard = keyed.open(&mut conn).await?;
+                conn.execute("BEGIN").await?;
+                guard.before_statements(&mut conn).await?;
+                let pg = pbps_pg::Postgres::new();
+                for p in &saved.changes.changes {
+                    for statement in pg.emit(&p.change, p.strategy)? {
+                        conn.execute(&statement.sql).await?;
+                    }
+                }
+                guard
+                    .before_recording(&mut conn, inputs.desired().schema, inputs.desired().ids)
+                    .await?;
+                conn.execute("COMMIT").await?;
+                Ok(())
+            }
+            .await;
+            fixture.drop().await;
+            result.unwrap_or_else(|e| panic!("{server}, {case}: {e:#}"));
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn scratch_generated_table_parts_compile_literal_and_collision_names_before_functions() {
+    use crate::resolver::generated_fixtures::shape;
+    use crate::resolver::server::engine;
+    for server in SERVERS {
+        for case in ["literal", "reverse", "array", "collision", "missing"] {
+            let mut fixture = Fixture::new(server);
+            let database = fixture.database("s1503", None).await;
+            fixture.run(&database, &["CREATE SCHEMA app"]).await;
+            let mut desired = shape(case);
+            if case == "missing" {
+                desired
+                    .tables
+                    .get_mut(&pbps_model::TableName::new("app", "a"))
+                    .unwrap()
+                    .columns
+                    .get_mut("g")
+                    .unwrap()
+                    .value_source = pbps_model::ValueSource::Generated(pbps_model::Generated {
+                    expression: "app.missing(id)".into(),
+                    stored: true,
+                });
+            }
+            let inputs = Inputs::from_pair((pbps_model::Schema::default(), desired));
+            let result: anyhow::Result<()> = async {
+                let mut conn = Conn::connect(Driver::Postgres, &fixture.on(&database)).await?;
+                let version = engine::generation_version(&mut conn).await.map_err(anyhow::Error::msg)?;
+                let pg = pbps_pg::Postgres::new().with_server_version(version);
+                let mut reconstruction = engine::reconstruction(Driver::Postgres, &[],
+                    inputs.binding().bootstrap, inputs.desired().ids, &inputs.hints.module_deps, version)
+                    .map_err(anyhow::Error::msg)?;
+                let compiled = reconstruction.compile(&pg, &pbps_model::SessionZone::utc(), &mut conn).await;
+                if case == "missing" {
+                    let Err(pbps_pg::resolver::reconstruct::ReconstructError::Compile { reason, .. }) = compiled else {
+                        anyhow::bail!("a missing function must remain an engine compile refusal");
+                    };
+                    anyhow::ensure!(reason.contains("app.missing") && reason.contains("does not exist"), "{reason}");
+                    let rows = conn.query("SELECT to_regclass('app.a') IS NULL AS absent").await?;
+                    anyhow::ensure!(rows[0].try_get::<bool>("absent")? == Some(true),
+                        "failed compilation must leave no table");
+                    return Ok(());
+                }
+                compiled?;
+                let columns = conn.query("SELECT attname::text AS name FROM pg_attribute WHERE attrelid='app.a'::regclass AND attnum>0 AND NOT attisdropped ORDER BY attnum").await?;
+                assert_eq!(columns.iter().map(|r| r.try_get::<&str>("name").unwrap().unwrap()).collect::<Vec<_>>(),
+                    inputs.desired().schema.tables[&pbps_model::TableName::new("app", "a")].columns.keys().map(pbps_model::ColumnName::raw).collect::<Vec<_>>());
+                if case == "collision" {
+                    let rows = conn.query("SELECT t.typname::text AS name FROM pg_type r JOIN pg_type t ON t.oid=r.typarray WHERE r.oid='app.a'::regtype").await?;
+                    assert_eq!(rows[0].try_get::<&str>("name")?.unwrap(), "_a_1");
+                }
+                Ok(())
+            }.await;
+            fixture.drop().await;
+            result.unwrap_or_else(|e| panic!("{server}, {case}: {e:#}"));
+        }
+    }
+}

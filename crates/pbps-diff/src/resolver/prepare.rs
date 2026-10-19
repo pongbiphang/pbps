@@ -205,7 +205,32 @@ pub(super) fn changes(
 ) -> Result<Prepared, Error> {
     let names = ids.index();
     let mut changes: Vec<(Origin, PlannedChange)> = Vec::new();
+    let functions = crate::order::generated::functions(&ordinary.changes);
     for (position, planned) in ordinary.changes.iter().enumerate() {
+        if let Some(parts) = crate::order::generated::parts(planned, ids, &functions, dialect)
+            .map_err(Error::Names)?
+        {
+            // Lower the same typed parts before the resolver's ordinary
+            // expression splits, retaining their one logical source.
+            let split = self::changes(
+                &ChangeSet { changes: parts },
+                base,
+                desired,
+                ids,
+                before_ids,
+                &BTreeSet::new(),
+                hints,
+                dialect,
+            )?;
+            changes.extend(
+                split
+                    .changes
+                    .changes
+                    .into_iter()
+                    .map(|part| (Origin::SplitPart(position), part)),
+            );
+            continue;
+        }
         let expanded = match &planned.change {
             Change::CreateTable {
                 uid,

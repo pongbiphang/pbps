@@ -251,6 +251,7 @@ pub(crate) fn schedule(
             declared.module_deps,
             declared.schema,
             handovers,
+            dialect,
         )
         .map_err(Refusal::module_passes)?;
         // A partition's own default after its parent's, wherever the passes
@@ -715,7 +716,7 @@ mod tests {
     /// created first. Offline the schedule runs the passes that read no
     /// catalog, and what calls a function follows it.
     #[test]
-    fn offline_a_new_table_follows_the_function_it_calls() {
+    fn offline_generated_table_names_precede_functions_and_its_columns_follow_them() {
         let (schema, ids) = declarations();
         let differ = differ_order(&schema, &ids);
         let order = names(&differ);
@@ -725,9 +726,18 @@ mod tests {
 
         let offline = scheduled(differ.clone(), &schema, &ids, &Facts::default()).unwrap();
         let order = names(&offline.changes);
-        // A generated column stays in its table, which follows the function.
+        // Names exist before the function; only the generation waits.
+        let function = position(&order, "create app.zz_double(integer)");
+        assert!(position(&order, "table app.gen") < function);
         assert!(
-            position(&order, "create app.zz_double(integer)") < position(&order, "table app.gen")
+            offline
+                .changes
+                .changes
+                .iter()
+                .enumerate()
+                .any(|(i, p)| i > function
+                    && matches!(&p.change, Change::AddColumn { table, name, .. }
+                if table.name == "gen" && name.raw() == "g"))
         );
         // A default is split out of its table and set after the function.
         assert!(position(&order, "table app.dflt") < position(&order, "create app.zz()"));
@@ -741,7 +751,7 @@ mod tests {
             position(&order, "table app.a_plain") < position(&order, "table app.dflt"),
         );
         assert!(position(&order, "table app.a_plain") < position(&order, "create app.zz()"));
-        assert_eq!(offline.split, 1);
+        assert_eq!(offline.split, 2);
         assert_eq!(offline.skipped, []);
     }
 
@@ -786,15 +796,17 @@ mod tests {
             released: &BTreeSet<super::ColumnRef>,
             deps: &ModuleDeps,
             schema: &Schema,
+            dialect: &dyn Dialect,
         ) -> Result<usize, String> {
             let order = pbps_diff::order::Schedule::new(cs.changes.len());
-            crate::dependents::after_the_rebuilds(cs, released, deps, schema, order)
+            crate::dependents::after_the_rebuilds(cs, released, deps, schema, order, dialect)
         }
 
         pub(super) fn bootstrap(mut cs: ChangeSet, schema: &Schema, ids: &IdsFile) -> ChangeSet {
             let decisions = take_public_execution(&mut cs);
             split_new_tables(&mut cs, &[ids], &pg()).unwrap();
-            after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema).unwrap();
+            after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema, &pg())
+                .unwrap();
             after_their_parents_defaults(&mut cs, schema, &[ids], &pg()).unwrap();
             settle_public_execution(&mut cs, decisions);
             cs
@@ -805,7 +817,8 @@ mod tests {
             let both = [ids, &IdsFile::default()];
             split_new_tables(&mut cs, &both, &pg()).unwrap();
             split_moving_defaults(&mut cs, schema, &pg());
-            after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema).unwrap();
+            after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema, &pg())
+                .unwrap();
             after_their_parents_defaults(&mut cs, schema, &both, &pg()).unwrap();
             before_its_partitions_indexes(&mut cs, schema, &pg()).unwrap();
             settle_public_execution(&mut cs, decisions);

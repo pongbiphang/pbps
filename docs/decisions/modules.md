@@ -1639,11 +1639,19 @@ otherwise two new tables stay independent. Its array type is not guessed: the
 engine's spelling for it depends on what the namespace already holds, and later
 objects can rename it (measured on 16 and 18), so a guessed spelling can name
 another object and close a cycle no order has. A table named only by its array
-type is left to ordering by trial (#1503).
+type was left for #1503; DEC-1503.1 instead exposes that type at the table's
+ordinary creation position.
+
+*Narrowed by [DEC-1503.1](diff.md#dec-1503-1): the whole-table hold remains
+only when a partition key is in the creation suffix or a generation reads a
+later column, and no connected PostgreSQL 17+ capability permits expression
+replacement. Other new tables create their prefix at the ordinary position;
+the suffix preserves declaration order. Array spellings are neither guessed
+nor ordered by trial.*
 
 Pinned by `a_new_table_generating_from_a_new_function_follows_it_whole`
 (`crates/pbps-cli/src/dependents.rs`),
-`a_table_generating_from_a_declared_function_compiles_after_it`
+`generated_columns_and_readers_follow_functions_but_relation_names_precede_them`
 (`crates/pbps-pg/src/resolver/reconstruct/tests.rs`), and the live
 `a_new_table_generating_from_a_new_function_follows_its_create`
 (`crates/pbps-cli/tests/flow_pg.rs`) and

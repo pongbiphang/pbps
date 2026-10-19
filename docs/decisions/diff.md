@@ -7369,3 +7369,73 @@ also covers the ordinary connected path: a separate function drop follows
 its computed column's drop through the existing catalog pass, while the
 binding release precedes its own callee rewrite. The saved plan applies,
 verifies and leaves an empty next plan.
+
+<a id="dec-1503-1"></a>
+
+**DEC-1503.1. A new PostgreSQL table exposes its relation before the generated
+expressions that call planned functions bind.** Holding the entire table
+made its relation, row type and engine-chosen array type arrive late. Naming
+consumers then needed predictions about collision spellings, including names
+PostgreSQL can change as another relation arrives. The expansion instead
+creates the prefix before the first such generated column, then adds every
+remaining column in declaration order. This is the primary path on every
+server and offline: learning a version does not change a splittable plan.
+Recorded column UIDs are retained; no Change variant, sort rank, name trial
+or type-identity format is introduced.
+
+Two shapes cannot use that split: a partition key in the suffix must exist
+in CREATE TABLE, and a generation cannot read a later column when it is
+added. With an immutable connected capability at least
+`SET_EXPRESSION_ARRIVED_IN` (PostgreSQL 17), the table instead creates all
+columns with typed NULL generated placeholders and uses the existing
+AlterColumnExpression to install the real expressions. Unknown/offline and
+older capabilities keep DEC-1274.2's whole-table hold for those two shapes.
+The ordinary schedule, resolver preparation and scratch share these typed
+parts. The pure dialect chooses parts; the differ states edges and settles
+them, and scratch lowers the same parts before selecting any chained-fill
+transaction boundary. The bounded two-part Rewrite::Split cannot represent
+a declaration-length suffix and is not used.
+
+Prefix-only keys, checks and indexes stay in CREATE, avoiding an unrelated
+constraint approval for a key that already fits the prefix. Indexes split
+out of CREATE retain its transactional behavior even when the
+table carried an online hint; a standing table's index retains its strategy.
+Column effects and explicit edges put seed rows after the complete columns
+and real expressions, and keep deferred validators after the rows
+and new triggers after them. Keys, indexes and referencing foreign keys
+follow their inputs. Modules naming the table follow its complete column
+shape, SELECT * included. A function called by the generation may use the
+prefix; a suffix-column or whole-row dependency requires the full shape and
+therefore closes a named cycle. Existing lexical scans supply these
+conservative dependencies. Placeholder binding checks run at the real
+expression installation, and producer transitions prove their absent opening
+inventory from the preceding typed CREATE and recorded UIDs, never from
+unsealed provenance. Apply's created-table inventory includes the typed added
+column names while their existing field promises still reject wrong types,
+value sources or undeclared columns.
+
+Measured on PostgreSQL 16 and 18: the literal regclass consumer, reverse pair,
+array `_a` and colliding `_a_1` compile and apply with declared column order;
+plain splits keep the same SQL with known or unknown versions. A suffix
+partition key (including a real child), a generation reading a later column
+and stored values follow the selected path. Capture's existing refusal of
+regclass/regtype constants remains unchanged (capture/profile.rs); those
+name cases measure ordinary apply and scratch compile. Full producer sealing,
+saved-plan round-trip and target-only closing measure plain splits, the two
+exception shapes and seed rows. Qualification of partition-bound nodes is
+also unchanged; producer closing measures the partitioned parent, while
+ordinary apply measures its child.
+
+Pinned by `generated_table_parts_keep_names_early_and_columns_in_declaration_order_on_every_version`,
+`generation_functions_may_read_prefix_columns_but_suffix_and_whole_row_cycles_are_named`,
+`generated_table_parts_apply_with_the_declared_column_order_values_and_names`
+(`crates/pbps-cli/src/dependents/generated_tests.rs`),
+`placeholder_bindings_are_measured_at_the_real_expression_and_fill_uses_the_complete_shape`
+(`crates/pbps-pg/src/resolver/reconstruct/tests.rs`),
+`generated_creation_parts_provide_columns_before_rows_and_preserve_stored_value_effects`
+(`crates/pbps-pg/tests/generated_parts.rs`),
+`a_generated_placeholder_created_in_the_plan_has_no_opening_inventory`
+(`crates/pbps-cli/src/resolver/server/transitions_tests.rs`), and the live
+`scratch_generated_table_parts_compile_literal_and_collision_names_before_functions`
+and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`
+(`crates/pbps-cli/src/resolver/server/scratch/live_tests.rs`).

@@ -180,6 +180,7 @@
         "darwin"
       ],
       "cases": [
+        "dependents::generated_tests::generated_table_parts_apply_with_the_declared_column_order_values_and_names",
         "deploy::tests::a_probe_cannot_advance_a_sequence_named_in_a_declared_check",
         "deploy::tests::a_probe_is_answered_under_the_settings_the_statement_will_run_under",
         "deploy::tests::a_read_only_probe_still_refuses_a_violating_row",
@@ -1686,6 +1687,8 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
+        "resolver::server::scratch::live_tests::scratch_generated_table_parts_compile_literal_and_collision_names_before_functions",
+        "resolver::server::scratch::live_tests::resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes",
         "resolver::server::scratch::live_tests::resolver_answers_a_managed_question_without_root_or_observation",
         "resolver::server::scratch::live_tests::resolver_run_owned_reproduction_stays_linear_in_the_clusters_roles",
       "resolver::server::scratch::live_tests::postgres_request_counts_cover_batches_failures_and_connection_startup",

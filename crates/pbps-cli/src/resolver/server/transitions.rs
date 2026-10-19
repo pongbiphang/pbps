@@ -262,7 +262,7 @@ pub(super) fn derive(
             ));
         }
     }
-    for step in &changes.changes {
+    for (position, step) in changes.changes.iter().enumerate() {
         let parent = if let Change::AddColumn { table, .. } | Change::RenameColumn { table, .. } =
             &step.change
         {
@@ -437,6 +437,24 @@ pub(super) fn derive(
                     None
                 };
                 (surface, false, from.is_some(), to.is_some(), prior)
+            }
+            Change::AlterColumnExpression { uid, column, from, .. }
+                if !base.ids.columns.contains_key(uid) => {
+                // A typed placeholder is born inside this plan: it has no
+                // opening catalog inventory. Prove that from the preceding
+                // CREATE payload and recorded UIDs, never from provenance.
+                let created_here = changes.changes[..position].iter().any(|p| matches!(&p.change,
+                    Change::CreateTable { uid: table_uid, name, table, .. }
+                        if name == &column.table && !base.ids.tables.contains_key(table_uid)
+                            && tables.get(name) == Some(table_uid)
+                            && table.columns.get(&column.name).is_some_and(|c| matches!(&c.value_source,
+                                pbps_model::ValueSource::Generated(g) if &g.expression == from))));
+                if !created_here || desired.ids.columns.get(uid) != Some(column) {
+                    return Err(Error::Binding(
+                        "an expression change lacks its recorded opening column UID".into(),
+                    ));
+                }
+                (Surface::Default(column.clone()), false, false, true, None)
             }
             Change::AlterColumnExpression { uid, column, .. } => {
                 let prior = base.ids.columns.get(uid).cloned().ok_or_else(|| {

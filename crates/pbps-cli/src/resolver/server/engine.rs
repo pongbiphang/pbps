@@ -159,10 +159,12 @@ impl Scratch<'_> {
         &self,
         target: &mut Conn,
         binding: &BindingRequest<'_>,
+        ids: &pbps_model::IdsFile,
+        dependencies: &pbps_model::ModuleDeps,
     ) -> Result<Binding, Error> {
         match self {
             Self::Postgres(scratch) => scratch
-                .reconstruction(target, binding)
+                .reconstruction(target, binding, ids, dependencies)
                 .await
                 .map(Binding::Postgres),
         }
@@ -440,17 +442,18 @@ pub(super) fn ordinary(
     }
 }
 
-pub(super) fn plan(
-    driver: Driver,
-    base: pbps_diff::Side<'_>,
-    desired: pbps_diff::Side<'_>,
-    hints: &Hints,
-    extras: &[String],
-    surfaces: &[SurfaceResolution],
-) -> Result<pbps_diff::resolver::Ordered, Error> {
-    match driver {
-        Driver::Postgres => postgres::plan(base, desired, hints, extras, surfaces),
-        Driver::Mssql => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
+impl Binding {
+    pub(super) fn plan(
+        &self,
+        base: pbps_diff::Side<'_>,
+        desired: pbps_diff::Side<'_>,
+        hints: &Hints,
+        extras: &[String],
+        surfaces: &[SurfaceResolution],
+    ) -> Result<pbps_diff::resolver::Ordered, Error> {
+        match self {
+            Self::Postgres(binding) => binding.plan(base, desired, hints, extras, surfaces),
+        }
     }
 }
 
@@ -511,7 +514,7 @@ pub(super) fn catalog_read_failed(error: pbps_db::resolver::capture::CaptureErro
 use postgres::compile_failed;
 
 #[cfg(test)]
-pub(super) use postgres::release_supplied;
+pub(super) use postgres::{generation_version, reconstruction, release_supplied};
 
 /// Values the runner needs to start and reach one engine's Docker image.
 /// Acquisition, deadlines and confirmed removal remain the runner's work.

@@ -239,6 +239,9 @@ fn scheduled(
     for c in graph::constraints(changes, origins, owners, resolution, base, desired) {
         schedule.edge(c.before, c.after, c.source, c.reason);
     }
+    for c in crate::order::generated::constraints(changes, desired.schema, declared, dialect) {
+        schedule.edge(c.before, c.after, c.source, c.reason);
+    }
     // Unknown effects do not establish independence: keep every pair rather
     // than inventing edges that could contradict known effects (DEC-2158.1).
     for (id, _) in &shadowed.unowned {
