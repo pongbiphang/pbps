@@ -2229,6 +2229,55 @@ fn after_the_rebuilds(
     mut schedule: Schedule,
 ) -> Result<usize, String> {
     let has_handovers = !schedule.constraints().is_empty();
+    // A partition delayed past its trigger's release must take its readers
+    // with it. Preserve the same structural/lexical needs the existing
+    // function ordering uses across each affected stretch. In particular,
+    // a row still precedes the module changes, so carrying that row is a
+    // named cycle rather than silently running it under a new trigger.
+    let arrivals: Vec<_> = schedule
+        .constraints()
+        .iter()
+        .filter_map(|edge| {
+            (edge.after < edge.before
+                && matches!(
+                    cs.changes[edge.after].change,
+                    Change::CreateTable { .. } | Change::AttachPartition { .. }
+                ))
+            .then_some((edge.after, edge.before))
+        })
+        .collect();
+    let partitions = Partitions::of(declared);
+    for (first, last) in arrivals {
+        for later in first + 1..=last {
+            for earlier in first..later {
+                let parent = match &cs.changes[earlier].change {
+                    Change::CreateTable { table, .. } => {
+                        table.partition_of.as_ref().map(|of| &of.parent)
+                    }
+                    Change::AttachPartition { parent, .. } => Some(parent),
+                    _ => None,
+                };
+                // Rows written through the parent may route into the new
+                // partition even though they do not spell its name.
+                let parent_rows = match &cs.changes[later].change {
+                    Change::InsertRow { table, .. }
+                    | Change::UpdateRow { table, .. }
+                    | Change::DeleteRow { table, .. } => Some(table) == parent,
+                    _ => false,
+                };
+                if parent_rows
+                    || needs(
+                        &cs.changes[later].change,
+                        &cs.changes[earlier].change,
+                        deps,
+                        &partitions,
+                    )
+                {
+                    schedule.edge(earlier, later, Source::Effect, OrderReason::Structural);
+                }
+            }
+        }
+    }
     let last = last_function_create(cs);
     if last.is_none() && !has_handovers {
         return Ok(0);
@@ -5050,6 +5099,94 @@ mod tests {
             "these steps wait on one another: `app.p0`, `app.t.audit`; because `app.p0` before `app.t.audit` (structural, Lexical), `app.t.audit` before `app.p0` (identity, Effect)"
         );
         assert_eq!(cs, original);
+    }
+
+    #[test]
+    fn a_delayed_partition_keeps_its_readers_after_it_and_refuses_a_row_cycle() {
+        let parent = TableName::new("app", "t");
+        let child = TableName::new("app", "p0");
+        let shape = Table {
+            columns: [("id".into(), Column::new("integer".parse().unwrap()))].into(),
+            partition_of: Some(pbps_model::PartitionOf {
+                parent: parent.clone(),
+                bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Table::default()
+        };
+        let declaration = Schema {
+            tables: [
+                (parent.clone(), Table::default()),
+                (child.clone(), shape.clone()),
+            ]
+            .into(),
+            ..Schema::default()
+        };
+        for row in [None, Some(child.clone()), Some(parent.clone())] {
+            let mut cs = plan(vec![
+                Change::CreateTable {
+                    uid: Uid::derived(UidKind::Table, "child", 0),
+                    name: child.clone(),
+                    table: Box::new(shape.clone()),
+                    beside_default: None,
+                    moves_at_most: None,
+                },
+                if let Some(table) = &row {
+                    Change::InsertRow {
+                        table: table.clone(),
+                        key_column: "id".into(),
+                        identity_key: false,
+                        key: pbps_model::RowKey("1".into()),
+                        row: pbps_model::Row::default(),
+                        defaults: BTreeMap::new(),
+                        types: BTreeMap::new(),
+                    }
+                } else {
+                    Change::AddCheck {
+                        table: child.clone(),
+                        name: "positive".into(),
+                        constraint: CheckConstraint {
+                            expression: "id > 0".into(),
+                        },
+                    }
+                },
+                Change::AlterModule {
+                    id: ModuleId::Trigger {
+                        on: parent.clone(),
+                        name: "audit".into(),
+                    },
+                    module: Box::new(module(
+                        ModuleKind::Trigger,
+                        "AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()",
+                    )),
+                },
+            ]);
+            let original = cs.clone();
+            let mut order = Schedule::new(cs.changes.len());
+            order.edge(2, 0, Source::Effect, OrderReason::Identity);
+            let result = super::after_the_rebuilds(
+                &mut cs,
+                &BTreeSet::new(),
+                &ModuleDeps::new(),
+                &declaration,
+                order,
+            );
+            if row.is_some() {
+                let why = result.unwrap_err();
+                assert!(
+                    why.contains("these steps wait on one another")
+                        && why.contains("app.p0")
+                        && why.contains("app.t.audit"),
+                    "{why}"
+                );
+                assert_eq!(cs, original);
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+                assert!(matches!(cs.changes[0].change, Change::AlterModule { .. }));
+                assert!(matches!(cs.changes[1].change, Change::CreateTable { .. }));
+                assert!(matches!(cs.changes[2].change, Change::AddCheck { .. }));
+            }
+        }
     }
 
     /// DEC-1364.1: a column added with an expression calling a new function

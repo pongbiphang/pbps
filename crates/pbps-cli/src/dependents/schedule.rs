@@ -239,6 +239,8 @@ pub(crate) fn schedule(
                         | Change::AddForeignKey { .. }
                         | Change::AddUnique { .. }
                         | Change::SetPrimaryKey { to: Some(_), .. }
+                        | Change::CreateTable { .. }
+                        | Change::AttachPartition { .. }
                 ) {
                     handovers.edge(edge.before, edge.after, edge.source, edge.reason);
                 }

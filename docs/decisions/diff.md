@@ -7036,3 +7036,44 @@ Pinned by `a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots
 `ordinary_modules_checks_and_rows_without_a_handover_keep_their_bytes`,
 `a_constraint_slot_cycle_is_refused_with_its_steps_named`, and the live
 `a_constraint_trigger_rebuild_frees_its_name_before_a_check_or_foreign_key`.
+
+<a id="dec-2100-2"></a>
+
+**DEC-2100.2. A trigger release covers prospective partition clones, and a
+partition arrival claims only the clones its parent then creates.** Review
+of #2100 found that a new or attached partition with its own check could
+reach the parent's old constraint trigger before its conversion to an ordinary
+trigger. Measured on PostgreSQL 16 and 18: create fails with 42710 for the
+constraint name, and attach with 23505 on the constraint catalog's unique
+index. Releasing the constraint trigger first permits both operations.
+
+The dialect's name analysis reads the operation list as well as the baseline.
+A release includes the clone slots of partitions the plan creates or attaches,
+scoped through the parent's and partition's identities. An arrival reads the
+parent's trigger kind after the preceding module operations: it claims a
+companion only while the trigger is a constraint trigger. A module creation
+claims clones only on partitions already introduced. The baseline still seeds
+only standing clones, never ones whose table does not yet exist.
+
+An attach restates a competing own constraint as it stands at that operation,
+replaying portable names through the prefix. Its final `shape` is not evidence
+that a later check already exists, nor that a removed check still stands.
+Inherited clone claims remain visible to replay, but do not make their
+standing parent trigger a new independent holder: that trigger's release
+still precedes another holder's competing claim.
+
+`CreateTable` and `AttachPartition` join the existing companion handovers in
+`after_the_rebuilds`' sink settle. Across an arrival delayed by such an edge,
+the existing `needs` constraints keep readers behind it. Rows through its
+parent may route into the partition too. A row still precedes module changes,
+so a row that would have to cross the release is a named cycle, refused without
+changing the plan, rather than being run under a different trigger. No new
+ordering pass, rank or hoisting mode is added. Plans without a handover keep
+their existing order. A kept constraint trigger remains a named refusal by
+the connected plan's existing validation; this change adds no intake rule.
+
+Pinned by `an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_releases_it`,
+`an_attach_claims_its_standing_checks_instead_of_its_final_checks`,
+`a_delayed_partition_keeps_its_readers_after_it_and_refuses_a_row_cycle`, and
+the live `a_created_partition_takes_a_constraint_trigger_name_after_its_release`
+and `an_attached_partition_keeps_its_check_after_a_constraint_trigger_releases_its_name`.

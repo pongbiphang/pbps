@@ -154,8 +154,12 @@ Then, in this order:
     new column whose expression names one after that create, with what may
     read the column after it (DEC-942.1, DEC-1364.1, DEC-1967.1).
     A constraint trigger's companion-name handovers join the same settle,
-    including its partition clones: the check or foreign key taking the name
-    sinks after the module change releasing it (DEC-2100.1).
+    including its partition clones: the constraint addition, partition
+    creation or attachment taking the name sinks after the module change
+    releasing it. A partition inherits a constraint clone only while the
+    parent still has that constraint trigger; what needs the delayed
+    partition follows it, or is refused by name when rows would have to
+    cross a module change (DEC-2100.1, DEC-2100.2).
   - `after_their_parents_defaults` then sets each partition's own default
     again after a parent's default the plan sets, which reaches every
     partition (DEC-1581.1).
@@ -350,7 +354,7 @@ rows below list each.
 | A table rename moving a holder away (P) → a cross-schema rename carrying an index or owned sequence onto the held name | engine-sourced | on a connected PostgreSQL plan, `order_carried_moves` settles the plan over the name handovers, the catalog's occupants included, where only table renames pass one another; refused at `plan --db` with the remedy otherwise | ✓ DEC-1767.1, DEC-1957.2 |
 | `RenameColumn` or another later class freeing a default name → `RenameTable` into it | — | refused at `plan --db` with the remedy | ✓ refused by design, DEC-1366.2 |
 | Index (P) or named constraint (S) drop → `RenameTable` into its name | fixed | `rename_order` | ✓ DECISIONS 496, DEC-496.1 |
-| Constraint or index drop → add of the same name | fixed | class 2 before 13; P: a constraint trigger's companion name, on its table and its partitions, is released by its module change before the check or foreign key taking it, by slot edges in `after_the_rebuilds`' settle | ✓ DECISIONS 168 (namespaces), DEC-2100.1 |
+| Constraint or index drop → add of the same name | fixed | class 2 before 13; P: a constraint trigger's companion name, on its table and its partitions, is released by its module change before the constraint addition or partition creation/attachment taking it, by slot edges in `after_the_rebuilds`' settle | ✓ DECISIONS 168 (namespaces), DEC-2100.1, DEC-2100.2 |
 | `DropModule` → `CreateModule` of its id | fixed | class 0 before 14 | ✓ |
 | `DropRole` or `RenameRole` away → `CreateRole` of its name | fixed | class 0 or 1 before 15 | ✓ |
 | `DropRole` → `RenameRole` into its name (S) | fixed | class 0 before 1 | ✓ |

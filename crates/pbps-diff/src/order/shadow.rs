@@ -396,6 +396,8 @@ pub(crate) fn judge_slots(
                         | pbps_model::Change::AddForeignKey { .. }
                         | pbps_model::Change::AddUnique { .. }
                         | pbps_model::Change::SetPrimaryKey { to: Some(_), .. }
+                        | pbps_model::Change::CreateTable { .. }
+                        | pbps_model::Change::AttachPartition { .. }
                 )
             })
             .collect()

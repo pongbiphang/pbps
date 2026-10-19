@@ -159,12 +159,22 @@ fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
             ids: &ids,
         };
         let ops = Operations::of_plan(&changes, ModuleEdits::Rebuilt);
-        let removed =
-            pbps_dialect::slots::names(&Postgres::new(), &ops.as_slice()[0], &owners, before)
-                .unwrap();
-        let created =
-            pbps_dialect::slots::names(&Postgres::new(), &ops.as_slice()[1], &owners, before)
-                .unwrap();
+        let removed = pbps_dialect::slots::names(
+            &Postgres::new(),
+            &ops.as_slice()[0],
+            &owners,
+            before,
+            ops.as_slice(),
+        )
+        .unwrap();
+        let created = pbps_dialect::slots::names(
+            &Postgres::new(),
+            &ops.as_slice()[1],
+            &owners,
+            before,
+            ops.as_slice(),
+        )
+        .unwrap();
         let count = |names: &[pbps_model::operation::Named]| {
             names
                 .iter()
@@ -254,5 +264,253 @@ fn a_constraint_trigger_releases_its_own_and_its_clones_constraint_slots() {
                 .is_empty()
             );
         }
+    }
+}
+
+#[test]
+fn an_arriving_partition_claims_a_constraint_clone_only_until_its_parent_releases_it() {
+    use pbps_diff::order::slots::{SlotViolation, analyse, edges, verify};
+    use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+    use pbps_model::plan_names::PlanNames;
+    use pbps_model::{
+        Change, CheckConstraint, IdsFile, Module, PartitionBound, PartitionOf, PlannedChange,
+        Schema, Table, TableName, Uid, UidKind,
+    };
+    let parent = TableName::new("app", "t");
+    let child = TableName::new("app", "p0");
+    let parent_uid = Uid::derived(UidKind::Table, "parent", 0);
+    let child_uid = Uid::derived(UidKind::Table, "child", 0);
+    let id = ModuleId::Trigger {
+        on: parent.clone(),
+        name: "audit".into(),
+    };
+    let trigger = |constraint| Module {
+        kind: ModuleKind::Trigger,
+        description: None,
+        definition: format!(
+            "{}AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()",
+            if constraint { "CONSTRAINT " } else { "" }
+        ),
+    };
+    for attach in [false, true] {
+        for (was, will, check, handover) in [
+            (true, false, "audit", true),
+            (true, true, "audit", false),
+            (false, false, "audit", false),
+            (true, false, "other", false),
+        ] {
+            let mut before = Schema::default();
+            before.tables.insert(parent.clone(), Table::default());
+            before.modules.insert(id.clone(), trigger(was));
+            let mut ids = IdsFile::default();
+            ids.tables.insert(parent_uid.clone(), parent.clone());
+            let mut shape = Table::default();
+            shape.checks.insert(
+                check.into(),
+                CheckConstraint {
+                    expression: "id >= 0".into(),
+                },
+            );
+            if attach {
+                before.tables.insert(child.clone(), shape.clone());
+                ids.tables.insert(child_uid.clone(), child.clone());
+            }
+            shape.partition_of = Some(PartitionOf {
+                parent: parent.clone(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            });
+            let arrival = if attach {
+                Change::AttachPartition {
+                    uid: child_uid.clone(),
+                    table: child.clone(),
+                    parent: parent.clone(),
+                    bound: PartitionBound::Default,
+                    key: Vec::new(),
+                    shape: Box::new(shape),
+                }
+            } else {
+                Change::CreateTable {
+                    uid: child_uid.clone(),
+                    name: child.clone(),
+                    table: Box::new(shape),
+                    beside_default: None,
+                    moves_at_most: None,
+                }
+            };
+            let mut after_ids = ids.clone();
+            after_ids.tables.insert(child_uid.clone(), child.clone());
+            let changes: Vec<_> = [
+                arrival,
+                Change::AlterModule {
+                    id: id.clone(),
+                    module: Box::new(trigger(will)),
+                },
+            ]
+            .into_iter()
+            .map(PlannedChange::new)
+            .collect();
+            let names = PlanNames::of(&changes, &after_ids).unwrap();
+            let owners = PlanOwners::new(names, &ids, &after_ids);
+            let base = Snapshot {
+                schema: &before,
+                ids: &ids,
+            };
+            let ops = Operations::of_plan(&changes, ModuleEdits::Rebuilt);
+            let slots = analyse(ops.as_slice(), &owners, base, &Postgres::new());
+            let clones = |fx: &pbps_diff::order::slots::SlotEffects| {
+                fx.claims
+                    .iter()
+                    .filter(|(_, h)| matches!(h, ObjectKey::Module(_)))
+                    .count()
+            };
+            assert_eq!(
+                clones(&slots.effects[0]),
+                usize::from(was),
+                "attach={attach}, was={was}, will={will}, check={check}"
+            );
+            let found = edges(&slots, None, &[]);
+            assert_eq!(
+                found.iter().any(|e| (e.before, e.after) == (1, 0)),
+                handover,
+                "{found:?}"
+            );
+            let mut order = pbps_diff::order::Schedule::new(changes.len());
+            pbps_diff::order::slots::schedule(&mut order, &found);
+            let sequence = order.sequence().unwrap();
+            assert_eq!(sequence, if handover { vec![1, 0] } else { vec![0, 1] });
+            let ordered = ops.reordered(&sequence);
+            let slots = analyse(ordered.as_slice(), &owners, base, &Postgres::new());
+            let (violations, _) = verify(
+                ordered.as_slice(),
+                &slots,
+                &Postgres::new(),
+                None,
+                &owners,
+                base,
+            );
+            if was && will && check == "audit" {
+                assert!(
+                    violations
+                        .iter()
+                        .any(|v| matches!(v, SlotViolation::Contested { .. })),
+                    "{violations:?}"
+                );
+            } else {
+                assert!(violations.is_empty(), "{violations:?}");
+                if handover {
+                    assert_eq!(
+                        clones(&slots.effects[1]),
+                        0,
+                        "the ordinary parent creates no constraint clone"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_attach_claims_its_standing_checks_instead_of_its_final_checks() {
+    use pbps_diff::order::slots::{analyse, edges};
+    use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
+    use pbps_model::plan_names::PlanNames;
+    use pbps_model::{
+        Change, CheckConstraint, IdsFile, Module, PartitionBound, PartitionOf, PlannedChange,
+        Schema, Table, TableName, Uid, UidKind,
+    };
+    let parent = TableName::new("app", "t");
+    let child = TableName::new("app", "p0");
+    let mut ids = IdsFile::default();
+    let mut before = Schema::default();
+    for name in [&parent, &child] {
+        ids.tables.insert(
+            Uid::derived(UidKind::Table, &name.raw().to_string(), 0),
+            name.clone(),
+        );
+        before.tables.insert(name.clone(), Table::default());
+    }
+    let id = ModuleId::Trigger {
+        on: parent.clone(),
+        name: "audit".into(),
+    };
+    let module = |constraint| Module {
+        kind: ModuleKind::Trigger,
+        description: None,
+        definition: format!(
+            "{}AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f()",
+            if constraint { "CONSTRAINT " } else { "" }
+        ),
+    };
+    before.modules.insert(id.clone(), module(true));
+    for removed_first in [false, true] {
+        let mut before = before.clone();
+        let check = CheckConstraint {
+            expression: "id >= 0".into(),
+        };
+        if removed_first {
+            before
+                .tables
+                .get_mut(&child)
+                .unwrap()
+                .checks
+                .insert("audit".into(), check.clone());
+        }
+        let shape = Table {
+            partition_of: Some(PartitionOf {
+                parent: parent.clone(),
+                bound: PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            checks: [("audit".into(), check.clone())].into(),
+            ..Table::default()
+        };
+        let attach = Change::AttachPartition {
+            uid: ids.table_uid(&child).unwrap().clone(),
+            table: child.clone(),
+            parent: parent.clone(),
+            bound: PartitionBound::Default,
+            key: Vec::new(),
+            shape: Box::new(shape),
+        };
+        let mut changes = Vec::new();
+        if removed_first {
+            changes.push(Change::DropCheck {
+                table: child.clone(),
+                name: "audit".into(),
+            });
+        }
+        let at = changes.len();
+        changes.push(attach);
+        changes.push(Change::AddCheck {
+            table: child.clone(),
+            name: "audit".into(),
+            constraint: check,
+        });
+        changes.push(Change::AlterModule {
+            id: id.clone(),
+            module: Box::new(module(false)),
+        });
+        let changes: Vec<_> = changes.into_iter().map(PlannedChange::new).collect();
+        let names = PlanNames::of(&changes, &ids).unwrap();
+        let owners = PlanOwners::new(names, &ids, &ids);
+        let ops = Operations::of_plan(&changes, ModuleEdits::Rebuilt);
+        let slots = analyse(
+            ops.as_slice(),
+            &owners,
+            Snapshot {
+                schema: &before,
+                ids: &ids,
+            },
+            &Postgres::new(),
+        );
+        let found = edges(&slots, None, &[]);
+        assert!(!found.iter().any(|e| e.after == at), "{found:?}");
+        assert!(
+            found
+                .iter()
+                .any(|e| (e.before, e.after) == (at + 2, at + 1)),
+            "{found:?}"
+        );
     }
 }

@@ -14099,6 +14099,123 @@ fn a_constraint_trigger_rebuild_frees_its_name_before_a_check_or_foreign_key() {
     }
 }
 
+fn a_partition_takes_a_released_constraint_trigger_name(attach: bool) {
+    for was_constraint in [true, false] {
+        let slug = format!("partition-trigger-slot-{attach}-{was_constraint}");
+        let own = OwnDatabase::new(&server(), &slug);
+        let connection = own.connection();
+        on_server(connection, &format!(
+            "CREATE SCHEMA app;
+             CREATE TABLE app.t (id integer) PARTITION BY RANGE (id);
+             CREATE FUNCTION app.f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+             CREATE {}TRIGGER audit AFTER INSERT ON app.t FOR EACH ROW EXECUTE FUNCTION app.f();{}",
+            if was_constraint { "CONSTRAINT " } else { "" },
+            if attach {
+                "CREATE TABLE app.p0 (id integer CONSTRAINT audit CHECK (id >= 0)); INSERT INTO app.p0 VALUES (1);"
+            } else { "" }
+        ));
+        let d = Demo::new(&slug);
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+        let check = if attach {
+            let path = d.dir.join("schema/app.p0.yml");
+            let table = std::fs::read_to_string(&path).unwrap();
+            std::fs::remove_file(path).unwrap();
+            table.split_once("checks:\n").unwrap().1.to_owned()
+        } else {
+            "  audit: id >= 0\n".into()
+        };
+        let check: String = check.lines().map(|line| format!("    {line}\n")).collect();
+        std::fs::write(d.dir.join("schema/app.t.yml"), format!(
+            "table: app.t\ncolumns:\n  id: {{type: integer}}\npartition_by: [id]\npartitions:\n  p0:\n    from: ['0']\n    to: ['10']\n    checks:\n{check}"
+        )).unwrap();
+        if was_constraint {
+            // A kept constraint trigger still makes this final shape invalid.
+            // Keep the connected plan's named refusal: changing the order
+            // cannot make two final holders of the same name valid.
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let kept = d.dir.join("kept.json");
+            let result = d.run(&["plan", "--db", connection, "--out", kept.to_str().unwrap()]);
+            assert_ne!(code(&result), 0, "{}", stdout(&result));
+            let why = stderr(&result);
+            assert!(
+                why.contains("audit")
+                    && why.contains("app.p0")
+                    && why.contains("constraint trigger"),
+                "{why}"
+            );
+            assert!(!kept.exists(), "a refused plan writes no artifact");
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*)::bigint FROM pg_class WHERE relnamespace='app'::regnamespace AND relname='p0' AND relispartition"
+                ),
+                0
+            );
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT count(*)::bigint FROM pg_constraint WHERE conrelid='app.t'::regclass AND conname='audit' AND contype='t'"
+                ),
+                1
+            );
+        }
+        let trigger = d.dir.join("schema/app.t%2Eaudit.trigger.yml");
+        let original = std::fs::read_to_string(&trigger).unwrap();
+        let ordinary = original
+            .replace("CONSTRAINT AFTER", "AFTER")
+            .replace(" NOT DEFERRABLE INITIALLY IMMEDIATE", "")
+            .replace("AFTER INSERT", "AFTER INSERT OR UPDATE");
+        assert_ne!(ordinary, original);
+        std::fs::write(trigger, ordinary).unwrap();
+        let (plan, script) = connected_plan(&d, connection);
+        let partition = script
+            .find(if attach {
+                "ATTACH PARTITION"
+            } else {
+                "CREATE TABLE \"app\".\"p0\""
+            })
+            .unwrap();
+        let release = script.find("DROP TRIGGER \"audit\"").unwrap();
+        assert_eq!(release < partition, was_constraint, "{script}");
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "destructive,constraint"],
+        ));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        on_server(connection, "INSERT INTO app.t VALUES (2)");
+        assert_eq!(
+            scalar(connection, "SELECT count(*)::bigint FROM app.t"),
+            if attach { 2 } else { 1 }
+        );
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*)::bigint FROM pg_constraint WHERE conrelid='app.p0'::regclass AND conname='audit' AND contype='c'"
+            ),
+            1
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_created_partition_takes_a_constraint_trigger_name_after_its_release() {
+    a_partition_takes_a_released_constraint_trigger_name(false);
+}
+
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_attached_partition_keeps_its_check_after_a_constraint_trigger_releases_its_name() {
+    a_partition_takes_a_released_constraint_trigger_name(true);
+}
+
 /// #1749: `ALTER TABLE ... SET SCHEMA` takes a table's indexes along under
 /// their names, and refuses one whose name a relation of the destination
 /// holds (measured on 16 and 18). An unmanaged sequence `s2.n` and a table
