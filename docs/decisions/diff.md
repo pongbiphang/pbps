@@ -6841,7 +6841,11 @@ is still #595's named limitation, not a reason to omit an otherwise supported
 table. Resolver reconstruction explicitly leaves policy/flag setup to the
 deployment plan: neither operation adds a nameable lookup candidate, policy
 predicates are not captured surfaces, and scratch need not reproduce their
-recipient roles. Exact declared policy catalog rows and their dependency rows
+recipient roles. The connected role check reads every named recipient of each
+policy creation, including recipients outside the managed role declarations,
+and refuses a missing one by policy and role name before producing an artifact.
+PUBLIC is its own target and needs no role lookup. Bootstrap and saved-plan
+apply share that check. Exact declared policy catalog rows and their dependency rows
 belong to the UID-proven table for closing ownership; this grants no predicate
 binding proof or ownership of referenced objects. The created-only operations
 have no intrinsic risk. A catalog-proven policy dependency is released by a

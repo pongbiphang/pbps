@@ -31024,7 +31024,7 @@ fn row_security_adoption_preserves_policies_during_an_unrelated_column_migration
         let saved: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
         assert!(
-            matches!(&saved.changes.changes[..], [step] if matches!(&step.change, pbps_model::Change::AddColumn { table, name, .. } if table == &pbps_model::TableName::new("app", "t") && name == "label"))
+            matches!(&saved.changes.changes[..], [step] if matches!(&step.change, pbps_model::Change::AddColumn { table, name, .. } if table == &pbps_model::TableName::new("app", "t") && name.raw() == "label"))
         );
         succeeds(approved_apply(&d, connection, &plan, &[]));
         succeeds(d.run(&["verify", "--db", connection]));
@@ -31456,5 +31456,158 @@ fn row_security_renames_preserve_unmanaged_policy_owners() {
                     .is_empty()
             );
         }
+    }
+}
+
+#[test]
+#[ignore = "needs both live PostgreSQL versions"]
+fn row_security_policy_targets_must_exist_before_planning_or_bootstrap() {
+    struct Roles(String, Vec<String>);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            for name in &self.1 {
+                let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {name}"));
+            }
+        }
+    }
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).unwrap();
+        let present = format!("pbps_rls_a_{}", std::process::id());
+        let missing = format!("pbps_rls_z_{}", std::process::id());
+        let _roles = Roles(base.clone(), vec![present.clone(), missing.clone()]);
+        on_server(&base, &format!("CREATE ROLE {present}"));
+        let own = OwnDatabase::new(&base, "rls_roles1172");
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new("rls-roles1172");
+        d.keyed(connection);
+        d.table(ONE_COLUMN);
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        let declaration = |table: &str, target: &str| {
+            format!(
+                "table: app.{table}\ncolumns:\n  id: {{type: integer}}\nrow_policies:\n  recipient_gate:\n    using: 'id > 0'\n{target}"
+            )
+        };
+        let path = d.dir.join("schema/app.docs.yml");
+        for (case, targets) in [format!("[{missing}]"), format!("[{present}, {missing}]")]
+            .into_iter()
+            .enumerate()
+        {
+            std::fs::write(&path, declaration("docs", &format!("    to: {targets}\n"))).unwrap();
+            if case == 0 {
+                succeeds(d.run(&["plan"]));
+            }
+            d.commit();
+            let snapshot = latest_snapshot(connection);
+            let artifact = d.dir.join("missing-role.json");
+            std::fs::write(&artifact, "keep the previous artifact").unwrap();
+            for format in ["text", "json"] {
+                let refused = d.run(&[
+                    "plan",
+                    "--db",
+                    connection,
+                    "--out",
+                    artifact.to_str().unwrap(),
+                    "--format",
+                    format,
+                ]);
+                let said = format!("{}{}", stdout(&refused), stderr(&refused));
+                assert_ne!(code(&refused), 0, "{said}");
+                for needle in [
+                    "missing_roles (PostgreSQL)",
+                    "recipient_gate",
+                    "app.docs",
+                    &missing,
+                ] {
+                    assert!(said.contains(needle), "{needle}: {said}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(&artifact).unwrap(),
+                    "keep the previous artifact"
+                );
+                assert_eq!(latest_snapshot(connection), snapshot);
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT (to_regclass('app.docs') IS NULL)::int::int8"
+                    ),
+                    1
+                );
+            }
+        }
+        // The same recipient check runs before a connected bootstrap builds
+        // anything, including when no role declaration carries the recipient.
+        let fresh = OwnDatabase::new(&base, "rls_boot_roles1172");
+        on_server(fresh.connection(), "CREATE SCHEMA app");
+        let other = Demo::new("rls-boot-roles1172");
+        other.table(&declaration("docs", &format!("    to: [{missing}]\n")));
+        succeeds(other.run(&["plan"]));
+        other.commit();
+        let refused = other.run(&["bootstrap", "--db", fresh.connection()]);
+        let said = format!("{}{}", stdout(&refused), stderr(&refused));
+        assert_ne!(code(&refused), 0, "{said}");
+        assert!(
+            said.contains("recipient_gate") && said.contains(&missing),
+            "{said}"
+        );
+        assert_eq!(
+            scalar(
+                fresh.connection(),
+                "SELECT (to_regclass('app.docs') IS NULL)::int::int8"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                fresh.connection(),
+                "SELECT (to_regclass('public.__pbps_state') IS NULL)::int::int8"
+            ),
+            1
+        );
+
+        // PUBLIC needs no pg_roles row. Existing recipients need no managed
+        // role declaration, and every accepted creation must apply and converge.
+        std::fs::remove_file(&path).unwrap();
+        for (table, target) in [
+            ("default_public", String::new()),
+            ("explicit_public", "    to: public\n".into()),
+            ("existing_recipient", format!("    to: [{present}]\n")),
+        ] {
+            std::fs::write(
+                d.dir.join(format!("schema/app.{table}.yml")),
+                declaration(table, &target),
+            )
+            .unwrap();
+        }
+        on_server(&base, &format!("CREATE ROLE {missing}"));
+        std::fs::write(
+            &path,
+            declaration("docs", &format!("    to: [{present}, {missing}]\n")),
+        )
+        .unwrap();
+        let plan = connected_artifact(&d, connection, false);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+        assert_eq!(
+            saved
+                .changes
+                .changes
+                .iter()
+                .filter(|p| matches!(p.change, pbps_model::Change::CreatePolicy { .. }))
+                .count(),
+            4
+        );
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &plan,
+            &["--allow", "grant-widen"],
+        ));
+        succeeds(d.run(&["verify", "--db", connection]));
+        let noop = succeeds(d.run(&["plan", "--db", connection, "--format", "json"]));
+        let json: serde_json::Value = serde_json::from_str(&stdout(&noop)).unwrap();
+        assert_eq!(json["data"]["changes"], 0, "{json}");
     }
 }

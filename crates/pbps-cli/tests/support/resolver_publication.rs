@@ -1589,7 +1589,7 @@ pub fn row_security(server: &str, scratch_server: &str) {
         serde_json::from_str(&std::fs::read_to_string(&artifact).unwrap()).unwrap();
     assert!(saved.changes.changes.iter().any(|step| matches!(
         &step.change, pbps_model::Change::AddColumn { table, name, .. }
-        if table == &pbps_model::TableName::new("app", "t") && name == "label"
+        if table == &pbps_model::TableName::new("app", "t") && name.raw() == "label"
     )));
     assert!(!saved.changes.changes.iter().any(|step| matches!(
         step.change,

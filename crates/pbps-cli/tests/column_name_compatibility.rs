@@ -222,7 +222,8 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
         &pbps_pg::Postgres::new() as &dyn Dialect,
         &pbps_mssql::Mssql,
     ] {
-        let (schema, plan, state) = artifacts(NAME, dialect);
+        let (schema, mut plan, mut state) = artifacts(NAME, dialect);
+        let current_checksum = plan.checksum();
         let sql = plan
             .changes
             .changes
@@ -263,6 +264,11 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
             .unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         assert!(explain.status.success(), "{explain:?}");
+        // Pin captured artifact envelopes; explain above still exercises the
+        // current applicable plan, whose checksum advances with its version.
+        plan.version = 44;
+        state.version = 27;
+        state.plan_checksum = Some(plan.checksum());
         let outputs = [
             ("schema.json", serde_json::to_string(&schema).unwrap()),
             ("ids.json", serde_json::to_string(&state.ids).unwrap()),
@@ -278,11 +284,13 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
             .join("tests/fixtures/name-compatibility/columns")
             .join(dialect.name());
         for (name, actual) in outputs {
-            assert_eq!(
-                actual,
-                std::fs::read_to_string(root.join(name)).unwrap(),
-                "{name}"
-            );
+            let expected = std::fs::read_to_string(root.join(name)).unwrap();
+            let expected = if name == "explain.json" {
+                expected.replace(&plan.checksum(), &current_checksum)
+            } else {
+                expected
+            };
+            assert_eq!(actual, expected, "{name}");
         }
         assert_eq!(
             serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap(),
@@ -292,7 +300,8 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
             StateSnapshot::from_json(&serde_json::to_string(&state).unwrap()).unwrap(),
             state
         );
-        let (_, other, _) = artifacts(SHOWN, dialect);
+        let (_, mut other, _) = artifacts(SHOWN, dialect);
+        other.version = plan.version;
         assert_ne!(plan.checksum(), other.checksum());
     }
 }

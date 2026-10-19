@@ -2654,6 +2654,56 @@ pub async fn generation_support(
     })
 }
 
+/// Policy recipients need not be declared roles: an existing cluster role may
+/// receive a policy without any managed grants. Ask the connected role reader,
+/// shared by plan, bootstrap and saved-plan apply, rather than the managed scope.
+async fn refuse_missing_policy_roles(conn: &mut Conn, changes: &ChangeSet) -> anyhow::Result<()> {
+    let policies: Vec<_> = changes
+        .changes
+        .iter()
+        .filter_map(|step| {
+            if let pbps_model::Change::CreatePolicy {
+                table,
+                name,
+                policy,
+                ..
+            } = &step.change
+                && let pbps_model::PolicyRoles::Roles(roles) = &policy.to
+            {
+                Some((table, name, roles))
+            } else {
+                // PUBLIC is a target in its own right, never a role to look up.
+                None
+            }
+        })
+        .collect();
+    let recipients = policies
+        .iter()
+        .flat_map(|(_, _, roles)| roles.iter().map(String::as_str))
+        .collect();
+    let missing: BTreeSet<_> = pbps_pg::roles::missing_roles(conn, &recipients)
+        .await?
+        .into_iter()
+        .collect();
+    let problems: Vec<_> = policies
+        .iter()
+        .flat_map(|(table, policy, roles)| {
+            roles.iter().filter(|role| missing.contains(*role)).map(|role| {
+                format!(
+                    "policy `{}` on {} names missing cluster role `{}`; create it first, then plan again",
+                    pbps_model::escape::Escaped(policy),
+                    table.shown(),
+                    pbps_model::escape::Escaped(role)
+                )
+            })
+        })
+        .collect();
+    if !problems.is_empty() {
+        anyhow::bail!("missing_roles (PostgreSQL): {}", problems.join("\n"));
+    }
+    Ok(())
+}
+
 pub async fn permission_support(
     conn: &mut Conn,
     changes: &ChangeSet,
@@ -2668,6 +2718,7 @@ pub async fn permission_support(
                 .to_owned(),
         }),
         Driver::Postgres => {
+            refuse_missing_policy_roles(conn, changes).await?;
             let version = pbps_pg::roles::server_version_num(conn).await?;
             let mut roles: BTreeMap<pbps_model::RoleName, pbps_model::Role> = BTreeMap::new();
             for planned in &changes.changes {

@@ -3484,7 +3484,7 @@ pub async fn policies_on_column(
            JOIN pg_catalog.pg_namespace n ON n.oid = own.relnamespace
           WHERE tn.nspname = $1 AND t.relname = $2 AND a.attname = $3 AND a.attnum > 0 AND NOT a.attisdropped
           ORDER BY 2, 3, 1",
-        &[Param::Str(&column.table.schema), Param::Str(&column.table.name), Param::Str(&column.name)]).await?;
+        &[Param::Str(&column.table.schema), Param::Str(&column.table.name), Param::Str(column.name.raw())]).await?;
     rows.iter()
         .map(|row| {
             Ok(PolicyDependent {
