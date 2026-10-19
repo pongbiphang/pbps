@@ -791,8 +791,8 @@ fn compiled_early(
     paths: &Paths,
 ) -> bool {
     let owner = owner(object);
-    // A generated column's expression compiles with its table, not as a
-    // module: found by its column (#1778).
+    // A generated expression has its own installation step after creation
+    // parts expand: found by its column (DEC-1503.1, #1778).
     let generated = match (object.class.as_str(), object.signature.as_slice()) {
         ("pg_attrdef", [column]) => match (column.name.as_slice(), column.signature.as_slice()) {
             ([name], [table]) => match table.name.as_slice() {

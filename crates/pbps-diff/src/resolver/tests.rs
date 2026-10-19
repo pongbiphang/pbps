@@ -1466,10 +1466,10 @@ mod generated_surface_coverage {
         }
     }
 
-    /// A generation expression stays in its CREATE TABLE or ADD COLUMN, so
-    /// that step provides its `pg_attrdef` surface: a function the plan
-    /// creates and the expression calls is ordered before the table or
-    /// column, not after it (DEC-1274.2).
+    /// The step installing a generation expression provides its `pg_attrdef`
+    /// surface and follows the function it calls. This MinimalDialect fixture
+    /// keeps the expression in CREATE TABLE or ADD COLUMN; PostgreSQL expands
+    /// new tables into creation parts first (DEC-1503.1).
     #[test]
     fn a_generation_expression_waits_for_the_function_it_calls() {
         let function: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();

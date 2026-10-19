@@ -64,9 +64,9 @@ pub enum ReconstructError {
     Cycle(String),
 }
 
-/// A table whose generated columns may call a declared function. Its
-/// `CREATE TABLE` must follow that function, and a generated column cannot be
-/// split out without changing the column order (DEC-1364.1).
+/// An unsplittable table whose generation still calls a declared function
+/// after the shared expansion (DEC-1503.1): a suffix partition key or a read
+/// of a later column, without a known expression-replacement capability.
 struct Late {
     table: pbps_model::TableName,
     steps: std::ops::Range<usize>,
@@ -999,8 +999,8 @@ async fn routines(
 /// What creating a table or view makes nameable before it compiles: the
 /// relation with its row type, which always has its name. Its array type is
 /// read back once it exists ([`array_type`]).
-/// Places each table whose generated column may call a declared function
-/// after that function, as the ordinary plan does (DEC-1364.1). The table
+/// Keeps the legacy whole-table hold for the two unsplittable shapes left
+/// by the shared expansion, as the ordinary plan does (DEC-1503.1). The table
 /// and what it holds that runs before the modules join the modules phase
 /// after the last function its generation text names. A module ahead of it
 /// that names the table, or names something so moved, follows it; a foreign

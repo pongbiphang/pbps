@@ -2227,15 +2227,17 @@ DEC-1778.2).**
 - **It lifts a chain through what it writes.** A shape that names a managed
   relation's row type cannot exist before that relation does, so the compile
   then runs in two parts:
-  - the deployer's session compiles up to the step that creates the last
-    managed relation those shapes name, and commits;
+  - the deployer's session compiles up to the step that completes the last
+    column shape of every managed relation those shapes name, and commits;
   - the setup session creates the chained shapes, in `pg_depend` order;
   - the deployer's session compiles the rest.
 
-  That step can come among the modules: a table whose generated column calls
-  a declared function is created after the function. The split waits for
-  every managed relation a chained shape names; a shape waiting for one the
-  compile does not create (a base table the plan renames) is not filled,
+  That step can come among the modules: a split table creates its prefix
+  before a declared function its generation calls, then adds its generated
+  suffix after the function (DEC-1503.1). The fill boundary waits for the
+  complete column shape, not just the prefix's relation name. The split
+  waits for every managed relation a chained shape names; a shape waiting
+  for one the compile does not create (a base table the plan renames) is not filled,
   and neither is what names it, while the other shapes are. An extension
   never waits: its script runs code and creates names the split does not
   order, so one that would is not filled. Where the setup
@@ -2246,8 +2248,9 @@ DEC-1778.2).**
   bound a name a chained shape then takes (a call that the target casts to a
   domain, for instance): the order check counts the chained shapes' names
   as created at the split, and such a binding is unresolved. A generated
-  column's expression compiles with its table, so the check reads it from
-  that table's step. A sequence has no row type, so it takes no call or
+  expression's binding is checked at the step that installs its real text:
+  CREATE TABLE, ADD COLUMN or SET EXPRESSION, as the expansion requires.
+  A sequence has no row type, so it takes no call or
   cast. The chained shapes are compared with the target
   after the compile, before any binding question is answered.
 - **What it does not stage**, it names when the compile fails for want of it:

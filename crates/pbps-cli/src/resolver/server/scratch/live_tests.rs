@@ -2426,7 +2426,8 @@ async fn resolver_lifts_a_chain_through_an_object_fill_stages() {
 const GENERATING: &str = "(x integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN x";
 
 /// The target's `f` and `m`, whose generated column calls `f`: scratch
-/// creates `m` after `f`, among the modules.
+/// creates `m`'s prefix before `f` and completes its suffix after it
+/// (DEC-1503.1).
 fn generating_target() -> Vec<String> {
     vec![
         format!("CREATE SCHEMA {MANAGED}"),
@@ -2473,9 +2474,9 @@ fn generating_inputs(definition: &str) -> Inputs {
     ))
 }
 
-/// `chain_target` over `generating_target`: scratch creates `m` among the
-/// modules, and fill waits for that step. With `calling`, the managed views
-/// call `f` too, so they compile after it.
+/// `chain_target` over `generating_target`: scratch completes `m`'s columns
+/// among the modules, and fill waits for that step (DEC-1503.1). With
+/// `calling`, the managed views call `f` too, so they compile after it.
 async fn after_its_function(calling: bool) -> Result<ResolvedPlan, ProduceError> {
     let filter = if calling {
         format!(" WHERE {MANAGED}.f(id) > 0")

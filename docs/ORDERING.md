@@ -447,7 +447,7 @@ and the expression-bearing changes that need a function.
 | `AddColumn` → a module created that reads it | content, over-approximated | class 8 before 14; reordered after a column that moves, when it names the column or its table | ✓ DEC-1364.1 |
 | Function rebuilt → default a row of the plan takes | content | stays ahead of the rows | ⧗ #1030 |
 | Function created → a new table's expression-bearing parts | content, over-approximated | `split_new_tables`, then `after_the_rebuilds`, when their text names the function | ✓ #1027, DEC-1364.1 |
-| Function created → a new table's generated column calling it | content | stays inside `CREATE TABLE`: split out, the column would move to the end of the table | ⧗ DEC-1364.1 |
+| Function created → a new table's generated column calling it | content, over-approximated | shared creation parts keep the prefix before the function, then add the suffix in declaration order; a suffix partition key or a generation reading a later column instead uses SET EXPRESSION on connected PostgreSQL 17+, retaining the whole-table hold otherwise | ✓ DEC-1503.1 |
 
 ### Something removed before what it blocks
 
@@ -565,10 +565,11 @@ What is left to the engine is recorded on #1350, each with a two-plan remedy:
 - an expression change still calling a function the plan rebuilds;
 - a function dropped after its release whose own body reads a column dropped
   or retyped earlier;
-- a default a plan row takes calling a rebuilt function (#1030);
-- a generated column of a table the plan creates calling a function the plan
-  creates or rebuilds: taken out of `CREATE TABLE`, the column would change
-  the table's column order (DEC-1364.1).
+- a default a plan row takes calling a rebuilt function (#1030).
+
+New tables use creation parts that preserve column order. A suffix partition
+key or a generation reading a later column instead keeps the whole-table
+hold without a known PostgreSQL 17+ capability (DEC-1503.1).
 
 ## Value flow
 

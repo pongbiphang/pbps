@@ -2771,8 +2771,8 @@ the `CREATE` give, the NOT NULL row on 18 under the same engine name.
 **Ordering.** That statement is part of the partition's `CreateTable`, which
 sorts ahead of the modules. In the ordinary plan, a default of its own that
 calls a function the plan creates therefore holds the whole partition after
-that function, as a generated column holds its table (DEC-1364.1). It is not
-split out into an `AlterColumnDefault` as a table column's default is: the
+that function (DEC-1364.1). Unlike a new table's generated suffix
+(DEC-1503.1), it is not split out into an `AlterColumnDefault`: the
 partition has no column, and no column uid, of its own. A new partition whose
 own default names a held new table follows it too. Scratch reconstruction
 sets every table's defaults in its expressions phase, after the modules; a
@@ -7430,6 +7430,9 @@ Pinned by `generated_table_parts_keep_names_early_and_columns_in_declaration_ord
 `generation_functions_may_read_prefix_columns_but_suffix_and_whole_row_cycles_are_named`,
 `generated_table_parts_apply_with_the_declared_column_order_values_and_names`
 (`crates/pbps-cli/src/dependents/generated_tests.rs`),
+`an_offline_plan_creates_what_a_new_table_calls_before_it` and
+`a_bootstrap_creates_what_a_new_table_calls_before_it`
+(`crates/pbps-cli/tests/flow_pg.rs`),
 `placeholder_bindings_are_measured_at_the_real_expression_and_fill_uses_the_complete_shape`
 (`crates/pbps-pg/src/resolver/reconstruct/tests.rs`),
 `generated_creation_parts_provide_columns_before_rows_and_preserve_stored_value_effects`

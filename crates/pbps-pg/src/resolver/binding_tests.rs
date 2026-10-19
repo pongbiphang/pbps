@@ -425,10 +425,9 @@ async fn related_tables_compile_on_scratch_with_their_foreign_key() {
     }
 }
 
-/// A table whose generated column calls a declared function compiles on
-/// scratch after that function, as the ordinary plan creates it (DEC-1364.1),
-/// so even an unchanged schema reaches a verdict instead of failing to
-/// compile the table before its function exists.
+/// Scratch exposes a new table's prefix before the function its generated
+/// suffix calls, then compiles that suffix after the function (DEC-1503.1),
+/// so even an unchanged schema reaches a verdict.
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 async fn a_table_generating_from_a_declared_function_compiles_on_scratch() {

@@ -25069,16 +25069,13 @@ fn a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_dep
     );
 }
 
-/// A bootstrap orders what a new table calls ahead of it, as `plan --db`
-/// does (#1585): a column default and a generated column calling declared
-/// functions bootstrap an empty database, verify and replan empty. Without
-/// the reordering passes the table was created first and the whole
-/// bootstrap rolled back on `function … does not exist`. The negative: a
-/// table that calls nothing is created where the differ puts it, before the
-/// functions, so the passes move only what calls one. A partitioned parent
-/// held behind its function takes its partition with it (#1586), and so does
-/// one whose generated column calls a built-in sharing a declared function's
-/// name, through bootstrap and through `plan --db` and `apply` alike.
+/// A bootstrap creates a new table's prefix before the functions its
+/// expressions call, then adds the generated suffix and sets the default
+/// after those functions, as `plan --db` does (DEC-1503.1). Both expressions
+/// bootstrap an empty database, verify and replan empty. The negative: a
+/// table that calls nothing stays before the functions. A partition waits
+/// for its parent's completed columns, including when a built-in shares a
+/// declared function's name, through bootstrap and `plan --db` alike.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
@@ -25111,8 +25108,7 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
     succeeds(d.run(&["pull", "--db", &src]));
     d.commit();
 
-    // The script orders each function ahead of the table that calls it,
-    // and leaves the table that calls nothing ahead of both.
+    // Relation names precede the functions; only the expressions wait.
     let sql = d.dir.join("boot.sql");
     succeeds(d.run(&["bootstrap", "--sql", sql.to_str().unwrap()]));
     let script = std::fs::read_to_string(&sql).unwrap();
@@ -25122,22 +25118,31 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
             .unwrap_or_else(|| panic!("{needle} is not in:\n{script}"))
     };
     let table = at("CREATE TABLE \"app\".\"t\"");
-    assert!(at("CREATE FUNCTION \"app\".\"zz\"\n") < table, "{script}");
+    let zz = at("CREATE FUNCTION \"app\".\"zz\"\n");
+    let double = at("CREATE FUNCTION \"app\".\"zz_double\"");
+    let generated = at("ALTER TABLE \"app\".\"t\" ADD COLUMN \"g\"");
+    assert!(table < double && double < generated, "{script}");
     assert!(
-        at("CREATE FUNCTION \"app\".\"zz_double\"") < table,
+        table < zz && zz < at("ALTER TABLE \"app\".\"t\" ALTER COLUMN \"note\" SET DEFAULT"),
         "{script}"
     );
+    let prefix = &script[table..script[table..].find(") USING heap;").unwrap() + table];
+    assert!(
+        prefix.contains("\"id\" integer") && prefix.contains("\"note\" text"),
+        "{script}"
+    );
+    assert!(!prefix.contains("GENERATED ALWAYS"), "{script}");
     assert!(
         at("CREATE TABLE \"app\".\"a_plain\"") < at("CREATE FUNCTION \"app\".\"zz\"\n"),
         "{script}"
     );
-    // Each parent before its partition (#1586).
+    // Each partition follows the last column its parent adds (#1586).
     assert!(
-        at("CREATE TABLE \"app\".\"ev\" (") < at("CREATE TABLE \"app\".\"ev_1\""),
+        at("ALTER TABLE \"app\".\"ev\" ADD COLUMN \"g\"") < at("CREATE TABLE \"app\".\"ev_1\""),
         "{script}"
     );
     assert!(
-        at("CREATE TABLE \"app\".\"ab\" (") < at("CREATE TABLE \"app\".\"ab_1\""),
+        at("ALTER TABLE \"app\".\"ab\" ADD COLUMN \"g\"") < at("CREATE TABLE \"app\".\"ab_1\""),
         "{script}"
     );
 
@@ -25194,14 +25199,12 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
-/// The offline `plan` orders what a new table calls ahead of it, as `plan
-/// --db` does (#1598): a generated column calling a declared function is
-/// created after that function, and a default calling one is set after it.
-/// Before the preview went through the same schedule as the connected plan
-/// (#1955), it showed the table created first, a script no engine runs. The
-/// negative: a table that calls nothing keeps its place, ahead of the
-/// function, so only what calls one moves. The script is the one `--out`
-/// records, so the preview and its artifact agree.
+/// The offline `plan` uses the same creation parts as `plan --db`
+/// (DEC-1503.1): a new table creates its prefix before the function its
+/// generated suffix calls, then adds that suffix after the function.
+/// A default calling a declared function is set after it too. Negative: a
+/// table that calls nothing keeps its place ahead of the functions. The
+/// script is the one `--out` records, so the preview and its artifact agree.
 #[test]
 fn an_offline_plan_creates_what_a_new_table_calls_before_it() {
     let d = Demo::new("preview-1598");
@@ -25253,8 +25256,10 @@ fn an_offline_plan_creates_what_a_new_table_calls_before_it() {
     };
     let zz = at("CREATE FUNCTION \"app\".\"zz\"\n");
     let double = at("CREATE FUNCTION \"app\".\"zz_double\"");
-    // A generated column stays in its table, so the table follows the function.
-    assert!(double < at("CREATE TABLE \"app\".\"gen\""), "{script}");
+    // Keeping the prefix early exposes the relation before the generation binds.
+    let prefix = at("CREATE TABLE \"app\".\"gen\" (\n    \"id\" integer NOT NULL\n) USING heap;");
+    let generated = at("ALTER TABLE \"app\".\"gen\" ADD COLUMN \"g\"");
+    assert!(prefix < double && double < generated, "{script}");
     // A default is split out of its table and set after the function.
     assert!(
         at("CREATE TABLE \"app\".\"dflt\"") < zz && zz < at("SET DEFAULT"),

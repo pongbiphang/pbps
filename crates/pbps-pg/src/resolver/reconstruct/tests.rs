@@ -295,13 +295,11 @@ fn a_split_foreign_key_follows_every_table() {
     );
 }
 
-/// A table whose generated column calls a declared function cannot have
-/// the column split out without changing its column order, so the table
-/// follows the function on scratch, as in the ordinary plan (DEC-1364.1):
-/// its plain index with it, a view naming it after it, and a foreign key
-/// naming it once every module exists. A table generating from nothing
-/// declared keeps its place, and a function that needs the table it is
-/// called from is refused by name.
+/// Scratch creates the prefix and its plain index before the generation's
+/// function, then adds the generated suffix (DEC-1503.1). Readers and foreign
+/// keys wait for the columns they may need. A table generating from nothing
+/// declared keeps its place; a generation function needing the whole table
+/// closes a named cycle.
 #[test]
 fn generated_columns_and_readers_follow_functions_but_relation_names_precede_them() {
     use pbps_model::{Column, ForeignKey, Generated, Index, IndexColumn, IndexKey, Module, Schema};
@@ -643,11 +641,10 @@ fn an_index_replica_identity_is_set_after_its_index() {
     assert!(last.contains("REPLICA IDENTITY USING INDEX"), "{last}");
 }
 
-/// Two tables held behind different functions keep the order between them:
-/// `app.b` calls the earlier function and another of its generated columns
-/// names `app.a` in an OID-alias literal, resolved as the table is created
-/// (measured on 18), while `app.a` waits for the later function. Placing
-/// `app.b` after its own function alone would create it before `app.a`.
+/// Two tables calling different functions expose their prefixes before
+/// either function (DEC-1503.1). A generated suffix of `app.b` can therefore
+/// name `app.a` in an OID-alias literal even though `app.a`'s own generation
+/// calls the later function.
 #[test]
 fn split_generated_tables_expose_names_before_either_function() {
     use pbps_model::{Column, Generated, Module, Schema};
@@ -774,9 +771,9 @@ fn a_compile_failure_is_a_verdict_only_when_the_server_judged_the_statement() {
     )));
 }
 
-/// A fill's chained shapes go just after the step that creates the last
-/// managed relation they name, which for a table generating from a declared
-/// function is among the modules, after that function (#1778).
+/// A fill's chained shapes wait for the last managed relation's complete
+/// column shape. A split table exposes its prefix before the function and
+/// finishes its generated suffix after it (DEC-1503.1, #1778).
 #[test]
 fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
     use pbps_model::{Column, Generated, Module, Schema};
@@ -899,11 +896,11 @@ fn names_created_between_steps_are_later_only_for_modules_before_them() {
     assert!(later(&reconstruction), "created after the view compiled");
 }
 
-/// A generated column's expression compiles in its table's step, so what
-/// came after that step is later for it; a plain column, or a table no
-/// step creates, has no such step (#1778).
+/// A generated expression's own installation step decides which names
+/// arrived later, including when ADD COLUMN follows the prefix CREATE
+/// (DEC-1503.1, #1778). A plain column or absent table has no such step.
 #[test]
-fn a_generated_columns_later_names_follow_its_tables_step() {
+fn a_generated_columns_later_names_follow_its_expression_step() {
     use pbps_model::{Column, Generated, Module, Schema};
     let mut generated = Column::new("integer".parse().unwrap());
     generated.value_source = pbps_model::ValueSource::Generated(Generated {
@@ -967,12 +964,12 @@ fn a_generated_columns_later_names_follow_its_tables_step() {
     .map(|planned| planned.change)
     .collect();
     let mut reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap).unwrap();
-    let table = reconstruction
+    let expression = reconstruction
         .steps
         .iter()
         .position(|step| step.declaration == "column app.n.g")
         .unwrap();
-    let later: Vec<_> = reconstruction.steps[table + 1..]
+    let later: Vec<_> = reconstruction.steps[expression + 1..]
         .iter()
         .flat_map(|step| step.names.clone())
         .collect();
@@ -995,13 +992,16 @@ fn a_generated_columns_later_names_follow_its_tables_step() {
             .later_names_generated("app", "x", "g")
             .is_none()
     );
-    reconstruction.created_before(table + 1, vec![(Nameable::Type, "ext".into(), "d".into())]);
+    reconstruction.created_before(
+        expression + 1,
+        vec![(Nameable::Type, "ext".into(), "d".into())],
+    );
     assert!(
         reconstruction
             .later_names_generated("app", "n", "g")
             .unwrap()
             .contains(&(Nameable::Type, "ext", "d")),
-        "a fill after the table"
+        "a fill after the expression"
     );
 }
 

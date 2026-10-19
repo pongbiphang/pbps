@@ -1568,10 +1568,12 @@ over-approximated, a refusal can name a cycle the engine would not have:
 
 The remedy applies either in two plans.
 
-Left to the engine, as before: a generated column of a table the plan creates
-that calls a function the plan creates or rebuilds. It stays inside `CREATE
-TABLE`, because a column taken out would be added last and change the table's
-column order. The other corners on #1350 are not this rule's. A release
+Initially left to the engine: a generated column of a table the plan creates
+that calls a function the plan creates or rebuilds. Taking only that column
+out of `CREATE TABLE` would add it last and change column order. DEC-1274.2
+introduced a whole-table hold; [DEC-1503.1](diff.md#dec-1503-1) now splits the
+entire suffix in declaration order instead. The other corners on #1350 are
+not this rule's. A release
 (DEC-1316.1) whose new expression names no created function now keeps its
 place, so its retype is refused only when the release names one.
 
@@ -1590,35 +1592,37 @@ Pinned by `an_addition_naming_no_created_function_keeps_its_place`,
 `a_new_column_calling_a_function_that_reads_it_is_refused_by_name`
 (`crates/pbps-cli/tests/flow_pg.rs`).
 
-*Amended by [DEC-1274.2](#dec-1274-2): a table the plan creates whose generated
-column calls a function the plan creates or rebuilds follows that create whole,
-instead of being left to the engine.*
+*Amended by [DEC-1274.2](#dec-1274-2), then narrowed by
+[DEC-1503.1](diff.md#dec-1503-1): creation parts expose a new table before its
+generation calls planned functions; only the two unsplittable shapes without
+expression-replacement capability retain the whole-table hold.*
 
 <a id="dec-1274-2"></a>
 
-**DEC-1274.2. A new table whose generated column calls a function the plan
-creates or rebuilds follows that create whole, in the plan and on scratch
-(#1274).** DEC-1364.1 left such a table to the engine: a generated column
-cannot leave its `CREATE TABLE` without changing the table's column order, so
-the table stayed ahead of the function and the engine refused it. The
+**DEC-1274.2. A new table's generated column follows the function it calls,
+in the plan and on scratch; DEC-1503.1 limits the whole-table hold to its two
+unsplittable shapes (#1274).** DEC-1364.1 initially left such a table to the
+engine: taking only its generated column out of CREATE would change column
+order, so the table stayed ahead of the function and the engine refused it. The
 resolver's scratch compile of the desired namespace failed the same way, even
 for a plan that changed nothing (#1303 review).
 
-`after_their_functions` now holds the whole `CreateTable` as it holds an added
-column: the table waits for the creates its generation text names, by the same
-lexer scan, and every later change that may need it follows it — a module
-naming the table, a foreign key referencing it, a row it receives. The column
-order is the declared one, because the table is not split. A function that
-reads the table it is called from is the cycle DEC-1364.1 already refuses by
-name, with the two-plan remedy.
+The original `after_their_functions` rule held the whole `CreateTable` as it
+held an added column: the table waited for the creates its generation text
+named, by the same lexer scan, and every later change that might need it
+followed it — a module naming the table, a foreign key referencing it, a row
+it received. This preserved column order without splitting. A function that
+needed the table it was called from closed a cycle, refused by name with the
+two-plan remedy. DEC-1503.1 permits a generation function to read the prefix;
+a suffix-column or whole-row dependency still closes that cycle.
 
-Scratch reconstruction (DEC-613.1) applies the same rule to its own phases:
-such a table, with what it holds that runs before the modules, joins the
-modules phase after the last function its generation text names; a module ahead
-of it that names the table, or names something so moved, follows it; and a
-foreign key naming it waits for the end of the modules, when every table
-exists. A function the table calls that would itself have to follow the table
-is refused by name.
+Scratch reconstruction (DEC-613.1) originally applied the same hold to its
+own phases: such a table, with what it held before the modules, joined the
+modules phase after the last function its generation text named; a module ahead
+of it that named the table, or named something so moved, followed it; and a
+foreign key naming it waited for the end of the modules. The shared parts of
+DEC-1503.1 now expose the prefix before those functions and delay readers
+until the suffix is complete; the two unsplittable exceptions retain the hold.
 
 The resolver's own ordering of a sealed plan treats a generation expression as
 it treats a default, since both are the column's `pg_attrdef` (DEC-1168.1): the
@@ -1649,8 +1653,9 @@ replacement. Other new tables create their prefix at the ordinary position;
 the suffix preserves declaration order. Array spellings are neither guessed
 nor ordered by trial.*
 
-Pinned by `a_new_table_generating_from_a_new_function_follows_it_whole`
-(`crates/pbps-cli/src/dependents.rs`),
+The retained hold is pinned by
+`a_generation_reading_a_later_column_keeps_the_whole_table_hold_offline`
+(`crates/pbps-cli/src/dependents.rs`). The shared parts are pinned by
 `generated_columns_and_readers_follow_functions_but_relation_names_precede_them`
 (`crates/pbps-pg/src/resolver/reconstruct/tests.rs`), and the live
 `a_new_table_generating_from_a_new_function_follows_its_create`
