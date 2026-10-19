@@ -827,3 +827,197 @@ fn a_callers_binding_requirement_reads_its_own_payload() {
         );
     }
 }
+
+#[test]
+fn case_distinct_callees_do_not_invent_a_schema_bound_cycle() {
+    use pbps_model::operation::{Incarnation, Requirement};
+    use pbps_model::resolver::{BoundSurface, ObjectIdentity, Surface, SurfaceResolution};
+
+    let function = |body: &str| Module {
+        kind: ModuleKind::Function,
+        definition: format!("(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN {body} END"),
+        description: None,
+    };
+    let named = |name| ModuleId::Named(TableName::new("app", name));
+    let (a, upper, lower) = (named("A"), named("F"), named("f"));
+    let mut before = Schema::default();
+    before.modules.insert(upper.clone(), function("@a"));
+    before.modules.insert(a.clone(), function("app.F(@a)"));
+    // The old f does not bind A, so A can be altered before f introduces
+    // that binding; an already-bound baseline caller would block the edit.
+    before.modules.insert(lower.clone(), function("@a"));
+    let mut after = before.clone();
+    after.modules.insert(a.clone(), function("app.F(@a) + 1"));
+    after
+        .modules
+        .insert(lower.clone(), function("app.A(@a) + 1"));
+    let ids = IdsFile::default();
+    let evidence: Vec<_> = before
+        .modules
+        .keys()
+        .map(|id| {
+            let inputs = if id == &a {
+                vec![Surface::Module(upper.clone())]
+            } else if id == &lower {
+                vec![Surface::Module(a.clone())]
+            } else {
+                vec![]
+            };
+            let bound = BoundSurface {
+                object: ObjectIdentity {
+                    class: "function".into(),
+                    name: vec![id.shown().to_string()],
+                    signature: vec![],
+                },
+                bindings: vec![],
+                managed_inputs: inputs.into_iter().collect(),
+            };
+            let mut current = bound.clone();
+            if id == &lower {
+                current.managed_inputs.clear();
+            }
+            SurfaceResolution {
+                surface: Surface::Module(id.clone()),
+                current: Some(current),
+                desired: Some(bound),
+            }
+        })
+        .collect();
+    let planned = pbps_diff::resolver::plan_operations(
+        pbps_diff::Side {
+            schema: &before,
+            ids: &ids,
+        },
+        pbps_diff::Side {
+            schema: &after,
+            ids: &ids,
+        },
+        &Default::default(),
+        &evidence,
+        &Mssql,
+    )
+    .expect("the stable app.F is not the edited app.f");
+    assert_eq!(planned.ordered.changes.changes.len(), 2);
+    assert!(
+        matches!(&planned.ordered.changes.changes[0].change, Change::AlterModule { id, .. } if id == &a)
+    );
+    assert!(
+        matches!(&planned.ordered.changes.changes[1].change, Change::AlterModule { id, .. } if id == &lower)
+    );
+    let diffed = Diffed::new(&before, &after);
+    let a_at = diffed.at(|change| matches!(change, Change::AlterModule { id, .. } if id == &a));
+    let f_at = diffed.at(|change| matches!(change, Change::AlterModule { id, .. } if id == &lower));
+    assert!(diffed.effects[a_at].requires.contains(&Requirement::Is(
+        ObjectKey::Module(upper),
+        Incarnation::Final
+    )));
+    assert!(!diffed.effects[a_at].requires.contains(&Requirement::Is(
+        ObjectKey::Module(lower),
+        Incarnation::Final
+    )));
+    assert_eq!(diffed.verify(&[a_at, f_at]), []);
+    assert!(!diffed.verify(&[f_at, a_at]).is_empty());
+}
+
+#[test]
+fn an_unambiguous_case_insensitive_callee_still_binds() {
+    use pbps_model::operation::{Incarnation, Requirement};
+
+    for kind in [ModuleKind::Function, ModuleKind::View] {
+        let text = if kind == ModuleKind::Function {
+            "APP.F(@a)"
+        } else {
+            "(SELECT TOP 1 n FROM APP.F)"
+        };
+        let (mut before, mut after, callee, _) = module_pair(
+            &format!("(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN {text} END"),
+            false,
+        );
+        if kind == ModuleKind::View {
+            for schema in [&mut before, &mut after] {
+                schema.modules.insert(
+                    callee.clone(),
+                    Module {
+                        kind,
+                        definition: "SELECT 1 AS n".into(),
+                        description: None,
+                    },
+                );
+            }
+            after.modules.get_mut(&callee).unwrap().definition = "SELECT 2 AS n".into();
+        }
+        let diffed = Diffed::new(&before, &after);
+        let caller = diffed.at(|change| matches!(change, Change::CreateModule { .. }));
+        let target =
+            diffed.at(|change| matches!(change, Change::AlterModule { id, .. } if id == &callee));
+        assert!(
+            diffed.effects[caller].requires.contains(&Requirement::Is(
+                ObjectKey::Module(callee),
+                Incarnation::Final
+            )),
+            "{kind:?}"
+        );
+        assert_eq!(diffed.verify(&[target, caller]), []);
+        assert!(!diffed.verify(&[caller, target]).is_empty());
+    }
+}
+
+#[test]
+fn an_exact_callee_spelling_wins_over_a_case_only_neighbour() {
+    use pbps_model::operation::{Incarnation, Requirement};
+
+    for kind in [ModuleKind::Function, ModuleKind::View] {
+        for (schema, leaf, expected) in [
+            ("app", "F", Some("F")),
+            ("app", "f", Some("f")),
+            ("APP", "F", None),
+        ] {
+            let call = if kind == ModuleKind::Function {
+                format!("[{schema}].[{leaf}](@a)")
+            } else {
+                format!("(SELECT TOP 1 n FROM [{schema}].[{leaf}])")
+            };
+            let (mut before, mut after, lower, _) = module_pair(
+                &format!("(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN {call} END"),
+                false,
+            );
+            let upper = ModuleId::Named(TableName::new("app", "F"));
+            for schema in [&mut before, &mut after] {
+                if kind == ModuleKind::View {
+                    schema.modules.insert(
+                        lower.clone(),
+                        Module {
+                            kind,
+                            definition: "SELECT 1 AS n".into(),
+                            description: None,
+                        },
+                    );
+                }
+                schema
+                    .modules
+                    .insert(upper.clone(), schema.modules[&lower].clone());
+            }
+            // Only the caller is new: the requirements must select the exact
+            // stable callee even without an edit to expose a false edge.
+            after
+                .modules
+                .insert(lower.clone(), before.modules[&lower].clone());
+            after
+                .modules
+                .insert(upper.clone(), before.modules[&upper].clone());
+            let diffed = Diffed::new(&before, &after);
+            assert_eq!(diffed.changes.len(), 1);
+            for (id, spelling) in [(&upper, "F"), (&lower, "f")] {
+                assert_eq!(
+                    diffed.effects[0].requires.contains(&Requirement::Is(
+                        ObjectKey::Module(id.clone()),
+                        Incarnation::Final
+                    )),
+                    expected == Some(spelling),
+                    "{kind:?}, call={call}, callee={spelling}"
+                );
+            }
+            assert_eq!(diffed.verify(&[0]), []);
+        }
+    }
+}

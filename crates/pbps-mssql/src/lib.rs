@@ -103,6 +103,12 @@ impl Dialect for Mssql {
             // would read as a cycle the engine does not have. Any other
             // module is bound by its name, as a view in FROM is.
             let calls = self.qualified_calls(&module.definition);
+            let managed: Vec<_> = after
+                .schema
+                .modules
+                .keys()
+                .filter_map(ModuleId::referenced_name)
+                .collect();
             for (callee, callee_module) in after
                 .schema
                 .modules
@@ -112,13 +118,29 @@ impl Dialect for Mssql {
                 let Some(name) = callee.referenced_name() else {
                     continue;
                 };
+                // Case-only neighbours prove that this catalog distinguishes
+                // them. Keep the case-insensitive fallback for a unique name,
+                // including the caller among its possible exact holders.
+                let folded = |other: &TableName| {
+                    other.schema.to_lowercase() == name.schema.to_lowercase()
+                        && other.name.to_lowercase() == name.name.to_lowercase()
+                };
+                let unambiguous = !managed.iter().any(|other| other != &name && folded(other));
                 let bound = if callee_module.kind == pbps_model::ModuleKind::Function {
                     calls.iter().any(|(schema, leaf)| {
-                        schema.to_lowercase() == name.schema.to_lowercase()
-                            && leaf.to_lowercase() == name.name.to_lowercase()
+                        (schema == &name.schema && leaf == &name.name)
+                            || (unambiguous
+                                && schema.to_lowercase() == name.schema.to_lowercase()
+                                && leaf.to_lowercase() == name.name.to_lowercase())
                     })
                 } else {
-                    self.may_name_qualified(&module.definition, &name.schema, &name.name)
+                    self.may_name_qualified_exact(&module.definition, &name.schema, &name.name)
+                        || (unambiguous
+                            && self.may_name_qualified(
+                                &module.definition,
+                                &name.schema,
+                                &name.name,
+                            ))
                 };
                 if bound {
                     // Exists alone does not state which definition a binding

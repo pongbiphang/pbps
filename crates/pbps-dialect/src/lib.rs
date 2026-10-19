@@ -2361,6 +2361,17 @@ pub trait Dialect {
         names_at_a_boundary(&code, &wanted)
     }
 
+    /// The same qualified-name scan, preserving case. Managed names that
+    /// differ only by case can coexist only where the fold is not binding
+    /// evidence; callers can prefer an exact spelling (DEC-2192.1).
+    fn may_name_qualified_exact(&self, text: &str, schema: &str, name: &str) -> bool {
+        if schema.is_empty() || name.is_empty() {
+            return false;
+        }
+        let code = undelimited(&self.lexicon().code_only(text));
+        names_at_a_boundary(&code, &format!("{schema}.{name}"))
+    }
+
     /// Every two-part name `text` calls in code, undelimited:
     /// `[dbo].[cafe]([a])` is `("dbo", "cafe")`. The names as written, for a
     /// caller that compares them the way the engine binds them, under the
@@ -4315,6 +4326,16 @@ mod tests {
         assert!(!d.may_name_qualified("x.f(a)", "dbo", "f"));
         assert!(!d.may_name_qualified("f(a)", "dbo", "f"));
         assert!(!d.may_name_qualified("'dbo.f'", "dbo", "f"));
+        // Exact matching shares the code/boundary scan but distinguishes
+        // neighbours a case-sensitive catalog can hold together.
+        assert!(d.may_name_qualified_exact("[dbo] . [F](a)", "dbo", "F"));
+        assert!(!d.may_name_qualified_exact("[dbo].[F](a)", "dbo", "f"));
+        assert!(!d.may_name_qualified_exact("DBO.f(a)", "dbo", "f"));
+        for text in ["dbo.F_extra(a)", "'dbo.F'", "x -- dbo.F\n + 1", ""] {
+            assert!(!d.may_name_qualified_exact(text, "dbo", "F"), "{text}");
+        }
+        assert!(!d.may_name_qualified_exact("dbo.F", "", "F"));
+        assert!(!d.may_name_qualified_exact("dbo.F", "dbo", ""));
         // A delimited name is stored with its closing delimiter doubled.
         assert!(d.may_name("[a]]b] * 2", "a]b"));
         assert!(d.may_name("\"a\"\"b\" * 2", "a\"b"));
