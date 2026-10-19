@@ -2372,6 +2372,130 @@ fn slots_listed(moving: &[String], slots: &[(String, String)]) -> ConnectedCheck
     }
 }
 
+/// What logical decoding misses of a plan's identity or `serial` column
+/// added to a table already there (#1890, DEC-1890.1), listed and never
+/// refused. The engine numbers every row already there in the table's
+/// rewrite, and measured on 18.6 that rewrite reaches no stream: a
+/// `test_decoding` slot shows an empty transaction, a `pgoutput` slot nothing,
+/// and a subscriber keeps the new column empty for those rows, while a row
+/// inserted afterwards arrives with its number. So the publications over the
+/// table and the database's logical slots are named, for whoever answers for
+/// their consumers. A table the plan creates is empty when made: it has no
+/// `AddColumn`, and its rows stream as they come.
+pub async fn numbered_column_fills(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    ids: &pbps_model::IdsFile,
+) -> anyhow::Result<ConnectedCheck> {
+    use pbps_model::plan_names::At;
+    if conn.driver() == Driver::Mssql {
+        return Ok(ConnectedCheck {
+            name: "numbered_column_fills",
+            engine: "SQL Server",
+            status: "not_applicable",
+            message: "SQL Server has no logical decoding this model reads".to_owned(),
+        });
+    }
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+    let mut fills: Vec<(TableName, String)> = Vec::new();
+    for (i, p) in changes.changes.iter().enumerate() {
+        let pbps_model::Change::AddColumn {
+            table,
+            name,
+            column,
+            ..
+        } = &p.change
+        else {
+            continue;
+        };
+        let numbered = match column.value_source {
+            pbps_model::ValueSource::Identity(_) | pbps_model::ValueSource::Sequence(_) => true,
+            pbps_model::ValueSource::None
+            | pbps_model::ValueSource::Default(_)
+            | pbps_model::ValueSource::Generated(_) => false,
+        };
+        // The table under the name the catalog has it by now, after a
+        // rename this plan may run first; none for one the plan creates.
+        if let (true, Some(live)) = (numbered, names.stored(table, At::Before(i))) {
+            fills.push((live, name.clone()));
+        }
+    }
+    if fills.is_empty() {
+        return Ok(ConnectedCheck {
+            name: "numbered_column_fills",
+            engine: "PostgreSQL",
+            status: "not_applicable",
+            message: "this plan adds no identity or serial column to a table already there"
+                .to_owned(),
+        });
+    }
+    let mut publications = Vec::new();
+    for (table, _) in &fills {
+        if !publications
+            .iter()
+            .any(|(t, _): &(TableName, _)| t == table)
+        {
+            let found = pbps_pg::impact::publications_of(conn, table).await?;
+            publications.push((table.clone(), found));
+        }
+    }
+    let slots = pbps_pg::impact::logical_slots(conn).await?;
+    Ok(fills_listed(&fills, &publications, &slots))
+}
+
+/// [`numbered_column_fills`]' answer over what the catalog said.
+fn fills_listed(
+    fills: &[(TableName, String)],
+    publications: &[(TableName, Vec<String>)],
+    slots: &[(String, String)],
+) -> ConnectedCheck {
+    let columns = fills
+        .iter()
+        .map(|(table, column)| format!("{}.{column}", table.shown()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut streams: Vec<String> = publications
+        .iter()
+        .filter(|(_, found)| !found.is_empty())
+        .map(|(table, found)| format!("publication(s) {} over {}", found.join(", "), table.shown()))
+        .collect();
+    if !slots.is_empty() {
+        streams.push(format!(
+            "logical replication slot(s) {} on this database",
+            slots
+                .iter()
+                .map(|(slot, plugin)| format!("{slot} ({plugin})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let (status, message) = if streams.is_empty() {
+        (
+            "passed",
+            format!(
+                "no publication or logical replication slot would miss the numbers {columns} \
+                 gives the rows already there"
+            ),
+        )
+    } else {
+        (
+            "listed",
+            format!(
+                "{columns} numbers the rows already there in a table rewrite, which logical \
+                 decoding does not stream: {} will not carry those numbers, and a consumer keeps \
+                 them empty until it takes a new snapshot of the table",
+                streams.join("; ")
+            ),
+        )
+    };
+    ConnectedCheck {
+        name: "numbered_column_fills",
+        engine: "PostgreSQL",
+        status,
+        message,
+    }
+}
+
 /// What a plan over generated columns needs of this server and of the columns
 /// already there, asked before anything is written (DEC-1168.1).
 ///
@@ -4789,6 +4913,46 @@ mod tests {
                 && none.message.contains("app.ev_rest into app.ev_2025"),
             "{}",
             none.message
+        );
+    }
+
+    /// A numbered column added to a table already there names each
+    /// publication over the table and each logical slot, and refuses
+    /// nothing; with neither it passes, still naming the column (#1890).
+    #[test]
+    fn a_numbered_column_fill_lists_the_streams_that_miss_it() {
+        let t: TableName = "app.t".parse().unwrap();
+        let u: TableName = "app.u".parse().unwrap();
+        let fills = vec![(t.clone(), "n".to_owned()), (u.clone(), "m".to_owned())];
+        let listed = fills_listed(
+            &fills,
+            &[
+                (t.clone(), vec!["cdc".into(), "every".into()]),
+                (u.clone(), Vec::new()),
+            ],
+            &[("debezium".to_owned(), "pgoutput".to_owned())],
+        );
+        assert_eq!(listed.status, "listed");
+        assert_eq!(
+            listed.message,
+            "app.t.n, app.u.m numbers the rows already there in a table rewrite, which logical \
+             decoding does not stream: publication(s) cdc, every over app.t; logical \
+             replication slot(s) debezium (pgoutput) on this database will not carry those \
+             numbers, and a consumer keeps them empty until it takes a new snapshot of the table"
+        );
+        let slots_only = fills_listed(
+            &fills[..1],
+            &[(t.clone(), Vec::new())],
+            &[("s".to_owned(), "test_decoding".to_owned())],
+        );
+        assert_eq!(slots_only.status, "listed");
+        // Negative: no publication and no slot is a pass, not a listing.
+        let none = fills_listed(&fills[..1], &[(t, Vec::new())], &[]);
+        assert_eq!(none.status, "passed");
+        assert_eq!(
+            none.message,
+            "no publication or logical replication slot would miss the numbers app.t.n gives \
+             the rows already there"
         );
     }
 }

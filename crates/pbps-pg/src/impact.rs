@@ -560,6 +560,41 @@ pub async fn logical_slots(conn: &mut Conn) -> Result<Vec<(String, String)>, DbE
     Ok(out)
 }
 
+/// The publications that publish `table` or any of its partitions, by
+/// name (#1890). `pg_publication_tables` expands `FOR ALL TABLES` and `FOR
+/// TABLES IN SCHEMA`, and names a partition, or its root under
+/// `publish_via_partition_root`, so the whole tree is asked: the table and,
+/// since measured on 18 `pg_partition_tree` of a plain table is empty, the
+/// rows of its tree. A table the catalog does not have reads as none: the
+/// caller asks only of a table the plan found there.
+pub async fn publications_of(
+    conn: &mut Conn,
+    table: &pbps_model::TableName,
+) -> Result<Vec<String>, DbError> {
+    let mut out = Vec::new();
+    for row in conn
+        .query_with(
+            "SELECT DISTINCT pt.pubname::text AS pubname
+               FROM pg_catalog.pg_class c
+               JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+               JOIN pg_catalog.pg_class tc
+                 ON tc.oid = c.oid
+                    OR tc.oid IN (SELECT tree.relid
+                                    FROM pg_catalog.pg_partition_tree(c.oid) tree)
+               JOIN pg_catalog.pg_namespace tn ON tn.oid = tc.relnamespace
+               JOIN pg_catalog.pg_publication_tables pt
+                 ON pt.schemaname = tn.nspname AND pt.tablename = tc.relname
+              WHERE n.nspname = $1 AND c.relname = $2
+              ORDER BY 1",
+            &[table.schema.as_str().into(), table.name.as_str().into()],
+        )
+        .await?
+    {
+        out.push(text(&row, "pubname")?);
+    }
+    Ok(out)
+}
+
 fn text(row: &Row, column: &str) -> Result<String, DbError> {
     Ok(row.try_get::<&str>(column)?.unwrap_or_default().to_owned())
 }
