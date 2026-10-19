@@ -7107,3 +7107,48 @@ and the PostgreSQL 16/18 live
 `a_deferred_unique_or_primary_key_keeps_its_referencing_foreign_key_after_it`,
 including check and unrelated-FK controls, a replica identity on each key,
 and an already ordered trigger-drop control in the unit test.
+
+<a id="dec-1959-1"></a>
+
+**DEC-1959.1. Connected role drops settle membership and compatibility
+constraints within their original role slots.** S7 PR4 (#1959) replaces
+`order_role_drops`' stable sort with `order::role_drops`. The catalog
+memberships have already been written into `DropRole` payloads by the
+shared CLI schedule. A holder precedes a dropped member, as before
+(DECISIONS 127, 139), through `Catalog` edges with `Authorization` reasons.
+Members not themselves dropped add no edge or depth.
+
+The existing `member_depth` remains the one depth calculation, also used
+by the differ's initial class sort. Holder edges alone do not preserve its
+global layering across separate branches: a ready child could run before
+an unrelated root. Constraints between adjacent depth layers keep that
+policy: peers are chained in their input order by `Constraint` entries,
+and the last peer of one layer precedes the first peer of the next.
+Transitivity supplies the remaining cross-layer orders, so a linear number
+of compatibility edges suffices. Non-adjacent depth constraints and
+same-level `Keep` entries are redundant and omitted; duplicate holder and
+compatibility edges coalesce. The operations passed to `settle` are never
+pre-sorted.
+
+Only role drops are projected into the schedule, in their input order.
+`Schedule::settle` is the only step that reorders them. Its result fills
+their original slots, retaining the complete planned-change payloads and
+every non-role step's exact position. There is no expansion or new rank,
+and no saved-plan format change. An inconsistent membership cycle is
+refused by the existing named cycle path rather than emitted in a wrong
+order; SQL Server cannot supply a valid cyclic role hierarchy.
+
+The connected read and its error propagation remain unchanged. `Some`,
+including an empty map, permits this ordering; `None` skips it and retains
+`plan.role-members-unread`. Unread memberships are never used to clear a
+payload. Removing the old cross-crate mover retires DEC-1955.1's last
+listed exception and its now-empty scanner; the CLI's other pass visibility
+restrictions remain, and S7's later compiler-enforcement PR is separate.
+
+The frozen old depth walk and sort live only in a shared `cfg(test)`
+oracle. Existing role and connected-schedule pins compare full plans,
+and tests compare SQL and saved-plan checksums too. Multi-branch trees,
+shared descendants, peers, mixed non-role slots, external members, empty
+and single-role plans, and varied role uids pin the same output. The live
+`roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan`
+also compares the connected artifact with the old order before applying it.

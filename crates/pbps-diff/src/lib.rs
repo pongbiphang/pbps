@@ -21,7 +21,7 @@ pub use identity::{
 pub use managed::{Scoped, external_parents, observed_ids, own_parts, scope};
 pub use schema_diff::{
     DiffError, Diffed, Screen, Side, diff, diff_connected, diff_partial, diff_read_back,
-    diff_rebuilding, order_role_drops,
+    diff_rebuilding,
 };
 
 #[cfg(test)]
