@@ -7174,9 +7174,14 @@ The function header keeps its authored options, whereas the model cannot
 hold a schema-bound view's options (DECISIONS 29). The header check reuses
 `Mssql::code_only` and the module reader's `qualified_name` and `skip_ws`:
 parenthesized parameters and returns, quoted names, and `EXECUTE AS` cannot
-masquerade as a binding option or the body boundary. The reference check
-reuses `Dialect::may_name_qualified`, already used for SQL Server's
-computed-column effects, including its conservative identifier comparison.
+masquerade as a binding option or the body boundary. A function callee
+counts only where it is called, `schema.name(`, through
+`Dialect::qualified_calls`: a bare two-part name may be an alias's column,
+`app.g` under alias `app`, and two edited functions spelling each other's
+names that way would otherwise read as a cycle the engine does not have.
+Any other callee, a view in `FROM`, is matched by
+`Dialect::may_name_qualified`, already used for SQL Server's
+computed-column effects.
 Neither check treats a literal or comment as code. Reading the desired
 module's definition instead of the operation's payload would state the
 wrong requirement for a split or replaced step.

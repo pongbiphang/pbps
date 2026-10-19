@@ -643,6 +643,9 @@ fn schema_bound_callers_require_their_callees_final_definition() {
         "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @a /* app.f(@a) */ END",
         "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN DECLARE @s nvarchar(100) = N'app.f(@a)'; RETURN @a END",
         "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN app.a_caller(@a) END",
+        // An alias's column spelled like the function, `app.f` under alias
+        // `app`: no call, so no binding (#2192 review).
+        "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT TOP 1 app.f FROM dbo.t AS app) END",
     ];
     for alter in [false, true] {
         for (texts, needs_callee) in [(&bound[..], true), (&independent[..], false)] {
@@ -749,6 +752,39 @@ fn schema_bound_callers_require_their_callees_final_definition() {
     let unbound = Diffed::new(&before, &after);
     assert_eq!(unbound.verify(&[0, 1]), []);
     assert_eq!(unbound.verify(&[1, 0]), []);
+
+    // Two edited schema-bound functions, each reading an alias's column
+    // spelled like the other: no call either way, so no cycle, and both
+    // orders verify (#2192 review).
+    let function = |text: &str| Module {
+        kind: ModuleKind::Function,
+        definition: text.into(),
+        description: None,
+    };
+    let (f, g) = (
+        ModuleId::Named(TableName::new("app", "f")),
+        ModuleId::Named(TableName::new("app", "g")),
+    );
+    let mut before = Schema::default();
+    for id in [&f, &g] {
+        before.modules.insert(
+            id.clone(),
+            function("(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @a END"),
+        );
+    }
+    let mut after = before.clone();
+    after.modules.insert(
+        f,
+        function("(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT TOP 1 app.g FROM dbo.t AS app) END"),
+    );
+    after.modules.insert(
+        g,
+        function("(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN (SELECT TOP 1 app.f FROM dbo.t AS app) END"),
+    );
+    let aliased = Diffed::new(&before, &after);
+    assert_eq!(aliased.changes.len(), 2);
+    assert_eq!(aliased.verify(&[0, 1]), []);
+    assert_eq!(aliased.verify(&[1, 0]), []);
 }
 
 #[test]

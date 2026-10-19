@@ -97,10 +97,30 @@ impl Dialect for Mssql {
             && module.kind == pbps_model::ModuleKind::Function
             && introspect::function_is_schema_bound(&module.definition)
         {
-            for callee in after.schema.modules.keys().filter(|callee| *callee != id) {
-                if let Some(name) = callee.referenced_name()
-                    && self.may_name_qualified(&module.definition, &name.schema, &name.name)
-                {
+            // A function is bound by a call, `schema.name(`: a two-part name
+            // alone may be an alias's column, `app.g` under alias `app`,
+            // and two edited functions spelling each other's names that way
+            // would read as a cycle the engine does not have. Any other
+            // module is bound by its name, as a view in FROM is.
+            let calls = self.qualified_calls(&module.definition);
+            for (callee, callee_module) in after
+                .schema
+                .modules
+                .iter()
+                .filter(|(callee, _)| *callee != id)
+            {
+                let Some(name) = callee.referenced_name() else {
+                    continue;
+                };
+                let bound = if callee_module.kind == pbps_model::ModuleKind::Function {
+                    calls.iter().any(|(schema, leaf)| {
+                        schema.to_lowercase() == name.schema.to_lowercase()
+                            && leaf.to_lowercase() == name.name.to_lowercase()
+                    })
+                } else {
+                    self.may_name_qualified(&module.definition, &name.schema, &name.name)
+                };
+                if bound {
                     // Exists alone does not state which definition a binding
                     // needs. Final joins the callee's in-place rewrite without
                     // a new pass or a positional dependency (DEC-2192.1).
