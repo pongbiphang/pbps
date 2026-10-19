@@ -1569,14 +1569,12 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
 /// back to its default, #1030), and when no ids file names the column, since
 /// `AlterColumnDefault` needs its uid.
 ///
-/// Split this way, the table's check is added to an empty table, and it asks
-/// for `--allow constraint` as any added check does. The approver sees the
-/// constraint as its own step, where before it was inside `CREATE TABLE`.
-///
-/// A generated column is not split out. Its expression may call the function
-/// as a default's may, but the engine has no way to give an existing column
-/// one, and taken out of the table as a column of its own it would change the
-/// table's column order (DEC-1168.1, DEC-1364.1).
+/// A new generated table's typed column parts are expanded first, retaining
+/// declaration order (DEC-1503.1). Its columns and validators finish CREATE
+/// with its creation risks (DEC-1503.3). Other added checks keep the existing
+/// constraint approval, where the approver sees a separately added step.
+/// Unsplittable generations retain their whole-table hold when the connected
+/// capability cannot install an expression on the complete column shape.
 ///
 /// A partitioned table's default split out this way reaches every partition
 /// when it is set, measured on 16 and 18, a new partition's own default

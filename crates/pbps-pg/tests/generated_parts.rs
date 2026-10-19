@@ -594,3 +594,146 @@ fn a_primary_key_using_a_suffix_input_waits_for_its_column() {
         ));
     }
 }
+
+#[test]
+fn generated_expression_installations_keep_their_creation_risks() {
+    for partition_key in [false, true] {
+        let (mut schema, _) = fixture();
+        let name = TableName::new("app", "a");
+        let table = schema.tables.get_mut(&name).unwrap();
+        if partition_key {
+            table.partition_by = Some(pbps_model::PartitionBy {
+                strategy: Default::default(),
+                columns: vec!["z".into()],
+                external: false,
+            });
+        } else if let ValueSource::Generated(g) = &mut table.columns["g"].value_source {
+            g.expression = "app.f(z)".into();
+        }
+        let ids = identities(&schema);
+        let pg = Postgres::new().with_server_version(180_000);
+        let create = pbps_model::PlannedChange::new(Change::CreateTable {
+            uid: ids.table_uid(&name).unwrap().clone(),
+            name: name.clone(),
+            table: Box::new(schema.tables[&name].clone()),
+            beside_default: None,
+            moves_at_most: None,
+        });
+        assert!(create.risks.is_empty());
+        let parts = generated::parts(&create, &ids, &["app.f(integer)".parse().unwrap()], &pg)
+            .unwrap()
+            .unwrap();
+        assert!(
+            parts
+                .iter()
+                .any(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        );
+        for part in &parts {
+            assert_eq!(part.risks, create.risks, "{:?}", part.change);
+        }
+        let cs = pbps_model::ChangeSet { changes: parts };
+        assert_eq!(
+            generated::risks(&cs, &ids, &pg),
+            cs.changes
+                .iter()
+                .map(|p| p.risks.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn generated_columns_and_validators_keep_their_creation_risks() {
+    let (mut schema, _) = fixture();
+    let name = TableName::new("app", "a");
+    let table = schema.tables.get_mut(&name).unwrap();
+    table.columns["g"].nullable = false;
+    table.columns["z"].nullable = false;
+    table.primary_key = Some(pbps_model::PrimaryKey {
+        name: Some("a_pk".into()),
+        columns: vec!["z".into()],
+        storage_parameters: Default::default(),
+    });
+    table.unique.insert(
+        "g_unique".into(),
+        pbps_model::UniqueConstraint {
+            columns: vec!["g".into()],
+            storage_parameters: Default::default(),
+        },
+    );
+    table.checks.insert(
+        "g_check".into(),
+        pbps_model::CheckConstraint {
+            expression: "g > 0".into(),
+        },
+    );
+    table.foreign_keys.insert(
+        "g_fk".into(),
+        pbps_model::ForeignKey {
+            columns: vec!["g".into()],
+            references_table: name.clone(),
+            references_columns: vec!["z".into()],
+            on_delete: Default::default(),
+            on_update: Default::default(),
+        },
+    );
+    for (index, unique) in [("g_index", false), ("g_unique_index", true)] {
+        table.indexes.insert(
+            index.into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key: pbps_model::IndexKey::Column("g".into()),
+                    descending: false,
+                    opclass: None,
+                }],
+                include: Vec::new(),
+                unique,
+                filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+    }
+    let ids = identities(&schema);
+    for pg in [
+        Postgres::new(),
+        Postgres::new().with_server_version(160_000),
+        Postgres::new().with_server_version(180_000),
+    ] {
+        let create = pbps_model::PlannedChange::new(Change::CreateTable {
+            uid: ids.table_uid(&name).unwrap().clone(),
+            name: name.clone(),
+            table: Box::new(schema.tables[&name].clone()),
+            beside_default: None,
+            moves_at_most: None,
+        });
+        let parts = generated::parts(&create, &ids, &["app.f(integer)".parse().unwrap()], &pg)
+            .unwrap()
+            .unwrap();
+        for part in &parts {
+            assert_eq!(part.risks, create.risks, "{:?}", part.change);
+        }
+        for kind in ["column", "key", "unique", "foreign key", "check", "index"] {
+            assert!(
+                parts.iter().any(|p| match kind {
+                    "column" => matches!(p.change, Change::AddColumn { .. }),
+                    "key" => matches!(p.change, Change::SetPrimaryKey { .. }),
+                    "unique" => matches!(p.change, Change::AddUnique { .. }),
+                    "foreign key" => matches!(p.change, Change::AddForeignKey { .. }),
+                    "check" => matches!(p.change, Change::AddCheck { .. }),
+                    "index" => matches!(p.change, Change::AddIndex { .. }),
+                    _ => unreachable!(),
+                }),
+                "{kind}"
+            );
+        }
+        let cs = pbps_model::ChangeSet { changes: parts };
+        assert_eq!(
+            generated::risks(&cs, &ids, &pg),
+            cs.changes
+                .iter()
+                .map(|p| p.risks.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+}

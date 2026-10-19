@@ -1,12 +1,14 @@
 //! Typed creation parts for a new table, shared by ordinary planning,
 //! resolver planning and scratch (DEC-1503.1). This module emits no SQL.
 
+use std::collections::BTreeSet;
+
 use super::{Constraint, Schedule, Source};
 use pbps_dialect::Dialect;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{
     AddedRole, Change, ChangeSet, IdsFile, ModuleDeps, ModuleId, ModuleKind, PlannedChange,
-    Provenance, Schema, ValueSource,
+    Provenance, RiskClass, Schema, ValueSource,
 };
 
 pub const RULE: &str = "generated-new-table";
@@ -49,7 +51,10 @@ pub fn parts(
             .into_iter()
             .map(|change| {
                 let mut part = planned.clone();
-                part.risks = dialect.change_risks(&change);
+                // These finish CREATE on a new relation, before its seed
+                // rows. Reclassifying them as standing-table alterations
+                // would invent approvals that CREATE did not need
+                // (DEC-1503.3).
                 // CREATE builds its indexes transactionally on an empty
                 // relation. Splitting must not turn an inherited hint into
                 // concurrent DDL (SPEC 9.3.2).
@@ -67,6 +72,78 @@ pub fn parts(
             })
             .collect(),
     ))
+}
+
+/// Derive creation-part risks from typed ownership, never diagnostic provenance.
+/// Generated-column installations identify this family after serialization;
+/// an earlier CREATE of that identity proves its context (DEC-1503.3).
+pub fn risks(cs: &ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Vec<BTreeSet<RiskClass>> {
+    use pbps_model::plan_names::{At, Holder, PlanNames};
+
+    let names = cs
+        .changes
+        .iter()
+        .any(|p| matches!(p.change, Change::CreateTable { .. }))
+        .then(|| PlanNames::of(&cs.changes, ids).ok())
+        .flatten();
+    let installations: BTreeSet<_> = cs
+        .changes
+        .iter()
+        .enumerate()
+        .filter_map(|(at, p)| {
+            let installation = matches!(p.change, Change::AlterColumnExpression { .. })
+                || matches!(&p.change, Change::AddColumn { column, .. }
+                if matches!(column.value_source, ValueSource::Generated(_)));
+            if !installation {
+                return None;
+            }
+            match names.as_ref()?.holder(p.change.table()?, At::Before(at)) {
+                Holder::Tracked(owner) => Some(owner.clone()),
+                Holder::Unmanaged | Holder::Vacant => None,
+            }
+        })
+        .collect();
+    cs.changes
+        .iter()
+        .enumerate()
+        .map(|(at, part)| {
+            let source = || {
+                if !matches!(
+                    &part.change,
+                    Change::AddColumn { .. }
+                        | Change::AlterColumnExpression { .. }
+                        | Change::AlterColumnDefault { from: None, .. }
+                        | Change::SetPrimaryKey {
+                            from: None,
+                            to: Some(_),
+                            ..
+                        }
+                        | Change::AddUnique { .. }
+                        | Change::AddForeignKey { .. }
+                        | Change::AddCheck { .. }
+                        | Change::AddIndex { .. }
+                        | Change::SetReplicaIdentity { .. }
+                ) {
+                    return None;
+                }
+                let Holder::Tracked(owner) =
+                    names.as_ref()?.holder(part.change.table()?, At::Before(at))
+                else {
+                    return None;
+                };
+                if !installations.contains(owner) {
+                    return None;
+                }
+                cs.changes[..at].iter().find_map(|p| {
+                    matches!(&p.change, Change::CreateTable {
+                        uid, table, beside_default: None, ..
+                    } if uid == owner && table.partition_of.is_none())
+                    .then_some(&p.change)
+                })
+            };
+            dialect.change_risks(source().unwrap_or(&part.change))
+        })
+        .collect()
 }
 
 pub fn expand(cs: &mut ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Result<usize, String> {

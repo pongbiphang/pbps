@@ -7398,8 +7398,8 @@ them, and scratch lowers the same parts before selecting any chained-fill
 transaction boundary. The bounded two-part Rewrite::Split cannot represent
 a declaration-length suffix and is not used.
 
-Prefix-only keys, checks and indexes stay in CREATE, avoiding an unrelated
-constraint approval for a key that already fits the prefix. Indexes split
+Prefix-only keys, checks and indexes stay in CREATE rather than adding
+statements whose inputs already fit the prefix. Indexes split
 out of CREATE retain its transactional behavior even when the
 table carried an online hint; a standing table's index retains its strategy.
 Column effects and explicit edges put seed rows after the complete columns
@@ -7481,3 +7481,49 @@ and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shape
 The live cases on PostgreSQL 16 and 18 check the declared column order,
 computed values, offline hold, connected version choice, and producer
 sealing and closing; prefix-only inputs remain controls for the ordinary split.
+
+<a id="dec-1503-3"></a>
+
+**DEC-1503.3. Generated-table creation parts retain their CREATE's risks;
+finishing a new table does not acquire standing-table alteration risks.**
+(#1503, PR #2222 ready review.) A connected PostgreSQL 17+ placeholder installs
+its real expression before seed rows. No standing value is recomputed, so
+classifying that installation as a standalone AlterColumnExpression invented
+a `narrowing` approval for an otherwise safe creation. The same mistake
+added `not-null` or `constraint` approvals to suffix columns, keys, checks,
+unique indexes and inline foreign keys split from the CREATE. These parts
+now retain their source creation's risk set through ordinary planning and
+resolver preparation, including a second lowering of its checks and indexes.
+The complete typed plan identifies a newly generated table by its column
+installation parts, so older lowering routes and separately emitted
+validators of that table receive the same context. Other new-table plans
+retain their existing classification.
+
+Saved-plan validation re-derives this context from the typed plan: an
+installation or validator must follow an ordinary CREATE of the same table
+UID, resolved through PlanNames. Provenance is diagnostic, absent after
+serialization, and proves no identity or absence of standing data. A missing CREATE, a different holder,
+a partition filled from a DEFAULT, and destructive changes cannot use that
+context to suppress their intrinsic risks. A standing table's SET EXPRESSION
+still carries `narrowing`, even with a forged creation-part annotation.
+The normal column and part guards still check source kinds, fields, names
+and complete primary-key, unique, check and index inventories. Risk approval
+does not grant ownership of an undeclared field or object.
+
+Measured on PostgreSQL 16 and 18: the suffix partition-key and later-column
+shapes retain their old hold on 16 and use placeholders on 18; both apply
+without alteration approvals. The plain split also adds NOT NULL columns,
+keys, CHECKs and unique indexes without those approvals. Seed rows follow
+the complete columns and real expression. A populated standing table refuses
+an unapproved expression rewrite and recomputes its stored value only after
+`--allow narrowing`. The resolver's sealed creation parts keep the same risks
+through saved-plan validation and target-only closing.
+
+Pinned by `generated_expression_installations_keep_their_creation_risks`,
+`generated_columns_and_validators_keep_their_creation_risks`,
+`preparing_generated_creation_parts_preserves_their_creation_risks`,
+`saved_creation_part_risks_require_a_preceding_create_of_the_same_table`,
+`new_generated_expression_parts_apply_without_alteration_approvals_on_both_servers`,
+`split_generated_columns_and_validators_apply_without_alteration_approvals_on_both_servers`,
+`a_standing_generated_expression_still_requires_narrowing_approval`, and
+`resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.

@@ -165,6 +165,9 @@ Then, in this order:
     unsplittable shapes use a typed placeholder and SET EXPRESSION with a
     known PostgreSQL 17+ capability, or retain the whole-table hold without
     it (DEC-1503.1). Resolver preparation and scratch share the same parts.
+    Those creation parts retain CREATE's risks through resolver preparation;
+    saved-plan validation proves their preceding CREATE by table identity
+    before deriving the same context (DEC-1503.3).
   - `split_moving_defaults` sets a create's own default after the last
     function its text may call, where the create moves rows out of a DEFAULT
     partition (DEC-1547.1).

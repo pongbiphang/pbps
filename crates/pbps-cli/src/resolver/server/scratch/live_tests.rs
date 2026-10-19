@@ -5763,6 +5763,19 @@ async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_s
                 .with_resolution(plan.evidence)?;
                 let saved: pbps_model::SavedPlan =
                     serde_json::from_slice(&serde_json::to_vec(&saved)?)?;
+                assert!(
+                    saved.changes.gated_risks().is_empty(),
+                    "{case}: {:?}",
+                    saved.changes
+                );
+                let risks = pbps_diff::order::generated::risks(
+                    &saved.changes,
+                    inputs.desired().ids,
+                    &pbps_pg::Postgres::new(),
+                );
+                for (part, expected) in saved.changes.changes.iter().zip(risks) {
+                    assert_eq!(part.risks, expected, "{case}: {:?}", part.change);
+                }
                 let keyed = crate::resolver::apply::Keyed::check(
                     &saved,
                     crate::resolver::sealing::environment_key(&key.project, Some(ENVIRONMENT)),

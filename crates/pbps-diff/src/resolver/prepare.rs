@@ -629,10 +629,14 @@ pub(super) fn changes(
     let mut all: Vec<(Origin, PlannedChange)> = changes.into_iter().chain(added).collect();
     pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut all, |(_, p)| &p.change);
     let (origins, changes) = all.into_iter().unzip();
-    Ok(Prepared {
-        changes: ChangeSet { changes },
-        origins,
-    })
+    let mut changes = ChangeSet { changes };
+    // Preparation may split a creation part again. Derive its risks from
+    // the complete typed context, as saved-plan validation does.
+    let risks = crate::order::generated::risks(&changes, ids, dialect);
+    for (part, risks) in changes.changes.iter_mut().zip(risks) {
+        part.risks = risks;
+    }
+    Ok(Prepared { changes, origins })
 }
 
 /// A column's default, where its value comes from one: not an identity's,

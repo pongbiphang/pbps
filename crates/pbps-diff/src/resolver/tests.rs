@@ -5162,3 +5162,117 @@ fn two_reference_tables_referencing_each_other_plan_and_settle_in_the_differs_or
     assert_eq!(ordered.changes, differ);
     ordered.proof.validate(&ordered.changes).unwrap();
 }
+
+#[test]
+fn preparing_generated_creation_parts_preserves_their_creation_risks() {
+    use pbps_model::{Column, Generated, IdsFile, Schema, Table, TableName, ValueSource};
+    let name = TableName::new("app", "a");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let mut g = Column::new("integer".parse().unwrap());
+    g.value_source = ValueSource::Generated(Generated {
+        expression: "id * 2".into(),
+        stored: true,
+    });
+    table.columns.insert("g".into(), g);
+    let z = Column::new("integer".parse().unwrap()).not_null();
+    table.columns.insert("z".into(), z.clone());
+    table.checks.insert(
+        "positive".into(),
+        pbps_model::CheckConstraint {
+            expression: "g > 0".into(),
+        },
+    );
+    let desired = Schema {
+        tables: [(name.clone(), table.clone())].into(),
+        ..Default::default()
+    };
+    let identities = ids(&desired, &IdsFile::default());
+    table.columns.shift_remove("z");
+    if let ValueSource::Generated(g) = &mut table.columns["g"].value_source {
+        g.expression = "NULL::integer".into();
+    }
+    let mut ordinary = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::CreateTable {
+                uid: identities.table_uid(&name).unwrap().clone(),
+                name: name.clone(),
+                table: Box::new(table),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+            PlannedChange::new(Change::AddColumn {
+                uid: identities.column_uid(&name.column("z")).unwrap().clone(),
+                table: name.clone(),
+                name: "z".into(),
+                column: Box::new(z),
+            }),
+            PlannedChange::new(Change::AlterColumnExpression {
+                uid: identities.column_uid(&name.column("g")).unwrap().clone(),
+                column: name.column("g"),
+                from: "NULL::integer".into(),
+                to: "id * 2".into(),
+            }),
+        ],
+    };
+    for part in &mut ordinary.changes {
+        part.risks.clear();
+        part.provenance = Some(pbps_model::Provenance {
+            rule: crate::order::generated::RULE,
+            role: pbps_model::AddedRole::SplitPart,
+            source: "app.a".into(),
+            reason: "typed creation part".into(),
+        });
+    }
+    let prepare = |cs: &ChangeSet| {
+        super::prepare::changes(
+            cs,
+            &Schema::default(),
+            &desired,
+            &identities,
+            &IdsFile::default(),
+            &BTreeSet::new(),
+            &Default::default(),
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap()
+    };
+    let prepared = prepare(&ordinary);
+    assert!(
+        prepared
+            .changes
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, Change::AddCheck { .. }))
+    );
+    assert!(
+        prepared.changes.gated_risks().is_empty(),
+        "{:?}",
+        prepared.changes
+    );
+    let mut standing = prepared.changes;
+    standing
+        .changes
+        .retain(|p| !matches!(p.change, Change::CreateTable { .. }));
+    let unmarked = prepare(&standing);
+    assert!(
+        unmarked
+            .changes
+            .gated_risks()
+            .contains(&pbps_model::RiskClass::Narrowing)
+    );
+    assert!(
+        unmarked
+            .changes
+            .gated_risks()
+            .contains(&pbps_model::RiskClass::NotNull)
+    );
+    assert!(
+        unmarked
+            .changes
+            .gated_risks()
+            .contains(&pbps_model::RiskClass::Constraint)
+    );
+}

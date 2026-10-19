@@ -104,8 +104,8 @@ pub(crate) fn parts(
             }
         }
     }
-    // Keep prefix-only validators in CREATE: moving them would introduce
-    // independent constraint approvals without changing their inputs.
+    // Prefix-only validators already have their inputs in CREATE. Splitting
+    // them would add statements without exposing another needed name.
     if bare
         .primary_key
         .as_ref()

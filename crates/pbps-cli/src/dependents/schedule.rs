@@ -303,6 +303,12 @@ pub(crate) fn schedule(
         declared.module_deps,
     )
     .map_err(Refusal)?;
+    // The complete typed plan proves which additions finish a newly
+    // generated table, even if an older lowering added them separately.
+    let risks = pbps_diff::order::generated::risks(&cs, declared.sources.after, dialect);
+    for (part, risks) in cs.changes.iter_mut().zip(risks) {
+        part.risks = risks;
+    }
     // The verifier runs on the order this entry point settles, in tests and
     // debug builds (#1954, DEC-1954.6). On a connected SQL Server plan the
     // computed-column pass still follows, so that pair is recorded and not

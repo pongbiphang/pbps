@@ -2355,6 +2355,198 @@ fn a_new_table_generating_from_a_new_function_follows_its_create() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn new_generated_expression_parts_apply_without_alteration_approvals_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        for case in ["partition", "later"] {
+            check_safe_generated_creation(server, &format!("placeholder-risk-{k}-{case}"), case);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn split_generated_columns_and_validators_apply_without_alteration_approvals_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        for case in ["split", "split-rows"] {
+            check_safe_generated_creation(server, &format!("split-risk-{k}-{case}"), case);
+        }
+    }
+}
+
+fn check_safe_generated_creation(server: &str, slug: &str, case: &str) {
+    let own = OwnDatabase::new(server, slug);
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, slug, &ONE_COLUMN.replace("bigint", "integer"));
+    on_server(connection, "INSERT INTO app.t (id) VALUES (1),(3)");
+    declare_function(&d, "f", "SELECT x * 2");
+    let modern = scalar(
+        connection,
+        "SELECT current_setting('server_version_num')::bigint",
+    ) >= pbps_pg::generated::SET_EXPRESSION_ARRIVED_IN;
+    let seeded = case == "split-rows" || (case == "later" && modern);
+    let expression = if case == "later" {
+        "app.f(z)"
+    } else {
+        "app.f(id)"
+    };
+    let key = if seeded { "[id]" } else { "[id, z]" };
+    let partition = if case == "partition" {
+        "partition_by: [z]\npartitions:\n  a_default: default\n"
+    } else {
+        ""
+    };
+    let foreign_key = if case == "split-rows" {
+        "foreign_keys:\n  a_source_fk:\n    columns: [id]\n    references: app.t(id)\n"
+    } else {
+        ""
+    };
+    let rows = if seeded {
+        "data:\n  mode: ensure\n  rows:\n    1: {z: 3}\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        d.dir.join("schema/app.a.yml"),
+        format!(
+            "table: app.a\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+         g: {{type: integer, generated: {{expression: '{expression}', stored: true}}}}\n  \
+         z: {{type: integer, nullable: false}}\nprimary_key: {{name: a_pk, columns: {key}}}\n\
+         unique:\n  a_g: [g, z]\nchecks:\n  a_positive: g > 0\nindexes:\n  \
+         a_g_index: {{columns: [g]}}\n  a_g_unique_index: {{columns: [g, z], unique: true}}\n\
+         {partition}{foreign_key}"
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    if seeded {
+        // Offline keeps the exception's whole-table hold. Mint its identities
+        // before adding rows, then measure the connected capability's plan.
+        use std::io::Write;
+        let mut table = std::fs::OpenOptions::new()
+            .append(true)
+            .open(d.dir.join("schema/app.a.yml"))
+            .unwrap();
+        table.write_all(rows.as_bytes()).unwrap();
+    }
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(sql).unwrap();
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    assert!(
+        saved.changes.gated_risks().is_empty(),
+        "{case}: {:?}",
+        saved.changes
+    );
+    let placeholder = modern && matches!(case, "partition" | "later");
+    assert_eq!(script.contains("SET EXPRESSION"), placeholder, "{script}");
+    assert_eq!(
+        script.contains("ADD COLUMN \"g\""),
+        case.starts_with("split"),
+        "{script}"
+    );
+    if seeded {
+        let install = script.find(if placeholder {
+            "SET EXPRESSION"
+        } else {
+            "ADD COLUMN \"z\""
+        });
+        if let Some(install) = install {
+            assert!(
+                install < script.find("INSERT INTO \"app\".\"a\"").unwrap(),
+                "{script}"
+            );
+        }
+    }
+    succeeds(approved_apply(&d, connection, &plan, &[]));
+    if seeded {
+        assert_eq!(
+            scalar(connection, "SELECT g::bigint FROM app.a WHERE id = 1"),
+            if case == "later" { 6 } else { 2 }
+        );
+    }
+    on_server(connection, "INSERT INTO app.a (id,z) VALUES (3,5)");
+    assert_eq!(
+        scalar(connection, "SELECT g::bigint FROM app.a WHERE id = 3"),
+        if case == "later" { 10 } else { 6 }
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT attnum::bigint FROM pg_attribute WHERE attrelid='app.a'::regclass AND attname='z'"
+        ),
+        3
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE conrelid='app.a'::regclass AND conname IN ('a_pk','a_g','a_positive','a_source_fk')"
+        ),
+        if case == "split-rows" { 4 } else { 3 }
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 18; set PBPS_TEST_PG_DB"]
+fn a_standing_generated_expression_still_requires_narrowing_approval() {
+    let own = OwnDatabase::new(&server(), "standing-expression-risk-1503");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t \
+        (id integer NOT NULL, g integer GENERATED ALWAYS AS (id * 2) STORED); \
+        INSERT INTO app.t (id) VALUES (3)",
+    );
+    let d = Demo::new("standing-expression-risk-1503");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    d.table(
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+             g: {type: integer, generated: {expression: 'id * 3', stored: true}}\n",
+    );
+    let (plan, script) = connected_plan(&d, connection);
+    assert!(script.contains("SET EXPRESSION"), "{script}");
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    assert_eq!(
+        saved.changes.gated_risks(),
+        [pbps_model::RiskClass::Narrowing].into()
+    );
+    let refused = approved_apply(&d, connection, &plan, &[]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("narrowing"),
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert_eq!(scalar(connection, "SELECT g::bigint FROM app.t"), 6);
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "narrowing"],
+    ));
+    assert_eq!(scalar(connection, "SELECT g::bigint FROM app.t"), 9);
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
 /// #1364, a corner #1350 recorded: a new column whose default or generation
 /// expression calls a function the same plan rebuilds follows the rebuild.
 /// Ahead of it, the column's call held the old function, and the rebuild's
