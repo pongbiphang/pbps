@@ -5932,7 +5932,7 @@ fn rank_of(order: &[ModuleId]) -> BTreeMap<ModuleId, usize> {
 /// number of drops regardless, so a catalog that somehow held a cycle costs
 /// a wrong order rather than a hang.
 #[allow(clippy::wildcard_enum_match_arm)]
-fn member_depth(planned: &[PlannedChange]) -> BTreeMap<String, usize> {
+pub(crate) fn member_depth(planned: &[PlannedChange]) -> BTreeMap<String, usize> {
     let dropped: BTreeMap<&str, &[String]> = planned
         .iter()
         .filter_map(|p| match &p.change {
@@ -5959,40 +5959,6 @@ fn member_depth(planned: &[PlannedChange]) -> BTreeMap<String, usize> {
         }
     }
     depth
-}
-
-/// Re-orders the role drops of a change set parent before member, once their
-/// members are known.
-///
-/// The differ ranks them by [`member_depth`] when it sorts, but a `DropRole`
-/// leaves the differ with no members — `plan --db` reads them from the
-/// environment afterwards and writes them into the plan — so the rank the
-/// differ used was every role at depth zero, and the name tiebreaker decided.
-/// This is the same ranking applied again, over the positions the drops
-/// already hold, after the members are in: nothing else moves, and a plan
-/// whose dropped roles hold none of each other keeps the order it had
-/// (DECISIONS 127, 139).
-pub fn order_role_drops(cs: &mut ChangeSet) {
-    let depth = member_depth(&cs.changes);
-    let slots: Vec<usize> = cs
-        .changes
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| matches!(p.change, Change::DropRole { .. }))
-        .map(|(i, _)| i)
-        .collect();
-    let mut drops: Vec<PlannedChange> = slots.iter().rev().map(|&i| cs.changes.remove(i)).collect();
-    drops.reverse();
-    // Stable: two drops at one depth keep the order the differ gave them.
-    drops.sort_by_key(|p| {
-        let Change::DropRole { name, .. } = &p.change else {
-            return 0;
-        };
-        depth.get(name).copied().unwrap_or(0)
-    });
-    for (slot, drop) in slots.into_iter().zip(drops) {
-        cs.changes.insert(slot, drop);
-    }
 }
 
 /// Where a change sorts *within* its ordering class.
@@ -22036,7 +22002,14 @@ mod tests {
                 drop("z", &["a"]),
             ],
         };
-        super::order_role_drops(&mut cs);
+        let mut legacy = cs.clone();
+        crate::order::roles::legacy::legacy_order(&mut legacy);
+        cs = crate::order::role_drops(cs).unwrap();
+        assert_eq!(cs, legacy);
+        assert_eq!(
+            crate::order::roles::legacy::checksum(&cs),
+            crate::order::roles::legacy::checksum(&legacy)
+        );
         let names: Vec<String> = cs
             .changes
             .iter()
@@ -22052,7 +22025,10 @@ mod tests {
             changes: vec![drop("a", &[]), other, drop("z", &["some_user"])],
         };
         let before = format!("{:?}", flat.changes);
-        super::order_role_drops(&mut flat);
+        let mut legacy = flat.clone();
+        crate::order::roles::legacy::legacy_order(&mut legacy);
+        flat = crate::order::role_drops(flat).unwrap();
+        assert_eq!(flat, legacy);
         assert_eq!(format!("{:?}", flat.changes), before);
     }
 }

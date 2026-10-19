@@ -10,10 +10,8 @@
 //! would give it from the same facts.
 //!
 //! The passes themselves are private to [`super`], so the compiler refuses a
-//! call from any other module of this crate. The one that lives in another
-//! crate cannot be hidden that way; DEC-1955.1 lists it, and
-//! `no_pass_is_called_outside_the_schedule` fails when it is called anywhere
-//! else.
+//! call from any other module of this crate. Role drops are ordered inside
+//! `pbps-diff::order` once their memberships are supplied (DEC-1959.1).
 //!
 //! This changes which call sites order a plan, not how a plan is ordered: the
 //! passes run in `plan --db`'s order, and a caller that supplies the same
@@ -91,7 +89,7 @@ pub(crate) enum Skipped {
     /// read from what it found: where it does not run, no module drop waits
     /// for a release.
     Weave,
-    /// `order_role_drops` needs the members of every role the plan drops.
+    /// Role-drop ordering needs the members of every role the plan drops.
     RoleDrops,
 }
 
@@ -288,7 +286,7 @@ pub(crate) fn schedule(
                         *of = members.get(name).cloned().unwrap_or_default();
                     }
                 }
-                pbps_diff::order_role_drops(&mut cs);
+                cs = pbps_diff::order::role_drops(cs).map_err(Refusal)?;
             }
             None => skipped.push(Skipped::RoleDrops),
         }
@@ -383,6 +381,10 @@ fn keep_handover_dependents(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../../../pbps-diff/tests/support/role_order.rs"]
+mod role_order_oracle;
 
 #[cfg(test)]
 mod tests {
@@ -971,6 +973,34 @@ mod tests {
             &p.change,
             Change::DropRole { name, members, .. } if name == "holder" && members == &["member"]
         )));
+        let mut expected = plan();
+        for p in &mut expected.changes {
+            if let Change::DropRole {
+                name, members: of, ..
+            } = &mut p.change
+            {
+                *of = members.get(name).cloned().unwrap_or_default();
+            }
+        }
+        super::role_order_oracle::legacy_order(&mut expected);
+        assert_eq!(connected.changes, expected);
+        assert_eq!(
+            serde_json::to_vec(&connected.changes).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+        assert_eq!(
+            super::role_order_oracle::checksum(&connected.changes),
+            super::role_order_oracle::checksum(&expected)
+        );
+        let sql = |plan: &ChangeSet| {
+            use pbps_dialect::Dialect;
+            plan.changes
+                .iter()
+                .flat_map(|p| sql_server.emit(&p.change, p.strategy).unwrap())
+                .map(|s| s.sql)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sql(&connected.changes), sql(&expected));
 
         // Read and empty: a role the read does not name holds nobody.
         let none = RoleMembers::new();
@@ -980,6 +1010,91 @@ mod tests {
             names(&nobody.changes),
             ["drop role member", "drop role holder"]
         );
+        assert_eq!(offline.changes, plan());
+        assert_eq!(nobody.changes, plan());
+
+        // Unread also preserves any membership payload already supplied;
+        // treating it as an empty read would silently erase that payload.
+        let mut supplied = plan();
+        if let Change::DropRole { members, .. } = &mut supplied.changes[1].change {
+            members.push("member".into());
+        }
+        let unread = schedule(
+            supplied.clone(),
+            &Declarations {
+                schema: &schema,
+                sources: Sources {
+                    before: pbps_diff::Side {
+                        schema: &schema,
+                        ids: &ids,
+                    },
+                    after: &ids,
+                },
+                module_deps: &ModuleDeps::new(),
+            },
+            &Facts::default(),
+            &sql_server,
+        )
+        .unwrap();
+        assert_eq!(unread.changes, supplied);
+        assert_eq!(unread.skipped, [Skipped::RoleDrops]);
+    }
+
+    #[test]
+    fn role_drop_scripts_and_checksums_match_the_legacy_sort_for_interleaved_branches() {
+        use pbps_dialect::Dialect;
+        for salt in 0..32 {
+            let drop = |name: &str, members: &[&str]| {
+                PlannedChange::new(Change::DropRole {
+                    uid: Uid::derived(UidKind::Role, name, salt),
+                    name: name.into(),
+                    members: members.iter().map(|m| (*m).into()).collect(),
+                })
+            };
+            let other = |name: &str| {
+                PlannedChange::new(Change::DropTable {
+                    uid: Uid::derived(UidKind::Table, name, salt),
+                    name: TableName::new("dbo", name),
+                    detach_from: None,
+                })
+            };
+            for reverse in [false, true] {
+                let mut input = ChangeSet {
+                    changes: vec![
+                        drop("leaf", &["some_user"]),
+                        other("first_table"),
+                        drop("branch", &["leaf"]),
+                        drop("other_root", &[]),
+                        other("second_table"),
+                        drop("root", &["branch"]),
+                    ],
+                };
+                if reverse {
+                    input.changes.reverse();
+                }
+                let mut expected = input.clone();
+                super::role_order_oracle::legacy_order(&mut expected);
+                let actual = pbps_diff::order::role_drops(input).unwrap();
+                assert_eq!(actual, expected);
+                assert_eq!(
+                    serde_json::to_vec(&actual).unwrap(),
+                    serde_json::to_vec(&expected).unwrap()
+                );
+                assert_eq!(
+                    super::role_order_oracle::checksum(&actual),
+                    super::role_order_oracle::checksum(&expected)
+                );
+                let sql = |changes: &ChangeSet| {
+                    changes
+                        .changes
+                        .iter()
+                        .flat_map(|p| pbps_mssql::Mssql.emit(&p.change, p.strategy).unwrap())
+                        .map(|s| s.sql)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(sql(&actual), sql(&expected));
+            }
+        }
     }
 
     /// The passes that reorder a PostgreSQL plan are not SQL Server's: a plan
@@ -1008,127 +1123,5 @@ mod tests {
         .unwrap();
         assert_eq!(out.changes, differ);
         assert_eq!(out.skipped, []);
-    }
-
-    /// Whether `source` calls `pass` as a function. Comments are not calls:
-    /// they name passes to explain them.
-    fn calls(source: &str, pass: &str) -> Vec<usize> {
-        source
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| {
-                let code = line.split("//").next().unwrap_or("");
-                code.match_indices(pass).any(|(at, _)| {
-                    let before = code[..at].chars().next_back();
-                    let after = code[at + pass.len()..].trim_start();
-                    // A whole identifier, applied: not `my_order_role_drops(`,
-                    // not `fn order_role_drops` (a definition is not a call).
-                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
-                        && after.starts_with('(')
-                        && !code[..at].trim_end().ends_with("fn")
-                })
-            })
-            .map(|(n, _)| n + 1)
-            .collect()
-    }
-
-    /// The passes that live in another crate, and the files allowed to name
-    /// them: the pass's own crate, which calls it from its own tests, and the
-    /// schedule. DEC-1955.1 says why each is here; S7 (#1959) removes them as
-    /// it converts the passes.
-    const CROSS_CRATE: &[(&str, &[&str])] = &[(
-        "order_role_drops",
-        &[
-            "crates/pbps-diff/src/schema_diff.rs",
-            "crates/pbps-cli/src/dependents/schedule.rs",
-        ],
-    )];
-
-    fn sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                if path
-                    .file_name()
-                    .is_some_and(|n| n != "target" && n != ".git")
-                {
-                    sources(&path, found);
-                }
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                found.push(path);
-            }
-        }
-    }
-
-    #[test]
-    fn no_pass_is_called_outside_the_schedule() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut files = Vec::new();
-        sources(&root.join("crates"), &mut files);
-        assert!(files.len() > 100, "the workspace was not found");
-        // The scan sees what it is looking for: both places that call the
-        // pass today are found, so a scan that matched nothing would fail
-        // here rather than pass for want of input.
-        for (pass, allowed) in CROSS_CRATE {
-            for file in *allowed {
-                let text = std::fs::read_to_string(root.join(file)).unwrap();
-                assert!(
-                    !calls(&text, pass).is_empty(),
-                    "{file} does not call {pass}"
-                );
-            }
-        }
-        let mut stray = Vec::new();
-        for file in files {
-            let relative = file
-                .strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            let text = std::fs::read_to_string(&file).unwrap();
-            for (pass, allowed) in CROSS_CRATE {
-                if allowed.contains(&relative.as_str()) {
-                    continue;
-                }
-                for line in calls(&text, pass) {
-                    stray.push(format!("{relative}:{line} calls {pass}"));
-                }
-            }
-        }
-        assert!(
-            stray.is_empty(),
-            "a pass is called outside `schedule`; route the call through it (DEC-1955.1):\n{}",
-            stray.join("\n")
-        );
-        // The allowed files exist, so a rename cannot leave the list pointing
-        // at nothing while everything passes.
-        for (_, allowed) in CROSS_CRATE {
-            for file in *allowed {
-                assert!(root.join(file).is_file(), "{file} is not a file");
-            }
-        }
-    }
-
-    #[test]
-    fn a_call_to_a_listed_pass_outside_the_schedule_is_found() {
-        let source = "fn plan() {\n    pbps_diff::order_role_drops(&mut cs);\n}\n";
-        assert_eq!(calls(source, "order_role_drops"), [2]);
-        assert_eq!(
-            calls("    order_role_drops (&mut cs);", "order_role_drops"),
-            [1]
-        );
-    }
-
-    #[test]
-    fn a_comment_a_definition_or_another_name_is_not_a_call() {
-        for source in [
-            "// pbps_diff::order_role_drops(&mut cs) ranks them again",
-            "pub fn order_role_drops(cs: &mut ChangeSet) {",
-            "my_order_role_drops(&mut cs);",
-            "order_role_drops_again(&mut cs);",
-            "use pbps_diff::order_role_drops;",
-        ] {
-            assert!(calls(source, "order_role_drops").is_empty(), "{source}");
-        }
     }
 }

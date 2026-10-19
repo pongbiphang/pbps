@@ -24,12 +24,14 @@
 pub mod commute;
 pub mod edges;
 pub mod expand;
+pub(crate) mod roles;
 pub mod schedule;
 pub mod shadow;
 pub mod slots;
 pub mod verify;
 
 pub use edges::{Baseline, Because, Checks, Edge, Graph, Source, Unmet, graph};
+pub use roles::role_drops;
 pub use schedule::{Constraint, Refusal, Schedule, Settled};
 pub use shadow::{Report, Shadowed, analyse};
 pub use verify::{Violation, verify};

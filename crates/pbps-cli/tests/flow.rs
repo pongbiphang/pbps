@@ -7,6 +7,10 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+#[cfg(test)]
+#[path = "../../pbps-diff/tests/support/role_order.rs"]
+mod role_order_oracle;
+
 /// Opens a connection to the live SQL Server this suite runs against.
 ///
 /// The driver is named here, once, rather than at each call site below: every
@@ -14110,6 +14114,44 @@ fn roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan() 
         .find("drop role a_analysts")
         .unwrap_or_else(|| panic!("the member's drop:\n{listing}"));
     assert!(holder < member, "the holder is dropped first:\n{listing}");
+
+    let actual: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    let mut expected = actual.clone();
+    let slots: Vec<_> = expected
+        .changes
+        .changes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| matches!(p.change, pbps_model::Change::DropRole { .. }).then_some(i))
+        .collect();
+    assert_eq!(slots.len(), 2);
+    // Reconstruct this fixture's pre-membership name order, then run the
+    // frozen sort: the connected path must keep its plan, SQL and checksum.
+    let member_step = actual.changes.changes[slots[1]].clone();
+    let holder_step = actual.changes.changes[slots[0]].clone();
+    expected.changes.changes[slots[0]] = member_step;
+    expected.changes.changes[slots[1]] = holder_step;
+    role_order_oracle::legacy_order(&mut expected.changes);
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&expected).unwrap()
+    );
+    assert_eq!(actual.checksum(), expected.checksum());
+    assert_eq!(
+        role_order_oracle::checksum(&actual.changes),
+        role_order_oracle::checksum(&expected.changes)
+    );
+    let sql = |changes: &pbps_model::ChangeSet| {
+        use pbps_dialect::Dialect;
+        changes
+            .changes
+            .iter()
+            .flat_map(|p| pbps_mssql::Mssql.emit(&p.change, p.strategy).unwrap())
+            .map(|statement| statement.sql)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(sql(&actual.changes), sql(&expected.changes));
 
     let o = d.run(&[
         "apply",

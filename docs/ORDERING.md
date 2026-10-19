@@ -117,10 +117,13 @@ Then, in this order:
   every other pass runs, so the preview of a new table orders what it calls
   ahead of it as `plan --db` does (#1598). The resolver's answer is scheduled
   by `plan --db` before it is sealed (#1516).
-- **With the members read, `order_role_drops`** (`schedule` calls it once
-  `plan --db` has read the dropped roles' members) ranks the role drops by
-  membership again. The differ saw no members when it sorted (DECISIONS 127,
-  139).
+- **With the members read, `order::role_drops`** (`schedule` calls it once
+  `plan --db` has supplied the memberships) settles a role-only projection
+  over holder-before-member catalog edges and the existing depth policy.
+  Constraints chain same-depth peers in their original order and connect
+  adjacent layers, preserving the old global layering. The result fills the
+  same role slots, so every non-role step keeps its position and payload. No
+  expansion or pre-sort precedes `settle` (DEC-1959.1; DECISIONS 127, 139).
 - **On a PostgreSQL plan**, in this order:
   - `weave`, when the catalog's dependents are supplied (`plan --db`), puts
     each catalog dependent of a dropped or rebuilt module on the
@@ -361,7 +364,7 @@ rows below list each.
 | `DropModule` → `CreateModule` of its id | fixed | class 0 before 14 | ✓ |
 | `DropRole` or `RenameRole` away → `CreateRole` of its name | fixed | class 0 or 1 before 15 | ✓ |
 | `DropRole` → `RenameRole` into its name (S) | fixed | class 0 before 1 | ✓ |
-| `DropRole` of a holder → `DropRole` of its member | fixed | `member_depth`, then `order_role_drops` once the members are read | ✓ DECISIONS 127, 139 |
+| `DropRole` of a holder → `DropRole` of its member | fixed | once memberships are read, `order::role_drops` settles catalog edges within the original role slots, preserving the existing depth and peer order | ✓ DECISIONS 127, 139; DEC-1959.1 |
 | Trigger and grants keyed by a table name that passes to another table | fixed | rebuilt as the occupant's | ✓ DEC-1118.1 |
 
 ### Names in force
