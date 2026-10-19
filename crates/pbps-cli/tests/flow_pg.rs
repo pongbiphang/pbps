@@ -2556,6 +2556,170 @@ fn a_connected_plan_knows_a_serials_generated_sequence_name() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
+/// A parent's serial survives the engine's partition-default copies through
+/// pull, a connected create and re-pull; independent sequence users still
+/// name a limitation (DEC-2217.1). Both supported server versions are measured.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partitioned_parents_serial_round_trips_without_partition_drift() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [(16, old), (18, server())] {
+        let source = OwnDatabase::new(&server, "serial_parent_source");
+        let target = OwnDatabase::new(&server, "serial_parent_target");
+        let src = source.connection();
+        let tgt = target.connection();
+        assert_eq!(
+            scalar(
+                src,
+                "SELECT current_setting('server_version_num')::bigint / 10000"
+            ),
+            version
+        );
+        on_server(
+            src,
+            "CREATE SCHEMA app;
+            CREATE TABLE app.p (id bigserial, v integer) PARTITION BY RANGE (v);
+            CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (0) TO (10);
+            CREATE TABLE app.p2 PARTITION OF app.p FOR VALUES FROM (10) TO (20)",
+        );
+        // The engine records all three calls, but only the parent owns the
+        // sequence: counting the copies as independent users loses the tree.
+        assert_eq!(
+            scalar(
+                src,
+                "SELECT count(*) FROM pg_catalog.pg_depend
+            WHERE classid = 'pg_attrdef'::regclass AND refobjid = 'app.p_id_seq'::regclass
+              AND deptype = 'n'"
+            ),
+            3
+        );
+        let d = Demo::new("serial-parent");
+        let pulled = succeeds(d.run(&["pull", "--db", src]));
+        assert!(!stderr(&pulled).contains("sequence"), "{}", stderr(&pulled));
+        let path = d.dir.join("schema/app.p.yml");
+        let bytes = std::fs::read(&path).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("    type: bigserial\n"), "{text}");
+        let loaded = pbps_load::load_schema_dir(&d.dir.join("schema")).unwrap();
+        assert_eq!(loaded.schema.tables.len(), 3);
+        let parent = &loaded.schema.tables[&"app.p".parse().unwrap()];
+        assert!(matches!(
+            parent.columns["id"].value_source,
+            pbps_model::ValueSource::Sequence(_)
+        ));
+        for name in ["app.p1", "app.p2"] {
+            let p = &loaded.schema.tables[&name.parse().unwrap()];
+            assert!(p.columns.is_empty());
+            assert!(p.partition_of.as_ref().unwrap().columns.is_empty());
+        }
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        on_server(tgt, "CREATE SCHEMA app");
+        succeeds(d.run(&["baseline", "--db", tgt, "--reason", "empty database"]));
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", tgt, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, tgt, &plan, &[]));
+        let next = succeeds(d.run(&["plan", "--db", tgt]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        let repull = Demo::new("serial-parent-repull");
+        succeeds(repull.run(&["pull", "--db", tgt]));
+        assert_eq!(
+            std::fs::read(repull.dir.join("schema/app.p.yml")).unwrap(),
+            bytes
+        );
+        on_server(
+            tgt,
+            "INSERT INTO app.p (v) VALUES (1), (15);
+            INSERT INTO app.p1 (v) VALUES (2)",
+        );
+        assert_eq!(
+            scalar(
+                tgt,
+                "SELECT count(*) FROM app.p
+            WHERE (id, v) IN ((1, 1), (2, 15), (3, 2))"
+            ),
+            3
+        );
+        assert_eq!(scalar(tgt, "SELECT last_value FROM app.p_id_seq"), 3);
+
+        // An ordinary table is never a partition copy, even with the same
+        // column and text. Its call keeps the parent's shared limitation.
+        on_server(
+            src,
+            "CREATE TABLE app.other (id bigint DEFAULT nextval('app.p_id_seq'))",
+        );
+        let limited = Demo::new("serial-parent-shared");
+        let output = succeeds(limited.run(&["pull", "--db", src]));
+        assert!(stderr(&output).contains("sequence"), "{}", stderr(&output));
+        let text = std::fs::read_to_string(limited.dir.join("schema/app.p.yml")).unwrap();
+        assert!(!text.contains("serial"), "{text}");
+        on_server(src, "DROP TABLE app.other");
+
+        // These are each a partition's own default, so its limitation must
+        // still take the whole tree out of the pull (DEC-2072.1).
+        on_server(src, "CREATE SEQUENCE app.another_seq");
+        for (slug, sql) in [
+            (
+                "other-sequence",
+                "ALTER TABLE app.p1 ALTER COLUMN id SET DEFAULT nextval('app.another_seq')",
+            ),
+            (
+                "different-text",
+                "ALTER TABLE app.p1 ALTER COLUMN id SET DEFAULT (nextval('app.p_id_seq') + 0)",
+            ),
+            (
+                "other-column",
+                "ALTER TABLE app.p1 ALTER COLUMN id SET DEFAULT nextval('app.p_id_seq');
+                 ALTER TABLE app.p1 ALTER COLUMN v SET DEFAULT nextval('app.p_id_seq')",
+            ),
+        ] {
+            on_server(src, sql);
+            let limited = Demo::new(slug);
+            let output = succeeds(limited.run(&["pull", "--db", src]));
+            assert!(stderr(&output).contains("sequence"), "{}", stderr(&output));
+            assert!(!limited.dir.join("schema/app.p.yml").exists());
+        }
+        on_server(
+            src,
+            "ALTER TABLE app.p1 ALTER COLUMN id SET DEFAULT nextval('app.p_id_seq');
+            ALTER TABLE app.p1 ALTER COLUMN v DROP DEFAULT;
+            DROP SEQUENCE app.another_seq;
+            DROP TABLE app.p2;
+            CREATE TABLE app.p2 (id bigint NOT NULL, v integer);
+            ALTER TABLE app.p ATTACH PARTITION app.p2 FOR VALUES FROM (10) TO (20)",
+        );
+        // ATTACH does not copy the default (#2218), whereas ADD COLUMN
+        // reaches the existing partitions (#2219). Neither changes the
+        // read/create slice's model or permits those changes in its differ.
+        assert_eq!(
+            scalar(
+                src,
+                "SELECT count(*) FROM pg_catalog.pg_attrdef
+            WHERE adrelid = 'app.p2'::regclass"
+            ),
+            0
+        );
+        on_server(src, "INSERT INTO app.p (v) VALUES (1), (15)");
+        assert_eq!(
+            scalar(src, "SELECT count(*) FROM app.p WHERE id IN (1, 2)"),
+            2
+        );
+        let refused = try_on_server(src, "INSERT INTO app.p2 (v) VALUES (16)").unwrap_err();
+        assert!(refused.contains("null value"), "{refused}");
+        on_server(src, "ALTER TABLE app.p ADD COLUMN n serial");
+        assert_eq!(
+            scalar(
+                src,
+                "SELECT count(*) FROM pg_catalog.pg_attrdef d
+            JOIN pg_catalog.pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+            WHERE d.adrelid IN ('app.p'::regclass, 'app.p1'::regclass, 'app.p2'::regclass)
+              AND a.attname = 'n'"
+            ),
+            3
+        );
+    }
+}
+
 /// `verify` compares two reads, and each knows the sequence name it leaves
 /// out: a `serial`'s sequence renamed by hand since the baseline is drift
 /// that names its column (#1631), and one a plan can express, as the

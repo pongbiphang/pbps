@@ -203,7 +203,8 @@ pub struct RawSerial {
     pub max: i64,
     pub cache: i64,
     pub cycles: bool,
-    /// The defaults that use it, this column's included.
+    /// The defaults that use it, this column's included, excluding a
+    /// partitioned parent's same-column, same-text partition copies.
     pub users: i64,
 }
 
@@ -698,9 +699,6 @@ struct Parts<'a> {
     /// is simply not in it — which is what makes an unresolvable attnum a
     /// reportable fact rather than an off-by-one.
     by_attnum: HashMap<i32, &'a str>,
-    /// A partitioned parent or a partition: a `serial` on either is not held
-    /// (#1631), since a partition takes its parent's sequence and owns none.
-    partitioned: bool,
 }
 
 impl Parts<'_> {
@@ -867,7 +865,6 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     .iter()
                     .map(|c| (c.attnum, c.name.as_str()))
                     .collect(),
-                partitioned: true,
             };
             for column in raw_columns {
                 let Some(theirs) = parent_columns.iter().find(|p| p.name == column.name) else {
@@ -965,7 +962,6 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 .iter()
                 .map(|c| (c.attnum, c.name.as_str()))
                 .collect(),
-            partitioned: raw_table.partition_key.is_some(),
         };
 
         let mut table = Table {
@@ -2448,8 +2444,10 @@ fn sequence_limitations(raw: &RawColumn, parts: &Parts, held: Option<&str>, pull
 /// The column's owned sequence as this model holds it, where the column is
 /// the shape `serial` creates and nothing more (#1631, DEC-1631.1): its
 /// default is `nextval` of the one sequence it owns, which no other default
-/// uses, in the table's schema, `AS` the column's type, as logged as the
-/// table. Its bounds, cache and cycling are held as options (#1921,
+/// uses except its partition copies (DEC-2217.1), in the table's schema,
+/// `AS` the column's type, as logged as the table. A partition takes only
+/// its own overrides above and never calls this column reader. Its bounds,
+/// cache and cycling are held as options (#1921,
 /// DEC-1921.1). Anything else is left as the default it is, with the
 /// sequence named, because a declaration could not recreate it.
 fn held_serial(
@@ -2467,8 +2465,7 @@ fn held_serial(
         && !raw.nullable
         && raw.identity.is_none()
         && raw.generated.is_none()
-        && raw.default_sequences.is_none()
-        && !parts.partitioned;
+        && raw.default_sequences.is_none();
     plain.then(|| pbps_model::OwnedSequence {
         start: s.start,
         increment: s.increment,
@@ -6863,6 +6860,120 @@ mod tests {
                 "{why}: {:?}",
                 pulled.warnings
             );
+        }
+    }
+
+    /// A parent's copies are not independent users of its sequence, and a
+    /// partition keeps only a default that differs from its parent's
+    /// (DEC-2217.1). Counts here are the catalog's non-copy user counts.
+    #[test]
+    fn a_partitioned_parents_serial_holds_only_its_same_column_same_text_copies() {
+        let mut parent = table(1, "t");
+        parent.partition_key = Some(vec!["v".into()]);
+        let partitions = [2, 3].map(|oid| {
+            let mut p = table(oid, &format!("p{oid}"));
+            p.partition_of = Some((
+                1,
+                if oid == 2 {
+                    "FOR VALUES FROM (0) TO (10)".into()
+                } else {
+                    "FOR VALUES FROM (10) TO (20)".into()
+                },
+            ));
+            p
+        });
+        let mut id = col(1, 1, "id", "bigint");
+        id.nullable = false;
+        id.default = Some("nextval('app.t_id_seq'::regclass)".into());
+        id.owned_sequence = Some("t_id_seq".into());
+        id.serial = Some(RawSerial {
+            name: "t_id_seq".into(),
+            exact: true,
+            same_schema: true,
+            same_type: true,
+            same_persistence: true,
+            start: 1,
+            increment: 1,
+            min: 1,
+            max: i64::MAX,
+            cache: 1,
+            cycles: false,
+            users: 1,
+        });
+        let mut columns = vec![id.clone(), col(1, 2, "v", "integer")];
+        for oid in [2, 3] {
+            let mut copy = id.clone();
+            copy.table_oid = oid;
+            copy.serial = None;
+            copy.owned_sequence = None;
+            copy.default_sequences = Some("`app.t_id_seq`".into());
+            columns.extend([copy, col(oid, 2, "v", "integer")]);
+        }
+        let raw = RawCatalog {
+            tables: vec![parent, partitions[0].clone(), partitions[1].clone()],
+            columns,
+            ..Default::default()
+        };
+        let parent_name = TableName::new("app", "t");
+        let held = assemble(&raw);
+        assert!(held.limitations.is_empty(), "{:?}", held.warnings);
+        assert!(matches!(
+            &held.schema.tables[&parent_name].columns["id"].value_source,
+            pbps_model::ValueSource::Sequence(_)
+        ));
+        for name in ["p2", "p3"] {
+            let partition = &held.schema.tables[&TableName::new("app", name)];
+            assert!(partition.columns.is_empty());
+            assert!(partition.partition_of.as_ref().unwrap().columns.is_empty());
+        }
+
+        let mut shared = raw.clone();
+        shared.columns[0].serial.as_mut().unwrap().users = 2;
+        shared.tables.push(table(4, "ordinary"));
+        let mut foreign = shared.columns[2].clone();
+        foreign.table_oid = 4;
+        shared.columns.push(foreign);
+        let pulled = assemble(&shared);
+        assert!(matches!(
+            &pulled.schema.tables[&parent_name].columns["id"].value_source,
+            pbps_model::ValueSource::Default(_)
+        ));
+        assert!(
+            pulled
+                .limitations
+                .iter()
+                .any(|l| l.detail.contains("t_id_seq"))
+        );
+
+        // Both differences are the partition's own default and must keep
+        // its sequence limitation; DEC-2072.1 will omit the whole tree.
+        for (default, sequence, users) in [
+            ("nextval('app.other_seq'::regclass)", "`app.other_seq`", 1),
+            (
+                "(nextval('app.t_id_seq'::regclass) + 0)",
+                "`app.t_id_seq`",
+                2,
+            ),
+        ] {
+            let mut changed = raw.clone();
+            changed.columns[0].serial.as_mut().unwrap().users = users;
+            changed.columns[2].default = Some(default.into());
+            changed.columns[2].default_sequences = Some(sequence.into());
+            let pulled = assemble(&changed);
+            assert!(
+                pulled.limitations.iter().any(|l| {
+                    l.target == LimitationTarget::Relation(TableName::new("app", "p2"))
+                        && l.detail.contains(sequence)
+                }),
+                "{default}: {:?}",
+                pulled.warnings
+            );
+            if users == 2 {
+                assert!(matches!(
+                    &pulled.schema.tables[&parent_name].columns["id"].value_source,
+                    pbps_model::ValueSource::Default(_)
+                ));
+            }
         }
     }
 

@@ -63,15 +63,26 @@ pub enum DiffError {
 
     /// A numbering source, an identity or an owned sequence, added, removed,
     /// retuned or converted on a partitioned table or a partition (#1889):
-    /// each partition carries its parent's source, which this model does not
-    /// hold yet (#1681, #1893).
+    /// the partitions' sources must be accounted for too (#1681, #2219).
     #[error(
         "column {column}: its identity or `serial` sequence changes on a partitioned table or a \
-         partition, which is not planned yet (issues #1681, #1893). Make the change by hand, \
+         partition, which is not planned yet (issues #1681, #2219). Make the change by hand, \
          then pull.",
         column = .column.shown(),
     )]
     NumberingChangeOnPartitionedTable { column: ColumnRef },
+
+    /// A parent's serial is held and created, but changing its columns must
+    /// account for every partition's copy of the default (DEC-2217.1).
+    #[error(
+        "column {column}: {what} on an existing partitioned parent is not planned yet \
+         (issue #2219). Make the change by hand, then pull.",
+        column = .column.shown(),
+    )]
+    SerialChangeOnPartitionedParent {
+        column: ColumnRef,
+        what: &'static str,
+    },
 
     /// An identity or owned sequence kept, whose increment changes sign
     /// (#1889): the sequence keeps the bounds of the direction it was made
@@ -2053,6 +2064,14 @@ fn diff_columns(
         let Some(base_ref) = base_cols.get(uid) else {
             // Present only on the declared side: a new column.
             if let Some(c) = declared_table.columns.get(&declared_ref.name) {
+                if matches!(&c.value_source, ValueSource::Sequence(_))
+                    && (base_table.partition_by.is_some() || declared_table.partition_by.is_some())
+                {
+                    errs.push(DiffError::SerialChangeOnPartitionedParent {
+                        column: declared_ref.clone(),
+                        what: "adding a `serial` column",
+                    });
+                }
                 // The change does not carry the table's persistence, and the
                 // emitter creates the sequence logged (#1631).
                 if let ValueSource::Sequence(_) = &c.value_source
@@ -2095,8 +2114,8 @@ fn diff_columns(
         let mut recomputed = false;
         // A numbering source changed in place (#1889, DEC-1889.1), where the
         // engine has an `ALTER` for it and the table takes it. A partitioned
-        // table carries the source on every partition, which this model does
-        // not hold (#1681, #1893), and an owned sequence is created logged,
+        // table's sources need their partition handling (#1681, #2219),
+        // and an owned sequence is created logged,
         // which an `UNLOGGED` table's would not be (#1631).
         //
         // A plain default on either side is not the change's: one given up
@@ -2118,6 +2137,14 @@ fn diff_columns(
                     DiffError::SequenceChangeUnsupported {
                         column: declared_ref.clone(),
                     }
+                });
+            } else if (matches!(from, ValueSource::Sequence(_))
+                || matches!(to, ValueSource::Sequence(_)))
+                && (base_table.partition_by.is_some() || declared_table.partition_by.is_some())
+            {
+                errs.push(DiffError::SerialChangeOnPartitionedParent {
+                    column: declared_ref.clone(),
+                    what: "changing numbering to or from a `serial`",
                 });
             } else if [base_table, declared_table]
                 .iter()
@@ -2332,6 +2359,17 @@ fn diff_columns(
     // Present only on the base side: a dropped column.
     for (uid, base_ref) in &base_cols {
         if !declared_cols.contains_key(uid) {
+            if (base_table.partition_by.is_some() || declared_table.partition_by.is_some())
+                && base_table
+                    .columns
+                    .get(&base_ref.name)
+                    .is_some_and(|c| matches!(&c.value_source, ValueSource::Sequence(_)))
+            {
+                errs.push(DiffError::SerialChangeOnPartitionedParent {
+                    column: declared_table_name.column(base_ref.name.clone()),
+                    what: "dropping a `serial` column",
+                });
+            }
             changes.push(Change::DropColumn {
                 uid: uid.clone(),
                 // The **declared** table, with the column's base name. Only
@@ -4413,7 +4451,7 @@ fn refuse_partition_changes(
             } else if let Change::AddColumn { column: c, .. } = change
                 && (match &c.value_source {
                     ValueSource::Identity(_) => true,
-                    // Refused on a partitioned table by validation (#1893).
+                    // A serial addition is refused in diff_columns (#2219).
                     ValueSource::None
                     | ValueSource::Default(_)
                     | ValueSource::Sequence(_)

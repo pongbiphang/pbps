@@ -397,12 +397,11 @@ fn sequence_problems(
             "column `{column}` is a `serial`, which is NOT NULL; leave out `nullable: true`"
         )));
     }
-    // A partition carries its own copy of its parent's default, so the
-    // parent's sequence is called by more than one: not held yet (#1893).
-    if table.partition_by.is_some() || table.partition_of.is_some() {
+    // Only the parent owns the sequence; a partition declares no serial of
+    // its own, even though the engine copies the parent's default (#2217).
+    if table.partition_of.is_some() {
         found.push(invalid(format!(
-            "column `{column}` is a `serial` on a partitioned table or a partition, which this \
-             model does not hold yet (issue #1893)"
+            "column `{column}` is a `serial` on a partition; declare it on the partitioned parent"
         )));
     }
     if let Some(named) = &sequence.name {
@@ -5982,10 +5981,10 @@ mod tests {
     }
 
     /// A `serial` is NOT NULL with its sequence's default and no other value
-    /// source, on a table that is not partitioned, and names its sequence
+    /// source, on a plain table or partitioned parent, and names its sequence
     /// only where the name is not the engine's own (#1631, DEC-1631.1).
     #[test]
-    fn a_serial_that_is_nullable_defaulted_partitioned_or_misnamed_is_refused() {
+    fn a_serial_that_is_nullable_defaulted_on_a_partition_or_misnamed_is_refused() {
         let serial = |name: Option<&str>| {
             let mut c = pbps_model::Column::new(ty("integer")).not_null();
             c.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
@@ -6062,10 +6061,17 @@ mod tests {
             columns: vec!["id".into()],
             strategy: Default::default(),
         });
+        assert!(found(&parent).is_empty(), "{:?}", found(&parent));
+        parent.partition_by = None;
+        parent.partition_of = Some(pbps_model::PartitionOf {
+            parent: "app.p".parse().unwrap(),
+            bound: pbps_model::PartitionBound::Default,
+            columns: Default::default(),
+        });
         assert!(
             found(&parent)
                 .iter()
-                .any(|m| m.contains("partitioned table")),
+                .any(|m| m.contains("`serial` on a partition;")),
             "{:?}",
             found(&parent)
         );
@@ -6081,6 +6087,119 @@ mod tests {
                     .any(|m| m.contains("cannot be written into SQL")),
                 "{unwritable:?}: {refused:?}"
             );
+        }
+    }
+
+    /// Read/create support must not admit a standing parent's column edits
+    /// before their partition-default handling exists (DEC-2217.1).
+    #[test]
+    fn a_standing_parents_serial_column_changes_name_their_partition_support_issue() {
+        use pbps_model::{
+            Change, Column, Hints, IdsFile, Intent, OwnedSequence, Schema, ValueSource,
+        };
+        let table_name = TableName::new("app", "t");
+        let schema = |partitioned: bool, source: Option<ValueSource>| {
+            let mut table = Table::default();
+            table.columns.insert("v".into(), Column::new(ty("integer")));
+            if let Some(source) = source {
+                let mut c = Column::new(ty("integer")).not_null();
+                c.value_source = source;
+                table.columns.insert("n".into(), c);
+            }
+            if partitioned {
+                table.partition_by = Some(pbps_model::PartitionBy {
+                    columns: vec!["v".into()],
+                    external: false,
+                    strategy: Default::default(),
+                });
+            }
+            let mut schema = Schema::default();
+            schema.tables.insert(table_name.clone(), table);
+            schema
+        };
+        let serial = ValueSource::Sequence(OwnedSequence::serial());
+        let context = pbps_diff::Context {
+            operator: "test".into(),
+            today: "2026-10-19".into(),
+        };
+        for (from, to, what) in [
+            (None, Some(serial.clone()), "adding a `serial` column"),
+            (
+                Some(ValueSource::None),
+                Some(serial.clone()),
+                "changing numbering to or from a `serial`",
+            ),
+            (
+                Some(serial.clone()),
+                Some(ValueSource::None),
+                "changing numbering to or from a `serial`",
+            ),
+            (
+                Some(serial.clone()),
+                Some(ValueSource::Sequence(OwnedSequence {
+                    start: 5,
+                    ..OwnedSequence::serial()
+                })),
+                "changing numbering to or from a `serial`",
+            ),
+            (Some(serial.clone()), None, "dropping a `serial` column"),
+        ] {
+            for partitioned in [true, false] {
+                let base = schema(partitioned, from.clone());
+                let declared = schema(partitioned, to.clone());
+                let base_ids = pbps_diff::resolve(&base, &IdsFile::default(), &[], &context)
+                    .unwrap()
+                    .ids;
+                let intents = if to.is_none() {
+                    vec![Intent::DropColumn {
+                        column: table_name.column("n"),
+                        reason: "retired".parse().unwrap(),
+                    }]
+                } else {
+                    vec![]
+                };
+                let declared_ids = pbps_diff::resolve(&declared, &base_ids, &intents, &context)
+                    .unwrap()
+                    .ids;
+                let outcome = pbps_diff::diff(
+                    pbps_diff::Side {
+                        schema: &base,
+                        ids: &base_ids,
+                    },
+                    pbps_diff::Side {
+                        schema: &declared,
+                        ids: &declared_ids,
+                    },
+                    &Postgres::new(),
+                    &Hints::default(),
+                );
+                if partitioned {
+                    let errors = outcome.expect_err(what);
+                    assert!(
+                        matches!(errors.as_slice(), [pbps_diff::DiffError::SerialChangeOnPartitionedParent { what: named, .. }] if *named == what),
+                        "{errors:?}"
+                    );
+                    let message = errors[0].to_string();
+                    assert!(
+                        message.contains("app.t.n") && message.contains("#2219"),
+                        "{message}"
+                    );
+                } else {
+                    let changes = outcome.expect("a plain table retains the same change");
+                    assert!(
+                        changes.changes.iter().any(|p| matches!(
+                            (what, &p.change),
+                            ("adding a `serial` column", Change::AddColumn { .. })
+                                | (
+                                    "changing numbering to or from a `serial`",
+                                    Change::AlterColumnNumbering { .. }
+                                )
+                                | ("dropping a `serial` column", Change::DropColumn { .. })
+                        )),
+                        "{changes:?}"
+                    );
+                }
+            }
         }
     }
 

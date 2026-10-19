@@ -6406,6 +6406,70 @@ mod tests {
         );
     }
 
+    /// A parent owns its sequence before any partition copies the default;
+    /// a partition's create has no sequence of its own (DEC-2217.1).
+    #[test]
+    fn a_created_partitioned_parent_owns_its_serial_and_its_partition_owns_none() {
+        let parent = name("app", "p");
+        let mut table = Table::default();
+        let mut id = Column::new(ty("bigint")).not_null();
+        id.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+        table.columns.insert("id".into(), id);
+        table.columns.insert("v".into(), Column::new(ty("integer")));
+        table.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
+            columns: vec!["v".into()],
+            strategy: Default::default(),
+        });
+        let sql = sql_of(
+            &Postgres::new(),
+            &Change::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: parent.clone(),
+                table: Box::new(table),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        );
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        let sql = &sql[0];
+        let sequence = sql
+            .find("CREATE SEQUENCE \"app\".\"p_id_seq\" AS bigint")
+            .unwrap();
+        let create = sql.find("CREATE TABLE \"app\".\"p\"").unwrap();
+        let ownership = sql
+            .find("ALTER SEQUENCE \"app\".\"p_id_seq\" OWNED BY \"app\".\"p\".\"id\"")
+            .unwrap();
+        assert!(sequence < create && create < ownership, "{sql}");
+        assert!(
+            sql.contains("DEFAULT pg_catalog.nextval('\"app\".\"p_id_seq\"'::regclass)"),
+            "{sql}"
+        );
+        assert!(sql.contains("PARTITION BY RANGE (\"v\")"), "{sql}");
+        let partition = Table {
+            partition_of: Some(pbps_model::PartitionOf {
+                parent,
+                bound: pbps_model::PartitionBound::Default,
+                columns: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let sql = sql_of(
+            &Postgres::new(),
+            &Change::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: name("app", "p1"),
+                table: Box::new(partition),
+                beside_default: None,
+                moves_at_most: None,
+            },
+        );
+        assert_eq!(sql.len(), 1, "{sql:?}");
+        assert!(sql[0].contains("PARTITION OF \"app\".\"p\""), "{sql:?}");
+        assert!(!sql[0].contains("SEQUENCE"), "{sql:?}");
+        assert!(!sql[0].contains("DEFAULT pg_catalog.nextval"), "{sql:?}");
+    }
+
     fn sql_of(pg: &Postgres, change: &Change) -> Vec<String> {
         pg.emit(change, Strategy::default())
             .expect("emit")

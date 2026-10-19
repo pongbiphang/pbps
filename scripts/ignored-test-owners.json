@@ -483,6 +483,7 @@
         "a_continued_escape_strings_spacing_is_a_change_to_the_view",
         "a_created_routine_refuses_a_low_privilege_caller_unless_the_declaration_opens_it",
         "a_connected_plan_knows_a_serials_generated_sequence_name",
+        "a_partitioned_parents_serial_round_trips_without_partition_drift",
         "a_conversion_past_an_exhausted_counter_is_refused_before_apply",
         "a_numbered_column_added_to_rows_names_the_publications_that_miss_it",
         "declared_insert_grants_serial_usage_and_keeps_it_on_new_sequences",
