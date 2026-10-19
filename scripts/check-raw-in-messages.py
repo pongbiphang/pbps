@@ -124,8 +124,9 @@ ALLOWED = {
         "until #2084 step 5",
     ),
     "crates/pbps-pg/src/lib.rs": (
-        19,
+        21,
         "schema/table/column validation feeds whole-escaped DialectError::Invalid "
+        "and cycling-expression declaration notes feed whole-escaped dialect.not-checked "
         "until #2084 step 5",
     ),
     "crates/pbps-pg/src/validate.rs": (

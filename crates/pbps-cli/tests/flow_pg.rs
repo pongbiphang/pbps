@@ -26856,6 +26856,108 @@ fn an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails() 
     }
 }
 
+/// Shared warnings retain raw names in JSON and escape them once at both
+/// human writers. A default the engine can ask about emits no warning.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn partition_default_warnings_keep_raw_json_and_escape_names_once_for_humans() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [("18", server()), ("16", old)] {
+        let partition = "ev\nline\\tail";
+        let column = "v\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+        let db = OwnDatabase::new(&server, &format!("parts-2084-{version}"));
+        let conn = db.connection();
+        on_server(
+            conn,
+            &format!(
+                "CREATE SCHEMA app;
+                 CREATE TABLE app.ev (k integer NOT NULL, \"{column}\" integer DEFAULT 1)
+                     PARTITION BY RANGE (k);
+                 CREATE TABLE app.\"{partition}\" PARTITION OF app.ev FOR VALUES FROM (0) TO (10);
+                 ALTER TABLE app.\"{partition}\" ALTER COLUMN \"{column}\" SET DEFAULT 7"
+            ),
+        );
+        let d = Demo::new(&format!("parts-2084-{version}"));
+        succeeds(d.run(&["pull", "--db", conn]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", conn, "--reason", "adopt"]));
+        // JSON leaves C1 characters literal; YAML requires them escaped even in quotes.
+        let column_yaml = serde_json::to_string(column)
+            .unwrap()
+            .replace('\u{9b}', "\\u009b");
+        let partition_yaml = serde_json::to_string(partition).unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!(
+                "table: app.ev
+columns:
+  k: {{type: integer, nullable: false}}
+  {column_yaml}: {{type: integer, default: \"1\"}}
+partition_by: [k]
+partitions:
+  {partition_yaml}:
+    from: [\"0\"]
+    to: [\"10\"]
+    columns:
+      {column_yaml}: {{default: \"8\"}}
+"
+            ),
+        )
+        .unwrap();
+        d.commit();
+        let unasked = |report: &serde_json::Value| -> Vec<serde_json::Value> {
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|finding| finding["id"] == "plan.partition-default-unasked")
+                .cloned()
+                .collect()
+        };
+        // Negative: a pair the engine can ask about emits no warning.
+        let report = json_output(succeeds(d.run(&["plan", "--db", conn, "--format", "json"])));
+        assert!(unasked(&report).is_empty(), "{version}: {report}");
+
+        let trigger =
+            "CREATE FUNCTION public.pbps_2084_noop() RETURNS event_trigger LANGUAGE plpgsql AS
+                           $$ BEGIN END $$;
+                       CREATE EVENT TRIGGER pbps_2084_watch ON ddl_command_end
+                           EXECUTE FUNCTION public.pbps_2084_noop()";
+        on_server(conn, trigger);
+        let prefix =
+            "not checked before the plan whether the engine stores it as the parent's default: ";
+        let reason = "the target has the enabled DDL event trigger(s) `pbps_2084_watch`, which this check's temporary table would fire";
+        let raw = format!("{prefix}partition app.{partition} column `{column}`: {reason}");
+        let shown = format!(
+            "{prefix}partition app.ev\\nline\\\\tail column `v\\nline\\r\\u{{1b}}[31m\\u{{9b}}\\\\\\u{{202e}}名前`: {reason}"
+        );
+        let report = json_output(succeeds(d.run(&["plan", "--db", conn, "--format", "json"])));
+        let warnings = unasked(&report);
+        assert_eq!(warnings.len(), 1, "{version}: {report}");
+        assert_eq!(warnings[0]["message"], raw, "{version}: {report}");
+        let check_human = |output: Output| {
+            let error = stderr(&succeeds(output));
+            let lines: Vec<_> = error
+                .lines()
+                .filter(|line| line.starts_with("warning: not checked before the plan"))
+                .collect();
+            assert_eq!(lines, [format!("warning: {shown}")], "{version}: {error}");
+        };
+        check_human(d.run(&["plan", "--db", conn]));
+        // Bootstrap uses the direct warning printer rather than the plan envelope.
+        let empty = OwnDatabase::new(&server, &format!("parts-2084-boot-{version}"));
+        on_server(empty.connection(), &format!("CREATE SCHEMA app; {trigger}"));
+        let sql = d.dir.join("bootstrap.sql");
+        check_human(d.run(&[
+            "bootstrap",
+            "--db",
+            empty.connection(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ]));
+    }
+}
+
 /// A partition's own default the probe could not ask about is a typed
 /// warning in a JSON plan's one envelope, with nothing beside it on stderr
 /// (SPEC §9.8; #1660). Human output keeps the warning line. Negative: a pair

@@ -563,20 +563,20 @@ fn cycle_expression_notes(schema: &Schema) -> Vec<String> {
             for (name, index) in &table.indexes {
                 let over_expression = index.columns.iter().any(|k| {
                     matches!(&k.key, pbps_model::IndexKey::Expression(text)
-                        if crate::impact::mentions(text, column))
+                        if crate::impact::mentions(text, column.raw()))
                 });
                 // A plain key on the column is refused by `cycle_problems`.
-                let over_column = index
-                    .columns
-                    .iter()
-                    .any(|k| k.key.column() == Some(column.as_str()));
+                let over_column = index.columns.iter().any(|k| k.key.column() == Some(column));
                 if index.unique && over_expression && !over_column {
                     notes.push(format!(
                         "{}.{column} has `cycle: true` and unique index `{name}` has an \
                          expression over it: whether a number the sequence hands out again \
                          collides there depends on what the expression gives back, which is \
                          not checked",
-                        table_name.shown()
+                        // raw: declaration notes are escaped whole until #2084 step 5.
+                        table_name.raw(),
+                        // raw: declaration notes are escaped whole until #2084 step 5.
+                        column = column.raw(),
                     ));
                 }
             }

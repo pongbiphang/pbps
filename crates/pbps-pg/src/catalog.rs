@@ -2900,8 +2900,10 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
                 out.defaults_unasked.push(format!(
                     "partition {partition} column `{column}`: its declared text may name a \
                      temporary schema, whose objects another session can change",
-                    partition = partition.shown(),
-                    column = column.shown(),
+                    // raw: shared warning is escaped by its human writers until #2084 step 5.
+                    partition = partition.raw(),
+                    // raw: shared warning is escaped by its human writers until #2084 step 5.
+                    column = column.raw(),
                 ));
                 continue;
             }
@@ -2918,8 +2920,10 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
                     "partition {partition} column `{column}`: its type `{}` is not one this \
                      check can create a column of",
                     theirs.ty,
-                    partition = partition.shown(),
-                    column = column.shown(),
+                    // raw: shared warning is escaped by its human writers until #2084 step 5.
+                    partition = partition.raw(),
+                    // raw: shared warning is escaped by its human writers until #2084 step 5.
+                    column = column.raw(),
                 )),
             }
         }
@@ -2976,8 +2980,10 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
         out.defaults_unasked.extend(asked.iter().map(|d| {
             format!(
                 "partition {} column `{}`: {why}",
-                d.partition.shown(),
-                d.column.shown()
+                // raw: shared warning is escaped by its human writers until #2084 step 5.
+                d.partition.raw(),
+                // raw: shared warning is escaped by its human writers until #2084 step 5.
+                d.column.raw()
             )
         }));
         return;
@@ -3001,8 +3007,10 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
                     Ok(_) => {}
                     Err(why) => out.defaults_unasked.push(format!(
                         "partition {} column `{}`: {why}",
-                        d.partition.shown(),
-                        d.column.shown()
+                        // raw: shared warning is escaped by its human writers until #2084 step 5.
+                        d.partition.raw(),
+                        // raw: shared warning is escaped by its human writers until #2084 step 5.
+                        d.column.raw()
                     )),
                 }
             }
@@ -3010,8 +3018,10 @@ async fn ask_about_partition_defaults(conn: &mut Conn, schema: &Schema, out: &mu
         Err(why) => out.defaults_unasked.extend(asked.iter().map(|d| {
             format!(
                 "partition {} column `{}`: {why}",
-                d.partition.shown(),
-                d.column.shown()
+                // raw: shared warning is escaped by its human writers until #2084 step 5.
+                d.partition.raw(),
+                // raw: shared warning is escaped by its human writers until #2084 step 5.
+                d.column.raw()
             )
         })),
     }

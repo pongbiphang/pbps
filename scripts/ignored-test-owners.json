@@ -744,6 +744,7 @@
         "an_untrusted_domain_check_leaves_the_partition_default_probe_unrun",
         "an_unasked_partition_default_stays_in_the_envelope_beside_a_spelling_refusal",
         "an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails",
+        "partition_default_warnings_keep_raw_json_and_escape_names_once_for_humans",
         "an_unlogged_partition_under_an_undeclared_permanent_key_is_refused",
         "an_ambiguous_date_or_time_literal_is_refused_with_both_readings",
         "an_offset_less_value_is_read_in_the_target_databases_own_zone",

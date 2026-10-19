@@ -2912,8 +2912,9 @@ pub(crate) fn catalogued_as(
 /// Prints what [`refuse_misspelt`] could not ask, for a command whose
 /// warnings go to stderr.
 pub(crate) fn warn_unasked(unasked: &[String]) {
+    // Shared warnings keep the plan's whole-message boundary until #2084 step 5.
     for w in unasked {
-        eprintln!("warning: {w}");
+        eprintln!("warning: {}", pbps_model::escape::Escaped(w));
     }
 }
 

@@ -3651,7 +3651,7 @@ fn attached(
     let (mine, theirs) = (columns(&table_spelled), columns(&parent_spelled));
     let names = |c: &[(ColumnName, pbps_model::Column)]| {
         c.iter()
-            .map(|(n, _)| n.raw())
+            .map(|(n, _)| n.shown().to_string())
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -7044,6 +7044,71 @@ mod tests {
             Some(&Cell::Value(Value::Int(9)))
         );
         assert!(types.contains_key(raw.raw()) && types.contains_key(literal.raw()));
+    }
+
+    #[test]
+    fn attachment_refusals_escape_column_lists_once() {
+        use pbps_model::{PartitionBound, PartitionBy, PartitionOf};
+        let raw = "col\nline\\tail";
+        let other = "other\rline\\tail";
+        let parent_name = TableName::new("app", "parent");
+        let child_name = TableName::new("app", "child");
+        let mut parent = table(&[(raw, Column::new(ty("int")))]);
+        parent.partition_by = Some(PartitionBy {
+            columns: vec![raw.into()],
+            strategy: Default::default(),
+            external: false,
+        });
+        let base = Schema {
+            tables: [(parent_name.clone(), parent.clone())].into(),
+            ..Default::default()
+        };
+        let of = PartitionOf {
+            parent: parent_name,
+            bound: PartitionBound::Default,
+            columns: Default::default(),
+        };
+        let declared = Table {
+            partition_of: Some(of.clone()),
+            ..Default::default()
+        };
+        let ids = IdsFile::default();
+        let ask = |ordinary: &Table| {
+            super::attached(
+                Side {
+                    schema: &base,
+                    ids: &ids,
+                },
+                &child_name,
+                &child_name,
+                ordinary,
+                &declared,
+                &of,
+                &MinimalDialect,
+                None,
+            )
+        };
+        let ordinary = table(&[(other, Column::new(ty("int")))]);
+        match ask(&ordinary) {
+            Err(problems) => {
+                let error = DiffError::AttachedShape {
+                    table: child_name.clone(),
+                    parent: of.parent.clone(),
+                    what: problems,
+                };
+                assert_eq!(
+                    error.to_string(),
+                    r"app.child is attached to app.parent as a partition, but its columns are (other\rline\\tail), and its parent's are (col\nline\\tail), in that order. Bring the table to its parent's shape in an earlier plan, then attach it."
+                );
+            }
+            Ok(_) => panic!("different raw column identities cannot attach"),
+        }
+        // Negative: matching raw identities can attach without a refusal.
+        let matching = Table {
+            columns: parent.columns,
+            ..Default::default()
+        };
+        assert!(ask(&matching).is_ok());
     }
 
     fn ctx() -> Context {

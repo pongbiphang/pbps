@@ -389,6 +389,136 @@ fn replica_identity_column_diagnostics_escape_once_at_dialect_validation() {
 }
 
 #[test]
+fn row_read_refusals_escape_column_names_once() {
+    let name = TableName::new("app", "t");
+    let scope = RowScope::Every {
+        known: Default::default(),
+    };
+    let mut table = Table {
+        columns: [
+            (NAME.into(), Column::new("int".parse().unwrap()).not_null()),
+            ("ordinary".into(), Column::new("int".parse().unwrap())),
+        ]
+        .into(),
+        primary_key: Some(PrimaryKey {
+            name: None,
+            columns: vec![NAME.into(), "ordinary".into()],
+            storage_parameters: Default::default(),
+        }),
+        ..Default::default()
+    };
+    let expected = format!(
+        "app.t: its rows cannot be read back -- its primary key has 2 columns ({SHOWN}, ordinary), and rows are keyed by one"
+    );
+    for error in [
+        pbps_pg::rows::query(&name, &table, &scope)
+            .unwrap_err()
+            .to_string(),
+        pbps_mssql::rows::query(&name, &table, &scope)
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert_eq!(error, expected);
+    }
+    table.primary_key.as_mut().unwrap().columns.pop();
+    // Negative: the raw hostile identity still selects the supported key.
+    assert!(pbps_pg::rows::query(&name, &table, &scope).is_ok());
+    assert!(pbps_mssql::rows::query(&name, &table, &scope).is_ok());
+    table.columns.get_mut(NAME).unwrap().ty = "integer[]".parse().unwrap();
+    assert_eq!(
+        pbps_pg::rows::query(&name, &table, &scope)
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "app.t: its rows cannot be read back -- its column `{SHOWN}` is `integer[]`, an array, and pbps reads no rows of a table with an array column"
+        )
+    );
+    table.columns.shift_remove(NAME);
+    let expected = format!(
+        "app.t: its rows cannot be read back -- its primary key column `{SHOWN}` is not among the columns read"
+    );
+    for error in [
+        pbps_pg::rows::query(&name, &table, &scope)
+            .unwrap_err()
+            .to_string(),
+        pbps_mssql::rows::query(&name, &table, &scope)
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert_eq!(error, expected);
+    }
+}
+
+#[test]
+fn cycling_expression_notes_keep_raw_column_identities_until_the_writer() {
+    let mut column = Column::new("integer".parse().unwrap()).not_null();
+    column.value_source = ValueSource::Identity(Identity {
+        seed: 1,
+        increment: 1,
+        options: SequenceOptions {
+            cycle: true,
+            ..Default::default()
+        },
+    });
+    let mut schema = Schema {
+        tables: [(
+            TableName::new("app", NAME),
+            Table {
+                columns: [(NAME.into(), column)].into(),
+                indexes: [(
+                    "expr".into(),
+                    Index {
+                        columns: vec![IndexColumn {
+                            key: IndexKey::Expression(format!("(\"{NAME}\" + 0)")),
+                            descending: false,
+                            opclass: None,
+                        }],
+                        unique: true,
+                        include: Vec::new(),
+                        filter: None,
+                        method: Default::default(),
+                        storage_parameters: Default::default(),
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let dialect = pbps_pg::Postgres::new();
+    let notes = dialect.declaration_notes(&schema);
+    let reason = "has `cycle: true` and unique index `expr` has an expression over it: whether a number the sequence hands out again collides there depends on what the expression gives back, which is not checked";
+    assert_eq!(notes, [format!("app.{NAME}.{NAME} {reason}")]);
+    assert_eq!(
+        pbps_model::escape::Escaped(&notes[0]).to_string(),
+        format!("app.{SHOWN}.{SHOWN} {reason}")
+    );
+    let index = schema
+        .tables
+        .values_mut()
+        .next()
+        .unwrap()
+        .indexes
+        .get_mut("expr")
+        .unwrap();
+    index.columns.push(IndexColumn::column(SHOWN));
+    assert_eq!(dialect.declaration_notes(&schema), notes);
+    // Negative: a plain key on the same raw identity is refused separately.
+    let index = schema
+        .tables
+        .values_mut()
+        .next()
+        .unwrap()
+        .indexes
+        .get_mut("expr")
+        .unwrap();
+    index.columns.last_mut().unwrap().key = IndexKey::Column(NAME.into());
+    assert!(dialect.declaration_notes(&schema).is_empty());
+}
+
+#[test]
 fn baseline_key_diagnostics_keep_the_previous_escaped_string_list() {
     let error = pbps_diff::DiffError::DataBaselineKeyNotSingle {
         table: TableName::new("app", "t"),

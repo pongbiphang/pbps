@@ -139,11 +139,9 @@ pub(crate) fn key_column(name: &TableName, table: &Table) -> Result<ColumnName, 
             why: format!(
                 "its primary key has {} columns ({}), and rows are keyed by one",
                 pk.columns.len(),
-                // Shared RowsError.why, escaped whole until #2084 step 5.
                 pk.columns
                     .iter()
-                    // Shared why is escaped whole until #2084 step 5.
-                    .map(pbps_model::ColumnName::raw)
+                    .map(|name| name.shown().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -174,8 +172,7 @@ pub fn query(
                 "its column `{column}` is `{}`, an array, and pbps reads no rows of a table \
                  with an array column",
                 spec.ty,
-                // raw: whole-message escaped until #2084 step 5.
-                column = column.raw(),
+                column = column.shown(),
             ),
         });
     }

@@ -143,11 +143,9 @@ fn key_column(name: &TableName, table: &Table) -> Result<ColumnName, RowsError> 
             why: format!(
                 "its primary key has {} columns ({}), and rows are keyed by one",
                 pk.columns.len(),
-                // Shared RowsError.why, escaped whole until #2084 step 5.
                 pk.columns
                     .iter()
-                    // Shared why is escaped whole until #2084 step 5.
-                    .map(pbps_model::ColumnName::raw)
+                    .map(|name| name.shown().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),

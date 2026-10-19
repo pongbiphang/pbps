@@ -3528,7 +3528,7 @@ fn build<'v, 'p: 'v>(
                          {bound}::pg_catalog.numeric END;",
                         saturated_count("count(*)"),
                         value_literal(&qualified(&stored.table)?),
-                        value_literal(&stored.name),
+                        value_literal(stored.name.raw()),
                     ),
                 ));
             }
