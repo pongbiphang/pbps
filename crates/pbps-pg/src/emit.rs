@@ -3218,12 +3218,17 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             let normalized = types::normalize(to)?;
             let was = types::normalize(from)?;
             if from.type_ref().is_some() || to.type_ref().is_some() {
-                return Err(invalid(format!(
-                    "column `{}` cannot be changed from `{was}` to `{normalized}`: retyping a \
-                     user-defined type reference is not supported. Add the new column, fill \
-                     it in a declared step, and drop the old one.",
-                    column.name
-                )));
+                return Err(DialectError::InvalidVerbatim {
+                    dialect: DIALECT,
+                    message: format!(
+                        "column `{}` cannot be changed from `{}` to `{}`: retyping a \
+                         user-defined type reference is not supported. Add the new column, fill \
+                         it in a declared step, and drop the old one.",
+                        column.name.shown(),
+                        pbps_model::escape::Escaped(&was.to_string()),
+                        pbps_model::escape::Escaped(&normalized.to_string()),
+                    ),
+                });
             }
             // No `USING`, ever (ADR-0012 §5). Where the engine would need one,
             // the change is refused here with the clause named, rather than
@@ -9832,15 +9837,24 @@ mod tests {
             ("app.mood[]", "app.other[]"),
             ("app.mood", "app.mood[]"),
         ] {
-            let error = Postgres::new()
-                .emit(&retype(from, to), pbps_model::Strategy::default())
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains("retyping a user-defined type reference")
-                    && error.contains("fill it in a declared step"),
-                "{error}"
-            );
+            for spelling in ["v", "v\n\\name"] {
+                let mut change = retype(from, to);
+                let Change::AlterColumnType { column, .. } = &mut change else {
+                    unreachable!("retype constructs an AlterColumnType");
+                };
+                column.name = spelling.into();
+                let shown = column.name.shown().to_string();
+                let error = Postgres::new()
+                    .emit(&change, pbps_model::Strategy::default())
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("retyping a user-defined type reference")
+                        && error.contains("fill it in a declared step")
+                        && error.contains(&format!("column `{shown}`")),
+                    "{error}"
+                );
+            }
             assert_eq!(
                 types::change_risk(&ty(from), &ty(to)),
                 pbps_dialect::TypeChangeRisk::Incompatible

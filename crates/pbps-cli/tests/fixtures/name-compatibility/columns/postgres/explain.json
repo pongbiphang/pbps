@@ -16,7 +16,7 @@
     "created_at": "2026-10-19T00:00:00Z",
     "baseline": "column-name master fixture",
     "mode": "transactional",
-    "checksum": "9347c4076b3ff54e8b2d57cc66b84a5648e8ebffda6f05a83b5242819b15389c",
+    "checksum": "f24c786207edb153b884bb62584f98cf84db684033cc330b9d80d4d254b65247",
     "change_count": 5,
     "table_count": 4,
     "module_count": 0,
@@ -30,7 +30,7 @@
         ]
       }
     ],
-    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 9347c4076b3ff54e8b2d57cc66b84a5648e8ebffda6f05a83b5242819b15389c --allow data-update",
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum f24c786207edb153b884bb62584f98cf84db684033cc330b9d80d4d254b65247 --allow data-update",
     "probes": [
       "foreign keys with incompatible collations for app.child.fk_parent",
       "rows of app.partitioned inside the range of its new partition app.part: they are in its DEFAULT partition now, and the engine will not create a partition over them; move or delete them first, then plan again"

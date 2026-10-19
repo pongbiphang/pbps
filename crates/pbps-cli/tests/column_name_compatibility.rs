@@ -1,5 +1,6 @@
 //! Captured on unchanged master c50c0db4 before #2084 step 2's production edits.
 //! Collections exercise column identities independently of their printed spelling.
+//! Versioned artifacts advance with the plan/state formats; name bytes stay raw.
 
 use pbps_dialect::Dialect;
 use pbps_model::*;

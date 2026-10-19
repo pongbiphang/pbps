@@ -170,7 +170,8 @@ pub fn query(
             table: name.clone(),
             why: format!(
                 "its column `{column}` is `{}`, a user-defined type reference, and pbps reads no rows of this type",
-                spec.ty
+                spec.ty,
+                column = column.shown()
             ),
         });
     }

@@ -201,7 +201,13 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
                 .get(column)
                 .is_some_and(|c| c.ty.type_ref().is_some())
             {
-                found.push(invalid(format!("partition key `{column}` has a user-defined type reference, which is not supported as a partition key")));
+                found.push(DialectError::InvalidVerbatim {
+                    dialect: crate::types::DIALECT,
+                    message: format!(
+                        "partition key `{column}` has a user-defined type reference, which is not supported as a partition key",
+                        column = column.shown(),
+                    ),
+                });
             }
             if !table.columns.contains_key(column) {
                 found.push(invalid(format!(
@@ -1339,9 +1345,13 @@ impl Dialect for Postgres {
         if table.data.is_some() {
             for (column, spec) in &table.columns {
                 if spec.ty.type_ref().is_some() {
-                    found.push(DialectError::Invalid {
+                    found.push(DialectError::InvalidVerbatim {
                         dialect: types::DIALECT,
-                        message: format!("`data:` cannot be declared on a table with the user-defined type reference `{}` on column `{column}`", spec.ty),
+                        message: format!(
+                            "`data:` cannot be declared on a table with the user-defined type reference `{}` on column `{column}`",
+                            pbps_model::escape::Escaped(&spec.ty.to_string()),
+                            column = column.shown(),
+                        ),
                     });
                 }
             }
@@ -5245,50 +5255,61 @@ mod tests {
     #[test]
     fn references_are_admitted_as_columns_but_refused_as_partition_keys() {
         let name = "app.t".parse().unwrap();
-        let mut table = Table::default();
-        for (column, spelling) in [
-            ("mood", "app.mood"),
-            ("moods", "app.mood[]"),
-            ("note", "text"),
-        ] {
-            table
-                .columns
-                .insert(column.into(), pbps_model::Column::new(ty(spelling)));
-        }
-        assert!(Postgres::new().validate_table(&name, &table).is_empty());
-        table.partition_by = Some(pbps_model::PartitionBy {
-            strategy: pbps_model::PartitionStrategy::Range,
-            columns: vec!["mood".into()],
-            external: false,
-        });
-        let found = Postgres::new().validate_table(&name, &table);
-        assert!(
-            found
+        for spelling in ["mood", "mood\n\\name"] {
+            let column: pbps_model::ColumnName = spelling.into();
+            let mut table = Table::default();
+            for (column, spelling) in [
+                (column.clone(), "app.mood"),
+                ("moods".into(), "app.mood[]"),
+                ("note".into(), "text"),
+            ] {
+                table
+                    .columns
+                    .insert(column, pbps_model::Column::new(ty(spelling)));
+            }
+            assert!(Postgres::new().validate_table(&name, &table).is_empty());
+            table.partition_by = Some(pbps_model::PartitionBy {
+                strategy: pbps_model::PartitionStrategy::Range,
+                columns: vec![column.clone()],
+                external: false,
+            });
+            let found = Postgres::new().validate_table(&name, &table);
+            let message = found
                 .iter()
-                .any(|e| e.to_string().contains("user-defined type reference")
-                    && e.to_string().contains("partition key")),
-            "{found:?}"
-        );
+                .map(ToString::to_string)
+                .find(|m| m.contains("user-defined type reference"))
+                .expect("a referenced partition key refuses");
+            assert!(
+                message.contains(&format!("partition key `{}`", column.shown())),
+                "{message}"
+            );
+        }
     }
 
     #[test]
     fn a_scalar_reference_refuses_declared_data_by_type_before_any_row_read() {
         let name = "app.t".parse().unwrap();
-        let mut table = Table::default();
-        table
-            .columns
-            .insert("mood".into(), pbps_model::Column::new(ty("app.mood")));
-        table.data = Some(pbps_model::TableData {
-            mode: pbps_model::DataMode::Ensure,
-            rows: Default::default(),
-        });
-        assert!(
-            Postgres::new()
+        for spelling in ["mood", "mood\n\\name"] {
+            let column: pbps_model::ColumnName = spelling.into();
+            let mut table = Table::default();
+            table
+                .columns
+                .insert(column.clone(), pbps_model::Column::new(ty("app.mood")));
+            table.data = Some(pbps_model::TableData {
+                mode: pbps_model::DataMode::Ensure,
+                rows: Default::default(),
+            });
+            let message = Postgres::new()
                 .validate_table(&name, &table)
                 .iter()
-                .any(|e| e.to_string().contains("`data:`")
-                    && e.to_string().contains("user-defined type reference"))
-        );
+                .map(ToString::to_string)
+                .find(|m| m.contains("`data:`") && m.contains("user-defined type reference"))
+                .expect("reference data refuses before reading rows");
+            assert!(
+                message.contains(&format!("column `{}`", column.shown())),
+                "{message}"
+            );
+        }
     }
 
     /// A name the emitter cannot spell is a table `validate` must not call

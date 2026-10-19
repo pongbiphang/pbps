@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 
 use pbps_db::{Conn, DbError};
 use pbps_model::{
-    Change, ChangeSet, Column, ColumnType, ModuleKind, Schema, TypePin, TypeRef, ValueSource,
+    Change, ChangeSet, Column, ColumnName, ColumnType, ModuleKind, Schema, TypePin, TypeRef,
+    ValueSource,
 };
 
 use crate::pins::Within;
@@ -149,7 +150,7 @@ pub async fn seal(
     let types = read(conn, Within::OwnTransaction, &references).await?;
     for schema in schemas {
         for (table, definition) in &schema.tables {
-            let check_default = |column: &str, spec: &Column| {
+            let check_default = |column: &ColumnName, spec: &Column| {
                 let ty = &spec.ty;
                 let Some(reference) = ty.type_ref() else {
                     return Ok(());
@@ -162,7 +163,8 @@ pub async fn seal(
                 {
                     return Err(failed(format!(
                         "column `{table}.{column}` has a NULL default the engine does not keep; declare no default",
-                        table = table.shown()
+                        table = table.shown(),
+                        column = column.shown()
                     )));
                 }
                 Ok(())
