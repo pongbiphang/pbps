@@ -224,6 +224,45 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
             ));
         }
     }
+    // A partition the read could not take all of its own in, such as a
+    // `DEFERRABLE` foreign key or a hash index, takes its whole tree too
+    // (#2072), and for the same reason. Written without that object it is a
+    // managed relation with a limitation, which every later command refuses
+    // by name; a table is carried that way, but a tree is read whole or not
+    // at all. One place for its own indexes and foreign keys alike: the
+    // limitation, not the kind of object, is what the commands refuse on.
+    let mut limited: std::collections::BTreeMap<
+        pbps_model::TableName,
+        (pbps_model::TableName, String),
+    > = std::collections::BTreeMap::new();
+    for limitation in &pulled.limitations {
+        match &limitation.target {
+            LimitationTarget::Relation(name) => {
+                if let Some(of) = schema
+                    .tables
+                    .get(name)
+                    .and_then(|t| t.partition_of.as_ref())
+                {
+                    limited
+                        .entry(of.parent.clone())
+                        .or_insert_with(|| (name.clone(), limitation.detail.clone()));
+                }
+            }
+            LimitationTarget::SharedModule(_)
+            | LimitationTarget::Module(_)
+            | LimitationTarget::UnnameableModule(_) => {}
+        }
+    }
+    for (parent, (name, why)) in limited {
+        if schema.tables.remove(&parent).is_some() {
+            pulled.warnings.push(format!(
+                "table `{parent}` was left out with its partitions: pbps cannot read all of its \
+                 partition `{name}` — {why}",
+                parent = parent.shown(),
+                name = name.shown()
+            ));
+        }
+    }
     // A partition goes with its parent (#1170): written alone it would name
     // a parent the declarations do not have, which the whole-schema check
     // refuses for the whole write.
@@ -864,6 +903,66 @@ mod tests {
             warned.contains("table `app.bad_2` was left out: it is a partition of `app.bad`"),
             "{warned}"
         );
+    }
+
+    /// A partition the read could not take all of its own in takes its whole
+    /// tree out, named with the limitation (#2072). Negative: a limitation on
+    /// a plain table leaves it carried, and a tree with none stays as read.
+    #[test]
+    fn a_partition_with_a_limitation_takes_its_tree_out() {
+        let mut pulled = Pulled::default();
+        let s = &mut pulled.schema;
+        let mut parent = table("integer", None);
+        parent.partition_by = Some(pbps_model::PartitionBy {
+            external: false,
+            columns: vec!["id".into()],
+            strategy: Default::default(),
+        });
+        s.tables
+            .insert(TableName::new("app", "bad"), parent.clone());
+        s.tables.insert(TableName::new("app", "good"), parent);
+        s.tables
+            .insert(TableName::new("app", "plain"), table("integer", None));
+        for (name, of) in [("bad_1", "bad"), ("bad_2", "bad"), ("good_1", "good")] {
+            let partition = pbps_model::Table {
+                partition_of: Some(pbps_model::PartitionOf {
+                    parent: TableName::new("app", of),
+                    bound: pbps_model::PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            };
+            s.tables.insert(TableName::new("app", name), partition);
+        }
+        for on in ["bad_2", "plain"] {
+            pulled.limitations.push(pbps_db::catalog::Limitation {
+                target: LimitationTarget::Relation(TableName::new("app", on)),
+                detail: format!("foreign key `k` on `app.{on}` is `DEFERRABLE`"),
+            });
+        }
+
+        leave_out_what_validate_refuses(&mut pulled, pg().as_ref());
+
+        let kept: Vec<String> = pulled
+            .schema
+            .tables
+            .keys()
+            .map(|n| n.raw().to_string())
+            .collect();
+        assert_eq!(kept, ["app.good", "app.good_1", "app.plain"]);
+        let warned = pulled.warnings.join("\n");
+        assert!(
+            warned.contains(
+                "table `app.bad` was left out with its partitions: pbps cannot read all of its \
+                 partition `app.bad_2` — foreign key `k` on `app.bad_2` is `DEFERRABLE`"
+            ),
+            "{warned}"
+        );
+        assert!(
+            warned.contains("table `app.bad_1` was left out: it is a partition of `app.bad`"),
+            "{warned}"
+        );
+        assert!(!warned.contains("app.plain"), "{warned}");
     }
 
     /// A grant is judged by what removing it fixes. Validated on its own,

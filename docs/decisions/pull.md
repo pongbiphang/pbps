@@ -925,3 +925,30 @@ old predicate and policy count, but needs the other policy columns for this
 complete read; without them the batch fails with `42501` rather than claiming
 an empty policy set. Neither the display view nor the table's enable flag can
 stand in for a complete policy read.
+
+<a id="dec-2072-1"></a>
+
+**DEC-2072.1. A partition the read cannot take all of its own in leaves its
+whole tree out of a pull, named.** (#2072; extends #1170 and DEC-1577.1)
+
+The partition-tree predicate admits a partition's own foreign keys and
+indexes before the object readers decide whether they can hold them. A
+`DEFERRABLE` key, a `MATCH FULL` one, or a hash index then reaches its
+reader, which names a limitation on the partition and leaves the object out.
+A plain table is carried that way: the limitation refuses the later
+commands by name. In a partition, it would also leave the parent written
+with a member every later command refuses, where a tree is read whole or not
+at all. So `pull` and `init --from` now leave out the parent of any
+partition that holds a limitation, in the same pass that already leaves out
+a tree whose partition `validate` refuses. Its partitions follow, and the
+warning names the partition and the limitation.
+
+The rule keys on the limitation, not the kind of object, so a partition's
+own indexes and own foreign keys are treated alike in one place. The other
+route, narrowing the predicate to what the readers can hold, was not taken.
+It would duplicate every reader's rule in SQL, and a referenced uniqueness
+left out is only known after the read.
+
+Pinned by `a_partition_with_a_limitation_takes_its_tree_out` (unit, with a
+limited plain table carried as the negative) and, live on 16 and 18, by
+`a_partition_the_read_cannot_hold_all_of_takes_its_tree_out_of_a_pull`.
