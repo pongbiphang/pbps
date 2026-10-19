@@ -62,7 +62,8 @@ pbps-model.workspace = true
 # For the live tests only: the ledger state a CLI flag cannot produce — a lock
 # taken while the ledger is still empty — is set up with the same functions the
 # tool uses, rather than by a copy of the DDL in the test.
-pbps-db.workspace = true
+# PostgreSQL resolver tests count requests without timing shared-host load.
+pbps-db = { workspace = true, features = ["test-request-count"] }
 pbps-mssql.workspace = true
 tokio = { workspace = true, features = ["macros", "io-util"] }
 jsonschema.workspace = true

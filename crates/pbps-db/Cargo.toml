@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Enabled by the CLI's dev-dependency only; production has no counter hooks.
+test-request-count = []
+
 [dependencies]
 pbps-model.workspace = true
 # For `TransactionFraming` only: the text of begin/commit/rollback is the

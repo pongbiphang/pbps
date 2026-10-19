@@ -46,6 +46,8 @@ pub struct Conn {
 /// pinned zone and not its own. `SHOW` and not `current_setting`, so nothing a
 /// schema user created is on the way before the path is pinned.
 async fn fresh_zone(client: &tokio_postgres::Client) -> Result<SessionZone, DbError> {
+    #[cfg(feature = "test-request-count")]
+    crate::request_count::record();
     let rows = client.simple_query("SHOW TimeZone").await?;
     let answer = rows.iter().find_map(|m| {
         if let tokio_postgres::SimpleQueryMessage::Row(row) = m {
@@ -89,6 +91,8 @@ fn version_name(num: i32) -> String {
 /// (DEC-2151.1). `SHOW` for the reason [`fresh_zone`] gives, before anything
 /// else is asked of the session.
 async fn require_supported_server(client: &tokio_postgres::Client) -> Result<(), DbError> {
+    #[cfg(feature = "test-request-count")]
+    crate::request_count::record();
     let rows = client.simple_query("SHOW server_version_num").await?;
     let answer = rows.iter().find_map(|m| {
         if let tokio_postgres::SimpleQueryMessage::Row(row) = m {
@@ -498,6 +502,8 @@ impl Conn {
     /// [`Row`] the only row this driver produces, and an introspection query is
     /// one statement.
     pub(crate) async fn query(&mut self, sql: &str) -> Result<Vec<Row>, DbError> {
+        #[cfg(feature = "test-request-count")]
+        crate::request_count::record();
         Ok(self
             .client
             .query(sql, &[])
@@ -513,6 +519,8 @@ impl Conn {
     /// (ADR-0014's seam table): DDL is sent as a batch exactly the way the
     /// emitter framed it, with no parameter machinery in the way.
     pub(crate) async fn execute(&mut self, sql: &str) -> Result<(), DbError> {
+        #[cfg(feature = "test-request-count")]
+        crate::request_count::record();
         self.client.batch_execute(sql).await?;
         Ok(())
     }
@@ -522,6 +530,8 @@ impl Conn {
         sql: &str,
         params: &[Param<'_>],
     ) -> Result<Vec<Row>, DbError> {
+        #[cfg(feature = "test-request-count")]
+        crate::request_count::record();
         let bound = bind(params);
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             bound.iter().map(AsRef::as_ref).collect();
@@ -539,6 +549,8 @@ impl Conn {
         sql: &str,
         params: &[Param<'_>],
     ) -> Result<u64, DbError> {
+        #[cfg(feature = "test-request-count")]
+        crate::request_count::record();
         let bound = bind(params);
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             bound.iter().map(AsRef::as_ref).collect();
