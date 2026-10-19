@@ -37,6 +37,11 @@ use pbps_model::{
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DiffError {
     #[error(
+        "column {column}: its partition default cannot be planned: {reason}",
+        column = .column.shown(),
+    )]
+    PartitionDefault { column: ColumnRef, reason: String },
+    #[error(
         "{table} has row-security flags or policies; RLS planning arrives with #1172's later PRs",
         table = .table.shown(),
     )]
@@ -965,7 +970,9 @@ pub(crate) fn diff_partial_rebuilding(
                         base,
                         declared,
                         &index,
+                        dialect,
                         &mut changes,
+                        &mut errs,
                     );
                     // A column without a default where its parent's has one:
                     // the attach gives it none, which no declaration can say
@@ -975,15 +982,17 @@ pub(crate) fn diff_partial_rebuilding(
                     let parent = declared.schema.tables.get(&of.parent);
                     for column in defaultless {
                         let own = of.columns.get(&column).and_then(|c| c.default.as_ref());
-                        let fallback = parent.and_then(|p| p.columns.get(&column)).and_then(|c| {
-                            match &c.value_source {
-                                ValueSource::Default(value) => Some(value.clone()),
-                                ValueSource::None
-                                | ValueSource::Identity(_)
-                                | ValueSource::Sequence(_)
-                                | ValueSource::Generated(_) => None,
-                            }
-                        });
+                        let fallback = partition_default(
+                            dialect,
+                            &of.parent,
+                            &column,
+                            parent.and_then(|p| p.columns.get(&column)),
+                            base.schema
+                                .tables
+                                .get(&of.parent)
+                                .and_then(|p| p.columns.get(&column)),
+                            &mut errs,
+                        );
                         if let (None, Some(fallback)) = (own, fallback) {
                             changes.push(Change::SetPartitionDefault {
                                 uid: uid.clone(),
@@ -1039,7 +1048,9 @@ pub(crate) fn diff_partial_rebuilding(
             base,
             declared,
             &index,
+            dialect,
             &mut changes,
+            &mut errs,
         );
         // Rows are compared by column *name* on each side, and a rename in
         // this same plan means the two sides know one column by two names.
@@ -3608,7 +3619,7 @@ fn attached(
     }
     // Types in the engine's spelling, as `diff_columns` compares them. A
     // default and NOT NULL may be its own, and are compared below.
-    let columns = |t: &Table| -> Vec<(ColumnName, pbps_model::Column)> {
+    let columns = |t: &Table, is_parent: bool| -> Vec<(ColumnName, pbps_model::Column)> {
         t.columns
             .iter()
             .map(|(name, c)| {
@@ -3623,6 +3634,10 @@ fn attached(
                     value_source: match &c.value_source {
                         ValueSource::Default(_) | ValueSource::None => ValueSource::None,
                         ValueSource::Identity(identity) => ValueSource::Identity(*identity),
+                        // The parent's serial is a default the partition
+                        // copies, not a sequence the attached table owns.
+                        // An ordinary table's own sequence still differs.
+                        ValueSource::Sequence(_) if is_parent => ValueSource::None,
                         ValueSource::Sequence(sequence) => ValueSource::Sequence(sequence.clone()),
                         ValueSource::Generated(generated) => {
                             ValueSource::Generated(generated.clone())
@@ -3686,7 +3701,10 @@ fn attached(
         t
     };
     let (table_spelled, parent_spelled) = (spelled(table, base_name), spelled(parent, &of.parent));
-    let (mine, theirs) = (columns(&table_spelled), columns(&parent_spelled));
+    let (mine, theirs) = (
+        columns(&table_spelled, false),
+        columns(&parent_spelled, true),
+    );
     let names = |c: &[(ColumnName, pbps_model::Column)]| {
         c.iter()
             .map(|(n, _)| n.shown().to_string())
@@ -3780,11 +3798,8 @@ fn attached(
             | ValueSource::Sequence(_)
             | ValueSource::Generated(_) => true,
         }) && (match &p.value_source {
-            ValueSource::Default(_) => true,
-            ValueSource::None
-            | ValueSource::Identity(_)
-            | ValueSource::Sequence(_)
-            | ValueSource::Generated(_) => false,
+            ValueSource::Default(_) | ValueSource::Sequence(_) => true,
+            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => false,
         }) {
             defaultless.push(name.clone());
         }
@@ -4782,7 +4797,9 @@ fn diff_partition_columns(
     base: Side<'_>,
     declared: Side<'_>,
     index: &Indexes<'_>,
+    dialect: &dyn Dialect,
     changes: &mut Vec<Change>,
+    errors: &mut Vec<DiffError>,
 ) {
     let (Some(was), Some(now)) = (&base_table.partition_of, &declared_table.partition_of) else {
         return;
@@ -4840,14 +4857,25 @@ fn diff_partition_columns(
         let theirs = parent.and_then(|p| p.columns.get(column));
         let theirs_was = base_of.get(column);
         let parent_default = |c: &pbps_model::Column| match &c.value_source {
-            ValueSource::Default(default) => Some(default.clone()),
-            ValueSource::None
-            | ValueSource::Identity(_)
-            | ValueSource::Sequence(_)
-            | ValueSource::Generated(_) => None,
+            source @ (ValueSource::Default(_) | ValueSource::Sequence(_)) => Some(source.clone()),
+            ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
         };
-        let default_moved =
-            theirs_was.is_some_and(|b| Some(parent_default(b)) != theirs.map(parent_default));
+        let was_default = theirs_was.and_then(|c| parent_default(c));
+        let now_default = theirs.and_then(parent_default);
+        // An omitted sequence name is unknown in a declaration, not a
+        // request to replace the name a read knows (DEC-1631.1).
+        let default_moved = theirs_was.is_some()
+            && if let (Some(ValueSource::Sequence(was)), Some(ValueSource::Sequence(now))) =
+                (&was_default, &now_default)
+            {
+                let was = pbps_model::OwnedSequence {
+                    name: was.name.clone().or_else(|| now.name.clone()),
+                    ..was.clone()
+                };
+                !now.declares(&was)
+            } else {
+                was_default != now_default
+            };
         if from.default != to.default || (default_moved && to.default.is_some()) {
             changes.push(Change::SetPartitionDefault {
                 uid: uid.clone(),
@@ -4858,15 +4886,14 @@ fn diff_partition_columns(
                 to: to.default.clone(),
                 // What the engine gave the partition when it was made, and
                 // what a row written to it directly gets without one.
-                fallback: parent.and_then(|p| p.columns.get(column)).and_then(|c| {
-                    match &c.value_source {
-                        ValueSource::Default(value) => Some(value.clone()),
-                        ValueSource::None
-                        | ValueSource::Identity(_)
-                        | ValueSource::Sequence(_)
-                        | ValueSource::Generated(_) => None,
-                    }
-                }),
+                fallback: partition_default(
+                    dialect,
+                    &now.parent,
+                    column,
+                    theirs,
+                    theirs_was.copied(),
+                    errors,
+                ),
             });
         }
         let tightened =
@@ -4879,6 +4906,46 @@ fn diff_partition_columns(
                 not_null: to.not_null,
             });
         }
+    }
+}
+
+/// Both an attach and an override removed later take the parent's default.
+/// Keep the serial expression in the dialect, while the saved change keeps
+/// the same concrete fallback text as a plain default (DEC-2218.1).
+fn partition_default(
+    dialect: &dyn Dialect,
+    parent: &TableName,
+    column: &ColumnName,
+    declared: Option<&pbps_model::Column>,
+    previous: Option<&pbps_model::Column>,
+    errors: &mut Vec<DiffError>,
+) -> Option<String> {
+    match &declared?.value_source {
+        ValueSource::Default(value) => Some(value.clone()),
+        ValueSource::Sequence(sequence) => {
+            let name = previous.and_then(|c| match &c.value_source {
+                ValueSource::Sequence(sequence) => sequence.name.clone(),
+                ValueSource::None
+                | ValueSource::Default(_)
+                | ValueSource::Identity(_)
+                | ValueSource::Generated(_) => None,
+            });
+            let sequence = pbps_model::OwnedSequence {
+                name: sequence.name.clone().or(name),
+                ..sequence.clone()
+            };
+            match dialect.owned_sequence_default(parent, column.raw(), &sequence) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    errors.push(DiffError::PartitionDefault {
+                        column: parent.column(column.clone()),
+                        reason: error.to_string(),
+                    });
+                    None
+                }
+            }
+        }
+        ValueSource::None | ValueSource::Identity(_) | ValueSource::Generated(_) => None,
     }
 }
 
@@ -12019,6 +12086,225 @@ mod tests {
                 .any(|e| matches!(e, DiffError::PartitionedTableChange { .. })),
             "{errors:?}"
         );
+    }
+
+    /// A serial fallback is supplied by the dialect, not by naming a
+    /// PostgreSQL sequence in the differ (DEC-2218.1).
+    #[test]
+    fn an_attached_partition_takes_its_serial_parents_default_unless_it_declares_its_own() {
+        use pbps_model::{
+            Identity, OwnedSequence, PartitionBound, PartitionBy, PartitionColumn, PartitionOf,
+        };
+
+        let plain = table(&[
+            ("id", Column::new(ty("bigint")).not_null()),
+            ("v", Column::new(ty("integer"))),
+        ]);
+        for source in [
+            ValueSource::Default("42".into()),
+            ValueSource::Sequence(OwnedSequence::serial()),
+            ValueSource::Identity(Identity::new(1, 1)),
+        ] {
+            let mut parent = plain.clone();
+            parent.columns["id"].value_source = source.clone();
+            parent.partition_by = Some(PartitionBy {
+                external: false,
+                columns: vec!["v".into()],
+                strategy: Default::default(),
+            });
+            let mut base = schema_of("app.p", parent);
+            let mut ordinary = plain.clone();
+            if let ValueSource::Identity(identity) = &source {
+                ordinary.columns["id"].value_source = ValueSource::Identity(*identity);
+            }
+            base.tables.insert("app.t".parse().unwrap(), ordinary);
+            let mut declared = base.clone();
+            let partition = Table {
+                partition_of: Some(PartitionOf {
+                    parent: "app.p".parse().unwrap(),
+                    bound: PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            };
+            declared.tables.insert("app.t".parse().unwrap(), partition);
+            let planned = run_with(&SerialDefaults, &base, &declared, &[]);
+            let expected = match &source {
+                ValueSource::Default(value) => Some(value.as_str()),
+                ValueSource::Sequence(_) => Some("dialect serial default"),
+                ValueSource::Identity(_) => None,
+                ValueSource::None | ValueSource::Generated(_) => unreachable!("test sources"),
+            };
+            if let Some(expected) = expected {
+                assert_eq!(kinds(&planned), ["AttachPartition", "SetPartitionDefault"]);
+                assert!(matches!(
+                    &planned.changes[1].change,
+                    Change::SetPartitionDefault { to: None, fallback: Some(f), .. } if f == expected
+                ));
+            } else {
+                assert_eq!(kinds(&planned), ["AttachPartition"]);
+                continue;
+            }
+
+            // An own default is set once; no later fallback overwrites it.
+            declared
+                .tables
+                .get_mut(&"app.t".parse::<TableName>().unwrap())
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .insert(
+                    "id".into(),
+                    PartitionColumn {
+                        default: Some("7".into()),
+                        not_null: false,
+                    },
+                );
+            let own = run_with(&SerialDefaults, &base, &declared, &[]);
+            assert_eq!(kinds(&own), ["AttachPartition", "SetPartitionDefault"]);
+            assert!(matches!(
+                &own.changes[1].change,
+                Change::SetPartitionDefault { to: Some(value), .. } if value == "7"
+            ));
+
+            // Removing that override on a standing partition restores the
+            // same fallback as the attach, including a serial's expression.
+            let mut restored = declared.clone();
+            restored
+                .tables
+                .get_mut(&"app.t".parse::<TableName>().unwrap())
+                .unwrap()
+                .partition_of
+                .as_mut()
+                .unwrap()
+                .columns
+                .clear();
+            let planned = run_with(&SerialDefaults, &declared, &restored, &[]);
+            assert_eq!(kinds(&planned), ["SetPartitionDefault"]);
+            assert!(matches!(
+                &planned.changes[0].change,
+                Change::SetPartitionDefault { to: None, fallback: Some(f), .. } if Some(f.as_str()) == expected
+            ));
+            if let ValueSource::Sequence(sequence) = &source {
+                let mut recorded = declared.clone();
+                recorded
+                    .tables
+                    .get_mut(&TableName::new("app", "p"))
+                    .unwrap()
+                    .columns["id"]
+                    .value_source = ValueSource::Sequence(OwnedSequence {
+                    name: Some("known sequence default".into()),
+                    ..sequence.clone()
+                });
+                assert!(run_with(&SerialDefaults, &recorded, &declared, &[]).is_empty());
+                let planned = run_with(&SerialDefaults, &recorded, &restored, &[]);
+                assert!(matches!(&planned.changes[0].change,
+                    Change::SetPartitionDefault { fallback: Some(f), .. } if f == "known sequence default"));
+
+                // An ordinary table's own sequence is not an inherited
+                // copy: silently discarding its ownership would lose intent.
+                base.tables
+                    .get_mut(&TableName::new("app", "t"))
+                    .unwrap()
+                    .columns["id"]
+                    .value_source = source.clone();
+                let base_ids = crate::resolve(&base, &IdsFile::default(), &[], &ctx())
+                    .unwrap()
+                    .ids;
+                let declared_ids = crate::resolve(&declared, &base_ids, &[], &ctx())
+                    .unwrap()
+                    .ids;
+                let errors = diff(
+                    Side {
+                        schema: &base,
+                        ids: &base_ids,
+                    },
+                    Side {
+                        schema: &declared,
+                        ids: &declared_ids,
+                    },
+                    &SerialDefaults,
+                    &Hints::default(),
+                )
+                .unwrap_err();
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| matches!(e, DiffError::AttachedShape { .. })),
+                    "{errors:?}"
+                );
+            }
+        }
+    }
+
+    /// Returning opaque text proves that the differ uses the dialect's
+    /// answer without constructing SQL or a generated sequence name itself.
+    struct SerialDefaults;
+
+    impl Dialect for SerialDefaults {
+        fn name(&self) -> &'static str {
+            "serial-defaults"
+        }
+        fn owned_sequence_default(
+            &self,
+            table: &TableName,
+            column: &str,
+            sequence: &pbps_model::OwnedSequence,
+        ) -> Result<String, pbps_dialect::DialectError> {
+            assert_eq!(table, &TableName::new("app", "p"));
+            assert_eq!(column, "id");
+            Ok(sequence
+                .name
+                .clone()
+                .unwrap_or_else(|| "dialect serial default".into()))
+        }
+        fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
+            MinimalDialect.quote_ident(ident)
+        }
+        fn emit(
+            &self,
+            change: &Change,
+            strategy: pbps_model::Strategy,
+        ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
+            MinimalDialect.emit(change, strategy)
+        }
+        fn normalize_type(
+            &self,
+            ty: &ColumnType,
+        ) -> Result<ColumnType, pbps_dialect::DialectError> {
+            MinimalDialect.normalize_type(ty)
+        }
+        fn type_change_risk(
+            &self,
+            from: &ColumnType,
+            to: &ColumnType,
+        ) -> pbps_dialect::TypeChangeRisk {
+            MinimalDialect.type_change_risk(from, to)
+        }
+        fn fold_ident<'a>(&self, ident: &'a str) -> std::borrow::Cow<'a, str> {
+            MinimalDialect.fold_ident(ident)
+        }
+        fn lexicon(&self) -> pbps_dialect::Lexicon {
+            MinimalDialect.lexicon()
+        }
+        fn validate_table(
+            &self,
+            name: &TableName,
+            table: &Table,
+        ) -> Vec<pbps_dialect::DialectError> {
+            MinimalDialect.validate_table(name, table)
+        }
+        fn transaction_framing(
+            &self,
+            zone: &pbps_model::SessionZone,
+        ) -> pbps_dialect::TransactionFraming {
+            MinimalDialect.transaction_framing(zone)
+        }
+        fn probe_framing(&self) -> Option<pbps_dialect::TransactionFraming> {
+            MinimalDialect.probe_framing()
+        }
     }
 
     /// A partition's own column defaults and NOT NULLs (#1578) are created

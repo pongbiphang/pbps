@@ -1658,6 +1658,15 @@ impl Dialect for Postgres {
         Some(emit::owned_sequence(table, column, sequence).name)
     }
 
+    fn owned_sequence_default(
+        &self,
+        table: &TableName,
+        column: &str,
+        sequence: &pbps_model::OwnedSequence,
+    ) -> Result<String, DialectError> {
+        emit::owned_sequence_default(table, column, sequence)
+    }
+
     fn implicit_relation_names(
         &self,
         name: &TableName,
