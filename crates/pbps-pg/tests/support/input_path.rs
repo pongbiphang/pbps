@@ -1665,3 +1665,156 @@ async fn stored_typed_composite_array_and_range_defaults_do_not_recheck_nested_d
         db.drop().await;
     }
 }
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 18; see scripts/live-tests-pg.sh"]
+async fn io_coercions_execute_nested_checks_and_require_trust_on_postgres_18() {
+    io_coercions_execute_nested_checks("18").await;
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 16; see scripts/live-tests-pg.sh"]
+async fn io_coercions_execute_nested_checks_and_require_trust_on_postgres_16() {
+    io_coercions_execute_nested_checks("16").await;
+}
+
+async fn io_coercions_execute_nested_checks(major: &str) {
+    let server = servers().into_iter().find(|s| s.label == major).unwrap();
+    let mut db = Scratch::create(&server, "io_proof").await;
+    let (_, mut me) = deployer(&mut db).await;
+    let stranger = db.role("stranger", "NOLOGIN").await;
+    run(
+        &mut me,
+        major,
+        "CREATE TABLE app.calls (n integer);
+         CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql AS $$
+           BEGIN INSERT INTO app.calls VALUES (1); RETURN true; END $$;
+         CREATE DOMAIN app.checked AS integer CHECK (app.seen(VALUE));
+         CREATE TYPE app.pair AS (v app.checked);
+         CREATE TYPE app.nested_pair AS (v app.pair);
+         CREATE TYPE app.span AS RANGE (subtype = app.checked);
+         CREATE DOMAIN app.io_array AS text CHECK (VALUE::app.checked[] IS NOT NULL);
+         CREATE DOMAIN app.io_pair AS text CHECK (VALUE::app.pair IS NOT NULL);
+         CREATE DOMAIN app.io_nested AS text CHECK (VALUE::app.nested_pair IS NOT NULL);
+         CREATE DOMAIN app.io_range AS text CHECK (VALUE::app.span IS NOT NULL);
+         CREATE DOMAIN app.array_io AS text[] CHECK (VALUE::app.pair[] IS NOT NULL);
+         CREATE DOMAIN app.reconstructed AS app.pair DEFAULT '(1)'::app.pair
+           CHECK (VALUE::text::app.pair IS NOT NULL);
+         CREATE DOMAIN app.row_build AS app.pair DEFAULT ROW(1::app.checked)::app.pair;
+         CREATE DOMAIN app.array_build AS app.checked[] DEFAULT ARRAY[1::app.checked];
+         CREATE DOMAIN app.relabel AS app.checked[] DEFAULT '{1}'::app.checked[]
+           CHECK (VALUE::integer[] IS NOT NULL);
+         CREATE DOMAIN app.subscript AS app.checked[] DEFAULT '{1}'::app.checked[]
+           CHECK (VALUE[1] > 0);
+         CREATE DOMAIN app.positive AS integer CHECK (VALUE > 0);
+         CREATE DOMAIN app.io_builtin AS text CHECK (VALUE::app.positive[] IS NOT NULL);
+         CREATE DOMAIN app.checked_json AS jsonb CHECK (app.seen(1));
+         CREATE DOMAIN app.json_build AS integer
+           CHECK (JSON_OBJECT('v': VALUE RETURNING app.checked_json) IS NOT NULL);
+         TRUNCATE app.calls;",
+    )
+    .await;
+    let mut errors = Vec::new();
+    for (name, sql) in [
+        ("io_array", "SELECT '{1}'::app.io_array"),
+        ("io_pair", "SELECT '(1)'::app.io_pair"),
+        ("io_nested", "SELECT '(\"(1)\")'::app.io_nested"),
+        ("io_range", "SELECT '[1,2)'::app.io_range"),
+        ("array_io", "SELECT ARRAY['(1)']::app.array_io"),
+        ("reconstructed", "SELECT '(1)'::app.reconstructed"),
+        ("json_build", "SELECT 1::app.json_build"),
+        (
+            "row_build",
+            "CREATE TABLE app.r(v app.row_build); INSERT INTO app.r DEFAULT VALUES",
+        ),
+        (
+            "array_build",
+            "CREATE TABLE app.a(v app.array_build); INSERT INTO app.a DEFAULT VALUES",
+        ),
+    ] {
+        let path = gate(&mut me, &[], name).await;
+        if !matches!(&path, InputPath::Refused(reasons) if routines(reasons).iter().any(|r| r.identity == "app.seen(integer)"))
+        {
+            errors.push(format!("{name} did not find the nested CHECK: {path:?}"));
+        }
+        if number(&mut me, "SELECT count(*)::integer FROM app.calls").await != 0 {
+            errors.push(format!("reading {name} executed code"));
+        }
+        run(&mut me, major, sql).await;
+        if number(&mut me, "SELECT count(*)::integer FROM app.calls").await == 0 {
+            errors.push(format!("{name} did not execute its nested CHECK"));
+        }
+        run(&mut me, major, "TRUNCATE app.calls").await;
+    }
+    // Already typed values stay typed: neither the array relabel nor fetching
+    // an element re-runs its CHECK. Constructor coercions above do run it.
+    for (name, sql) in [
+        (
+            "relabel",
+            "CREATE TABLE app.rl(v app.relabel); INSERT INTO app.rl DEFAULT VALUES",
+        ),
+        (
+            "subscript",
+            "CREATE TABLE app.ss(v app.subscript); INSERT INTO app.ss DEFAULT VALUES",
+        ),
+    ] {
+        let path = gate(&mut me, &[], name).await;
+        if !matches!(path, InputPath::Admitted(_)) {
+            errors.push(format!("{name} refused an already typed value: {path:?}"));
+        }
+        run(&mut me, major, sql).await;
+        if number(&mut me, "SELECT count(*)::integer FROM app.calls").await != 0 {
+            errors.push(format!("{name} rechecked an already typed value"));
+        }
+    }
+    let path = gate(&mut me, &[], "io_builtin").await;
+    if !matches!(path, InputPath::Admitted(_)) {
+        errors.push(format!("builtin I/O input refused: {path:?}"));
+    }
+    db.sql(&format!(
+        "GRANT USAGE ON SCHEMA app TO {stranger}; ALTER DOMAIN app.positive OWNER TO {stranger}"
+    ))
+    .await;
+    let path = gate(&mut me, &[], "io_builtin").await;
+    if !matches!(&path, InputPath::Refused(reasons) if owner_reasons(reasons).iter().any(|r| r.owner == stranger))
+    {
+        errors.push(format!("nested I/O target owner not checked: {path:?}"));
+    }
+    let path = gate(&mut me, &[&stranger], "io_builtin").await;
+    if !matches!(path, InputPath::Admitted(_)) {
+        errors.push(format!("trusted I/O target owner refused: {path:?}"));
+    }
+    drop(me);
+    db.drop().await;
+    assert!(errors.is_empty(), "PG {major}: {errors:#?}");
+}
+
+#[tokio::test]
+#[ignore = "needs live PostgreSQL 18; see scripts/live-tests-pg.sh"]
+async fn json_return_coercion_runs_a_domain_check_and_is_unreadable_on_postgres_18() {
+    let server = servers().into_iter().find(|s| s.label == "18").unwrap();
+    let mut db = Scratch::create(&server, "json_proof").await;
+    let (_, mut me) = deployer(&mut db).await;
+    run(
+        &mut me,
+        "18",
+        "CREATE TABLE app.calls(n integer);
+         CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql AS $$
+           BEGIN INSERT INTO app.calls VALUES(1); RETURN true; END $$;
+         CREATE DOMAIN app.checked AS integer CHECK (app.seen(VALUE));
+         CREATE DOMAIN app.json_input AS jsonb
+           CHECK (JSON_VALUE(VALUE, '$.v' RETURNING app.checked) IS NOT NULL);",
+    )
+    .await;
+    let path = gate(&mut me, &[], "json_input").await;
+    let before = number(&mut me, "SELECT count(*)::integer FROM app.calls").await;
+    run(&mut me, "18", "SELECT '{\"v\":1}'::app.json_input").await;
+    let after = number(&mut me, "SELECT count(*)::integer FROM app.calls").await;
+    drop(me);
+    db.drop().await;
+    assert!(
+        matches!(path, InputPath::Unreadable(Unreadable::Failed(ref why)) if why.contains("JSONEXPR")),
+        "{path:?}"
+    );
+    assert_eq!((before, after), (0, 1));
+}

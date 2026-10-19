@@ -1749,6 +1749,69 @@ fn any_language_roots_require_source_review_and_the_saved_opt_in() {
 }
 
 #[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn io_coercion_roots_require_source_review_on_postgres_18() {
+    io_coercion_roots_require_source_review(&server());
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn io_coercion_roots_require_source_review_on_postgres_16() {
+    io_coercion_roots_require_source_review(
+        &std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    );
+}
+
+fn io_coercion_roots_require_source_review(server: &str) {
+    let own = OwnDatabase::new(server, "io_review");
+    let db = own.connection();
+    on_server(
+        db,
+        "CREATE SCHEMA app; CREATE SEQUENCE app.calls;
+         CREATE FUNCTION app.seen(integer) RETURNS boolean LANGUAGE plpgsql AS $$
+           BEGIN PERFORM nextval('app.calls'); RETURN true; END $$;
+         CREATE DOMAIN app.checked AS integer CHECK (app.seen(VALUE));
+         CREATE DOMAIN app.outer_text AS text DEFAULT '{1}'
+           CHECK (VALUE::app.checked[] IS NOT NULL);",
+    );
+    let d = Demo::new("io-review");
+    d.keyed(db);
+    d.table(&declarations(""));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["bootstrap", "--db", db]));
+    on_server(db, "INSERT INTO app.t VALUES (1)");
+    d.table(&declarations("  n: {type: app.outer_text}\n"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    refused_plan(&d, db, "pin_type_routines");
+    assert_eq!(
+        scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+        0
+    );
+    opt_in(&d, db, true);
+    let path = plan(&d, db);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(saved.type_routines.len(), 1);
+    assert!(saved.type_routines[0].definition.contains("nextval"));
+    assert!(saved.type_routine_pins.is_some());
+    assert_eq!(
+        scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+        0
+    );
+    let out = d.run(&["explain", "--plan", path.to_str().unwrap()]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(stdout(&out).contains("nextval"));
+    succeeds(apply_plan(&d, db, &path, false));
+    assert_eq!(
+        scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+        1
+    );
+    succeeds(d.run(&["verify", "--db", db]));
+}
+
+#[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn superuser_owned_root_replacements_are_pinned_separately_from_replaceable_callees() {
     for server in servers() {

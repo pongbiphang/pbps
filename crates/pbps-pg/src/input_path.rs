@@ -43,7 +43,10 @@
 //! A NULL composite, array or range does not evaluate its parts; a statement
 //! DEFAULT can construct them. Stored typed constants have already passed
 //! input conversion, unlike ROW, array coercion and range constructors
-//! (measured on 16 and 18). A cast to a domain follows that domain's CHECKs.
+//! (measured on 16 and 18). A cast to a domain follows that domain's CHECKs;
+//! an I/O coercion also follows the target's reconstructed attributes, elements
+//! and range bounds. A known node layout without an audited execution proof is
+//! unreadable (DEC-2181.4).
 //! A type the engine made (OID below 16384)
 //! is a leaf: nothing a role can write is behind it. The set is closed by
 //! reading, not by listing the kinds of object that might lead somewhere else.
@@ -872,7 +875,8 @@ async fn gather(
     let mut row_compares: BTreeMap<(Oid, Oid), Vec<Use>> = BTreeMap::new();
     let mut runs_code = false;
 
-    let mut roots: Vec<Oid> = vec![root];
+    let mut roots = BTreeMap::from([(root, added.fill == Fill::StatementDefault)]);
+    let mut constructed = BTreeSet::new();
     let mut rounds = 0;
     while !roots.is_empty() {
         rounds += 1;
@@ -881,21 +885,31 @@ async fn gather(
                 "types are nested more than {MAX_DEPTH} deep"
             )));
         }
-        let reached = reach(
-            conn,
-            &roots,
-            added.fill == Fill::StatementDefault && rounds == 1,
-        )
-        .await?;
+        let mut reached = BTreeMap::new();
+        for constructs in [false, true] {
+            let wanted: Vec<Oid> = roots
+                .iter()
+                .filter_map(|(oid, input)| (*input == constructs).then_some(*oid))
+                .collect();
+            if wanted.is_empty() {
+                continue;
+            }
+            for ty in reach(conn, &wanted, constructs).await? {
+                if constructs {
+                    constructed.insert(ty.oid);
+                }
+                reached.insert(ty.oid, ty);
+            }
+        }
         // A type the walk was asked to start from and did not find has been
         // dropped under the read: a failed read, not an absence.
-        if let Some(gone) = roots.iter().find(|r| !reached.iter().any(|t| t.oid == **r)) {
+        if let Some(gone) = roots.keys().find(|r| !reached.contains_key(*r)) {
             return Err(Failure::Read(DbError::BadRow(format!(
                 "type {gone} disappeared while it was being read"
             ))));
         }
         let fresh: Vec<TypeRow> = reached
-            .into_iter()
+            .into_values()
             .filter(|t| !types.contains_key(&t.oid))
             .collect();
         let mut bounds: Vec<(Use, Bound)> = Vec::new();
@@ -942,7 +956,7 @@ async fn gather(
                 bounds.push((used_by.clone(), certify(&text, major, &used_by)?));
             }
         }
-        let mut next: BTreeSet<Oid> = BTreeSet::new();
+        let mut next = BTreeMap::new();
         for (used_by, bound) in bounds {
             for f in &bound.routines {
                 functions
@@ -962,13 +976,20 @@ async fn gather(
                     .or_default()
                     .push(used_by.clone());
             }
-            // Only a coercion evaluates domain CHECKs. A stored typed constant
-            // has already passed input conversion (measured on 16 and 18).
+            // A domain coercion checks the domain without reconstructing its
+            // already typed attributes/elements. I/O input reconstructs them
+            // too, even when this type was already reached without them.
             for ty in &bound.domain_coercions {
                 let ty = Oid::from(*ty);
                 if !is_builtin(ty) && !types.contains_key(&ty) && !fresh.iter().any(|t| t.oid == ty)
                 {
-                    next.insert(ty);
+                    next.entry(ty).or_insert(false);
+                }
+            }
+            for ty in &bound.input_coercions {
+                let ty = Oid::from(*ty);
+                if !is_builtin(ty) && !constructed.contains(&ty) {
+                    next.insert(ty, true);
                 }
             }
         }
@@ -978,7 +999,7 @@ async fn gather(
                 "a type is made of more than {MAX_TYPES} types"
             )));
         }
-        roots = next.into_iter().collect();
+        roots = next;
     }
 
     let routines =
@@ -1895,5 +1916,17 @@ mod tests {
         // A node with a field removed.
         let truncated = LENGTH_CHECK_18.replace(" :opcollid 0", "");
         assert!(bound_objects(&truncated, 18).is_err());
+    }
+
+    #[test]
+    fn a_known_node_layout_without_an_execution_proof_is_refused() {
+        for major in [16, 18] {
+            // The generic resolver decodes this identity-sequence node. That
+            // is not an input-path proof of the code the node itself runs.
+            let why = bound_objects("{NEXTVALUEEXPR :seqid 40001 :typeId 20}", major)
+                .expect_err("a known layout cannot substitute for an execution proof");
+            assert!(why.contains("NEXTVALUEEXPR"), "{major}: {why}");
+            assert!(bound_objects(LENGTH_CHECK_18, major).is_ok());
+        }
     }
 }
