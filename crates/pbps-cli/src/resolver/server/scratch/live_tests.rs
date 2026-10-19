@@ -471,14 +471,12 @@ async fn drop_crowd_roles(conn: &mut Conn, stem: &str) -> Result<(), String> {
     }
 }
 
-/// A run's cost grows with the roles of its target's cluster by a small
-/// constant, not by a round trip each (#2049). A superuser deployer's closure is
-/// every role in the cluster, and the run-owned layout reproduces each one in
-/// the scratch cluster: a `CREATE ROLE`, a `GRANT` and a `DROP ROLE`. One round
-/// trip each cost about 9 ms a role (110 s at 11,000 roles, against about 10 s
-/// of server time), so ten thousand more roles took minutes. Sent in batches,
-/// ten thousand more roles cost under 20 s, about 2 ms a role. Run-to-run noise
-/// on a shared machine is a few seconds, so the bound is the issue's own.
+/// A superuser deployer's run reproduces every cluster role. Sending each
+/// CREATE, GRANT and DROP separately was the slowdown in #2049. Count driver
+/// requests instead of elapsed growth: shared-host contention made both the
+/// absolute gap and a same-run timing ratio unreliable (DEC-2121.1). Timings
+/// remain diagnostics; the focused 20,000-role lookup guard covers the reverse
+/// map's CPU shape separately. Both sizes share one growing target crowd.
 #[tokio::test]
 #[ignore = "requires the pinned PostgreSQL servers"]
 async fn resolver_run_owned_reproduction_stays_linear_in_the_clusters_roles() {
@@ -500,29 +498,82 @@ async fn resolver_run_owned_reproduction_stays_linear_in_the_clusters_roles() {
             break;
         }
         let started = std::time::Instant::now();
-        let result = produce(&scratch.server, &target.on(&target_db), &inputs, &key).await;
-        runs.push((count, started.elapsed(), result));
+        let (result, requests) = pbps_db::request_count::scope(produce(
+            &scratch.server,
+            &target.on(&target_db),
+            &inputs,
+            &key,
+        ))
+        .await;
+        runs.push((count, started.elapsed(), requests, result));
     }
     let removed = crowd.remove(&mut admin).await;
     let after = scratch.inventory().await;
     target.drop().await;
     grown.unwrap();
     removed.unwrap();
-    for (count, took, result) in &runs {
-        eprintln!("issue 2049: {count} crowd roles: {took:?}");
+    for (count, took, requests, result) in &runs {
+        eprintln!("issue 2049: {count} crowd roles: {took:?}; {requests} requests");
+        assert_ne!(
+            *requests, 0,
+            "the PostgreSQL request counter must be active"
+        );
         assert_answers_the_overload(result.as_ref().unwrap_or_else(|e| panic!("{count}: {e}")));
     }
     assert_eq!(
         before, after,
         "every role the runs made on the scratch server is dropped"
     );
-    let [(_, small, _), (_, large, _)] = &runs[..] else {
+    let [(_, _, small, _), (_, _, large, _)] = &runs[..] else {
         panic!("two runs were expected");
     };
+    // 9,000 extra roles add 3 * (9,000 / 250) = 108 CREATE/GRANT/DROP
+    // batches. Each of the 12 capture cursors gains at most 18,000 rows
+    // (a role and a membership each): ceil(18,000 / 4,096) = 5 extra FETCHes,
+    // or 60 more requests. Pin 108 + 60 = 168 independently of ROLE_BATCH,
+    // so reducing the production batch size cannot relax its own guard.
+    // Measured growth was 136 healthy and 27,028 with ROLE_BATCH=1
+    // (DEC-2121.1). Cleanup and correctness checks precede this assertion.
     assert!(
-        *large <= *small + std::time::Duration::from_secs(20),
-        "ten thousand roles took {large:?}, a thousand took {small:?}: more than 20 s longer"
+        *large <= *small + 168,
+        "ten thousand roles made {large} requests, a thousand made {small}: more than 168 extra"
     );
+}
+
+/// Exercise every PostgreSQL request path through the real connection seam:
+/// a multi-statement batch is one request, and a failed call still counts.
+#[tokio::test]
+#[ignore = "requires the pinned PostgreSQL servers"]
+async fn postgres_request_counts_cover_batches_failures_and_connection_startup() {
+    let fixture = Fixture::new("PBPS_TEST_PG_DB");
+    let mut existing = fixture.admin().await;
+    existing.query("SELECT 0").await.unwrap();
+    let (existing, fresh) = tokio::join!(
+        pbps_db::request_count::scope(async {
+            existing.execute("SELECT 1; SELECT 2").await.unwrap();
+            existing.query("SELECT 3").await.unwrap();
+            existing
+                .query_with("SELECT $1::integer", &[pbps_db::Param::I32(4)])
+                .await
+                .unwrap();
+            existing
+                .execute_with("SELECT $1::integer", &[pbps_db::Param::I32(5)])
+                .await
+                .unwrap();
+            existing
+                .execute("SELECT 1 / 0")
+                .await
+                .expect_err("a failed request still counts");
+        }),
+        pbps_db::request_count::scope(async {
+            let mut connection = fixture.admin().await;
+            connection.query("SELECT 6").await.unwrap();
+        }),
+    );
+    assert_eq!(existing.1, 5);
+    // Version, TimeZone, pinned search_path, then SELECT 6.
+    assert_eq!(fresh.1, 4);
+    assert_eq!(pbps_db::request_count::scope(async {}).await.1, 0);
 }
 
 /// The layout the run used is sealed as its own (#1517).

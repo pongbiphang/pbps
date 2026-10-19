@@ -38,6 +38,11 @@ pub mod impact;
 pub mod ledger;
 mod mssql;
 mod postgres;
+// Cross-crate test support is opt-in because cfg(test) does not reach a
+// dependency. Neither this API nor its driver hooks exists in normal builds.
+#[cfg(feature = "test-request-count")]
+#[doc(hidden)]
+pub mod request_count;
 pub mod resolver;
 pub mod transport;
 

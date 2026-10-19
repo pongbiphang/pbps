@@ -1351,3 +1351,39 @@ The multiplier leaves room for shared-host variation while still rejecting
 each dense quadratic editor walk independently. The positive measurements and
 shortcut-removal controls are recorded in
 [CI performance](../CI-PERFORMANCE.md#ledger-trust-growth-comparison).
+
+<a id="dec-2121-1"></a>
+
+**DEC-2121.1. The full PostgreSQL resolver regression bounds SQL request growth
+instead of elapsed time.** [#2166](https://github.com/pongbiphang/pbps/issues/2166)
+and [DEC-2166.1](#dec-2166-1) replace an absolute timing bound with a same-run
+ratio and repeated minima. That remedy did not separate the full resolver's
+fixed cost and shared-host variation from the original per-role round trips:
+healthy min-of-three ratios were 1.58–1.99, the `ROLE_BATCH=1` control reached
+2.50, and the previously posted loaded single-sample ratio reached 4.91.
+[#2121](https://github.com/pongbiphang/pbps/issues/2121) therefore measures the unit
+of work that #2049 changed: a PostgreSQL driver query or execute invocation,
+with a whole batch counted once and failures counted as attempts. A task scope
+covers the entire `produce` future, its new connections' startup requests and
+normal scratch cleanup; crowd setup and inventory checks stay outside it.
+
+Run once at 1,000 roles, grow the same crowd to 10,000, and require
+`count_10k <= count_1k + 168`. The extra 9,000 roles add 108 requests across
+250-role CREATE/GRANT/DROP batches. Each of 12 capture cursors gains at most
+18,000 rows (a role and membership per added role), allowing five additional
+4,096-row FETCH pages each, or 60 requests. The fixed allowance is independent
+of production `ROLE_BATCH`, so its own regression cannot enlarge the bound.
+Four healthy pairs measured 344/480 requests, growth 136, while three
+`ROLE_BATCH=1` pairs measured 4,077/31,105, growth 27,028, despite 10,000-role
+elapsed times ranging 11.70–27.67 and 63.14–214.09 seconds respectively. The
+healthy margin is 32 requests; the control exceeds the allowance by 26,860.
+
+The counter and all driver hooks are gated by `test-request-count`, enabled
+only by the CLI's dev-dependency; ordinary builds have neither instrumentation
+cost nor a counter API. Concurrent and nested measurement scopes keep separate
+counts. The resolver SQL measured here stays in the caller's task; spawned
+tasks would need an explicit scope. The full-resolver timings remain diagnostic
+only. Binding correctness, before/after scratch inventory and the armed crowd
+cleanup guard remain, with cleanup before assertions. The focused 20,000-role
+reverse-map lookup test retains its CPU-shape guard; SQL request counts do not
+measure the in-process lookup cost.
