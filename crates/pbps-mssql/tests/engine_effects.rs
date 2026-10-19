@@ -588,3 +588,206 @@ fn violations_from(
     let effects: Vec<_> = order.iter().map(|&i| shadowed.effects[i].clone()).collect();
     pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
 }
+
+fn module_pair(caller: &str, alter_caller: bool) -> (Schema, Schema, ModuleId, ModuleId) {
+    let callee = ModuleId::Named(TableName::new("app", "f"));
+    let caller_id = ModuleId::Named(TableName::new("app", "a_caller"));
+    let function = |text: &str| Module {
+        kind: ModuleKind::Function,
+        definition: text.into(),
+        description: None,
+    };
+    let mut before = Schema::default();
+    before.modules.insert(
+        callee.clone(),
+        function("(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @a END"),
+    );
+    if alter_caller {
+        before.modules.insert(
+            caller_id.clone(),
+            function("(@a int) RETURNS int AS BEGIN RETURN @a END"),
+        );
+    }
+    let mut after = before.clone();
+    after.modules.insert(
+        callee.clone(),
+        function("(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @a + 1 END"),
+    );
+    after.modules.insert(caller_id.clone(), function(caller));
+    (before, after, callee, caller_id)
+}
+
+#[test]
+fn schema_bound_callers_require_their_callees_final_definition() {
+    use pbps_diff::order::{Because, Checks, Schedule, Source, commute, graph};
+    use pbps_model::operation::{Incarnation, Requirement};
+
+    // The caller sorts first by name, so the differ's lexical ranks still
+    // decide its correct order. The effects must independently agree with it.
+    let bound = [
+        "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN app.f(@a) END",
+        "(@a int) RETURNS int with /* outer /* nested */ end */ schemabinding, RETURNS NULL ON NULL INPUT AS BEGIN RETURN [APP] . [F](@a) END",
+        "(@a int) RETURNS int WITH EXECUTE AS OWNER, SCHEMABINDING AS BEGIN RETURN app.f(@a) END",
+        "(@a int) RETURNS int WITH EXECUTE AS [SCHEMABINDING], SCHEMABINDING AS BEGIN RETURN app.f(@a) END",
+    ];
+    let independent = [
+        "(@a int) RETURNS int AS BEGIN RETURN app.f(@a) END",
+        "(@a int) RETURNS int /* WITH SCHEMABINDING */ AS BEGIN RETURN app.f(@a) END",
+        "(@a int) RETURNS int AS BEGIN DECLARE @s nvarchar(100) = N'WITH SCHEMABINDING'; RETURN app.f(@a) END",
+        "(@a int) RETURNS int AS BEGIN DECLARE @schemabinding int = 0; RETURN app.f(@a) END",
+        "(@a int) RETURNS int AS BEGIN DECLARE @s int; SELECT @s = @a AS [WITH SCHEMABINDING]; RETURN app.f(@a) END",
+        "(@a int) RETURNS int WITH EXECUTE AS [SCHEMABINDING] AS BEGIN RETURN app.f(@a) END",
+        "(@a int) RETURNS int WITH EXECUTE AS \"WITH SCHEMABINDING\" AS BEGIN RETURN app.f(@a) END",
+        "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN other.f(@a) END",
+        "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN app.f_extra(@a) END",
+        "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN @a /* app.f(@a) */ END",
+        "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN DECLARE @s nvarchar(100) = N'app.f(@a)'; RETURN @a END",
+        "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN app.a_caller(@a) END",
+    ];
+    for alter in [false, true] {
+        for (texts, needs_callee) in [(&bound[..], true), (&independent[..], false)] {
+            for definition in texts {
+                let (before, after, callee, caller) = module_pair(definition, alter);
+                let diffed = Diffed::new(&before, &after);
+                assert_eq!(diffed.changes.len(), 2, "{definition}");
+                let f = diffed.at(|c| matches!(c, Change::AlterModule { id, .. } if id == &callee));
+                let g = diffed.at(|c| matches!(c,
+                    Change::CreateModule { id, .. } | Change::AlterModule { id, .. } if id == &caller));
+                let requirement =
+                    Requirement::Is(ObjectKey::Module(callee.clone()), Incarnation::Final);
+                assert_eq!(
+                    diffed.effects[g].requires.contains(&requirement),
+                    needs_callee,
+                    "{definition}"
+                );
+                // Self-reference must never invent an edge from a step to itself.
+                assert!(
+                    !diffed.effects[g].requires.contains(&Requirement::Is(
+                        ObjectKey::Module(caller),
+                        Incarnation::Final
+                    )),
+                    "{definition}"
+                );
+                let own: Vec<usize> = (0..diffed.changes.len()).collect();
+                assert_eq!(diffed.verify(&own), [], "{definition}");
+                let graph = graph(
+                    diffed.ops.as_slice(),
+                    &diffed.effects,
+                    &diffed.baseline,
+                    &Default::default(),
+                    Checks::ALL,
+                );
+                let mut reversed = own;
+                reversed.swap(f, g);
+                if needs_callee {
+                    assert!(f < g, "{definition}");
+                    assert!(diffed.verify(&reversed).iter().any(|v| matches!(v, Violation::Edge { edge, .. }
+                        if edge.source == Source::Effect && edge.because == Because::Rewrites(ObjectKey::Module(callee.clone())))), "{definition}");
+                    assert_eq!(commute::swapped(&graph, 2, f, g), None, "{definition}");
+                    let ordered = diffed.ops.reordered(&reversed);
+                    let effects: Vec<_> = reversed
+                        .iter()
+                        .map(|&i| diffed.effects[i].clone())
+                        .collect();
+                    let backwards_graph = pbps_diff::order::graph(
+                        ordered.as_slice(),
+                        &effects,
+                        &diffed.baseline,
+                        &Default::default(),
+                        Checks::ALL,
+                    );
+                    let backwards = pbps_model::ChangeSet {
+                        changes: reversed
+                            .iter()
+                            .map(|&i| diffed.changes[i].clone())
+                            .collect(),
+                    };
+                    let settled = Schedule::of_graph(&backwards_graph, ordered.as_slice())
+                        .settle(backwards)
+                        .unwrap();
+                    assert_eq!(settled.changes.changes, diffed.changes, "{definition}");
+                } else {
+                    assert_eq!(diffed.verify(&reversed), [], "{definition}");
+                    assert!(!commute::joined(&graph, 2, f, g), "{definition}");
+                }
+            }
+        }
+    }
+
+    // A callee the plan leaves alone is already final in the baseline.
+    let (before, mut after, callee, caller) = module_pair(bound[0], false);
+    after
+        .modules
+        .insert(callee.clone(), before.modules[&callee].clone());
+    let stable = Diffed::new(&before, &after);
+    assert_eq!(stable.changes.len(), 1);
+    assert!(stable.effects[0].requires.contains(&Requirement::Is(
+        ObjectKey::Module(callee),
+        Incarnation::Final
+    )));
+    assert_eq!(stable.verify(&[0]), []);
+
+    // Unbound procedures can call one another; imposing Final on both
+    // references would manufacture a cycle a valid plan does not have.
+    let mut before = Schema::default();
+    let procedure = |text: &str| Module {
+        kind: ModuleKind::Procedure,
+        definition: text.into(),
+        description: None,
+    };
+    let f = ModuleId::Named(TableName::new("app", "f"));
+    before
+        .modules
+        .insert(f.clone(), procedure("AS BEGIN RETURN END"));
+    let mut after = before.clone();
+    after
+        .modules
+        .insert(f, procedure("AS BEGIN EXEC app.a_caller END"));
+    after
+        .modules
+        .insert(caller, procedure("AS BEGIN EXEC app.f END"));
+    let unbound = Diffed::new(&before, &after);
+    assert_eq!(unbound.verify(&[0, 1]), []);
+    assert_eq!(unbound.verify(&[1, 0]), []);
+}
+
+#[test]
+fn a_callers_binding_requirement_reads_its_own_payload() {
+    use pbps_model::operation::{Incarnation, Requirement};
+
+    let bound = "(@a int) RETURNS int WITH SCHEMABINDING AS BEGIN RETURN app.f(@a) END";
+    let plain = "(@a int) RETURNS int AS BEGIN RETURN @a END";
+    for (payload, ending, needs_callee) in [(bound, plain, true), (plain, bound, false)] {
+        let (before, mut after, callee, caller) = module_pair(payload, false);
+        let module = after.modules[&caller].clone();
+        after.modules.get_mut(&caller).unwrap().definition = ending.into();
+        let changes = vec![PlannedChange::new(Change::CreateModule {
+            id: caller,
+            module: Box::new(module),
+        })];
+        let ids = IdsFile::default();
+        let owners = PlanOwners::new(PlanNames::of(&changes, &ids).unwrap(), &ids, &ids);
+        let ops = Operations::of_plan(&changes, ModuleEdits::InPlace);
+        let fx = analyse(
+            &ops,
+            &owners,
+            Snapshot {
+                schema: &before,
+                ids: &ids,
+            },
+            Snapshot {
+                schema: &after,
+                ids: &ids,
+            },
+            &Mssql,
+        );
+        assert!(fx.unowned.is_empty());
+        assert_eq!(
+            fx.effects[0].requires.contains(&Requirement::Is(
+                ObjectKey::Module(callee),
+                Incarnation::Final
+            )),
+            needs_callee
+        );
+    }
+}

@@ -1153,6 +1153,7 @@
         "positional_preflight_tests::tightening_reads_prior_writes_and_never_future_writes",
         "positional_preflight_tests::a_catalog_key_counts_only_references_that_survive_the_current_delete",
         "commutation::a_row_written_before_and_after_the_column_it_fills_fails_the_row_check",
+        "commutation::schema_bound_callers_block_reversed_edits_and_plain_callers_commute",
         "commutation::pairs_the_effects_call_independent_commute_on_the_engine"
       ]
     },

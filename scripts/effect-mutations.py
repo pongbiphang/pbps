@@ -133,8 +133,6 @@ UNSHOWABLE = {
     "AddUnique: Reads of the rows",
     "AddCheck: Reads of the rows",
     "SetPrimaryKey: Absent of the foreign keys into the old key",
-    # Until #2192: no effect makes a caller need the callee it binds to.
-    "AlterModule: Rewrites of a module edited in place",
 }
 
 

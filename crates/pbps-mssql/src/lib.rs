@@ -59,6 +59,8 @@ impl Dialect for Mssql {
     /// What SQL Server's catalog refuses beyond the portable effects
     /// (DEC-1954.3):
     ///
+    /// - a schema-bound caller needs each module it may reference as the
+    ///   plan leaves it, before binding prevents the callee's edit (3729);
     /// - a computed column that may call a function stands in the way of
     ///   altering or dropping it (3729, measured on 17.0, even without
     ///   SCHEMABINDING);
@@ -82,13 +84,33 @@ impl Dialect for Mssql {
     ) -> Result<pbps_model::operation::Effects, pbps_model::operation::OwnerError> {
         use pbps_model::Change;
         use pbps_model::operation::{
-            PartKey, Requirement, base_table, base_table_named, final_table,
+            Incarnation, ObjectKey, PartKey, Requirement, base_table, base_table_named, final_table,
         };
         let mut fx =
             pbps_dialect::engine_effects::text_dependents(self, op, owners, before, after, true)?
                 .merged(pbps_dialect::engine_effects::retype_blockers(
                     self, op, owners, before, after,
                 )?);
+        if let Change::CreateModule { id, module } | Change::AlterModule { id, module } = op.change()
+            // Functions retain their header options in the model; views do
+            // not (DECISIONS 29). Read this step's payload, not its endpoint.
+            && module.kind == pbps_model::ModuleKind::Function
+            && introspect::function_is_schema_bound(&module.definition)
+        {
+            for callee in after.schema.modules.keys().filter(|callee| *callee != id) {
+                if let Some(name) = callee.referenced_name()
+                    && self.may_name_qualified(&module.definition, &name.schema, &name.name)
+                {
+                    // Exists alone does not state which definition a binding
+                    // needs. Final joins the callee's in-place rewrite without
+                    // a new pass or a positional dependency (DEC-2192.1).
+                    fx.requires.push(Requirement::Is(
+                        ObjectKey::Module(callee.clone()),
+                        Incarnation::Final,
+                    ));
+                }
+            }
+        }
         // A computed column the plan replaces under its own name with an
         // expression that no longer reads what the step changes does not
         // stand in its way: its baseline incarnation goes, and a requirement

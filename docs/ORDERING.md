@@ -419,7 +419,7 @@ and the expression-bearing changes that need a function.
 | `CreateModule` or `AlterModule` → `PublicExecution` on the routine | fixed | same class, same create rank and subject: the next statement, so an autocommit `--sql` script never leaves the routine executable by `PUBLIC` past its own `CREATE` | ✓ #687 |
 | Tightening → primary key or unique key over the column | fixed | class 9 before 13 | ✓ |
 | Row writes → `SetDataMode` / `SetEnsureKeys` of their table | fixed | class 11 and 12 before 17 | ✓ |
-| Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315) | ✓ |
+| Module → module that names it | content, over-approximated | `creation_order_with`, lexed names (DECISIONS 315); on SQL Server a schema-bound function caller also requires the callee's `Final` definition, so its in-place rewrite orders the pair in the effects | ✓ DEC-2192.1 |
 | Function created or rebuilt → check, filtered index or set default calling it | content, over-approximated | `after_the_rebuilds`: a `Lexical` edge from the last function create, when its text names the function, settled | ✓ DEC-942.1, DEC-1364.1, DEC-1967.1 |
 | Function created or rebuilt → `AlterColumnExpression` calling it | content, over-approximated | `after_the_rebuilds`, when its text names the function | ✓ DEC-1168.1, DEC-1364.1 |
 | Function created or rebuilt → `AddColumn` whose default or generation expression calls it | content, over-approximated | `after_their_functions`: after the create its text names, and what may read the column, or a partition holding it, after it; a cycle is refused by name | ✓ DEC-1364.1 |
