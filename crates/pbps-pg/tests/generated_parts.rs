@@ -32,8 +32,13 @@ fn fixture() -> (Schema, IdsFile) {
             definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2".into(),
         },
     );
-    let ids = pbps_diff::resolve(
-        &schema,
+    let ids = identities(&schema);
+    (schema, ids)
+}
+
+fn identities(schema: &Schema) -> IdsFile {
+    pbps_diff::resolve(
+        schema,
         &IdsFile::default(),
         &[],
         &pbps_diff::Context {
@@ -42,8 +47,7 @@ fn fixture() -> (Schema, IdsFile) {
         },
     )
     .unwrap()
-    .ids;
-    (schema, ids)
+    .ids
 }
 
 #[test]
@@ -258,7 +262,11 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
     });
-    for (key, column) in [("prefix_unique", "id"), ("suffix_unique", "g")] {
+    for (key, column) in [
+        ("prefix_unique", "id"),
+        ("suffix_unique", "g"),
+        ("suffix_input", "z"),
+    ] {
         table.unique.insert(
             key.into(),
             pbps_model::UniqueConstraint {
@@ -283,6 +291,54 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
                 include: vec![],
                 unique: false,
                 filter: None,
+                method: Default::default(),
+                storage_parameters: Default::default(),
+            },
+        );
+    }
+    for (key, column) in [("prefix_fk", "id"), ("suffix_fk", "z")] {
+        table.foreign_keys.insert(
+            key.into(),
+            pbps_model::ForeignKey {
+                columns: vec![column.into()],
+                references_table: name.clone(),
+                references_columns: vec!["id".into()],
+                on_delete: Default::default(),
+                on_update: Default::default(),
+            },
+        );
+    }
+    for (name, key, include, filter) in [
+        (
+            "suffix_expression",
+            pbps_model::IndexKey::Expression("id + z".into()),
+            vec![],
+            None,
+        ),
+        (
+            "suffix_include",
+            pbps_model::IndexKey::Column("id".into()),
+            vec!["z".into()],
+            None,
+        ),
+        (
+            "suffix_filter",
+            pbps_model::IndexKey::Column("id".into()),
+            vec![],
+            Some("z > 0".into()),
+        ),
+    ] {
+        table.indexes.insert(
+            name.into(),
+            pbps_model::Index {
+                columns: vec![pbps_model::IndexColumn {
+                    key,
+                    descending: false,
+                    opclass: None,
+                }],
+                include,
+                unique: false,
+                filter,
                 method: Default::default(),
                 storage_parameters: Default::default(),
             },
@@ -340,4 +396,201 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
             .iter()
             .any(|p| matches!(p, Change::AddIndex { name, .. } if name == "suffix_unique"))
     );
+    assert!(!table.unique.contains_key("suffix_input"));
+    assert!(!table.checks.contains_key("suffix_input"));
+    assert!(
+        parts
+            .iter()
+            .any(|p| matches!(p, Change::AddUnique { name, .. } if name == "suffix_input"))
+    );
+    assert!(
+        parts
+            .iter()
+            .any(|p| matches!(p, Change::AddCheck { name, .. } if name == "suffix_input"))
+    );
+    for name in [
+        "suffix_input",
+        "suffix_expression",
+        "suffix_include",
+        "suffix_filter",
+    ] {
+        assert!(!table.indexes.contains_key(name), "{name}");
+        assert!(
+            parts
+                .iter()
+                .any(|p| matches!(p, Change::AddIndex { name: n, .. } if n == name)),
+            "{name}"
+        );
+    }
+    assert!(table.foreign_keys.is_empty());
+    for name in ["prefix_fk", "suffix_fk"] {
+        assert!(
+            parts
+                .iter()
+                .any(|p| matches!(p, Change::AddForeignKey { name: n, .. } if n == name)),
+            "{name}"
+        );
+    }
+}
+
+fn prefix_generation_fixture(expression: &str, input_before_cut: bool) -> (Change, IdsFile) {
+    let (mut schema, _) = fixture();
+    let name = TableName::new("app", "a");
+    let mut table = Table::default();
+    let mut columns = vec![("id", None), ("a", Some(expression))];
+    if input_before_cut {
+        columns.push(("b", None));
+    }
+    columns.push(("g", Some("app.f(id)")));
+    if !input_before_cut {
+        columns.push(("b", None));
+    }
+    for (name, expression) in columns {
+        let mut column = Column::new("integer".parse().unwrap());
+        if let Some(expression) = expression {
+            column.value_source = ValueSource::Generated(Generated {
+                expression: expression.into(),
+                stored: true,
+            });
+        }
+        table.columns.insert(name.into(), column);
+    }
+    schema.tables.insert(name.clone(), table.clone());
+    let ids = identities(&schema);
+    let change = Change::CreateTable {
+        uid: ids.table_uid(&name).unwrap().clone(),
+        name,
+        table: Box::new(table),
+        beside_default: None,
+        moves_at_most: None,
+    };
+    (change, ids)
+}
+
+#[test]
+fn a_prefix_generation_reading_a_removed_column_requires_the_full_creation_shape() {
+    let (change, ids) = prefix_generation_fixture("b * 2", false);
+    let f = ["app.f(integer)".parse().unwrap()];
+    for pg in [
+        Postgres::new(),
+        Postgres::new().with_server_version(160_000),
+    ] {
+        assert!(
+            pg.generated_table_parts(&change, &ids, &f)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let parts = Postgres::new()
+        .with_server_version(180_000)
+        .generated_table_parts(&change, &ids, &f)
+        .unwrap()
+        .unwrap();
+    let Change::CreateTable { table, .. } = &parts[0] else {
+        panic!("{parts:?}")
+    };
+    assert_eq!(
+        table
+            .columns
+            .keys()
+            .map(pbps_model::ColumnName::raw)
+            .collect::<Vec<_>>(),
+        ["id", "a", "g", "b"]
+    );
+    assert!(
+        matches!(&table.columns["a"].value_source, ValueSource::Generated(g) if g.expression == "b * 2")
+    );
+    assert_eq!(
+        parts.len(),
+        2,
+        "only the function-calling expression is postponed"
+    );
+    assert!(
+        matches!(&parts[1], Change::AlterColumnExpression { column, to, .. } if column.name.raw() == "g" && to == "app.f(id)")
+    );
+    let sql = Postgres::new().emit(&parts[0], Default::default()).unwrap();
+    assert!(sql.iter().any(|s| s.sql.contains("b * 2")));
+    assert!(!sql.iter().any(|s| s.sql.contains("app.f(id)")));
+}
+
+#[test]
+fn prefix_generation_inputs_kept_in_create_do_not_prevent_the_suffix_split() {
+    for (expression, input_before_cut, prefix) in [
+        ("id * 2", false, vec!["id", "a"]),
+        ("b * 2", true, vec!["id", "a", "b"]),
+    ] {
+        let (change, ids) = prefix_generation_fixture(expression, input_before_cut);
+        let f = ["app.f(integer)".parse().unwrap()];
+        let expected = Postgres::new()
+            .generated_table_parts(&change, &ids, &f)
+            .unwrap()
+            .unwrap();
+        for pg in [
+            Postgres::new().with_server_version(160_000),
+            Postgres::new().with_server_version(180_000),
+        ] {
+            assert_eq!(
+                pg.generated_table_parts(&change, &ids, &f)
+                    .unwrap()
+                    .unwrap(),
+                expected
+            );
+        }
+        let Change::CreateTable { table, .. } = &expected[0] else {
+            panic!("{expected:?}")
+        };
+        assert_eq!(
+            table
+                .columns
+                .keys()
+                .map(pbps_model::ColumnName::raw)
+                .collect::<Vec<_>>(),
+            prefix
+        );
+        assert!(
+            matches!(&table.columns["a"].value_source, ValueSource::Generated(g) if g.expression == expression)
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|c| matches!(c, Change::AddColumn { name, .. } if name.raw() == "g"))
+        );
+        assert!(
+            !expected
+                .iter()
+                .any(|c| matches!(c, Change::AlterColumnExpression { .. }))
+        );
+    }
+}
+
+#[test]
+fn a_primary_key_using_a_suffix_input_waits_for_its_column() {
+    let (schema, ids) = fixture();
+    let name = TableName::new("app", "a");
+    for column in ["g", "z"] {
+        let mut table = schema.tables[&name].clone();
+        table.primary_key = Some(pbps_model::PrimaryKey {
+            name: Some("a_pk".into()),
+            columns: vec![column.into()],
+            storage_parameters: Default::default(),
+        });
+        let change = Change::CreateTable {
+            uid: ids.table_uid(&name).unwrap().clone(),
+            name: name.clone(),
+            table: Box::new(table),
+            beside_default: None,
+            moves_at_most: None,
+        };
+        let parts = Postgres::new()
+            .generated_table_parts(&change, &ids, &["app.f(integer)".parse().unwrap()])
+            .unwrap()
+            .unwrap();
+        let Change::CreateTable { table, .. } = &parts[0] else {
+            panic!("{parts:?}")
+        };
+        assert!(table.primary_key.is_none());
+        assert!(parts.iter().any(
+            |p| matches!(p, Change::SetPrimaryKey { to: Some(key), .. } if key.columns == [pbps_model::ColumnName::from(column)])
+        ));
+    }
 }

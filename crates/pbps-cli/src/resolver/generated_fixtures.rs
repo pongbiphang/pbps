@@ -16,6 +16,20 @@ pub(crate) fn shape(case: &str) -> Schema {
     };
     let mut a = Table::default();
     a.columns.insert("id".into(), plain());
+    let prefix_generation = ["prefix-later", "prefix-only", "prefix-forward"].contains(&case);
+    if prefix_generation {
+        a.columns.insert(
+            "a".into(),
+            generated(if case == "prefix-only" {
+                "id * 2"
+            } else {
+                "b * 2"
+            }),
+        );
+        if case == "prefix-forward" {
+            a.columns.insert("b".into(), plain());
+        }
+    }
     a.columns.insert(
         "g".into(),
         generated(if case == "later" {
@@ -24,7 +38,13 @@ pub(crate) fn shape(case: &str) -> Schema {
             "app.f(id)"
         }),
     );
-    a.columns.insert("z".into(), plain());
+    if prefix_generation {
+        if case != "prefix-forward" {
+            a.columns.insert("b".into(), plain());
+        }
+    } else {
+        a.columns.insert("z".into(), plain());
+    }
     if case == "partition" {
         a.partition_by = Some(PartitionBy {
             strategy: pbps_model::PartitionStrategy::Range,

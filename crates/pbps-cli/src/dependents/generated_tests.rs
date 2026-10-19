@@ -97,7 +97,7 @@ fn generated_table_parts_keep_names_early_and_columns_in_declaration_order_on_ev
 
 #[test]
 fn only_unsplittable_generated_tables_use_known_set_expression_capability() {
-    for case in ["partition", "later"] {
+    for case in ["partition", "later", "prefix-later"] {
         let schema = shape(case);
         let ids = identities(&schema);
         for dialect in [
@@ -214,6 +214,10 @@ async fn generated_table_parts_apply_with_the_declared_column_order_values_and_n
             "partition",
             "later",
             "rows",
+            "prefix-later",
+            "prefix-later-offline",
+            "prefix-only",
+            "prefix-forward",
         ] {
             let database = format!("pbps_1503_{:016x}", rand::random::<u64>());
             let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
@@ -224,8 +228,13 @@ async fn generated_table_parts_apply_with_the_declared_column_order_values_and_n
             let result: anyhow::Result<()> = async {
                 let mut conn = Conn::connect(Driver::Postgres, &format!("{server} dbname={database}")).await?;
                 conn.execute("CREATE SCHEMA app").await?;
-                let dialect = crate::engine::planning_dialect(&mut conn).await?;
-                let schema = shape(case);
+                let dialect: Box<dyn Dialect> = if case.ends_with("-offline") {
+                    Box::new(pbps_pg::Postgres::new())
+                } else {
+                    crate::engine::planning_dialect(&mut conn).await?
+                };
+                let shape_case = case.strip_suffix("-offline").unwrap_or(case);
+                let schema = shape(shape_case);
                 let cs = ordinary(&schema, &identities(&schema), dialect.as_ref()).map_err(anyhow::Error::msg)?;
                 conn.execute("BEGIN").await?;
                 for p in &cs.changes {
@@ -238,10 +247,22 @@ async fn generated_table_parts_apply_with_the_declared_column_order_values_and_n
                     assert_eq!(seeded[0].try_get::<i32>("g")?, Some(2));
                     assert_eq!(seeded[0].try_get::<i32>("z")?, Some(4));
                 }
-                conn.execute("INSERT INTO app.a (id,z) VALUES (3,5)").await?;
-                let rows = conn.query("SELECT id,g,z FROM app.a ORDER BY id").await?;
+                let input = if shape_case.starts_with("prefix-") { "b" } else { "z" };
+                conn.execute(&format!("INSERT INTO app.a (id,{input}) VALUES (3,5)")).await?;
+                let rows = conn.query(&format!("SELECT id,g,{input} FROM app.a ORDER BY id")).await?;
                 let row = rows.last().unwrap();
                 assert_eq!(row.try_get::<i32>("g")?.unwrap(), if case == "later" { 10 } else { 6 }, "{case}");
+                if shape_case.starts_with("prefix-") {
+                    let rows = conn.query("SELECT a FROM app.a WHERE id=3").await?;
+                    assert_eq!(rows[0].try_get::<i32>("a")?, Some(if shape_case == "prefix-only" { 6 } else { 10 }), "{case}");
+                    let has_parts = cs.changes.iter().any(pbps_diff::order::generated::is_part);
+                    let placeholder = cs.changes.iter().any(|p| matches!(p.change, Change::AlterColumnExpression { .. }));
+                    let version = conn.query("SHOW server_version_num").await?;
+                    let modern = version[0].try_get::<&str>("server_version_num")?.unwrap().parse::<i64>()? >= pbps_pg::generated::SET_EXPRESSION_ARRIVED_IN;
+                    let suffix_input = shape_case == "prefix-later";
+                    assert_eq!(has_parts, !suffix_input || (modern && !case.ends_with("-offline")), "{case}");
+                    assert_eq!(placeholder, suffix_input && modern && !case.ends_with("-offline"), "{case}");
+                }
                 let columns = conn.query("SELECT attname::text AS name FROM pg_catalog.pg_attribute WHERE attrelid='app.a'::regclass AND attnum>0 AND NOT attisdropped ORDER BY attnum").await?;
                 assert_eq!(columns.iter().map(|r| r.try_get::<&str>("name").unwrap().unwrap()).collect::<Vec<_>>(),
                     schema.tables[&TableName::new("app", "a")].columns.keys().map(pbps_model::ColumnName::raw).collect::<Vec<_>>(), "{case}");

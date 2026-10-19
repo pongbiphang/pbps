@@ -28,13 +28,15 @@ pub(crate) fn parts(
         return Ok(None);
     };
     let suffix: Vec<_> = table.columns.keys().skip(cut).cloned().collect();
+    // Prefix generations also lose suffix inputs. A forward read within
+    // the retained prefix is safe because CREATE still supplies both columns
+    // together (DEC-1503.2).
     let later_input = table
         .columns
         .iter()
         .enumerate()
-        .skip(cut)
         .any(|(at, (_, c))| {
-            matches!(&c.value_source, ValueSource::Generated(g) if table.columns.keys().skip(at+1)
+            matches!(&c.value_source, ValueSource::Generated(g) if table.columns.keys().skip(cut.max(at + 1))
             .any(|column| super::may_read(&g.expression, column.raw())))
         });
     let partition_key = table

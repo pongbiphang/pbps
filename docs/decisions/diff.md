@@ -7384,11 +7384,13 @@ Recorded column UIDs are retained; no Change variant, sort rank, name trial
 or type-identity format is introduced.
 
 Two shapes cannot use that split: a partition key in the suffix must exist
-in CREATE TABLE, and a generation cannot read a later column when it is
-added. With an immutable connected capability at least
-`SET_EXPRESSION_ARRIVED_IN` (PostgreSQL 17), the table instead creates all
-columns with typed NULL generated placeholders and uses the existing
-AlterColumnExpression to install the real expressions. Unknown/offline and
+in CREATE TABLE, and a generation cannot read a column absent from its
+creation statement, including a prefix generation reading the suffix. With
+an immutable connected capability at least
+`SET_EXPRESSION_ARRIVED_IN` (PostgreSQL 17), the table instead creates the
+full column shape, using typed NULL placeholders for generations that call
+planned functions, then the existing AlterColumnExpression installs their
+real expressions. Unknown/offline and
 older capabilities keep DEC-1274.2's whole-table hold for those two shapes.
 The ordinary schedule, resolver preparation and scratch share these typed
 parts. The pure dialect chooses parts; the differ states edges and settles
@@ -7442,3 +7444,40 @@ Pinned by `generated_table_parts_keep_names_early_and_columns_in_declaration_ord
 `scratch_generated_table_parts_compile_literal_and_collision_names_before_functions`
 and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`
 (`crates/pbps-cli/src/resolver/server/scratch/live_tests.rs`).
+
+
+<a id="dec-1503-2"></a>
+
+**DEC-1503.2. Creation parts keep each generation's inputs available when
+it binds, including a generation before the planned-function cut.** A
+prefix generation reading an ordinary suffix column becomes invalid if the
+suffix is removed: `id, a GENERATED AS (b * 2), g GENERATED AS (app.f(id)), b`
+cannot create its prefix without `b`. The shared parts helper therefore
+checks every generation for inputs that splitting would create later.
+A forward read entirely within the prefix remains splittable;
+scanning all later columns without considering the cut would unnecessarily
+hold it. This uses the existing lexical read scan and the two existing
+unsplittable paths, without a new ordering pass or edge kind.
+
+Connected PostgreSQL 17+ creates the full shape and replaces only the
+planned-function generation with SET EXPRESSION. The independent prefix
+generation retains its real text. Unknown/offline and PostgreSQL 16 retain
+the whole-table hold. The ordinary plan and scratch use the same choice.
+CHECKs, primary and unique keys, and index column, expression, INCLUDE and
+filter dependencies on suffix columns already move to the suffix. Foreign
+keys are already separate in the differ, and the raw creation-parts helper
+also moves every inline foreign key, including one on prefix-only columns.
+These shapes need no additional hold.
+
+Pinned by `a_prefix_generation_reading_a_removed_column_requires_the_full_creation_shape`,
+`prefix_generation_inputs_kept_in_create_do_not_prevent_the_suffix_split`,
+`prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait`
+and `a_primary_key_using_a_suffix_input_waits_for_its_column`
+(`crates/pbps-pg/tests/generated_parts.rs`),
+`only_unsplittable_generated_tables_use_known_set_expression_capability`,
+and the expanded live tests
+`generated_table_parts_apply_with_the_declared_column_order_values_and_names`
+and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.
+The live cases on PostgreSQL 16 and 18 check the declared column order,
+computed values, offline hold, connected version choice, and producer
+sealing and closing; prefix-only inputs remain controls for the ordinary split.

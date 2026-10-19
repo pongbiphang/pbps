@@ -5714,7 +5714,15 @@ async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_s
     use crate::resolver::generated_fixtures::shape;
     use pbps_dialect::Dialect;
     for server in SERVERS {
-        for case in ["plain", "partition", "later", "rows"] {
+        for case in [
+            "plain",
+            "partition",
+            "later",
+            "rows",
+            "prefix-later",
+            "prefix-only",
+            "prefix-forward",
+        ] {
             let mut fixture = Fixture::new(server);
             let target_db = fixture.database("g1503", None).await;
             fixture.run(&target_db, &["CREATE SCHEMA app"]).await;
