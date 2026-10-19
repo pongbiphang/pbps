@@ -8564,6 +8564,69 @@ fn pg_partman_parent_is_pulled_with_external_partitions(server: &str, k: usize) 
     assert!(!reader.dir.join("schema/app.ev.yml").exists());
 }
 
+/// A partition the read cannot take all of its own in, a `DEFERRABLE`
+/// foreign key of its own or a hash index of its own, takes its whole tree
+/// out of a pull, named: written without that object it would be a managed
+/// relation with a limitation every later command refuses, where a tree is
+/// read whole or not at all (#2072). Negative: a tree with no such partition
+/// is written, and a plain table with the same key is carried as before.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_partition_the_read_cannot_hold_all_of_takes_its_tree_out_of_a_pull() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        let own = OwnDatabase::new(server, &format!("partition_limit2072_{k}"));
+        let connection = own.connection();
+        on_server(
+            connection,
+            "CREATE SCHEMA app;
+             CREATE TABLE app.r (id int PRIMARY KEY);
+             CREATE TABLE app.a (id int NOT NULL, r int) PARTITION BY RANGE (id);
+             CREATE TABLE app.a_1 PARTITION OF app.a FOR VALUES FROM (0) TO (10);
+             ALTER TABLE app.a_1 ADD CONSTRAINT a_1_r FOREIGN KEY (r)
+                 REFERENCES app.r (id) DEFERRABLE;
+             CREATE TABLE app.c (id int NOT NULL, r int) PARTITION BY RANGE (id);
+             CREATE TABLE app.c_1 PARTITION OF app.c FOR VALUES FROM (0) TO (10);
+             CREATE INDEX c_1_hash ON app.c_1 USING hash (r);
+             CREATE TABLE app.b (id int NOT NULL, r int) PARTITION BY RANGE (id);
+             CREATE TABLE app.b_1 PARTITION OF app.b FOR VALUES FROM (0) TO (10);
+             CREATE TABLE app.p (id int, r int);
+             ALTER TABLE app.p ADD CONSTRAINT p_r FOREIGN KEY (r)
+                 REFERENCES app.r (id) DEFERRABLE;",
+        );
+        let d = Demo::new(&format!("partition-limit2072-{k}"));
+        let o = succeeds(d.run(&["pull", "--db", connection]));
+        let said = format!("{}{}", stdout(&o), stderr(&o));
+        for (parent, partition) in [("app.a", "app.a_1"), ("app.c", "app.c_1")] {
+            assert!(
+                said.contains(&format!(
+                    "table `{parent}` was left out with its partitions: pbps cannot read all \
+                     of its partition `{partition}`"
+                )),
+                "{server}: {said}"
+            );
+            assert!(
+                !d.dir.join(format!("schema/{parent}.yml")).exists(),
+                "{server}: {parent}"
+            );
+        }
+        for kept in ["app.b", "app.p", "app.r"] {
+            assert!(
+                d.dir.join(format!("schema/{kept}.yml")).exists(),
+                "{server}: {kept}: {said}"
+            );
+        }
+        assert!(
+            !said.contains("table `app.b` was left out"),
+            "{server}: {said}"
+        );
+        assert!(
+            !said.contains("table `app.p` was left out"),
+            "{server}: {said}"
+        );
+    }
+}
+
 /// A pending drop intent takes a held partition's uid out of the identity
 /// file before anything runs. Under a parent now declared `partitions:
 /// external`, `baseline` would then read the partition as one of the
