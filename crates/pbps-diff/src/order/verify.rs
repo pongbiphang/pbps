@@ -132,8 +132,8 @@ pub(crate) fn verify_with(
                         Incarnation::Base | Incarnation::Final => present(input),
                     }
                 }
-                // Checked below, against the whole plan's writes.
-                Requirement::Reads(_) => true,
+                // Ordering requirements are checked below against the whole graph.
+                Requirement::Reads(_) | Requirement::BeforeRewrite(_) => true,
                 Requirement::Absent(_) => {
                     if present(now) {
                         out.push(Violation::StillPresent {

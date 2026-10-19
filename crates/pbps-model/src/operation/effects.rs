@@ -30,6 +30,8 @@
 //! - [`Requirement::Reads`]: the values under a key, after every write of
 //!   them. A check or a key validates the rows, and a tightened NOT NULL reads
 //!   the NULLs the writes before it leave.
+//! - [`Requirement::BeforeRewrite`]: this step runs before other rewrites of
+//!   the key, without requiring its presence or choosing an incarnation.
 //! - [`Requirement::Bound`]: an input the resolver's evidence binds the object
 //!   to. `effects` never builds one: evidence is not in a step's payload.
 //!
@@ -93,6 +95,9 @@ pub enum Requirement {
     /// issue's list of four: `Exists` on a table cannot tell a reader of its
     /// rows from a user of its definition (DEC-1954.2).
     Reads(ObjectKey),
+    /// This step precedes other operations rewriting the key. This states
+    /// order, not presence or an incarnation (DEC-2228.1).
+    BeforeRewrite(ObjectKey),
 }
 
 impl Requirement {
@@ -103,7 +108,8 @@ impl Requirement {
             | Requirement::Is(key, _)
             | Requirement::Bound(key, _)
             | Requirement::Absent(key)
-            | Requirement::Reads(key) => key,
+            | Requirement::Reads(key)
+            | Requirement::BeforeRewrite(key) => key,
         }
     }
 }

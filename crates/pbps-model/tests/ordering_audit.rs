@@ -791,6 +791,7 @@ mod effects_of_each_kind {
                 Requirement::Bound(..) => "Bound",
                 Requirement::Absent(_) => "Absent",
                 Requirement::Reads(_) => "Reads",
+                Requirement::BeforeRewrite(_) => "BeforeRewrite",
             });
         }
         out

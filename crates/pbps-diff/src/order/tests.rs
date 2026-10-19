@@ -4884,3 +4884,95 @@ fn a_computed_column_s_drop_follows_the_drop_of_an_index_over_it() {
         &["id"],
     ));
 }
+
+#[test]
+fn a_before_rewrite_requirement_orders_every_other_rewrite_without_requiring_presence() {
+    let id = ModuleId::Named(t("f"));
+    let key = ObjectKey::Module(id.clone());
+    let logical: Vec<_> = (0..3)
+        .map(|_| {
+            p(Change::AlterModule {
+                id: id.clone(),
+                module: Box::new(Module {
+                    kind: ModuleKind::Function,
+                    definition: "() RETURNS int AS BEGIN RETURN 1 END".into(),
+                    description: None,
+                }),
+            })
+        })
+        .collect();
+    let ops = Operations::of_plan(&logical, ModuleEdits::InPlace);
+    let mut fx = vec![Effects::default(); 3];
+    for at in [0, 2] {
+        fx[at]
+            .rewrites
+            .push(Resource::Object(key.clone(), Incarnation::Final));
+    }
+    fx[1].requires.push(Requirement::BeforeRewrite(key.clone()));
+    let base = Baseline::default();
+    let declared = ModuleDeps::default();
+    for incarnations in [true, false] {
+        let checks = Checks {
+            incarnations,
+            ..Checks::ALL
+        };
+        let graph = graph(ops.as_slice(), &fx, &base, &declared, checks);
+        for at in [0, 2] {
+            assert!(graph.edges.iter().any(|e| e.before == 1 && e.after == at));
+        }
+        assert!(graph.unmet.is_empty());
+        assert_eq!(run(&ops, &fx, &base, &[1, 0, 2], &declared, checks), []);
+        assert!(
+            run(&ops, &fx, &base, &[0, 1, 2], &declared, checks)
+                .iter()
+                .any(|v| matches!(v, Violation::Edge { .. }))
+        );
+        let settled = super::Schedule::of_graph(&graph, ops.as_slice())
+            .settle(pbps_model::ChangeSet {
+                changes: logical.clone(),
+            })
+            .unwrap();
+        assert_eq!(settled.sequence, vec![1, 0, 2]);
+    }
+    // Only the class-order observer may defer this edge: the shared and
+    // final schedule must still reject it if the hook fails to repair it.
+    let report = super::shadow::Shadowed {
+        effects: fx.clone(),
+        unowned: vec![],
+    }
+    .report(&ops, &base, &declared);
+    for stage in [
+        super::shadow::Stage::BeforeSchedule,
+        super::shadow::Stage::Differ,
+        super::shadow::Stage::Final,
+    ] {
+        let (lines, fails) = super::shadow::judge(ops.as_slice(), &report, stage);
+        assert!(!lines.is_empty());
+        assert_eq!(
+            fails,
+            stage != super::shadow::Stage::BeforeSchedule,
+            "{lines:?}"
+        );
+    }
+    // An ordinary baseline-instance requirement intentionally does not order
+    // an in-place rewrite (DEC-1954.4); releasing a binding needs its own term.
+    fx[1].requires = vec![Requirement::Is(key.clone(), Incarnation::Base)];
+    assert!(
+        !graph(ops.as_slice(), &fx, &base, &declared, Checks::ALL)
+            .edges
+            .iter()
+            .any(|e| e.before == 1)
+    );
+    // No other rewrite makes the ordering requirement vacuous, even if the
+    // object is absent; a step's own rewrite must not form a self-edge.
+    fx[0] = Effects::default();
+    fx[2] = Effects::default();
+    fx[1].requires = vec![Requirement::BeforeRewrite(key.clone())];
+    fx[1]
+        .rewrites
+        .push(Resource::Object(key, Incarnation::Final));
+    let graph = graph(ops.as_slice(), &fx, &base, &declared, Checks::ALL);
+    assert!(graph.edges.is_empty());
+    assert!(graph.unmet.is_empty());
+    assert_eq!(verify(ops.as_slice(), &fx, &base, &declared), []);
+}

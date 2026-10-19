@@ -17,7 +17,7 @@
 //!
 //! In a release build the effects order the resolver's plan and the connected
 //! PostgreSQL handovers of an identity sequence's or detached clone's name
-//! (DEC-1986.1, DEC-1558.1). Other
+//! (DEC-1986.1, DEC-1558.1), and baseline binding releases (DEC-2228.1). Other
 //! callers settle only the edges they state, such as the generated- and
 //! computed-column releases (DEC-1956.3). The resolver combines the effects,
 //! name slots and its evidence (DEC-1968.2).
@@ -25,6 +25,7 @@
 pub mod commute;
 pub mod edges;
 pub mod expand;
+mod rewrites;
 pub(crate) mod roles;
 pub mod schedule;
 pub mod shadow;
@@ -32,6 +33,7 @@ pub mod slots;
 pub mod verify;
 
 pub use edges::{Baseline, Because, Checks, Edge, Graph, Source, Unmet, graph};
+pub use rewrites::before_rewrites;
 pub use roles::role_drops;
 pub use schedule::{Constraint, Refusal, Schedule, Settled};
 pub use shadow::{Report, Shadowed, analyse};

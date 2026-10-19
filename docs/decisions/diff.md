@@ -7293,3 +7293,59 @@ Pinned by the unit tests
 rows, the surviving detached table's rows and its declared index; verify and
 the next plan agree after apply. The negatives publish neither plan artifact
 and leave the rows and partition membership untouched.
+
+
+<a id="dec-2228-1"></a>
+
+**DEC-2228.1. A step that releases a baseline schema binding precedes the
+old callee's rewrite through an ordering-only effect requirement.** (#2228.)
+SQL Server refuses an in-place callee edit with 3729 while a schema-bound
+caller still references it. The desired caller may remove SCHEMABINDING,
+retarget the call, or remove it entirely: reading only the new payload
+(DEC-2192.1) misses the binding that the baseline still holds.
+
+`Mssql::engine_effects` scans the baseline function definition using the
+same header and managed-callee lexical matching as the desired definition.
+A caller's `AlterModule` requires `BeforeRewrite(Module(old_callee))` only
+for bindings its own replacement releases; a split caller attaches the
+requirement to `DropModule`, never to its later `CreateModule`. New callers,
+unbound baseline callers, retained bindings and non-code names add no
+release requirement. Matching keeps exact case and uses a folded fallback
+only for an unambiguous managed name, separately in each snapshot. This
+uses the supplied baseline model offline too, without connected catalog
+facts. Collation-aware matching and alias-column ambiguity for view names
+remain the separate work in #2221 and #2143.
+
+`BeforeRewrite` is internal, generic and ordering-only: the graph draws an
+edge from its step to every other rewrite of its key, and none to itself.
+No rewrite makes the requirement vacuous; it asserts neither existence nor
+an incarnation. `Is(Base)` keeps its deliberate ordinary-rewrite semantics
+(DEC-1954.4). The verifier checks the new edge through the same graph and
+settle path as other effects, including when incarnation checks are off.
+
+The shared CLI schedule calls `order::before_rewrites` after its existing
+expansions. That generic entry analyses effects and returns the original
+plan unless it carries this requirement and has a corresponding rewrite
+edge. When active, it gives the full effect graph to `Schedule::settle`,
+with Keep entries preserving the relative order of every step that is not
+an endpoint of a BeforeRewrite edge. The callee rewrite sinks after the
+release under DEC-1956.2; no SQL Server rank, standalone reorder pass or
+hoisting policy is added. A conflicting Keep or cycle uses the existing
+named refusal. The class-order observer records BeforeRewrite edges as
+pending only before the shared schedule; its output and the final order
+must satisfy them. Plans without the requirement retain identical steps,
+emitted SQL, saved-plan bytes and checksum.
+
+Pinned by `a_before_rewrite_requirement_orders_every_other_rewrite_without_requiring_presence`
+in `pbps-diff`, and `releasing_a_baseline_binding_precedes_the_old_callees_rewrite`,
+`a_split_caller_releases_its_binding_at_teardown_and_rebinds_after_the_rewrite`,
+`only_an_actual_old_binding_that_the_step_releases_adds_before_rewrite`,
+`baseline_bindings_preserve_case_and_allow_only_unambiguous_folding`,
+`binding_release_settle_refuses_to_reverse_nonparticipants`,
+`incompatible_binding_releases_are_refused_with_the_cycle_members_named`, and
+`plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes`
+in `pbps-mssql`. The CLI live
+`baseline_schema_bindings_are_released_before_callee_rewrites` measures the
+baseline's 3729 before planning, checks offline and connected release-first
+order for all three release forms, applies the saved plan, verifies the
+results and read-back, and requires an empty next plan.

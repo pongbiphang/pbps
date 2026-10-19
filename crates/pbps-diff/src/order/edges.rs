@@ -40,6 +40,8 @@ pub enum Because {
     Creates(ObjectKey),
     /// The earlier rewrites what the later requires, or reads the new name of.
     Rewrites(ObjectKey),
+    /// The earlier releases what would block the later rewrite.
+    BeforeRewrite(ObjectKey),
     /// The later removes what the earlier requires.
     Removes(ObjectKey),
     /// The earlier removes what the later needs gone.
@@ -236,7 +238,8 @@ fn normalised(effects: &Effects, incarnations: bool) -> Effects {
                 other @ (Requirement::Exists(_)
                 | Requirement::Bound(..)
                 | Requirement::Absent(_)
-                | Requirement::Reads(_)) => other.clone(),
+                | Requirement::Reads(_)
+                | Requirement::BeforeRewrite(_)) => other.clone(),
             })
             .collect(),
     }
@@ -471,6 +474,11 @@ pub fn graph(
                             operation: b,
                             requirement: requirement.clone(),
                         });
+                    }
+                }
+                Requirement::BeforeRewrite(_) => {
+                    for &a in rewriters {
+                        edge(b, a, Source::Effect, Because::BeforeRewrite(key.clone()));
                     }
                 }
                 Requirement::Reads(_) => {

@@ -291,6 +291,17 @@ pub(crate) fn schedule(
             None => skipped.push(Skipped::RoleDrops),
         }
     }
+    cs = pbps_diff::order::before_rewrites(
+        cs,
+        declared.sources.before,
+        pbps_diff::Side {
+            schema: declared.schema,
+            ids: declared.sources.after,
+        },
+        dialect,
+        declared.module_deps,
+    )
+    .map_err(Refusal)?;
     // The verifier runs on the order this entry point settles, in tests and
     // debug builds (#1954, DEC-1954.6). On a connected SQL Server plan the
     // computed-column pass still follows, so that pair is recorded and not
@@ -925,7 +936,9 @@ mod tests {
         let ids = IdsFile::default();
         let drop = |name: &str| {
             PlannedChange::new(Change::DropRole {
-                uid: "r_aaaaaa".parse().unwrap(),
+                // Effect analysis reads the identity history too: distinct
+                // roles cannot share one synthetic identity.
+                uid: Uid::derived(UidKind::Role, name, 0),
                 name: name.to_owned(),
                 members: Vec::new(),
             })
