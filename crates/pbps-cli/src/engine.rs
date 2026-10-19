@@ -52,6 +52,22 @@ pub async fn execute_staged_statement(
     }
 }
 
+/// Recover validation after a staged step's caller has rolled its transaction back.
+pub async fn recover_failed_staged_validation(
+    conn: &mut Conn,
+    statement: &pbps_dialect::Statement,
+) -> Option<String> {
+    let check = statement
+        .scan_check
+        .as_ref()
+        .filter(|check| check.step == pbps_dialect::ScanCheckStep::Validate)?;
+    match conn.driver() {
+        // SQL Server does not emit a staged attach's temporary CHECK.
+        Driver::Mssql => None,
+        Driver::Postgres => Some(pbps_pg::staged::recover_failed_validation(conn, check).await),
+    }
+}
+
 /// Catalog estimates are advisory. Failure to measure is an unavailable
 /// answer, not a reason to refuse a valid plan (ADR-0012 §3, DECISIONS 430).
 pub async fn operational_cost(

@@ -767,6 +767,8 @@
         "a_schema_move_follows_the_partition_releasing_its_carried_index_name_on_both_servers",
         "rename_claims_cannot_take_a_retained_partition_clone_name_on_both_servers",
         "a_staged_attach_skips_its_scan_and_leaves_its_check_to_nobody",
+        "staged_attach_type_pins_preserve_check_recovery_on_postgres_18",
+        "staged_attach_type_pins_preserve_check_recovery_on_postgres_16",
         "a_table_is_attached_as_a_partition_through_the_cli",
         "a_table_is_attached_as_the_default_partition_through_the_cli",
         "a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_deploy_it",

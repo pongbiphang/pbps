@@ -8836,7 +8836,18 @@ async fn apply_staged_under_lock(
                 .await
             }
             .await;
-            finish_transaction(conn, dialect, result).await
+            let result = finish_transaction(conn, dialect, result).await;
+            // The preceding ADD committed its NOT VALID CHECK. Recover it
+            // after rollback, when catalog reads can run again (DEC-1638.1).
+            match result {
+                Err(error) => {
+                    match crate::engine::recover_failed_staged_validation(conn, stmt).await {
+                        Some(outcome) => Err(error.context(outcome)),
+                        None => Err(error),
+                    }
+                }
+                Ok(()) => Ok(()),
+            }
         } else {
             crate::engine::execute_staged_statement(conn, stmt)
                 .await

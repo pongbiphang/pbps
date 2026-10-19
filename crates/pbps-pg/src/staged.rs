@@ -21,18 +21,7 @@ pub async fn execute(conn: &mut Conn, statement: &Statement) -> Result<(), DbErr
         let Err(error) = conn.execute(&statement.sql).await else {
             return Ok(());
         };
-        let outcome = match remove_unvalidated(conn, check).await {
-            Ok(outcome) => outcome,
-            // As for an index: the cleanup driver's message stays out of the
-            // durable context (DECISIONS 455/456).
-            Err(_) => format!(
-                "Removing the temporary CHECK `{}` on `{}` failed; it may remain `NOT VALID`, \
-                 which every read of the table refuses. `pbps baseline --reason ...` removes it \
-                 by name before it records; the original error follows.",
-                check.name,
-                check.table.shown()
-            ),
-        };
+        let outcome = recover_failed_validation(conn, check).await;
         return Err(error.context(outcome));
     }
     let Some(build) = statement
@@ -82,6 +71,23 @@ pub async fn execute(conn: &mut Conn, statement: &Statement) -> Result<(), DbErr
         }
     };
     Err(error.context(outcome))
+}
+
+/// Recover a failed staged validation after its statement transaction has ended.
+/// A caller that owns that transaction must roll it back first (DEC-1638.1).
+pub async fn recover_failed_validation(conn: &mut Conn, check: &ScanCheck) -> String {
+    match remove_unvalidated(conn, check).await {
+        Ok(outcome) => outcome,
+        // As for an index: the cleanup driver's message stays out of the
+        // durable context (DECISIONS 455/456).
+        Err(_) => format!(
+            "Removing the temporary CHECK `{}` on `{}` failed; it may remain `NOT VALID`, \
+             which every read of the table refuses. `pbps baseline --reason ...` removes it \
+             by name before it records; the original error follows.",
+            check.name,
+            check.table.shown()
+        ),
+    }
 }
 
 async fn recover(conn: &mut Conn, build: &IndexBuild, table_oid: i64) -> Result<String, DbError> {
