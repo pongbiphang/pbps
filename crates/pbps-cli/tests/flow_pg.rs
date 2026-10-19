@@ -2710,7 +2710,13 @@ fn a_serial_turned_identity_frees_its_name_for_a_new_table() {
 fn an_identity_release_hands_its_catalog_name_to_a_new_table_on_both_servers() {
     for (k, server) in [old_server(), server()].iter().enumerate() {
         for renamed in [false, true] {
-            identity_name_handover(server, &format!("release-{k}-{renamed}"), renamed, false);
+            identity_name_handover(
+                server,
+                &format!("release-{k}-{renamed}"),
+                renamed,
+                false,
+                false,
+            );
         }
     }
 }
@@ -2719,11 +2725,27 @@ fn an_identity_release_hands_its_catalog_name_to_a_new_table_on_both_servers() {
 #[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 fn an_identity_conversion_hands_its_catalog_name_to_a_new_table_on_both_servers() {
     for (k, server) in [old_server(), server()].iter().enumerate() {
-        identity_name_handover(server, &format!("convert-{k}"), true, true);
+        identity_name_handover(server, &format!("convert-{k}"), true, true, false);
     }
 }
 
-fn identity_name_handover(server: &str, slug: &str, renamed: bool, converted: bool) {
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_retyped_identity_release_hands_its_catalog_name_to_a_new_table_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        identity_name_handover(server, &format!("retype-release-{k}"), true, false, true);
+    }
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn a_retyped_identity_conversion_hands_its_catalog_name_to_a_new_table_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        identity_name_handover(server, &format!("retype-convert-{k}"), true, true, true);
+    }
+}
+
+fn identity_name_handover(server: &str, slug: &str, renamed: bool, converted: bool, retyped: bool) {
     let own = OwnDatabase::new(server, &format!("identity-name-{slug}"));
     let connection = own.connection();
     on_server(
@@ -2752,6 +2774,7 @@ fn identity_name_handover(server: &str, slug: &str, renamed: bool, converted: bo
     )
     .unwrap();
     let plan = d.dir.join("handover.json");
+    let ty = if retyped { "bigint" } else { "integer" };
 
     // A kept or retuned identity does not release its sequence. The renamed
     // case passes declaration validation and reaches the catalog refusal.
@@ -2759,7 +2782,7 @@ fn identity_name_handover(server: &str, slug: &str, renamed: bool, converted: bo
         std::fs::write(
             &source,
             format!(
-                "table: app.t\ncolumns:\n  id: {{type: integer, nullable: false, \
+                "table: app.t\ncolumns:\n  id: {{type: {ty}, nullable: false, \
                      identity: [{start}, 1]}}\n"
             ),
         )
@@ -2786,10 +2809,11 @@ fn identity_name_handover(server: &str, slug: &str, renamed: bool, converted: bo
             1
         );
     }
-    let column = if converted {
-        "{type: serial, sequence: {name: replacement}}"
-    } else {
-        "{type: integer, nullable: false}"
+    let column = match (converted, retyped) {
+        (true, true) => "{type: bigserial, sequence: {name: replacement}}",
+        (true, false) => "{type: serial, sequence: {name: replacement}}",
+        (false, true) => "{type: bigint, nullable: false}",
+        (false, false) => "{type: integer, nullable: false}",
     };
     std::fs::write(&source, format!("table: app.t\ncolumns:\n  id: {column}\n")).unwrap();
     succeeds(d.run(&["plan"]));
@@ -2812,6 +2836,9 @@ fn identity_name_handover(server: &str, slug: &str, renamed: bool, converted: bo
         .find(&format!("CREATE TABLE \"app\".\"{name}\""))
         .expect("the plan creates the new holder");
     assert!(release < claim, "{script}");
+    if retyped {
+        assert!(script.contains("TYPE bigint"), "{script}");
+    }
     assert!(claim < script.find("CREATE INDEX").unwrap(), "{script}");
     succeeds(approved_apply(
         &d,
@@ -2829,6 +2856,16 @@ fn identity_name_handover(server: &str, slug: &str, renamed: bool, converted: bo
         1
     );
     assert_eq!(scalar(connection, "SELECT id::bigint FROM app.t"), 1);
+    assert_eq!(
+        scalar(
+            connection,
+            &format!(
+                "SELECT count(*) FROM pg_attribute WHERE attrelid = 'app.t'::regclass \
+         AND attname = 'id' AND atttypid = '{ty}'::regtype"
+            )
+        ),
+        1
+    );
     if converted {
         on_server(connection, "INSERT INTO app.t DEFAULT VALUES");
         assert_eq!(scalar(connection, "SELECT max(id)::bigint FROM app.t"), 2);

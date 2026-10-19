@@ -475,6 +475,8 @@ pub(crate) fn order_carried_moves(
     sides: (pbps_diff::Side<'_>, pbps_diff::Side<'_>),
     dialect: &dyn pbps_dialect::Dialect,
 ) {
+    use pbps_model::{Change, ValueSource};
+
     let clashes = name_clashes(&cs.changes, occupants, relations);
     if clashes.is_empty() {
         return;
@@ -485,6 +487,45 @@ pub(crate) fn order_carried_moves(
     else {
         return;
     };
+    // A retype and a numbering change are both possible leavers to the
+    // generic slots. The PostgreSQL identity release is exact, so state its
+    // own handover instead of requiring a unique generic edge (DEC-1986.2).
+    let mut moving = vec![false; cs.changes.len()];
+    let mut present = Occupant::all(occupants);
+    for (before, release) in cs.changes.iter().enumerate() {
+        if matches!(&release.change, Change::AlterColumnNumbering {
+            from: ValueSource::Identity(_), to, ..
+        } if !matches!(to, ValueSource::Identity(_)))
+        {
+            for (after, claim) in cs.changes.iter().enumerate() {
+                if relation_names_created(&claim.change).iter().any(|name| {
+                    present.iter().any(|o| {
+                        o.found.kind == "sequence" && o.name == *name && o.freed_by(&release.change)
+                    })
+                }) {
+                    schedule.edge(
+                        before,
+                        after,
+                        pbps_diff::order::Source::Catalog,
+                        pbps_model::resolver::OrderReason::Identity,
+                    );
+                    moving[after] = true;
+                }
+            }
+        }
+        present.retain(|o| !o.freed_by(&release.change));
+        for o in &mut present {
+            if let Change::RenameTable { from, to, .. } = &release.change {
+                o.moved(from, to);
+            }
+            if let Change::RenameColumn {
+                table, from, to, ..
+            } = &release.change
+            {
+                o.column_renamed(table, from, to);
+            }
+        }
+    }
     let Ok(mut settled) = schedule.settle(cs.clone()) else {
         return;
     };
@@ -496,49 +537,6 @@ pub(crate) fn order_carried_moves(
     if !only_crossed_by(&settled.sequence, &renames) {
         use pbps_diff::order::{Baseline, Checks, Schedule, analyse, graph};
         use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
-        use pbps_model::{Change, ValueSource};
-
-        // Slot occupants may leave at any numbering change. Here only an
-        // identity actually given up frees its sequence: a retune keeps it.
-        // Follow the owner's names as the existing replay does, rather than
-        // guessing the sequence's name from its table and column.
-        let mut present = Occupant::all(occupants);
-        let releases: Vec<bool> = cs
-            .changes
-            .iter()
-            .map(|p| {
-                let releases = matches!(
-                    &p.change,
-                    Change::AlterColumnNumbering {
-                        from: ValueSource::Identity(_), to, ..
-                    } if !matches!(to, ValueSource::Identity(_))
-                ) && present
-                    .iter()
-                    .any(|o| o.found.kind == "sequence" && o.freed_by(&p.change));
-                present.retain(|o| !o.freed_by(&p.change));
-                for o in &mut present {
-                    if let Change::RenameTable { from, to, .. } = &p.change {
-                        o.moved(from, to);
-                    }
-                    if let Change::RenameColumn {
-                        table, from, to, ..
-                    } = &p.change
-                    {
-                        o.column_renamed(table, from, to);
-                    }
-                }
-                releases
-            })
-            .collect();
-        let mut moving = vec![false; cs.changes.len()];
-        for edge in schedule.constraints() {
-            if edge.source == pbps_diff::order::Source::Catalog
-                && releases[edge.before]
-                && !relation_names_created(&cs.changes[edge.after].change).is_empty()
-            {
-                moving[edge.after] = true;
-            }
-        }
         if !moving.iter().any(|&moves| moves) {
             return;
         }
@@ -12298,6 +12296,128 @@ mod tests {
             plan.changes, original,
             "no catalog fact, no guessed handover"
         );
+    }
+
+    #[test]
+    fn a_retyped_identity_releases_its_catalog_name_before_the_new_holder() {
+        use pbps_model::{Change, Identity, OwnedSequence, ValueSource};
+
+        for to in [
+            ValueSource::None,
+            ValueSource::Sequence(OwnedSequence {
+                name: Some("new_counter".into()),
+                ..OwnedSequence::serial()
+            }),
+            ValueSource::Identity(Identity::new(1, 1)),
+        ] {
+            let released = !matches!(to, ValueSource::Identity(_));
+            let mut plan = IdentityHandover::new(to);
+            plan.after
+                .tables
+                .get_mut(&TableName::new("app", "t"))
+                .unwrap()
+                .columns
+                .get_mut("id")
+                .unwrap()
+                .ty = "bigint".parse().unwrap();
+            let sides = (
+                pbps_diff::Side {
+                    schema: &plan.before,
+                    ids: &plan.before_ids,
+                },
+                pbps_diff::Side {
+                    schema: &plan.after,
+                    ids: &plan.after_ids,
+                },
+            );
+            plan.changes = pbps_diff::diff(
+                sides.0,
+                sides.1,
+                &pbps_pg::Postgres::new(),
+                &pbps_model::Hints::default(),
+            )
+            .unwrap();
+            assert!(
+                plan.changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, Change::AlterColumnType { .. }))
+            );
+            let generic = pbps_diff::order::slots::handovers(
+                &plan.changes.changes,
+                sides.0,
+                sides.1,
+                &pbps_pg::Postgres::new(),
+                &occupant_slots(&plan.occupants),
+            )
+            .unwrap();
+            if released {
+                assert!(
+                    generic
+                        .constraints()
+                        .iter()
+                        .all(|edge| edge.source != pbps_diff::order::Source::Catalog),
+                    "the retype makes the generic catalog release ambiguous"
+                );
+            } else {
+                assert!(
+                    generic
+                        .constraints()
+                        .iter()
+                        .any(|edge| edge.source == pbps_diff::order::Source::Catalog),
+                    "a retype alone may supply a generic edge without freeing the identity"
+                );
+            }
+            assert!(plan.refused());
+            let original = plan.changes.changes.clone();
+            plan.order();
+            if released {
+                let release = plan
+                    .changes
+                    .changes
+                    .iter()
+                    .position(|p| matches!(p.change, Change::AlterColumnNumbering { .. }))
+                    .unwrap();
+                let claim = plan
+                    .changes
+                    .changes
+                    .iter()
+                    .position(|p| matches!(p.change, Change::CreateTable { .. }))
+                    .unwrap();
+                assert!(
+                    release < claim,
+                    "the exact identity release still orders its claimant"
+                );
+                assert!(!plan.refused());
+                let kept = |steps: &[pbps_model::PlannedChange]| {
+                    steps
+                        .iter()
+                        .filter(|p| !matches!(p.change, Change::CreateTable { .. }))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    kept(&plan.changes.changes),
+                    kept(&original),
+                    "the retype and numbering keep their order"
+                );
+                let ordered = plan.changes.clone();
+                plan.order();
+                assert_eq!(plan.changes, ordered);
+            } else {
+                assert!(
+                    original
+                        .iter()
+                        .all(|p| !matches!(p.change, Change::AlterColumnNumbering { .. })),
+                    "this negative only retypes the kept identity"
+                );
+                assert_eq!(plan.changes.changes, original);
+                assert!(
+                    plan.refused(),
+                    "a retype alone keeps the identity sequence occupied"
+                );
+            }
+        }
     }
 
     #[test]

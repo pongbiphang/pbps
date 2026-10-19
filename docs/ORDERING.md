@@ -98,7 +98,9 @@ Then, in this order:
   alone pass one another and the replay finds fewer clashes in it; a cycle,
   or any other change the move would pass, keeps the order and the refusal
   (DEC-1957.2). A creation taking an identity sequence's catalog name also
-  follows the numbering change that gives up or converts the identity. That
+  follows the numbering change that gives up or converts the identity. The
+  exact identity release states that handover even when a retype leaves
+  the generic slot release ambiguous (DEC-1986.2). That
   handover is settled with the effects, carrying the creation's consumers
   after it while keeping other steps in their relative order (DEC-1986.1).
   `refuse_created_name_occupants` calls it before the module

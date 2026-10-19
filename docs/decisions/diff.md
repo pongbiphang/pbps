@@ -6913,3 +6913,39 @@ live flows `an_identity_release_hands_its_catalog_name_to_a_new_table_on_both_se
 and `an_identity_conversion_hands_its_catalog_name_to_a_new_table_on_both_servers`.
 The live flows check the original and renamed backing names, kept and
 retuned negatives, apply, row preservation, verify and an empty next plan.
+
+
+<a id="dec-1986-2"></a>
+
+**DEC-1986.2. A PostgreSQL identity release states its catalog-name
+handover directly, including when the column is also retyped.** (#1986,
+PR #2212 ready review.) The generic slot walk conservatively treats both
+`AlterColumnType` and `AlterColumnNumbering` as possible releases of a
+column's catalog occupant. With both in the plan it cannot select a
+unique leaver and supplies no `Catalog` edge. Requiring that edge to seed
+DEC-1986.1's additional settlement route refused a valid plan: widen the
+identity column from integer to bigint, give up or convert its identity,
+and create a table at the backing sequence's name.
+
+`order_carried_moves` already knows which numbering change actually gives
+up the identity and which catalog sequence belongs to its owner and
+column. Its existing name replay now connects that exact release to each
+creation claiming the released name before the first settlement, and
+seeds the delayed creation from the same evidence. Table and column
+renames are followed as before; no generated name is inferred. The
+existing effects, dependent closure, `Keep` constraints and final clash
+replay still decide whether the order is retained. The generic slots
+remain conservative; a retype alone, a kept identity and a retune prove
+no identity-name release.
+
+Measured on PostgreSQL 16 and 18. Pinned by
+`a_retyped_identity_releases_its_catalog_name_before_the_new_holder` and
+the CLI live flows
+`a_retyped_identity_release_hands_its_catalog_name_to_a_new_table_on_both_servers`
+and
+`a_retyped_identity_conversion_hands_its_catalog_name_to_a_new_table_on_both_servers`:
+integer to bigint, the renamed catalog sequence, kept and retuned
+negatives, release before creation, dependent index ordering, row
+preservation, continued numbering after conversion, verify and empty
+replanning. The unit pin also checks the generic edge is absent,
+idempotency and the retype/numbering steps' relative order.

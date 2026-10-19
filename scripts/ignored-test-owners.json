@@ -544,6 +544,8 @@
         "a_serial_turned_identity_frees_its_name_for_a_new_table",
         "an_identity_release_hands_its_catalog_name_to_a_new_table_on_both_servers",
         "an_identity_conversion_hands_its_catalog_name_to_a_new_table_on_both_servers",
+        "a_retyped_identity_release_hands_its_catalog_name_to_a_new_table_on_both_servers",
+        "a_retyped_identity_conversion_hands_its_catalog_name_to_a_new_table_on_both_servers",
         "a_staged_apply_creates_serials_whole",
         "a_staged_cli_checkpoint_survives_state_json_and_resume_checks_its_intermediate_name",
         "a_staged_create_never_closes_over_a_replaced_pending_part",
