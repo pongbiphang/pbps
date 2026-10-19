@@ -8801,6 +8801,128 @@ fn a_partition_the_read_cannot_hold_all_of_takes_its_tree_out_of_a_pull() {
     }
 }
 
+/// An identity or `serial` column added to a table already there numbers
+/// its rows in a rewrite logical decoding does not stream, so `plan --db`
+/// names the publications over the table, refusing nothing (#1890,
+/// DEC-1890.1). Negative: a table with no publication passes, and a table
+/// the plan creates is not named at all.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
+    let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (k, server) in [old_server, server()].iter().enumerate() {
+        let own = OwnDatabase::new(server, &format!("numbered_fill1890_{k}"));
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(&format!("numbered-fill1890-{k}"));
+        let file = |name: &str, columns: &str| {
+            std::fs::write(
+                d.dir.join(format!("schema/app.{name}.yml")),
+                format!("table: app.{name}\ncolumns:\n  v: {{type: integer}}\n{columns}"),
+            )
+            .unwrap();
+        };
+        file("t", "");
+        file("q", "");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", connection, "--reason", "empty database"]));
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        on_server(
+            connection,
+            "INSERT INTO app.t VALUES (10), (20), (30);
+             INSERT INTO app.q VALUES (10);
+             SET client_min_messages = error;
+             CREATE PUBLICATION pbps_fill_t FOR TABLE app.t;",
+        );
+
+        // A table the plan creates only: nothing to name.
+        file("fresh", "  n: {type: serial}\n");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let shown = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+        assert!(
+            shown.contains(
+                "numbered_column_fills: this plan adds no identity or serial column to a table \
+                 already there"
+            ),
+            "{server}: {shown}"
+        );
+
+        file(
+            "t",
+            "  n: {type: integer, nullable: false, identity: [1, 1]}\n",
+        );
+        file("q", "  m: {type: serial}\n");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let shown = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+        let line = shown
+            .lines()
+            .find(|l| l.starts_with("numbered_column_fills: "))
+            .unwrap_or_else(|| panic!("{server}: {shown}"));
+        for said in [
+            "app.t.n",
+            "app.q.m",
+            "numbers the rows already there in a table rewrite, which logical decoding does \
+             not stream",
+            "publication(s) pbps_fill_t over app.t",
+            "until it takes a new snapshot of the table",
+        ] {
+            assert!(line.contains(said), "{server}: {said}: {line}");
+        }
+        assert!(!line.contains("over app.q"), "{server}: {line}");
+        assert!(!line.contains("app.fresh"), "{server}: {line}");
+        on_server(
+            connection,
+            "SET client_min_messages = error;
+             CREATE PUBLICATION pbps_fill_cols FOR TABLE app.t (v);",
+        );
+        let shown = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+        let line = shown
+            .lines()
+            .find(|l| l.starts_with("numbered_column_fills: "))
+            .unwrap_or_else(|| panic!("{server}: {shown}"));
+        for said in [
+            "publication(s) pbps_fill_t over app.t",
+            "until it takes a new snapshot of the table",
+            "publication pbps_fill_cols over app.t lists its columns, so it publishes none of \
+             the added column(s) until they are added to its list",
+        ] {
+            assert!(line.contains(said), "{server}: {said}: {line}");
+        }
+        // Listed, never refused: the plan applies.
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        assert_eq!(
+            scalar(connection, "SELECT count(*) FROM app.t WHERE n IS NOT NULL"),
+            3
+        );
+
+        // Negative: with no publication and no slot, the add passes.
+        on_server(
+            connection,
+            "DROP PUBLICATION pbps_fill_t; DROP PUBLICATION pbps_fill_cols;",
+        );
+        file(
+            "t",
+            "  n: {type: integer, nullable: false, identity: [1, 1]}\n  w: {type: serial}\n",
+        );
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let shown = stdout(&succeeds(d.run(&["plan", "--db", connection])));
+        assert!(
+            shown.contains(
+                "numbered_column_fills: no publication or logical replication slot would miss \
+                 the numbers app.t.w gives the rows already there"
+            ),
+            "{server}: {shown}"
+        );
+    }
+}
+
 /// A pending drop intent takes a held partition's uid out of the identity
 /// file before anything runs. Under a parent now declared `partitions:
 /// external`, `baseline` would then read the partition as one of the

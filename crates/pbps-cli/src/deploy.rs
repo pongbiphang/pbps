@@ -6761,15 +6761,16 @@ pub fn cmd_plan_db(
             )
             .await?;
             let slots = crate::engine::logical_slots(&mut conn, &cs).await?;
+            let fills = crate::engine::numbered_column_fills(&mut conn, &cs, &resolved.ids).await?;
             crate::engine::prepare_data_writes(&mut conn, &cs, &entry.snapshot, &resolved.ids)
                 .await?;
-            Ok::<_, anyhow::Error>((rename_evidence, dependents, rebuilds, drops, slots))
+            Ok::<_, anyhow::Error>((rename_evidence, dependents, rebuilds, drops, slots, fills))
         }
         .await;
         let rollback = conn
             .rollback(&dialect.transaction_framing(&pin_zone(&conn)))
             .await;
-        let (rename_evidence, dependents, rebuilds, drop_blockers, logical_slots) = checks?;
+        let (rename_evidence, dependents, rebuilds, drop_blockers, logical_slots, fills) = checks?;
         rollback?;
         // Again, over what the dependents added: a rebuild the plan now
         // synthesizes needs the transaction as much as one it was given.
@@ -7018,6 +7019,7 @@ pub fn cmd_plan_db(
                 dependents,
                 rebuilds,
                 logical_slots,
+                fills,
             ],
             findings,
             cost,

@@ -6949,3 +6949,59 @@ negatives, release before creation, dependent index ordering, row
 preservation, continued numbering after conversion, verify and empty
 replanning. The unit pin also checks the generic edge is absent,
 idempotency and the retype/numbering steps' relative order.
+
+<a id="dec-1890-1"></a>
+
+**DEC-1890.1. A connected PostgreSQL plan that adds an identity or `serial`
+column to a table already there lists the publications over the table and
+the database's logical slots, as the check `numbered_column_fills`, and
+refuses nothing.** (#1890; beside DEC-1788.1's `logical_slots`)
+
+The engine numbers every row already there in the table's rewrite, and that
+rewrite reaches no stream. Measured on 18.6 with `wal_level = logical`:
+- a `test_decoding` slot shows an empty transaction for each add;
+- a `pgoutput` slot, the plugin built-in replication and Debezium read,
+  shows no message;
+- a subscriber, which adds the column itself since DDL is not replicated,
+  keeps it empty for those rows while the publisher has 1, 2, 3;
+- a row inserted afterwards arrives with its number.
+
+So the check names the column, each publication that covers the table or
+any of its partitions, and each logical slot. For a publication without a
+column list or a slot, it says that a consumer keeps those numbers empty
+until it takes a new snapshot of the table. With neither a publication nor
+a slot it passes.
+
+- **A table the plan creates is never named.** It is a `CreateTable`, empty
+  when made, and its rows stream as they come. The table is found under the
+  name the catalog has it by (`PlanNames::stored` before the add), so a
+  table this plan renames first is asked by its old name. A table the plan
+  creates has no stored name.
+- **Listed, not refused, and no risk class.** Whether a consumer can
+  re-snapshot is its operator's to answer, which `logical_slots` already
+  leaves to the operator for a row move. A risk class would add an approval
+  that pbps cannot judge.
+- **No row count.** An empty table already there is named too. Counting its
+  rows would read data at plan time, and a row inserted between the plan and
+  the apply would still be missed.
+- **Publications through `pg_publication_tables`,** which expands `FOR ALL
+  TABLES` and `FOR TABLES IN SCHEMA`. Over the table itself and the rows of
+  `pg_partition_tree`, which measured on 18 is empty for a plain table. A
+  partition's publication and one under `publish_via_partition_root` are
+  both found.
+- **A publication with an explicit column list needs the new columns added
+  to its list first.** A new snapshot alone cannot publish them. Measured on
+  16 and 18, after `ALTER TABLE t ADD COLUMN n serial`,
+  `pg_publication_tables.attnames` stays `{v,w}` for a publication listing
+  `(v, w)` and becomes `{v,w,n}` for a whole-table publication;
+  `pg_publication_rel.prattrs IS NOT NULL` is true exactly for the listed
+  one. The check gives each listed publication its own clause, and promises
+  no snapshot remedy when only listed publications exist.
+
+Pinned by `a_numbered_column_fill_lists_the_streams_that_miss_it` (unit:
+publications and slots listed, slots alone listed, neither passes) and, live
+on 16 and 18, by
+`a_numbered_column_added_to_rows_names_the_publications_that_miss_it`. That
+test covers a publication named for an identity and a `serial` added
+together, a table with none left unnamed, a created table not named, the plan
+applying, and the pass once the publication is gone.
