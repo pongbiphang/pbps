@@ -147,10 +147,10 @@ pub fn render(schema: &Schema) -> String {
         for (col_name, col) in &table.columns {
             // The key marker is what makes the diagram readable at a glance;
             // Mermaid only has PK and FK.
-            let key = key_marker(table, col_name);
-            let token = attr_name(col_name);
+            let key = key_marker(table, col_name.raw());
+            let token = attr_name(col_name.raw());
             let description = col.description.as_ref().map(|d| d.raw().to_string());
-            let comment = attr_comment(col_name, &token, description.as_deref());
+            let comment = attr_comment(col_name.raw(), &token, description.as_deref());
             let _ = writeln!(
                 s,
                 "        {} {token}{key}{comment}",
@@ -160,9 +160,9 @@ pub fn render(schema: &Schema) -> String {
         // A SQL Server computed column has no type in the model: the engine
         // infers it (DEC-1174.1). `computed` stands in its place.
         for col_name in table.computed.keys() {
-            let key = key_marker(table, col_name);
-            let token = attr_name(col_name);
-            let comment = attr_comment(col_name, &token, None);
+            let key = key_marker(table, col_name.raw());
+            let token = attr_name(col_name.raw());
+            let comment = attr_comment(col_name.raw(), &token, None);
             let _ = writeln!(s, "        computed {token}{key}{comment}");
         }
         s.push_str("    }\n");
@@ -202,14 +202,14 @@ fn key_marker(table: &Table, column: &str) -> &'static str {
     let is_pk = table
         .primary_key
         .as_ref()
-        .is_some_and(|pk| pk.columns.iter().any(|c| c == column));
+        .is_some_and(|pk| pk.columns.iter().any(|c| c.raw() == column));
     if is_pk {
         return " PK";
     }
     if table
         .foreign_keys
         .values()
-        .any(|fk| fk.columns.iter().any(|c| c == column))
+        .any(|fk| fk.columns.iter().any(|c| c.raw() == column))
     {
         return " FK";
     }
@@ -310,20 +310,21 @@ mod tests {
         for (i, (namespace, name, _, _)) in names.iter().enumerate() {
             let next = (i + 1) % names.len();
             let mut table = Table::default();
-            table
-                .columns
-                .insert(format!("column_{i}"), Column::new(ty("bigint")).not_null());
+            table.columns.insert(
+                format!("column_{i}").into(),
+                Column::new(ty("bigint")).not_null(),
+            );
             table.primary_key = Some(PrimaryKey {
                 name: None,
-                columns: vec![format!("column_{i}")],
+                columns: vec![format!("column_{i}").into()],
                 storage_parameters: Default::default(),
             });
             table.foreign_keys.insert(
                 format!("fk_{i}"),
                 ForeignKey {
-                    columns: vec![format!("column_{i}")],
+                    columns: vec![format!("column_{i}").into()],
                     references_table: TableName::new(names[next].0, names[next].1),
-                    references_columns: vec![format!("column_{next}")],
+                    references_columns: vec![format!("column_{next}").into()],
                     on_delete: Default::default(),
                     on_update: Default::default(),
                 },

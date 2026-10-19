@@ -56,11 +56,11 @@ impl<'a> Identity<'a> {
         &self,
         declared: &ObjectName,
         current: &ObjectName,
-        name: &str,
-    ) -> Option<String> {
+        name: &pbps_model::ColumnName,
+    ) -> Option<pbps_model::ColumnName> {
         let wanted = ColumnRef {
             table: declared.clone(),
-            name: name.to_owned(),
+            name: name.clone(),
         };
         if let Some(recorded) = self
             .project

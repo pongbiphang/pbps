@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use pbps_model::ColumnName;
 use pbps_model::plan_names::{At, Holder, PlanNames};
 use pbps_model::{
     Cell, Change, Collation, Column, ColumnRef, ColumnType, ForeignKey, Row, RowKey, Table,
@@ -23,7 +24,7 @@ pub enum Event<'p> {
     RenameColumn {
         uid: &'p Uid,
         table: &'p TableName,
-        from: &'p String,
+        from: &'p ColumnName,
     },
     DropColumn {
         uid: &'p Uid,
@@ -31,7 +32,7 @@ pub enum Event<'p> {
     },
     AddColumn {
         table: &'p TableName,
-        name: &'p String,
+        name: &'p ColumnName,
         column: &'p Column,
     },
     AlterColumnType {
@@ -46,7 +47,7 @@ pub enum Event<'p> {
     },
     AddComputedColumn {
         table: &'p TableName,
-        name: &'p String,
+        name: &'p ColumnName,
     },
     DropComputedColumn {
         table: &'p TableName,
@@ -66,27 +67,27 @@ pub enum Event<'p> {
     },
     InsertRow {
         table: &'p TableName,
-        key_column: &'p String,
+        key_column: &'p ColumnName,
         key: &'p RowKey,
         row: &'p Row,
-        defaults: &'p BTreeMap<String, String>,
-        types: &'p BTreeMap<String, ColumnType>,
+        defaults: &'p BTreeMap<ColumnName, String>,
+        types: &'p BTreeMap<ColumnName, ColumnType>,
     },
     UpdateRow {
         table: &'p TableName,
-        key_column: &'p String,
+        key_column: &'p ColumnName,
         key: &'p RowKey,
-        columns: &'p BTreeMap<String, (Cell, Cell)>,
-        unchanged: &'p BTreeMap<String, Cell>,
-        types: &'p BTreeMap<String, ColumnType>,
-        after_types: &'p BTreeMap<String, ColumnType>,
+        columns: &'p BTreeMap<ColumnName, (Cell, Cell)>,
+        unchanged: &'p BTreeMap<ColumnName, Cell>,
+        types: &'p BTreeMap<ColumnName, ColumnType>,
+        after_types: &'p BTreeMap<ColumnName, ColumnType>,
     },
     DeleteRow {
         table: &'p TableName,
-        key_column: &'p String,
+        key_column: &'p ColumnName,
         key: &'p RowKey,
-        types: &'p BTreeMap<String, ColumnType>,
-        after_types: &'p BTreeMap<String, ColumnType>,
+        types: &'p BTreeMap<ColumnName, ColumnType>,
+        after_types: &'p BTreeMap<ColumnName, ColumnType>,
     },
 }
 
@@ -340,7 +341,7 @@ impl<'p> View<'_, 'p> {
     pub fn renamed_columns(
         &self,
         table: &TableName,
-    ) -> impl Iterator<Item = (&'p Uid, &'p str, &'p str)> + use<'p> {
+    ) -> impl Iterator<Item = (&'p Uid, &'p ColumnName, &'p ColumnName)> + use<'p> {
         self.facts.names.renamed_columns_at(table, self.at())
     }
 
@@ -353,8 +354,8 @@ impl<'p> View<'_, 'p> {
     pub fn column_as(&self, column: &ColumnRef, source: &ColumnRef) -> Option<ColumnRef> {
         let stored = self
             .renamed_columns(&source.table)
-            .find(|(_, _, to)| *to == source.name)
-            .map_or(source.name.as_str(), |(_, from, _)| from);
+            .find(|(_, _, to)| *to == &source.name)
+            .map_or(&source.name, |(_, from, _)| from);
         Some(self.table(&column.table)?.column(stored))
     }
 
@@ -515,7 +516,7 @@ impl<'p> View<'_, 'p> {
 pub struct Assignment<'p> {
     pub table: &'p TableName,
     pub key: &'p RowKey,
-    pub column: &'p str,
+    pub column: &'p ColumnName,
     pub cell: WrittenCell<'p>,
     pub ty: Option<&'p ColumnType>,
 }
@@ -534,28 +535,23 @@ impl<'p> WrittenCell<'p> {
     /// three inputs remains engine-assigned when queried with `inserted`.
     pub fn cells(
         row: &'p Row,
-        defaults: &'p BTreeMap<String, String>,
-        types: &'p BTreeMap<String, ColumnType>,
-    ) -> impl Iterator<Item = (&'p str, Self)> {
+        defaults: &'p BTreeMap<ColumnName, String>,
+        types: &'p BTreeMap<ColumnName, ColumnType>,
+    ) -> impl Iterator<Item = (&'p ColumnName, Self)> {
         row.0
             .keys()
             .chain(defaults.keys())
             .chain(types.keys())
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .map(move |column| {
-                (
-                    column.as_str(),
-                    Self::inserted(row, defaults, types, column),
-                )
-            })
+            .map(move |column| (column, Self::inserted(row, defaults, types, column)))
     }
 
     pub fn inserted(
         row: &'p Row,
-        defaults: &'p BTreeMap<String, String>,
-        types: &BTreeMap<String, ColumnType>,
-        column: &str,
+        defaults: &'p BTreeMap<ColumnName, String>,
+        types: &BTreeMap<ColumnName, ColumnType>,
+        column: &ColumnName,
     ) -> Self {
         if let Some(value) = row.0.get(column) {
             Self::Value(value)
@@ -574,24 +570,24 @@ impl<'p> WrittenCell<'p> {
 /// neither renders nor interprets V; engine-specific metadata remains M.
 #[derive(Debug)]
 pub struct RowWrites<V, M = ()> {
-    pub key_column: String,
+    pub key_column: ColumnName,
     pub deleted: BTreeSet<RowKey>,
-    pub updated: BTreeMap<RowKey, BTreeMap<String, Option<V>>>,
-    pub inserted: BTreeMap<RowKey, BTreeMap<String, V>>,
+    pub updated: BTreeMap<RowKey, BTreeMap<ColumnName, Option<V>>>,
+    pub inserted: BTreeMap<RowKey, BTreeMap<ColumnName, V>>,
     /// Non-key columns the insert can spell. A missing column is assigned by
     /// the engine; a present but unwritten one is an omitted NULL.
-    pub typed: BTreeMap<RowKey, BTreeSet<String>>,
+    pub typed: BTreeMap<RowKey, BTreeSet<ColumnName>>,
     /// Unknown assignments stay visible even where no value can be rendered.
-    pub unprobeable: BTreeMap<String, BTreeSet<RowKey>>,
+    pub unprobeable: BTreeMap<ColumnName, BTreeSet<RowKey>>,
     /// Unchanged NULL siblings can exempt the entire FK tuple (DECISIONS 349).
-    pub held_null: BTreeMap<RowKey, BTreeSet<String>>,
+    pub held_null: BTreeMap<RowKey, BTreeSet<ColumnName>>,
     pub metadata: M,
 }
 
 impl<V, M: Default> Default for RowWrites<V, M> {
     fn default() -> Self {
         Self {
-            key_column: String::new(),
+            key_column: ColumnName::default(),
             deleted: BTreeSet::new(),
             updated: BTreeMap::new(),
             inserted: BTreeMap::new(),
@@ -606,7 +602,7 @@ impl<V, M: Default> Default for RowWrites<V, M> {
 impl<V, M> RowWrites<V, M> {
     /// A deleted row contributes neither a surviving reference nor an arrival
     /// from its earlier writes. Keep other rows' unknown assignments visible.
-    pub fn delete(&mut self, key_column: &str, row: &RowKey) {
+    pub fn delete(&mut self, key_column: &ColumnName, row: &RowKey) {
         self.key_column = key_column.to_owned();
         self.deleted.insert(row.clone());
         self.updated.remove(row);
@@ -621,7 +617,7 @@ impl<V, M> RowWrites<V, M> {
 
     /// Keep an unknown assignment visible: treating it as an untouched cell
     /// would compare the stored reference instead (DECISIONS 124, 165).
-    pub fn update(&mut self, row: &RowKey, column: &str, value: Option<V>) {
+    pub fn update(&mut self, row: &RowKey, column: &ColumnName, value: Option<V>) {
         self.remember_unknown(row, column, &value);
         self.updated
             .entry(row.clone())
@@ -629,7 +625,7 @@ impl<V, M> RowWrites<V, M> {
             .insert(column.to_owned(), value);
     }
 
-    pub fn insert(&mut self, row: &RowKey, column: &str, value: Option<V>) {
+    pub fn insert(&mut self, row: &RowKey, column: &ColumnName, value: Option<V>) {
         self.remember_unknown(row, column, &value);
         if let Some(value) = value {
             self.inserted
@@ -639,7 +635,7 @@ impl<V, M> RowWrites<V, M> {
         }
     }
 
-    fn remember_unknown(&mut self, row: &RowKey, column: &str, value: &Option<V>) {
+    fn remember_unknown(&mut self, row: &RowKey, column: &ColumnName, value: &Option<V>) {
         if value.is_none() {
             self.unprobeable
                 .entry(column.to_owned())
@@ -652,7 +648,7 @@ impl<V, M> RowWrites<V, M> {
         !self.inserted.is_empty() || !self.updated.is_empty()
     }
 
-    pub fn gone_keys<'a>(&'a self, columns: &[String]) -> BTreeSet<&'a RowKey> {
+    pub fn gone_keys<'a>(&'a self, columns: &[ColumnName]) -> BTreeSet<&'a RowKey> {
         self.deleted
             .iter()
             .chain(
@@ -667,9 +663,9 @@ impl<V, M> RowWrites<V, M> {
     pub fn nulls_of(
         &self,
         row: &RowKey,
-        stored_name: &impl Fn(&str) -> Option<String>,
+        stored_name: &impl Fn(&ColumnName) -> Option<ColumnName>,
         is_null: impl Fn(&V) -> bool,
-    ) -> BTreeSet<String> {
+    ) -> BTreeSet<ColumnName> {
         let mut out = BTreeSet::new();
         if let Some(columns) = self.updated.get(row) {
             out.extend(
@@ -688,7 +684,7 @@ impl<V, M> RowWrites<V, M> {
             );
         }
         if let Some(columns) = self.held_null.get(row) {
-            out.extend(columns.iter().filter_map(|c| stored_name(c)));
+            out.extend(columns.iter().filter_map(stored_name));
         }
         out
     }

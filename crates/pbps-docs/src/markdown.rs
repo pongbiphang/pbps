@@ -108,7 +108,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
     s.push_str("| Column | Type | Null | Default | Description |\n");
     s.push_str("|---|---|---|---|---|\n");
     for (col_name, c) in &table.columns {
-        let mut label = code_cell(col_name);
+        let mut label = code_cell(col_name.raw());
         if table
             .primary_key
             .as_ref()
@@ -201,7 +201,7 @@ fn computed_table(s: &mut String, table: &Table) {
     }
     s.push_str("\n| Computed column | Expression | Stored |\n|---|---|---|\n");
     for (col_name, c) in &table.computed {
-        let mut label = code_cell(col_name);
+        let mut label = code_cell(col_name.raw());
         if table
             .primary_key
             .as_ref()
@@ -222,7 +222,11 @@ fn deprecated_section(s: &mut String, schema: &Schema) {
         for (col_name, c) in &table.columns {
             if let Some(reason) = &c.deprecated {
                 rows.push((
-                    format!("{name}.{col_name}", name = name.raw()),
+                    format!(
+                        "{name}.{col_name}",
+                        name = name.raw(),
+                        col_name = col_name.raw(),
+                    ),
                     reason.clone(),
                 ));
             }
@@ -272,9 +276,9 @@ pub(crate) fn computed_flags(c: &ComputedColumn) -> Option<String> {
     (!flags.is_empty()).then(|| flags.join(", "))
 }
 
-fn columns(cols: &[String]) -> String {
+fn columns(cols: &[pbps_model::ColumnName]) -> String {
     cols.iter()
-        .map(|c| format!("`{c}`"))
+        .map(|c| format!("`{c}`", c = c.raw()))
         .collect::<Vec<_>>()
         .join(", ")
 }

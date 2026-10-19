@@ -1,0 +1,57 @@
+table: app.child
+
+columns:
+  "col\nline\r\e[31m\x9B\\‮名前":
+    type: int
+    nullable: false
+  "col\nline\r\e[31m\x9B\\‮名前payload":
+    type: int
+    nullable: false
+    default: "2"
+
+computed:
+  "col\nline\r\e[31m\x9B\\‮名前computed": {expression: 1 + 1, persisted: true}
+
+primary_key:
+  name: pk_child
+  columns: ["col\nline\r\e[31m\x9B\\‮名前"]
+
+unique:
+  uq_child: ["col\nline\r\e[31m\x9B\\‮名前payload"]
+
+foreign_keys:
+  fk_parent:
+    columns: ["col\nline\r\e[31m\x9B\\‮名前payload"]
+    references: "app.parent(col\nline\r\e[31m\x9B\\‮名前)"
+
+indexes:
+  ix_child:
+    columns: ["col\nline\r\e[31m\x9B\\‮名前"]
+    include: ["col\nline\r\e[31m\x9B\\‮名前payload"]
+
+data:
+  mode: ensure
+  rows:
+    "1": {"col\nline\r\e[31m\x9B\\‮名前payload": 2}
+
+---
+table: app.parent
+
+columns:
+  "col\nline\r\e[31m\x9B\\‮名前":
+    type: int
+    nullable: false
+
+---
+table: app.temporal
+
+columns:
+  "col\nline\r\e[31m\x9B\\‮名前start":
+    type: datetime2(7)
+    nullable: false
+  "col\nline\r\e[31m\x9B\\‮名前end":
+    type: datetime2(7)
+    nullable: false
+
+system_time:
+  period: ["col\nline\r\e[31m\x9B\\‮名前start", "col\nline\r\e[31m\x9B\\‮名前end"]

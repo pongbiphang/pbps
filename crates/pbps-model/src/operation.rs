@@ -48,6 +48,7 @@
 //! (DEC-1961.2). [`Incarnations::replay`] refuses a plan in which a key would
 //! need a third instance.
 
+use crate::ColumnName;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -249,7 +250,7 @@ pub enum ColumnKey {
     Recorded(Recorded),
     /// A partition's column, which it inherits and holds no uid for: its
     /// table's uid and the column's name (DEC-1581.1).
-    Partition { table: Recorded, column: String },
+    Partition { table: Recorded, column: ColumnName },
 }
 
 /// A named part of a table. The kind travels with the name because indexes
@@ -263,7 +264,7 @@ pub enum PartKey {
     Check(String),
     Index(String),
     /// A SQL Server computed column, added and dropped whole by name.
-    Computed(String),
+    Computed(ColumnName),
 }
 
 impl From<&IndexPart> for PartKey {
@@ -692,7 +693,7 @@ impl Operation {
                 let owner = Recorded(uid.clone());
                 // Its columns are named as they are once it stands.
                 let at = spelling.produced();
-                let column = |c: &str| -> Result<ColumnKey, OwnerError> {
+                let column = |c: &ColumnName| -> Result<ColumnKey, OwnerError> {
                     owners
                         .column(&name.column(c), at)
                         .map(|uid| ColumnKey::Recorded(Recorded(uid)))

@@ -174,7 +174,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
     }
     s.push_str("<table>\n<tr><th>Column</th><th>Type</th><th>Null</th><th>Default</th><th>Description</th></tr>\n");
     for (col_name, c) in &table.columns {
-        let mut label = code(col_name);
+        let mut label = code(col_name.raw());
         if c.is_deprecated() {
             label = format!("<span class=\"dep\">{label}</span>");
         }
@@ -275,7 +275,11 @@ fn deprecated_section(s: &mut String, schema: &Schema) {
         for (col_name, c) in &table.columns {
             if let Some(reason) = &c.deprecated {
                 rows.push((
-                    format!("{name}.{col_name}", name = name.raw()),
+                    format!(
+                        "{name}.{col_name}",
+                        name = name.raw(),
+                        col_name = col_name.raw(),
+                    ),
                     reason.clone(),
                 ));
             }
@@ -325,7 +329,7 @@ fn computed_table(s: &mut String, table: &Table) {
     }
     s.push_str("<table>\n<tr><th>Computed column</th><th>Expression</th><th>Stored</th></tr>\n");
     for (col_name, c) in &table.computed {
-        let mut label = code(col_name);
+        let mut label = code(col_name.raw());
         if table
             .primary_key
             .as_ref()
@@ -345,8 +349,11 @@ fn computed_table(s: &mut String, table: &Table) {
     s.push_str("</table>\n");
 }
 
-fn columns(cols: &[String]) -> String {
-    cols.iter().map(|c| code(c)).collect::<Vec<_>>().join(", ")
+fn columns(cols: &[pbps_model::ColumnName]) -> String {
+    cols.iter()
+        .map(|c| code(c.raw()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn dash() -> String {

@@ -1,3 +1,4 @@
+use pbps_model::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{
@@ -20,7 +21,7 @@ pub(crate) struct Created<'a> {
     declared: &'a Table,
     finished: Table,
     kind: Kind<'a>,
-    incompatible_defaults: BTreeSet<String>,
+    incompatible_defaults: BTreeSet<ColumnName>,
     identity: Option<&'a ReplicaIdentity>,
 }
 
@@ -133,7 +134,12 @@ impl<'a> CreatedChanges<'a> {
     }
 }
 
-fn final_column(names: &PlanNames<'_>, table: &TableName, column: &str, at: At) -> Option<String> {
+fn final_column(
+    names: &PlanNames<'_>,
+    table: &TableName,
+    column: &ColumnName,
+    at: At,
+) -> Option<ColumnName> {
     match names.column_holder(&table.column(column), at) {
         Holder::Tracked(uid) => names
             .column_at(uid, At::End)
@@ -176,7 +182,8 @@ impl Created<'_> {
                 moved.push(format!(
                     "{now_name} {kind} `{extra}` is there, and this plan declares no such \
                      {kind}",
-                    now_name = now_name.shown()
+                    now_name = now_name.shown(),
+                    extra = pbps_model::escape::Escaped(extra),
                 ));
             }
             // Only once every statement has run: a foreign key is split
@@ -187,7 +194,8 @@ impl Created<'_> {
                     moved.push(format!(
                         "{now_name} {kind} `{missing}` is not there, and this plan's \
                          `CREATE TABLE` declares it",
-                        now_name = now_name.shown()
+                        now_name = now_name.shown(),
+                        missing = pbps_model::escape::Escaped(missing),
                     ));
                 }
             }
@@ -197,8 +205,8 @@ impl Created<'_> {
         // also creates.
         named(
             "column",
-            declared.columns.keys().map(String::as_str).collect(),
-            now.columns.keys().map(String::as_str).collect(),
+            declared.columns.keys().map(ColumnName::raw).collect(),
+            now.columns.keys().map(ColumnName::raw).collect(),
         );
         named(
             "unique",
@@ -228,8 +236,8 @@ impl Created<'_> {
         // payload names every one (#1174 review).
         named(
             "computed column",
-            self.finished.computed.keys().map(String::as_str).collect(),
-            now.computed.keys().map(String::as_str).collect(),
+            self.finished.computed.keys().map(ColumnName::raw).collect(),
+            now.computed.keys().map(ColumnName::raw).collect(),
         );
         // A column's own promise, in the fields the catalog reads back
         // unchanged — the type once normalized, measured: the live
@@ -248,7 +256,8 @@ impl Created<'_> {
                 moved.push(format!(
                     "{now_name} column `{n}` is not the one this plan's `CREATE TABLE` \
                      declares",
-                    now_name = now_name.shown()
+                    now_name = now_name.shown(),
+                    n = n.shown(),
                 ));
             }
         }
@@ -304,7 +313,8 @@ impl Created<'_> {
                 moved.push(format!(
                     "{now_name} computed column `{n}` is not the one this plan's `CREATE \
                      TABLE` declares",
-                    now_name = now_name.shown()
+                    now_name = now_name.shown(),
+                    n = n.shown(),
                 ));
             }
         }

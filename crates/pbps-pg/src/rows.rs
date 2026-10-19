@@ -49,6 +49,7 @@
 //! "empty" and "unreadable" are three different answers, and only one of them
 //! is good news.
 
+use pbps_model::ColumnName;
 use pbps_model::ValueSource;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -95,7 +96,7 @@ impl ValueKind {
 /// One selected column and where its pieces land in the result row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot {
-    pub column: String,
+    pub column: ColumnName,
     pub kind: ValueKind,
     /// Position of the value in the result row.
     pub value_at: usize,
@@ -130,7 +131,7 @@ pub struct RowQuery {
 const ALIAS_BATCH: usize = 128;
 
 /// The single primary-key column, or why there is none.
-pub(crate) fn key_column(name: &TableName, table: &Table) -> Result<String, RowsError> {
+pub(crate) fn key_column(name: &TableName, table: &Table) -> Result<ColumnName, RowsError> {
     match &table.primary_key {
         Some(pk) if pk.columns.len() == 1 => Ok(pk.columns[0].clone()),
         Some(pk) => Err(RowsError::Unreadable {
@@ -138,7 +139,11 @@ pub(crate) fn key_column(name: &TableName, table: &Table) -> Result<String, Rows
             why: format!(
                 "its primary key has {} columns ({}), and rows are keyed by one",
                 pk.columns.len(),
-                pk.columns.join(", ")
+                pk.columns
+                    .iter()
+                    .map(|name| name.shown().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }),
         None => Err(RowsError::Unreadable {
@@ -166,14 +171,18 @@ pub fn query(
             why: format!(
                 "its column `{column}` is `{}`, an array, and pbps reads no rows of a table \
                  with an array column",
-                spec.ty
+                spec.ty,
+                column = column.shown(),
             ),
         });
     }
     let Some(key_spec) = table.columns.get(&key) else {
         return Err(RowsError::Unreadable {
             table: name.clone(),
-            why: format!("its primary key column `{key}` is not among the columns read"),
+            why: format!(
+                "its primary key column `{key}` is not among the columns read",
+                key = key.shown(),
+            ),
         });
     };
     if let RowScope::Keys(keys) = scope
@@ -187,7 +196,7 @@ pub fn query(
         .map(|k| value_literal(k.as_str()))
         .collect();
 
-    let mut select = vec![read_expr(&quote(&key)?)];
+    let mut select = vec![read_expr(&quote(key.raw())?)];
     let key_slot = Slot {
         column: key.clone(),
         kind: ValueKind::of(&key_spec.ty.base),
@@ -225,7 +234,7 @@ pub fn query(
                 continue;
             }
         };
-        let quoted = quote(column)?;
+        let quoted = quote(column.raw())?;
         let value_at = select.len();
         select.push(read_expr(&quoted));
         let asked = confirms_default(spec);
@@ -305,14 +314,14 @@ pub fn query(
         let list: Vec<String> = keys.iter().map(|k| value_literal(k.as_str())).collect();
         sql.push_str(&format!(
             "\n WHERE {} IN ({})",
-            quote(&key)?,
+            quote(key.raw())?,
             list.join(", ")
         ));
     }
     sql.push(';');
 
     let table = qualified(name)?;
-    let key = quote(&key)?;
+    let key = quote(key.raw())?;
     // One scalar subquery per requested spelling rather than a join
     // against a `VALUES` list: a `VALUES` column resolves to `text`, and
     // `"id" = v.requested` on an `integer` column is then an operator that
@@ -1149,7 +1158,7 @@ pub fn decode_alias(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpellingQuery {
     /// `None` for the key column.
-    pub column: Option<String>,
+    pub column: Option<ColumnName>,
     pub ty: String,
     pub literals: Vec<(RowKey, String)>,
     pub sql: String,
@@ -1233,7 +1242,7 @@ pub fn spelling_queries(
         })?;
         Ok((ty.base.clone(), ty.to_string()))
     };
-    let query = |column: Option<String>,
+    let query = |column: Option<ColumnName>,
                  base: &str,
                  ty: String,
                  literals: Vec<(RowKey, String)>|
@@ -1309,7 +1318,7 @@ pub fn spelling_queries(
     };
 
     let mut out = Vec::new();
-    let (base, ty) = ty_of(&key)?;
+    let (base, ty) = ty_of(key.raw())?;
     let keys: Vec<(RowKey, String)> = data
         .rows
         .keys()
@@ -1330,14 +1339,14 @@ pub fn spelling_queries(
         {
             continue;
         }
-        let (base, ty) = ty_of(column)?;
+        let (base, ty) = ty_of(column.raw())?;
         if ValueKind::of(&base) != ValueKind::Text {
             continue;
         }
         let literals: Vec<(RowKey, String)> = data
             .rows
             .iter()
-            .filter_map(|(k, row)| match row.get(column) {
+            .filter_map(|(k, row)| match row.get(column.raw()) {
                 Some(Value::Text(t)) => Some((k.clone(), t.clone())),
                 _ => None,
             })
@@ -1362,7 +1371,7 @@ fn collatable(base: &str) -> bool {
 /// partition's bound values on one key column (#1170).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundSpellingQuery {
-    pub column: String,
+    pub column: ColumnName,
     pub ty: String,
     /// The declared values, by the index the query returns.
     pub values: Vec<String>,
@@ -1658,7 +1667,7 @@ pub(crate) fn data_problems(
     if let Some(pk) = &table.primary_key
         && let [key] = pk.columns.as_slice()
         && table.columns.get(key).is_some_and(|c| {
-            sources.get(key, c).iter().any(|source| match source {
+            sources.get(key.raw(), c).iter().any(|source| match source {
                 ValueSource::Identity(_) => true,
                 // Refused below, naming its own sequence.
                 ValueSource::None
@@ -1677,7 +1686,10 @@ pub(crate) fn data_problems(
              past any lock, a sequence cannot be locked, and an advance survives the rollback of \
              a failed apply (ADR-0013 section 2). Declare the rows by a natural key, or place them \
              outside pbps and adopt them with `pbps baseline`.",
-            name.schema, name.name
+            name.schema,
+            name.name,
+            // raw: whole-message escaped until #2084 step 5.
+            key = key.raw(),
         )));
     }
     // A `serial` key is the same construct with the same sequence left behind
@@ -1696,13 +1708,15 @@ pub(crate) fn data_problems(
              can safely do to the sequence (ADR-0013 section 2). Declare the rows by a natural \
              key, or place them outside pbps and adopt them with `pbps baseline`.",
             // raw: whole-message escaped until #2084 step 5
-            crate::emit::owned_sequence(name, key, sequence).raw()
+            crate::emit::owned_sequence(name, key.raw(), sequence).raw(),
+            // raw: whole-message escaped until #2084 step 5.
+            key = key.raw(),
         )));
     }
 
     for (key, row) in &data.rows {
         for (column, value) in &row.0 {
-            let Some(base) = base_of(column) else {
+            let Some(base) = base_of(column.raw()) else {
                 continue;
             };
             let kind = ValueKind::of(&base);
@@ -1731,7 +1745,9 @@ pub(crate) fn data_problems(
                         ValueKind::Bool => "`true` or `false`",
                         ValueKind::Int => "a bare integer",
                         ValueKind::Text => "a quoted string",
-                    }
+                    },
+                    // raw: whole-message escaped until #2084 step 5.
+                    column = column.raw(),
                 )));
                 continue;
             }
@@ -1746,7 +1762,9 @@ pub(crate) fn data_problems(
                     "row `{key}` sets `{column}` to {n}, but `{base}` holds {} to {}: the engine \
                      would refuse the insert",
                     range.start(),
-                    range.end()
+                    range.end(),
+                    // raw: whole-message escaped until #2084 step 5.
+                    column = column.raw(),
                 )));
             }
             if let (Value::Text(t), "bytea") = (value, base.as_str())
@@ -1763,7 +1781,7 @@ pub(crate) fn data_problems(
                          `decode('...','hex')` (ADR-0013 section 3); a declaration in any other \
                          spelling would be restated by every plan.",
                         Escaped(&key.to_string()),
-                        Escaped(column),
+                        column.shown(),
                         Escaped(&format!("{t:?}"))
                     ),
                 });
@@ -1775,7 +1793,7 @@ pub(crate) fn data_problems(
     // table this plan creates — there is no table to ask yet.
     if let Some(pk) = &table.primary_key
         && let [key_column] = pk.columns.as_slice()
-        && base_of(key_column).as_deref() == Some("bytea")
+        && base_of(key_column.raw()).as_deref() == Some("bytea")
     {
         for key in data.rows.keys() {
             if let Some(why) = not_a_bytea(key.as_str()) {
@@ -1785,7 +1803,7 @@ pub(crate) fn data_problems(
                     message: format!(
                         "row key `{}` cannot be a `bytea`, the type of the key column `{}`: {why}",
                         pbps_model::escape::Escaped(&key.to_string()),
-                        pbps_model::escape::Escaped(key_column)
+                        key_column.shown()
                     ),
                 });
             }
@@ -1858,6 +1876,9 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
                  (ADR-0013 section 5).",
                 data.rows.len(),
                 name = name.raw(),
+
+                // raw: whole-message escaped until #2084 step 5.
+                key = key.raw(),
             ));
         }
         let Some(column) = table.columns.get(&key) else {
@@ -1891,7 +1912,9 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
              `{ty}`, the type of `{key}`, and reads back with the same spelling. Even one \
              key can be refused or respelled by the engine. `pbps plan --db` checks the \
              key conversion and spelling against the live column.",
-            name = name.raw()
+            name = name.raw(),
+            // raw: whole-message escaped until #2084 step 5.
+            key = key.raw(),
         ));
     }
     out
@@ -1966,11 +1989,11 @@ mod tests {
             c.value_source = default.map_or(pbps_model::ValueSource::None, |text| {
                 pbps_model::ValueSource::Default(text.into())
             });
-            t.columns.insert((*name).to_owned(), c);
+            t.columns.insert((*name).into(), c);
         }
         t.primary_key = pk.map(|c| PrimaryKey {
             name: None,
-            columns: c.into_iter().map(str::to_owned).collect(),
+            columns: c.into_iter().map(pbps_model::ColumnName::from).collect(),
             storage_parameters: Default::default(),
         });
         t
@@ -2030,7 +2053,7 @@ mod tests {
         for (key, cells) in rows {
             let mut row = Row::default();
             for (column, value) in *cells {
-                row.0.insert((*column).to_owned(), value.clone());
+                row.0.insert((*column).into(), value.clone());
             }
             data.rows.insert(RowKey::from(*key), row);
         }
@@ -2051,12 +2074,12 @@ mod tests {
             .expect("the table is readable")
             .expect("the scope names rows");
         assert_eq!(q.key.value_at, 0);
-        assert_eq!(q.key.column, "code");
+        assert_eq!(q.key.column, "code".into());
         assert_eq!(q.columns.len(), 2);
-        assert_eq!(q.columns[0].column, "label");
+        assert_eq!(q.columns[0].column, "label".into());
         assert_eq!(q.columns[0].value_at, 1);
         assert_eq!(q.columns[0].default_at, Some(2));
-        assert_eq!(q.columns[1].column, "rank");
+        assert_eq!(q.columns[1].column, "rank".into());
         assert_eq!(q.columns[1].value_at, 3);
         assert_eq!(q.columns[1].default_at, None);
         assert_eq!(q.columns[1].kind, ValueKind::Int);
@@ -2124,12 +2147,12 @@ mod tests {
             increment: 1,
             options: Default::default(),
         });
-        t.columns.insert("seq".to_owned(), seq);
+        t.columns.insert("seq".into(), seq);
         let q = query(&name(), &t, &every())
             .expect("the table is readable")
             .expect("the scope names rows");
         assert_eq!(q.columns.len(), 1, "{:?}", q.columns);
-        assert_eq!(q.columns[0].column, "label");
+        assert_eq!(q.columns[0].column, "label".into());
         assert!(!q.sql.contains("\"seq\""), "{}", q.sql);
     }
 
@@ -2448,7 +2471,7 @@ mod tests {
         let slot = |column: &str| {
             q.columns
                 .iter()
-                .find(|s| s.column == column)
+                .find(|s| s.column == column.into())
                 .expect("the column is read")
                 .clone()
         };
@@ -2484,7 +2507,7 @@ mod tests {
         let q = query(&name(), &t, &every())
             .expect("readable")
             .expect("rows");
-        let read: Vec<&str> = q.columns.iter().map(|s| s.column.as_str()).collect();
+        let read: Vec<&str> = q.columns.iter().map(|s| s.column.raw()).collect();
         assert_eq!(read, ["v"], "{}", q.sql);
         assert!(!q.sql.contains("\"n\""), "{}", q.sql);
     }
@@ -2611,7 +2634,10 @@ mod tests {
             )],
         );
         let queries = spelling_queries(&name(), &t, &Catalogued::default()).expect("built");
-        let asked: Vec<Option<String>> = queries.iter().map(|q| q.column.clone()).collect();
+        let asked: Vec<Option<String>> = queries
+            .iter()
+            .map(|q| q.column.as_ref().map(|c| c.raw().to_owned()))
+            .collect();
         assert_eq!(
             asked,
             vec![None, Some("pct".to_owned()), Some("since".to_owned())],
@@ -3046,12 +3072,12 @@ mod tests {
         let parent = |strategy: S| {
             let mut t = Table::default();
             t.columns.insert(
-                "k".to_owned(),
+                "k".into(),
                 Column::new(ColumnType::from_str("numeric").unwrap()),
             );
             t.partition_by = Some(pbps_model::PartitionBy {
                 external: false,
-                columns: vec!["k".to_owned()],
+                columns: vec!["k".into()],
                 strategy,
             });
             t

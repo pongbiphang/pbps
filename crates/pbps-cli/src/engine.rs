@@ -1136,7 +1136,7 @@ pub async fn order_created_object_names(
             .iter()
             .map(|(t, name)| {
                 let group = tables.iter().position(|u| *u == t).unwrap_or_default();
-                (group, name.clone())
+                (group, name.raw().to_owned())
             })
             .collect();
         let alike: Vec<_> = pbps_mssql::catalog::column_names_alike(conn, &grouped)
@@ -1781,7 +1781,12 @@ fn stored_grant_target(
 fn changed_column<'c>(
     names: &pbps_model::plan_names::PlanNames<'_>,
     change: &'c pbps_model::Change,
-) -> Option<(TableName, String, &'c pbps_model::ColumnRef, &'static str)> {
+) -> Option<(
+    TableName,
+    pbps_model::ColumnName,
+    &'c pbps_model::ColumnRef,
+    &'static str,
+)> {
     use pbps_model::{Change, plan_names::At};
     let (uid, column, what) = if let Change::AlterColumnType { uid, column, .. } = change {
         (uid, column, "retyped")
@@ -1793,7 +1798,7 @@ fn changed_column<'c>(
     let (owner, name) = names.column_at(uid, At::Start)?;
     Some((
         names.table_at(owner, At::Start)?.clone(),
-        name.into(),
+        name.clone(),
         column,
         what,
     ))
@@ -1802,7 +1807,7 @@ fn changed_column<'c>(
 fn stored_column(
     names: &pbps_model::plan_names::PlanNames<'_>,
     column: &pbps_model::ColumnRef,
-) -> (TableName, String) {
+) -> (TableName, pbps_model::ColumnName) {
     let stored = names
         .stored_column(column, pbps_model::plan_names::At::End)
         .unwrap_or_else(|| column.clone());
@@ -1822,23 +1827,23 @@ fn release_of(
     changes: &ChangeSet,
     names: &pbps_model::plan_names::PlanNames<'_>,
     table: &TableName,
-    generated: &str,
-    base: &str,
+    generated: &pbps_model::ColumnName,
+    base: &pbps_model::ColumnName,
     named: &pbps_model::ColumnRef,
 ) -> Option<usize> {
     // Where the plan renames the input and gives its catalog name to another
     // column, that name in the new text reads the other one (review of
     // #1424).
-    let base_is_another = base != named.name
+    let base_is_another = base != &named.name
         && reused(
             changes,
             &pbps_model::ColumnRef::new(named.table.clone(), base),
         );
     changes.changes.iter().position(|p| {
         matches!(&p.change, pbps_model::Change::AlterColumnExpression { column, to, .. }
-            if stored_column(names, column) == (table.clone(), generated.to_owned())
-                && (base_is_another || !pbps_pg::generated::may_read(to, base))
-                && !pbps_pg::generated::may_read(to, &named.name))
+            if stored_column(names, column) == (table.clone(), generated.clone())
+                && (base_is_another || !pbps_pg::generated::may_read(to, base.raw()))
+                && !pbps_pg::generated::may_read(to, named.name.raw()))
     })
 }
 
@@ -1895,7 +1900,7 @@ pub(crate) fn order_after_releases(
                     if on.schema == table.schema && on.name == table.name)
         })
     };
-    let required: BTreeMap<(TableName, String), Option<usize>> = dependences
+    let required: BTreeMap<(TableName, pbps_model::ColumnName), Option<usize>> = dependences
         .iter()
         .flat_map(|(table, ds)| {
             let from = trigger_change_at(table);
@@ -1923,12 +1928,12 @@ pub(crate) fn order_after_releases(
         let Some((table, live, column, _)) = changed_column(&names, &p.change) else {
             continue;
         };
-        let readers: Vec<&str> = dependences
+        let readers: Vec<&pbps_model::ColumnName> = dependences
             .get(&table)
             .into_iter()
             .flatten()
             .filter(|d| d.base == live)
-            .map(|d| d.generated.as_str())
+            .map(|d| &d.generated)
             .collect();
         for generated in &readers {
             if let Some(r) = release_of(changes, &names, &table, generated, &live, column) {
@@ -1978,8 +1983,9 @@ pub(crate) fn order_after_releases(
             };
             let (at, generated) = stored_column(&names, &c);
             if at != table
-                || (!added && readers.contains(&generated.as_str()))
-                || !((!live_is_another && may_read(to, &live)) || may_read(to, &column.name))
+                || (!added && readers.contains(&&generated))
+                || !((!live_is_another && may_read(to, live.raw()))
+                    || may_read(to, column.name.raw()))
             {
                 continue;
             }
@@ -2108,7 +2114,7 @@ fn keep_ahead(
     schedule: &mut pbps_diff::order::Schedule,
     changes: &ChangeSet,
     names: &pbps_model::plan_names::PlanNames<'_>,
-    required: &BTreeMap<(TableName, String), Option<usize>>,
+    required: &BTreeMap<(TableName, pbps_model::ColumnName), Option<usize>>,
     held: usize,
     reach: usize,
 ) {
@@ -2255,7 +2261,7 @@ fn unreleased(
 ) -> Vec<String> {
     // A drop names its column by the catalog's name already: only its table
     // is reversed. A rename into the freed name is another column's.
-    let dropped: std::collections::BTreeSet<(TableName, String)> = changes
+    let dropped: std::collections::BTreeSet<(TableName, pbps_model::ColumnName)> = changes
         .changes
         .iter()
         .filter_map(|p| {
@@ -2285,8 +2291,8 @@ fn unreleased(
                  from it: the engine refuses to retype such a column and drops it only with \
                  CASCADE. Drop the generated column in the same plan, or change its expression \
                  to one that does not name `{}`.",
-                d.generated,
-                column.name,
+                d.generated.shown(),
+                column.name.shown(),
                 column = column.shown()
             ));
         }
@@ -2397,7 +2403,7 @@ pub async fn numbered_column_fills(
         });
     }
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    let mut fills: Vec<(TableName, String)> = Vec::new();
+    let mut fills: Vec<(TableName, pbps_model::ColumnName)> = Vec::new();
     for (i, p) in changes.changes.iter().enumerate() {
         let pbps_model::Change::AddColumn {
             table,
@@ -2445,13 +2451,19 @@ pub async fn numbered_column_fills(
 
 /// [`numbered_column_fills`]' answer over what the catalog said.
 fn fills_listed(
-    fills: &[(TableName, String)],
+    fills: &[(TableName, pbps_model::ColumnName)],
     publications: &[(TableName, Vec<(String, bool)>)],
     slots: &[(String, String)],
 ) -> ConnectedCheck {
     let columns = fills
         .iter()
-        .map(|(table, column)| format!("{}.{column}", table.shown()))
+        .map(|(table, column)| {
+            format!(
+                "{}.{}",
+                table.raw(), // #2084 step 5: connected-check JSON stays raw; the human writer escapes once.
+                column.raw()  // #2084 step 5: the shared message is escaped at the human writer.
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let mut streams = Vec::new();
@@ -2463,7 +2475,7 @@ fn fills_listed(
                 clauses.push(format!(
                     "publication {name} over {} lists its columns, so it publishes none of the \
                      added column(s) until they are added to its list",
-                    table.shown()
+                    table.raw() // #2084 step 5: connected-check JSON stays raw until the human writer.
                 ));
             } else {
                 whole.push(name.as_str());
@@ -2473,7 +2485,7 @@ fn fills_listed(
             streams.push(format!(
                 "publication(s) {} over {}",
                 whole.join(", "),
-                table.shown()
+                table.raw() // #2084 step 5: connected-check JSON stays raw until the human writer.
             ));
         }
     }
@@ -3891,7 +3903,7 @@ mod tests {
         assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(0));
         assert_eq!(cs, settled);
         assert!(matches!(&cs.changes[3].change,
-            Change::AlterColumnDefault { column, .. } if column.name == "a"));
+            Change::AlterColumnDefault { column, .. } if column.name == "a".into()));
         // Released, the check has nothing left to refuse; unreleased, it
         // does.
         let mut cs = plan(vec![retype("a"), recompute("b * 2")]);
@@ -3931,9 +3943,9 @@ mod tests {
         let mut cs = plan(vec![retype("a"), start_reading, recompute("b * 2")]);
         assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(2));
         assert!(
-            matches!(&cs.changes[0].change, Change::AlterColumnExpression { column, .. } if column.name == "g")
+            matches!(&cs.changes[0].change, Change::AlterColumnExpression { column, .. } if column.name == "g".into())
                 && matches!(cs.changes[1].change, Change::AlterColumnType { .. })
-                && matches!(&cs.changes[2].change, Change::AlterColumnExpression { column, .. } if column.name == "h"),
+                && matches!(&cs.changes[2].change, Change::AlterColumnExpression { column, .. } if column.name == "h".into()),
             "{:?}",
             cs.changes
         );
@@ -3987,7 +3999,7 @@ mod tests {
             key_column: "id".into(),
             key: pbps_model::RowKey::from("1"),
             columns: BTreeMap::from([(
-                column.to_owned(),
+                column.into(),
                 (
                     pbps_model::Cell::Value(pbps_model::Value::Int(1)),
                     pbps_model::Cell::Value(pbps_model::Value::Int(2)),
@@ -4140,9 +4152,9 @@ mod tests {
         let mut cs = plan(vec![reader(), retype("a"), recompute("b * 2")]);
         assert_eq!(order_after_releases(&mut cs, &reads_a), Ok(2));
         assert!(
-            matches!(&cs.changes[0].change, Change::AlterColumnExpression { column, .. } if column.name == "g")
+            matches!(&cs.changes[0].change, Change::AlterColumnExpression { column, .. } if column.name == "g".into())
                 && matches!(cs.changes[1].change, Change::AlterColumnType { .. })
-                && matches!(&cs.changes[2].change, Change::AlterColumnExpression { column, .. } if column.name == "h"),
+                && matches!(&cs.changes[2].change, Change::AlterColumnExpression { column, .. } if column.name == "h".into()),
             "{:?}",
             cs.changes
         );
@@ -4244,8 +4256,8 @@ mod tests {
         let at = |what: &dyn Fn(&Change) -> bool| {
             cs.changes.iter().position(|p| what(&p.change)).unwrap()
         };
-        let retyped = |name: &'static str| move |c: &Change| matches!(c, Change::AlterColumnType { column, .. } if column.name == name);
-        let expression = |name: &'static str| move |c: &Change| matches!(c, Change::AlterColumnExpression { column, .. } if column.name == name);
+        let retyped = |name: &'static str| move |c: &Change| matches!(c, Change::AlterColumnType { column, .. } if column.name == name.into());
+        let expression = |name: &'static str| move |c: &Change| matches!(c, Change::AlterColumnExpression { column, .. } if column.name == name.into());
         assert!(
             at(&expression("h")) < at(&retyped("b"))
                 && at(&retyped("b")) < at(&expression("g"))
@@ -4304,7 +4316,7 @@ mod tests {
                 key_column: "id".into(),
                 key: pbps_model::RowKey::from(key.to_string().as_str()),
                 columns: BTreeMap::from([(
-                    "b".to_owned(),
+                    "b".into(),
                     (
                         pbps_model::Cell::Value(pbps_model::Value::Int(1)),
                         pbps_model::Cell::Value(pbps_model::Value::Int(2)),
@@ -4943,6 +4955,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn numbered_column_fill_messages_keep_raw_names_until_the_human_writer() {
+        const RAW: &str = "name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+        const SHOWN: &str = r"name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+        let table = TableName::new("app", RAW);
+        let fills = [(table.clone(), RAW.into())];
+        for listed in [false, true] {
+            let publications = if listed {
+                vec![(
+                    table.clone(),
+                    vec![("whole".into(), false), ("cols".into(), true)],
+                )]
+            } else {
+                Vec::new()
+            };
+            let check = fills_listed(&fills, &publications, &[]);
+            assert_eq!(check.status, if listed { "listed" } else { "passed" });
+            let expected = |name: &str| {
+                if listed {
+                    format!(
+                        "app.{name}.{name} numbers the rows already there in a table rewrite, \
+                         which logical decoding does not stream: publication(s) whole over \
+                         app.{name} will not carry those numbers, and a consumer keeps them \
+                         empty until it takes a new snapshot of the table; publication cols over \
+                         app.{name} lists its columns, so it publishes none of the added \
+                         column(s) until they are added to its list"
+                    )
+                } else {
+                    format!(
+                        "no publication or logical replication slot would miss the numbers \
+                         app.{name}.{name} gives the rows already there"
+                    )
+                }
+            };
+            assert_eq!(check.message, expected(RAW));
+            assert_eq!(
+                serde_json::to_value(&check).unwrap()["message"],
+                expected(RAW)
+            );
+            assert_eq!(
+                pbps_model::escape::Escaped(&check.message).to_string(),
+                expected(SHOWN)
+            );
+            // An escaped-looking identifier is a different column, not an alias.
+            let literal = fills_listed(&[(table.clone(), SHOWN.into())], &publications, &[]);
+            assert_ne!(literal.message, check.message);
+        }
+    }
+
     /// A numbered column added to a table already there names each
     /// publication over the table and each logical slot, and refuses
     /// nothing; with neither it passes, still naming the column (#1890).
@@ -4950,7 +5011,7 @@ mod tests {
     fn a_numbered_column_fill_lists_the_streams_that_miss_it() {
         let t: TableName = "app.t".parse().unwrap();
         let u: TableName = "app.u".parse().unwrap();
-        let fills = vec![(t.clone(), "n".to_owned()), (u.clone(), "m".to_owned())];
+        let fills = vec![(t.clone(), "n".into()), (u.clone(), "m".into())];
         let listed = fills_listed(
             &fills,
             &[

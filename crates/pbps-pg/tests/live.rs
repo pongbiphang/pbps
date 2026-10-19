@@ -1393,7 +1393,7 @@ async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
             increment: 1,
             options: Default::default(),
         });
-        declaration.columns.insert("id".to_owned(), column);
+        declaration.columns.insert("id".into(), column);
         let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &declaration);
 
         assert_eq!(
@@ -1458,7 +1458,7 @@ async fn the_engine_and_the_dialect_agree_on_what_can_carry_an_identity() {
             increment,
             options: Default::default(),
         });
-        declaration.columns.insert("id".to_owned(), column);
+        declaration.columns.insert("id".into(), column);
         let found = Postgres::new().validate_table(&"app.t".parse().unwrap(), &declaration);
 
         assert_eq!(
@@ -1802,7 +1802,10 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
         Some("parent_pkey"),
         "an unnamed primary key comes back under the name the engine gave it"
     );
-    assert_eq!(parent.unique["parent_code_uq"].columns, ["code"]);
+    assert_eq!(
+        parent.unique["parent_code_uq"].columns,
+        [pbps_model::ColumnName::from("code")]
+    );
     // The index behind a constraint is that constraint, and not also an index.
     assert!(parent.indexes.is_empty(), "{:?}", parent.indexes);
 
@@ -1811,12 +1814,22 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
     // in the pull — and `attnum` keeps the hole, so everything after it would
     // be off by one if anything read a position.
     assert_eq!(
-        child.columns.keys().collect::<Vec<_>>(),
-        ["id", "parent_id", "label", "amount", "kind", "note"]
+        child.columns.keys().cloned().collect::<Vec<_>>(),
+        [
+            pbps_model::ColumnName::from("id"),
+            pbps_model::ColumnName::from("parent_id"),
+            pbps_model::ColumnName::from("label"),
+            pbps_model::ColumnName::from("amount"),
+            pbps_model::ColumnName::from("kind"),
+            pbps_model::ColumnName::from("note")
+        ]
     );
     assert_eq!(
         child.primary_key.as_ref().unwrap().columns,
-        ["id", "parent_id"]
+        [
+            pbps_model::ColumnName::from("id"),
+            pbps_model::ColumnName::from("parent_id")
+        ]
     );
 
     // The three verbatim expressions, exactly as the engine respelled them.
@@ -1835,20 +1848,26 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
     );
     let ix = &child.indexes["child_note_ix"];
     assert_eq!(ix.filter.as_deref(), Some("(note IS NOT NULL)"));
-    assert_eq!(ix.columns[0].key.column(), Some("note"));
+    assert_eq!(
+        ix.columns[0].key.column().map(pbps_model::ColumnName::raw),
+        Some("note")
+    );
     assert!(ix.columns[0].descending);
-    assert_eq!(ix.columns[1].key.column(), Some("label"));
+    assert_eq!(
+        ix.columns[1].key.column().map(pbps_model::ColumnName::raw),
+        Some("label")
+    );
     assert!(!ix.columns[1].descending);
-    assert_eq!(ix.include, ["kind"]);
+    assert_eq!(ix.include, [pbps_model::ColumnName::from("kind")]);
     assert!(!ix.unique);
 
     let fk = &child.foreign_keys["child_fk"];
-    assert_eq!(fk.columns, ["parent_id"]);
+    assert_eq!(fk.columns, [pbps_model::ColumnName::from("parent_id")]);
     assert_eq!(
         fk.references_table,
         pbps_model::TableName::new(&s, "parent")
     );
-    assert_eq!(fk.references_columns, ["id"]);
+    assert_eq!(fk.references_columns, [pbps_model::ColumnName::from("id")]);
     assert_eq!(fk.on_delete, pbps_model::ReferentialAction::Cascade);
     assert_eq!(fk.on_update, pbps_model::ReferentialAction::NoAction);
 
@@ -1899,7 +1918,7 @@ async fn the_pull_does_not_move_when_the_sessions_search_path_does() {
     let fk = &pulled.schema.tables[&pbps_model::TableName::new(&s, "c")].foreign_keys;
     let key = fk.values().next().expect("one foreign key");
     assert_eq!(key.references_table, pbps_model::TableName::new(&s, "p"));
-    assert_eq!(key.references_columns, ["id"]);
+    assert_eq!(key.references_columns, [pbps_model::ColumnName::from("id")]);
 
     // The same question about the settings that decide how a *value* is
     // printed, not how a name is. The expressions are carried verbatim, so a
@@ -2260,7 +2279,7 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     let held = restricted
         .foreign_keys
         .values()
-        .find(|fk| fk.columns == ["oid_"])
+        .find(|fk| fk.columns == [pbps_model::ColumnName::from("oid_")])
         .expect("the RESTRICT key is pulled");
     assert_eq!(held.on_delete, pbps_model::ReferentialAction::Restrict);
     assert_eq!(held.on_update, pbps_model::ReferentialAction::NoAction);
@@ -2612,7 +2631,10 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     let pointing = &pulled.schema.tables[&pbps_model::TableName::new(&s, "pointing")];
     assert_eq!(
         pointing.foreign_keys["pointing_fk"].references_columns,
-        ["x", "a)b"]
+        [
+            pbps_model::ColumnName::from("x"),
+            pbps_model::ColumnName::from("a)b")
+        ]
     );
     // A generated column's expression shares `pg_attrdef` with the defaults,
     // and reading it back as one would make a plan that computes it once.
@@ -3037,7 +3059,7 @@ async fn a_generated_columns_inputs_leave_out_its_own_column() {
     assert_eq!(
         found
             .iter()
-            .map(|d| (d.base.as_str(), d.base_required))
+            .map(|d| (d.base.raw(), d.base_required))
             .collect::<Vec<_>>(),
         [
             ("dflt", false),
@@ -3072,7 +3094,7 @@ async fn a_generated_columns_inputs_leave_out_its_own_column() {
         found
             .iter()
             .filter(|d| d.filled_by_trigger)
-            .map(|d| d.base.as_str())
+            .map(|d| d.base.raw())
             .collect::<Vec<_>>(),
         ["req"],
         "{found:?}"
@@ -3083,7 +3105,11 @@ async fn a_generated_columns_inputs_leave_out_its_own_column() {
     let found = dependences(&mut db.conn, &TableName::new(&s, "r"))
         .await
         .expect("the catalog answers");
-    assert_eq!(required(&found), ["req"], "{found:?}");
+    assert_eq!(
+        required(&found),
+        [pbps_model::ColumnName::from("req")],
+        "{found:?}"
+    );
     assert!(found.iter().all(|d| !d.filled_by_trigger), "{found:?}");
     db.execute(&format!("ALTER TABLE {s}.t ALTER COLUMN b TYPE bigint;"))
         .await
@@ -3586,7 +3612,10 @@ async fn a_declared_xml_or_network_value_is_read_under_the_pins_and_not_the_sess
         .map(|m| {
             (
                 m.key.to_string(),
-                m.column.clone().unwrap_or_default(),
+                m.column
+                    .as_ref()
+                    .map(|c| c.raw().to_owned())
+                    .unwrap_or_default(),
                 m.declared.clone(),
                 m.canonical.clone(),
             )
@@ -4511,7 +4540,7 @@ async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
     assert!(
         matches!(
             step.changes.as_slice(),
-            [p] if matches!(&p.change, Change::AddColumn { name, .. } if name == "n")
+            [p] if matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "n")
         ),
         "{step:#?}"
     );
@@ -5317,7 +5346,7 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
         let ev = &held.tables[&t(&s, "ev")];
         assert_eq!(
             ev.partition_by.as_ref().map(|p| p.columns.clone()),
-            Some(vec!["ts".to_owned()])
+            Some(vec![pbps_model::ColumnName::from("ts")])
         );
         assert_eq!(ev.columns.len(), 3);
         assert!(matches!(
@@ -5349,7 +5378,7 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
                 .unwrap()
                 .columns,
             [(
-                "g".to_owned(),
+                "g".into(),
                 pbps_model::PartitionColumn {
                     default: None,
                     not_null: true
@@ -5393,14 +5422,14 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
                 );
                 let of = p.partition_of.as_mut().unwrap();
                 of.columns.insert(
-                    "v".to_owned(),
+                    "v".into(),
                     pbps_model::PartitionColumn {
                         default: Some("'old'::text".to_owned()),
                         not_null: true,
                     },
                 );
                 of.columns.insert(
-                    "ts".to_owned(),
+                    "ts".into(),
                     pbps_model::PartitionColumn {
                         default: Some("'2024-01-01'::date".to_owned()),
                         not_null: false,
@@ -9909,7 +9938,8 @@ async fn a_foreign_keys_width_is_the_servers_answer_and_it_answers_before_lookin
     let pg = Postgres::new();
     for count in [32usize, 33] {
         let mut table = Table::default();
-        let columns: Vec<String> = (0..count).map(|i| format!("c{i}")).collect();
+        let columns: Vec<pbps_model::ColumnName> =
+            (0..count).map(|i| format!("c{i}").into()).collect();
         for column in &columns {
             table
                 .columns
@@ -10084,7 +10114,10 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
         ] {
             let label = format!("{kind} {columns:?}");
             let mut table = base();
-            let columns: Vec<String> = columns.into_iter().map(String::from).collect();
+            let columns: Vec<pbps_model::ColumnName> = columns
+                .into_iter()
+                .map(pbps_model::ColumnName::from)
+                .collect();
             match kind {
                 "primary" => {
                     table.primary_key = Some(PrimaryKey {
@@ -10150,7 +10183,10 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
             ForeignKey {
                 columns: vec!["a".into()],
                 references_table: TableName::new(&s, "parent"),
-                references_columns: remote.into_iter().map(String::from).collect(),
+                references_columns: remote
+                    .into_iter()
+                    .map(pbps_model::ColumnName::from)
+                    .collect(),
                 on_delete: Default::default(),
                 on_update: Default::default(),
             },
@@ -10172,9 +10208,9 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
         table.foreign_keys.insert(
             "fk".into(),
             ForeignKey {
-                columns: local.iter().map(|c| (*c).to_owned()).collect(),
+                columns: local.iter().map(|c| (*c).into()).collect(),
                 references_table: TableName::new(&s, "parent"),
-                references_columns: remote.iter().map(|c| (*c).to_owned()).collect(),
+                references_columns: remote.iter().map(|c| (*c).into()).collect(),
                 on_delete: Default::default(),
                 on_update: Default::default(),
             },
@@ -10194,7 +10230,10 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
                     descending: false,
                     opclass: None,
                 }],
-                include: include.into_iter().map(String::from).collect(),
+                include: include
+                    .into_iter()
+                    .map(pbps_model::ColumnName::from)
+                    .collect(),
                 unique: false,
                 filter: None,
                 method: Default::default(),
@@ -10261,7 +10300,8 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
     for count in [32, 33] {
         for kind in ["primary", "unique", "index", "include"] {
             let mut table = base();
-            let columns: Vec<_> = (0..count).map(|n| format!("c{n}")).collect();
+            let columns: Vec<pbps_model::ColumnName> =
+                (0..count).map(|n| format!("c{n}").into()).collect();
             for column in &columns {
                 table
                     .columns
@@ -11222,7 +11262,7 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
         uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
         column: pbps_model::ColumnRef {
             table: table.clone(),
-            name: column.to_owned(),
+            name: column.into(),
         },
         from: ty(from),
         to: ty("text"),
@@ -11349,7 +11389,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
         for (name, spec) in columns {
             let column = Column::new(ty(spec));
             t.columns.insert(
-                (*name).to_owned(),
+                (*name).into(),
                 if *name == "code" {
                     column.not_null()
                 } else {
@@ -11359,7 +11399,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
         }
         t.primary_key = Some(PrimaryKey {
             name: Some("pk_s".to_owned()),
-            columns: vec!["code".to_owned()],
+            columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });
         t
@@ -11421,10 +11461,11 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
             .position(|p| f(&p.change))
             .unwrap_or_else(|| panic!("{migration:?}"))
     };
-    let drop_at =
-        at(|c| matches!(c, pbps_model::Change::DropColumn { column, .. } if column.name == "note"));
+    let drop_at = at(
+        |c| matches!(c, pbps_model::Change::DropColumn { column, .. } if column.name == "note".into()),
+    );
     let rename_at =
-        at(|c| matches!(c, pbps_model::Change::RenameColumn { to, .. } if to == "note"));
+        at(|c| matches!(c, pbps_model::Change::RenameColumn { to, .. } if to.raw() == "note"));
     assert!(
         drop_at < rename_at,
         "the drop must free the name first: {migration:?}"
@@ -12781,13 +12822,13 @@ async fn doctor_reads_a_real_version_and_a_permission_set_ownership_decides() {
     let mut table = Table::default();
     table
         .columns
-        .insert("id".to_owned(), Column::new("integer".parse().unwrap()));
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
     table
         .columns
-        .insert("email".to_owned(), Column::new("text".parse().unwrap()));
+        .insert("email".into(), Column::new("text".parse().unwrap()));
     table.primary_key = Some(pbps_model::PrimaryKey {
         name: None,
-        columns: vec!["id".to_owned()],
+        columns: vec!["id".into()],
         storage_parameters: Default::default(),
     });
     with_data(
@@ -14614,7 +14655,7 @@ async fn a_column_grant_covering_exactly_the_keys_columns_reports_no_gap() {
         name: "parent".to_owned(),
     };
     let referenced_columns: pbps_db::doctor::ReferencedColumns =
-        [(parent.clone(), ["id".to_owned()].into_iter().collect())]
+        [(parent.clone(), ["id".into()].into_iter().collect())]
             .into_iter()
             .collect();
     let ask = doctor::Ask {
@@ -19688,7 +19729,7 @@ fn data_schema(test: &str) -> String {
 fn row(cells: &[(&str, Value)]) -> Row {
     Row(cells
         .iter()
-        .map(|(c, v)| ((*c).to_owned(), v.clone()))
+        .map(|(c, v)| ((*c).into(), v.clone()))
         .collect())
 }
 
@@ -26434,7 +26475,7 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);
     let base = connected_base(&mut conn, &declared, &s).await;
     let cs = plan(&base, &ids, &declared, &ids);
-    let set: Vec<&String> = cs
+    let set: Vec<&str> = cs
         .changes
         .iter()
         .filter_map(|c| {
@@ -26444,7 +26485,7 @@ async fn a_null_default_is_one_this_engine_does_not_keep() {
                 ..
             } = &c.change
             {
-                Some(&column.name)
+                Some(column.name.raw())
             } else {
                 None
             }
@@ -29291,7 +29332,7 @@ async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_hold
     let parent = TableName::new(&s, "status");
     let mut declared = pbps_model::Table::default();
     declared.columns.insert(
-        "code".to_owned(),
+        "code".into(),
         pbps_model::Column::new(ty("text")).not_null(),
     );
     // The key needs something unique to point at, or the engine refuses it
@@ -30521,7 +30562,7 @@ async fn relation_name_occupants_name_each_kind_and_its_owner() {
                 o.name.name.clone(),
                 o.kind,
                 o.owner.as_ref().map(|t| t.name.clone()),
-                o.owner_column.clone(),
+                o.owner_column.as_ref().map(|c| c.raw().to_owned()),
             )
         })
         .collect();
@@ -36316,9 +36357,9 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         .insert(
             "fk_keyed".to_owned(),
             pbps_model::ForeignKey {
-                columns: vec!["id".to_owned()],
+                columns: vec!["id".into()],
                 references_table: "public.kept".parse().unwrap(),
-                references_columns: vec!["id".to_owned()],
+                references_columns: vec!["id".into()],
                 on_delete: Default::default(),
                 on_update: Default::default(),
             },
@@ -37218,8 +37259,12 @@ async fn a_date_or_time_literal_read_two_ways_is_found_on_both_versions() {
             .map(|a| {
                 let at = match &a.at {
                     LiteralAt::Cell { key, .. } => key.as_str().to_owned(),
-                    LiteralAt::Default { column, .. } => format!("default {column}"),
-                    LiteralAt::Bound { column, .. } => format!("bound {column}"),
+                    LiteralAt::Default { column, .. } => {
+                        format!("default {column}", column = column.shown(),)
+                    }
+                    LiteralAt::Bound { column, .. } => {
+                        format!("bound {column}", column = column.shown(),)
+                    }
                 };
                 (at, a.pinned.clone())
             })

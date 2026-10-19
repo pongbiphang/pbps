@@ -40,7 +40,7 @@ fn projection_work_depends_on_steps_not_evidence_width() {
         for i in 0..columns {
             definition
                 .columns
-                .insert(format!("c{i}"), Column::new("int".parse().unwrap()));
+                .insert(format!("c{i}").into(), Column::new("int".parse().unwrap()));
         }
         let inputs: BTreeSet<_> = definition
             .columns

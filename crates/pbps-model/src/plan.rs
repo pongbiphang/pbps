@@ -620,7 +620,7 @@ mod tests {
     fn schema_with(ty: &str) -> Schema {
         let mut columns = IndexMap::new();
         columns.insert(
-            "email".to_string(),
+            "email".into(),
             Column::new(ty.parse::<ColumnType>().unwrap()),
         );
         let mut s = Schema::default();
@@ -639,7 +639,7 @@ mod tests {
         let mut map = IndexMap::new();
         for c in columns {
             map.insert(
-                (*c).to_string(),
+                (*c).into(),
                 Column::new("nvarchar(200)".parse::<ColumnType>().unwrap()),
             );
         }

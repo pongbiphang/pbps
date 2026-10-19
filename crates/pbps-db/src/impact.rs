@@ -63,7 +63,7 @@ impl RenameTarget {
     pub fn column(&self) -> Option<&str> {
         match self {
             RenameTarget::Table(_) | RenameTarget::Module(_) => None,
-            RenameTarget::Column(c) => Some(&c.name),
+            RenameTarget::Column(c) => Some(c.name.raw()),
         }
     }
 

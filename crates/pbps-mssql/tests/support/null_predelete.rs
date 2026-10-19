@@ -423,7 +423,7 @@ async fn a_planned_foreign_key_counts_references_after_parent_deletion() {
                 let mut update =
                     update_child("1", vec![("a", Cell::Default("NULL".into()))], vec![]);
                 if let Change::UpdateRow { types, .. } = &mut update {
-                    types.retain(|name, _| name == "a");
+                    types.retain(|name, _| name.raw() == "a");
                 }
                 vec![update]
             }

@@ -53,7 +53,10 @@ fn a_column_finds_its_untouched_owner_in_the_final_mapping() {
     let after = ids(&[(&owner, t("a"))], &[(&c, t("a").column("c"))]);
     let names = PlanNames::of(&changes, &after).unwrap();
     for at in [At::Start, At::Before(0), At::After(0), At::End] {
-        assert_eq!(names.column_at(&c, at), Some((&owner, "c")));
+        assert_eq!(
+            names.column_at(&c, at),
+            Some((&owner, &crate::ColumnName::from("c")))
+        );
         assert_eq!(names.holder(&t("a"), at), Holder::Tracked(&owner));
     }
     assert_eq!(names.holder(&t("unmanaged"), At::Start), Holder::Unmanaged);
@@ -94,7 +97,10 @@ fn a_source_named_change_in_a_chain_keeps_its_own_original_table() {
     let names = PlanNames::of(&changes, &after).unwrap();
     assert_eq!(names.stored(&t("b"), At::Before(0)), Some(t("b")));
     assert_eq!(names.stored(&t("b"), At::End), Some(t("a")));
-    assert_eq!(names.column_at(&c, At::Start), Some((&b, "c")));
+    assert_eq!(
+        names.column_at(&c, At::Start),
+        Some((&b, &crate::ColumnName::from("c")))
+    );
 }
 
 #[test]
@@ -205,7 +211,10 @@ fn a_created_tables_inline_column_has_no_stored_address() {
     let after = ids(&[(&a, t("a"))], &[(&c, t("a").column("c"))]);
     let names = PlanNames::of(&changes, &after).unwrap();
     assert_eq!(names.column_at(&c, At::Start), None);
-    assert_eq!(names.column_at(&c, At::End), Some((&a, "c")));
+    assert_eq!(
+        names.column_at(&c, At::End),
+        Some((&a, &crate::ColumnName::from("c")))
+    );
     assert_eq!(names.stored(&t("a"), At::End), None);
     assert_eq!(names.stored_column(&t("a").column("c"), At::End), None);
 }
@@ -223,8 +232,14 @@ fn dropping_a_table_ends_the_lifetime_of_its_known_columns() {
     ];
     let after = IdsFile::default();
     let names = PlanNames::of(&changes, &after).unwrap();
-    assert_eq!(names.column_at(&c, At::Start), Some((&a, "c")));
-    assert_eq!(names.column_at(&c, At::After(0)), Some((&a, "c")));
+    assert_eq!(
+        names.column_at(&c, At::Start),
+        Some((&a, &crate::ColumnName::from("c")))
+    );
+    assert_eq!(
+        names.column_at(&c, At::After(0)),
+        Some((&a, &crate::ColumnName::from("c")))
+    );
     assert_eq!(names.column_at(&c, At::End), None);
 }
 
@@ -338,7 +353,10 @@ fn an_added_column_is_absent_until_its_own_change() {
         names.column_holder(&t("a").column("c"), At::Start),
         Holder::Vacant
     );
-    assert_eq!(names.column_at(&c, At::After(0)), Some((&a, "c")));
+    assert_eq!(
+        names.column_at(&c, At::After(0)),
+        Some((&a, &crate::ColumnName::from("c")))
+    );
     assert_eq!(names.stored_column(&t("a").column("c"), At::End), None);
 }
 
@@ -363,7 +381,10 @@ fn an_added_column_is_not_mistaken_for_an_inline_created_column() {
     let after = ids(&[(&a, t("a"))], &[(&c, t("a").column("c"))]);
     let names = PlanNames::of(&changes, &after).unwrap();
     assert_eq!(names.column_at(&c, At::After(0)), None);
-    assert_eq!(names.column_at(&c, At::End), Some((&a, "c")));
+    assert_eq!(
+        names.column_at(&c, At::End),
+        Some((&a, &crate::ColumnName::from("c")))
+    );
 }
 
 #[test]
@@ -425,7 +446,10 @@ fn dropping_a_column_before_its_table_does_not_drop_the_column_twice() {
     ];
     let after = IdsFile::default();
     let names = PlanNames::of(&changes, &after).unwrap();
-    assert_eq!(names.column_at(&c, At::Start), Some((&a, "c")));
+    assert_eq!(
+        names.column_at(&c, At::Start),
+        Some((&a, &crate::ColumnName::from("c")))
+    );
     assert_eq!(names.column_at(&c, At::After(0)), None);
     assert_eq!(names.column_at(&c, At::End), None);
 }
@@ -508,7 +532,10 @@ fn a_detach_introduces_owned_column_identities_without_creating_its_table() {
     let names = PlanNames::of(&changes, &after).unwrap();
     assert_eq!(names.table_at(&a, At::Start), Some(&t("a")));
     assert_eq!(names.column_at(&c, At::Start), None);
-    assert_eq!(names.column_at(&c, At::End), Some((&a, "c")));
+    assert_eq!(
+        names.column_at(&c, At::End),
+        Some((&a, &crate::ColumnName::from("c")))
+    );
 }
 
 #[test]
@@ -527,7 +554,10 @@ fn an_attach_retires_known_column_identities_without_dropping_its_table() {
     ];
     let after = ids(&[(&a, t("a"))], &[]);
     let names = PlanNames::of(&changes, &after).unwrap();
-    assert_eq!(names.column_at(&c, At::Start), Some((&a, "c")));
+    assert_eq!(
+        names.column_at(&c, At::Start),
+        Some((&a, &crate::ColumnName::from("c")))
+    );
     assert_eq!(names.column_at(&c, At::End), None);
     assert_eq!(names.table_at(&a, At::End), Some(&t("a")));
 }
@@ -565,7 +595,10 @@ fn a_final_detachs_column_identity_does_not_leak_into_an_earlier_ownership_scope
         for at in 0..changes.len() - 1 {
             assert_eq!(names.column_at(&fresh, At::After(at)), None);
         }
-        assert_eq!(names.column_at(&fresh, At::End), Some((&owner, "c")));
+        assert_eq!(
+            names.column_at(&fresh, At::End),
+            Some((&owner, &crate::ColumnName::from("c")))
+        );
         assert_eq!(names.stored_column(&t("leaf").column("c"), At::End), None);
     }
 }
@@ -598,10 +631,16 @@ fn a_first_column_address_does_not_extend_its_managed_lifetime() {
         &[(&fresh, t("leaf").column("amount"))],
     );
     let names = PlanNames::of(&changes, &after).unwrap();
-    assert_eq!(names.column_first(&fresh), Some((&owner, "v")));
+    assert_eq!(
+        names.column_first(&fresh),
+        Some((&owner, &crate::ColumnName::from("v")))
+    );
     assert_eq!(names.column_first(&column("unknown")), None);
     assert_eq!(names.column_at(&fresh, At::Start), None);
-    assert_eq!(names.column_at(&fresh, At::End), Some((&owner, "amount")));
+    assert_eq!(
+        names.column_at(&fresh, At::End),
+        Some((&owner, &crate::ColumnName::from("amount")))
+    );
     assert_eq!(
         names.stored_column(&t("leaf").column("amount"), At::End),
         None

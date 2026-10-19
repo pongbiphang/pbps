@@ -221,7 +221,7 @@ pub fn carried(
         let column = table
             .as_ref()
             .zip(o.column.as_ref())
-            .and_then(|(t, c)| t.column(owners, c).map(|key| (key, c.clone())));
+            .and_then(|(t, c)| t.column(owners, c.raw()).map(|key| (key, c.clone())));
         let who = Occupier::Catalog {
             kind: o.kind.clone(),
             owner: table.map(|t| t.table_key()),
@@ -574,7 +574,7 @@ enum Occupier {
         owner: Option<ObjectKey>,
         /// The owner's column it belongs to, by the column's key and the
         /// baseline's name.
-        column: Option<(ObjectKey, String)>,
+        column: Option<(ObjectKey, pbps_model::ColumnName)>,
     },
 }
 
@@ -664,7 +664,7 @@ pub fn verify(
             let column = table
                 .as_ref()
                 .zip(o.column.as_ref())
-                .and_then(|(t, c)| t.column(owners, c).map(|k| (k, c.clone())));
+                .and_then(|(t, c)| t.column(owners, c.raw()).map(|k| (k, c.clone())));
             held.push((
                 o.slot.clone(),
                 Occupier::Catalog {

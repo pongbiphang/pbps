@@ -484,7 +484,7 @@ fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
             parent: TableName::new("app", "ev"),
             bound,
             columns: [(
-                "v".to_owned(),
+                "v".into(),
                 PartitionColumn {
                     default: Some(default.to_owned()),
                     not_null: false,

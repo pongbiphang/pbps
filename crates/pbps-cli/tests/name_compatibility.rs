@@ -30,7 +30,7 @@ fn artifacts(text: &str) -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
             planned(Change::AddColumn {
                 uid: uid("c_aaaaaa"),
                 table: table.clone(),
-                name: kept.clone(),
+                name: kept.clone().into(),
                 column: Box::new(Column::new("int".parse().unwrap())),
             }),
             planned(Change::DropColumn {
@@ -51,7 +51,7 @@ fn artifacts(text: &str) -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
         tables: [(
             table.clone(),
             Table {
-                columns: [(kept, Column::new("int".parse().unwrap()).not_null())].into(),
+                columns: [(kept.into(), Column::new("int".parse().unwrap()).not_null())].into(),
                 ..Default::default()
             },
         )]

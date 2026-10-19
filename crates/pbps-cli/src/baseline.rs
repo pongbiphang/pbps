@@ -652,7 +652,7 @@ mod tests {
         let mut t = Table::default();
         for c in cols {
             t.columns.insert(
-                (*c).to_owned(),
+                (*c).into(),
                 Column::new(ColumnType::from_str("int").unwrap()),
             );
         }

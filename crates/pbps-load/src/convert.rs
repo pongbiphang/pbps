@@ -199,6 +199,8 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
                 message: format!(
                     "column `{}.{column}` can have only one of default, identity, a `serial` type or generated",
                     table.name.shown()
+                ,
+                    column = column.shown(),
                 ),
             })
             .collect())
@@ -207,7 +209,7 @@ pub fn convert(src: &SourceFile, dto: TableDto) -> Result<LoadedTable, Vec<LoadE
 
 type TableInspection = (
     LoadedTable,
-    std::collections::BTreeMap<String, Vec<pbps_model::ValueSource>>,
+    std::collections::BTreeMap<pbps_model::ColumnName, Vec<pbps_model::ValueSource>>,
 );
 
 /// Recovery is confined to diagnostics. The public converter never returns a
@@ -256,12 +258,12 @@ pub(crate) fn convert_for_diagnostics(
         // Asked before the type, and neither answer stops the other: the two
         // are independent, and a type error that `continue`d first hid a
         // bad name until the next validation cycle (#410).
-        let named = pbps_model::check_segment(&col_name).map_err(|e| {
+        let named = pbps_model::check_segment(col_name.raw()).map_err(|e| {
             errs.push(
                 LoadError::semantic(
                     src,
                     to_span(&c.ty.defined),
-                    format!("column `{col_name}`: {e}"),
+                    format!("column `{col_name}`: {e}", col_name = col_name.shown(),),
                     e.to_string(),
                 )
                 .with_help(
@@ -305,7 +307,8 @@ pub(crate) fn convert_for_diagnostics(
                         to_span(&c.ty.defined),
                         format!(
                             "column `{col_name}` has a `sequence:` on `{ty}`, which is not a \
-                             serial type"
+                             serial type",
+                            col_name = col_name.shown(),
                         ),
                         "`sequence:` beside a type that is not serial".to_owned(),
                     )
@@ -781,7 +784,8 @@ pub(crate) fn convert_for_diagnostics(
                                 format!(
                                     "partition `{child}` column `{column}` is `nullable: true`: \
                                      a partition takes its parent's nullability or adds NOT \
-                                     NULL, so write `nullable: false` or nothing"
+                                     NULL, so write `nullable: false` or nothing",
+                                    column = column.shown(),
                                 ),
                                 "not a partition column",
                             ));
@@ -798,7 +802,8 @@ pub(crate) fn convert_for_diagnostics(
                                 format!(
                                     "partition `{child}` column `{column}` declares nothing of \
                                      its own: write its `default:` or `nullable: false`, or \
-                                     leave it out"
+                                     leave it out",
+                                    column = column.shown(),
                                 ),
                                 "not a partition column",
                             ));
@@ -929,7 +934,9 @@ fn convert_data(src: &SourceFile, dto: DataDto) -> Result<TableData, Vec<LoadErr
                     LoadError::semantic(
                         src,
                         at,
-                        format!("row `{key}`, column `{column}`: an unquoted decimal"),
+                        format!("row `{key}`, column `{column}`: an unquoted decimal",
+                            column = column.shown(),
+                        ),
                         "quote it",
                     )
                     .with_help(
@@ -966,7 +973,7 @@ fn convert_value(dto: ValueDto) -> Result<Value, FloatCell> {
 fn parse_reference(
     src: &SourceFile,
     v: &Spanned<String>,
-) -> Result<(TableName, Vec<String>), LoadError> {
+) -> Result<(TableName, Vec<pbps_model::ColumnName>), LoadError> {
     let bad = |msg: &str| {
         LoadError::semantic(
             src,
@@ -992,7 +999,7 @@ fn parse_reference(
         if c.is_empty() {
             return Err(bad("the column list has an empty entry"));
         }
-        columns.push(c.to_owned());
+        columns.push(c.into());
     }
     Ok((table, columns))
 }
@@ -1125,7 +1132,7 @@ fn parse_index_column(src: &SourceFile, v: &Spanned<String>) -> Result<IndexColu
         }
     };
     let column = |name: &str, opclass: Option<String>, descending: bool| IndexColumn {
-        key: pbps_model::IndexKey::Column(name.to_owned()),
+        key: pbps_model::IndexKey::Column(name.into()),
         descending,
         opclass,
     };

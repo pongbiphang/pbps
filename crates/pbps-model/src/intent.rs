@@ -20,6 +20,7 @@
 //! desired state may have arrived via a rename or via a rebuild, so mixing it in
 //! would break that equality (see constraint 1 in CLAUDE.md).
 
+use crate::ColumnName;
 use crate::Reason;
 use crate::name::{ColumnRef, TableName};
 
@@ -37,8 +38,8 @@ pub enum Intent {
     },
     RenameColumn {
         table: TableName,
-        from: String,
-        to: String,
+        from: ColumnName,
+        to: ColumnName,
     },
     /// Drop a table. `reason` is required for audit and cannot be omitted.
     DropTable {

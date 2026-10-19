@@ -42,7 +42,12 @@ fn table(columns: &[String]) -> Table {
     Table {
         columns: columns
             .iter()
-            .map(|c| (c.clone(), Column::new("int".parse().expect("a type"))))
+            .map(|c| {
+                (
+                    pbps_model::ColumnName::from(c),
+                    Column::new("int".parse().expect("a type")),
+                )
+            })
             .collect::<IndexMap<_, _>>(),
         ..Table::default()
     }

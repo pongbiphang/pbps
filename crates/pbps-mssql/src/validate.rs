@@ -9,6 +9,7 @@
 //! matter of taste — style opinions belong in `fmt`, not in an error.
 
 use pbps_dialect::{Dialect as _, DialectError};
+use pbps_model::ColumnName;
 use pbps_model::{
     GrantTarget, Module, ModuleId, ModuleKind, ObjectName, Permission, Role, Schema, Table,
     TableName, Value,
@@ -492,7 +493,7 @@ pub(crate) fn checks_over_computed_columns(schema: &pbps_model::Schema) -> Vec<S
     for (name, table) in &schema.tables {
         for (check, c) in &table.checks {
             for (column, computed) in &table.computed {
-                if !computed.persisted && crate::Mssql.may_name(&c.expression, column) {
+                if !computed.persisted && crate::Mssql.may_name(&c.expression, column.raw()) {
                     notes.push(format!(
                         "{name}: check constraint `{check}` may read the computed column \
                          `{column}`, which is not `persisted`; SQL Server refuses a CHECK over \
@@ -500,7 +501,9 @@ pub(crate) fn checks_over_computed_columns(schema: &pbps_model::Schema) -> Vec<S
                          `persisted: true`; `plan --dev` asks the engine before anything runs",
                         // Raw: `validate` escapes the whole note once, as it
                         // does every declaration note.
-                        name = name.raw()
+                        name = name.raw(),
+                        // raw: whole-message escaped until #2084 step 5.
+                        column = column.raw(),
                     ));
                 }
             }
@@ -592,21 +595,25 @@ pub(crate) fn table_sources(
 
     let mut identity_columns = Vec::new();
     for (col_name, col) in &table.columns {
-        if let Err(e) = ident::quote(col_name) {
+        if let Err(e) = ident::quote(col_name.raw()) {
             errs.push(e);
         }
         // PostgreSQL's (DEC-1168.1): SQL Server's computed columns are a
         // different object, with no declared type, and #1174's to model.
-        let supplied = sources.get(col_name, col);
+        let supplied = sources.get(col_name.raw(), col);
         for source in supplied {
             match source {
                 pbps_model::ValueSource::Generated(_) => errs.push(invalid(format!(
-                    "column `{col_name}` is a generated column, which this model holds for PostgreSQL only"
+                    "column `{col_name}` is a generated column, which this model holds for PostgreSQL only",
+                    // raw: whole-message escaped until #2084 step 5.
+                    col_name = col_name.raw(),
                 ))),
                 // PostgreSQL's `serial` (#1631): SQL Server numbers a column
                 // with an `identity:`.
                 pbps_model::ValueSource::Sequence(_) => errs.push(invalid(format!(
-                    "column `{col_name}` is a `serial`, which this model holds for PostgreSQL only; declare an `identity:`"
+                    "column `{col_name}` is a `serial`, which this model holds for PostgreSQL only; declare an `identity:`",
+                    // raw: whole-message escaped until #2084 step 5.
+                    col_name = col_name.raw(),
                 ))),
                 pbps_model::ValueSource::None | pbps_model::ValueSource::Default(_) | pbps_model::ValueSource::Identity(_) => {}
             }
@@ -631,7 +638,9 @@ pub(crate) fn table_sources(
                 errs.push(invalid(format!(
                     "column `{col_name}` is `{}`, which takes no collation; only character \
                      types do",
-                    col.ty
+                    col.ty,
+                    // raw: whole-message escaped until #2084 step 5.
+                    col_name = col_name.raw(),
                 )));
             }
             if let Err(e) = crate::emit::collate_clause(Some(collation)) {
@@ -651,16 +660,23 @@ pub(crate) fn table_sources(
                 errs.push(invalid(format!(
                     "column `{col_name}` is IDENTITY, which needs an integer type or a decimal with scale 0, not `{}`",
                     col.ty
+                ,
+                    // raw: whole-message escaped until #2084 step 5.
+                    col_name = col_name.raw(),
                 )));
             }
             if col.nullable {
                 errs.push(invalid(format!(
-                    "column `{col_name}` is IDENTITY, so it cannot be nullable"
+                    "column `{col_name}` is IDENTITY, so it cannot be nullable",
+                    // raw: whole-message escaped until #2084 step 5.
+                    col_name = col_name.raw(),
                 )));
             }
             if identity.increment == 0 {
                 errs.push(invalid(format!(
-                    "column `{col_name}` has an IDENTITY increment of 0, which never advances"
+                    "column `{col_name}` has an IDENTITY increment of 0, which never advances",
+                    // raw: whole-message escaped until #2084 step 5.
+                    col_name = col_name.raw(),
                 )));
             }
             // An IDENTITY here has a seed and an increment and nothing else:
@@ -669,7 +685,9 @@ pub(crate) fn table_sources(
                 errs.push(invalid(format!(
                     "column `{col_name}` has an `identity:` with min, max, cycle or cache, \
                      which a SQL Server IDENTITY does not have; it takes only a seed and an \
-                     increment"
+                     increment",
+                    // raw: whole-message escaped until #2084 step 5.
+                    col_name = col_name.raw(),
                 )));
             }
             if supplied.iter().any(|source| match source {
@@ -680,7 +698,9 @@ pub(crate) fn table_sources(
                 | pbps_model::ValueSource::Generated(_) => false,
             }) {
                 errs.push(invalid(format!(
-                    "column `{col_name}` is IDENTITY, so it cannot also have a default"
+                    "column `{col_name}` is IDENTITY, so it cannot also have a default",
+                    // raw: whole-message escaped until #2084 step 5.
+                    col_name = col_name.raw(),
                 )));
             }
         }
@@ -688,7 +708,12 @@ pub(crate) fn table_sources(
     if identity_columns.len() > 1 {
         errs.push(invalid(format!(
             "a table may have only one IDENTITY column, but `{}` are all marked",
-            identity_columns.join("`, `")
+            // Shared invalid() sentence, escaped whole until #2084 step 5.
+            identity_columns
+                .iter()
+                .map(|c| c.raw())
+                .collect::<Vec<_>>()
+                .join("`, `")
         )));
     }
 
@@ -734,10 +759,12 @@ pub(crate) fn table_sources(
         };
         if let Some(pk) = &table.primary_key
             && let [key] = pk.columns.as_slice()
-            && let Some((what, why)) = base_of(key).as_deref().and_then(unholdable)
+            && let Some((what, why)) = base_of(key.raw()).as_deref().and_then(unholdable)
         {
             errs.push(invalid(format!(
-                "a `data:` block cannot key its rows by `{key}`, {what}: {why}"
+                "a `data:` block cannot key its rows by `{key}`, {what}: {why}",
+                // raw: whole-message escaped until #2084 step 5.
+                key = key.raw(),
             )));
         }
         // The key travels as a string literal too, and the engine converts
@@ -749,7 +776,7 @@ pub(crate) fn table_sources(
         // its four spellings, and any text is a text key (DECISIONS 99).
         if let Some(pk) = &table.primary_key
             && let [key_column] = pk.columns.as_slice()
-            && let Some(base) = base_of(key_column)
+            && let Some(base) = base_of(key_column.raw())
         {
             let kind = ValueKind::of(&base);
             for key in data.rows.keys() {
@@ -791,20 +818,24 @@ pub(crate) fn table_sources(
                                                within what the type holds",
                             ValueKind::Bool => "a `bit` key is `0`, `1`, `true` or `false`",
                             ValueKind::Text => key_shape(&base, text).unwrap_or_default(),
-                        }
+                        },
+                        // raw: whole-message escaped until #2084 step 5.
+                        key_column = key_column.raw(),
                     )));
                 }
             }
         }
         for (key, row) in &data.rows {
             for (column, value) in &row.0 {
-                let Some(base) = base_of(column) else {
+                let Some(base) = base_of(column.raw()) else {
                     continue;
                 };
                 if let Some((what, why)) = unholdable(&base) {
                     errs.push(invalid(format!(
                         "row `{key}` sets `{column}`, {what}, which a `data:` block cannot \
-                         hold: {why} — leave the column out of the row"
+                         hold: {why} — leave the column out of the row",
+                        // raw: whole-message escaped until #2084 step 5.
+                        column = column.raw(),
                     )));
                     continue;
                 }
@@ -827,7 +858,9 @@ pub(crate) fn table_sources(
                          {}: the declaration would disagree with its own database on every \
                          plan — write it as {spelling}",
                         value.kind(),
-                        kind.name()
+                        kind.name(),
+                        // raw: whole-message escaped until #2084 step 5.
+                        column = column.raw(),
                     )));
                 }
                 // The right kind, but not a value the type holds: the kind
@@ -839,7 +872,9 @@ pub(crate) fn table_sources(
                 {
                     errs.push(invalid(format!(
                         "row `{key}` sets `{column}` to {n}, but `{base}` holds {lo} to {hi}: the \
-                         engine would refuse the insert"
+                         engine would refuse the insert",
+                        // raw: whole-message escaped until #2084 step 5.
+                        column = column.raw(),
                     )));
                 }
             }
@@ -847,17 +882,21 @@ pub(crate) fn table_sources(
     }
 
     for (name, computed) in &table.computed {
-        if let Err(e) = ident::quote(name) {
+        if let Err(e) = ident::quote(name.raw()) {
             errs.push(e);
         }
         if table.columns.contains_key(name) {
             errs.push(invalid(format!(
-                "`{name}` is both a column and a computed column"
+                "`{name}` is both a column and a computed column",
+                // raw: whole-message escaped until #2084 step 5.
+                name = name.raw(),
             )));
         }
         if computed.expression.trim().is_empty() {
             errs.push(invalid(format!(
-                "computed column `{name}` has an empty expression"
+                "computed column `{name}` has an empty expression",
+                // raw: whole-message escaped until #2084 step 5.
+                name = name.raw(),
             )));
         }
         // Measured on 17.0: 8183, "Only UNIQUE or PRIMARY KEY constraints can
@@ -866,7 +905,9 @@ pub(crate) fn table_sources(
         if computed.not_null && !computed.persisted {
             errs.push(invalid(format!(
                 "computed column `{name}` is `not_null` but not `persisted`, and SQL Server holds \
-                 NOT NULL on persisted computed columns only"
+                 NOT NULL on persisted computed columns only",
+                // raw: whole-message escaped until #2084 step 5.
+                name = name.raw(),
             )));
         }
     }
@@ -886,7 +927,9 @@ pub(crate) fn table_sources(
         for c in &pk.columns {
             if table.columns.get(c).is_some_and(|c| c.nullable) {
                 errs.push(invalid(format!(
-                    "primary key column `{c}` is nullable; a primary key column must be NOT NULL"
+                    "primary key column `{c}` is nullable; a primary key column must be NOT NULL",
+                    // raw: whole-message escaped until #2084 step 5.
+                    c = c.raw(),
                 )));
             }
         }
@@ -964,10 +1007,10 @@ pub(crate) fn table_sources(
                 )));
             }
         }
-        let keys: Vec<String> = idx
+        let keys: Vec<ColumnName> = idx
             .columns
             .iter()
-            .filter_map(|c| c.key.column().map(str::to_owned))
+            .filter_map(|c| c.key.column().cloned())
             .collect();
         errs.extend(key_columns(
             &format!("index `{n}`"),
@@ -984,12 +1027,16 @@ pub(crate) fn table_sources(
         for inc in &idx.include {
             if !table.columns.contains_key(inc) && !table.computed.contains_key(inc) {
                 errs.push(invalid(format!(
-                    "index `{n}` includes `{inc}`, which is not a column of this table"
+                    "index `{n}` includes `{inc}`, which is not a column of this table",
+                    // raw: whole-message escaped until #2084 step 5.
+                    inc = inc.raw(),
                 )));
             }
             if keys.contains(inc) {
                 errs.push(invalid(format!(
-                    "index `{n}` has `{inc}` both as a key column and as an included column"
+                    "index `{n}` has `{inc}` both as a key column and as an included column",
+                    // raw: whole-message escaped until #2084 step 5.
+                    inc = inc.raw(),
                 )));
             }
         }
@@ -1066,14 +1113,17 @@ fn system_time(
         errs.push(invalid(format!(
             "`system_time` names `{}` as both the start and the end of its period; name two \
              columns",
-            st.start
+            // raw: whole-message escaped until #2084 step 5.
+            st.start.raw()
         )));
     }
     for (role, column) in [("start", &st.start), ("end", &st.end)] {
         let Some(col) = table.columns.get(column) else {
             errs.push(invalid(format!(
                 "`system_time` names `{column}` as its period's {role}, but no column of that \
-                 name is declared; declare it under `columns:` as `datetime2`, not nullable"
+                 name is declared; declare it under `columns:` as `datetime2`, not nullable",
+                // raw: whole-message escaped until #2084 step 5.
+                column = column.raw(),
             )));
             continue;
         };
@@ -1082,26 +1132,36 @@ fn system_time(
             errs.push(invalid(format!(
                 "column `{column}` is the period's {role}, which SQL Server requires to be \
                  `datetime2`, not `{}`",
-                col.ty
+                col.ty,
+                // raw: whole-message escaped until #2084 step 5.
+                column = column.raw(),
             )));
         }
         if col.nullable {
             errs.push(invalid(format!(
                 "column `{column}` is the period's {role}, which is never NULL; declare it \
-                 `nullable: false`"
+                 `nullable: false`",
+                // raw: whole-message escaped until #2084 step 5.
+                column = column.raw(),
             )));
         }
-        if sources.get(column, col).iter().any(|source| match source {
-            pbps_model::ValueSource::Identity(_) => true,
-            // Refused on this engine by name, above.
-            pbps_model::ValueSource::None
-            | pbps_model::ValueSource::Default(_)
-            | pbps_model::ValueSource::Sequence(_)
-            | pbps_model::ValueSource::Generated(_) => false,
-        }) {
+        if sources
+            .get(column.raw(), col)
+            .iter()
+            .any(|source| match source {
+                pbps_model::ValueSource::Identity(_) => true,
+                // Refused on this engine by name, above.
+                pbps_model::ValueSource::None
+                | pbps_model::ValueSource::Default(_)
+                | pbps_model::ValueSource::Sequence(_)
+                | pbps_model::ValueSource::Generated(_) => false,
+            })
+        {
             errs.push(invalid(format!(
                 "column `{column}` is the period's {role}, which the engine writes, so it \
-                 cannot also be an identity"
+                 cannot also be an identity",
+                // raw: whole-message escaped until #2084 step 5.
+                column = column.raw(),
             )));
         }
     }
@@ -1113,13 +1173,16 @@ fn system_time(
             _ => 7,
         })
     };
-    if let (Some(start), Some(end)) = (precision(&st.start), precision(&st.end))
+    if let (Some(start), Some(end)) = (precision(st.start.raw()), precision(st.end.raw()))
         && start != end
     {
         errs.push(invalid(format!(
             "the period's columns `{}` and `{}` are `datetime2({start})` and `datetime2({end})`, \
              and SQL Server requires one precision for both",
-            st.start, st.end
+            // raw: whole-message escaped until #2084 step 5.
+            st.start.raw(),
+            // raw: whole-message escaped until #2084 step 5.
+            st.end.raw()
         )));
     }
     // Every write to a row writes history, and the period's columns are the
@@ -1183,7 +1246,7 @@ fn system_time(
 
 fn key_columns(
     what: &str,
-    columns: &[String],
+    columns: &[ColumnName],
     table: &Table,
     computed: Computed,
 ) -> Vec<DialectError> {
@@ -1199,19 +1262,29 @@ fn key_columns(
             None if table.computed.contains_key(c) && computed == Computed::Allowed => {}
             None if table.computed.contains_key(c) => errs.push(invalid(format!(
                 "{what} uses the computed column `{c}`, and a key over a computed column is not \
-                 held yet"
+                 held yet",
+                // raw: whole-message escaped until #2084 step 5.
+                c = c.raw(),
             ))),
             None => errs.push(invalid(format!(
-                "{what} references `{c}`, which is not a column of this table"
+                "{what} references `{c}`, which is not a column of this table",
+                // raw: whole-message escaped until #2084 step 5.
+                c = c.raw(),
             ))),
             Some(col) if !types::is_indexable(&col.ty) => errs.push(invalid(format!(
                 "{what} uses `{c}`, whose type `{}` cannot be part of a key",
-                col.ty
+                col.ty,
+                // raw: whole-message escaped until #2084 step 5.
+                c = c.raw(),
             ))),
             Some(_) => {}
         }
         if seen.contains(&c) {
-            errs.push(invalid(format!("{what} names `{c}` twice")));
+            errs.push(invalid(format!(
+                "{what} names `{c}` twice",
+                // raw: whole-message escaped until #2084 step 5.
+                c = c.raw(),
+            )));
         }
         seen.push(c);
     }
@@ -1871,7 +1944,7 @@ mod tests {
     fn a_clustered_index_can_be_neither_filtered_nor_including() {
         use pbps_model::Clustered;
         let (name, mut t) = base_table();
-        let index = |include: Vec<String>, filter: Option<&str>| Index {
+        let index = |include: Vec<pbps_model::ColumnName>, filter: Option<&str>| Index {
             columns: vec![IndexColumn {
                 key: pbps_model::IndexKey::Column("id".into()),
                 descending: false,
@@ -2061,7 +2134,7 @@ mod tests {
         let with = |t: &mut Table, cells: Vec<(&str, Value)>| {
             let mut row = Row::default();
             for (c, v) in cells {
-                row.0.insert(c.to_owned(), v);
+                row.0.insert(c.into(), v);
             }
             t.data = Some(TableData {
                 mode: DataMode::Exact,
@@ -2120,7 +2193,7 @@ mod tests {
         let with = |t: &mut Table, cells: Vec<(&str, i64)>| {
             let mut row = Row::default();
             for (c, v) in cells {
-                row.0.insert(c.to_owned(), Value::Int(v));
+                row.0.insert(c.into(), Value::Int(v));
             }
             t.data = Some(TableData {
                 mode: DataMode::Exact,

@@ -309,8 +309,15 @@ pub async fn drop_blockers(
                 from: pbps_model::ValueSource::Sequence(_),
                 ..
             } = &cs[index].change
-                && let Some(default) =
-                    default_row(conn, &classes, sources, index, &column.table, &column.name).await?
+                && let Some(default) = default_row(
+                    conn,
+                    &classes,
+                    sources,
+                    index,
+                    &column.table,
+                    column.name.raw(),
+                )
+                .await?
             {
                 removals.push((index, default));
             }
@@ -399,7 +406,7 @@ fn stored(
             let address = table.column(column);
             Ok(
                 existing(sources.source(&address, at), &address.shown().to_string())?
-                    .map(|stored| (stored.table, Some(stored.name))),
+                    .map(|stored| (stored.table, Some(stored.name.into_raw()))),
             )
         }
         None => Ok(
@@ -506,8 +513,15 @@ async fn removal(
     } = change
         && gives_up(from, to)
     {
-        return numbering_sequence(conn, classes, sources, index, &column.table, &column.name)
-            .await;
+        return numbering_sequence(
+            conn,
+            classes,
+            sources,
+            index,
+            &column.table,
+            column.name.raw(),
+        )
+        .await;
     }
     match removal_part(change) {
         Some(Removal::Table(name)) => {
@@ -526,7 +540,8 @@ async fn removal(
                 })
         }
         Some(Removal::Column(column)) => {
-            let Some((table, name)) = stored(sources, index, &column.table, Some(&column.name))?
+            let Some((table, name)) =
+                stored(sources, index, &column.table, Some(column.name.raw()))?
             else {
                 return Ok(None);
             };
@@ -546,7 +561,15 @@ async fn removal(
             table_part(conn, classes, sources, index, table, part).await
         }
         Some(Removal::Default(column)) => {
-            default_row(conn, classes, sources, index, &column.table, &column.name).await
+            default_row(
+                conn,
+                classes,
+                sources,
+                index,
+                &column.table,
+                column.name.raw(),
+            )
+            .await
         }
         None => Ok(None),
     }

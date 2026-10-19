@@ -194,7 +194,11 @@ fn whole_table(name: &TableName, owner: &Recorded, table: &Table) -> Vec<Named> 
         ));
     }
     for n in table.computed.keys() {
-        out.push(part(NameKind::Column, PartKey::Computed(n.clone()), n));
+        out.push(part(
+            NameKind::Column,
+            PartKey::Computed(n.clone()),
+            n.raw(),
+        ));
     }
     out
 }
@@ -261,7 +265,7 @@ pub fn names(
                             kind: NameKind::Column,
                             schema: name.schema.clone(),
                             table: Some(ObjectKey::Table(owner.clone())),
-                            name: column.clone(),
+                            name: column.raw().to_owned(),
                             signature: None,
                         },
                         ObjectKey::Column(ColumnKey::Recorded(Recorded(column_uid))),
@@ -348,8 +352,10 @@ pub fn names(
         }
         Change::AddColumn {
             uid, table, name, ..
-        } => nx.column(true, table, uid, name)?,
-        Change::DropColumn { uid, column } => nx.column(false, &column.table, uid, &column.name)?,
+        } => nx.column(true, table, uid, name.raw())?,
+        Change::DropColumn { uid, column } => {
+            nx.column(false, &column.table, uid, column.name.raw())?
+        }
         Change::RenameColumn {
             uid,
             table,
@@ -357,8 +363,8 @@ pub fn names(
             to,
             ..
         } => {
-            nx.column(false, table, uid, from)?;
-            nx.column(true, table, uid, to)?;
+            nx.column(false, table, uid, from.raw())?;
+            nx.column(true, table, uid, to.raw())?;
         }
         Change::AddComputedColumn { table, name, .. } => {
             nx.part(
@@ -366,7 +372,7 @@ pub fn names(
                 table,
                 NameKind::Column,
                 PartKey::Computed(name.clone()),
-                name,
+                name.raw(),
             )?;
         }
         Change::DropComputedColumn { table, name, .. } => {
@@ -375,7 +381,7 @@ pub fn names(
                 table,
                 NameKind::Column,
                 PartKey::Computed(name.clone()),
-                name,
+                name.raw(),
             )?;
         }
         Change::SetPrimaryKey {
@@ -535,7 +541,7 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
                         kind: NameKind::Column,
                         schema: name.schema.clone(),
                         table: Some(ObjectKey::Table(owner.clone())),
-                        name: column.clone(),
+                        name: column.raw().to_owned(),
                         signature: None,
                     },
                     holder: ObjectKey::Column(ColumnKey::Recorded(Recorded(uid))),

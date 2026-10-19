@@ -223,7 +223,9 @@ async fn walk(
         relation: named,
         event: event(&write.operation),
         columns: match &write.operation {
-            RowOperation::Update { columns } => columns.iter().cloned().collect(),
+            RowOperation::Update { columns } => {
+                columns.iter().map(|c| c.raw().to_owned()).collect()
+            }
             RowOperation::Insert | RowOperation::Delete => BTreeSet::new(),
         },
         partitions_only: false,

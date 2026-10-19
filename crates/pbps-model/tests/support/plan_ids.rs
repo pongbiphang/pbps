@@ -177,7 +177,11 @@ pub(crate) fn ids(changes: &ChangeSet, before: &Schema) -> IdsFile {
         for column in table.columns.keys() {
             if !affected.contains(&(uid.clone(), column.clone())) {
                 column_end.insert(
-                    Uid::derived(UidKind::Column, &format!("{uid}/{column}"), 0),
+                    Uid::derived(
+                        UidKind::Column,
+                        &[uid.to_string(), column.raw().to_owned()].join("/"),
+                        0,
+                    ),
                     Some((uid.clone(), column.clone())),
                 );
             }
@@ -193,7 +197,11 @@ pub(crate) fn ids(changes: &ChangeSet, before: &Schema) -> IdsFile {
                 for name in shape.columns.keys() {
                     if !affected.contains(&(uid.clone(), name.clone())) {
                         column_end.insert(
-                            Uid::derived(UidKind::Column, &format!("{uid}/{name}"), 0),
+                            Uid::derived(
+                                UidKind::Column,
+                                &[uid.to_string(), name.raw().to_owned()].join("/"),
+                                0,
+                            ),
                             Some((uid.clone(), name.clone())),
                         );
                     }

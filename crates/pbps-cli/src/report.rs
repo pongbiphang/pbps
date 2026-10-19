@@ -28,7 +28,9 @@ pub fn intent(i: &Intent) -> String {
         Intent::RenameColumn { table, from, to } => {
             format!(
                 "rename column {table}.{from} -> {table}.{to}",
-                table = table.shown()
+                table = table.shown(),
+                from = from.shown(),
+                to = to.shown(),
             )
         }
         Intent::DropTable { table, reason } => format!(
@@ -92,8 +94,8 @@ pub fn blocker_findings(list: &[Blocker]) -> Vec<crate::output::Finding> {
 
 fn decision_count(blocker: &Blocker) -> Option<usize> {
     match blocker {
-        Blocker::AmbiguousColumns { disappeared, .. }
-        | Blocker::AmbiguousRoles { disappeared, .. } => Some(disappeared.len()),
+        Blocker::AmbiguousColumns { disappeared, .. } => Some(disappeared.len()),
+        Blocker::AmbiguousRoles { disappeared, .. } => Some(disappeared.len()),
         Blocker::AmbiguousTables { disappeared, .. } => Some(disappeared.len()),
         Blocker::DropColumnNeedsReason { .. }
         | Blocker::DropTableNeedsReason { .. }
@@ -119,8 +121,13 @@ fn supplied_flag(intent: &Intent) -> Option<String> {
     Some(match intent {
         Intent::RenameColumn { table, from, to } => pair_flag(
             "--rename",
-            &format!("{table}.{from}", table = table.raw()),
-            to,
+            &format!(
+                "{table}.{from}",
+                table = table.raw(),
+                // Preserve raw command arguments for shell_arg.
+                from = from.raw(),
+            ),
+            to.raw(),
             "new column",
         ),
         Intent::RenameTable { from, to } => pair_flag(
@@ -205,8 +212,13 @@ fn batch_flags(blocker: &Blocker, fixed: &mut Vec<String>, choices: &mut Vec<Str
                 alternatives(
                     "--rename",
                     "--drop",
-                    &format!("{table}.{from}", table = table.raw()),
-                    appeared.clone(),
+                    &format!(
+                        "{table}.{from}",
+                        table = table.raw(),
+                        // Preserve raw command arguments for shell_arg.
+                        from = from.raw(),
+                    ),
+                    appeared.iter().map(|c| c.raw().to_owned()).collect(),
                 );
             }
         }
@@ -586,19 +598,37 @@ fn one_blocker(b: &Blocker) -> String {
         } => {
             let mut s = format!(
                 "  {table}: {} disappeared, {} is new\n\n",
-                disappeared.join(", "),
-                appeared.join(", "),
+                disappeared
+                    .iter()
+                    .map(|c| c.shown().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                appeared
+                    .iter()
+                    .map(|c| c.shown().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 table = table.shown()
             );
             for from in disappeared {
-                let source = format!("{table}.{from}", table = table.raw());
+                let source = format!(
+                    "{table}.{from}",
+                    table = table.raw(),
+                    // Preserve raw command arguments for shell_arg.
+                    from = from.raw(),
+                );
                 let source_arg = shell_arg(&source).unwrap_or_else(|| placeholder("object name"));
                 for to in appeared {
-                    let command = pair_flag("pbps rename", &source, to, "new column");
-                    s.push_str(&format!("    if {from} was renamed to {to}:  {command}\n"));
+                    let command = pair_flag("pbps rename", &source, to.raw(), "new column");
+                    s.push_str(&format!(
+                        "    if {from} was renamed to {to}:  {command}\n",
+                        from = from.shown(),
+                        to = to.shown(),
+                    ));
                 }
                 s.push_str(&format!(
-                    "    to drop {from}:                pbps drop {source_arg} --reason {why}\n"
+                    "    to drop {from}:                pbps drop {source_arg} --reason {why}\n",
+                    from = from.shown(),
                 ));
             }
             s
@@ -1308,14 +1338,33 @@ pub fn describe(c: &Change) -> String {
             to = to.raw()
         ),
         Change::AddColumn { name, column, .. } => {
-            format!("+ add column {name} {}", column.ty)
+            format!(
+                "+ add column {name} {}",
+                column.ty,
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                name = name.raw(),
+            )
         }
-        Change::DropColumn { column, .. } => format!("- drop column {}", column.name),
-        Change::RenameColumn { from, to, .. } => format!("~ rename column {from} -> {to}"),
+        Change::DropColumn { column, .. } => format!(
+            "- drop column {}",
+            // Shared JSON/prose, escaped whole until #2084 step 5.
+            column.name.raw()
+        ),
+        Change::RenameColumn { from, to, .. } => format!(
+            "~ rename column {from} -> {to}",
+            // Shared JSON/prose, escaped whole until #2084 step 5.
+            from = from.raw(),
+            // Shared JSON/prose, escaped whole until #2084 step 5.
+            to = to.raw(),
+        ),
         Change::AlterColumnType {
             column, from, to, ..
         } => {
-            format!("~ {} type {from} -> {to}", column.name)
+            format!(
+                "~ {} type {from} -> {to}",
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                column.name.raw()
+            )
         }
         Change::AlterColumnNullability {
             column,
@@ -1323,21 +1372,35 @@ pub fn describe(c: &Change) -> String {
             ..
         } => format!(
             "~ {} becomes {}",
-            column.name,
+            // Shared JSON/prose, escaped whole until #2084 step 5.
+            column.name.raw(),
             if *to_nullable { "nullable" } else { "NOT NULL" }
         ),
         Change::AlterColumnDefault { column, to, .. } => match to {
-            Some(v) => format!("~ {} default -> {v}", column.name),
-            None => format!("~ {} default removed", column.name),
+            Some(v) => format!(
+                "~ {} default -> {v}",
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                column.name.raw()
+            ),
+            None => format!(
+                "~ {} default removed",
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                column.name.raw()
+            ),
         },
         Change::AlterColumnExpression { column, to, .. } => {
-            format!("~ {} generated as {to}", column.name)
+            format!(
+                "~ {} generated as {to}",
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                column.name.raw()
+            )
         }
         Change::AlterColumnNumbering {
             column, from, to, ..
         } => format!(
             "~ {} numbered by {} -> {}",
-            column.name,
+            // Shared JSON/prose, escaped whole until #2084 step 5.
+            column.name.raw(),
             numbering_source(from),
             numbering_source(to)
         ),
@@ -1345,20 +1408,43 @@ pub fn describe(c: &Change) -> String {
             "+ add computed column {name} as ({}){}{}",
             computed.expression,
             if computed.persisted { " persisted" } else { "" },
-            if computed.not_null { " not null" } else { "" }
+            if computed.not_null { " not null" } else { "" },
+            // Shared JSON/prose, escaped whole until #2084 step 5.
+            name = name.raw(),
         ),
-        Change::DropComputedColumn { name, .. } => format!("- drop computed column {name}"),
+        Change::DropComputedColumn { name, .. } => format!(
+            "- drop computed column {name}",
+            // Shared JSON/prose, escaped whole until #2084 step 5.
+            name = name.raw(),
+        ),
         Change::SetColumnDeprecated { column, reason, .. } => match reason {
             // `.raw()`: this line is the JSON `risks[].changes` text as well as
             // the report's, and the report escapes each line whole when it
             // prints it (`Escaped(&describe(..))`, #2035). Showing the reason
             // here too would escape it twice and change the JSON. The interim
             // cover goes with #2084 step 5 (DEC-2084.1).
-            Some(r) => format!("~ {} marked deprecated: {}", column.name, r.raw()),
-            None => format!("~ {} no longer deprecated", column.name),
+            Some(r) => format!(
+                "~ {} marked deprecated: {}",
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                column.name.raw(),
+                r.raw()
+            ),
+            None => format!(
+                "~ {} no longer deprecated",
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                column.name.raw()
+            ),
         },
         Change::SetPrimaryKey { to, .. } => match to {
-            Some(pk) => format!("~ primary key -> ({})", pk.columns.join(", ")),
+            Some(pk) => format!(
+                "~ primary key -> ({})",
+                /* Shared JSON/prose, escaped whole until #2084 step 5. */
+                pk.columns
+                    .iter()
+                    .map(pbps_model::ColumnName::raw)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             None => "- drop primary key".to_owned(),
         },
         Change::SetTablePersistence { unlogged, .. } => {
@@ -1372,15 +1458,29 @@ pub fn describe(c: &Change) -> String {
             fallback,
             ..
         } => match (to, fallback) {
-            (Some(v), _) => format!("~ {column} default -> {v}"),
-            (None, Some(_)) => format!("~ {column} default -> its parent's"),
-            (None, None) => format!("~ {column} default removed"),
+            (Some(v), _) => format!(
+                "~ {column} default -> {v}",
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                column = column.raw(),
+            ),
+            (None, Some(_)) => format!(
+                "~ {column} default -> its parent's",
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                column = column.raw(),
+            ),
+            (None, None) => format!(
+                "~ {column} default removed",
+                // Shared JSON/prose, escaped whole until #2084 step 5.
+                column = column.raw(),
+            ),
         },
         Change::SetPartitionNotNull {
             column, not_null, ..
         } => format!(
             "~ {column} becomes {}",
-            if *not_null { "NOT NULL" } else { "nullable" }
+            if *not_null { "NOT NULL" } else { "nullable" },
+            // Shared JSON/prose, escaped whole until #2084 step 5.
+            column = column.raw(),
         ),
         Change::SetIndexStorageParameters {
             target, set, reset, ..
@@ -1426,7 +1526,13 @@ pub fn describe(c: &Change) -> String {
             // value up — and "sets label" is not something anyone can approve.
             let cells: Vec<String> = columns
                 .iter()
-                .map(|(c, (from, to))| format!("{c} {from} -> {to}"))
+                .map(|(c, (from, to))| {
+                    format!(
+                        "{c} {from} -> {to}",
+                        // Shared JSON/prose, escaped whole until #2084 step 5.
+                        c = c.raw(),
+                    )
+                })
                 .collect();
             format!("~ row {key}: {}", cells.join(", "))
         }

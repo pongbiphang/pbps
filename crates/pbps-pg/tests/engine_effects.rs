@@ -22,7 +22,7 @@ fn schema(column_ty: &str, identity: Identity) -> Schema {
     column.nullable = false;
     column.value_source = ValueSource::Identity(identity);
     let mut table = Table::default();
-    table.columns.insert("id".to_owned(), column);
+    table.columns.insert("id".into(), column);
     let mut schema = Schema::default();
     schema.tables.insert(t(), table);
     schema

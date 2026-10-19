@@ -1608,13 +1608,13 @@ pub enum Holds {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
     Check(String),
-    Default(String),
+    Default(pbps_model::ColumnName),
     Index(String),
     /// A generated column's expression. Never restorable: no statement takes
     /// the expression off and puts it back. A plan that changes the
     /// expression releases the dependency instead, when that change runs
     /// before the module's drop (DEC-1168.1).
-    Generated(String),
+    Generated(pbps_model::ColumnName),
 }
 
 /// One object that depends on a module, established by the catalog.
@@ -1644,7 +1644,7 @@ impl Dependent {
                     // the engine gave it (#1588).
                     Part::Default(column) => {
                         t.columns
-                            .get(column)
+                            .get(column.raw())
                             .is_some_and(|c| match &c.value_source {
                                 ValueSource::Default(_) => true,
                                 ValueSource::None
@@ -1653,11 +1653,13 @@ impl Dependent {
                                 | ValueSource::Generated(_) => false,
                             })
                             || t.partition_of.as_ref().is_some_and(|of| {
-                                of.columns.get(column).is_some_and(|o| o.default.is_some())
+                                of.columns
+                                    .get(column.raw())
+                                    .is_some_and(|o| o.default.is_some())
                                     || declared
                                         .tables
                                         .get(&of.parent)
-                                        .and_then(|parent| parent.columns.get(column))
+                                        .and_then(|parent| parent.columns.get(column.raw()))
                                         .is_some_and(|c| match &c.value_source {
                                             ValueSource::Default(_) => true,
                                             ValueSource::None
@@ -1939,11 +1941,11 @@ async fn direct_dependents(
                 },
                 "default" => Holds::TablePart {
                     table: TableName::new(&dep_schema, &dep_name),
-                    part: Part::Default(part.clone()),
+                    part: Part::Default(part.clone().into()),
                 },
                 "generated" => Holds::TablePart {
                     table: TableName::new(&dep_schema, &dep_name),
-                    part: Part::Generated(part.clone()),
+                    part: Part::Generated(part.clone().into()),
                 },
                 "index" => Holds::TablePart {
                     table: TableName::new(&dep_schema, &dep_name),

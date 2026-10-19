@@ -562,7 +562,7 @@ mod tests {
         let mut s = Schema::default();
         let mut t = Table::default();
         t.columns.insert(
-            "id".to_owned(),
+            "id".into(),
             Column::new("int".parse::<ColumnType>().unwrap()),
         );
         s.tables.insert(TableName::new("dbo", "customer"), t);

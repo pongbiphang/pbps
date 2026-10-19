@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.0.0",
+  "command": "explain",
+  "result": "ok",
+  "findings": [
+    {
+      "id": "plan.risk",
+      "severity": "warning",
+      "message": "data-update: a reference row's current values are overwritten, and the plan does not record what they were (1 change(s))"
+    }
+  ],
+  "data": {
+    "applyable": true,
+    "dialect": "mssql",
+    "created_at": "2026-10-19T00:00:00Z",
+    "baseline": "column-name master fixture",
+    "mode": "transactional",
+    "checksum": "3581293533bde116a1b30059ae441732960db50ec72963c750372d37b2d157f6",
+    "change_count": 4,
+    "table_count": 3,
+    "module_count": 0,
+    "role_count": 0,
+    "risks": [
+      {
+        "class": "data-update",
+        "why": "a reference row's current values are overwritten, and the plan does not record what they were",
+        "changes": [
+          "app.child  ~ row 1: col\nline\r\u001b[31m\\‮名前payload 1 -> 2"
+        ]
+      }
+    ],
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 3581293533bde116a1b30059ae441732960db50ec72963c750372d37b2d157f6 --allow data-update",
+    "probes": [],
+    "unchecked": [],
+    "statement_count": 7
+  }
+}

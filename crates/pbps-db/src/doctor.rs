@@ -11,6 +11,7 @@
 //! their securables in their own `GRANT` spelling. So the *ask* lives here and
 //! the *held* stays with the engine (DECISIONS 417).
 
+use pbps_model::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{GrantTarget, ModuleId, ObjectName, Permission, Table};
@@ -65,7 +66,7 @@ pub struct Ask<'a> {
 /// A foreign-key target the declarations do not hold, mapped to the columns a
 /// declared key names on it — the union across every key that points there.
 /// See [`Ask::referenced_columns`].
-pub type ReferencedColumns = BTreeMap<ObjectName, BTreeSet<String>>;
+pub type ReferencedColumns = BTreeMap<ObjectName, BTreeSet<pbps_model::ColumnName>>;
 
 /// The declared table holding foreign keys, mapped to the tables its keys
 /// point at. See [`Ask::declared_keys`].
@@ -126,11 +127,11 @@ pub struct DataDemand {
     /// list being non-empty), and *which* columns the permission has to cover
     /// — the question a column-level grant makes different from the
     /// object-level one.
-    row_columns: Vec<String>,
+    row_columns: Vec<ColumnName>,
     /// The key and writable cells used by data readback.
-    data_columns: Vec<String>,
+    data_columns: Vec<ColumnName>,
     /// The key and cells explicitly supplied by at least one declared row.
-    insert_columns: Vec<String>,
+    insert_columns: Vec<ColumnName>,
 }
 
 impl DataDemand {
@@ -148,8 +149,8 @@ impl DataDemand {
         let data = table.data.as_ref()?;
         let key_column = table.data_key_column()?;
         let declares_a_row = !data.rows.is_empty();
-        let row_columns: Vec<String> = table
-            .row_columns(key_column)
+        let row_columns: Vec<ColumnName> = table
+            .row_columns(key_column.raw())
             .map(|(name, _)| name.clone())
             .collect();
         let demand = Self {
@@ -199,19 +200,19 @@ impl DataDemand {
     /// The columns an emitted `UPDATE` could name — the set `UPDATE` has to
     /// be held on, column by column, when it is not held on the table.
     #[must_use]
-    pub fn row_columns(&self) -> &[String] {
+    pub fn row_columns(&self) -> &[ColumnName] {
         &self.row_columns
     }
 
     /// Columns named by data readback, including omitted defaulted cells.
     #[must_use]
-    pub fn data_columns(&self) -> &[String] {
+    pub fn data_columns(&self) -> &[ColumnName] {
         &self.data_columns
     }
 
     /// Columns an INSERT can explicitly name; omitted cells use their defaults.
     #[must_use]
-    pub fn insert_columns(&self) -> &[String] {
+    pub fn insert_columns(&self) -> &[ColumnName] {
         &self.insert_columns
     }
 }
@@ -246,15 +247,35 @@ mod tests {
             rows: [("1".into(), Row::default())].into(),
         });
         let omitted = DataDemand::of(&table).unwrap();
-        assert_eq!(omitted.insert_columns(), ["id"]);
-        assert_eq!(omitted.data_columns(), ["id", "label", "note"]);
-        assert_eq!(omitted.row_columns(), ["label", "note"]);
+        assert_eq!(
+            omitted.insert_columns(),
+            [pbps_model::ColumnName::from("id")]
+        );
+        assert_eq!(
+            omitted.data_columns(),
+            [
+                pbps_model::ColumnName::from("id"),
+                pbps_model::ColumnName::from("label"),
+                pbps_model::ColumnName::from("note")
+            ]
+        );
+        assert_eq!(
+            omitted.row_columns(),
+            [
+                pbps_model::ColumnName::from("label"),
+                pbps_model::ColumnName::from("note")
+            ]
+        );
         let rows = &mut table.data.as_mut().unwrap().rows;
         rows.insert("2".into(), Row([("note".into(), Value::Null)].into()));
         rows.insert("3".into(), Row([("label".into(), Value::Int(3))].into()));
         assert_eq!(
             DataDemand::of(&table).unwrap().insert_columns(),
-            ["id", "label", "note"]
+            [
+                pbps_model::ColumnName::from("id"),
+                pbps_model::ColumnName::from("label"),
+                pbps_model::ColumnName::from("note")
+            ]
         );
         table.data.as_mut().unwrap().rows.clear();
         assert!(

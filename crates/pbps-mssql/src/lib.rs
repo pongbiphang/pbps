@@ -130,7 +130,9 @@ impl Dialect for Mssql {
                         for (column, computed) in &table.computed {
                             let reads =
                                 |text: &str| self.may_name_qualified(text, schema, function);
-                            if reads(&computed.expression) && !replaced_off(&base, column, &reads) {
+                            if reads(&computed.expression)
+                                && !replaced_off(&base, column.raw(), &reads)
+                            {
                                 fx.requires.push(Requirement::Absent(
                                     base.part(PartKey::Computed(column.clone())),
                                 ));
@@ -144,8 +146,9 @@ impl Dialect for Mssql {
             | Change::AlterColumnNullability { column, .. } => {
                 if let Some(table) = base_table(op, owners, before, &column.table)? {
                     for (name, computed) in &table.table.computed {
-                        let reads = |text: &str| self.may_name(text, &column.name);
-                        if reads(&computed.expression) && !replaced_off(&table, name, &reads) {
+                        let reads = |text: &str| self.may_name(text, column.name.raw());
+                        if reads(&computed.expression) && !replaced_off(&table, name.raw(), &reads)
+                        {
                             fx.requires.push(Requirement::Absent(
                                 table.part(PartKey::Computed(name.clone())),
                             ));
@@ -162,8 +165,8 @@ impl Dialect for Mssql {
                     for (check_name, check) in &base.table.checks {
                         let off = replaced
                             .and_then(|t| t.checks.get(check_name))
-                            .is_some_and(|c| !self.may_name(&c.expression, name));
-                        if !off && self.may_name(&check.expression, name) {
+                            .is_some_and(|c| !self.may_name(&c.expression, name.raw()));
+                        if !off && self.may_name(&check.expression, name.raw()) {
                             fx.requires.push(Requirement::Absent(
                                 base.part(PartKey::Check(check_name.clone())),
                             ));
@@ -174,8 +177,8 @@ impl Dialect for Mssql {
             Change::RenameColumn { table, from, .. } => {
                 if let Some(base) = base_table(op, owners, before, table)? {
                     for (name, computed) in &base.table.computed {
-                        let reads = |text: &str| self.may_name(text, from);
-                        if reads(&computed.expression) && !replaced_off(&base, name, &reads) {
+                        let reads = |text: &str| self.may_name(text, from.raw());
+                        if reads(&computed.expression) && !replaced_off(&base, name.raw(), &reads) {
                             fx.requires.push(Requirement::Absent(
                                 base.part(PartKey::Computed(name.clone())),
                             ));
@@ -201,7 +204,7 @@ impl Dialect for Mssql {
                 | pbps_model::ValueSource::Sequence(_)
                 | pbps_model::ValueSource::Generated(_) => false,
             })
-            .flat_map(|(column, _)| emit::generated_default_names(name, column))
+            .flat_map(|(column, _)| emit::generated_default_names(name, column.raw()))
             .collect()
     }
 

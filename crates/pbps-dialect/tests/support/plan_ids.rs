@@ -45,7 +45,7 @@ pub fn ids(changes: &ChangeSet) -> IdsFile {
             ids.tables.insert(Uid::derived(UidKind::Table, &name.raw().to_string(), 0), name.clone());
         }
     }
-    let mut columns: BTreeMap<Uid, (Uid, String)> = BTreeMap::new();
+    let mut columns: BTreeMap<Uid, (Uid, pbps_model::ColumnName)> = BTreeMap::new();
     let mut generated = BTreeSet::new();
     for p in &changes.changes {
         let mut inline = None;
@@ -69,20 +69,21 @@ pub fn ids(changes: &ChangeSet) -> IdsFile {
         }
         if let Some((owner, shape)) = inline {
             for name in shape.columns.keys() {
-                let uid = Uid::derived(UidKind::Column, &format!("{owner}.{name}"), 0);
+                let raw_name = name.raw();
+                let uid = Uid::derived(UidKind::Column, &format!("{owner}.{raw_name}"), 0);
                 generated.insert(uid.clone());
                 columns.insert(uid, (owner.clone(), name.clone()));
             }
         }
         let column = match &p.change {
-            Change::AddColumn { uid, table, name, .. } => Some((uid, table.column(name), Some(name.as_str()))),
-            Change::RenameColumn { uid, table, from, to, .. } => Some((uid, table.column(from), Some(to.as_str()))),
+            Change::AddColumn { uid, table, name, .. } => Some((uid, table.column(name), Some(name))),
+            Change::RenameColumn { uid, table, from, to, .. } => Some((uid, table.column(from), Some(to))),
             Change::DropColumn { uid, column } => Some((uid, column.clone(), None)),
             Change::AlterColumnType { uid, column, .. }
             | Change::AlterColumnNullability { uid, column, .. }
             | Change::AlterColumnDefault { uid, column, .. }
             | Change::AlterColumnExpression { uid, column, .. }
-            | Change::SetColumnDeprecated { uid, column, .. } => Some((uid, column.clone(), Some(column.name.as_str()))),
+            | Change::SetColumnDeprecated { uid, column, .. } => Some((uid, column.clone(), Some(&column.name))),
             _ => None,
         };
         if let Some((uid, address, after)) = column {

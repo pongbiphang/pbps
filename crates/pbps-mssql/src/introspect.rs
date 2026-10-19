@@ -173,8 +173,8 @@ fn system_time(
         (other, _) => return Err(format!("temporal_type = {other} is not one pbps knows")),
     };
     Ok(pbps_model::SystemTime {
-        start,
-        end,
+        start: start.into(),
+        end: end.into(),
         hidden,
         versioning,
     })
@@ -1227,7 +1227,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 continue;
             };
             table.computed.insert(
-                c.name.clone(),
+                c.name.clone().into(),
                 pbps_model::ComputedColumn {
                     expression: strip_stored_parens(definition).to_owned(),
                     persisted: c.computed_persisted,
@@ -1337,7 +1337,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 pbps_model::ValueSource::None
             }
         };
-        table.columns.insert(c.name.clone(), column);
+        table.columns.insert(c.name.clone().into(), column);
     }
 
     // A computed column that reads a column left out above names a column
@@ -1356,7 +1356,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         .collect();
     for r in computed_over_left_out {
         if let Some(table) = tables.get_mut(&r.object_id) {
-            table.computed.remove(&r.name);
+            table.computed.remove(r.name.as_str());
         }
         if left_out_columns
             .entry(r.object_id)
@@ -1611,7 +1611,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 columns: Vec::new(),
                 storage_parameters: Default::default(),
             });
-            pk.columns.push(k.column.clone());
+            pk.columns.push(k.column.clone().into());
         } else {
             table
                 .unique
@@ -1621,7 +1621,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     storage_parameters: Default::default(),
                 })
                 .columns
-                .push(k.column.clone());
+                .push(k.column.clone().into());
         }
     }
 
@@ -1738,10 +1738,10 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 storage_parameters: Default::default(),
             });
         if i.is_included {
-            index.include.push(i.column.clone());
+            index.include.push(i.column.clone().into());
         } else {
             index.columns.push(IndexColumn {
-                key: pbps_model::IndexKey::Column(i.column.clone()),
+                key: pbps_model::IndexKey::Column(i.column.clone().into()),
                 descending: i.is_descending,
                 opclass: None,
             });
@@ -1852,8 +1852,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 on_delete: action(f.on_delete),
                 on_update: action(f.on_update),
             });
-        fk.columns.push(f.column.clone());
-        fk.references_columns.push(f.ref_column.clone());
+        fk.columns.push(f.column.clone().into());
+        fk.references_columns.push(f.ref_column.clone().into());
     }
 
     for c in &raw.checks {
@@ -1925,8 +1925,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     if raw.columns.iter().any(|column| {
         column.collation.is_some()
             && tables.get(&column.object_id).is_some_and(|table| {
-                table.columns.contains_key(&column.name)
-                    || table.computed.contains_key(&column.name)
+                table.columns.contains_key(column.name.as_str())
+                    || table.computed.contains_key(column.name.as_str())
             })
     }) {
         onboarding_notices.push(format!(
@@ -2469,8 +2469,12 @@ mod tests {
             })
         );
         assert_eq!(
-            t.columns.keys().collect::<Vec<_>>(),
-            ["id", "vf", "vt"],
+            t.columns.keys().cloned().collect::<Vec<_>>(),
+            [
+                pbps_model::ColumnName::from("id"),
+                pbps_model::ColumnName::from("vf"),
+                pbps_model::ColumnName::from("vt")
+            ],
             "the period's columns are the table's"
         );
         assert!(
@@ -2987,7 +2991,10 @@ mod tests {
         };
         let pulled = assemble(&raw);
         let table = &pulled.schema.tables[&TableName::new("dbo", "t")];
-        assert_eq!(table.columns.keys().collect::<Vec<_>>(), ["a"]);
+        assert_eq!(
+            table.columns.keys().cloned().collect::<Vec<_>>(),
+            [pbps_model::ColumnName::from("a")]
+        );
         let read = |name: &str| table.computed[name].clone();
         assert_eq!(
             read("c1"),
@@ -3408,7 +3415,7 @@ mod tests {
         );
         assert_eq!(
             t.primary_key.as_ref().unwrap().columns,
-            vec!["id".to_owned()]
+            vec![pbps_model::ColumnName::from("id").to_owned()]
         );
     }
 
@@ -3493,7 +3500,13 @@ mod tests {
         ];
         let p = assemble(&raw);
         let t = &p.schema.tables[&TableName::new("dbo", "customer")];
-        assert_eq!(t.primary_key.as_ref().unwrap().columns, ["email", "id"]);
+        assert_eq!(
+            t.primary_key.as_ref().unwrap().columns,
+            [
+                pbps_model::ColumnName::from("email"),
+                pbps_model::ColumnName::from("id")
+            ]
+        );
     }
 
     #[test]
@@ -3518,8 +3531,20 @@ mod tests {
         }
         let p = assemble(&raw);
         let fk = &p.schema.tables[&TableName::new("dbo", "customer")].foreign_keys["fk_x"];
-        assert_eq!(fk.columns, ["id", "email"]);
-        assert_eq!(fk.references_columns, ["cid", "cemail"]);
+        assert_eq!(
+            fk.columns,
+            [
+                pbps_model::ColumnName::from("id"),
+                pbps_model::ColumnName::from("email")
+            ]
+        );
+        assert_eq!(
+            fk.references_columns,
+            [
+                pbps_model::ColumnName::from("cid"),
+                pbps_model::ColumnName::from("cemail")
+            ]
+        );
         assert_eq!(fk.on_delete, ReferentialAction::Cascade);
         assert_eq!(fk.on_update, ReferentialAction::NoAction);
     }
@@ -3578,7 +3603,10 @@ mod tests {
             } else {
                 assert_eq!(
                     pulled.schema.tables[&name].foreign_keys["fk_state"].columns,
-                    ["id", "email"]
+                    [
+                        pbps_model::ColumnName::from("id"),
+                        pbps_model::ColumnName::from("email")
+                    ]
                 );
             }
         }
@@ -3835,8 +3863,17 @@ mod tests {
             assert!(errors.is_empty(), "{name}: {errors:?}");
         }
         let t = table("t");
-        assert_eq!(t.columns.keys().collect::<Vec<_>>(), ["id", "a"]);
-        assert_eq!(t.primary_key.as_ref().unwrap().columns, ["id"]);
+        assert_eq!(
+            t.columns.keys().cloned().collect::<Vec<_>>(),
+            [
+                pbps_model::ColumnName::from("id"),
+                pbps_model::ColumnName::from("a")
+            ]
+        );
+        assert_eq!(
+            t.primary_key.as_ref().unwrap().columns,
+            [pbps_model::ColumnName::from("id")]
+        );
         assert!(t.unique.is_empty(), "{:?}", t.unique);
         assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_a"]);
         assert_eq!(t.checks.keys().collect::<Vec<_>>(), ["ck_a"]);
@@ -3958,8 +3995,17 @@ mod tests {
         let t = &pulled.schema.tables[&name];
         let errors = crate::validate::table(&name, t);
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(t.columns.keys().collect::<Vec<_>>(), ["id", "a"]);
-        assert_eq!(t.computed.keys().collect::<Vec<_>>(), ["e"]);
+        assert_eq!(
+            t.columns.keys().cloned().collect::<Vec<_>>(),
+            [
+                pbps_model::ColumnName::from("id"),
+                pbps_model::ColumnName::from("a")
+            ]
+        );
+        assert_eq!(
+            t.computed.keys().cloned().collect::<Vec<_>>(),
+            [pbps_model::ColumnName::from("e")]
+        );
         assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_g"]);
         for detail in [
             "t.c: the computed column reads column `m`, which was left out",
@@ -4145,7 +4191,7 @@ mod tests {
         let ix = &p.schema.tables[&TableName::new("dbo", "customer")].indexes["ix_email"];
         assert_eq!(ix.columns.len(), 1);
         assert!(ix.columns[0].descending);
-        assert_eq!(ix.include, ["status"]);
+        assert_eq!(ix.include, [pbps_model::ColumnName::from("status")]);
         assert_eq!(ix.filter.as_deref(), Some("[email] IS NOT NULL"));
     }
 

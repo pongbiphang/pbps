@@ -33,7 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_model::{
-    ColumnRef, IdsFile, Intent, ModuleId, Schema, TableName, Tombstone, Uid, UidKind,
+    ColumnName, ColumnRef, IdsFile, Intent, ModuleId, Schema, TableName, Tombstone, Uid, UidKind,
 };
 
 /// A situation that cannot be decided automatically and needs a human.
@@ -49,8 +49,8 @@ pub enum Blocker {
     /// One table both lost and gained columns.
     AmbiguousColumns {
         table: TableName,
-        disappeared: Vec<String>,
-        appeared: Vec<String>,
+        disappeared: Vec<ColumnName>,
+        appeared: Vec<ColumnName>,
     },
     /// Tables both disappeared and appeared.
     AmbiguousTables {
@@ -998,7 +998,7 @@ fn resolve_columns(
     // Grouped by table once, not scanned once per table (#1870): each pass
     // below changes only its own table's columns, so a table's group is what
     // a scan would read when its pass begins.
-    let mut known_by_table: BTreeMap<TableName, BTreeMap<String, Uid>> = BTreeMap::new();
+    let mut known_by_table: BTreeMap<TableName, BTreeMap<ColumnName, Uid>> = BTreeMap::new();
     for (u, c) in &r.ids.columns {
         known_by_table
             .entry(c.table.clone())
@@ -1006,7 +1006,7 @@ fn resolve_columns(
             .insert(c.name.clone(), u.clone());
     }
     for (table_name, table) in &declared.tables {
-        let declared_cols: BTreeSet<&String> = table.columns.keys().collect();
+        let declared_cols: BTreeSet<&ColumnName> = table.columns.keys().collect();
         let known = known_by_table.remove(table_name).unwrap_or_default();
         // A partition's columns are its parent's, and it declares none, so a
         // table that holds column uids and is declared as a partition is one
@@ -1021,12 +1021,12 @@ fn resolve_columns(
             continue;
         }
 
-        let mut appeared: BTreeSet<String> = declared_cols
+        let mut appeared: BTreeSet<ColumnName> = declared_cols
             .iter()
             .filter(|n| !known.contains_key(**n))
             .map(|n| (*n).clone())
             .collect();
-        let mut disappeared: BTreeSet<String> = known
+        let mut disappeared: BTreeSet<ColumnName> = known
             .keys()
             .filter(|n| !declared_cols.contains(n))
             .cloned()
@@ -1141,7 +1141,7 @@ fn resolve_columns(
             .filter(|name| {
                 !conflicting
                     .targets
-                    .contains(&table_name.column(name.as_str()).raw().to_string())
+                    .contains(&table_name.column(name.raw()).raw().to_string())
             })
             .cloned()
             .collect();
@@ -1170,10 +1170,10 @@ fn resolve_columns(
             // #108). This is the one place a fresh column identity is
             // minted, declared or pulled alike, so it is where that check
             // has to live for pull.
-            if pbps_model::check_segment(&name).is_err() {
+            if pbps_model::check_segment(name.raw()).is_err() {
                 blockers.push(Blocker::UnrepresentableName {
                     what: "column",
-                    part: name,
+                    part: name.into_raw(),
                     table: Some(table_name.clone()),
                 });
                 continue;
@@ -1494,7 +1494,7 @@ mod tests {
         let mut table = Table::default();
         for suffix in ["1", "2"] {
             table.columns.insert(
-                format!("{part}{suffix}"),
+                format!("{part}{suffix}").into(),
                 Column::new("int".parse().unwrap()),
             );
         }
@@ -1509,7 +1509,7 @@ mod tests {
             .map(|suffix| Intent::RenameColumn {
                 table: table_name.clone(),
                 from: part.into(),
-                to: format!("{part}{suffix}"),
+                to: format!("{part}{suffix}").into(),
             })
             .into();
         let errors = resolve(&declared, &ids, &intents, &ctx()).unwrap_err();

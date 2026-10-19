@@ -131,6 +131,7 @@
 //! table is the disaster the `data-delete` gate exists for, so those rows are
 //! counted and the apply stops the same way.
 
+use pbps_model::ColumnName;
 use pbps_model::ValueSource;
 use std::cell::LazyCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -319,17 +320,23 @@ fn tuple(child_side: &str) -> String {
 /// A row's tuple as the plan writes it: the value written in each column the
 /// plan spells, the stored cell in any other. Spelled for the engine as a
 /// `CASE` over the key's columns.
-fn side(values: &BTreeMap<String, String>) -> String {
+fn side(values: &BTreeMap<ColumnName, String>) -> String {
     let whens: Vec<String> = values
         .iter()
-        .map(|(name, sql)| format!("WHEN {} THEN {}", value_literal(name), value_literal(sql)))
+        .map(|(name, sql)| {
+            format!(
+                "WHEN {} THEN {}",
+                value_literal(name.raw()),
+                value_literal(sql)
+            )
+        })
         .collect();
     format!("CASE c.attname::text {} ELSE {STORED} END", whens.join(" "))
 }
 
 /// Whether the key spans one of `columns`.
-fn touches<'a>(columns: impl Iterator<Item = &'a String>) -> String {
-    let list: Vec<String> = columns.map(|c| value_literal(c)).collect();
+fn touches<'a>(columns: impl Iterator<Item = &'a ColumnName>) -> String {
+    let list: Vec<String> = columns.map(|c| value_literal(c.raw())).collect();
     if list.is_empty() {
         return "false".to_owned();
     }
@@ -340,8 +347,8 @@ fn touches<'a>(columns: impl Iterator<Item = &'a String>) -> String {
 }
 
 /// Whether the key spans a column outside `columns`.
-fn reaches_beyond<'a>(columns: impl Iterator<Item = &'a String>) -> String {
-    let list: Vec<String> = columns.map(|c| value_literal(c)).collect();
+fn reaches_beyond<'a>(columns: impl Iterator<Item = &'a ColumnName>) -> String {
+    let list: Vec<String> = columns.map(|c| value_literal(c.raw())).collect();
     if list.is_empty() {
         return "true".to_owned();
     }
@@ -355,8 +362,8 @@ fn reaches_beyond<'a>(columns: impl Iterator<Item = &'a String>) -> String {
 /// not touch — and nothing, so the row stays counted, for a key it sets a cell
 /// of to something the probe cannot compare.
 fn guarded(
-    uncomparable: &BTreeSet<String>,
-    comparable: &BTreeMap<String, String>,
+    uncomparable: &BTreeSet<ColumnName>,
+    comparable: &BTreeMap<ColumnName, String>,
     fragment: &str,
 ) -> String {
     let mut arms = String::new();
@@ -367,7 +374,7 @@ fn guarded(
     // another is a row the probe *can* place, and the arm below that gives up
     // on the unevaluable column must not win first. It did, and the ordinary
     // update-then-delete plan was refused for it (DECISIONS 336).
-    let nulls: Vec<&String> = comparable
+    let nulls: Vec<&ColumnName> = comparable
         .iter()
         .filter(|(_, sql)| crate::rows::unwrapped(sql).eq_ignore_ascii_case("null"))
         .map(|(c, _)| c)
@@ -472,9 +479,9 @@ struct AddedColumn {
 struct Added {
     child: TableName,
     name: String,
-    columns: Vec<String>,
+    columns: Vec<ColumnName>,
     parent: TableName,
-    referenced: Vec<String>,
+    referenced: Vec<ColumnName>,
 }
 
 impl Added {
@@ -770,11 +777,11 @@ impl<'v, 'p> AsStored<'v, 'p> {
         self.retyped.keys().any(|c| c.table == *table)
     }
 
-    fn renamed_column(&self, column: &ColumnRef) -> Option<&str> {
+    fn renamed_column(&self, column: &ColumnRef) -> Option<&ColumnName> {
         let source = self.partitions.column(column);
         self.view()
             .renamed_columns(&source.table)
-            .find(|(_, _, to)| *to == source.name)
+            .find(|(_, _, to)| *to == &source.name)
             .map(|(_, from, _)| from)
     }
 
@@ -916,7 +923,7 @@ fn delete_probe(
     // referenced columns are then not the key column at all (DECISIONS 116).
     let parent_row = format!(
         "SELECT 1 FROM {parent} AS p WHERE p.{} = {}",
-        quote(&stored.name)?,
+        quote(stored.name.raw())?,
         value_literal(key.as_str())
     );
     let (exclusion, arrival) = plan_moves(&parent_row, names)?;
@@ -959,11 +966,11 @@ fn plan_moves(parent_row: &str, names: &AsStored) -> Result<(String, String), Di
         let Some(stored_key) = names.column(&child.column(&moved.key_column)) else {
             continue;
         };
-        let key_sql = format!("ch.{}", quote(&stored_key.name)?);
+        let key_sql = format!("ch.{}", quote(stored_key.name.raw())?);
         let child_sql = qualified(&stored_child)?;
         // A column the database does not have yet cannot be in a foreign key it
         // has; one it names differently is asked about by that name.
-        let stored_name = |column: &str| names.column(&child.column(column)).map(|r| r.name);
+        let stored_name = |column: &ColumnName| names.column(&child.column(column)).map(|r| r.name);
         let mut pieces = Vec::new();
         let mut terms = Vec::new();
         // Deleted rows are gone whatever they pointed at.
@@ -1033,7 +1040,7 @@ fn plan_moves(parent_row: &str, names: &AsStored) -> Result<(String, String), Di
             terms.push(guarded(&uncomparable, &comparable, &arrived));
         }
         for columns in moved.inserted.values() {
-            let known: BTreeMap<String, String> = columns
+            let known: BTreeMap<ColumnName, String> = columns
                 .iter()
                 .filter_map(|(column, sql)| stored_name(column).map(|name| (name, sql.clone())))
                 .collect();
@@ -1270,7 +1277,7 @@ impl AsStored<'_, '_> {
         parent: &TableName,
         stored_child: &TableName,
         keys: &[Added],
-    ) -> BTreeSet<String> {
+    ) -> BTreeSet<ColumnName> {
         let mut out = BTreeSet::new();
         for a in keys.iter().filter(|a| a.parent == *parent) {
             if self.view().table(&a.child).as_ref() != Some(stored_child) {
@@ -1294,7 +1301,7 @@ impl AsStored<'_, '_> {
     /// The row key column of `child`, under the catalog's name, where the
     /// count reads it: the plan deletes or updates rows of the child, and the
     /// exclusions name them by key.
-    fn row_key_read(&self, child: &TableName) -> Option<String> {
+    fn row_key_read(&self, child: &TableName) -> Option<ColumnName> {
         let m = self.moved.get(child)?;
         if m.deleted.is_empty() && m.updated.is_empty() {
             return None;
@@ -1305,7 +1312,7 @@ impl AsStored<'_, '_> {
     fn remember_types(
         &mut self,
         table: &TableName,
-        types: &BTreeMap<String, pbps_model::ColumnType>,
+        types: &BTreeMap<ColumnName, pbps_model::ColumnType>,
     ) {
         for (column, ty) in types {
             self.column_types.insert(table.column(column), ty.clone());
@@ -1459,7 +1466,7 @@ fn hidden_children_probe(
             .map(|c| {
                 format!(
                     "pg_catalog.has_column_privilege(cl.oid, {}, 'SELECT')",
-                    value_literal(c)
+                    value_literal(c.raw())
                 )
             })
             .collect();
@@ -1491,7 +1498,7 @@ fn hidden_children_probe(
              THEN pg_catalog.has_column_privilege(cl.oid, {}, 'SELECT')",
             value_literal(&stored_child.schema),
             value_literal(&stored_child.name),
-            value_literal(&key)
+            value_literal(key.raw())
         ));
     }
     let row_keys = if row_keys.is_empty() {
@@ -1508,7 +1515,7 @@ fn hidden_children_probe(
     // saw (DECISIONS 354).
     let mut parent_reads = vec![format!(
         "pg_catalog.has_column_privilege(pc.oid, {}, 'SELECT')",
-        value_literal(&stored.name)
+        value_literal(stored.name.raw())
     )];
     for a in keys {
         if a.parent != *table {
@@ -1518,7 +1525,7 @@ fn hidden_children_probe(
             if let Some(stored_r) = names.column(&a.parent.column(r)) {
                 parent_reads.push(format!(
                     "pg_catalog.has_column_privilege(pc.oid, {}, 'SELECT')",
-                    value_literal(&stored_r.name)
+                    value_literal(stored_r.name.raw())
                 ));
             }
         }
@@ -1619,10 +1626,10 @@ fn unprobeable_probe(
     // tuple: an unprobeable value in one column of a key says nothing if
     // another column of the *same* key is written NULL by the *same* row
     // (DECISIONS 334).
-    let stored_name = |column: &str| names.column(&child.column(column)).map(|r| r.name);
+    let stored_name = |column: &ColumnName| names.column(&child.column(column)).map(|r| r.name);
     let mut described = Vec::new();
     let mut arms = Vec::new();
-    let mut rows: BTreeMap<&RowKey, BTreeSet<String>> = BTreeMap::new();
+    let mut rows: BTreeMap<&RowKey, BTreeSet<ColumnName>> = BTreeMap::new();
     for (column, keys) in &moved.unprobeable {
         let Some(name) = stored_name(column) else {
             continue;
@@ -1634,7 +1641,9 @@ fn unprobeable_probe(
         described.push(format!(
             "{column} (row{} {})",
             if listed.len() == 1 { "" } else { "s" },
-            listed.join(", ")
+            listed.join(", "),
+            // raw: whole-message escaped until #2084 step 5.
+            column = column.raw(),
         ));
     }
     for (row, unprobeable) in &rows {
@@ -1660,7 +1669,7 @@ fn unprobeable_probe(
     // identity — and its value may be the deleted row's key. The catalog
     // says which key reaches it; the plan cannot (DECISIONS 343).
     for (row, set) in &moved.inserted {
-        let mut recorded: BTreeSet<String> = set.keys().filter_map(|c| stored_name(c)).collect();
+        let mut recorded: BTreeSet<ColumnName> = set.keys().filter_map(&stored_name).collect();
         for (column, keys) in &moved.unprobeable {
             if keys.contains(row)
                 && let Some(name) = stored_name(column)
@@ -1787,7 +1796,7 @@ fn planned_key_probes(
     keys: &[Added],
 ) -> Result<Vec<Probe>, DialectError> {
     let parent = qualified(&stored.table)?;
-    let parent_key = quote(&stored.name)?;
+    let parent_key = quote(stored.name.raw())?;
     let parent_row = format!(
         "SELECT 1 FROM {parent} AS p WHERE p.{parent_key} = {}",
         value_literal(key.as_str())
@@ -1840,7 +1849,7 @@ fn planned_key_probes(
         // backfill no probe can evaluate.
         type Side = Box<dyn Fn(&str) -> Option<String>>;
         // (child column, referenced column, parent side, child side)
-        let mut columns: Vec<(String, String, Side, Option<String>)> = Vec::new();
+        let mut columns: Vec<(ColumnName, ColumnName, Side, Option<String>)> = Vec::new();
         let mut unprobeable_backfill = Vec::new();
         // The child columns of the key every stored row already holds, as
         // SQL over `ch`: a NULL there is a tuple that references nothing,
@@ -1850,7 +1859,7 @@ fn planned_key_probes(
         // SQL that spells its collation clause from the catalog, and the mark
         // that stands for it in a body the engine assembles (DECISIONS 353).
         let mut clauses: Vec<String> = Vec::new();
-        let mut collated: BTreeMap<String, usize> = BTreeMap::new();
+        let mut collated: BTreeMap<ColumnName, usize> = BTreeMap::new();
         // Rows `raise_guard` names as ones this key's own columns cannot
         // safely compare through their `CAST` — excluded, not blanked to
         // `NULL`, because a `NULL` already means something else here
@@ -1877,7 +1886,7 @@ fn planned_key_probes(
                 Some(held) => {
                     if held.is_none() {
                         unprobeable_backfill.push(described_backfill(
-                            r,
+                            r.raw(),
                             &a.parent,
                             names.columns_added.get(&a.parent.column(r)),
                         ));
@@ -1888,7 +1897,7 @@ fn planned_key_probes(
                     // Spelled once per alias the tuple uses, so that the
                     // closure owns what it needs.
                     let column = a.parent.column(r);
-                    let quoted = quote(&stored_r.name)?;
+                    let quoted = quote(stored_r.name.raw())?;
                     let (p_raw, q_raw) = (format!("p.{quoted}"), format!("q.{quoted}"));
                     // A narrowing here builds a `CAST`, and the row it would
                     // raise on is excluded below rather than compared, on
@@ -1945,7 +1954,7 @@ fn planned_key_probes(
                     collated.insert(r.clone(), clauses.len());
                     clauses.push(collation_clause(
                         &value_literal(&parent),
-                        &value_literal(&stored_r.name),
+                        &value_literal(stored_r.name.raw()),
                         &still_collatable,
                     ));
                     Box::new(move |alias: &str| {
@@ -1957,7 +1966,7 @@ fn planned_key_probes(
                 Some(held) => {
                     if held.is_none() {
                         unprobeable_backfill.push(described_backfill(
-                            c,
+                            c.raw(),
                             &a.child,
                             names.columns_added.get(&a.child.column(c)),
                         ));
@@ -1966,7 +1975,7 @@ fn planned_key_probes(
                 }
                 None => {
                     // Same rule, on the child side of the key.
-                    let raw = format!("ch.{}", quote(&stored_c.name)?);
+                    let raw = format!("ch.{}", quote(stored_c.name.raw())?);
                     let side = names.converted(&a.child.column(c), raw.clone());
                     stored_sides.push(side.clone());
                     if let Some(g) = names.raise_guard(&a.child.column(c), &raw) {
@@ -1996,7 +2005,7 @@ fn planned_key_probes(
             .any(|(_, _, parent_side, _)| parent_side("p").is_none());
         let tuple_null = |sides: &dyn Fn(&str) -> Option<Option<String>>| -> bool {
             parent_null
-                || columns.iter().any(|(c, _, _, held)| match sides(c) {
+                || columns.iter().any(|(c, _, _, held)| match sides(c.raw()) {
                     Some(Some(sql)) => is_null(&sql),
                     Some(None) => false,
                     None => held.as_deref().is_some_and(is_null),
@@ -2007,9 +2016,9 @@ fn planned_key_probes(
         // column, the rows an update sets it in and what it is set to, and
         // per inserted row what it holds in every referenced column.
         let parent_moved = names.moved.get(table);
-        let parent_updates: BTreeMap<&String, Vec<(String, Option<String>)>> = parent_moved
+        let parent_updates: BTreeMap<&ColumnName, Vec<(String, Option<String>)>> = parent_moved
             .map(|m| {
-                let mut out: BTreeMap<&String, Vec<(String, Option<String>)>> = BTreeMap::new();
+                let mut out: BTreeMap<&ColumnName, Vec<(String, Option<String>)>> = BTreeMap::new();
                 for (row_key, set) in &m.updated {
                     for (column, after) in set {
                         if a.referenced.contains(column) {
@@ -2053,7 +2062,7 @@ fn planned_key_probes(
                         }
                         _ => stored,
                     };
-                    let spelled = sides(c).map(|sql| names.typed(&a.child.column(c), sql));
+                    let spelled = sides(c.raw()).map(|sql| names.typed(&a.child.column(c), sql));
                     // Two stored columns, and the engine's own check compares
                     // them under the referenced one's collation, which the
                     // mark stands for (DECISIONS 353). A literal takes the
@@ -2167,7 +2176,7 @@ fn planned_key_probes(
                                     .unwrap_or_default();
                                 format!(
                                     "{value}{mark} = {}",
-                                    sides(c)
+                                    sides(c.raw())
                                         .map(|sql| names.typed(&a.child.column(c), sql))
                                         .or_else(|| held.clone())
                                         .unwrap_or_else(|| "NULL".to_owned())
@@ -2214,10 +2223,11 @@ fn planned_key_probes(
             Some(m) => Some(format!(
                 "ch.{}",
                 quote(
-                    &names
+                    names
                         .column(&a.child.column(&m.key_column))
                         .map(|r| r.name)
                         .unwrap_or_else(|| m.key_column.clone())
+                        .raw()
                 )?
             )),
             None => None,
@@ -2240,18 +2250,18 @@ fn planned_key_probes(
                     .collect();
                 surviving = format!(" AND {key_sql} NOT IN ({})", list.join(", "));
             }
-            let in_key = |column: &str| a.columns.iter().any(|c| c == column);
+            let in_key = |column: &ColumnName| a.columns.iter().any(|c| c == column);
             let rewriting: Vec<String> = m
                 .updated
                 .iter()
-                .filter(|(_, set)| set.keys().any(|c| in_key(c)))
+                .filter(|(_, set)| set.keys().any(&in_key))
                 .map(|(k, _)| value_literal(k.as_str()))
                 .collect();
             if !rewriting.is_empty() {
                 rewritten = format!(" AND {key_sql} NOT IN ({})", rewriting.join(", "));
             }
             for (row_key, set) in &m.updated {
-                if !set.keys().any(|c| in_key(c)) {
+                if !set.keys().any(&in_key) {
                     continue;
                 }
                 let row = value_literal(row_key.as_str());
@@ -2266,7 +2276,7 @@ fn planned_key_probes(
                             .then(|| Some("NULL".to_owned()))
                     })
                 });
-                let uncomparable: Vec<&String> = set
+                let uncomparable: Vec<&ColumnName> = set
                     .iter()
                     .filter(|(c, sql)| in_key(c) && sql.is_none())
                     .map(|(c, _)| c)
@@ -2276,7 +2286,7 @@ fn planned_key_probes(
                     // the update is one no probe can compare.
                     for c in uncomparable {
                         refused
-                            .entry(c.clone())
+                            .entry(c.raw().to_owned())
                             .or_default()
                             .insert(row_key.to_string());
                     }
@@ -2306,7 +2316,7 @@ fn planned_key_probes(
                 // the insert's `types` — is one the engine assigns, an
                 // identity, and its value may be the deleted row's key
                 // (DECISIONS 343).
-                let assigned: Vec<&String> = columns
+                let assigned: Vec<&ColumnName> = columns
                     .iter()
                     .map(|(c, _, _, _)| c)
                     .filter(|c| {
@@ -2321,13 +2331,17 @@ fn planned_key_probes(
                 if !assigned.is_empty() && !written_null {
                     for c in assigned {
                         refused
-                            .entry(format!("{c} (left to the engine to assign)"))
+                            .entry(format!(
+                                "{c} (left to the engine to assign)",
+                                // raw: whole-message escaped until #2084 step 5.
+                                c = c.raw(),
+                            ))
                             .or_default()
                             .insert(row_key.to_string());
                     }
                     continue;
                 }
-                let left_unprobeable: Vec<&String> = m
+                let left_unprobeable: Vec<&ColumnName> = m
                     .unprobeable
                     .iter()
                     .filter(|(c, rows)| in_key(c) && rows.contains(row_key))
@@ -2336,7 +2350,7 @@ fn planned_key_probes(
                 if !left_unprobeable.is_empty() && !written_null {
                     for c in left_unprobeable {
                         refused
-                            .entry(c.clone())
+                            .entry(c.raw().to_owned())
                             .or_default()
                             .insert(row_key.to_string());
                     }
@@ -2542,7 +2556,7 @@ enum Applies<'a> {
 fn rows_after(
     names: &AsStored,
     table: &TableName,
-    columns: &[String],
+    columns: &[ColumnName],
     alias: &str,
     applies: &Applies<'_>,
 ) -> Result<Option<String>, DialectError> {
@@ -2621,7 +2635,7 @@ fn rows_after(
                     }
                 },
                 None => match names.column(&reference) {
-                    Some(stored_column) => format!("{alias}.{}", quote(&stored_column.name)?),
+                    Some(stored_column) => format!("{alias}.{}", quote(stored_column.name.raw())?),
                     None => {
                         unspellable = true;
                         break;
@@ -2633,7 +2647,7 @@ fn rows_after(
                 // Keep it so the primary-key probe can still count the NULL.
                 wheres.push(format!("({guard}) IS NOT TRUE"));
             }
-            match projected(i, column, read) {
+            match projected(i, column.raw(), read) {
                 Some(sql) => selected.push(sql),
                 None => {
                     unspellable = true;
@@ -2669,7 +2683,7 @@ fn rows_after(
                     };
                     wheres.push(format!(
                         "{alias}.{} NOT IN ({})",
-                        quote(&key_column.name)?,
+                        quote(key_column.name.raw())?,
                         gone.into_iter().collect::<Vec<_>>().join(", ")
                     ));
                 }
@@ -2692,7 +2706,7 @@ fn rows_after(
     if let Some(m) = moved
         && !unspellable
     {
-        let unprobeable = |column: &String, key: &RowKey| {
+        let unprobeable = |column: &ColumnName, key: &RowKey| {
             m.unprobeable
                 .get(column)
                 .is_some_and(|rows| rows.contains(key))
@@ -2716,7 +2730,11 @@ fn rows_after(
                     unspellable = true;
                     break;
                 }
-                match projected(i, column, names.typed(&table.column(column), sql.clone())) {
+                match projected(
+                    i,
+                    column.raw(),
+                    names.typed(&table.column(column), sql.clone()),
+                ) {
                     Some(sql) => values.push(sql),
                     None => {
                         unspellable = true;
@@ -2746,7 +2764,7 @@ fn rows_after(
             let mut guarded = false;
             let mut wheres = vec![format!(
                 "{alias}.{} = {}",
-                quote(&key_column.name)?,
+                quote(key_column.name.raw())?,
                 value_literal(key.as_str())
             )];
             for (i, column) in columns.iter().enumerate() {
@@ -2764,7 +2782,7 @@ fn rows_after(
                     Some(None) => "NULL".to_owned(),
                     None => match names.column(&table.column(column)) {
                         Some(c) => {
-                            let raw = format!("{alias}.{}", quote(&c.name)?);
+                            let raw = format!("{alias}.{}", quote(c.name.raw())?);
                             if let Some(guard) = names.raise_guard(&table.column(column), &raw) {
                                 guarded = true;
                                 wheres.push(format!("({guard}) IS NOT TRUE"));
@@ -2777,7 +2795,7 @@ fn rows_after(
                         }
                     },
                 };
-                match projected(i, column, read) {
+                match projected(i, column.raw(), read) {
                     Some(sql) => values.push(sql),
                     None => {
                         unspellable = true;
@@ -2941,7 +2959,7 @@ fn reads_recomputed<'v, 'p: 'v>(
     names: &impl Deref<Target = AsStored<'v, 'p>>,
     change: &Change,
 ) -> bool {
-    let named = |table: &TableName, columns: &[String]| {
+    let named = |table: &TableName, columns: &[ColumnName]| {
         columns
             .iter()
             .any(|c| names.recomputed.contains(&table.column(c)))
@@ -3125,7 +3143,7 @@ fn build<'v, 'p: 'v>(
                 Some(stored) => Ok(vec![null_probe(
                     &column,
                     &qualified(&stored.table)?,
-                    &quote(&stored.name)?,
+                    &quote(stored.name.raw())?,
                 )]),
                 None => Ok(skip(change, "the column does not exist before apply", unchecked)),
             }
@@ -3142,7 +3160,7 @@ fn build<'v, 'p: 'v>(
                 return Ok(skip(change, "the column does not exist before apply", unchecked));
             };
             let table = qualified(&stored.table)?;
-            let quoted = quote(&stored.name)?;
+            let quoted = quote(stored.name.raw())?;
             let mut out = Vec::new();
             // One `ALTER TABLE` takes both subcommands (ADR-0011 Amendment 1),
             // so a type change that also tightens the column carries the other
@@ -3253,7 +3271,7 @@ fn build<'v, 'p: 'v>(
                     .collect();
                 sql.push_str(&format!(
                     " AND {} NOT IN ({})",
-                    quote(&key_column.name)?,
+                    quote(key_column.name.raw())?,
                     gone.into_iter().collect::<Vec<_>>().join(", ")
                 ));
             }
@@ -3408,7 +3426,7 @@ fn build<'v, 'p: 'v>(
                      AND {counter} OPERATOR(pg_catalog.<=) {}) END;",
                     saturated_count("count(*)"),
                     value_literal(&qualified(&stored.table)?),
-                    value_literal(&stored.name),
+                    value_literal(stored.name.raw()),
                     bounds.start(),
                     bounds.end()
                 ),
@@ -3510,7 +3528,7 @@ fn build<'v, 'p: 'v>(
                          {bound}::pg_catalog.numeric END;",
                         saturated_count("count(*)"),
                         value_literal(&qualified(&stored.table)?),
-                        value_literal(&stored.name),
+                        value_literal(stored.name.raw()),
                     ),
                 ));
             }
@@ -3542,7 +3560,7 @@ fn build<'v, 'p: 'v>(
                      {last}::pg_catalog.numeric;",
                     saturated_count("count(*)"),
                     qualified(&stored.table)?,
-                    quote(&stored.name)?
+                    quote(stored.name.raw())?
                 ),
             ));
             Ok(probes)
@@ -3663,7 +3681,7 @@ fn orphan_probe(
             Some(stored) if !spelled_by_the_plan => {
                 let clause = collation_clause(
                     &value_literal(&qualified(&stored.table)?),
-                    &value_literal(&stored.name),
+                    &value_literal(stored.name.raw()),
                     "",
                 );
                 clauses.push(clause);
@@ -3726,7 +3744,7 @@ fn planned_collation(names: &AsStored, column: &ColumnRef) -> Result<String, Dia
          WHERE a.attrelid = pg_catalog.to_regclass({}) \
          AND a.attname = {} AND a.attnum > 0 AND NOT a.attisdropped)",
         value_literal(&qualified(&stored.table)?),
-        value_literal(&stored.name)
+        value_literal(stored.name.raw())
     ))
 }
 
@@ -5297,7 +5315,7 @@ mod tests {
             from_collation: None,
             to_collation: None,
         };
-        let columns = vec!["v".to_owned()];
+        let columns = vec![pbps_model::ColumnName::from("v")];
         let constraints = [
             Change::AddUnique {
                 table: table.clone(),
@@ -5375,7 +5393,7 @@ mod tests {
     fn deleting(table: &str, key: &str) -> Change {
         Change::DeleteRow {
             table: table.parse().expect("a table name"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from(key),
             cause: pbps_model::change::DeleteCause::Undeclared,
             dropped: Default::default(),
@@ -5424,7 +5442,7 @@ mod tests {
             table: table.clone(),
             name: format!("uq_{column}"),
             constraint: pbps_model::UniqueConstraint {
-                columns: vec![column.to_owned()],
+                columns: vec![column.into()],
                 storage_parameters: Default::default(),
             },
             clustered: false,
@@ -6408,8 +6426,8 @@ mod tests {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
             table: parent.clone(),
             table_was: None,
-            from: "code".to_owned(),
-            to: "label".to_owned(),
+            from: "code".into(),
+            to: "label".into(),
         };
         let unique = Change::AddIndex {
             table: partition.clone(),
@@ -6455,13 +6473,13 @@ mod tests {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
             table: table.clone(),
             table_was: None,
-            from: from.to_owned(),
-            to: to.to_owned(),
+            from: from.into(),
+            to: to.into(),
         };
         let add = |table: &TableName, c: &str| Change::AddColumn {
             table: table.clone(),
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
-            name: c.to_owned(),
+            name: c.into(),
             column: Box::new(pbps_model::Column::new("integer".parse().expect("a type"))),
         };
         let checked = |changes: Vec<Change>| {
@@ -6508,7 +6526,7 @@ mod tests {
         let not_null = |c: &str| Change::SetPartitionNotNull {
             uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
             table: partition.clone(),
-            column: c.to_owned(),
+            column: c.into(),
             not_null: true,
         };
         let readded = probes_with(
@@ -6559,16 +6577,16 @@ mod tests {
         let child: TableName = "app.child".parse().expect("a table name");
         let parent: TableName = "app.status".parse().expect("a table name");
         let key = pbps_model::ForeignKey {
-            columns: vec!["status".to_owned()],
+            columns: vec!["status".into()],
             references_table: parent.clone(),
-            references_columns: vec!["code".to_owned()],
+            references_columns: vec!["code".into()],
             on_delete: pbps_model::ReferentialAction::NoAction,
             on_update: pbps_model::ReferentialAction::NoAction,
         };
         let created = |ty: &str| {
             let mut table = pbps_model::Table::default();
             table.columns.insert(
-                "code".to_owned(),
+                "code".into(),
                 pbps_model::Column::new(ty.parse().expect("a type")),
             );
             set(vec![
@@ -6638,9 +6656,9 @@ mod tests {
         let mut column = pbps_model::Column::new("text".parse().expect("a type"));
         column.value_source = pbps_model::ValueSource::Default("'old'".to_owned());
         let key = pbps_model::ForeignKey {
-            columns: vec!["status".to_owned()],
+            columns: vec!["status".into()],
             references_table: parent.clone(),
-            references_columns: vec!["code".to_owned()],
+            references_columns: vec!["code".into()],
             on_delete: pbps_model::ReferentialAction::NoAction,
             on_update: pbps_model::ReferentialAction::NoAction,
         };
@@ -6649,7 +6667,7 @@ mod tests {
                 Change::AddColumn {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                     table: child.clone(),
-                    name: "status".to_owned(),
+                    name: "status".into(),
                     column: Box::new(column),
                 },
                 Change::AddForeignKey {
@@ -6769,9 +6787,9 @@ mod tests {
         let child: TableName = "app.child".parse().expect("a table name");
         let parent: TableName = "app.status".parse().expect("a table name");
         let key = pbps_model::ForeignKey {
-            columns: vec!["status".to_owned()],
+            columns: vec!["status".into()],
             references_table: parent.clone(),
-            references_columns: vec!["code".to_owned()],
+            references_columns: vec!["code".into()],
             on_delete: pbps_model::ReferentialAction::NoAction,
             on_update: pbps_model::ReferentialAction::NoAction,
         };
@@ -6916,9 +6934,9 @@ mod tests {
         let child: TableName = "app.child".parse().expect("a table name");
         let parent: TableName = "app.status".parse().expect("a table name");
         let key = pbps_model::ForeignKey {
-            columns: vec!["status".to_owned()],
+            columns: vec!["status".into()],
             references_table: parent.clone(),
-            references_columns: vec!["code".to_owned()],
+            references_columns: vec!["code".into()],
             on_delete: pbps_model::ReferentialAction::NoAction,
             on_update: pbps_model::ReferentialAction::NoAction,
         };
@@ -7110,10 +7128,10 @@ mod tests {
         let probes = probes(&set(vec![
             Change::UpdateRow {
                 table: "app.child".parse().expect("a table name"),
-                key_column: "code".to_owned(),
+                key_column: "code".into(),
                 key: RowKey::from("c1"),
                 columns: [(
-                    "parent".to_owned(),
+                    "parent".into(),
                     (
                         Cell::Value(Value::Text("old".into())),
                         Cell::Value(Value::Text("new".into())),

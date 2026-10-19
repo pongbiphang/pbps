@@ -148,7 +148,8 @@ pub fn size_of_data_warnings(changes: &ChangeSet, edition: &Edition) -> Vec<Stri
                 "{table}.{name}: adding a NOT NULL column with a DEFAULT rewrites every row on \
                  {} (it is metadata-only on Enterprise)",
                 edition.name(),
-                table = table.shown()
+                table = table.shown(),
+                name = name.shown(),
             ));
         }
     }

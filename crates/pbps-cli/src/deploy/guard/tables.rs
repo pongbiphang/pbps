@@ -130,7 +130,10 @@ impl<'a> Tables<'a> {
         // The identity index supplies final table spellings. A staged table
         // rename is one logical change and carries no separate column rename;
         // ordinary column renames are still undone only on unambiguous reads.
-        let holds_column = |s: &Schema, table: &TableName, a: &str, b: &str| {
+        let holds_column = |s: &Schema,
+                            table: &TableName,
+                            a: &pbps_model::ColumnName,
+                            b: &pbps_model::ColumnName| {
             s.tables
                 .get(table)
                 .is_some_and(|t| t.columns.contains_key(a) && t.columns.contains_key(b))
@@ -160,7 +163,7 @@ impl<'a> Tables<'a> {
         // The earlier read has run nothing, so only the later one is undone.
         for (table, net) in changing_hands {
             for (now, was) in net {
-                if let Some(was) = was.as_deref().filter(|was| *was != now) {
+                if let Some(was) = was.as_ref().filter(|was| *was != now) {
                     undo_after
                         .rename_column(pbps_model::ColumnRef::new((*table).clone(), now), was);
                 }

@@ -187,7 +187,11 @@ pub(super) fn classify(
             }
             // The captured pg_attribute row has a logical `column` address;
             // its raw catalog class is not the address used by pg_attrdef.
-            let column_id = identity("column", vec![column.clone()], vec![table_id.clone()]);
+            let column_id = identity(
+                "column",
+                vec![column.raw().to_owned()],
+                vec![table_id.clone()],
+            );
             if capture.inputs.contains_key(&column_id) {
                 if !owned.contains_key(&table_id) {
                     return Err(Uncovered::object(
@@ -203,7 +207,7 @@ pub(super) fn classify(
             }
             if let ValueSource::Sequence(sequence) = &declaration.value_source {
                 serials.insert(
-                    relation(&crate::emit::owned_sequence(name, column, sequence)),
+                    relation(&crate::emit::owned_sequence(name, column.raw(), sequence)),
                     column_id.clone(),
                 );
             }

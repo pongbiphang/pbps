@@ -1163,11 +1163,17 @@ CREATE EVENT TRIGGER replace_part ON ddl_command_end WHEN TAG IN ('{tag}') EXECU
         let recorded = &checkpoint.schema.tables[&"app.u".parse().unwrap()];
         if index {
             assert_eq!(
-                recorded.indexes["ix"].columns[0].key.column(),
+                recorded.indexes["ix"].columns[0]
+                    .key
+                    .column()
+                    .map(pbps_model::ColumnName::raw),
                 Some("other")
             );
         } else {
-            assert_eq!(recorded.unique["uq"].columns, ["other"]);
+            assert_eq!(
+                recorded.unique["uq"].columns,
+                [pbps_model::ColumnName::from("other")]
+            );
         }
         // An unchanged bad checkpoint is still not the CREATE's declaration.
         let still_bad = approved_apply(&d, connection, &plan, &["--staged", "--resume"]);
@@ -1426,7 +1432,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
             pbps_model::Change::AlterColumnType { column, .. } => {
                 assert_eq!(c["lock"], "AccessExclusiveLock");
                 assert_eq!(c["blocks"], "reads and writes");
-                match column.name.as_str() {
+                match column.name.raw() {
                     "i" => {
                         assert_eq!(c["rewrite"]["value"], "yes");
                         assert_eq!(c["reads"]["value"], "every_row");
@@ -1442,7 +1448,7 @@ fn connected_cost_distinguishes_rewrites_scans_unknowns_and_risk() {
                     "v" => assert_eq!(c["rows"]["status"], "never_analyzed"),
                     name => panic!("unexpected column {name}"),
                 }
-                if column.name != "v" {
+                if column.name != "v".into() {
                     assert_eq!(c["rows"]["status"], "estimated");
                     assert_eq!(c["rows"]["count"], 3);
                 }
@@ -1590,7 +1596,7 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
             let c = &costs[i];
             assert_eq!(c["change_index"], i);
             if let Change::AlterColumnType { column, .. } = &p.change
-                && column.name == "amount"
+                && column.name == "amount".into()
             {
                 assert_eq!(c["rewrite"]["value"], "unknown", "{report:#}");
                 assert!(c["rewrite"]["reason"].as_str().unwrap().contains("index"));
@@ -1598,7 +1604,7 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
                 verified += 1;
             }
             if let Change::AlterColumnNullability { column, .. } = &p.change
-                && column.name == "required"
+                && column.name == "required".into()
             {
                 // The renamed CHECK is replaced after tightening. Its old
                 // catalog definition is gone before the statement (479).
@@ -1607,7 +1613,7 @@ fn connected_cost_keeps_catalog_identity_through_column_and_table_renames() {
                 verified += 1;
             }
             if let Change::AlterColumnType { column, .. } = &p.change
-                && column.name == "plain"
+                && column.name == "plain".into()
             {
                 assert_eq!(c["rewrite"]["value"], "yes");
                 assert_eq!(c["reads"]["value"], "every_row");
@@ -8809,6 +8815,13 @@ fn a_partition_the_read_cannot_hold_all_of_takes_its_tree_out_of_a_pull() {
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
+    const RAW: &str = "n\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+    const SHOWN: &str = r"n\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+    let column_yaml = serde_json::to_string(RAW)
+        .unwrap()
+        .replace('\u{9b}', "\\u009b");
+    let identity =
+        format!("  {column_yaml}: {{type: integer, nullable: false, identity: [1, 1]}}\n");
     let old_server = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
     for (k, server) in [old_server, server()].iter().enumerate() {
         let own = OwnDatabase::new(server, &format!("numbered_fill1890_{k}"));
@@ -8851,10 +8864,7 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
             "{server}: {shown}"
         );
 
-        file(
-            "t",
-            "  n: {type: integer, nullable: false, identity: [1, 1]}\n",
-        );
+        file("t", &identity);
         file("q", "  m: {type: serial}\n");
         succeeds(d.run(&["plan"]));
         d.commit();
@@ -8864,7 +8874,7 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
             .find(|l| l.starts_with("numbered_column_fills: "))
             .unwrap_or_else(|| panic!("{server}: {shown}"));
         for said in [
-            "app.t.n",
+            concat!("app.t.", r"n\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前"),
             "app.q.m",
             "numbers the rows already there in a table rewrite, which logical decoding does \
              not stream",
@@ -8875,6 +8885,31 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
         }
         assert!(!line.contains("over app.q"), "{server}: {line}");
         assert!(!line.contains("app.fresh"), "{server}: {line}");
+        let report = json_output(succeeds(
+            d.run(&["plan", "--db", connection, "--format", "json"]),
+        ));
+        let check = report["data"]["connected_checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "numbered_column_fills")
+            .unwrap();
+        let raw_message = check["message"].as_str().unwrap();
+        assert!(
+            raw_message.contains(&format!("app.t.{RAW}")),
+            "{server}: {report}"
+        );
+        assert!(
+            !raw_message.contains(&format!("app.t.{SHOWN}")),
+            "{server}: {report}"
+        );
+        assert_eq!(
+            line,
+            format!(
+                "numbered_column_fills: {}",
+                pbps_model::escape::Escaped(raw_message)
+            )
+        );
         on_server(
             connection,
             "SET client_min_messages = error;
@@ -8897,7 +8932,10 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
         succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
         succeeds(approved_apply(&d, connection, &plan, &[]));
         assert_eq!(
-            scalar(connection, "SELECT count(*) FROM app.t WHERE n IS NOT NULL"),
+            scalar(
+                connection,
+                &format!("SELECT count(*) FROM app.t WHERE \"{RAW}\" IS NOT NULL")
+            ),
             3
         );
 
@@ -8906,10 +8944,7 @@ fn a_numbered_column_added_to_rows_names_the_publications_that_miss_it() {
             connection,
             "DROP PUBLICATION pbps_fill_t; DROP PUBLICATION pbps_fill_cols;",
         );
-        file(
-            "t",
-            "  n: {type: integer, nullable: false, identity: [1, 1]}\n  w: {type: serial}\n",
-        );
+        file("t", &format!("{identity}  w: {{type: serial}}\n"));
         succeeds(d.run(&["plan"]));
         d.commit();
         let shown = stdout(&succeeds(d.run(&["plan", "--db", connection])));
@@ -18321,7 +18356,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "t"),
                 operation: RowOperation::Update {
-                    columns: [column.to_owned()].into(),
+                    columns: [pbps_model::ColumnName::from(column)].into(),
                 },
             };
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
@@ -18345,7 +18380,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
         assert_eq!(rows[0].try_get::<i64>("n").unwrap(), Some(1));
         let write = RowWrite {
             table: pbps_model::TableName::new("app", "t"),
-            operation: RowOperation::Update { columns: ["audit".to_owned()].into() },
+            operation: RowOperation::Update { columns: ["audit".into()].into() },
         };
         conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let checked = pbps_pg::data_triggers::prepare(&mut conn, &[write], &Default::default(), &Default::default()).await;
@@ -18355,7 +18390,7 @@ fn update_of_generated_columns_follows_their_source_columns() {
         // the row statement the widener is gone and `size` is not touched.
         let write = RowWrite {
             table: pbps_model::TableName::new("app", "t"),
-            operation: RowOperation::Update { columns: ["audit".to_owned()].into() },
+            operation: RowOperation::Update { columns: ["audit".into()].into() },
         };
         let removed = pbps_pg::data_triggers::Dropped {
             modules: [pbps_model::ModuleId::Trigger {
@@ -19249,7 +19284,7 @@ fn the_write_closure_follows_writing_actions_and_stops_at_the_others() {
         "CREATE FUNCTION public.hook() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RETURN NULL; END$$",
     );
     let update = |columns: &[&str]| RowOperation::Update {
-        columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+        columns: columns.iter().map(|c| (*c).into()).collect(),
     };
     // Every case declares `{s}.p`, writes it, and puts one trigger somewhere a
     // referential action may or may not reach. `p` always keeps the same shape
@@ -19649,7 +19684,7 @@ fn a_cascade_reached_table_is_held_until_the_write_finishes() {
         let dialect = pbps_pg::Postgres::new();
         let write = RowWrite {
             table: pbps_model::TableName::new("app", "p"),
-            operation: RowOperation::Update { columns: ["ukey".to_owned()].into() },
+            operation: RowOperation::Update { columns: ["ukey".into()].into() },
         };
         writer.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc())).await.unwrap();
         let guard = pbps_pg::data_triggers::prepare(&mut writer, std::slice::from_ref(&write), &baseline, &Default::default()).await.unwrap();
@@ -19879,7 +19914,7 @@ fn a_reached_table_the_deployment_role_cannot_lock_is_named_in_the_refusal() {
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "p"),
                 operation: RowOperation::Update {
-                    columns: ["ukey".to_owned()].into(),
+                    columns: ["ukey".into()].into(),
                 },
             };
             conn.begin(&dialect.transaction_framing(&pbps_model::SessionZone::utc()))
@@ -19997,7 +20032,7 @@ fn referential_action_locks(admin: &str) {
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "p"),
                 operation: RowOperation::Update {
-                    columns: ["id".to_owned()].into(),
+                    columns: ["id".into()].into(),
                 },
             };
             let guard = pbps_pg::data_triggers::prepare(
@@ -20054,7 +20089,7 @@ fn referential_action_locks(admin: &str) {
             let direct = RowWrite {
                 table: pbps_model::TableName::new("app", "c"),
                 operation: RowOperation::Update {
-                    columns: ["id".to_owned()].into(),
+                    columns: ["id".into()].into(),
                 },
             };
             let refused = pbps_pg::data_triggers::prepare(
@@ -20235,7 +20270,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "p"),
                 operation: RowOperation::Update {
-                    columns: ["ukey".to_owned()].into(),
+                    columns: ["ukey".into()].into(),
                 },
             };
             let key = Dropped {
@@ -20504,7 +20539,7 @@ fn a_key_a_before_trigger_can_rewrite_is_in_the_closure() {
             let write = RowWrite {
                 table: pbps_model::TableName::new("app", "p"),
                 operation: RowOperation::Update {
-                    columns: ["ukey".to_owned()].into(),
+                    columns: ["ukey".into()].into(),
                 },
             };
             // Both baselines are recorded while `rewrite` is the only trigger
@@ -20665,7 +20700,7 @@ fn a_rewrite_rule_on_a_reached_table_is_refused() {
                 operation,
             };
             let updates = write(RowOperation::Update {
-                columns: ["ukey".to_owned()].into(),
+                columns: ["ukey".into()].into(),
             });
             for (label, write, refused) in [
                 ("the event the rule is on", updates.clone(), true),
@@ -27130,6 +27165,108 @@ fn an_unasked_partition_default_stays_in_the_envelope_when_a_later_step_fails() 
             "{version}: {err}"
         );
         on_server(&conn, "DROP EVENT TRIGGER pbps_1703_watch");
+    }
+}
+
+/// Shared warnings retain raw names in JSON and escape them once at both
+/// human writers. A default the engine can ask about emits no warning.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn partition_default_warnings_keep_raw_json_and_escape_names_once_for_humans() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [("18", server()), ("16", old)] {
+        let partition = "ev\nline\\tail";
+        let column = "v\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
+        let db = OwnDatabase::new(&server, &format!("parts-2084-{version}"));
+        let conn = db.connection();
+        on_server(
+            conn,
+            &format!(
+                "CREATE SCHEMA app;
+                 CREATE TABLE app.ev (k integer NOT NULL, \"{column}\" integer DEFAULT 1)
+                     PARTITION BY RANGE (k);
+                 CREATE TABLE app.\"{partition}\" PARTITION OF app.ev FOR VALUES FROM (0) TO (10);
+                 ALTER TABLE app.\"{partition}\" ALTER COLUMN \"{column}\" SET DEFAULT 7"
+            ),
+        );
+        let d = Demo::new(&format!("parts-2084-{version}"));
+        succeeds(d.run(&["pull", "--db", conn]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", conn, "--reason", "adopt"]));
+        // JSON leaves C1 characters literal; YAML requires them escaped even in quotes.
+        let column_yaml = serde_json::to_string(column)
+            .unwrap()
+            .replace('\u{9b}', "\\u009b");
+        let partition_yaml = serde_json::to_string(partition).unwrap();
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!(
+                "table: app.ev
+columns:
+  k: {{type: integer, nullable: false}}
+  {column_yaml}: {{type: integer, default: \"1\"}}
+partition_by: [k]
+partitions:
+  {partition_yaml}:
+    from: [\"0\"]
+    to: [\"10\"]
+    columns:
+      {column_yaml}: {{default: \"8\"}}
+"
+            ),
+        )
+        .unwrap();
+        d.commit();
+        let unasked = |report: &serde_json::Value| -> Vec<serde_json::Value> {
+            report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|finding| finding["id"] == "plan.partition-default-unasked")
+                .cloned()
+                .collect()
+        };
+        // Negative: a pair the engine can ask about emits no warning.
+        let report = json_output(succeeds(d.run(&["plan", "--db", conn, "--format", "json"])));
+        assert!(unasked(&report).is_empty(), "{version}: {report}");
+
+        let trigger =
+            "CREATE FUNCTION public.pbps_2084_noop() RETURNS event_trigger LANGUAGE plpgsql AS
+                           $$ BEGIN END $$;
+                       CREATE EVENT TRIGGER pbps_2084_watch ON ddl_command_end
+                           EXECUTE FUNCTION public.pbps_2084_noop()";
+        on_server(conn, trigger);
+        let prefix =
+            "not checked before the plan whether the engine stores it as the parent's default: ";
+        let reason = "the target has the enabled DDL event trigger(s) `pbps_2084_watch`, which this check's temporary table would fire";
+        let raw = format!("{prefix}partition app.{partition} column `{column}`: {reason}");
+        let shown = format!(
+            "{prefix}partition app.ev\\nline\\\\tail column `v\\nline\\r\\u{{1b}}[31m\\u{{9b}}\\\\\\u{{202e}}名前`: {reason}"
+        );
+        let report = json_output(succeeds(d.run(&["plan", "--db", conn, "--format", "json"])));
+        let warnings = unasked(&report);
+        assert_eq!(warnings.len(), 1, "{version}: {report}");
+        assert_eq!(warnings[0]["message"], raw, "{version}: {report}");
+        let check_human = |output: Output| {
+            let error = stderr(&succeeds(output));
+            let lines: Vec<_> = error
+                .lines()
+                .filter(|line| line.starts_with("warning: not checked before the plan"))
+                .collect();
+            assert_eq!(lines, [format!("warning: {shown}")], "{version}: {error}");
+        };
+        check_human(d.run(&["plan", "--db", conn]));
+        // Bootstrap uses the direct warning printer rather than the plan envelope.
+        let empty = OwnDatabase::new(&server, &format!("parts-2084-boot-{version}"));
+        on_server(empty.connection(), &format!("CREATE SCHEMA app; {trigger}"));
+        let sql = d.dir.join("bootstrap.sql");
+        check_human(d.run(&[
+            "bootstrap",
+            "--db",
+            empty.connection(),
+            "--sql",
+            sql.to_str().unwrap(),
+        ]));
     }
 }
 

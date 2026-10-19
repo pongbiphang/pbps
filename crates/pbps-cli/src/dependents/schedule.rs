@@ -518,7 +518,7 @@ mod tests {
                 Change::CreateModule { id, .. } => format!("create {id}", id = id.shown()),
                 Change::DropModule { id, .. } => format!("drop {id}", id = id.shown()),
                 Change::AlterColumnDefault { column, .. } => {
-                    format!("default {}.{}", column.table.shown(), column.name)
+                    format!("default {}.{}", column.table.shown(), column.name.shown())
                 }
                 Change::DropRole { name, .. } => format!("drop role {name}"),
                 other => format!("{other:?}"),

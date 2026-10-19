@@ -255,7 +255,7 @@ fn occupant(at: &str, owner: &str, column: Option<&str>) -> pbps_dialect::slots:
         },
         kind: "sequence".into(),
         owner: Some(name(owner)),
-        column: column.map(str::to_owned),
+        column: column.map(Into::into),
     }
 }
 

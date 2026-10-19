@@ -6,6 +6,7 @@
 //! allocator: even a managed address vacated by the plan can have an unmanaged
 //! catalog occupant that this input does not describe.
 
+use crate::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 
@@ -247,7 +248,7 @@ enum IdentityChange {
 #[derive(Debug)]
 enum ColumnLife {
     Keep,
-    Begin(BTreeSet<String>),
+    Begin(BTreeSet<ColumnName>),
     End,
 }
 
@@ -367,7 +368,7 @@ fn identity_change(step: usize, change: &Change) -> IdentityChange {
 pub struct PlanNames<'p> {
     changes: &'p [PlannedChange],
     tables: History<TableName>,
-    columns: History<(Uid, String)>,
+    columns: History<(Uid, ColumnName)>,
     roles: History<String>,
 }
 
@@ -423,7 +424,7 @@ impl<'p> PlanNames<'p> {
         // A table's lifetime bounds its columns even when CREATE/DROP carries
         // no individual column changes. Only known UIDs are represented: a
         // tombstone spelling is not permission to manufacture an identity.
-        let mut seeds: BTreeMap<Uid, Option<(Uid, String)>> = BTreeMap::new();
+        let mut seeds: BTreeMap<Uid, Option<(Uid, ColumnName)>> = BTreeMap::new();
         let mut owners = BTreeMap::new();
         for e in &events {
             seeds
@@ -447,7 +448,7 @@ impl<'p> PlanNames<'p> {
                 return Err(PlanNamesError::ColumnOwner { uid: uid.clone() });
             }
         }
-        let mut authored: BTreeMap<Uid, Vec<Transition<(Uid, String)>>> = BTreeMap::new();
+        let mut authored: BTreeMap<Uid, Vec<Transition<(Uid, ColumnName)>>> = BTreeMap::new();
         for e in events {
             if e.uid.kind() != UidKind::Column {
                 return Err(PlanNamesError::Kind {
@@ -552,7 +553,7 @@ impl<'p> PlanNames<'p> {
         self.tables.holder(name, self.boundary(at))
     }
 
-    pub fn column_at(&self, column: &Uid, at: At) -> Option<(&Uid, &str)> {
+    pub fn column_at(&self, column: &Uid, at: At) -> Option<(&Uid, &ColumnName)> {
         let boundary = self.boundary(at);
         let (owner, name) = self.columns.name(column, boundary)?;
         self.tables.name(owner, boundary)?;
@@ -562,7 +563,7 @@ impl<'p> PlanNames<'p> {
     /// First managed address of this UID, even when its scope starts after
     /// `Start`. This is a spelling history, not evidence of a stored catalog
     /// column: scope changes and physical creation have different lifetimes.
-    pub fn column_first(&self, column: &Uid) -> Option<(&Uid, &str)> {
+    pub fn column_first(&self, column: &Uid) -> Option<(&Uid, &ColumnName)> {
         let (owner, name) = self
             .columns
             .names
@@ -584,7 +585,10 @@ impl<'p> PlanNames<'p> {
 
     /// Surviving columns whose own spelling changed, under their final table.
     /// Table renames alone do not change a column's own name.
-    pub fn renamed_columns(&self, table: &TableName) -> impl Iterator<Item = (&Uid, &str, &str)> {
+    pub fn renamed_columns(
+        &self,
+        table: &TableName,
+    ) -> impl Iterator<Item = (&Uid, &ColumnName, &ColumnName)> {
         self.renamed_columns_at(table, At::End)
     }
 
@@ -593,7 +597,7 @@ impl<'p> PlanNames<'p> {
         &'a self,
         table: &TableName,
         at: At,
-    ) -> impl Iterator<Item = (&'a Uid, &'a str, &'a str)> + use<'a> {
+    ) -> impl Iterator<Item = (&'a Uid, &'a ColumnName, &'a ColumnName)> + use<'a> {
         let owner = match self.holder(table, at) {
             Holder::Tracked(uid) => Some(uid),
             Holder::Unmanaged | Holder::Vacant => None,

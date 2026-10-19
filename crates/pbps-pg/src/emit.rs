@@ -49,6 +49,7 @@
 //! reference data in (step 7), every [`Change`] is either a statement or a
 //! refusal that names a rule.
 
+use pbps_model::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 
 use pbps_dialect::{Created, DialectError, ScanCheckStep, Statement};
@@ -95,10 +96,10 @@ pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
     Ok(format!("{}.{}", quote(&t.schema)?, quote(&t.name)?))
 }
 
-fn column_list(columns: &[String]) -> Result<String, DialectError> {
+fn column_list(columns: &[ColumnName]) -> Result<String, DialectError> {
     Ok(columns
         .iter()
-        .map(|c| quote(c))
+        .map(|c| quote(c.raw()))
         .collect::<Result<Vec<_>, _>>()?
         .join(", "))
 }
@@ -913,14 +914,14 @@ fn numbering(
     }
     let table = &column.table;
     let t = qualified(table)?;
-    let c = quote(&column.name)?;
+    let c = quote(column.name.raw())?;
     let alter = format!("ALTER TABLE {t} ALTER COLUMN {c}");
     // `pg_get_serial_sequence` parses its first argument as a name and takes
     // its second as written: the qualified table, and the column's own text.
     let owned = format!(
         "pg_catalog.pg_get_serial_sequence({}, {})",
         literal(&t),
-        literal(&column.name)
+        literal(column.name.raw())
     );
     let found = format!(
         "pbps.pbps_seq := {owned};\n\
@@ -1044,7 +1045,7 @@ fn numbering(
     // Put on the new one.
     let (start, increment, options) = match to {
         ValueSource::Sequence(sequence) => {
-            let q = qualified(&owned_sequence(table, &column.name, sequence))?;
+            let q = qualified(&owned_sequence(table, column.name.raw(), sequence))?;
             body.push(format!(
                 "CREATE SEQUENCE {q} AS {} START WITH {} INCREMENT BY {}{};",
                 types::normalize(ty)?,
@@ -1288,7 +1289,7 @@ fn create_index(
             // with a newline so a trailing line comment in it cannot swallow
             // the rest of the statement (DECISIONS 281, DEC-1169.2).
             let mut key = match &c.key {
-                pbps_model::IndexKey::Column(name) => quote(name)?,
+                pbps_model::IndexKey::Column(name) => quote(name.raw())?,
                 pbps_model::IndexKey::Expression(text) => format!("({})", verbatim(text)),
             };
             // Qualified, so a class of the same name earlier on the
@@ -3066,9 +3067,9 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             let add = format!(
                 "ALTER TABLE {} ADD COLUMN {};",
                 qualified(table)?,
-                column_definition(table, name, column)?
+                column_definition(table, name.raw(), column)?
             );
-            let body = match owned_sequence_statements(table, name, column, false)? {
+            let body = match owned_sequence_statements(table, name.raw(), column, false)? {
                 Some((create, owned, sequence)) => {
                     let owner = sequence_to_table_owner(table, &sequence)?;
                     format!("{create}\n{owner}\n{add}\n{owned}")
@@ -3086,7 +3087,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             format!(
                 "ALTER TABLE {} DROP COLUMN {};",
                 qualified(&column.table)?,
-                quote(&column.name)?
+                quote(column.name.raw())?
             ),
         ),
 
@@ -3098,8 +3099,8 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             format!(
                 "ALTER TABLE {} RENAME COLUMN {} TO {};",
                 qualified(table)?,
-                quote(from)?,
-                quote(to)?
+                quote(from.raw())?,
+                quote(to.raw())?
             ),
         ),
 
@@ -3155,7 +3156,9 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                      element type is changed only where every element keeps its value, and \
                      this change narrows or converts them. Add the new column, fill it in a \
                      declared step, and drop the old one.",
-                    column.name
+
+                    // raw: whole-message escaped until #2084 step 5.
+column.name.raw()
                 )));
             }
             if types::change_risk(&was, &normalized) == pbps_dialect::TypeChangeRisk::Incompatible {
@@ -3167,9 +3170,13 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                      transformation to declare and review, not one for a tool to choose \
                      (ADR-0012 section 5). Add the new column, fill it in a declared step, and drop the \
                      old one.",
-                    column.name,
+
+                    // raw: whole-message escaped until #2084 step 5.
+column.name.raw(),
                     types::normalize(from)?,
-                    column.name
+
+                    // raw: whole-message escaped until #2084 step 5.
+column.name.raw()
                 )));
             }
             // The same refusal, for the same reason, on a change the risk
@@ -3196,7 +3203,9 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                      the zone the applying session happens to hold. Say what the values mean \
                      instead: add the new column, fill it in a declared step with the zone \
                      written out (`AT TIME ZONE \'...\'`), and drop the old one.",
-                    column.name
+
+                    // raw: whole-message escaped until #2084 step 5.
+column.name.raw()
                 )));
             }
             // One `ALTER TABLE` takes both subcommands (ADR-0011, Amendment 1),
@@ -3206,12 +3215,12 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             // nothing.
             let mut parts = vec![format!(
                 "ALTER COLUMN {} TYPE {normalized}",
-                quote(&column.name)?
+                quote(column.name.raw())?
             )];
             if from_nullable != to_nullable {
                 parts.push(format!(
                     "ALTER COLUMN {} {}",
-                    quote(&column.name)?,
+                    quote(column.name.raw())?,
                     if *to_nullable {
                         "DROP NOT NULL"
                     } else {
@@ -3229,7 +3238,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 ),
             )?;
             if !from_nullable && *to_nullable && *through_external_partitions {
-                clear_external_partitions(&column.table, &column.name, sql)
+                clear_external_partitions(&column.table, column.name.raw(), sql)
             } else {
                 Ok(sql)
             }
@@ -3251,7 +3260,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 format!(
                     "ALTER TABLE {} ALTER COLUMN {} {};",
                     qualified(&column.table)?,
-                    quote(&column.name)?,
+                    quote(column.name.raw())?,
                     if *to_nullable {
                         "DROP NOT NULL"
                     } else {
@@ -3260,7 +3269,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 ),
             )?;
             if *to_nullable && *through_external_partitions {
-                clear_external_partitions(&column.table, &column.name, sql)
+                clear_external_partitions(&column.table, column.name.raw(), sql)
             } else {
                 Ok(sql)
             }
@@ -3284,13 +3293,13 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 Some(expr) => format!(
                     "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
                     qualified(&column.table)?,
-                    quote(&column.name)?,
+                    quote(column.name.raw())?,
                     verbatim(expr)
                 ),
                 None => format!(
                     "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
                     qualified(&column.table)?,
-                    quote(&column.name)?
+                    quote(column.name.raw())?
                 ),
             },
         ),
@@ -3316,7 +3325,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                 Ok(format!(
                     "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT {};",
                     qualified(table)?,
-                    quote(column)?,
+                    quote(column.raw())?,
                     verbatim(expr)
                 ))
             };
@@ -3329,7 +3338,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                     format!(
                         "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT;",
                         qualified(table)?,
-                        quote(column)?
+                        quote(column.raw())?
                     ),
                 ),
             }
@@ -3345,7 +3354,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             format!(
                 "ALTER TABLE {} ALTER COLUMN {} {};",
                 qualified(table)?,
-                quote(column)?,
+                quote(column.raw())?,
                 if *not_null {
                     "SET NOT NULL"
                 } else {
@@ -3376,7 +3385,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             format!(
                 "ALTER TABLE {} ALTER COLUMN {} SET EXPRESSION AS ({});",
                 qualified(&column.table)?,
-                quote(&column.name)?,
+                quote(column.name.raw())?,
                 verbatim(to)
             ),
         ),
@@ -3737,7 +3746,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             pbps_dialect::RowOperation::Insert,
             atomically(&insert_row(
                 table,
-                key_column,
+                key_column.raw(),
                 *identity_key,
                 key,
                 row,
@@ -3762,7 +3771,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             },
             atomically(&update_row(
                 table,
-                key_column,
+                key_column.raw(),
                 key,
                 columns,
                 unchanged,
@@ -3786,7 +3795,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             pbps_dialect::RowOperation::Delete,
             atomically(&delete_row(
                 table,
-                key_column,
+                key_column.raw(),
                 key,
                 row,
                 types,
@@ -4038,7 +4047,7 @@ pub const SCAN_CHECK_PREFIX: &str = "pbps_attach_";
 /// key (a plan from before #1638), or a range end the engine reads as empty.
 fn bound_check(
     bound: &pbps_model::PartitionBound,
-    key: &[String],
+    key: &[ColumnName],
 ) -> Result<Option<String>, DialectError> {
     use pbps_model::{BoundDatum, ListDatum, PartitionBound};
     if key.is_empty() {
@@ -4046,7 +4055,7 @@ fn bound_check(
     }
     let columns = key
         .iter()
-        .map(|c| quote(c))
+        .map(|c| quote(c.raw()))
         .collect::<Result<Vec<_>, _>>()?;
     match bound {
         PartitionBound::Default | PartitionBound::Hash { .. } => Ok(None),
@@ -4492,12 +4501,15 @@ fn create_table(
             if let Some(default) = &c.default {
                 own.push(format!(
                     "ALTER COLUMN {} SET DEFAULT {}",
-                    quote(column)?,
+                    quote(column.raw())?,
                     verbatim(default)
                 ));
             }
             if c.not_null {
-                own.push(format!("ALTER COLUMN {} SET NOT NULL", quote(column)?));
+                own.push(format!(
+                    "ALTER COLUMN {} SET NOT NULL",
+                    quote(column.raw())?
+                ));
             }
         }
         if !own.is_empty() {
@@ -4545,8 +4557,9 @@ fn create_table(
     // (#1631).
     let mut sequences = Vec::new();
     for (col_name, column) in &table.columns {
-        body.push(column_definition(name, col_name, column)?);
-        if let Some(pair) = owned_sequence_statements(name, col_name, column, table.unlogged)? {
+        body.push(column_definition(name, col_name.raw(), column)?);
+        if let Some(pair) = owned_sequence_statements(name, col_name.raw(), column, table.unlogged)?
+        {
             sequences.push(pair);
         }
     }
@@ -4591,7 +4604,7 @@ fn create_table(
                 by.strategy.keyword(),
                 by.columns
                     .iter()
-                    .map(|c| quote(c))
+                    .map(|c| quote(c.raw()))
                     .collect::<Result<Vec<_>, _>>()?
                     .join(", ")
             ),
@@ -5212,8 +5225,8 @@ fn insert_row(
     identity_key: bool,
     key: &RowKey,
     row: &Row,
-    defaults: &BTreeMap<String, String>,
-    types: &BTreeMap<String, ColumnType>,
+    defaults: &BTreeMap<ColumnName, String>,
+    types: &BTreeMap<ColumnName, ColumnType>,
 ) -> Result<String, DialectError> {
     if identity_key {
         return Err(invalid(format!(
@@ -5229,7 +5242,7 @@ fn insert_row(
     let mut columns = vec![quote(key_column)?];
     let mut values = vec![row_key(key)];
     for (column, v) in row.columns() {
-        columns.push(quote(column)?);
+        columns.push(quote(column.raw())?);
         values.push(cell_sql(v, types.get(column))?);
     }
     // What the row must hold afterwards: a trigger that deleted it again, or
@@ -5238,14 +5251,18 @@ fn insert_row(
     let mut cells = Vec::new();
     for (column, v) in row.columns() {
         let held = recorded_cell(
-            column,
+            column.raw(),
             &Cell::Value(v.clone()),
             types.get(column).map(Held::same),
         )?;
         cells.push(match (held, v) {
             (Some(held), _) => held,
-            (None, Value::Null) => format!("{} IS NULL", quote(column)?),
-            (None, v) => format!("{} = {}", quote(column)?, cell_sql(v, types.get(column))?),
+            (None, Value::Null) => format!("{} IS NULL", quote(column.raw())?),
+            (None, v) => format!(
+                "{} = {}",
+                quote(column.raw())?,
+                cell_sql(v, types.get(column))?
+            ),
         });
     }
     // And the columns the row left to the table: a trigger rewriting one of
@@ -5255,12 +5272,12 @@ fn insert_row(
     // to run to answer — `now()`, `nextval()` — is not asked: it has no value
     // before it runs, and asking would consume a sequence value.
     for (column, ty) in types {
-        if row.get(column).is_some() {
+        if row.get(column.raw()).is_some() {
             continue;
         }
         cells.extend(match defaults.get(column) {
-            Some(default) => defaulted_cell(column, default, Some(Held::same(ty)))?,
-            None => Some(format!("{} IS NULL", quote(column)?)),
+            Some(default) => defaulted_cell(column.raw(), default, Some(Held::same(ty)))?,
+            None => Some(format!("{} IS NULL", quote(column.raw())?)),
         });
     }
     Ok(format!(
@@ -5301,14 +5318,14 @@ fn update_row(
     table: &TableName,
     key_column: &str,
     key: &RowKey,
-    columns: &BTreeMap<String, (Cell, Cell)>,
-    unchanged: &BTreeMap<String, Cell>,
-    types: &BTreeMap<String, ColumnType>,
-    after_types: &BTreeMap<String, ColumnType>,
+    columns: &BTreeMap<ColumnName, (Cell, Cell)>,
+    unchanged: &BTreeMap<ColumnName, Cell>,
+    types: &BTreeMap<ColumnName, ColumnType>,
+    after_types: &BTreeMap<ColumnName, ColumnType>,
     key_type: Option<&ColumnType>,
 ) -> Result<String, DialectError> {
-    let before_ty = |column: &String| Held::of(types.get(column), after_types.get(column));
-    let after_ty = |column: &String| {
+    let before_ty = |column: &ColumnName| Held::of(types.get(column), after_types.get(column));
+    let after_ty = |column: &ColumnName| {
         after_types
             .get(column)
             .or_else(|| types.get(column))
@@ -5317,7 +5334,7 @@ fn update_row(
     let mut sets = Vec::with_capacity(columns.len());
     let mut recorded = Vec::new();
     for (column, (from, to)) in columns {
-        let quoted = quote(column)?;
+        let quoted = quote(column.raw())?;
         // `DEFAULT` is the keyword: it asks the engine to evaluate the
         // column's default, which is the one thing a literal cannot say.
         let rhs = match to {
@@ -5325,10 +5342,10 @@ fn update_row(
             Cell::Default(_) => "DEFAULT".to_owned(),
         };
         sets.push(format!("{quoted} = {rhs}"));
-        recorded.extend(recorded_cell(column, from, before_ty(column))?);
+        recorded.extend(recorded_cell(column.raw(), from, before_ty(column))?);
     }
     for (column, held) in unchanged {
-        recorded.extend(recorded_cell(column, held, before_ty(column))?);
+        recorded.extend(recorded_cell(column.raw(), held, before_ty(column))?);
     }
     // An empty `SET` is not valid SQL, and the differ never produces one — it
     // emits an `UpdateRow` only for columns that differ. Refusing rather than
@@ -5358,10 +5375,10 @@ fn update_row(
     // being read back as the plan's own result.
     let mut cells = Vec::new();
     for (column, (_, to)) in columns {
-        cells.extend(recorded_cell(column, to, after_ty(column))?);
+        cells.extend(recorded_cell(column.raw(), to, after_ty(column))?);
     }
     for (column, held) in unchanged {
-        cells.extend(recorded_cell(column, held, after_ty(column))?);
+        cells.extend(recorded_cell(column.raw(), held, after_ty(column))?);
     }
     sql.push('\n');
     sql.push_str(&wrote_the_row(table, key, key_column, &cells)?);
@@ -5380,15 +5397,15 @@ fn delete_row(
     table: &TableName,
     key_column: &str,
     key: &RowKey,
-    row: &BTreeMap<String, Cell>,
-    types: &BTreeMap<String, ColumnType>,
-    after_types: &BTreeMap<String, ColumnType>,
+    row: &BTreeMap<ColumnName, Cell>,
+    types: &BTreeMap<ColumnName, ColumnType>,
+    after_types: &BTreeMap<ColumnName, ColumnType>,
     key_type: Option<&ColumnType>,
 ) -> Result<String, DialectError> {
     let mut predicates = vec![key_equals(key_column, key, key_type)?];
     for (column, cell) in row {
         predicates.extend(recorded_cell(
-            column,
+            column.raw(),
             cell,
             Held::of(types.get(column), after_types.get(column)),
         )?);
@@ -5673,7 +5690,10 @@ mod tests {
             table: "app.t".parse().unwrap(),
             parent: "app.ev".parse().unwrap(),
             bound,
-            key: key.iter().map(|k| k.to_string()).collect(),
+            key: key
+                .iter()
+                .map(|k| pbps_model::ColumnName::from(*k))
+                .collect(),
             shape: Box::default(),
         };
         let staged = |change: &Change| -> Vec<pbps_dialect::Statement> {
@@ -9312,17 +9332,15 @@ mod tests {
         row.0.insert("label".into(), Value::Text("One".into()));
         let change = Change::InsertRow {
             table: "app.status".parse().expect("a table name"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             identity_key: false,
             key: RowKey::from("a"),
             row,
-            defaults: [("rank".to_owned(), "(0)".to_owned())]
-                .into_iter()
-                .collect(),
+            defaults: [("rank".into(), "(0)".to_owned())].into_iter().collect(),
             types: [
-                ("label".to_owned(), ty("text")),
-                ("rank".to_owned(), ty("integer")),
-                ("note".to_owned(), ty("text")),
+                ("label".into(), ty("text")),
+                ("rank".into(), ty("integer")),
+                ("note".into(), ty("text")),
             ]
             .into_iter()
             .collect(),
@@ -9353,7 +9371,7 @@ mod tests {
     fn an_identity_keyed_insert_is_refused_by_the_emitter_too() {
         let change = Change::InsertRow {
             table: "app.status".parse().expect("a table name"),
-            key_column: "id".to_owned(),
+            key_column: "id".into(),
             identity_key: true,
             key: RowKey::from("1"),
             row: Row::default(),
@@ -9374,10 +9392,10 @@ mod tests {
         let ty = |s: &str| s.parse::<ColumnType>().expect("a type");
         let change = Change::UpdateRow {
             table: "app.status".parse().expect("a table name"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("a"),
             columns: [(
-                "label".to_owned(),
+                "label".into(),
                 (
                     Cell::Value(Value::Text("Old".into())),
                     Cell::Value(Value::Text("New".into())),
@@ -9385,15 +9403,12 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            unchanged: [("rank".to_owned(), Cell::Value(Value::Int(3)))]
+            unchanged: [("rank".into(), Cell::Value(Value::Int(3)))]
                 .into_iter()
                 .collect(),
-            types: [
-                ("label".to_owned(), ty("text")),
-                ("rank".to_owned(), ty("integer")),
-            ]
-            .into_iter()
-            .collect(),
+            types: [("label".into(), ty("text")), ("rank".into(), ty("integer"))]
+                .into_iter()
+                .collect(),
             after_types: BTreeMap::new(),
             key_type: None,
         };
@@ -9419,33 +9434,30 @@ mod tests {
         let ty = |s: &str| s.parse::<ColumnType>().expect("a type");
         let change = Change::DeleteRow {
             table: "app.status".parse().expect("a table name"),
-            key_column: "code".to_owned(),
+            key_column: "code".into(),
             key: RowKey::from("old"),
             cause: pbps_model::change::DeleteCause::Undeclared,
             dropped: [
                 (
-                    "label".to_owned(),
+                    "label".into(),
                     Cell::Value(Value::Text("Dropped baseline".into())),
                 ),
-                ("dropped_only".to_owned(), Cell::Value(Value::Null)),
+                ("dropped_only".into(), Cell::Value(Value::Null)),
             ]
             .into_iter()
             .collect(),
             row: [
-                ("label".to_owned(), Cell::Value(Value::Text("Old".into()))),
-                ("rank".to_owned(), Cell::Value(Value::Null)),
+                ("label".into(), Cell::Value(Value::Text("Old".into()))),
+                ("rank".into(), Cell::Value(Value::Null)),
                 // No type carried, so nothing to compare it by: held to
                 // nothing rather than to a guess.
-                ("doc".to_owned(), Cell::Value(Value::Text("{}".into()))),
+                ("doc".into(), Cell::Value(Value::Text("{}".into()))),
             ]
             .into_iter()
             .collect(),
-            types: [
-                ("label".to_owned(), ty("text")),
-                ("rank".to_owned(), ty("integer")),
-            ]
-            .into_iter()
-            .collect(),
+            types: [("label".into(), ty("text")), ("rank".into(), ty("integer"))]
+                .into_iter()
+                .collect(),
             after_types: BTreeMap::new(),
             key_type: None,
         };

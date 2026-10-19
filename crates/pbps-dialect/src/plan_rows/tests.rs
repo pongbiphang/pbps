@@ -1,6 +1,24 @@
 use super::*;
 use pbps_model::{IdsFile, PlannedChange, UidKind};
 
+#[test]
+fn row_write_and_null_evidence_keys_keep_raw_column_names() {
+    let column = pbps_model::ColumnName::from("cell\n\r\u{1b}[31m\u{9b}\\\u{200b}名前");
+    let shown = pbps_model::ColumnName::from(column.shown().to_string());
+    let row = RowKey::from("1");
+    let mut writes = RowWrites::<&str>::default();
+    writes.insert(&row, &column, Some("NULL"));
+    assert!(writes.inserted[&row].contains_key(column.raw()));
+    assert!(!writes.inserted[&row].contains_key(shown.raw()));
+    assert_eq!(
+        writes.nulls_of(&row, &|c| Some(c.clone()), |v| *v == "NULL"),
+        [column.clone()].into()
+    );
+    writes.update(&row, &shown, None);
+    assert!(writes.unprobeable.contains_key(shown.raw()));
+    assert!(!writes.unprobeable.contains_key(column.raw()));
+}
+
 fn table(name: &str) -> TableName {
     TableName::new("app", name)
 }
@@ -162,21 +180,41 @@ fn omitted_nulls_and_engine_assignments_are_different_from_defaults() {
     let defaults = [("default".into(), "NULL".into())].into();
     let types = [("omitted".into(), "integer".parse().unwrap())].into();
     assert_eq!(
-        WrittenCell::inserted(&row, &defaults, &types, "explicit"),
+        WrittenCell::inserted(
+            &row,
+            &defaults,
+            &types,
+            &pbps_model::ColumnName::from("explicit")
+        ),
         WrittenCell::Value(&Value::Null)
     );
     // The engine's literal reader, not this walk, decides whether NULL is
     // evaluable. In particular, an arbitrary default is not an omitted cell.
     assert_eq!(
-        WrittenCell::inserted(&row, &defaults, &types, "default"),
+        WrittenCell::inserted(
+            &row,
+            &defaults,
+            &types,
+            &pbps_model::ColumnName::from("default")
+        ),
         WrittenCell::Default("NULL")
     );
     assert_eq!(
-        WrittenCell::inserted(&row, &defaults, &types, "omitted"),
+        WrittenCell::inserted(
+            &row,
+            &defaults,
+            &types,
+            &pbps_model::ColumnName::from("omitted")
+        ),
         WrittenCell::OmittedNull
     );
     assert_eq!(
-        WrittenCell::inserted(&row, &defaults, &types, "identity"),
+        WrittenCell::inserted(
+            &row,
+            &defaults,
+            &types,
+            &pbps_model::ColumnName::from("identity")
+        ),
         WrittenCell::EngineAssigned
     );
 }
@@ -188,9 +226,13 @@ fn deleting_and_updating_one_key_excludes_it_once_and_keeps_unknowns_visible() {
     let changed = RowKey("changed".into());
     let unrelated = RowKey("unrelated".into());
     rows.deleted.insert(deleted.clone());
-    rows.update(&deleted, "fk", Some("old"));
-    rows.update(&changed, "fk", None);
-    rows.update(&unrelated, "description", Some("text"));
+    rows.update(&deleted, &pbps_model::ColumnName::from("fk"), Some("old"));
+    rows.update(&changed, &pbps_model::ColumnName::from("fk"), None);
+    rows.update(
+        &unrelated,
+        &pbps_model::ColumnName::from("description"),
+        Some("text"),
+    );
     assert_eq!(rows.gone_keys(&["fk".into()]), [&deleted, &changed].into());
     assert_eq!(rows.gone_keys(&["untouched".into()]), [&deleted].into());
     assert_eq!(rows.unprobeable["fk"], [changed.clone()].into());
@@ -207,15 +249,15 @@ fn a_deleted_row_cannot_arrive_again_from_its_earlier_writes() {
     let gone = RowKey("gone".into());
     let kept = RowKey("kept".into());
     for row in [&gone, &kept] {
-        rows.insert(row, "known", Some("1"));
-        rows.update(row, "unknown", None);
+        rows.insert(row, &pbps_model::ColumnName::from("known"), Some("1"));
+        rows.update(row, &pbps_model::ColumnName::from("unknown"), None);
         rows.typed.insert(row.clone(), ["known".into()].into());
         rows.held_null
             .insert(row.clone(), ["sibling".into()].into());
     }
-    rows.insert(&gone, "gone_only", None);
-    rows.delete("id", &gone);
-    assert_eq!(rows.key_column, "id");
+    rows.insert(&gone, &pbps_model::ColumnName::from("gone_only"), None);
+    rows.delete(&pbps_model::ColumnName::from("id"), &gone);
+    assert_eq!(rows.key_column, "id".into());
     assert_eq!(rows.deleted, [gone.clone()].into());
     assert_eq!(rows.inserted.keys().collect::<Vec<_>>(), [&kept]);
     assert_eq!(rows.updated.keys().collect::<Vec<_>>(), [&kept]);
@@ -226,7 +268,7 @@ fn a_deleted_row_cannot_arrive_again_from_its_earlier_writes() {
         [("unknown".into(), [kept.clone()].into())].into()
     );
     assert!(rows.has_writes());
-    rows.delete("id", &kept);
+    rows.delete(&pbps_model::ColumnName::from("id"), &kept);
     assert!(!rows.has_writes());
     assert!(rows.unprobeable.is_empty());
     assert_eq!(rows.gone_keys(&[]), [&gone, &kept].into());
@@ -237,12 +279,19 @@ fn null_evidence_stays_with_its_row_and_uses_the_callers_interpretation() {
     let mut rows = RowWrites::<&str>::default();
     let first = RowKey("1".into());
     let second = RowKey("2".into());
-    rows.insert(&first, "a", Some("NULL"));
-    rows.update(&first, "b", Some("engine-null"));
+    rows.insert(&first, &pbps_model::ColumnName::from("a"), Some("NULL"));
+    rows.update(
+        &first,
+        &pbps_model::ColumnName::from("b"),
+        Some("engine-null"),
+    );
     rows.held_null
         .insert(first.clone(), ["held".into(), "gone".into()].into());
-    rows.insert(&second, "unknown", None);
-    let stored = |name: &str| (name != "gone").then(|| format!("stored_{name}"));
+    rows.insert(&second, &pbps_model::ColumnName::from("unknown"), None);
+    let stored = |name: &pbps_model::ColumnName| {
+        (name.raw() != "gone")
+            .then(|| pbps_model::ColumnName::from(format!("stored_{}", name.shown())))
+    };
     assert_eq!(
         rows.nulls_of(&first, &stored, |v| *v == "NULL" || *v == "engine-null"),
         ["stored_a".into(), "stored_b".into(), "stored_held".into()].into()

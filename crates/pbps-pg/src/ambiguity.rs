@@ -234,7 +234,7 @@ fn declared_literals(schema: &Schema) -> Result<Vec<Literal>, DbError> {
                     let (at_column, text) = if *column == key {
                         (None, row_key.as_str().to_owned())
                     } else {
-                        match row.get(column) {
+                        match row.get(column.raw()) {
                             Some(Value::Text(t)) => (Some(column.clone()), t.clone()),
                             _ => continue,
                         }
@@ -254,7 +254,7 @@ fn declared_literals(schema: &Schema) -> Result<Vec<Literal>, DbError> {
                 }
             }
         }
-        let own_defaults: Vec<(&String, &str)> = match &table.partition_of {
+        let own_defaults: Vec<(&pbps_model::ColumnName, &str)> = match &table.partition_of {
             Some(of) => of
                 .columns
                 .iter()

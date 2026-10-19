@@ -33,7 +33,7 @@ fn p(change: Change) -> PlannedChange {
 fn table_with(columns: &[&str]) -> Table {
     let mut cols = IndexMap::new();
     for c in columns {
-        cols.insert((*c).to_owned(), Column::new(int()));
+        cols.insert((*c).into(), Column::new(int()));
     }
     Table {
         columns: cols,
@@ -323,7 +323,7 @@ fn row(table: &str, key: &str) -> PlannedChange {
         key_column: "id".into(),
         identity_key: false,
         key: RowKey::from(key),
-        row: [("id".to_owned(), Value::Text(key.into()))]
+        row: [("id".into(), Value::Text(key.into()))]
             .into_iter()
             .collect::<Row>(),
         defaults: Default::default(),
@@ -661,7 +661,7 @@ fn attached_partition() -> Plan {
         parent: t("par"),
         bound: PartitionBound::Default,
         columns: [(
-            "note".to_owned(),
+            "note".into(),
             PartitionColumn {
                 default: Some("5".into()),
                 not_null: true,
@@ -754,7 +754,7 @@ fn a_column_gaining_a_default_and_a_deprecation_runs_them_in_either_order() {
     let mut after = Schema::default();
     after.tables.insert(t("t"), table.clone());
     let bare = Table {
-        columns: [("x".to_owned(), Column::new(int()))].into_iter().collect(),
+        columns: [("x".into(), Column::new(int()))].into_iter().collect(),
         ..Table::default()
     };
     let (tid, cid) = (uid(UidKind::Table, "t"), uid(UidKind::Column, "t.x"));
@@ -1027,8 +1027,8 @@ fn child_row(id: i64, parent: Option<i64>) -> PlannedChange {
         identity_key: false,
         key: RowKey::from(id.to_string().as_str()),
         row: [
-            ("id".to_owned(), Value::Int(id)),
-            ("pid".to_owned(), parent.map_or(Value::Null, Value::Int)),
+            ("id".into(), Value::Int(id)),
+            ("pid".into(), parent.map_or(Value::Null, Value::Int)),
         ]
         .into_iter()
         .collect::<Row>(),
@@ -1324,12 +1324,9 @@ fn a_tightening_followed_by_a_non_null_write_is_a_valid_order() {
         key_column: "id".into(),
         identity_key: false,
         key: RowKey::from("1"),
-        row: [
-            ("id".to_owned(), Value::Int(1)),
-            ("n".to_owned(), Value::Int(5)),
-        ]
-        .into_iter()
-        .collect::<Row>(),
+        row: [("id".into(), Value::Int(1)), ("n".into(), Value::Int(5))]
+            .into_iter()
+            .collect::<Row>(),
         defaults: Default::default(),
         types: Default::default(),
     });
@@ -1515,7 +1512,7 @@ fn update_pid(id: i64, parent: i64) -> PlannedChange {
         key_column: "id".into(),
         key: RowKey::from(id.to_string().as_str()),
         columns: [(
-            "pid".to_owned(),
+            "pid".into(),
             (Cell::Value(Value::Null), Cell::Value(Value::Int(parent))),
         )]
         .into_iter()
@@ -1608,9 +1605,7 @@ fn a_dropped_column_takes_its_default_with_it_so_a_later_insert_is_valid() {
         key_column: "id".into(),
         identity_key: false,
         key: RowKey::from("1"),
-        row: [("id".to_owned(), Value::Int(1))]
-            .into_iter()
-            .collect::<Row>(),
+        row: [("id".into(), Value::Int(1))].into_iter().collect::<Row>(),
         defaults: Default::default(),
         types: Default::default(),
     });
@@ -1814,7 +1809,7 @@ fn parent_default_changes_under_a_partition() -> Plan {
             columns: own
                 .map(|d| {
                     (
-                        "v".to_owned(),
+                        "v".into(),
                         PartitionColumn {
                             default: Some(d.into()),
                             not_null: false,
@@ -2136,12 +2131,9 @@ fn checked(was: &str, will: &str, update: pbps_model::Cell) -> Plan {
         table: t("t"),
         key_column: "id".into(),
         key: RowKey::from("1"),
-        columns: [(
-            "n".to_owned(),
-            (pbps_model::Cell::Value(Value::Int(5)), update),
-        )]
-        .into_iter()
-        .collect(),
+        columns: [("n".into(), (pbps_model::Cell::Value(Value::Int(5)), update))]
+            .into_iter()
+            .collect(),
         unchanged: Default::default(),
         types: Default::default(),
         after_types: Default::default(),
@@ -2339,9 +2331,7 @@ fn a_foreign_key_added_follows_the_parent_rows_the_plan_writes() {
                 key_column: "id".into(),
                 identity_key: false,
                 key: RowKey::from("1"),
-                row: [("id".to_owned(), Value::Int(1))]
-                    .into_iter()
-                    .collect::<Row>(),
+                row: [("id".into(), Value::Int(1))].into_iter().collect::<Row>(),
                 defaults: Default::default(),
                 types: Default::default(),
             }),
@@ -2831,7 +2821,7 @@ fn update_beside_a_rename(guard: bool) -> Plan {
         ids
     };
     let unchanged = if guard {
-        [("b".to_owned(), pbps_model::Cell::Value(Value::Int(7)))]
+        [("b".into(), pbps_model::Cell::Value(Value::Int(7)))]
             .into_iter()
             .collect()
     } else {
@@ -2851,7 +2841,7 @@ fn update_beside_a_rename(guard: bool) -> Plan {
                 key_column: "id".into(),
                 key: RowKey::from("1"),
                 columns: [(
-                    "n".to_owned(),
+                    "n".into(),
                     (
                         pbps_model::Cell::Value(Value::Int(5)),
                         pbps_model::Cell::Value(Value::Int(6)),
@@ -2902,10 +2892,10 @@ fn insert_beside_a_new_column(held: bool) -> Plan {
     let (mut before, mut after) = (Schema::default(), Schema::default());
     before.tables.insert(t("t"), table_with(&["id", "a"]));
     after.tables.insert(t("t"), table_with(&["id", "a", "c"]));
-    let mut types: std::collections::BTreeMap<String, ColumnType> =
-        [("a".to_owned(), int())].into_iter().collect();
+    let mut types: std::collections::BTreeMap<pbps_model::ColumnName, ColumnType> =
+        [("a".into(), int())].into_iter().collect();
     if held {
-        types.insert("c".to_owned(), int());
+        types.insert("c".into(), int());
     }
     Plan {
         logical: vec![
@@ -2920,9 +2910,7 @@ fn insert_beside_a_new_column(held: bool) -> Plan {
                 key_column: "id".into(),
                 identity_key: false,
                 key: RowKey::from("3"),
-                row: [("a".to_owned(), Value::Int(5))]
-                    .into_iter()
-                    .collect::<Row>(),
+                row: [("a".into(), Value::Int(5))].into_iter().collect::<Row>(),
                 defaults: Default::default(),
                 types,
             }),
@@ -3147,7 +3135,11 @@ fn rows_across(
     parent_row: &[(&str, i64)],
     child_row: &[(&str, i64)],
 ) -> Plan {
-    let strings = |v: &[&str]| v.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+    let strings = |v: &[&str]| {
+        v.iter()
+            .map(|c| pbps_model::ColumnName::from(*c))
+            .collect::<Vec<_>>()
+    };
     let mut parent = table_with(parent_columns);
     parent.unique.insert(
         "u".into(),
@@ -3184,7 +3176,7 @@ fn rows_across(
             key: RowKey::from(cells[0].1.to_string().as_str()),
             row: cells
                 .iter()
-                .map(|(c, v)| ((*c).to_owned(), Value::Int(*v)))
+                .map(|(c, v)| ((*c).into(), Value::Int(*v)))
                 .collect::<Row>(),
             defaults: Default::default(),
             types: Default::default(),
@@ -3317,7 +3309,7 @@ fn plain_row(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
         // A real payload leaves the key column to `key`.
         row: cells
             .iter()
-            .map(|(c, v)| ((*c).to_owned(), Value::Int(*v)))
+            .map(|(c, v)| ((*c).into(), Value::Int(*v)))
             .collect::<Row>(),
         defaults: Default::default(),
         types: Default::default(),
@@ -3326,9 +3318,9 @@ fn plain_row(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
 
 fn reference(columns: &[&str], references: &[&str]) -> ForeignKey {
     ForeignKey {
-        columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+        columns: columns.iter().map(|c| (*c).into()).collect(),
         references_table: t("p"),
-        references_columns: references.iter().map(|c| (*c).to_owned()).collect(),
+        references_columns: references.iter().map(|c| (*c).into()).collect(),
         on_delete: ReferentialAction::default(),
         on_update: ReferentialAction::default(),
     }
@@ -3353,7 +3345,7 @@ fn parent_and_child(
         parent.unique.insert(
             "u".into(),
             pbps_model::UniqueConstraint {
-                columns: unique.iter().map(|c| (*c).to_owned()).collect(),
+                columns: unique.iter().map(|c| (*c).into()).collect(),
                 storage_parameters: Default::default(),
             },
         );
@@ -3413,7 +3405,7 @@ fn a_child_update_of_one_component_of_a_composite_reference_waits_for_the_new_tu
         key_column: "id".into(),
         key: RowKey::from("1"),
         columns: [(
-            "pa".to_owned(),
+            "pa".into(),
             (
                 pbps_model::Cell::Value(Value::Int(1)),
                 pbps_model::Cell::Value(Value::Int(3)),
@@ -3421,7 +3413,7 @@ fn a_child_update_of_one_component_of_a_composite_reference_waits_for_the_new_tu
         )]
         .into_iter()
         .collect(),
-        unchanged: [("pb".to_owned(), pbps_model::Cell::Value(Value::Int(2)))]
+        unchanged: [("pb".into(), pbps_model::Cell::Value(Value::Int(2)))]
             .into_iter()
             .collect(),
         types: Default::default(),
@@ -3452,7 +3444,7 @@ fn delete(table: &str, key: i64, cells: &[(&str, i64)]) -> PlannedChange {
         cause: pbps_model::change::DeleteCause::Undeclared,
         row: cells
             .iter()
-            .map(|(c, v)| ((*c).to_owned(), pbps_model::Cell::Value(Value::Int(*v))))
+            .map(|(c, v)| ((*c).into(), pbps_model::Cell::Value(Value::Int(*v))))
             .collect(),
         dropped: Default::default(),
         types: Default::default(),
@@ -3497,7 +3489,7 @@ fn rows_swapping_the_values_of_a_rebuilt_unique_index_draw_no_cycle() {
             descending: false,
             opclass: None,
         }],
-        include: include.iter().map(|c| (*c).to_owned()).collect(),
+        include: include.iter().map(|c| (*c).into()).collect(),
         unique: true,
         filter: None,
         method: IndexMethod::Btree,
@@ -3509,7 +3501,7 @@ fn rows_swapping_the_values_of_a_rebuilt_unique_index_draw_no_cycle() {
             key_column: "id".into(),
             key: RowKey::from(key.to_string().as_str()),
             columns: [(
-                "code".to_owned(),
+                "code".into(),
                 (
                     pbps_model::Cell::Value(Value::Int(from)),
                     pbps_model::Cell::Value(Value::Int(to)),
@@ -3632,7 +3624,7 @@ fn a_child_row_taking_a_literal_default_for_its_reference_waits_for_the_parent()
         identity_key: false,
         key: RowKey::from("1"),
         row: Row::default(),
-        defaults: [("pid".to_owned(), "1".to_owned())].into_iter().collect(),
+        defaults: [("pid".into(), "1".to_owned())].into_iter().collect(),
         types: Default::default(),
     });
     let mut plan = parent_and_child(
@@ -3720,7 +3712,7 @@ fn rows_swapping_the_values_of_a_key_over_a_retyped_column_draw_no_cycle() {
             key_column: "id".into(),
             key: RowKey::from(key.to_string().as_str()),
             columns: [(
-                "code".to_owned(),
+                "code".into(),
                 (
                     pbps_model::Cell::Value(Value::Int(from)),
                     pbps_model::Cell::Value(Value::Int(to)),
@@ -3794,7 +3786,7 @@ fn a_child_row_waits_for_a_parent_update_to_a_literal_default() {
         key_column: "id".into(),
         key: RowKey::from("1"),
         columns: [(
-            "code".to_owned(),
+            "code".into(),
             (
                 pbps_model::Cell::Value(Value::Int(9)),
                 pbps_model::Cell::Default("5".into()),
@@ -3843,7 +3835,7 @@ fn a_parent_row_deleted_holding_a_default_goes_after_its_child() {
         key_column: "id".into(),
         key: RowKey::from("1"),
         cause: pbps_model::change::DeleteCause::Undeclared,
-        row: [("code".to_owned(), pbps_model::Cell::Default("5".into()))]
+        row: [("code".into(), pbps_model::Cell::Default("5".into()))]
             .into_iter()
             .collect(),
         dropped: Default::default(),
@@ -3878,7 +3870,7 @@ fn a_child_row_taking_a_computed_default_for_its_reference_waits_for_the_parent(
         identity_key: false,
         key: RowKey::from("1"),
         row: Row::default(),
-        defaults: [("pid".to_owned(), "app.next_parent()".to_owned())]
+        defaults: [("pid".into(), "app.next_parent()".to_owned())]
             .into_iter()
             .collect(),
         types: Default::default(),
@@ -4014,7 +4006,7 @@ fn a_child_update_releasing_its_reference_goes_before_the_parent_row_is_deleted(
         key_column: "id".into(),
         key: RowKey::from("1"),
         columns: [(
-            "pid".to_owned(),
+            "pid".into(),
             (
                 pbps_model::Cell::Value(Value::Int(1)),
                 pbps_model::Cell::Value(Value::Null),
@@ -4105,7 +4097,7 @@ fn the_rows_of_tables_in_a_cycle_of_foreign_keys_keep_their_relative_order() {
         key_column: "id".into(),
         key: RowKey::from("1"),
         columns: [(
-            "pid".to_owned(),
+            "pid".into(),
             (
                 pbps_model::Cell::Value(Value::Null),
                 pbps_model::Cell::Value(Value::Int(1)),
@@ -4271,7 +4263,7 @@ fn a_row_delete_waits_for_the_rename_of_its_key_column() {
                 key_column: "k".into(),
                 key: RowKey::from("1"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
-                row: [("n".to_owned(), pbps_model::Cell::Value(Value::Int(5)))]
+                row: [("n".into(), pbps_model::Cell::Value(Value::Int(5)))]
                     .into_iter()
                     .collect(),
                 dropped: Default::default(),
@@ -4315,7 +4307,7 @@ fn a_partitions_default_follows_its_parents_default_through_a_column_rename() {
         parent: t("par"),
         bound: PartitionBound::Default,
         columns: [(
-            "b".to_owned(),
+            "b".into(),
             PartitionColumn {
                 default: Some("5".into()),
                 not_null: false,

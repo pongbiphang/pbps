@@ -81,7 +81,7 @@ impl<'a> Slot<'a> {
             .chain(table.foreign_keys.keys().map(|n| Self::ForeignKey(n)))
             .chain(table.checks.keys().map(|n| Self::Check(n)))
             .chain(table.indexes.keys().map(|n| Self::Index(n)))
-            .chain(table.computed.keys().map(|n| Self::Computed(n)))
+            .chain(table.computed.keys().map(|n| Self::Computed(n.raw())))
             .collect()
     }
 }
@@ -209,7 +209,7 @@ impl<'a> PartChanges<'a> {
                                 table.indexes.insert(name, value.clone());
                             }
                             PartDefinition::Computed(value) => {
-                                table.computed.insert(name, value.clone());
+                                table.computed.insert(name.into(), value.clone());
                             }
                         }
                     }
@@ -320,7 +320,7 @@ impl<'a> PartChanges<'a> {
                     format!(
                         "{name} {} `{}` is not as the plan left it",
                         slot.kind(),
-                        slot.name(),
+                        pbps_model::escape::Escaped(slot.name()),
                         name = name.shown()
                     )
                 });
@@ -365,7 +365,11 @@ impl<'a> PartChanges<'a> {
                 let what = if *slot == Slot::PrimaryKey {
                     slot.kind().to_owned()
                 } else {
-                    format!("{} `{}`", slot.kind(), slot.name())
+                    format!(
+                        "{} `{}`",
+                        slot.kind(),
+                        pbps_model::escape::Escaped(slot.name())
+                    )
                 };
                 moved.push(format!("{name} {what} is not the one this plan leaves: its index storage parameters set, and nothing else changed", name = name.shown()));
             }
@@ -413,17 +417,18 @@ impl<'a> PartChanges<'a> {
                             part_as_planned(definition, table, part_name)
                         }) == Some(false)
                         {
-                            moved.push(format!("{name} {kind} `{part_name}` is there, and is not the one this plan adds", name = name.shown()));
+                            moved.push(format!("{name} {kind} `{part_name}` is there, and is not the one this plan adds", name = name.shown(), part_name = pbps_model::escape::Escaped(part_name)));
                         } else if slot.read(table).is_none() {
                             moved.push(format!(
                                 "{name} {kind} `{part_name}` is not there, and this plan writes it",
-                                name = name.shown()
+                                name = name.shown(),
+                                part_name = pbps_model::escape::Escaped(part_name),
                             ));
                         }
                     }
                     PartAfter::Gone(_) => {
                         if slot.read(table).is_some() {
-                            moved.push(format!("{name} {kind} `{part_name}` is still there, and this plan removes it", name = name.shown()));
+                            moved.push(format!("{name} {kind} `{part_name}` is still there, and this plan removes it", name = name.shown(), part_name = pbps_model::escape::Escaped(part_name)));
                         }
                     }
                 }

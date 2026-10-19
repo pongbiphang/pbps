@@ -116,12 +116,12 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                 Naming::Column => table
                     .columns
                     .keys()
-                    .map(|c| ("column", c.clone()))
+                    .map(|c| ("column", c.raw().to_owned()))
                     .chain(
                         table
                             .computed
                             .keys()
-                            .map(|c| ("computed column", c.clone())),
+                            .map(|c| ("computed column", c.raw().to_owned())),
                     )
                     .collect(),
                 Naming::Index => table.indexes.keys().map(|i| ("index", i.clone())).collect(),
@@ -196,7 +196,13 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                 {
                     out.extend(live.finding(
                         Some(&subject),
-                        format!("{name}.{column}: `{}` {advice}", spec.ty, name = name.raw()),
+                        format!(
+                            "{name}.{column}: `{}` {advice}",
+                            spec.ty,
+                            name = name.raw(),
+                            // raw: whole-message escaped until #2084 step 5.
+                            column = column.raw(),
+                        ),
                     ));
                 }
             }
@@ -266,13 +272,13 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
             if let Change::AddColumn { name, .. } | Change::AddComputedColumn { name, .. } =
                 &p.change
             {
-                added.insert((table, name));
+                added.insert((table, name.raw()));
             }
             if let Change::DropColumn { column, .. } = &p.change {
-                dropped.insert((table, &column.name));
+                dropped.insert((table, column.name.raw()));
             }
             if let Change::DropComputedColumn { name, .. } = &p.change {
-                dropped.insert((table, name));
+                dropped.insert((table, name.raw()));
             }
         }
         for (i, p) in cs.changes.iter().enumerate() {
@@ -328,14 +334,14 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 // leave out.
                 Change::AddComputedColumn { name, .. } => {
                     if let Some(id) = id
-                        && !dropped.contains(&(id, name.as_str()))
+                        && !dropped.contains(&(id, name.raw()))
                     {
                         adds.entry(id).or_insert(i);
                     }
                     None
                 }
                 Change::DropComputedColumn { table, name, .. } => id
-                    .is_none_or(|id| !added.contains(&(id, name.as_str())))
+                    .is_none_or(|id| !added.contains(&(id, name.raw())))
                     .then_some(table),
                 Change::AlterColumnType { .. }
                 | Change::CreateTable { .. }
@@ -674,11 +680,11 @@ mod tests {
         let mut s = Schema::default();
         let mut t = Table::default();
         t.columns.insert(
-            "CustomerId".to_owned(),
+            "CustomerId".into(),
             Column::new("int".parse::<ColumnType>().unwrap()),
         );
         t.columns.insert(
-            "notes".to_owned(),
+            "notes".into(),
             Column::new("text".parse::<ColumnType>().unwrap()),
         );
         t.indexes.insert(
@@ -768,7 +774,7 @@ mod tests {
         let t = s.tables.get_mut(&"dbo.customer".parse().unwrap()).unwrap();
         for name in ["GrossTotal", "net_total"] {
             t.computed.insert(
-                name.to_owned(),
+                name.into(),
                 pbps_model::ComputedColumn {
                     expression: "[a] + 1".into(),
                     persisted: false,

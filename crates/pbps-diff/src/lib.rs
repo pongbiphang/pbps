@@ -65,7 +65,7 @@ mod tests {
             let mut columns = IndexMap::new();
             for c in *cols {
                 columns.insert(
-                    (*c).to_string(),
+                    (*c).into(),
                     Column::new("int".parse::<ColumnType>().unwrap()),
                 );
             }
@@ -389,7 +389,7 @@ mod tests {
         let r = resolve(&s, &ids, &[], &ctx()).unwrap();
 
         assert_eq!(r.added_columns.len(), 1);
-        assert_eq!(r.added_columns[0].1.name, "mobile");
+        assert_eq!(r.added_columns[0].1.name, "mobile".into());
     }
 
     /// Deletion is unambiguous as an operation, but the tombstone has to answer
@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(errs.len(), 1);
         assert!(matches!(
             &errs[0],
-            Blocker::DropColumnNeedsReason { column } if column.name == "legacy"
+            Blocker::DropColumnNeedsReason { column } if column.name == "legacy".into()
         ));
     }
 
@@ -461,8 +461,11 @@ mod tests {
                 appeared,
             } => {
                 assert_eq!(table, &t("dbo.customer"));
-                assert_eq!(disappeared, &["customer_name"]);
-                assert_eq!(appeared, &["full_name"]);
+                assert_eq!(
+                    disappeared,
+                    &[pbps_model::ColumnName::from("customer_name")]
+                );
+                assert_eq!(appeared, &[pbps_model::ColumnName::from("full_name")]);
             }
             other => panic!("expected a column ambiguity, got {other:?}"),
         }
@@ -490,8 +493,8 @@ mod tests {
             uid, &before_uid,
             "a rename must preserve the original identity"
         );
-        assert_eq!(from.name, "customer_name");
-        assert_eq!(to.name, "full_name");
+        assert_eq!(from.name, "customer_name".into());
+        assert_eq!(to.name, "full_name".into());
         assert!(
             r.added_columns.is_empty(),
             "a rename must not also count as an addition"
@@ -520,7 +523,7 @@ mod tests {
 
         assert_eq!(r.renamed_columns.len(), 1);
         assert_eq!(r.added_columns.len(), 1);
-        assert_eq!(r.added_columns[0].1.name, "mobile");
+        assert_eq!(r.added_columns[0].1.name, "mobile".into());
     }
 
     // ---- table level ----
@@ -1419,7 +1422,7 @@ mod tests {
         let r = resolve(&s, &ids, &[intent.clone(), intent], &ctx()).unwrap();
 
         assert_eq!(r.renamed_columns.len(), 1);
-        assert_eq!(r.renamed_columns[0].2.name, "new");
+        assert_eq!(r.renamed_columns[0].2.name, "new".into());
     }
 
     /// Two renames in one table that contend for nothing are still two
@@ -1586,7 +1589,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(r.renamed_columns.len(), 1);
-        assert_eq!(r.renamed_columns[0].2.name, "aaa");
+        assert_eq!(r.renamed_columns[0].2.name, "aaa".into());
     }
 
     /// And for a role.

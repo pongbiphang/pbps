@@ -132,7 +132,7 @@ struct Step {
     names: Vec<(Nameable, String, String)>,
     /// The columns whose generated expressions this step compiles: a
     /// table's, in its `CREATE TABLE`.
-    generated: Vec<String>,
+    generated: Vec<pbps_model::ColumnName>,
     /// The module this step compiles, if it is one.
     module: Option<ModuleId>,
     /// The routine the engine created for this step, as the capture names
@@ -224,7 +224,7 @@ impl Reconstruction {
                         }
                     }
                     let declaration = format!("table {name}", name = name.shown());
-                    let generated_columns: Vec<String> = bare
+                    let generated_columns: Vec<pbps_model::ColumnName> = bare
                         .columns
                         .iter()
                         .filter(|(_, spec)| matches!(spec.value_source, ValueSource::Generated(_)))
@@ -266,7 +266,11 @@ impl Reconstruction {
                         steps.push(step(
                             dialect,
                             Phase::Expressions,
-                            &format!("the default of {name}.{column}", name = name.shown()),
+                            &format!(
+                                "the default of {name}.{column}",
+                                name = name.shown(),
+                                column = column.shown(),
+                            ),
                             &Change::AlterColumnDefault {
                                 uid: uid.clone(),
                                 column: pbps_model::ColumnRef::new(name.clone(), column),
@@ -512,7 +516,10 @@ impl Reconstruction {
     ) -> Option<std::collections::BTreeSet<(Nameable, &str, &str)>> {
         let at = self.steps.iter().position(|step| {
             step.module.is_none()
-                && step.generated.iter().any(|generated| generated == column)
+                && step
+                    .generated
+                    .iter()
+                    .any(|generated| generated.raw() == column)
                 && step
                     .names
                     .iter()

@@ -52,7 +52,7 @@ async fn an_undeclared_foreign_key_parent_in_a_managed_schema_is_asked_about() {
 
     let target: pbps_model::ObjectName = "app.parent".parse().unwrap();
     let referenced: pbps_mssql::doctor::ReferencedColumns =
-        [(target.clone(), ["code".to_owned()].into_iter().collect())]
+        [(target.clone(), ["code".into()].into_iter().collect())]
             .into_iter()
             .collect();
     let mut lp = connect_live(&as_login).await.expect("connect as the login");

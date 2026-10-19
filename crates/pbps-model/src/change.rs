@@ -14,6 +14,7 @@
 //! the model layer does not have. So risks are computed by the differ, which does
 //! hold a `Dialect`, and attached to [`PlannedChange`] as data.
 
+use crate::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -269,7 +270,7 @@ pub enum Change {
         /// a plan made before it, which then attaches by the single
         /// statement.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        key: Vec<String>,
+        key: Vec<ColumnName>,
         /// The partition as declared: what the apply holds the read-back to
         /// once every statement has run, as it holds a created table to its
         /// `CREATE`.
@@ -287,13 +288,13 @@ pub enum Change {
         /// is refused (#975). The emitter renames each generated default with
         /// its table. Empty on a plan written before this field existed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        defaults: Vec<String>,
+        defaults: Vec<ColumnName>,
     },
 
     AddColumn {
         uid: Uid,
         table: TableName,
-        name: String,
+        name: ColumnName,
         column: Box<Column>,
     },
     DropColumn {
@@ -303,8 +304,8 @@ pub enum Change {
     RenameColumn {
         uid: Uid,
         table: TableName,
-        from: String,
-        to: String,
+        from: ColumnName,
+        to: ColumnName,
         /// The table's name before this plan renamed it, when it did. The
         /// table rename leaves a generated default under the name built from
         /// this one when the name it would move to is taken, so the column
@@ -414,14 +415,14 @@ pub enum Change {
     /// (`ALTER COLUMN … AS` is a syntax error, measured on 17.0).
     AddComputedColumn {
         table: TableName,
-        name: String,
+        name: ColumnName,
         computed: ComputedColumn,
     },
     /// A SQL Server computed column dropped, carrying what it was. Its values
     /// are derived, so dropping one loses nothing a re-add cannot compute.
     DropComputedColumn {
         table: TableName,
-        name: String,
+        name: ColumnName,
         computed: ComputedColumn,
     },
     /// Deprecation flag changed. Produces no structural change; may optionally be
@@ -482,7 +483,7 @@ pub enum Change {
         uid: Uid,
         table: TableName,
         parent: TableName,
-        column: String,
+        column: ColumnName,
         from: Option<String>,
         to: Option<String>,
         fallback: Option<String>,
@@ -493,7 +494,7 @@ pub enum Change {
     SetPartitionNotNull {
         uid: Uid,
         table: TableName,
-        column: String,
+        column: ColumnName,
         not_null: bool,
     },
 
@@ -586,7 +587,7 @@ pub enum Change {
         /// Carried rather than looked up: the emitter has the change and
         /// nothing else, and a saved plan is applied on a host that may have no
         /// checkout at all — the same reason the plan carries its own ids.
-        key_column: String,
+        key_column: ColumnName,
         /// Whether the key column is an `IDENTITY` column, which the engine
         /// assigns unless told otherwise. Carried for the same reason the
         /// column name is: the emitter sees the change and nothing else, and
@@ -604,7 +605,7 @@ pub enum Change {
         /// has the plan and nothing else. Absent from older plans, which is
         /// an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        defaults: BTreeMap<String, String>,
+        defaults: BTreeMap<ColumnName, String>,
         /// The type of every non-key column the table has, an `IDENTITY`
         /// column aside: the ones the row spells, the columns in `defaults`,
         /// and the ones the table gives no default, which the insert leaves
@@ -619,7 +620,7 @@ pub enum Change {
         /// plans, which is an empty map: a spelled cell is then compared as
         /// the engine compares, and the rest holds nothing.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        types: BTreeMap<String, ColumnType>,
+        types: BTreeMap<ColumnName, ColumnType>,
     },
     /// The columns that differ, never the whole row: an `UPDATE` restating a
     /// column that did not change would overwrite a value the declaration and
@@ -627,7 +628,7 @@ pub enum Change {
     /// that is not one.
     UpdateRow {
         table: TableName,
-        key_column: String,
+        key_column: ColumnName,
         key: RowKey,
         /// Column to (before, after). The before is carried so the plan can say
         /// what is being replaced — the reviewer at the gate has no connection
@@ -635,7 +636,7 @@ pub enum Change {
         ///
         /// [`Cell`], not [`Value`]: an omitted column means the declared
         /// default, and the emitter has to write `DEFAULT`, not `NULL`.
-        columns: BTreeMap<String, (Cell, Cell)>,
+        columns: BTreeMap<ColumnName, (Cell, Cell)>,
         /// The declared cells the row already holds — every non-key column
         /// outside `columns`, resolved by the omission rule. Never restated
         /// in the `UPDATE`'s `SET`, for the reason `columns` gives; but the
@@ -646,7 +647,7 @@ pub enum Change {
         /// own result (DECISIONS 136). Absent from older plans, which is an
         /// empty map and holds the row to its changed cells alone.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        unchanged: BTreeMap<String, Cell>,
+        unchanged: BTreeMap<ColumnName, Cell>,
         /// The type each column in `columns` or `unchanged` has in the state
         /// the plan was made against, for the columns that state has. The
         /// emitter compares each cell by the rendering that read it — which
@@ -664,7 +665,7 @@ pub enum Change {
         /// dropped the precondition for exactly the cell most likely to be
         /// contended (DECISIONS 149).
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        types: BTreeMap<String, ColumnType>,
+        types: BTreeMap<ColumnName, ColumnType>,
         /// The type each column has *once this plan has run*, where that is
         /// not the type in `types` — a column this plan adds, and a column
         /// whose type it changes. Both sort before the row changes
@@ -686,7 +687,7 @@ pub enum Change {
         /// whole column list twice per row. The emitter falls back to
         /// `types`. Absent from older plans, which is an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        after_types: BTreeMap<String, ColumnType>,
+        after_types: BTreeMap<ColumnName, ColumnType>,
         /// The key column's type when the statement runs, so the emitter
         /// can find the row by the engine's own `=` for that type without
         /// asking the session's path for it: a built-in type is compared by
@@ -698,7 +699,7 @@ pub enum Change {
     },
     DeleteRow {
         table: TableName,
-        key_column: String,
+        key_column: ColumnName,
         key: RowKey,
         /// Why this row is going: `exact` means the table declared itself
         /// complete and this row is not in it. Recorded because the two reasons
@@ -717,20 +718,20 @@ pub enum Change {
         /// lose, since what it removes cannot be compared afterwards
         /// (DECISIONS 143). Absent from older plans, which is an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        row: BTreeMap<String, Cell>,
+        row: BTreeMap<ColumnName, Cell>,
         /// Baseline cells of columns this plan drops, keyed by their baseline
         /// names for review only. These names can also belong to surviving
         /// renamed columns in `row`, so the maps must remain separate. No
         /// emitter may build a predicate from this map (DECISIONS 442).
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        dropped: BTreeMap<String, Cell>,
+        dropped: BTreeMap<ColumnName, Cell>,
         /// The type each recorded cell was read by, so the predicate compares
         /// it the way the read-back rendered it (122). A cell is carried but
         /// not held only where this plan retypes its column and the old type
         /// has no way back from its own rendering, exactly as in an update
         /// (143, amended by 471); the type itself excludes nothing.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        types: BTreeMap<String, ColumnType>,
+        types: BTreeMap<ColumnName, ColumnType>,
         /// The type each of those columns has *when the `DELETE` runs*, where
         /// that is not the type in `types`: a column this plan retypes, whose
         /// `AlterColumnType` sorts before every row change. The recorded text
@@ -741,7 +742,7 @@ pub enum Change {
         /// (DECISIONS 149). Only the entries that differ; the emitter falls
         /// back to `types`. Absent from older plans, which is an empty map.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        after_types: BTreeMap<String, ColumnType>,
+        after_types: BTreeMap<ColumnName, ColumnType>,
         /// The key column's type when the statement runs, so the emitter
         /// can find the row by the engine's own `=` for that type without
         /// asking the session's path for it: a built-in type is compared by
@@ -925,7 +926,7 @@ pub enum RoutineOrigin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowAfter<'a> {
     /// The row is there, and holds at least these cells.
-    Holding(BTreeMap<&'a str, CellAfter<'a>>),
+    Holding(BTreeMap<&'a ColumnName, CellAfter<'a>>),
     /// The row is gone.
     Gone,
 }
@@ -1496,13 +1497,9 @@ impl Change {
                 RowAfter::Holding(
                     row.0
                         .iter()
-                        .map(|(column, v)| (column.as_str(), CellAfter::Spelled(v)))
+                        .map(|(column, v)| (column, CellAfter::Spelled(v)))
                         // And the columns the insert leaves to their default.
-                        .chain(
-                            defaults
-                                .keys()
-                                .map(|column| (column.as_str(), CellAfter::AtDefault)),
-                        )
+                        .chain(defaults.keys().map(|column| (column, CellAfter::AtDefault)))
                         .collect(),
                 ),
             )),
@@ -1520,7 +1517,7 @@ impl Change {
                         .iter()
                         .map(|(column, (_, to))| (column, to))
                         .chain(unchanged)
-                        .map(|(column, cell)| (column.as_str(), CellAfter::from(cell)))
+                        .map(|(column, cell)| (column, CellAfter::from(cell)))
                         .collect(),
                 ),
             )),
@@ -2286,11 +2283,11 @@ impl Change {
                 computed,
             } => it(
                 table,
-                Some(name),
+                Some(name.raw()),
                 standing(PartDefinition::Computed(computed)),
             ),
             Change::DropComputedColumn { table, name, .. } => {
-                it(table, Some(name), PartAfter::Gone(Part::Computed))
+                it(table, Some(name.raw()), PartAfter::Gone(Part::Computed))
             }
             Change::CreateTable { .. }
             | Change::DetachPartition { .. }

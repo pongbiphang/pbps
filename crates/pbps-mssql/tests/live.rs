@@ -849,16 +849,14 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
             let types = if legacy {
                 Default::default()
             } else {
-                [("k".to_owned(), kind.parse().unwrap())]
-                    .into_iter()
-                    .collect()
+                [("k".into(), kind.parse().unwrap())].into_iter().collect()
             };
             let update = Change::UpdateRow {
                 table: child.clone(),
                 key_column: "id".into(),
                 key: RowKey::from("1"),
                 columns: [(
-                    "k".to_owned(),
+                    "k".into(),
                     (
                         Cell::Value(Value::Text(old.into())),
                         Cell::Default(default.into()),
@@ -896,9 +894,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
             let types = if legacy {
                 Default::default()
             } else {
-                [("k".to_owned(), kind.parse().unwrap())]
-                    .into_iter()
-                    .collect()
+                [("k".into(), kind.parse().unwrap())].into_iter().collect()
             };
             let insert = Change::InsertRow {
                 table: child.clone(),
@@ -906,7 +902,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                 key: RowKey::from("1"),
                 identity_key: false,
                 row: Default::default(),
-                defaults: [("k".to_owned(), default.to_owned())].into_iter().collect(),
+                defaults: [("k".into(), default.to_owned())].into_iter().collect(),
                 types,
             };
             for (deleted, count) in [(old, 0), (next, 1)] {
@@ -1380,7 +1376,7 @@ async fn dotted_names_survive_introspection_in_keys_indexes_and_foreign_keys() {
         });
         assert_eq!(
             parent.primary_key.as_ref().map(|pk| pk.columns.clone()),
-            Some(vec![column.to_owned()]),
+            Some(vec![pbps_model::ColumnName::from(column)]),
             "{tag}: primary-key members"
         );
         let ix = &parent.indexes["ix_parent"];
@@ -1389,16 +1385,24 @@ async fn dotted_names_survive_introspection_in_keys_indexes_and_foreign_keys() {
             [column],
             "{tag}: index key members"
         );
-        assert_eq!(ix.include, ["other"], "{tag}: included columns");
+        assert_eq!(
+            ix.include,
+            [pbps_model::ColumnName::from("other")],
+            "{tag}: included columns"
+        );
         assert_eq!(
             parent.indexes["ix_include"].include,
-            [column],
+            [pbps_model::ColumnName::from(column)],
             "{tag}: an included dotted column"
         );
 
         let child = &pulled.schema.tables[&TableName::new("dbo", "child")];
         let fk = &child.foreign_keys["fk_parent"];
-        assert_eq!(fk.columns, [column], "{tag}: referencing columns");
+        assert_eq!(
+            fk.columns,
+            [pbps_model::ColumnName::from(column)],
+            "{tag}: referencing columns"
+        );
         // Compared part by part, not as a joined string: `schema.dot`.`parent`
         // and `schema`.`dot.parent` join to the same text.
         assert_eq!(
@@ -1406,7 +1410,11 @@ async fn dotted_names_survive_introspection_in_keys_indexes_and_foreign_keys() {
             "{tag}: referenced schema"
         );
         assert_eq!(fk.references_table.name, table, "{tag}: referenced table");
-        assert_eq!(fk.references_columns, [column], "{tag}: referenced columns");
+        assert_eq!(
+            fk.references_columns,
+            [pbps_model::ColumnName::from(column)],
+            "{tag}: referenced columns"
+        );
     }
 }
 
@@ -1703,8 +1711,17 @@ async fn an_object_over_a_left_out_column_is_left_out_with_it() {
         assert!(errors.is_empty(), "{name}: {errors:?}");
     }
     let t = table("t");
-    assert_eq!(t.columns.keys().collect::<Vec<_>>(), ["id", "a"]);
-    assert_eq!(t.primary_key.as_ref().unwrap().columns, ["id"]);
+    assert_eq!(
+        t.columns.keys().cloned().collect::<Vec<_>>(),
+        [
+            pbps_model::ColumnName::from("id"),
+            pbps_model::ColumnName::from("a")
+        ]
+    );
+    assert_eq!(
+        t.primary_key.as_ref().unwrap().columns,
+        [pbps_model::ColumnName::from("id")]
+    );
     assert!(t.unique.is_empty(), "{:?}", t.unique);
     assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_a"]);
     assert_eq!(t.checks.keys().collect::<Vec<_>>(), ["ck_a"]);
@@ -1804,8 +1821,17 @@ async fn a_computed_column_or_filter_reading_a_left_out_column_goes_with_it() {
     let t = &pulled.schema.tables[&name];
     let errors = pbps_mssql::validate::table(&name, t);
     assert!(errors.is_empty(), "{errors:?}");
-    assert_eq!(t.columns.keys().collect::<Vec<_>>(), ["id", "a"]);
-    assert_eq!(t.computed.keys().collect::<Vec<_>>(), ["e"]);
+    assert_eq!(
+        t.columns.keys().cloned().collect::<Vec<_>>(),
+        [
+            pbps_model::ColumnName::from("id"),
+            pbps_model::ColumnName::from("a")
+        ]
+    );
+    assert_eq!(
+        t.computed.keys().cloned().collect::<Vec<_>>(),
+        [pbps_model::ColumnName::from("e")]
+    );
     assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_g"]);
     for detail in [
         "t.c: the computed column reads column `m`, which was left out",
@@ -3083,7 +3109,7 @@ async fn a_new_column_s_planned_values_are_keyed_under_its_collation() {
             },
         );
         let row = |v: &str| {
-            [("label".to_owned(), Value::Text(v.into()))]
+            [("label".into(), Value::Text(v.into()))]
                 .into_iter()
                 .collect::<Row>()
         };
@@ -3134,21 +3160,21 @@ async fn a_literal_is_converted_under_the_utf8_column_it_is_compared_with() {
     let declare = |label: &str, note: &str| {
         let mut t = Table::default();
         t.columns
-            .insert("code".to_owned(), Column::new(ty("varchar(20)")).not_null());
+            .insert("code".into(), Column::new(ty("varchar(20)")).not_null());
         let mut label_column = Column::new(ty(label));
         if label.starts_with("varchar") {
             label_column.collation = Some(pbps_model::Collation::new(UTF8));
         }
-        t.columns.insert("label".to_owned(), label_column);
+        t.columns.insert("label".into(), label_column);
         t.columns
-            .insert("note".to_owned(), Column::new(ty("nvarchar(50)")));
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
         let mut tag = Column::new(ty("varchar(10)"));
         tag.collation = Some(pbps_model::Collation::new(UTF8));
         tag.value_source = pbps_model::ValueSource::Default("(N'中')".into());
-        t.columns.insert("tag".to_owned(), tag);
+        t.columns.insert("tag".into(), tag);
         t.primary_key = Some(PrimaryKey {
             name: None,
-            columns: vec!["code".to_owned()],
+            columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });
         // `tag` left to its default.
@@ -3157,8 +3183,8 @@ async fn a_literal_is_converted_under_the_utf8_column_it_is_compared_with() {
             rows: [(
                 RowKey::from("k"),
                 [
-                    ("label".to_owned(), Value::Text("中".into())),
-                    ("note".to_owned(), Value::Text(note.into())),
+                    ("label".into(), Value::Text("中".into())),
+                    ("note".into(), Value::Text(note.into())),
                 ]
                 .into_iter()
                 .collect::<Row>(),
@@ -3233,10 +3259,10 @@ async fn a_key_between_created_tables_is_probed_under_their_declared_collation()
             c
         };
         let mut parent = Table::default();
-        parent.columns.insert("code".to_owned(), column());
+        parent.columns.insert("code".into(), column());
         parent.primary_key = Some(PrimaryKey {
             name: None,
-            columns: vec!["code".to_owned()],
+            columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });
         parent.data = Some(TableData {
@@ -3246,11 +3272,11 @@ async fn a_key_between_created_tables_is_probed_under_their_declared_collation()
         let mut child = Table::default();
         child
             .columns
-            .insert("id".to_owned(), Column::new(ty("int")).not_null());
-        child.columns.insert("code".to_owned(), column());
+            .insert("id".into(), Column::new(ty("int")).not_null());
+        child.columns.insert("code".into(), column());
         child.primary_key = Some(PrimaryKey {
             name: None,
-            columns: vec!["id".to_owned()],
+            columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
         child.foreign_keys.insert(
@@ -3267,7 +3293,7 @@ async fn a_key_between_created_tables_is_probed_under_their_declared_collation()
             mode: DataMode::Exact,
             rows: [(
                 RowKey::from("1"),
-                [("code".to_owned(), Value::Text("a".into()))]
+                [("code".into(), Value::Text("a".into()))]
                     .into_iter()
                     .collect::<Row>(),
             )]
@@ -3327,7 +3353,7 @@ async fn a_retype_that_keeps_its_collation_is_probed_under_it() {
             .map(|(k, n)| {
                 (
                     RowKey::from(k),
-                    [("n".to_owned(), Value::Text(n.into()))]
+                    [("n".into(), Value::Text(n.into()))]
                         .into_iter()
                         .collect::<Row>(),
                 )
@@ -3388,10 +3414,10 @@ async fn an_added_column_s_default_is_assigned_under_its_collation() {
         let mut parent = Table::default();
         let mut code = Column::new(ty("varchar(10)")).not_null();
         code.collation = Some(pbps_model::Collation::new(UTF8));
-        parent.columns.insert("code".to_owned(), code);
+        parent.columns.insert("code".into(), code);
         parent.primary_key = Some(PrimaryKey {
             name: None,
-            columns: vec!["code".to_owned()],
+            columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });
         parent.data = Some(TableData {
@@ -3408,7 +3434,7 @@ async fn an_added_column_s_default_is_assigned_under_its_collation() {
         let mut reference = Column::new(ty("varchar(10)")).not_null();
         reference.collation = Some(pbps_model::Collation::new(UTF8));
         reference.value_source = pbps_model::ValueSource::Default("(N'中')".into());
-        child.columns.insert("code".to_owned(), reference);
+        child.columns.insert("code".into(), reference);
         child.foreign_keys.insert(
             "fk_c_p".into(),
             ForeignKey {
@@ -3451,22 +3477,22 @@ async fn a_value_is_spelled_under_its_columns_collation() {
     let mut db = TestDb::create_collated("coll_spell", "SQL_Latin1_General_CP1_CI_AS").await;
     let mut t = Table::default();
     t.columns
-        .insert("code".to_owned(), Column::new(ty("varchar(10)")).not_null());
+        .insert("code".into(), Column::new(ty("varchar(10)")).not_null());
     let mut label = Column::new(ty("varchar(10)"));
     label.collation = Some(pbps_model::Collation::new(
         "Latin1_General_100_CI_AS_SC_UTF8",
     ));
-    t.columns.insert("label".to_owned(), label);
+    t.columns.insert("label".into(), label);
     t.primary_key = Some(PrimaryKey {
         name: None,
-        columns: vec!["code".to_owned()],
+        columns: vec!["code".into()],
         storage_parameters: Default::default(),
     });
     t.data = Some(TableData {
         mode: DataMode::Exact,
         rows: [(
             RowKey::from("k"),
-            [("label".to_owned(), Value::Text("中".into()))]
+            [("label".into(), Value::Text("中".into()))]
                 .into_iter()
                 .collect::<Row>(),
         )]
@@ -3506,15 +3532,15 @@ async fn a_date_read_differently_by_another_language_or_order_is_ambiguous() {
     let mut db = TestDb::create("temporal_lang").await;
     let mut t = Table::default();
     t.columns
-        .insert("code".to_owned(), Column::new(ty("varchar(10)")).not_null());
-    t.columns.insert("d".to_owned(), Column::new(ty("date")));
+        .insert("code".into(), Column::new(ty("varchar(10)")).not_null());
+    t.columns.insert("d".into(), Column::new(ty("date")));
     t.primary_key = Some(PrimaryKey {
         name: None,
-        columns: vec!["code".to_owned()],
+        columns: vec!["code".into()],
         storage_parameters: Default::default(),
     });
     let row = |d: &str| {
-        [("d".to_owned(), Value::Text(d.into()))]
+        [("d".into(), Value::Text(d.into()))]
             .into_iter()
             .collect::<Row>()
     };
@@ -3626,13 +3652,11 @@ async fn a_key_of_a_type_with_no_collation_is_grouped_without_one() {
 
     let decimal_keyed = |keys: &[&str]| {
         let mut t = Table::default();
-        t.columns.insert(
-            "code".to_owned(),
-            Column::new(ty("decimal(5,2)")).not_null(),
-        );
+        t.columns
+            .insert("code".into(), Column::new(ty("decimal(5,2)")).not_null());
         t.primary_key = Some(PrimaryKey {
             name: None,
-            columns: vec!["code".to_owned()],
+            columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });
         t.data = Some(TableData {
@@ -4810,7 +4834,7 @@ async fn two_columns_whose_names_join_to_one_string_both_get_their_defaults() {
         let mut t = Table::default();
         let mut c = Column::new(ty("int")).not_null();
         c.value_source = pbps_model::ValueSource::Default("0".into());
-        t.columns.insert(column.to_owned(), c);
+        t.columns.insert(column.into(), c);
         t
     };
     let cs = pbps_model::ChangeSet {
@@ -4870,7 +4894,7 @@ async fn a_renamed_tables_and_columns_generated_defaults_follow_them() {
         for column in columns {
             let mut c = Column::new(ty("int")).not_null();
             c.value_source = pbps_model::ValueSource::Default("0".into());
-            t.columns.insert((*column).to_owned(), c);
+            t.columns.insert((*column).into(), c);
         }
         t
     };
@@ -5071,7 +5095,7 @@ async fn a_default_whose_new_name_is_taken_frees_its_old_one() {
         let mut t = Table::default();
         let mut c = Column::new(ty("int")).not_null();
         c.value_source = pbps_model::ValueSource::Default("0".into());
-        t.columns.insert("c".to_owned(), c.clone());
+        t.columns.insert("c".into(), c.clone());
         apply(
             &mut db.conn,
             &ChangeSet {
@@ -8113,7 +8137,7 @@ fn declared_table(mode: pbps_model::DataMode, columns: &[&str]) -> pbps_mssql::d
     let mut t = pbps_model::schema::Table {
         primary_key: Some(pbps_model::schema::PrimaryKey {
             name: None,
-            columns: vec!["code".to_owned()],
+            columns: vec!["code".into()],
             storage_parameters: Default::default(),
         }),
         data: Some(pbps_model::TableData {
@@ -8128,10 +8152,10 @@ fn declared_table(mode: pbps_model::DataMode, columns: &[&str]) -> pbps_mssql::d
         ..Default::default()
     };
     t.columns
-        .insert("code".to_owned(), pbps_model::Column::new(ty.clone()));
+        .insert("code".into(), pbps_model::Column::new(ty.clone()));
     for column in columns {
         t.columns
-            .insert((*column).to_owned(), pbps_model::Column::new(ty.clone()));
+            .insert((*column).into(), pbps_model::Column::new(ty.clone()));
     }
     pbps_mssql::doctor::DataDemand::of(&t).expect("a table with a declared row demands something")
 }
@@ -9184,7 +9208,7 @@ async fn a_managed_table_under_another_spelling_is_not_asked_about_twice() {
         let mut referenced = pbps_mssql::doctor::ReferencedColumns::new();
         referenced.insert(
             "app.T".parse().unwrap(),
-            ["code".to_owned()].into_iter().collect(),
+            ["code".into()].into_iter().collect(),
         );
         let data: pbps_mssql::doctor::DataTables = [("app.t".parse().unwrap(), seeded_table())]
             .into_iter()
@@ -9721,7 +9745,7 @@ async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
     let target: pbps_model::ObjectName = "shared.parent".parse().unwrap();
     let referenced: pbps_db::doctor::ReferencedColumns = [(
         target.clone(),
-        ["code".to_owned(), "alt".to_owned()].into_iter().collect(),
+        ["code".into(), "alt".into()].into_iter().collect(),
     )]
     .into_iter()
     .collect();
@@ -9790,7 +9814,10 @@ async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
         .unwrap();
     let invalid_answer = rows[0].try_get::<i32>("held").unwrap();
     let mut invalid = referenced.clone();
-    invalid.get_mut(&target).unwrap().insert(invalid_column);
+    invalid
+        .get_mut(&target)
+        .unwrap()
+        .insert(invalid_column.into());
     let invalid_gaps = named_gaps(&referenced_permissions(&mut lp, &invalid).await);
     let mut unknown = referenced.clone();
     unknown
@@ -9802,7 +9829,7 @@ async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
     let empty_gaps = named_gaps(&referenced_permissions(&mut lp, &empty).await);
     let absent = [(
         "shared.absent".parse().unwrap(),
-        ["code".to_owned()].into_iter().collect(),
+        ["code".into()].into_iter().collect(),
     )]
     .into_iter()
     .collect();
@@ -9887,9 +9914,7 @@ async fn every_explicitly_referenced_column_needs_its_grant() {
 
     let referenced = [(
         "shared.parent".parse().unwrap(),
-        ["code".to_owned(), "label".to_owned()]
-            .into_iter()
-            .collect(),
+        ["code".into(), "label".into()].into_iter().collect(),
     )]
     .into_iter()
     .collect();
@@ -10501,7 +10526,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
                     RowKey::from(*k),
                     cells
                         .iter()
-                        .map(|(c, v)| ((*c).to_owned(), v.clone()))
+                        .map(|(c, v)| ((*c).into(), v.clone()))
                         .collect::<Row>(),
                 )
             })
@@ -10513,13 +10538,13 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
     let mut status = Table::default();
     status
         .columns
-        .insert("code".to_owned(), Column::new(ty("varchar(20)")).not_null());
+        .insert("code".into(), Column::new(ty("varchar(20)")).not_null());
     let mut label = Column::new(ty("nvarchar(50)")).not_null();
     label.value_source = pbps_model::ValueSource::Default("'Unlabelled'".to_owned());
-    status.columns.insert("label".to_owned(), label);
+    status.columns.insert("label".into(), label);
     status.primary_key = Some(PrimaryKey {
         name: None,
-        columns: vec!["code".to_owned()],
+        columns: vec!["code".into()],
         storage_parameters: Default::default(),
     });
     status.data = Some(TableData {
@@ -10538,22 +10563,22 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
         increment: 1,
         options: Default::default(),
     });
-    kind.columns.insert("id".to_owned(), id);
+    kind.columns.insert("id".into(), id);
     kind.columns.insert(
-        "status_code".to_owned(),
+        "status_code".into(),
         Column::new(ty("varchar(20)")).not_null(),
     );
     kind.primary_key = Some(PrimaryKey {
         name: None,
-        columns: vec!["id".to_owned()],
+        columns: vec!["id".into()],
         storage_parameters: Default::default(),
     });
     kind.foreign_keys.insert(
         "fk_kind_status".to_owned(),
         pbps_model::ForeignKey {
-            columns: vec!["status_code".to_owned()],
+            columns: vec!["status_code".into()],
             references_table: TableName::new("dbo", "status"),
-            references_columns: vec!["code".to_owned()],
+            references_columns: vec!["code".into()],
             on_delete: Default::default(),
             on_update: Default::default(),
         },
@@ -10664,7 +10689,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
         changes: vec![pbps_model::PlannedChange::new(
             pbps_model::Change::DeleteRow {
                 table: TableName::new("dbo", "status"),
-                key_column: "code".to_owned(),
+                key_column: "code".into(),
                 key: RowKey::from("ghost"),
                 cause: pbps_model::change::DeleteCause::Undeclared,
                 dropped: Default::default(),
@@ -10736,7 +10761,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                     RowKey::from(*k),
                     cells
                         .iter()
-                        .map(|(c, v)| ((*c).to_owned(), v.clone()))
+                        .map(|(c, v)| ((*c).into(), v.clone()))
                         .collect::<Row>(),
                 )
             })
@@ -10750,21 +10775,19 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let mut status = Table::default();
     status
         .columns
-        .insert("code".to_owned(), Column::new(ty("varchar(20)")).not_null());
+        .insert("code".into(), Column::new(ty("varchar(20)")).not_null());
     let mut label = Column::new(ty("nvarchar(50)")).not_null();
     label.value_source = pbps_model::ValueSource::Default("'Unlabelled'".to_owned());
-    status.columns.insert("label".to_owned(), label);
+    status.columns.insert("label".into(), label);
+    status.columns.insert("rank".into(), Column::new(ty("int")));
     status
         .columns
-        .insert("rank".to_owned(), Column::new(ty("int")));
-    status
-        .columns
-        .insert("pct".to_owned(), Column::new(ty("decimal(5,2)")));
+        .insert("pct".into(), Column::new(ty("decimal(5,2)")));
     // Named, so the whole table compares equal below: the engine invents a
     // name for an unnamed key and the read-back reports it.
     status.primary_key = Some(PrimaryKey {
         name: Some("pk_status".to_owned()),
-        columns: vec!["code".to_owned()],
+        columns: vec!["code".into()],
         storage_parameters: Default::default(),
     });
     status.data = Some(TableData {
@@ -10791,22 +10814,22 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         increment: 1,
         options: Default::default(),
     });
-    kind.columns.insert("id".to_owned(), id);
+    kind.columns.insert("id".into(), id);
     kind.columns.insert(
-        "status_code".to_owned(),
+        "status_code".into(),
         Column::new(ty("varchar(20)")).not_null(),
     );
     kind.primary_key = Some(PrimaryKey {
         name: None,
-        columns: vec!["id".to_owned()],
+        columns: vec!["id".into()],
         storage_parameters: Default::default(),
     });
     kind.foreign_keys.insert(
         "fk_kind_status".to_owned(),
         ForeignKey {
-            columns: vec!["status_code".to_owned()],
+            columns: vec!["status_code".into()],
             references_table: TableName::new("dbo", "status"),
-            references_columns: vec!["code".to_owned()],
+            references_columns: vec!["code".into()],
             on_delete: Default::default(),
             on_update: Default::default(),
         },
@@ -10892,8 +10915,8 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     assert_eq!(
         status_rows[&RowKey::from("old")],
         [
-            ("label".to_owned(), text("Ancient")),
-            ("rank".to_owned(), Value::Int(9))
+            ("label".into(), text("Ancient")),
+            ("rank".into(), Value::Int(9))
         ]
         .into_iter()
         .collect::<Row>()
@@ -10956,7 +10979,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     };
     let delete = pbps_model::PlannedChange::new(pbps_model::Change::DeleteRow {
         table: TableName::new("dbo", "status"),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         key: RowKey::from("old"),
         cause: pbps_model::change::DeleteCause::Undeclared,
         dropped: Default::default(),
@@ -11046,10 +11069,10 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 types: Default::default(),
                 after_types: Default::default(),
                 table: TableName::new("dbo", "kind"),
-                key_column: "id".to_owned(),
+                key_column: "id".into(),
                 key: RowKey::from("7"),
                 columns: [(
-                    "status_code".to_owned(),
+                    "status_code".into(),
                     (
                         pbps_model::Cell::Value(text("old")),
                         pbps_model::Cell::Value(text("new")),
@@ -11084,10 +11107,10 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 types: Default::default(),
                 after_types: Default::default(),
                 table: TableName::new("dbo", "kind"),
-                key_column: "id".to_owned(),
+                key_column: "id".into(),
                 key: RowKey::from("7"),
                 columns: [(
-                    "status_code".to_owned(),
+                    "status_code".into(),
                     (
                         pbps_model::Cell::Value(text("old")),
                         pbps_model::Cell::Value(text("OLD")),
@@ -11128,10 +11151,10 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 types: Default::default(),
                 after_types: Default::default(),
                 table: TableName::new("dbo", "kind"),
-                key_column: "id".to_owned(),
+                key_column: "id".into(),
                 key: RowKey::from("7"),
                 columns: [(
-                    "note".to_owned(),
+                    "note".into(),
                     (
                         pbps_model::Cell::Value(Value::Null),
                         pbps_model::Cell::Value(text("x")),
@@ -11165,12 +11188,12 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             moved.changes[0].clone(),
             pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
                 table: TableName::new("dbo", "kind"),
-                key_column: "id".to_owned(),
+                key_column: "id".into(),
                 identity_key: true,
                 key: RowKey::from("9"),
                 defaults: Default::default(),
                 types: Default::default(),
-                row: [("status_code".to_owned(), text(code))]
+                row: [("status_code".into(), text(code))]
                     .into_iter()
                     .collect::<Row>(),
             }),
@@ -11185,10 +11208,10 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             moved.changes[0].clone(),
             pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
                 table: TableName::new("dbo", "kind"),
-                key_column: "id".to_owned(),
+                key_column: "id".into(),
                 identity_key: true,
                 key: RowKey::from("9"),
-                defaults: [("status_code".to_owned(), default.to_owned())]
+                defaults: [("status_code".into(), default.to_owned())]
                     .into_iter()
                     .collect(),
                 types: Default::default(),
@@ -11315,14 +11338,14 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             moved.changes[0].clone(),
             pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
                 table: TableName::new("dbo", "kind"),
-                key_column: "id".to_owned(),
+                key_column: "id".into(),
                 identity_key: true,
                 key: RowKey::from("9"),
-                defaults: [("note".to_owned(), "(CONVERT(nvarchar(10), 'x'))".to_owned())]
+                defaults: [("note".into(), "(CONVERT(nvarchar(10), 'x'))".to_owned())]
                     .into_iter()
                     .collect(),
                 types: Default::default(),
-                row: [("status_code".to_owned(), text("new"))]
+                row: [("status_code".into(), text("new"))]
                     .into_iter()
                     .collect::<Row>(),
             }),
@@ -11363,10 +11386,10 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
                 types: Default::default(),
                 after_types: Default::default(),
                 table: TableName::new("dbo", "kind"),
-                key_column: "id".to_owned(),
+                key_column: "id".into(),
                 key: RowKey::from("42"),
                 columns: [(
-                    "status_code".to_owned(),
+                    "status_code".into(),
                     (
                         pbps_model::Cell::Value(text("new")),
                         pbps_model::Cell::Value(text(code)),
@@ -11489,13 +11512,13 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
             types: Default::default(),
             after_types: Default::default(),
             table: TableName::new("dbo", "pair_child"),
-            key_column: "id".to_owned(),
+            key_column: "id".into(),
             key: RowKey::from(id),
             columns: cells
                 .iter()
                 .map(|(c, v)| {
                     (
-                        (*c).to_owned(),
+                        (*c).into(),
                         (
                             pbps_model::Cell::Value(Value::Null),
                             pbps_model::Cell::Value(v.clone()),
@@ -11509,14 +11532,14 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     let pair_insert = |id: &str, cells: &[(&str, Value)]| {
         pbps_model::PlannedChange::new(pbps_model::Change::InsertRow {
             table: TableName::new("dbo", "pair_child"),
-            key_column: "id".to_owned(),
+            key_column: "id".into(),
             identity_key: false,
             key: RowKey::from(id),
             defaults: Default::default(),
             types: Default::default(),
             row: cells
                 .iter()
-                .map(|(c, v)| ((*c).to_owned(), v.clone()))
+                .map(|(c, v)| ((*c).into(), v.clone()))
                 .collect::<Row>(),
         })
     };
@@ -11641,7 +11664,7 @@ async fn a_disabled_foreign_key_neither_cascades_nor_blocks_a_delete() {
 
     let delete = pbps_model::Change::DeleteRow {
         table: TableName::new("dbo", "status"),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         key: RowKey::from("old"),
         cause: pbps_model::change::DeleteCause::Undeclared,
         dropped: Default::default(),
@@ -11720,25 +11743,19 @@ async fn a_row_rewritten_after_the_plan_was_made_is_not_deleted_as_the_reviewed_
 
     let delete = pbps_model::Change::DeleteRow {
         table: TableName::new("dbo", "status"),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         key: RowKey::from("old"),
         cause: pbps_model::change::DeleteCause::Undeclared,
         dropped: Default::default(),
         row: [
-            (
-                "label".to_owned(),
-                Cell::Value(Value::Text("Old".to_owned())),
-            ),
-            ("rank".to_owned(), Cell::Value(Value::Int(1))),
+            ("label".into(), Cell::Value(Value::Text("Old".to_owned()))),
+            ("rank".into(), Cell::Value(Value::Int(1))),
         ]
         .into_iter()
         .collect(),
-        types: [
-            ("label".to_owned(), ty("nvarchar")),
-            ("rank".to_owned(), ty("int")),
-        ]
-        .into_iter()
-        .collect(),
+        types: [("label".into(), ty("nvarchar")), ("rank".into(), ty("int"))]
+            .into_iter()
+            .collect(),
         after_types: Default::default(),
         key_type: None,
     };
@@ -11829,7 +11846,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
 
     let delete = pbps_model::Change::DeleteRow {
         table: TableName::new("dbo", "status"),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         key: RowKey::from("old"),
         cause: pbps_model::change::DeleteCause::Undeclared,
         dropped: Default::default(),
@@ -11965,14 +11982,12 @@ async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
         let mut t = Table::default();
         let mut code = Column::new(ty("varchar(10)")).not_null();
         code.collation = collation.map(pbps_model::Collation::new);
-        t.columns.insert("code".to_owned(), code);
-        t.columns.insert(
-            "label".to_owned(),
-            Column::new(ty("nvarchar(50)")).not_null(),
-        );
+        t.columns.insert("code".into(), code);
+        t.columns
+            .insert("label".into(), Column::new(ty("nvarchar(50)")).not_null());
         t.primary_key = Some(PrimaryKey {
             name: None,
-            columns: vec!["code".to_owned()],
+            columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });
         t.data = Some(TableData {
@@ -11982,7 +11997,7 @@ async fn key_collisions_are_judged_by_the_key_column_s_own_collation() {
                 .map(|k| {
                     (
                         RowKey::from(k),
-                        [("label".to_owned(), Value::Text(format!("row {k}")))]
+                        [("label".into(), Value::Text(format!("row {k}")))]
                             .into_iter()
                             .collect::<Row>(),
                     )
@@ -12065,21 +12080,21 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
     let table = TableName::new("dbo", "status");
     let insert = |key: &str| pbps_model::Change::InsertRow {
         table: table.clone(),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         identity_key: false,
         key: RowKey::from(key),
         defaults: Default::default(),
         types: Default::default(),
-        row: [("label".to_owned(), Value::Text("New".to_owned()))]
+        row: [("label".into(), Value::Text("New".to_owned()))]
             .into_iter()
             .collect::<Row>(),
     };
     let update = |from: &str, to: &str| pbps_model::Change::UpdateRow {
         table: table.clone(),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         key: RowKey::from("old"),
         columns: [(
-            "label".to_owned(),
+            "label".into(),
             (
                 Cell::Value(Value::Text(from.to_owned())),
                 Cell::Value(Value::Text(to.to_owned())),
@@ -12088,15 +12103,13 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .into_iter()
         .collect(),
         unchanged: Default::default(),
-        types: [("label".to_owned(), ty("nvarchar(50)"))]
-            .into_iter()
-            .collect(),
+        types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
         after_types: Default::default(),
         key_type: None,
     };
     let delete = pbps_model::Change::DeleteRow {
         table: table.clone(),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         key: RowKey::from("old"),
         cause: pbps_model::change::DeleteCause::Undeclared,
         dropped: Default::default(),
@@ -12213,16 +12226,14 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .expect("a trigger that rewrites a defaulted column");
     let defaulted = pbps_model::Change::InsertRow {
         table: table.clone(),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         identity_key: false,
         key: RowKey::from("fourth"),
-        defaults: [("note".to_owned(), "(N'plain')".to_owned())]
+        defaults: [("note".into(), "(N'plain')".to_owned())]
             .into_iter()
             .collect(),
-        types: [("note".to_owned(), ty("nvarchar(50)"))]
-            .into_iter()
-            .collect(),
-        row: [("label".to_owned(), Value::Text("New".to_owned()))]
+        types: [("note".into(), ty("nvarchar(50)"))].into_iter().collect(),
+        row: [("label".into(), Value::Text("New".to_owned()))]
             .into_iter()
             .collect::<Row>(),
     };
@@ -12268,19 +12279,19 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .expect("a trigger that fills a column left to nothing");
     let left_null = pbps_model::Change::InsertRow {
         table: table.clone(),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         identity_key: false,
         key: RowKey::from("fifth"),
-        defaults: [("note".to_owned(), "(N'plain')".to_owned())]
+        defaults: [("note".into(), "(N'plain')".to_owned())]
             .into_iter()
             .collect(),
         types: [
-            ("note".to_owned(), ty("nvarchar(50)")),
-            ("memo".to_owned(), ty("nvarchar(50)")),
+            ("note".into(), ty("nvarchar(50)")),
+            ("memo".into(), ty("nvarchar(50)")),
         ]
         .into_iter()
         .collect(),
-        row: [("label".to_owned(), Value::Text("New".to_owned()))]
+        row: [("label".into(), Value::Text("New".to_owned()))]
             .into_iter()
             .collect::<Row>(),
     };
@@ -12321,20 +12332,20 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
     );
     let spelled = pbps_model::Change::InsertRow {
         table: table.clone(),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         identity_key: false,
         key: RowKey::from("sixth"),
-        defaults: [("note".to_owned(), "(N'plain')".to_owned())]
+        defaults: [("note".into(), "(N'plain')".to_owned())]
             .into_iter()
             .collect(),
         types: [
-            ("label".to_owned(), ty("nvarchar(50)")),
-            ("note".to_owned(), ty("nvarchar(50)")),
-            ("memo".to_owned(), ty("nvarchar(50)")),
+            ("label".into(), ty("nvarchar(50)")),
+            ("note".into(), ty("nvarchar(50)")),
+            ("memo".into(), ty("nvarchar(50)")),
         ]
         .into_iter()
         .collect(),
-        row: [("label".to_owned(), Value::Text("New".to_owned()))]
+        row: [("label".into(), Value::Text("New".to_owned()))]
             .into_iter()
             .collect::<Row>(),
     };
@@ -12396,10 +12407,10 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .expect("the row as the plan recorded it");
     let whole_row = pbps_model::Change::UpdateRow {
         table: table.clone(),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         key: RowKey::from("old"),
         columns: [(
-            "label".to_owned(),
+            "label".into(),
             (
                 Cell::Value(Value::Text("Ancient".to_owned())),
                 Cell::Value(Value::Text("Newer".to_owned())),
@@ -12408,18 +12419,15 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .into_iter()
         .collect(),
         unchanged: [
-            (
-                "note".to_owned(),
-                Cell::Value(Value::Text("plain".to_owned())),
-            ),
-            ("memo".to_owned(), Cell::Value(Value::Null)),
+            ("note".into(), Cell::Value(Value::Text("plain".to_owned()))),
+            ("memo".into(), Cell::Value(Value::Null)),
         ]
         .into_iter()
         .collect(),
         types: [
-            ("label".to_owned(), ty("nvarchar(50)")),
-            ("note".to_owned(), ty("nvarchar(50)")),
-            ("memo".to_owned(), ty("nvarchar(50)")),
+            ("label".into(), ty("nvarchar(50)")),
+            ("note".into(), ty("nvarchar(50)")),
+            ("memo".into(), ty("nvarchar(50)")),
         ]
         .into_iter()
         .collect(),
@@ -12488,11 +12496,11 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .expect("the column this plan adds");
     let added = pbps_model::Change::UpdateRow {
         table: table.clone(),
-        key_column: "code".to_owned(),
+        key_column: "code".into(),
         key: RowKey::from("old"),
         columns: [
             (
-                "label".to_owned(),
+                "label".into(),
                 (
                     Cell::Value(Value::Text("Newer".to_owned())),
                     Cell::Value(Value::Text("Newest".to_owned())),
@@ -12501,7 +12509,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
             // The differ's `before` for a column the base lacks: NULL by
             // convention, not something the base recorded.
             (
-                "tier".to_owned(),
+                "tier".into(),
                 (
                     Cell::Value(Value::Null),
                     Cell::Value(Value::Text("gold".to_owned())),
@@ -12511,12 +12519,8 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
         .into_iter()
         .collect(),
         unchanged: Default::default(),
-        types: [("label".to_owned(), ty("nvarchar(50)"))]
-            .into_iter()
-            .collect(),
-        after_types: [("tier".to_owned(), ty("nvarchar(20)"))]
-            .into_iter()
-            .collect(),
+        types: [("label".into(), ty("nvarchar(50)"))].into_iter().collect(),
+        after_types: [("tier".into(), ty("nvarchar(20)"))].into_iter().collect(),
         key_type: None,
     };
     let sql = sql_of(&added);
@@ -12829,14 +12833,14 @@ async fn money_reads_back_with_the_four_decimals_it_holds() {
     let text = |s: &str| Value::Text(s.to_owned());
     let mut t = Table::default();
     t.columns
-        .insert("id".to_owned(), Column::new(ty("int")).not_null());
+        .insert("id".into(), Column::new(ty("int")).not_null());
     t.columns
-        .insert("m".to_owned(), Column::new(ty("money")).not_null());
+        .insert("m".into(), Column::new(ty("money")).not_null());
     t.columns
-        .insert("sm".to_owned(), Column::new(ty("smallmoney")).not_null());
+        .insert("sm".into(), Column::new(ty("smallmoney")).not_null());
     t.primary_key = Some(PrimaryKey {
         name: None,
-        columns: vec!["id".to_owned()],
+        columns: vec!["id".into()],
         storage_parameters: Default::default(),
     });
     // The engine's own spelling, which the spelling probe already forces a
@@ -12845,12 +12849,9 @@ async fn money_reads_back_with_the_four_decimals_it_holds() {
         mode: DataMode::Exact,
         rows: [(
             RowKey::from("1"),
-            [
-                ("m".to_owned(), text("1.0001")),
-                ("sm".to_owned(), text("2.5678")),
-            ]
-            .into_iter()
-            .collect::<Row>(),
+            [("m".into(), text("1.0001")), ("sm".into(), text("2.5678"))]
+                .into_iter()
+                .collect::<Row>(),
         )]
         .into_iter()
         .collect(),
@@ -12885,7 +12886,7 @@ async fn money_reads_back_with_the_four_decimals_it_holds() {
     let row = &back.tables[&name].data.as_ref().unwrap().rows[&RowKey::from("1")];
     let cell = |c: &str| {
         row.columns()
-            .find(|(n, _)| n.as_str() == c)
+            .find(|(n, _)| n.raw() == c)
             .map(|(_, v)| v.clone())
     };
     // The fourth decimal survives. Under the default style these were
@@ -12913,21 +12914,21 @@ async fn an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run(
     let text = |s: &str| Value::Text(s.to_owned());
     let mut t = Table::default();
     t.columns
-        .insert("id".to_owned(), Column::new(ty("int")).not_null());
+        .insert("id".into(), Column::new(ty("int")).not_null());
     let mut label = Column::new(ty("nvarchar(50)")).not_null();
     label.value_source = pbps_model::ValueSource::Default("'Unlabelled'".to_owned());
-    t.columns.insert("label".to_owned(), label);
+    t.columns.insert("label".into(), label);
     let mut seq = Column::new(ty("int")).not_null();
     // In the engine's spelling, as every default has to be (§8.2): the
     // catalog stores `NEXT VALUE FOR [dbo].[seq]` whatever was written.
     seq.value_source = pbps_model::ValueSource::Default("NEXT VALUE FOR [dbo].[seq]".to_owned());
-    t.columns.insert("seq".to_owned(), seq);
+    t.columns.insert("seq".into(), seq);
     let mut stamp = Column::new(ty("datetime2")).not_null();
     stamp.value_source = pbps_model::ValueSource::Default("sysutcdatetime()".to_owned());
-    t.columns.insert("stamp".to_owned(), stamp);
+    t.columns.insert("stamp".into(), stamp);
     t.primary_key = Some(PrimaryKey {
         name: Some("pk_t".to_owned()),
-        columns: vec!["id".to_owned()],
+        columns: vec!["id".into()],
         storage_parameters: Default::default(),
     });
     let rows = |cells: &[(&str, &[(&str, Value)])]| -> std::collections::BTreeMap<RowKey, Row> {
@@ -12937,7 +12938,7 @@ async fn an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run(
                 (
                     RowKey::from(*k),
                     cs.iter()
-                        .map(|(c, v)| ((*c).to_owned(), v.clone()))
+                        .map(|(c, v)| ((*c).into(), v.clone()))
                         .collect::<Row>(),
                 )
             })
@@ -13008,7 +13009,7 @@ async fn an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run(
         .with_observed_rows(&observed, &scopes, &Schema::default())
         .unwrap();
     for (key, row) in &pulled.tables[&name].data.as_ref().unwrap().rows {
-        let columns: Vec<&String> = row.columns().map(|(c, _)| c).collect();
+        let columns: Vec<&str> = row.columns().map(|(c, _)| c.raw()).collect();
         assert_eq!(columns, ["seq", "stamp"], "row {key}");
     }
     // And the differ, measured against the declared reading, has nothing to
@@ -13053,14 +13054,12 @@ async fn a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently
     let table_with = |mode: DataMode, keys: &[&str]| {
         let mut t = Table::default();
         t.columns
-            .insert("id".to_owned(), Column::new(ty("int")).not_null());
-        t.columns.insert(
-            "label".to_owned(),
-            Column::new(ty("nvarchar(50)")).not_null(),
-        );
+            .insert("id".into(), Column::new(ty("int")).not_null());
+        t.columns
+            .insert("label".into(), Column::new(ty("nvarchar(50)")).not_null());
         t.primary_key = Some(PrimaryKey {
             name: Some("pk_k".to_owned()),
-            columns: vec!["id".to_owned()],
+            columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
         t.data = Some(TableData {
@@ -13070,7 +13069,7 @@ async fn a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently
                 .map(|k| {
                     (
                         RowKey::from(*k),
-                        [("label".to_owned(), text(&format!("row {k}")))]
+                        [("label".into(), text(&format!("row {k}")))]
                             .into_iter()
                             .collect::<Row>(),
                     )
@@ -13226,7 +13225,7 @@ async fn a_pinned_union_keeps_recorded_key_spelling_and_default_cells() {
         .await
         .unwrap()
         .schema;
-    let explicit: Row = [("label".to_owned(), Value::Text("New".into()))]
+    let explicit: Row = [("label".into(), Value::Text("New".into()))]
         .into_iter()
         .collect();
     let mut recorded = live.clone();
@@ -13309,10 +13308,10 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     let mut customer = Table::default();
     customer
         .columns
-        .insert("id".to_owned(), Column::new(ty("int")).not_null());
+        .insert("id".into(), Column::new(ty("int")).not_null());
     customer.primary_key = Some(PrimaryKey {
         name: Some("pk_customer".to_owned()),
-        columns: vec!["id".to_owned()],
+        columns: vec!["id".into()],
         storage_parameters: Default::default(),
     });
     let mut reader = Role::default();
@@ -14020,7 +14019,7 @@ async fn a_row_write_across_a_retyped_column_still_holds_the_recorded_row() {
                     RowKey::from(*k),
                     cells
                         .iter()
-                        .map(|(c, v)| ((*c).to_owned(), v.clone()))
+                        .map(|(c, v)| ((*c).into(), v.clone()))
                         .collect::<Row>(),
                 )
             })
@@ -14033,14 +14032,14 @@ async fn a_row_write_across_a_retyped_column_still_holds_the_recorded_row() {
     let table = |pct: &str, since: &str, rs: &[(&str, &[(&str, Value)])]| {
         let mut t = Table::default();
         t.columns
-            .insert("code".to_owned(), Column::new(ty("varchar(20)")).not_null());
-        t.columns.insert("pct".to_owned(), Column::new(ty(pct)));
-        t.columns.insert("since".to_owned(), Column::new(ty(since)));
+            .insert("code".into(), Column::new(ty("varchar(20)")).not_null());
+        t.columns.insert("pct".into(), Column::new(ty(pct)));
+        t.columns.insert("since".into(), Column::new(ty(since)));
         t.columns
-            .insert("note".to_owned(), Column::new(ty("nvarchar(50)")));
+            .insert("note".into(), Column::new(ty("nvarchar(50)")));
         t.primary_key = Some(PrimaryKey {
             name: None,
-            columns: vec!["code".to_owned()],
+            columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });
         t.data = Some(TableData {
@@ -14240,7 +14239,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
             table: TableName::new("dbo", "customer"),
             key_column: "code".into(),
             key: RowKey::from("repaired"),
-            columns: [("region_code".to_owned(), (text("nowhere"), text("here")))]
+            columns: [("region_code".into(), (text("nowhere"), text("here")))]
                 .into_iter()
                 .collect(),
             unchanged: Default::default(),
@@ -14311,7 +14310,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 key_column: "code".into(),
                 identity_key: false,
                 key: RowKey::from("newcomer"),
-                row: [("region_code".to_owned(), Value::Text("mars".into()))]
+                row: [("region_code".into(), Value::Text("mars".into()))]
                     .into_iter()
                     .collect(),
                 defaults: Default::default(),
@@ -14334,7 +14333,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
     let mut lookup = Table::default();
     lookup
         .columns
-        .insert("code".to_owned(), Column::new(ty("varchar(10)")).not_null());
+        .insert("code".into(), Column::new(ty("varchar(10)")).not_null());
     let to_a_new_parent = ChangeSet {
         changes: vec![
             PlannedChange::new(Change::CreateTable {
@@ -14407,7 +14406,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
                 table: TableName::new("dbo", "customer"),
                 key_column: "code".into(),
                 key: RowKey::from("typed"),
-                columns: [("region_code".to_owned(), (text("1"), text("01")))]
+                columns: [("region_code".into(), (text("1"), text("01")))]
                     .into_iter()
                     .collect(),
                 unchanged: Default::default(),
@@ -14444,7 +14443,7 @@ async fn a_new_foreign_key_is_probed_against_the_rows_the_plan_will_leave() {
     // question" this probe was not asked at all (DECISIONS 164).
     let mut bare = Table::default();
     bare.columns
-        .insert("code".to_owned(), Column::new(ty("varchar(10)")).not_null());
+        .insert("code".into(), Column::new(ty("varchar(10)")).not_null());
     let to_an_empty_parent = ChangeSet {
         changes: vec![
             PlannedChange::new(Change::CreateTable {
@@ -17016,10 +17015,10 @@ fn retype_dependency_plans_preserve_identity_and_do_not_duplicate_explicit_chang
     let changes = plan(&before, &ids, &after, &renamed_ids);
     assert!(changes.changes.iter().any(|p| matches!(&p.change,
         Change::SetPrimaryKey { table, from: None, to: Some(key), .. }
-        if table == &new_parent && key.columns == ["wide"])));
+        if table == &new_parent && key.columns == [pbps_model::ColumnName::from("wide")])));
     assert!(changes.changes.iter().any(|p| matches!(&p.change,
         Change::AddForeignKey { constraint, .. } if constraint.references_table == new_parent
-            && constraint.references_columns == ["wide"])));
+            && constraint.references_columns == [pbps_model::ColumnName::from("wide")])));
 }
 
 #[tokio::test]
@@ -17347,7 +17346,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
         for (name, spec) in columns {
             let column = Column::new(ty(spec));
             t.columns.insert(
-                (*name).to_owned(),
+                (*name).into(),
                 if *name == "code" {
                     column.not_null()
                 } else {
@@ -17360,7 +17359,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
         // `PK__s__357D4CF8…`.
         t.primary_key = Some(PrimaryKey {
             name: Some("pk_s".to_owned()),
-            columns: vec!["code".to_owned()],
+            columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });
         t
@@ -17421,10 +17420,11 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
             .position(|p| f(&p.change))
             .unwrap_or_else(|| panic!("{migration:?}"))
     };
-    let drop_at =
-        at(|c| matches!(c, pbps_model::Change::DropColumn { column, .. } if column.name == "note"));
+    let drop_at = at(
+        |c| matches!(c, pbps_model::Change::DropColumn { column, .. } if column.name == "note".into()),
+    );
     let rename_at =
-        at(|c| matches!(c, pbps_model::Change::RenameColumn { to, .. } if to == "note"));
+        at(|c| matches!(c, pbps_model::Change::RenameColumn { to, .. } if to.raw() == "note"));
     assert!(
         drop_at < rename_at,
         "the drop must free the name first: {migration:?}"

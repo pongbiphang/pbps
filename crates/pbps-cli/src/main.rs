@@ -1130,7 +1130,7 @@ fn run() -> anyhow::Result<()> {
                 Intent::RenameColumn {
                     table: col.table.clone(),
                     from: col.name,
-                    to,
+                    to: to.into(),
                 }
                 .into(),
             )

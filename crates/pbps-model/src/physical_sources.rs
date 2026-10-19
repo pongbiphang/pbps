@@ -6,6 +6,7 @@
 //! explicit creation, removal and rename intent. No catalog allocation or
 //! SQL semantics are inferred here.
 
+use crate::ColumnName;
 use std::collections::BTreeMap;
 
 use crate::plan_names::{At, Holder, PlanNames};
@@ -55,7 +56,7 @@ enum Origin {
     Created { step: usize, slot: Slot },
 }
 
-type Slot = (Uid, String);
+type Slot = (Uid, ColumnName);
 type Events<V> = Vec<(usize, Option<V>)>;
 
 #[derive(Debug)]
@@ -302,7 +303,8 @@ impl Build<'_, '_> {
             }
             return Err(SourceError(format!(
                 "column {}.{} has two physical sources at boundary {boundary}",
-                slot.0, slot.1
+                slot.0,
+                slot.1.shown()
             )));
         }
         self.columns.insert(slot.clone(), origin.clone());
@@ -379,7 +381,7 @@ impl Build<'_, '_> {
                 self.view
                     .table_births
                     .put(uid.clone(), boundary, Some(step));
-                let columns: Vec<String> = if let Some(partition) = &table.partition_of {
+                let columns: Vec<ColumnName> = if let Some(partition) = &table.partition_of {
                     let parent = self.owner(&partition.parent, before)?;
                     let columns = self
                         .columns
@@ -447,7 +449,8 @@ impl Build<'_, '_> {
                     let Some(origin) = self.remove(boundary, &old) else {
                         return Err(SourceError(format!(
                             "source of column {}.{} is unavailable before change {step}",
-                            old.0, old.1
+                            old.0,
+                            old.1.shown()
                         )));
                     };
                     self.insert(boundary, (owner, to.clone()), origin)?;

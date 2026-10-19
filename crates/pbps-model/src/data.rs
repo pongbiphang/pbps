@@ -17,6 +17,7 @@
 //! it names a column. Business rows are user history, and are never a
 //! declaration.
 
+use crate::ColumnName;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -117,14 +118,14 @@ impl fmt::Display for RowKey {
 /// therefore refuses a row that omits a `NOT NULL` column with no default.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
-pub struct Row(pub BTreeMap<String, Value>);
+pub struct Row(pub BTreeMap<ColumnName, Value>);
 
 impl Row {
     pub fn get(&self, column: &str) -> Option<&Value> {
         self.0.get(column)
     }
 
-    pub fn columns(&self) -> impl Iterator<Item = (&String, &Value)> {
+    pub fn columns(&self) -> impl Iterator<Item = (&ColumnName, &Value)> {
         self.0.iter()
     }
 
@@ -133,8 +134,8 @@ impl Row {
     }
 }
 
-impl FromIterator<(String, Value)> for Row {
-    fn from_iter<T: IntoIterator<Item = (String, Value)>>(it: T) -> Self {
+impl FromIterator<(ColumnName, Value)> for Row {
+    fn from_iter<T: IntoIterator<Item = (ColumnName, Value)>>(it: T) -> Self {
         Row(it.into_iter().collect())
     }
 }
@@ -302,12 +303,12 @@ pub type DataScopes = BTreeMap<TableName, DataScope>;
 pub struct ObservedRow {
     pub cells: Row,
     /// The engine confirmed these cells hold the column's default.
-    pub at_default: BTreeSet<String>,
+    pub at_default: BTreeSet<ColumnName>,
     /// The engine was never asked about these: the column's default is an
     /// expression it would have had to run. Nobody can tell the value from
     /// the default, so the side's own spelling decides — and a side with no
     /// spelling keeps the value, because a `NEWID()` key is a value.
-    pub unknown: BTreeSet<String>,
+    pub unknown: BTreeSet<ColumnName>,
 }
 
 impl ObservedRow {
@@ -321,11 +322,11 @@ impl ObservedRow {
         self.cells
             .columns()
             .filter(|(column, _)| {
-                let spelled = reference.is_some_and(|r| r.get(column).is_some());
+                let spelled = reference.is_some_and(|r| r.get(column.raw()).is_some());
                 if self.at_default.contains(*column) {
                     spelled
                 } else if self.unknown.contains(*column) {
-                    reference.is_none_or(|r| r.get(column).is_some())
+                    reference.is_none_or(|r| r.get(column.raw()).is_some())
                 } else {
                     true
                 }
@@ -881,7 +882,11 @@ pub fn check_with_sources(
                 "{name}: a `data:` block needs a single-column primary key; this one has {} \
                  ({}). Composite keys are not supported yet",
                 pk.columns.len(),
-                pk.columns.join(", "),
+                pk.columns
+                    .iter()
+                    .map(|n| n.shown().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 name = name.shown()
             ));
             None
@@ -894,11 +899,13 @@ pub fn check_with_sources(
         && let Some(column) = key_column.as_ref()
         && let Some(spec) = table.columns.get(column)
     {
-        for source in sources.get(column, spec) {
+        for source in sources.get(column.raw(), spec) {
             match source {
                 ValueSource::Generated(_) => problems.push(format!(
                     "{name}: declared rows set `{column}` through their primary-key values, but it is a generated column the engine computes — use an ordinary declared key or leave the rows outside reference-data management",
                     name = name.shown(),
+
+                    column = column.shown(),
                 )),
                 // A `serial` key is refused by the dialect that holds one (#1631).
                 ValueSource::None
@@ -913,7 +920,8 @@ pub fn check_with_sources(
             if !table.columns.contains_key(column) {
                 problems.push(format!(
                     "{name}: row `{key}` sets `{column}`, which the table does not declare",
-                    name = name.shown()
+                    name = name.shown(),
+                    column = column.shown(),
                 ));
             }
             // The key is the one identity column a row may pin, and it pins it
@@ -922,14 +930,16 @@ pub fn check_with_sources(
             // a value for it would be refused at apply time, after `validate`
             // had said the declaration was fine.
             if let Some(spec) = table.columns.get(column) {
-                for source in sources.get(column, spec) {
+                for source in sources.get(column.raw(), spec) {
                     match source {
                         ValueSource::Identity(_) => {
-                            if key_column.as_deref() != Some(column.as_str()) {
+                            if key_column.as_ref() != Some(column) {
                                 problems.push(format!(
                                     "{name}: row `{key}` sets `{column}`, which is an IDENTITY column the engine \
                                      assigns — leave it out",
                                     name = name.shown(),
+
+                                    column = column.shown(),
                                 ));
                             }
                         }
@@ -937,16 +947,20 @@ pub fn check_with_sources(
                             "{name}: row `{key}` sets `{column}`, which is a generated column the engine \
                              computes — leave it out",
                             name = name.shown(),
+
+                            column = column.shown(),
                         )),
                         // The engine's to number, as an identity is, and never
                         // read back (#1631, DECISIONS 94). A `serial` key is
                         // refused by its dialect.
                         ValueSource::Sequence(_) => {
-                            if key_column.as_deref() != Some(column.as_str()) {
+                            if key_column.as_ref() != Some(column) {
                                 problems.push(format!(
                                     "{name}: row `{key}` sets `{column}`, which is a `serial` column \
                                      its sequence numbers — leave it out",
                                     name = name.shown(),
+
+                                    column = column.shown(),
                                 ));
                             }
                         }
@@ -954,14 +968,15 @@ pub fn check_with_sources(
                     }
                 }
             }
-            if key_column.as_deref() == Some(column.as_str()) {
+            if key_column.as_ref() == Some(column) {
                 // Not a style rule. If the body could restate the key, it could
                 // disagree with it, and there would be two answers to "which
                 // row is this" — the bug map keys exist to make unwritable.
                 problems.push(format!(
                     "{name}: row `{key}` sets `{column}`, which is the primary key — the row's key \
                      is already its value",
-                    name = name.shown()
+                    name = name.shown(),
+                    column = column.shown(),
                 ));
             }
         }
@@ -973,14 +988,15 @@ pub fn check_with_sources(
         // sent. So a `NOT NULL` column refuses an explicit null whatever its
         // default, and refuses omission only when nothing would fill it.
         for (column, spec) in &table.columns {
-            if Some(column.as_str()) == key_column.as_deref() || spec.nullable {
+            if Some(column) == key_column.as_ref() || spec.nullable {
                 continue;
             }
+            let physical_sources = sources.get(column.raw(), spec);
             match row.0.get(column) {
                 Some(Value::Null) => problems.push(format!(
                     "{name}: row `{key}` sets `{column}` to null, but it is NOT NULL{}",
                     // A `serial`'s sequence fills it as a default would (#1631).
-                    if sources.get(column, spec).iter().any(|source| match source {
+                    if physical_sources.iter().any(|source| match source {
                         ValueSource::Default(_) | ValueSource::Sequence(_) => true,
                         ValueSource::None
                         | ValueSource::Identity(_)
@@ -990,9 +1006,10 @@ pub fn check_with_sources(
                     } else {
                         ""
                     },
-                    name = name.shown()
+                    name = name.shown(),
+                    column = column.shown(),
                 )),
-                None if sources.get(column, spec).iter().all(|source| match source {
+                None if physical_sources.iter().all(|source| match source {
                     ValueSource::None => true,
                     ValueSource::Default(_)
                     | ValueSource::Identity(_)
@@ -1003,6 +1020,8 @@ pub fn check_with_sources(
                     problems.push(format!(
                         "{name}: row `{key}` leaves `{column}` unset, but it is NOT NULL with no default",
                         name = name.shown(),
+
+                        column = column.shown(),
                     ));
                 }
                 _ => {}
@@ -1024,18 +1043,18 @@ mod tests {
     fn table(pk: Option<Vec<&str>>, rows: Vec<(&str, Vec<(&str, Value)>)>) -> Table {
         let mut columns = indexmap::IndexMap::new();
         columns.insert(
-            "code".to_owned(),
+            "code".into(),
             Column::new(ColumnType::from_str("varchar(20)").unwrap()).not_null(),
         );
         columns.insert(
-            "label".to_owned(),
+            "label".into(),
             Column::new(ColumnType::from_str("nvarchar(50)").unwrap()).not_null(),
         );
         Table {
             columns,
             primary_key: pk.map(|c| PrimaryKey {
                 name: None,
-                columns: c.into_iter().map(str::to_owned).collect(),
+                columns: c.into_iter().map(crate::ColumnName::from).collect(),
                 storage_parameters: Default::default(),
             }),
             data: Some(TableData {
@@ -1047,7 +1066,7 @@ mod tests {
                             RowKey::from(k),
                             cells
                                 .into_iter()
-                                .map(|(c, v)| (c.to_owned(), v))
+                                .map(|(c, v)| (c.into(), v))
                                 .collect::<Row>(),
                         )
                     })
@@ -1185,7 +1204,7 @@ mod tests {
         assert_eq!(cell(&row, "n", None), Cell::Value(Value::Null));
         // And a written value is that value, default or no default: the
         // default fills only what was left out.
-        let written: Row = [("n".to_owned(), Value::Int(7))].into_iter().collect();
+        let written: Row = [("n".into(), Value::Int(7))].into_iter().collect();
         assert_eq!(
             cell(&written, "n", Some(&with_default)),
             Cell::Value(Value::Int(7))
@@ -1287,12 +1306,12 @@ mod tests {
             expression: "length(label) * 2".into(),
             stored: true,
         });
-        t.columns.insert("twice".to_owned(), twice);
+        t.columns.insert("twice".into(), twice);
         let p = check(&name(), &t);
         assert!(p.iter().any(|m| m.contains("generated column")), "{p:?}");
         t.data.as_mut().unwrap().rows = [(
             RowKey::from("new"),
-            [("label".to_owned(), Value::Text("New".into()))]
+            [("label".into(), Value::Text("New".into()))]
                 .into_iter()
                 .collect(),
         )]
@@ -1313,14 +1332,14 @@ mod tests {
         );
         let mut n = Column::new(ColumnType::from_str("int").unwrap()).not_null();
         n.value_source = crate::ValueSource::Sequence(crate::schema::OwnedSequence::serial());
-        t.columns.insert("n".to_owned(), n);
+        t.columns.insert("n".into(), n);
         assert_eq!(check(&name(), &t), Vec::<String>::new());
         // Its sequence's to number: a row that sets it is refused.
         t.data.as_mut().unwrap().rows = [(
             RowKey::from("new"),
             [
-                ("label".to_owned(), Value::Text("New".into())),
-                ("n".to_owned(), Value::Int(5)),
+                ("label".into(), Value::Text("New".into())),
+                ("n".into(), Value::Int(5)),
             ]
             .into_iter()
             .collect(),
@@ -1331,7 +1350,7 @@ mod tests {
         assert!(p.iter().any(|m| m.contains("`serial` column")), "{p:?}");
         t.data.as_mut().unwrap().rows = [(
             RowKey::from("new"),
-            [("label".to_owned(), Value::Text("New".into()))]
+            [("label".into(), Value::Text("New".into()))]
                 .into_iter()
                 .collect(),
         )]
@@ -1363,13 +1382,13 @@ mod tests {
             increment: 1,
             options: Default::default(),
         });
-        t.columns.insert("seq".to_owned(), seq);
+        t.columns.insert("seq".into(), seq);
         let p = check(&name(), &t);
         assert!(p.iter().any(|m| m.contains("IDENTITY")), "{p:?}");
         // The negative case: omitting it is fine, identity or not.
         t.data.as_mut().unwrap().rows = [(
             RowKey::from("new"),
-            [("label".to_owned(), Value::Text("New".into()))]
+            [("label".into(), Value::Text("New".into()))]
                 .into_iter()
                 .collect(),
         )]
@@ -1395,7 +1414,7 @@ mod tests {
         // model does not, on purpose: a `Row` that guessed would need the table
         // to do it, and elements do not reach their container (constraint 2).
         let omitted = Row::default();
-        let explicit: Row = [("label".to_owned(), Value::Null)].into_iter().collect();
+        let explicit: Row = [("label".into(), Value::Null)].into_iter().collect();
         assert_ne!(omitted, explicit);
     }
 
@@ -1623,12 +1642,12 @@ mod tests {
             .into_iter()
             .map(|(alias, canonical)| (RowKey::from(alias), RowKey::from(canonical)))
             .collect();
-        let explicit: Row = [("label".to_owned(), Value::Text("New".into()))]
+        let explicit: Row = [("label".into(), Value::Text("New".into()))]
             .into_iter()
             .collect();
         seen.rows.get_mut(&RowKey::from("new")).unwrap().cells = explicit.clone();
         seen.rows.get_mut(&RowKey::from("new")).unwrap().at_default =
-            ["label".to_owned()].into_iter().collect();
+            ["label".into()].into_iter().collect();
         let recorded = TableData {
             mode: DataMode::Exact,
             rows: [(RowKey::from("new"), explicit.clone())]
@@ -1673,22 +1692,22 @@ mod tests {
         let text = |s: &str| Value::Text(s.to_owned());
         let seen = ObservedRow {
             cells: [
-                ("label".to_owned(), text("Unlabelled")),
-                ("rank".to_owned(), Value::Int(1)),
+                ("label".into(), text("Unlabelled")),
+                ("rank".into(), Value::Int(1)),
             ]
             .into_iter()
             .collect(),
-            at_default: ["label".to_owned()].into_iter().collect(),
+            at_default: ["label".into()].into_iter().collect(),
             unknown: BTreeSet::new(),
         };
         // The side omits `label`: omitted. The side writes it: explicit. No
         // side at all (`pull`): omitted. `rank` is not at its default and is
         // explicit every time.
-        let omits: Row = [("rank".to_owned(), Value::Int(1))].into_iter().collect();
+        let omits: Row = [("rank".into(), Value::Int(1))].into_iter().collect();
         assert_eq!(seen.as_seen_by(Some(&omits)), omits);
         let writes: Row = [
-            ("label".to_owned(), text("Unlabelled")),
-            ("rank".to_owned(), Value::Int(1)),
+            ("label".into(), text("Unlabelled")),
+            ("rank".into(), Value::Int(1)),
         ]
         .into_iter()
         .collect();
@@ -1696,7 +1715,7 @@ mod tests {
         assert_eq!(seen.as_seen_by(None), omits);
         // A side that writes a *different* value still sees what is stored:
         // the hand edit that set `label` back to its default is a drift.
-        let other: Row = [("label".to_owned(), text("Other"))].into_iter().collect();
+        let other: Row = [("label".into(), text("Other"))].into_iter().collect();
         assert_eq!(seen.as_seen_by(Some(&other)), writes);
     }
 
@@ -1710,23 +1729,23 @@ mod tests {
         let text = |s: &str| Value::Text(s.to_owned());
         let seen = ObservedRow {
             cells: [
-                ("stamp".to_owned(), text("2026-09-03T10:00:00")),
-                ("rank".to_owned(), Value::Int(1)),
+                ("stamp".into(), text("2026-09-03T10:00:00")),
+                ("rank".into(), Value::Int(1)),
             ]
             .into_iter()
             .collect(),
             at_default: BTreeSet::new(),
-            unknown: ["stamp".to_owned()].into_iter().collect(),
+            unknown: ["stamp".into()].into_iter().collect(),
         };
-        let omits: Row = [("rank".to_owned(), Value::Int(1))].into_iter().collect();
+        let omits: Row = [("rank".into(), Value::Int(1))].into_iter().collect();
         assert_eq!(
             seen.as_seen_by(Some(&omits)),
             omits,
             "the declaration's word"
         );
         let writes: Row = [
-            ("stamp".to_owned(), text("2026-09-03T10:00:00")),
-            ("rank".to_owned(), Value::Int(1)),
+            ("stamp".into(), text("2026-09-03T10:00:00")),
+            ("rank".into(), Value::Int(1)),
         ]
         .into_iter()
         .collect();

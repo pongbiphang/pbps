@@ -261,7 +261,7 @@ fn keyless_objects_are_keyed_by_their_owner_and_name() {
                 assert_eq!(table.uid(), &owner, "{:?}", op.change());
             }
             ObjectKey::Default(ColumnKey::Partition { table, column }) => {
-                assert_eq!((table.uid(), column.as_str()), (&owner, "c"));
+                assert_eq!((table.uid(), column.raw()), (&owner, "c"));
             }
             ObjectKey::Module(m) => assert_eq!(m, &id),
             ObjectKey::Grant { .. } => {}

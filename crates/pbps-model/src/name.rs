@@ -8,6 +8,99 @@
 use std::fmt;
 use std::str::FromStr;
 
+/// One column's original identifier, without implicit human rendering.
+///
+/// Serialization and identity retain the original bytes (SPEC §4.3). Choose
+/// `.shown()` for prose and `.raw()` for SQL quoting and textual keys.
+///
+/// ```compile_fail,E0277
+/// let name = pbps_model::ColumnName::from("column");
+/// let _ = format!("{}", name);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let name = pbps_model::ColumnName::from("column");
+/// let _ = name.to_string();
+/// ```
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(transparent)]
+pub struct ColumnName(String);
+
+impl ColumnName {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn raw(&self) -> &str {
+        &self.0
+    }
+
+    pub fn shown(&self) -> crate::escape::Escaped<'_> {
+        crate::escape::Escaped(&self.0)
+    }
+
+    pub fn into_raw(self) -> String {
+        self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for ColumnName {
+    fn borrow(&self) -> &str {
+        self.raw()
+    }
+}
+
+impl From<String> for ColumnName {
+    fn from(name: String) -> Self {
+        Self(name)
+    }
+}
+
+impl From<&str> for ColumnName {
+    fn from(name: &str) -> Self {
+        Self(name.to_owned())
+    }
+}
+
+impl From<&String> for ColumnName {
+    fn from(name: &String) -> Self {
+        Self(name.clone())
+    }
+}
+
+impl From<&ColumnName> for ColumnName {
+    fn from(name: &ColumnName) -> Self {
+        name.clone()
+    }
+}
+
+// The DTO schema remains that of a bare string, without a new definition/ref.
+impl schemars::JsonSchema for ColumnName {
+    fn inline_schema() -> bool {
+        <String as schemars::JsonSchema>::inline_schema()
+    }
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        <String as schemars::JsonSchema>::schema_name()
+    }
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        <String as schemars::JsonSchema>::schema_id()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        <String as schemars::JsonSchema>::json_schema(generator)
+    }
+}
+
 /// A refusal of a name, which shows the text it was given escaped.
 ///
 /// The text is whatever the file spelled, control characters included: SPEC
@@ -99,7 +192,7 @@ impl TableName {
     }
 
     /// A reference to one column of this table.
-    pub fn column(&self, column: impl Into<String>) -> ColumnRef {
+    pub fn column(&self, column: impl Into<ColumnName>) -> ColumnRef {
         ColumnRef {
             table: self.clone(),
             name: column.into(),
@@ -168,11 +261,11 @@ impl FromStr for TableName {
 #[serde(try_from = "String", into = "String")]
 pub struct ColumnRef {
     pub table: TableName,
-    pub name: String,
+    pub name: ColumnName,
 }
 
 impl ColumnRef {
-    pub fn new(table: TableName, name: impl Into<String>) -> Self {
+    pub fn new(table: TableName, name: impl Into<ColumnName>) -> Self {
         Self {
             table,
             name: name.into(),
@@ -195,7 +288,7 @@ struct RawColumnRef<'a>(&'a ColumnRef);
 
 impl fmt::Display for RawColumnRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.0.table.raw(), self.0.name)
+        write!(f, "{}.{}", self.0.table.raw(), self.0.name.raw())
     }
 }
 
@@ -204,12 +297,7 @@ struct ShownColumnRef<'a>(&'a ColumnRef);
 
 impl fmt::Display for ShownColumnRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}.{}",
-            self.0.table.shown(),
-            crate::escape::Escaped(&self.0.name)
-        )
+        write!(f, "{}.{}", self.0.table.shown(), self.0.name.shown())
     }
 }
 
@@ -318,7 +406,7 @@ mod tests {
     fn column_round_trips() {
         let c: ColumnRef = "dbo.customer.email".parse().unwrap();
         assert_eq!(c.table.raw().to_string(), "dbo.customer");
-        assert_eq!(c.name, "email");
+        assert_eq!(c.name, "email".into());
         assert_eq!(c.raw().to_string(), "dbo.customer.email");
     }
 
