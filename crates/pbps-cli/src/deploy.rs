@@ -8077,7 +8077,21 @@ async fn apply_under_lock(
     let role_renames = crate::engine::external_role_renames(conn, &original_ids, &plan.ids)
         .await?
         .renames;
+    let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes);
     if plan.changes.is_empty() && original_ids.roles == plan.ids.roles {
+        // No statements still means replay of the approved type prerequisites
+        // (DEC-2181.1). Reference-free no-ops keep their existing fast path.
+        if !pinned_managed.references.is_empty() || !plan.type_pins.is_empty() {
+            crate::pins::check(
+                conn,
+                project,
+                target,
+                plan,
+                &pinned_managed,
+                crate::pins::Check::BeforeProbes,
+            )
+            .await?;
+        }
         return Ok(None);
     }
     rename_snapshot_roles(&mut entry.snapshot, &role_renames);
@@ -8146,7 +8160,6 @@ async fn apply_under_lock(
     // they call (DEC-319.1). Every module the plan holds at any point of its
     // run is managed here, so its own creates, rebuilds and drops are the
     // read-back's to compare, not the pins'.
-    let pinned_managed = pinned_managed(&entry.snapshot, &plan.changes);
     crate::pins::check(
         conn,
         project,

@@ -2646,3 +2646,129 @@ fn an_existing_reference_cannot_be_unpinned_from_a_saved_default_change() {
         );
     }
 }
+
+fn empty_apply_checks_referenced_type_prerequisites(server: &str) {
+    let own = OwnDatabase::new(server, "refs_empty_apply");
+    let db = own.connection();
+    let root = "CREATE OR REPLACE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$";
+    on_server(
+        db,
+        &format!(
+            "CREATE SCHEMA app; CREATE SEQUENCE app.calls; {root}; CREATE DOMAIN app.checked AS varchar CHECK (app.root(VALUE)); CREATE TABLE app.t(id integer PRIMARY KEY,n app.checked)"
+        ),
+    );
+    let d = Demo::new("refs-empty-apply");
+    opt_in(&d, db, true);
+    d.table(&declarations("  n: {type: app.checked}\n"));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", db, "--reason", "existing reference"]));
+    let path = plan(&d, db);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(saved.changes.is_empty());
+    assert_eq!(saved.type_pins.len(), 1);
+    assert_eq!(saved.type_routines.len(), 1);
+    let out = succeeds(apply_plan(&d, db, &path, false));
+    assert!(stdout(&out).contains("nothing to apply"));
+    assert_eq!(
+        scalar(db, "SELECT count(*)::bigint FROM public.__pbps_state"),
+        1
+    );
+
+    let mut unpinned = saved.clone();
+    unpinned.type_pins.clear();
+    let edited = d.dir.join("unpinned.json");
+    std::fs::write(&edited, serde_json::to_vec_pretty(&unpinned).unwrap()).unwrap();
+    let out = apply_plan(&d, db, &edited, false);
+    assert_ne!(code(&out), 0, "an empty apply accepted missing type pins");
+    assert!(
+        stderr(&out).contains("no type pin for `app.checked`"),
+        "{}",
+        stderr(&out)
+    );
+
+    on_server(db, &root.replace("RETURN true", "RETURN length($1) > 0"));
+    let out = apply_plan(&d, db, &path, false);
+    assert_ne!(
+        code(&out),
+        0,
+        "an empty apply accepted a replaced reviewed root"
+    );
+    assert!(
+        stderr(&out).contains("reviewed type routines changed"),
+        "{}",
+        stderr(&out)
+    );
+    on_server(db, root);
+    on_server(
+        db,
+        "ALTER DOMAIN app.checked ADD CONSTRAINT nonempty CHECK (length(VALUE) > 0) NOT VALID",
+    );
+    let out = apply_plan(&d, db, &path, false);
+    assert_ne!(code(&out), 0, "an empty apply accepted a changed type");
+    assert!(
+        stderr(&out).contains("changed since planning"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+        0
+    );
+    assert_eq!(
+        scalar(
+            db,
+            "SELECT count(*)::bigint FROM public.__pbps_state WHERE kind <> 'failed'"
+        ),
+        1
+    );
+
+    // An unrelated routine's replacement did not invalidate reference-free
+    // no-ops before this gate; checking every empty plan would change that.
+    let role = UntrustedRole::new(server, "empty_apply_plain");
+    let plain = OwnDatabase::new(server, "refs_empty_plain");
+    let db = plain.connection();
+    on_server(
+        db,
+        &format!(
+            "CREATE SCHEMA app; CREATE TABLE app.t(id integer PRIMARY KEY); CREATE FUNCTION app.unused() RETURNS integer LANGUAGE sql AS 'SELECT 1'; ALTER FUNCTION app.unused() OWNER TO {}",
+            role.name
+        ),
+    );
+    let d = Demo::new("refs-empty-plain");
+    d.keyed(db);
+    d.table(&declarations(""));
+    succeeds(d.run(&["plan"]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", db, "--reason", "reference-free table"]));
+    let path = plan(&d, db);
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(saved.changes.is_empty() && saved.type_pins.is_empty());
+    assert!(saved.routine_pins.is_some());
+    on_server(
+        db,
+        "CREATE OR REPLACE FUNCTION app.unused() RETURNS integer LANGUAGE sql AS 'SELECT 2'",
+    );
+    let out = succeeds(apply_plan(&d, db, &path, false));
+    assert!(stdout(&out).contains("nothing to apply"));
+    assert_eq!(
+        scalar(db, "SELECT count(*)::bigint FROM public.__pbps_state"),
+        1
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn empty_apply_checks_referenced_type_prerequisites_on_postgres_16() {
+    empty_apply_checks_referenced_type_prerequisites(
+        &std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"),
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn empty_apply_checks_referenced_type_prerequisites_on_postgres_18() {
+    empty_apply_checks_referenced_type_prerequisites(&server());
+}
