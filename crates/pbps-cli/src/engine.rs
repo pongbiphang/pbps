@@ -1304,7 +1304,10 @@ fn absence_unproven(missing: &[TableName], error: DbError) -> anyhow::Error {
 /// PostgreSQL's roles are the cluster's, which a plan refuses rather than
 /// creates (`refuse_missing_cluster_roles`), so a missing one is kept as
 /// before: taking its uid out would change no plan.
-pub async fn absent_roles(conn: &mut Conn, missing: &[String]) -> anyhow::Result<Vec<String>> {
+pub async fn absent_roles(
+    conn: &mut Conn,
+    missing: &[pbps_model::RoleName],
+) -> anyhow::Result<Vec<pbps_model::RoleName>> {
     if conn.driver() != Driver::Mssql || missing.is_empty() {
         return Ok(Vec::new());
     }
@@ -1314,7 +1317,10 @@ pub async fn absent_roles(conn: &mut Conn, missing: &[String]) -> anyhow::Result
             "cannot record role(s) {} as missing: the database holds a principal by that name \
              this login cannot see; record the state with a login that can see it, so a role \
              hidden from this one is not taken for one that is gone",
-            held.join(", ")
+            held.iter()
+                .map(|name| name.shown().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(missing.to_vec())
@@ -1359,7 +1365,9 @@ pub async fn principals_holding(
 
 /// Every user-defined role's members, for the `DROP ROLE` that has to remove
 /// them first (ADR-0005).
-pub async fn role_members(conn: &mut Conn) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
+pub async fn role_members(
+    conn: &mut Conn,
+) -> anyhow::Result<BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>>> {
     match conn.driver() {
         Driver::Mssql => Ok(pbps_mssql::catalog::role_members(conn).await?),
         Driver::Postgres => Err(roles_are_the_clusters("reading the role memberships")),
@@ -1370,7 +1378,7 @@ pub async fn role_members(conn: &mut Conn) -> anyhow::Result<BTreeMap<String, Ve
 /// drop the role over.
 pub async fn role_owned_securables(
     conn: &mut Conn,
-) -> anyhow::Result<BTreeMap<String, Vec<String>>> {
+) -> anyhow::Result<BTreeMap<pbps_model::RoleName, Vec<String>>> {
     match conn.driver() {
         Driver::Mssql => Ok(pbps_mssql::catalog::role_owned_securables(conn).await?),
         Driver::Postgres => Err(roles_are_the_clusters("reading what the roles own")),
@@ -1611,8 +1619,8 @@ pub fn owned_targets(
     driver: Driver,
     changes: &ChangeSet,
     ids: &pbps_model::IdsFile,
-    owners: &std::collections::BTreeMap<pbps_model::GrantTarget, String>,
-    session_role: &str,
+    owners: &std::collections::BTreeMap<pbps_model::GrantTarget, pbps_model::RoleName>,
+    session_role: &pbps_model::RoleName,
 ) -> anyhow::Result<ConnectedCheck> {
     // The map is empty on a reader that carries no owner, so the loop would
     // find nothing anyway — named here so that "this engine was not asked"
@@ -1684,20 +1692,24 @@ pub fn owned_targets(
         // read did not cover. Absent, not empty — and not something this
         // check can refuse on.
         let owner = if created.contains(target) {
-            (!session_role.is_empty()).then_some(session_role)
+            (!session_role.raw().is_empty()).then_some(session_role)
         } else {
-            owners
-                .get(&stored_grant_target(&names, target))
-                .map(String::as_str)
+            owners.get(&stored_grant_target(&names, target))
         };
-        if owner == Some(role.as_str()) {
+        if owner == Some(role) {
             let when = if created.contains(target) {
                 format!(
                     "role `{role}` will own `{target}`, because this plan creates it and \
-                         the role that runs the statements owns what they create (measured)"
+                         the role that runs the statements owns what they create (measured)",
+                    role = role.shown(),
+                    target = target.shown(),
                 )
             } else {
-                format!("role `{role}` owns `{target}`")
+                format!(
+                    "role `{role}` owns `{target}`",
+                    role = role.shown(),
+                    target = target.shown(),
+                )
             };
             impossible.push(format!(
                 "{when}, so `{}` on it is a grant that cannot change what the role holds: an \
@@ -1710,7 +1722,8 @@ pub fn owned_targets(
                     .iter()
                     .map(|p| p.as_str())
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                role = role.shown(),
             ));
         }
     }
@@ -1784,7 +1797,7 @@ pub fn unrevocable_grants(
                 && found.target == read_as
                 && permissions.contains(&found.permission)
             {
-                impossible.push(format!("role {role}: {}", found.why));
+                impossible.push(format!("role {role}: {}", found.why, role = role.shown(),));
             }
         }
     }
@@ -2662,7 +2675,7 @@ pub async fn permission_support(
         }),
         Driver::Postgres => {
             let version = pbps_pg::roles::server_version_num(conn).await?;
-            let mut roles: BTreeMap<String, pbps_model::Role> = BTreeMap::new();
+            let mut roles: BTreeMap<pbps_model::RoleName, pbps_model::Role> = BTreeMap::new();
             for planned in &changes.changes {
                 if let pbps_model::Change::Grant {
                     role,
@@ -3075,7 +3088,10 @@ pub async fn rename_impact(
 
 /// Bootstrap can build database roles, but cluster roles must already exist
 /// and still exist when its successful snapshot is recorded.
-pub fn refuse_missing_cluster_roles(driver: Driver, missing: &[String]) -> anyhow::Result<()> {
+pub fn refuse_missing_cluster_roles(
+    driver: Driver,
+    missing: &[pbps_model::RoleName],
+) -> anyhow::Result<()> {
     match driver {
         // Missing database roles are created by the SQL Server typed plan.
         Driver::Mssql => Ok(()),
@@ -3098,7 +3114,7 @@ pub fn refuse_missing_cluster_roles(driver: Driver, missing: &[String]) -> anyho
 /// Cluster-owned identities move before pbps plans their database grants.
 /// SQL Server moves its database roles through the typed statements instead.
 pub struct ExternalRoleRenames {
-    pub renames: BTreeMap<String, String>,
+    pub renames: BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
     pub check: ConnectedCheck,
 }
 
@@ -3147,7 +3163,7 @@ pub fn reconcile_cluster_roles(
     driver: Driver,
     recorded: &pbps_model::IdsFile,
     queried: &pbps_model::IdsFile,
-    renames: &BTreeMap<String, String>,
+    renames: &BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
     live: &Schema,
     expected: &mut Schema,
 ) -> anyhow::Result<ConnectedCheck> {
@@ -3165,7 +3181,9 @@ pub fn reconcile_cluster_roles(
                     || !recorded.roles.values().any(|old| old == *name)
             }) {
                 let Some(role) = live.roles.get(to) else {
-                    anyhow::bail!("missing_roles (PostgreSQL): declared cluster role `{to}` is missing; create or rename it first, then plan again");
+                    anyhow::bail!("missing_roles (PostgreSQL): declared cluster role `{to}` is missing; create or rename it first, then plan again",
+                        to = to.shown(),
+                    );
                 };
                 expected.roles.insert(to.clone(), role.clone());
                 checked += 1;
@@ -5223,14 +5241,23 @@ mod plan_name_tests {
             permissions: [Permission::Select].into(),
         }));
         let owners = [(stored.clone(), "owner".into())].into();
-        assert!(owned_targets(Driver::Postgres, &changes, &ids, &owners, "deployer").is_err());
+        assert!(
+            owned_targets(
+                Driver::Postgres,
+                &changes,
+                &ids,
+                &owners,
+                &pbps_model::RoleName::from("deployer")
+            )
+            .is_err()
+        );
         assert!(
             owned_targets(
                 Driver::Postgres,
                 &changes,
                 &ids,
                 &BTreeMap::new(),
-                "deployer"
+                &pbps_model::RoleName::from("deployer")
             )
             .is_ok()
         );

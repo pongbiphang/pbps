@@ -428,7 +428,7 @@ mod scope611 {
                 .await
                 .unwrap();
         assert_eq!(catalog.settings["language"].value, "Deutsch");
-        assert_eq!(authorization.principal.effective, login);
+        assert_eq!(authorization.principal.effective, login.clone().into());
         assert_eq!(authorization.language, "Deutsch");
 
         drop(deployer);
@@ -567,7 +567,7 @@ mod recon611 {
         let mut run = connect_live(&login_url(&run_login, "Pbps!Run611", &scratch.name))
             .await
             .unwrap();
-        enter(&mut run, map.deployer(&context).as_deref())
+        enter(&mut run, map.deployer(&context).as_ref())
             .await
             .unwrap();
         let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();
@@ -644,7 +644,7 @@ mod recon611 {
             context.schemas["app"]
                 .grants
                 .iter()
-                .any(|g| g.grantee == "Readers" && g.permission == "SELECT"),
+                .any(|g| g.grantee == "Readers".into() && g.permission == "SELECT"),
             "the role's grant is in the context: {:?}",
             context.schemas["app"].grants
         );
@@ -655,13 +655,13 @@ mod recon611 {
             // A name planned by several grants, and one in two casings, are
             // answered by one statement (#1016) and each keyed as planned.
             &[
-                "readers".to_owned(),
-                "PUBLIC".to_owned(),
-                "hidden".to_owned(),
-                "readers".to_owned(),
-                "auditors".to_owned(),
-                "READERS".to_owned(),
-                "readers".to_owned(),
+                "readers".into(),
+                "PUBLIC".into(),
+                "hidden".into(),
+                "readers".into(),
+                "auditors".into(),
+                "READERS".into(),
+                "readers".into(),
             ],
         )
         .await
@@ -670,7 +670,7 @@ mod recon611 {
             context
                 .spellings
                 .iter()
-                .map(|(a, b)| (a.as_str(), b.as_deref()))
+                .map(|(a, b)| (a.raw(), b.as_ref().map(pbps_model::RoleName::raw)))
                 .collect::<Vec<_>>(),
             [
                 ("PUBLIC", Some("public")),
@@ -690,7 +690,7 @@ mod recon611 {
         let short = resolve_spellings(
             &mut planning,
             &mut context,
-            &["readers".to_owned(), "hidden".to_owned()],
+            &["readers".to_owned().into(), "hidden".to_owned().into()],
         )
         .await
         .unwrap_err()
@@ -704,13 +704,13 @@ mod recon611 {
             &mut planning,
             &pbps_mssql::resolver::environment::Scope { schemas: &schemas },
             &schemas,
-            &["readers".to_owned(), "PUBLIC".to_owned()],
+            &["readers".to_owned().into(), "PUBLIC".to_owned().into()],
         )
         .await
         .unwrap();
         assert_eq!(
             bracketed.spellings.get("readers"),
-            Some(&Some("Readers".to_owned()))
+            Some(&Some("Readers".into()))
         );
 
         let planned: Vec<PlannedGrant> = ["readers", "PUBLIC"]
@@ -746,7 +746,7 @@ mod recon611 {
         let mut run = connect_live(&login_url(&run_login, "Pbps!Run726", &scratch.name))
             .await
             .unwrap();
-        enter(&mut run, map.deployer(&context).as_deref())
+        enter(&mut run, map.deployer(&context).as_ref())
             .await
             .unwrap();
         let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();
@@ -786,7 +786,7 @@ mod recon611 {
         // #1013: a planned principal the catalog spells exactly as planned is
         // recorded too, so dropping it after the scope was read moves the
         // sealed context instead of reading back as the same empty answer.
-        let watched = ["watchers".to_owned()];
+        let watched = [pbps_model::RoleName::from("watchers")];
         let scope = pbps_mssql::resolver::environment::Scope { schemas: &schemas };
         let (_, before) =
             pbps_mssql::resolver::scope_facts(&mut planning, &scope, &schemas, &watched)
@@ -794,7 +794,7 @@ mod recon611 {
                 .unwrap();
         assert_eq!(
             before.spellings.get("watchers"),
-            Some(&Some("watchers".to_owned()))
+            Some(&Some("watchers".into()))
         );
         target.conn.execute("DROP ROLE watchers;").await.unwrap();
         let (_, after) =
@@ -854,7 +854,7 @@ mod recon611 {
             context
                 .database_grants
                 .iter()
-                .any(|g| g.grantee == "public" && g.permission == "CREATE VIEW"),
+                .any(|g| g.grantee == "public".into() && g.permission == "CREATE VIEW"),
             "{:?}",
             context.database_grants
         );
@@ -878,7 +878,7 @@ mod recon611 {
         let mut run = connect_live(&login_url(&run_login, "Pbps!Run611", &scratch.name))
             .await
             .unwrap();
-        enter(&mut run, map.deployer(&context).as_deref())
+        enter(&mut run, map.deployer(&context).as_ref())
             .await
             .unwrap();
         let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();
@@ -954,7 +954,14 @@ mod recon611 {
         let seen = |grants: &[pbps_mssql::resolver::authorization::Grant]| {
             grants
                 .iter()
-                .map(|g| format!("{} {} by {}", g.grantee, g.permission, g.grantor))
+                .map(|g| {
+                    format!(
+                        "{} {} by {}",
+                        g.grantee.raw(),
+                        g.permission,
+                        g.grantor.raw()
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         assert_eq!(
@@ -970,7 +977,7 @@ mod recon611 {
             context
                 .database_grants
                 .iter()
-                .all(|g| g.grantee != "dbg" && g.grantee != "wgo")
+                .all(|g| g.grantee != "dbg".into() && g.grantee != "wgo".into())
         );
 
         scratch
@@ -989,7 +996,7 @@ mod recon611 {
         let mut run = connect_live(&login_url(&run_login, "Pbps!Run611", &scratch.name))
             .await
             .unwrap();
-        enter(&mut run, map.deployer(&context).as_deref())
+        enter(&mut run, map.deployer(&context).as_ref())
             .await
             .unwrap();
         let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();
@@ -1088,7 +1095,7 @@ mod recon611 {
             .await
             .unwrap();
         let context = read(&mut planning, &schemas).await.unwrap();
-        assert_eq!(context.principal.effective, dep);
+        assert_eq!(context.principal.effective, dep.clone().into());
         assert!(!context.principal.superuser);
         assert_eq!(context.default_schema, "app");
         assert_eq!(context.language, "Deutsch");
@@ -1096,12 +1103,12 @@ mod recon611 {
             context
                 .roles
                 .iter()
-                .map(|(n, f)| (n.as_str(), *f))
+                .map(|(n, f)| (n.raw(), *f))
                 .collect::<Vec<_>>(),
             [("db_ddladmin", true), ("readers", false)]
         );
         assert!(context.impersonation.contains("other"));
-        assert_eq!(context.schemas["app"].owner, "app_owner");
+        assert_eq!(context.schemas["app"].owner, "app_owner".into());
         assert!(context.schemas["app"].permissions.contains("SELECT"));
         assert!(context.schemas["app"].permissions.contains("REFERENCES"));
         // The DENY wins over the role's grant in the engine's own answer.
@@ -1110,7 +1117,7 @@ mod recon611 {
             context.schemas["denied"]
                 .grants
                 .iter()
-                .any(|g| g.grantee == dep && g.state == "DENY"),
+                .any(|g| g.grantee == dep.clone().into() && g.state == "DENY"),
             "{:?}",
             context.schemas["denied"].grants
         );
@@ -1137,7 +1144,7 @@ mod recon611 {
         assert!(
             map.run_local_names()
                 .iter()
-                .all(|name| name.starts_with("pbps_principal_"))
+                .all(|name| name.raw().starts_with("pbps_principal_"))
         );
         reconstruct(&mut scratch.conn, &map, &context, &run_login)
             .await
@@ -1164,12 +1171,12 @@ mod recon611 {
         );
         let deployer = map.deployer(&context);
         assert!(deployer.is_some());
-        enter(&mut run, deployer.as_deref()).await.unwrap();
+        enter(&mut run, deployer.as_ref()).await.unwrap();
         // Every later check enters again. On a session already running as
         // the deployer that is a no-op, not one more impersonation context on
         // the stack: the engine refuses the 33rd.
         for _ in 0..40 {
-            enter(&mut run, deployer.as_deref()).await.unwrap();
+            enter(&mut run, deployer.as_ref()).await.unwrap();
         }
         let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();
         assert!(
@@ -1195,7 +1202,10 @@ mod recon611 {
                 .try_get::<&str>("grantor")
                 .unwrap()
                 .map(str::to_owned),
-            deployer,
+            deployer
+                .as_ref()
+                .map(pbps_model::RoleName::raw)
+                .map(str::to_owned),
             "the planned grant is recorded under the reproduced deployer"
         );
         let unusable = [PlannedGrant {
@@ -1218,7 +1228,7 @@ mod recon611 {
             .conn
             .execute(&format!(
                 "DENY SELECT ON SCHEMA::app TO [{}];",
-                deployer.clone().unwrap()
+                deployer.as_ref().unwrap().raw()
             ))
             .await
             .unwrap();
@@ -1256,7 +1266,7 @@ mod recon611 {
         let schemas = ["app".to_owned(), "dbo".to_owned()];
         let context = read(&mut target.conn, &schemas).await.unwrap();
         assert!(context.principal.superuser);
-        assert_eq!(context.principal.effective, "dbo");
+        assert_eq!(context.principal.effective.raw(), "dbo");
         assert!(context.roles.is_empty() && context.database_grants.is_empty());
         assert!(context.schemas["app"].permissions.contains("CONTROL"));
 
@@ -1340,18 +1350,18 @@ mod recon611 {
         // The premise: the class-4 grant is what shows the role's row, and
         // the role the deployer holds nothing on stays hidden.
         assert!(
-            app.iter().any(|g| g.grantee == "Readers"),
+            app.iter().any(|g| g.grantee == "Readers".into()),
             "the role's row is visible through VIEW DEFINITION: {app:?}"
         );
         assert!(
-            !app.iter().any(|g| g.grantee == "Writers"),
+            !app.iter().any(|g| g.grantee == "Writers".into()),
             "a role the deployer holds nothing on is hidden: {app:?}"
         );
         // Owning a role shows its rows with no grant on it at all, whether
         // the deployer owns it or a role the deployer is in does.
         for owned in ["Kept", "Led"] {
             assert!(
-                app.iter().any(|g| g.grantee == owned),
+                app.iter().any(|g| g.grantee == owned.into()),
                 "{owned}'s row is visible through ownership: {app:?}"
             );
         }
@@ -1360,9 +1370,9 @@ mod recon611 {
             .iter()
             .map(|g| {
                 (
-                    g.on.as_str(),
+                    g.on.raw(),
                     context.principals.get(&g.on).copied(),
-                    g.grant.grantor.as_str(),
+                    g.grant.grantor.raw(),
                     g.grant.permission.as_str(),
                     g.grant.state.as_str(),
                 )
@@ -1383,9 +1393,9 @@ mod recon611 {
                 ("auditor", None, "auditor", "VIEW DEFINITION", "DENY"),
             ]
         );
-        assert_eq!(context.principal_owners["Owned"], "Leads");
-        assert_eq!(context.principal_owners["Kept"], dep);
-        assert_eq!(context.principal_owners["Led"], "Leads");
+        assert_eq!(context.principal_owners["Owned"], "Leads".into());
+        assert_eq!(context.principal_owners["Kept"], dep.clone().into());
+        assert_eq!(context.principal_owners["Led"], "Leads".into());
         // `dbo` owns every role scratch creates, so it is not recorded.
         assert!(!context.principal_owners.contains_key("Readers"));
 
@@ -1405,7 +1415,7 @@ mod recon611 {
         let mut run = connect_live(&login_url(&run_login, "Pbps!Run1011", &scratch.name))
             .await
             .unwrap();
-        enter(&mut run, map.deployer(&context).as_deref())
+        enter(&mut run, map.deployer(&context).as_ref())
             .await
             .unwrap();
         let differences = verify(&mut run, &map, &context, &schemas).await.unwrap();

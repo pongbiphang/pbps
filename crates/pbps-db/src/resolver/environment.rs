@@ -333,7 +333,7 @@ pub struct DeploymentPrincipal {
     /// `session_user`: who authenticated.
     pub login: String,
     /// `current_user`: who statements run as, after any role switch.
-    pub effective: String,
+    pub effective: pbps_model::RoleName,
     pub superuser: bool,
 }
 

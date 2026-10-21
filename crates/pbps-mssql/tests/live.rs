@@ -4191,7 +4191,7 @@ async fn a_grant_on_a_system_object_is_reported_with_its_name_not_as_unnameable(
     let targets: Vec<String> = pulled.schema.roles["app_reader"]
         .grants
         .keys()
-        .map(ToString::to_string)
+        .map(|name| name.raw().to_string())
         .collect();
     assert_eq!(targets, ["dbo.customer"], "{said}");
     // The system object is not a table pbps models, so the grant on it is
@@ -8850,7 +8850,7 @@ async fn a_granted_target_whose_name_is_reused_is_an_unconditional_gap() {
             "app.old_name".parse().unwrap(),
         ],
         schemas: vec![],
-        roles: vec!["app_writer".to_owned()],
+        roles: vec!["app_writer".to_owned().into()],
         ..Default::default()
     };
 
@@ -12616,7 +12616,7 @@ async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_run
 
     let grant = |schema: &str| pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-            role: "reader".to_owned(),
+            role: "reader".to_owned().into(),
             target: pbps_model::GrantTarget::Schema(schema.to_owned()),
             permissions: [pbps_model::Permission::Select].into_iter().collect(),
         })],
@@ -12662,7 +12662,7 @@ async fn a_grant_on_a_schema_the_database_does_not_have_is_counted_before_it_run
     // creates it: no probe, and none wanted.
     let object = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(pbps_model::Change::Revoke {
-            role: "reader".to_owned(),
+            role: "reader".to_owned().into(),
             target: pbps_model::GrantTarget::Object(TableName::new("app", "t")),
             permissions: [pbps_model::Permission::Select].into_iter().collect(),
         })],
@@ -13334,7 +13334,7 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         .insert(TableName::new("dbo", "customer"), customer);
     declared
         .roles
-        .insert("app_reader".to_owned(), reader.clone());
+        .insert("app_reader".to_owned().into(), reader.clone());
     let ids = mint_ids(&declared, &IdsFile::default(), &[]);
     assert_eq!(ids.roles.len(), 1);
 
@@ -13385,7 +13385,8 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         again
             .unexpressible
             .iter()
-            .any(|u| u.role == "app_reader" && u.what.contains("CREATE TABLE on the database")),
+            .any(|u| u.role == "app_reader".into()
+                && u.what.contains("CREATE TABLE on the database")),
         "{:?}",
         again.unexpressible
     );
@@ -13395,7 +13396,7 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         again
             .unexpressible
             .iter()
-            .any(|u| u.role == "app_reader" && u.what.contains("DENY DELETE")),
+            .any(|u| u.role == "app_reader".into() && u.what.contains("DENY DELETE")),
         "{:?}",
         again.unexpressible
     );
@@ -13404,9 +13405,12 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     // is reported as unexpressible, where a drift check has to see it
     // (DECISIONS 95). The catalog spells the state `W`; measured here.
     assert!(
-        again.unexpressible.iter().any(|u| u.role == "app_reader"
-            && u.what.contains("UPDATE")
-            && u.what.contains("WITH GRANT OPTION")),
+        again
+            .unexpressible
+            .iter()
+            .any(|u| u.role == "app_reader".into()
+                && u.what.contains("UPDATE")
+                && u.what.contains("WITH GRANT OPTION")),
         "{:?}",
         again.unexpressible
     );
@@ -13460,19 +13464,19 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         .expect("a member");
     let mut renamed = declared.clone();
     let role = renamed.roles.remove("app_reader").unwrap();
-    renamed.roles.insert("reader".to_owned(), role);
+    renamed.roles.insert("reader".to_owned().into(), role);
     let renamed_ids = mint_ids(
         &renamed,
         &ids,
         &[Intent::RenameRole {
-            from: "app_reader".to_owned(),
-            to: "reader".to_owned(),
+            from: "app_reader".to_owned().into(),
+            to: "reader".to_owned().into(),
         }],
     );
     assert_eq!(renamed_ids.roles, {
         let mut r = ids.roles.clone();
         for v in r.values_mut() {
-            *v = "reader".to_owned();
+            *v = "reader".to_owned().into();
         }
         r
     });
@@ -13507,12 +13511,12 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
     let found = pbps_mssql::catalog::role_members(&mut db.conn)
         .await
         .expect("members");
-    assert_eq!(found.get("reader"), Some(&vec!["pbps_member".to_owned()]));
+    assert_eq!(found.get("reader"), Some(&vec!["pbps_member".into()]));
     let drop = pbps_model::ChangeSet {
         changes: vec![pbps_model::PlannedChange::new(
             pbps_model::Change::DropRole {
                 uid: renamed_ids.roles.keys().next().unwrap().clone(),
-                name: "reader".to_owned(),
+                name: "reader".to_owned().into(),
                 members: found["reader"].clone(),
             },
         )],
@@ -13884,7 +13888,9 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
         pbps_model::GrantTarget::Schema("legacy".to_owned()),
         [pbps_model::Permission::Select].into_iter().collect(),
     );
-    recorded.roles.insert("app_reader".to_owned(), app_reader);
+    recorded
+        .roles
+        .insert("app_reader".to_owned().into(), app_reader);
     pbps_mssql::state::ensure_tables(&mut db.conn)
         .await
         .expect("ledger");
@@ -13901,7 +13907,7 @@ async fn the_readiness_check_asks_for_role_permissions_only_where_a_role_is_gran
     .expect("record the state with the role");
     let managed = pbps_mssql::doctor::GrantTargets {
         permissions: Default::default(),
-        roles: vec!["app_reader".to_owned()],
+        roles: vec!["app_reader".to_owned().into()],
         ..targets.clone()
     };
     let held = pbps_mssql::doctor::permissions(
@@ -14509,7 +14515,7 @@ async fn an_object_name_holding_a_dot_or_a_bracket_is_asked_about_as_named() {
         schemas: vec![],
         // The role's own grant on `dbo.[a.b]` reaches the question through
         // the catalog, spelled by `sys.objects`, not by these declarations.
-        roles: vec!["app".to_owned()],
+        roles: vec!["app".to_owned().into()],
         ..Default::default()
     };
     let held = pbps_mssql::doctor::permissions(
@@ -17521,7 +17527,7 @@ async fn doctor_reads_the_permissions_of_more_schemas_than_one_statement_can_bin
     // the managed roles themselves, each past the ceiling alone.
     let granted = pbps_mssql::doctor::GrantTargets {
         schemas: schemas.clone(),
-        roles: (0..count).map(|i| format!("r{i}")).collect(),
+        roles: (0..count).map(|i| format!("r{i}").into()).collect(),
         ..Default::default()
     };
     let held = pbps_mssql::doctor::permissions(
@@ -18045,5 +18051,62 @@ async fn rename_chains_report_each_identity_once_without_changing_dependency_dec
             );
         }
     }
+    db.drop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs live SQL Server"]
+async fn role_catalog_keeps_raw_owner_grantee_and_grantor_identity() {
+    let mut db = TestDb::create("role_name").await;
+    let owner = pbps_model::RoleName::from("role\nowner\r\u{1b}[31m\u{9b}\u{202e}名前");
+    let reader = pbps_model::RoleName::from("role\nreader\r\u{1b}[31m\u{9b}\u{202e}名前");
+    let qo = pbps_mssql::Mssql.quote_ident(owner.raw()).unwrap();
+    let qr = pbps_mssql::Mssql.quote_ident(reader.raw()).unwrap();
+    db.conn
+        .execute(&format!("CREATE ROLE {qo}; CREATE ROLE {qr};"))
+        .await
+        .unwrap();
+    db.conn
+        .execute(&format!("CREATE SCHEMA role_names AUTHORIZATION {qo};"))
+        .await
+        .unwrap();
+    db.conn.execute(&format!("CREATE TABLE role_names.t (id int); GRANT SELECT ON SCHEMA::role_names TO {qr} AS {qo}; ALTER ROLE {qo} ADD MEMBER {qr};")).await.unwrap();
+    let pulled = pbps_mssql::catalog::introspect(&mut db.conn).await.unwrap();
+    assert!(
+        pulled.schema.roles[reader.raw()]
+            .grants
+            .contains_key(&"schema::role_names".parse().unwrap())
+    );
+    assert!(
+        !pulled
+            .schema
+            .roles
+            .contains_key(reader.shown().to_string().as_str())
+    );
+    let auth = pbps_mssql::resolver::authorization::read(&mut db.conn, &["role_names".into()])
+        .await
+        .unwrap();
+    assert_eq!(auth.schemas["role_names"].owner, owner);
+    assert!(
+        auth.schemas["role_names"]
+            .grants
+            .iter()
+            .any(|g| g.grantee == reader && g.grantor == owner)
+    );
+    let members = pbps_mssql::catalog::role_members(&mut db.conn)
+        .await
+        .unwrap();
+    assert_eq!(members[owner.raw()], vec![reader.clone()]);
+    let owned = pbps_mssql::catalog::role_owned_securables(&mut db.conn)
+        .await
+        .unwrap();
+    assert!(owned.contains_key(owner.raw()));
+    let absent = pbps_model::RoleName::from(reader.shown().to_string());
+    assert_eq!(
+        pbps_mssql::catalog::held_principals(&mut db.conn, &[reader.clone(), absent])
+            .await
+            .unwrap(),
+        vec![reader]
+    );
     db.drop().await;
 }

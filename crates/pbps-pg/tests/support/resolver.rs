@@ -651,19 +651,19 @@ mod auth610 {
 
         let context = read(&mut planning, &schemas).await.unwrap();
         // The deployer is the planning connection's user, not a superuser.
-        assert_eq!(context.principal.effective, dep);
+        assert_eq!(context.principal.effective, dep.clone().into());
         assert_eq!(context.principal.login, dep);
         assert!(!context.principal.superuser);
         // The engine's own effective answers: USAGE via the inherited reader,
         // no CREATE. In-scope object privileges are #613, not captured here.
         let app = &context.schemas["app"];
-        assert_eq!(app.owner, owner);
+        assert_eq!(app.owner, owner.clone().into());
         assert!(app.privileges["USAGE"]);
         assert!(!(app.privileges["CREATE"]));
         // The owner is switchable (SET, no inherit); the reader is inherited.
-        assert!(context.roles[&owner].can_set);
-        assert!(!context.roles[&owner].inherits);
-        assert!(context.roles[&reader].inherits);
+        assert!(context.roles[owner.as_str()].can_set);
+        assert!(!context.roles[owner.as_str()].inherits);
+        assert!(context.roles[reader.as_str()].inherits);
         // The database-role search_path pin is part of the context.
         assert_eq!(
             context
@@ -821,7 +821,7 @@ mod auth688 {
         assert_eq!(shown, "login_path", "the engine keeps the login's default");
         let context = read(&mut planning, &[]).await.unwrap();
         assert_eq!(context.principal.login, login);
-        assert_eq!(context.principal.effective, effective);
+        assert_eq!(context.principal.effective, effective.clone().into());
         assert_eq!(
             context.settings.get("role:search_path").map(String::as_str),
             Some("login_path"),
@@ -1011,10 +1011,10 @@ mod recon610 {
             "{:?}",
             target.schemas["public"]
         );
-        assert_eq!(target.schemas["public"].owner, owner);
+        assert_eq!(target.schemas["public"].owner, owner.clone().into());
         assert!(!target.schemas["information_schema"].privileges["USAGE"]);
         assert!(!target.schemas["information_schema"].privileges["CREATE"]);
-        assert_eq!(target.schemas["mine"].owner, dep);
+        assert_eq!(target.schemas["mine"].owner, dep.clone().into());
         assert!(target.schemas["mine"].privileges["USAGE"]);
         assert!(!target.schemas["mine"].privileges["CREATE"]);
         assert_eq!(
@@ -1032,7 +1032,7 @@ mod recon610 {
         assert!(
             target.schemas["secret"].acl[&reader]
                 .iter()
-                .any(|g| g.privilege == "USAGE" && g.grantor == dep),
+                .any(|g| g.privilege == "USAGE" && g.grantor == dep.clone().into()),
             "{:?}",
             target.schemas["secret"].acl
         );
@@ -1044,12 +1044,12 @@ mod recon610 {
         assert!(
             map.run_local_names()
                 .iter()
-                .all(|n| n.starts_with("pbps_role_"))
+                .all(|n| n.raw().starts_with("pbps_role_"))
         );
         assert!(
             !map.run_local_names()
                 .iter()
-                .any(|n| [&dep, &owner, &reader].contains(&n))
+                .any(|n| [dep.as_str(), owner.as_str(), reader.as_str()].contains(&n.raw()))
         );
         let mut scratch_admin =
             Conn::connect(Driver::Postgres, &format!("{server} dbname={scratch_db}"))
@@ -1074,14 +1074,22 @@ mod recon610 {
             // to each until current_user changes to a covered role.
             let mut found = None;
             for candidate in &names {
-                if run.execute(&format!("SET ROLE {candidate}")).await.is_ok() {
+                if run
+                    .execute(&format!(
+                        "SET ROLE {candidate}",
+                        // Preserve the original spelling in this SQL or comparison fixture.
+                        candidate = candidate.raw(),
+                    ))
+                    .await
+                    .is_ok()
+                {
                     let who = run.query("SELECT current_user AS u").await.unwrap()[0]
                         .try_get::<&str>("u")
                         .unwrap()
                         .unwrap()
                         .to_owned();
                     run.execute("RESET ROLE").await.unwrap();
-                    if who == *candidate {
+                    if who == candidate.raw() {
                         found = Some(candidate.clone());
                         break;
                     }
@@ -1089,9 +1097,13 @@ mod recon610 {
             }
             found.expect("the run login can become the mapped deployer")
         };
-        run.execute(&format!("SET ROLE {mapped_deployer}"))
-            .await
-            .unwrap();
+        run.execute(&format!(
+            "SET ROLE {mapped_deployer}",
+            // Preserve the original spelling in this SQL or comparison fixture.
+            mapped_deployer = mapped_deployer.raw(),
+        ))
+        .await
+        .unwrap();
         let differences = verify(&mut run, &map, &target, &schemas).await.unwrap();
         assert!(
             differences.is_empty(),
@@ -1196,7 +1208,7 @@ mod recon610 {
             .await
             .unwrap();
         let narrowed = read(&mut planning, &schemas).await.unwrap();
-        assert!(!narrowed.roles.contains_key(&owner));
+        assert!(!narrowed.roles.contains_key(owner.as_str()));
         let stale = verify(&mut run, &map, &narrowed, &schemas).await.unwrap();
         assert!(stale.contains(&format!("role:{owner}:extra")), "{stale:?}");
         // And the other way: a role the target lists and the reproduction
@@ -1204,7 +1216,7 @@ mod recon610 {
         let mut widened = narrowed.clone();
         widened.roles.insert(
             "a_role_only_the_target_has".into(),
-            widened.roles[&reader].clone(),
+            widened.roles[reader.as_str()].clone(),
         );
         let absent = verify(&mut run, &map, &widened, &schemas).await.unwrap();
         assert!(
@@ -1223,7 +1235,14 @@ mod recon610 {
                 .unwrap();
         }
         for role in map.run_local_names() {
-            admin.execute(&format!("DROP ROLE {role}")).await.unwrap();
+            admin
+                .execute(&format!(
+                    "DROP ROLE {role}",
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    role = role.raw(),
+                ))
+                .await
+                .unwrap();
         }
         for role in [&run_login, &dep, &owner, &reader] {
             admin.execute(&format!("DROP ROLE {role}")).await.unwrap();
@@ -1281,7 +1300,7 @@ mod recon610_public {
         // The default public schema: owned by pg_database_owner, USAGE to
         // PUBLIC, no CREATE for the deployer.
         let target = read(&mut planning, &schemas).await.unwrap();
-        assert_eq!(target.schemas["public"].owner, "pg_database_owner");
+        assert_eq!(target.schemas["public"].owner, "pg_database_owner".into());
         assert!(target.schemas["public"].privileges["USAGE"]);
         assert!(!target.schemas["public"].privileges["CREATE"]);
         assert!(target.schemas["public"].acl.contains_key("PUBLIC"));
@@ -1303,9 +1322,13 @@ mod recon610_public {
         .await
         .unwrap();
         let deployer_role = map.deployer(&target).unwrap();
-        run.execute(&format!("SET ROLE \"{deployer_role}\""))
-            .await
-            .unwrap();
+        run.execute(&format!(
+            "SET ROLE \"{deployer_role}\"",
+            // Preserve the original spelling in this SQL or comparison fixture.
+            deployer_role = deployer_role.raw(),
+        ))
+        .await
+        .unwrap();
         assert!(
             verify(&mut run, &map, &target, &schemas)
                 .await
@@ -1353,7 +1376,11 @@ mod recon610_public {
         }
         for role in map.run_local_names() {
             admin
-                .execute(&format!("DROP ROLE IF EXISTS \"{role}\""))
+                .execute(&format!(
+                    "DROP ROLE IF EXISTS \"{role}\"",
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    role = role.raw(),
+                ))
                 .await
                 .unwrap();
         }
@@ -1407,7 +1434,7 @@ mod recon610_super {
         let mut planning = Conn::connect(Driver::Postgres, &server).await.unwrap();
         let target = read(&mut planning, &schemas).await.unwrap();
         assert!(target.principal.superuser);
-        assert_eq!(target.schemas["public"].owner, "pg_database_owner");
+        assert_eq!(target.schemas["public"].owner, "pg_database_owner".into());
         assert!(target.schemas[&fresh].acl.is_empty());
 
         let planned = [PlannedGrant {
@@ -1439,9 +1466,13 @@ mod recon610_super {
         .await
         .unwrap();
         let deployer = map.deployer(&target).unwrap();
-        run.execute(&format!("SET ROLE \"{deployer}\""))
-            .await
-            .unwrap();
+        run.execute(&format!(
+            "SET ROLE \"{deployer}\"",
+            // Preserve the original spelling in this SQL or comparison fixture.
+            deployer = deployer.raw(),
+        ))
+        .await
+        .unwrap();
         let differences = verify(&mut run, &map, &target, &schemas).await.unwrap();
         assert!(
             differences.is_empty(),
@@ -1469,12 +1500,20 @@ mod recon610_super {
         let dropped = narrowed
             .roles
             .keys()
-            .find(|role| **role != target.principal.effective && !role.starts_with("pg_"))
+            .find(|role| **role != target.principal.effective && !role.raw().starts_with("pg_"))
             .cloned()
             .expect("the run login is in a superuser's closure");
         narrowed.roles.remove(&dropped);
         let extra = verify(&mut run, &map, &narrowed, &schemas).await.unwrap();
-        assert_eq!(extra, [format!("role:{dropped}:extra")], "{extra:?}");
+        assert_eq!(
+            extra,
+            [format!(
+                "role:{dropped}:extra",
+                // Preserve the original spelling in this SQL or comparison fixture.
+                dropped = dropped.raw(),
+            )],
+            "{extra:?}"
+        );
         let mut widened = expected.clone();
         widened.roles.insert(
             "a_role_only_the_target_has".into(),
@@ -1500,7 +1539,11 @@ mod recon610_super {
             .unwrap();
         for role in map.run_local_names() {
             admin
-                .execute(&format!("DROP ROLE IF EXISTS \"{role}\""))
+                .execute(&format!(
+                    "DROP ROLE IF EXISTS \"{role}\"",
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    role = role.raw(),
+                ))
                 .await
                 .unwrap();
         }
@@ -1550,7 +1593,7 @@ mod recon2049 {
             },
             schemas: BTreeMap::new(),
             roles: (0..ROLES)
-                .map(|i| (format!("crowd_{i:05}"), attributes.clone()))
+                .map(|i| (format!("crowd_{i:05}").into(), attributes.clone()))
                 .collect(),
             settings: BTreeMap::new(),
         }
@@ -1578,10 +1621,10 @@ mod recon2049 {
     }
 
     /// How many of `names` exist on the server.
-    async fn existing(admin: &mut Conn, names: &[String]) -> usize {
+    async fn existing(admin: &mut Conn, names: &[pbps_model::RoleName]) -> usize {
         let list = names
             .iter()
-            .map(|name| format!("'{name}'"))
+            .map(|name| format!("'{}'", name.raw()))
             .collect::<Vec<_>>()
             .join(", ");
         let rows = admin
@@ -1612,7 +1655,11 @@ mod recon2049 {
         // name on a shared server can be.
         let taken = names[ROLE_BATCH + ROLE_BATCH / 2].clone();
         admin
-            .execute(&format!("CREATE ROLE \"{taken}\""))
+            .execute(&format!(
+                "CREATE ROLE \"{taken}\"",
+                // Preserve the original spelling in this SQL or comparison fixture.
+                taken = taken.raw(),
+            ))
             .await
             .unwrap();
         let outcome = reconstruct(&mut admin, &map, &context(), "pbps_test").await;
@@ -1627,7 +1674,7 @@ mod recon2049 {
         // The engine's own sentence for the statement that failed, naming the
         // role: a batch does not swallow or rewrite it.
         assert!(
-            error.contains(&taken) && error.contains("already exists"),
+            error.contains(taken.raw()) && error.contains("already exists"),
             "{error}"
         );
         // The first batch was committed, so it is there to be dropped; the
@@ -1662,7 +1709,9 @@ mod recon2049 {
         let owner = names[ROLE_BATCH + 7].clone();
         admin
             .execute(&format!(
-                "CREATE TABLE public.{table} (c int); ALTER TABLE public.{table} OWNER TO \"{owner}\""
+                "CREATE TABLE public.{table} (c int); ALTER TABLE public.{table} OWNER TO \"{owner}\"",
+                // Preserve the original spelling in this SQL or comparison fixture.
+                owner = owner.raw(),
             ))
             .await
             .unwrap();

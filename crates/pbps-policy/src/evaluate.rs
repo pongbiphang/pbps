@@ -447,7 +447,8 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                 permissions,
             } = &p.change
             {
-                let subject = format!("role {role}");
+                // Raw subject key; reports escape it until #2084 step 5.
+                let subject = format!("role {}", role.raw());
                 out.extend(
                     live.finding(
                         Some(&subject),
@@ -457,7 +458,11 @@ pub fn plan(cs: &ChangeSet, policies: &Policies, ctx: &Context) -> Vec<(usize, F
                                 .iter()
                                 .map(|p| p.as_str())
                                 .collect::<Vec<_>>()
-                                .join(", ")
+                                .join(", "),
+                            // Shared finding sentence, escaped whole until #2084 step 5.
+                            role = role.raw(),
+                            // Shared finding sentence, escaped whole until #2084 step 5.
+                            target = target.raw(),
                         ),
                     )
                     .map(|f| (i, f)),
@@ -564,6 +569,44 @@ pub fn parse_window(s: &str) -> Result<Window, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn grant_policy_keys_and_shared_sentences_keep_raw_role_and_target_names() {
+        let name = "role\nline\\path\u{202e}名前";
+        let change = PlannedChange::new(Change::Grant {
+            role: name.into(),
+            target: pbps_model::GrantTarget::Schema(name.into()),
+            permissions: [pbps_model::Permission::Usage].into(),
+        });
+        let changes = cs(vec![change]);
+        let context = ctx();
+        let findings = plan(&changes, &Policies::default(), &context);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].1.subject.as_deref(),
+            Some(format!("role {name}").as_str())
+        );
+        assert_eq!(
+            findings[0].1.message,
+            format!("role {name} gains usage on schema::{name}")
+        );
+        let suppressed = |on: &str| {
+            serde_json::from_value::<Policies>(serde_json::json!({"suppress": [
+                {"rule": "grant.widen", "on": on, "reason": "approved"}
+            ]}))
+            .unwrap()
+        };
+        assert!(plan(&changes, &suppressed(&format!("role {name}")), &context).is_empty());
+        assert_eq!(
+            plan(
+                &changes,
+                &suppressed(r"role role\nline\\path\u{202e}名前"),
+                &context
+            )
+            .len(),
+            1
+        );
+    }
     #[test]
     fn declaration_policy_subjects_match_raw_changed_subject_keys() {
         let part = "a\nb\\c\u{200b}";

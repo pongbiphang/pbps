@@ -47,7 +47,7 @@ const PUBLIC_GRANTEE: &str = "PUBLIC";
 pub struct Entry {
     /// A role name, or `PUBLIC`.
     pub grantee: String,
-    pub grantor: String,
+    pub grantor: pbps_model::RoleName,
     pub privilege: String,
     pub grantable: bool,
 }
@@ -64,7 +64,7 @@ impl std::fmt::Display for Entry {
             } else {
                 ""
             },
-            self.grantor
+            self.grantor.shown()
         )
     }
 }
@@ -106,7 +106,7 @@ impl Standard {
     fn public_acl(&self) -> BTreeSet<Entry> {
         let entry = |grantee: &str, privilege: &str| Entry {
             grantee: grantee.to_owned(),
-            grantor: PUBLIC_OWNER.to_owned(),
+            grantor: PUBLIC_OWNER.into(),
             privilege: privilege.to_owned(),
             grantable: false,
         };
@@ -129,7 +129,7 @@ impl Standard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Public {
     pub name: String,
-    pub owner: String,
+    pub owner: pbps_model::RoleName,
     pub acl: BTreeSet<Entry>,
     pub comment: Option<String>,
 }
@@ -138,7 +138,7 @@ pub struct Public {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct State {
     pub database: String,
-    pub owner: String,
+    pub owner: pbps_model::RoleName,
     /// `None` once `public` was dropped: nothing the run can put back.
     pub public: Option<Public>,
     pub connection_limit: i32,
@@ -208,7 +208,7 @@ async fn acl(conn: &mut impl QueryConnection, from: &str) -> Result<BTreeSet<Ent
     .map(|row| {
         Ok(Entry {
             grantee: text(row, "grantee")?,
-            grantor: text(row, "grantor")?,
+            grantor: text(row, "grantor")?.into(),
             privilege: text(row, "privilege")?,
             grantable: text(row, "grantable")? == "true",
         })
@@ -275,7 +275,7 @@ pub async fn read_state(conn: &mut impl QueryConnection) -> Result<State, DbErro
         None => None,
         Some(found) => Some(Public {
             name: text(found, "name")?,
-            owner: text(found, "owner")?,
+            owner: text(found, "owner")?.into(),
             comment: optional(found, "comment")?,
             acl: acl(
                 conn,
@@ -291,7 +291,7 @@ pub async fn read_state(conn: &mut impl QueryConnection) -> Result<State, DbErro
     };
     Ok(State {
         database: text(&row, "database")?,
-        owner: text(&row, "owner")?,
+        owner: text(&row, "owner")?.into(),
         public,
         connection_limit,
         template: text(&row, "template")? == "true",
@@ -316,8 +316,11 @@ pub fn differences(
             if public.name != "public" {
                 found.push(format!("schema public is named {}", public.name));
             }
-            if public.owner != PUBLIC_OWNER {
-                found.push(format!("schema public is owned by {}", public.owner));
+            if public.owner.raw() != PUBLIC_OWNER {
+                found.push(format!(
+                    "schema public is owned by {}",
+                    public.owner.shown()
+                ));
             }
             let expected = standard.public_acl();
             found.extend(
@@ -530,7 +533,7 @@ async fn enforce_in(
             )
             .await;
         }
-        if public.owner != PUBLIC_OWNER {
+        if public.owner.raw() != PUBLIC_OWNER {
             // Only the login's own ownership can be handed back: another
             // owner's is not the login's to change, and stays named.
             run(
@@ -546,7 +549,7 @@ async fn enforce_in(
     // owner's.
     let state = read_state(conn).await?;
     if let Some(public) = &state.public
-        && public.owner == PUBLIC_OWNER
+        && public.owner.raw() == PUBLIC_OWNER
     {
         let expected = standard.public_acl();
         failed.extend(
@@ -556,7 +559,7 @@ async fn enforce_in(
                 &public.acl,
                 &expected,
                 &format!("SCHEMA {}", ident(&public.name)),
-                PUBLIC_OWNER,
+                &pbps_model::RoleName::from(PUBLIC_OWNER),
             )
             .await,
         );
@@ -766,16 +769,16 @@ async fn put_acl(
     current: &BTreeSet<Entry>,
     expected: &BTreeSet<Entry>,
     object: &str,
-    owner: &str,
+    owner: &pbps_model::RoleName,
 ) -> Vec<String> {
     let extra: Vec<&Entry> = current.difference(expected).collect();
     let foreign: Vec<String> = extra
         .iter()
-        .filter(|entry| entry.grantor != owner)
+        .filter(|entry| &entry.grantor != owner)
         .map(|entry| {
             format!(
                 "{object} grants {entry}, which only {} can revoke",
-                entry.grantor
+                entry.grantor.shown()
             )
         })
         .collect();

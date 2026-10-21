@@ -4418,7 +4418,11 @@ mod tests {
                 Change::PublicExecution { routine, .. } => {
                     format!("public {routine}", routine = routine.shown())
                 }
-                Change::CreateRole { name, .. } => format!("role {name}"),
+                Change::CreateRole { name, .. } => format!(
+                    "role {name}",
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    name = name.raw(),
+                ),
                 other => rendered(&ChangeSet {
                     changes: vec![PlannedChange::new(other.clone())],
                 })

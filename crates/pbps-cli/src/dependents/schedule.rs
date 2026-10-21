@@ -47,7 +47,7 @@ pub(crate) struct Declarations<'a> {
 pub(crate) type ModuleDependents = BTreeMap<ModuleId, Vec<Dependent>>;
 
 /// The members of each role the plan drops, by role name.
-pub(crate) type RoleMembers = BTreeMap<String, Vec<String>>;
+pub(crate) type RoleMembers = BTreeMap<pbps_model::RoleName, Vec<pbps_model::RoleName>>;
 
 /// What a caller has read from a catalog. A fact is `Some` once it was read,
 /// even when what was read is empty; `None` means nobody asked. The two never
@@ -539,7 +539,11 @@ mod tests {
                 Change::AlterColumnDefault { column, .. } => {
                     format!("default {}.{}", column.table.shown(), column.name.shown())
                 }
-                Change::DropRole { name, .. } => format!("drop role {name}"),
+                Change::DropRole { name, .. } => format!(
+                    "drop role {name}",
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    name = name.raw(),
+                ),
                 other => format!("{other:?}"),
             })
             .collect()
@@ -959,7 +963,7 @@ mod tests {
                 // Effect analysis reads the identity history too: distinct
                 // roles cannot share one synthetic identity.
                 uid: Uid::derived(UidKind::Role, name, 0),
-                name: name.to_owned(),
+                name: name.to_owned().into(),
                 members: Vec::new(),
             })
         };
@@ -994,7 +998,7 @@ mod tests {
             ["drop role member", "drop role holder"]
         );
 
-        let members = RoleMembers::from([("holder".to_owned(), vec!["member".to_owned()])]);
+        let members = RoleMembers::from([("holder".into(), vec!["member".into()])]);
         let connected = run(&Facts::default().with_role_members(&members));
         assert_eq!(connected.skipped, []);
         assert_eq!(
@@ -1004,7 +1008,7 @@ mod tests {
         // The members are written into the plan by name (ADR-0005).
         assert!(connected.changes.changes.iter().any(|p| matches!(
             &p.change,
-            Change::DropRole { name, members, .. } if name == "holder" && members == &["member"]
+            Change::DropRole { name, members, .. } if name.raw() == "holder" && members == &[pbps_model::RoleName::from("member")]
         )));
         let mut expected = plan();
         for p in &mut expected.changes {

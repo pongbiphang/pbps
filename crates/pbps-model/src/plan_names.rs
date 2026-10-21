@@ -239,7 +239,7 @@ impl<A: Clone + Ord + Debug> History<A> {
 enum IdentityChange {
     Table(Transition<TableName>, ColumnLife),
     Column(Transition<ColumnRef>),
-    Role(Transition<String>),
+    Role(Transition<crate::RoleName>),
     Other,
 }
 
@@ -369,7 +369,7 @@ pub struct PlanNames<'p> {
     changes: &'p [PlannedChange],
     tables: History<TableName>,
     columns: History<(Uid, ColumnName)>,
-    roles: History<String>,
+    roles: History<crate::RoleName>,
 }
 
 impl<'p> PlanNames<'p> {
@@ -609,12 +609,12 @@ impl<'p> PlanNames<'p> {
         })
     }
 
-    pub fn role_at(&self, role: &Uid, at: At) -> Option<&str> {
-        self.roles.name(role, self.boundary(at)).map(String::as_str)
+    pub fn role_at(&self, role: &Uid, at: At) -> Option<&crate::RoleName> {
+        self.roles.name(role, self.boundary(at))
     }
 
-    pub fn role_holder(&self, name: &str, at: At) -> Holder<'_> {
-        self.roles.holder(&name.to_owned(), self.boundary(at))
+    pub fn role_holder(&self, name: &crate::RoleName, at: At) -> Holder<'_> {
+        self.roles.holder(name, self.boundary(at))
     }
 
     /// The current holder's starting address, never an earlier occupant of

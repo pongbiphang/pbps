@@ -251,8 +251,11 @@ pub const ROLE_BATCH: usize = 250;
 /// one role that cannot be dropped (it owns something) fails every drop in its
 /// batch; that batch is then retried a role at a time, which names exactly the
 /// roles that cannot go and drops all the others.
-pub async fn drop_roles(conn: &mut impl ExecuteConnection, roles: &[String]) -> Vec<String> {
-    let quoted = |role: &String| format!("\"{}\"", role.replace('"', "\"\""));
+pub async fn drop_roles(
+    conn: &mut impl ExecuteConnection,
+    roles: &[pbps_model::RoleName],
+) -> Vec<pbps_model::RoleName> {
+    let quoted = |role: &pbps_model::RoleName| format!("\"{}\"", role.raw().replace('"', "\"\""));
     let mut failed = Vec::new();
     for batch in roles.chunks(ROLE_BATCH) {
         let all = batch.iter().map(quoted).collect::<Vec<_>>().join(", ");

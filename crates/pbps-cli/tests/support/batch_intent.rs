@@ -262,7 +262,10 @@ pub fn tables_and_roles(dialect: &str) {
             .to_string(),
         to
     );
-    assert_eq!(renamed.roles[old.roles.keys().next().unwrap()], "Auditor");
+    assert_eq!(
+        renamed.roles[old.roles.keys().next().unwrap()],
+        "Auditor".into()
+    );
     d.commit();
     std::fs::remove_file(d.dir.join(format!("schema/{schema}.t.yml"))).unwrap();
     std::fs::remove_file(role).unwrap();

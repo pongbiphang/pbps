@@ -31,7 +31,7 @@ fn baseline_fixture_table_identities_use_raw_name_seeds() {
 pub(crate) fn ids(changes: &ChangeSet, before: &Schema) -> IdsFile {
     let mut tables: Vec<Event<TableName>> = Vec::new();
     let mut columns: Vec<Event<ColumnRef>> = Vec::new();
-    let mut roles: Vec<Event<String>> = Vec::new();
+    let mut roles: Vec<Event<pbps_model::RoleName>> = Vec::new();
     let mut scopes = Vec::new();
     for (i, p) in changes.changes.iter().enumerate() {
         match &p.change {

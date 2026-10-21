@@ -94,7 +94,7 @@ pub struct GrantTargets {
     /// because a grant that is gone from the declarations is a `REVOKE` the
     /// plan will write, and the securable it names is where the right to
     /// revoke has to be held; the declarations alone cannot see it.
-    pub roles: Vec<String>,
+    pub roles: Vec<pbps_model::RoleName>,
     /// Declared and ids-recorded tables whose adopted ACLs the plan manages.
     /// PostgreSQL adds the environment's recorded tables before inspecting ACLs.
     pub managed_tables: BTreeSet<ObjectName>,

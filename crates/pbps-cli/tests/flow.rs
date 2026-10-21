@@ -14875,11 +14875,11 @@ fn role_name_reuse_compares_the_grants_of_the_final_principal() {
         let saved: pbps_model::SavedPlan =
             serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
         let steps: Vec<_> = saved.changes.changes.iter().map(|p| &p.change).collect();
-        assert!(matches!(steps[0], pbps_model::Change::DropRole { name, .. } if name == "a"));
+        assert!(matches!(steps[0], pbps_model::Change::DropRole { name, .. } if name.raw() == "a"));
         assert!(steps.iter().any(|step| if replacement {
-            matches!(step, pbps_model::Change::CreateRole { name, .. } if name == "a")
+            matches!(step, pbps_model::Change::CreateRole { name, .. } if name.raw() == "a")
         } else {
-            matches!(step, pbps_model::Change::RenameRole { from, to, .. } if from == "b" && to == "a")
+            matches!(step, pbps_model::Change::RenameRole { from, to, .. } if from.raw() == "b" && to.raw() == "a")
         }));
         success(&[
             "apply",

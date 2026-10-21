@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.0.0",
+  "command": "explain",
+  "result": "ok",
+  "findings": [
+    {
+      "id": "plan.risk",
+      "severity": "warning",
+      "message": "revoke: access is taken away: an application still relying on it fails from the moment the plan commits (1 change(s))"
+    },
+    {
+      "id": "plan.risk",
+      "severity": "warning",
+      "message": "grant-widen: access widens: a role can do more than before, which the merge request should have reviewed (3 change(s))"
+    }
+  ],
+  "data": {
+    "applyable": true,
+    "dialect": "postgres",
+    "created_at": "2026-10-19T00:00:00Z",
+    "baseline": "role-name master fixture",
+    "mode": "transactional",
+    "checksum": "4ffc1ae3bb3f3aca9f030816cee9b83b984857199369bd9867396ace78e2829e",
+    "change_count": 4,
+    "table_count": 0,
+    "module_count": 0,
+    "role_count": 1,
+    "risks": [
+      {
+        "class": "revoke",
+        "why": "access is taken away: an application still relying on it fails from the moment the plan commits",
+        "changes": [
+          "role role\nline\r\u001b[31m\\‮名前  - revoke update on app.role\nline\r\u001b[31m\\‮名前"
+        ]
+      },
+      {
+        "class": "grant-widen",
+        "why": "access widens: a role can do more than before, which the merge request should have reviewed",
+        "changes": [
+          "role role\nline\r\u001b[31m\\‮名前  + grant select on app.role\nline\r\u001b[31m\\‮名前",
+          "role role\nline\r\u001b[31m\\‮名前  + grant execute on app.role\nline\r\u001b[31m\\‮名前(integer)",
+          "role role\nline\r\u001b[31m\\‮名前  + grant execute on schema::role\nline\r\u001b[31m\\‮名前"
+        ]
+      }
+    ],
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 4ffc1ae3bb3f3aca9f030816cee9b83b984857199369bd9867396ace78e2829e --allow revoke",
+    "probes": [],
+    "unchecked": [],
+    "statement_count": 4
+  }
+}

@@ -132,7 +132,7 @@ enum Created {
     Nothing,
     RunOwned {
         names: ScratchNames,
-        roles: Vec<String>,
+        roles: Vec<pbps_model::RoleName>,
     },
     /// Objects the scratch account owns in the supplied database, its own
     /// stored defaults, and the database's ACL as they were once the
@@ -184,7 +184,7 @@ pub(in crate::resolver::server) struct Prepared {
     filled_objects: BTreeSet<String>,
     /// The role a run-owned layout gives USAGE on a schema the externals file
     /// created; `None` where the scratch account compiles as itself.
-    grantee: Option<String>,
+    grantee: Option<pbps_model::RoleName>,
 }
 
 impl Scratch<'_> {
@@ -294,8 +294,8 @@ impl Scratch<'_> {
         let deployer = map
             .deployer(authorization)
             .map_err(|reason| Error::Scope(reason.into()))?;
-        let grantee = Some(deployer.clone().unwrap_or_else(|| names.login().to_owned()));
-        scope::enter(&mut session, driver, deployer.as_deref())
+        let grantee = Some(deployer.clone().unwrap_or_else(|| names.login().into()));
+        scope::enter(&mut session, driver, deployer.as_ref())
             .await
             .map_err(db("the reproduced deployer"))?;
         let differences = scope::settle(
@@ -533,7 +533,7 @@ impl Scratch<'_> {
                     pbps_pg::resolver::drop_roles(admin, &roles)
                         .await
                         .into_iter()
-                        .map(|role| format!("role {role}")),
+                        .map(|role| format!("role {}", role.shown())),
                 );
                 if remaining.is_empty() {
                     Ok(())

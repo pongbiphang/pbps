@@ -41,7 +41,7 @@ fn row_security_validation_checks_programmatic_policies_and_names() {
             ..Default::default()
         },
         RowPolicy {
-            to: PolicyRoles::Roles(["x".repeat(64)].into()),
+            to: PolicyRoles::Roles(["x".repeat(64).into()].into()),
             ..Default::default()
         },
     ] {

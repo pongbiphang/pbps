@@ -374,7 +374,7 @@ pub struct RawCatalog {
     /// Needed beside every grant's grantor because a `REVOKE` matches on the
     /// grantor and nothing else: this connection can take back what it
     /// granted itself, and only that.
-    pub session_role: String,
+    pub session_role: pbps_model::RoleName,
 }
 
 /// A role held by something **outside this database** (ADR-0010 §4).
@@ -391,7 +391,7 @@ pub struct RawCatalog {
 /// stopping it" instead would be the answer that reads as good news.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawSharedDependency {
-    pub role: String,
+    pub role: pbps_model::RoleName,
     /// `None` is a dependency on a shared object — a database, a tablespace —
     /// which belongs to no one database.
     pub database: Option<String>,
@@ -409,7 +409,7 @@ pub struct RawSharedDependency {
 /// granted is the cluster's business rather than this database's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawRole {
-    pub name: String,
+    pub name: pbps_model::RoleName,
     /// A superuser passes every privilege check without consulting an ACL, so
     /// what such a role is *granted* does not decide what it can do. Carried
     /// rather than filtered out, because a role silently missing from a pull
@@ -439,7 +439,7 @@ pub struct RawOwner {
     pub kind: GrantedKind,
     /// The routine's oid, for the signature its identity needs.
     pub routine_oid: Option<i64>,
-    pub owner: String,
+    pub owner: pbps_model::RoleName,
 }
 
 /// permission at all.
@@ -448,7 +448,7 @@ pub struct RawGrant {
     /// `None` is PUBLIC — grantee oid `0`, which `regrole` renders as `-`.
     /// Never a role: PUBLIC is every principal in the cluster, so what it
     /// holds is reported as context and never compared (ADR-0010 §5).
-    pub grantee: Option<String>,
+    pub grantee: Option<pbps_model::RoleName>,
     pub schema: String,
     /// `None` when the target is the schema itself.
     pub object: Option<String>,
@@ -494,7 +494,7 @@ pub struct RawGrant {
     pub defaulted: bool,
     /// The object's owner, for the same reason: the owner's entry is the one
     /// `acldefault` puts there, not one anybody granted.
-    pub owner: String,
+    pub owner: pbps_model::RoleName,
     /// Who granted this entry, which decides whether anything the plan runs
     /// can take it away.
     ///
@@ -526,7 +526,7 @@ pub struct RawGrant {
     /// while the same revoke with a competing direct option in place removed
     /// nothing and reported success (DECISIONS 483). This field is what the
     /// report names; the decision is the engine's.
-    pub grantor: String,
+    pub grantor: pbps_model::RoleName,
     /// Whether a `REVOKE` from this connection would remove this entry — the
     /// question [`crate::catalog::revocable_by_current_role`] puts to the
     /// engine, because only the engine knows which grantor it would select.
@@ -584,7 +584,7 @@ pub enum GrantedKind {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawOtherGrant {
     /// `None` is PUBLIC.
-    pub grantee: Option<String>,
+    pub grantee: Option<pbps_model::RoleName>,
     /// The kind of object, in the words a message uses: `a type`,
     /// `a language`.
     pub class: String,
@@ -597,7 +597,7 @@ pub struct RawOtherGrant {
     /// Carried for the zero point (DECISIONS 371): these ACLs are NULL until
     /// somebody touches them, and touching one writes the owner's own
     /// inherent entry beside the change.
-    pub owner: Option<String>,
+    pub owner: Option<pbps_model::RoleName>,
     /// Whether this privilege is present in the engine's own default ACL
     /// for the class and owner, even if that default was stored explicitly.
     pub defaulted: bool,
@@ -614,7 +614,7 @@ pub struct RawOtherGrant {
 pub struct RawDefaultAcl {
     /// The role whose creations it covers, and the reason this is not
     /// portable: who runs the plan decides what the declaration means.
-    pub grantor: String,
+    pub grantor: pbps_model::RoleName,
     /// `None` is every schema.
     pub in_schema: Option<String>,
     /// `r` tables and views, `S` sequences, `f` routines, `T` types,
@@ -1097,7 +1097,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
 fn implied_sequence_targets(
     raw: &RawCatalog,
     schema: &pbps_model::Schema,
-) -> BTreeMap<(String, ObjectName), ObjectName> {
+) -> BTreeMap<(pbps_model::RoleName, ObjectName), ObjectName> {
     let tables: BTreeMap<_, _> = raw
         .tables
         .iter()
@@ -1215,7 +1215,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             pulled.warnings.push(format!(
                 "role `{}` is a superuser, which passes every privilege check without consulting \
                  an ACL: what it is granted here does not decide what it can do",
-                r.name
+                r.name.shown()
             ));
         }
     }
@@ -1295,17 +1295,18 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // The zero point. Reported below as one line per shape rather than one
         // per object: a database has as many of these as it has objects, and a
         // report nobody can read is a report nobody reads.
-        if g.defaulted || g.grantee.as_deref() == Some(g.owner.as_str()) {
+        if g.defaulted || g.grantee.as_ref() == Some(&g.owner) {
             continue;
         }
-        let grantee = g.grantee.as_deref().unwrap_or_default();
+        let grantee = g.grantee.as_ref().expect("PUBLIC handled above");
         // A grantee outside the roles read — a `pg_*` role, or one the query
         // filtered — still holds what it holds. Reported rather than dropped.
         if !pulled.schema.roles.contains_key(grantee) {
             pulled.warnings.push(format!(
                 "`{grantee}` holds {} on {}, and is not a role this project can declare",
                 g.permission,
-                target_label(g, &signatures)
+                target_label(g, &signatures),
+                grantee = grantee.shown(),
             ));
             continue;
         }
@@ -1341,7 +1342,11 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         {
             Ok(target) => target,
             Err(e) => {
-                unexpressible(pulled, e.target, format!("role {grantee}: {}", e.what));
+                unexpressible(
+                    pulled,
+                    e.target,
+                    format!("role {grantee}: {}", e.what, grantee = grantee.shown(),),
+                );
                 continue;
             }
         };
@@ -1353,6 +1358,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // the target is what scopes the report to the managed set
         // (`unexpressible_permissions`).
         if target
+            .raw()
             .to_string()
             .parse::<pbps_model::GrantTarget>()
             .as_ref()
@@ -1366,7 +1372,8 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                      or a period, which a declaration cannot spell -- written out it reads back \
                      as a different target; the declarations cannot express it",
                     g.permission,
-                    target_label(g, &signatures)
+                    target_label(g, &signatures),
+                    grantee = grantee.shown(),
                 ),
             );
             continue;
@@ -1386,7 +1393,8 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                     "role {grantee}: {} on {} is on an object this pull did not record, so the \
                      declarations cannot express it",
                     g.permission,
-                    target_label(g, &signatures)
+                    target_label(g, &signatures),
+                    grantee = grantee.shown(),
                 ),
             );
             continue;
@@ -1405,7 +1413,8 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                     "role {grantee}: {} on column `{column}` of {} is a column-level grant, which \
                      the declarations cannot express",
                     g.permission,
-                    target_label(g, &signatures)
+                    target_label(g, &signatures),
+                    grantee = grantee.shown(),
                 ),
             );
             continue;
@@ -1421,7 +1430,8 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                     "role {grantee}: {} on {} is not a permission this model holds; the \
                      declarations cannot express it",
                     g.permission,
-                    target_label(g, &signatures)
+                    target_label(g, &signatures),
+                    grantee = grantee.shown(),
                 ),
             );
             continue;
@@ -1438,7 +1448,8 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                     "role {grantee}: {} on {} is `WITH GRANT OPTION`, which the declarations \
                      cannot express",
                     g.permission,
-                    target_label(g, &signatures)
+                    target_label(g, &signatures),
+                    grantee = grantee.shown(),
                 ),
             );
             continue;
@@ -1488,9 +1499,14 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             // Role` does not parse (#1037). A catalog role name always
             // quotes; were one not to, the statement is left out rather than
             // printed wrong.
-            let set_role = crate::quote(&g.grantor).map_or_else(
+            let set_role = crate::quote(g.grantor.raw()).map_or_else(
                 |_| String::new(),
-                |quoted| format!(", or `SET ROLE {quoted}` and revoke it"),
+                |quoted| {
+                    format!(
+                        ", or `SET ROLE {}` and revoke it",
+                        pbps_model::escape::Escaped(&quoted)
+                    )
+                },
             );
             pulled.unrevocable.push(pbps_db::catalog::Unrevocable {
                 role: grantee.to_owned(),
@@ -1506,9 +1522,9 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
                      (ADR-0010 section 1, DECISIONS 483, measured)",
                     g.permission,
                     target_label(g, &signatures),
-                    g.grantor,
-                    raw.session_role,
-                    g.grantor,
+                    g.grantor.shown(),
+                    raw.session_role.shown(),
+                    g.grantor.shown(),
                 ),
             });
         }
@@ -1549,7 +1565,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
     // The catalogs whose targets no declaration can name. Grouped, because a
     // database has as many of these as it has types: one line per
     // (role, class, permission), naming the objects it covers.
-    let mut others: BTreeMap<(String, String, String), Vec<String>> = BTreeMap::new();
+    let mut others: BTreeMap<(pbps_model::RoleName, String, String), Vec<String>> = BTreeMap::new();
     let mut public_others: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for g in &raw.other_grants {
         let permission = if g.grantable {
@@ -1557,7 +1573,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         } else {
             g.permission.clone()
         };
-        let Some(grantee) = g.grantee.as_deref() else {
+        let Some(grantee) = g.grantee.as_ref() else {
             // Untouched ACLs produce no rows here. Once touched, the engine
             // may materialize default PUBLIC access beside a new grant;
             // only access beyond that zero point needs this warning (#258).
@@ -1577,7 +1593,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
         // the engine and not by anyone. Reported as unnameable state, it would
         // refuse every plan connected to a role that owns a type, for a
         // privilege nobody granted.
-        if Some(grantee) == g.owner.as_deref() {
+        if Some(grantee) == g.owner.as_ref() {
             continue;
         }
         if !pulled.schema.roles.contains_key(grantee) {
@@ -1607,7 +1623,8 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             what: format!(
                 "role {role}: {permission} on {class} is not something the declarations can \
                  name -- {}",
-                listed(&names)
+                listed(&names),
+                role = role.shown(),
             ),
         });
     }
@@ -1640,7 +1657,7 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             "`ALTER DEFAULT PRIVILEGES FOR ROLE {}` in {} grants {} on {} that role creates from \
              now on; the declarations have no such thing, because on this engine who creates an \
              object decides what it arrives with (ADR-0010 section 2)",
-            d.grantor,
+            d.grantor.shown(),
             match &d.in_schema {
                 Some(s) => format!("schema `{s}`"),
                 None => "every schema".to_owned(),
@@ -3792,7 +3809,7 @@ mod tests {
 
     fn role(name: &str) -> RawRole {
         RawRole {
-            name: name.to_owned(),
+            name: name.to_owned().into(),
             superuser: false,
         }
     }
@@ -3809,7 +3826,7 @@ mod tests {
         permission: &str,
     ) -> RawGrant {
         RawGrant {
-            grantee: grantee.map(str::to_owned),
+            grantee: grantee.map(pbps_model::RoleName::from),
             schema: "app".to_owned(),
             object: object.map(str::to_owned),
             // Oid 1 is the fixture's one routine; `signature` gives it the
@@ -3821,8 +3838,8 @@ mod tests {
             grantable: false,
             column: None,
             defaulted: false,
-            owner: "deploy".to_owned(),
-            grantor: "deploy".to_owned(),
+            owner: "deploy".to_owned().into(),
+            grantor: "deploy".to_owned().into(),
             // The engine's answer, which the fixtures set directly: what
             // `add_roles` does with an entry it cannot revoke is this file's
             // business, and which entries those are is
@@ -3897,26 +3914,26 @@ mod tests {
                     object: Some("customer".to_owned()),
                     kind: GrantedKind::Relation('r'),
                     routine_oid: None,
-                    owner: "deploy".to_owned(),
+                    owner: "deploy".to_owned().into(),
                 },
                 RawOwner {
                     schema: "app".to_owned(),
                     object: Some("f".to_owned()),
                     kind: GrantedKind::Routine(kind),
                     routine_oid: Some(1),
-                    owner: "deploy".to_owned(),
+                    owner: "deploy".to_owned().into(),
                 },
                 RawOwner {
                     schema: "app".to_owned(),
                     object: None,
                     kind: GrantedKind::Schema,
                     routine_oid: None,
-                    owner: "deploy".to_owned(),
+                    owner: "deploy".to_owned().into(),
                 },
             ],
             // Deliberately not the owner: the two exemptions have to be
             // distinguishable, or a fixture would pass under either rule.
-            session_role: "deployer".to_owned(),
+            session_role: "deployer".to_owned().into(),
             ..RawCatalog::default()
         }
     }
@@ -3953,7 +3970,7 @@ mod tests {
         let targets: Vec<String> = pulled_role(&pulled, "app_reader")
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|name| name.raw().to_string())
             .collect();
         assert_eq!(
             targets,
@@ -4106,7 +4123,7 @@ mod tests {
             name: name.to_owned(),
             permission: "USAGE".to_owned(),
             grantable: false,
-            owner: Some("deploy".to_owned()),
+            owner: Some("deploy".to_owned().into()),
             defaulted,
         };
         let pulled = assemble(&RawCatalog {
@@ -4190,7 +4207,12 @@ mod tests {
         );
         // ADR-0010 §7: a sequence is no grant target yet (#1892).
         assert!(what.iter().any(|w| w.contains("sequence")), "{what:?}");
-        assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
+        assert!(
+            pulled
+                .unexpressible
+                .iter()
+                .all(|u| u.role == "app_reader".into())
+        );
     }
 
     /// Issue #261. An object with no ACL row at all is still owned, so
@@ -4216,7 +4238,7 @@ mod tests {
                 .get(&pbps_model::GrantTarget::Object(
                     pbps_model::ObjectName::new("app", "customer")
                 ))
-                .map(String::as_str),
+                .map(pbps_model::RoleName::raw),
             Some("deploy"),
             "{:?}",
             pulled.owners
@@ -4225,7 +4247,7 @@ mod tests {
             pulled
                 .owners
                 .get(&pbps_model::GrantTarget::Schema("app".to_owned()))
-                .map(String::as_str),
+                .map(pbps_model::RoleName::raw),
             Some("deploy")
         );
 
@@ -4265,7 +4287,7 @@ mod tests {
                 GrantedKind::Relation('r'),
                 "SELECT",
             );
-            g.grantor = grantor.to_owned();
+            g.grantor = grantor.to_owned().into();
             g.revocable = revocable;
             g
         };
@@ -4286,7 +4308,7 @@ mod tests {
         );
         assert_eq!(pulled.unrevocable.len(), 1);
         let found = &pulled.unrevocable[0];
-        assert_eq!(found.role, "app_reader");
+        assert_eq!(found.role, "app_reader".into());
         assert_eq!(found.permission, pbps_model::Permission::Select);
         assert!(
             matches!(&found.target, pbps_model::GrantTarget::Object(o) if o.raw().to_string() == "app.customer"),
@@ -4392,6 +4414,46 @@ mod tests {
     /// else's table, reported without a target, refused every connected plan
     /// while the ordinary grant beside it on that same table was dropped as
     /// none of this project's business (DECISIONS 176).
+
+    #[test]
+    fn grantor_remedies_show_the_quoted_sql_role_name_exactly_once() {
+        let name = "grantor\nline\\\u{202e}名前";
+        let shown = r"grantor\nline\\\u{202e}名前";
+        let entry = RawGrant {
+            grantor: name.into(),
+            revocable: false,
+            ..grant(
+                Some("app_reader"),
+                Some("customer"),
+                GrantedKind::Relation('r'),
+                "SELECT",
+            )
+        };
+        let pulled = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![entry],
+            ..declaring('f', &[])
+        });
+        assert_eq!(pulled.unrevocable.len(), 1);
+        assert_eq!(
+            pulled.unrevocable[0].why,
+            format!(
+                "SELECT on `app.customer` was granted by `{shown}`, and a `REVOKE` from `deployer` would not carry that grantor -- so nothing this tool can run takes it away. Have `{shown}` revoke it, or `SET ROLE \"{shown}\"` and revoke it (ADR-0010 section 1, DECISIONS 483, measured)"
+            )
+        );
+        let ordinary = assemble(&RawCatalog {
+            roles: vec![role("app_reader")],
+            grants: vec![grant(
+                Some("app_reader"),
+                Some("customer"),
+                GrantedKind::Relation('r'),
+                "SELECT",
+            )],
+            ..declaring('f', &[])
+        });
+        assert!(ordinary.unrevocable.is_empty());
+    }
+
     #[test]
     fn a_limitation_on_an_object_carries_that_object_as_its_target() {
         let on_customer = |permission: &str| {
@@ -4453,7 +4515,7 @@ mod tests {
             pulled_role(&pulled, "app_reader")
                 .grants
                 .keys()
-                .map(ToString::to_string)
+                .map(|name| name.raw().to_string())
                 .collect::<Vec<_>>(),
             ["app.f(app.\"amount,type\",integer)"]
         );
@@ -4557,7 +4619,7 @@ mod tests {
             .map(|u| {
                 u.target
                     .as_ref()
-                    .map_or("-".to_owned(), ToString::to_string)
+                    .map_or("-".to_owned(), |name| name.raw().to_string())
             })
             .collect();
         assert_eq!(
@@ -4735,7 +4797,7 @@ mod tests {
             pulled.unexpressible[0]
                 .target
                 .as_ref()
-                .map(ToString::to_string),
+                .map(|name| name.raw().to_string()),
             Some("app.ser_id_seq".to_owned())
         );
         assert!(
@@ -4776,7 +4838,7 @@ mod tests {
             pulled_role(&pulled, "app_reader")
                 .grants
                 .keys()
-                .map(ToString::to_string)
+                .map(|name| name.raw().to_string())
                 .collect::<Vec<_>>(),
             ["app.f(integer)"]
         );
@@ -4796,12 +4858,12 @@ mod tests {
     #[test]
     fn a_grant_on_a_class_the_model_cannot_name_is_reported_grouped() {
         let other = |grantee: Option<&str>, class: &str, name: &str| RawOtherGrant {
-            grantee: grantee.map(str::to_owned),
+            grantee: grantee.map(pbps_model::RoleName::from),
             class: class.to_owned(),
             name: name.to_owned(),
             permission: "USAGE".to_owned(),
             grantable: false,
-            owner: Some("someone_else".to_owned()),
+            owner: Some("someone_else".to_owned().into()),
             defaulted: grantee.is_none(),
         };
         let pulled = assemble(&RawCatalog {
@@ -4824,7 +4886,12 @@ mod tests {
             .map(|u| u.what.as_str())
             .collect();
         assert_eq!(what.len(), 2, "{what:?}");
-        assert!(pulled.unexpressible.iter().all(|u| u.role == "app_reader"));
+        assert!(
+            pulled
+                .unexpressible
+                .iter()
+                .all(|u| u.role == "app_reader".into())
+        );
         assert!(pulled.unexpressible.iter().all(|u| u.target.is_none()));
         let types = what
             .iter()
@@ -4845,12 +4912,12 @@ mod tests {
         let pulled = assemble(&RawCatalog {
             roles: vec![role("ot_owner")],
             other_grants: vec![RawOtherGrant {
-                grantee: Some("ot_owner".to_owned()),
+                grantee: Some("ot_owner".to_owned().into()),
                 class: "a type".to_owned(),
                 name: "app.money_kind".to_owned(),
                 permission: "USAGE".to_owned(),
                 grantable: false,
-                owner: Some("ot_owner".to_owned()),
+                owner: Some("ot_owner".to_owned().into()),
                 defaulted: true,
             }],
             ..RawCatalog::default()
@@ -4887,7 +4954,7 @@ mod tests {
             pulled_role(&pulled, "app_reader")
                 .grants
                 .keys()
-                .map(ToString::to_string)
+                .map(|name| name.raw().to_string())
                 .collect::<Vec<_>>(),
             ["schema::app"],
             "the schema grant stands; the one on the missing table does not"
@@ -4934,7 +5001,7 @@ mod tests {
             pulled_role(&pulled, "app_reader")
                 .grants
                 .keys()
-                .map(ToString::to_string)
+                .map(|name| name.raw().to_string())
                 .collect::<Vec<_>>(),
             ["app.f(integer)", "schema::app"],
             "the routine grant stands; the one on the missing table does not"
@@ -5007,12 +5074,12 @@ mod tests {
         let pulled = assemble(&RawCatalog {
             roles: vec![role("app_reader")],
             other_grants: vec![RawOtherGrant {
-                grantee: Some("app_reader".to_owned()),
+                grantee: Some("app_reader".to_owned().into()),
                 class: "a type".to_owned(),
                 name: "app.money".to_owned(),
                 permission: "USAGE".to_owned(),
                 grantable: true,
-                owner: Some("someone_else".to_owned()),
+                owner: Some("someone_else".to_owned().into()),
                 defaulted: false,
             }],
             ..RawCatalog::default()
@@ -5045,7 +5112,7 @@ mod tests {
     fn a_default_privileges_entry_names_the_role_whose_creations_it_covers() {
         let pulled = assemble(&RawCatalog {
             default_acls: vec![RawDefaultAcl {
-                grantor: "owner_a".to_owned(),
+                grantor: "owner_a".to_owned().into(),
                 in_schema: Some("app".to_owned()),
                 objtype: 'r',
                 acl: "{all_reader=r/owner_a}".to_owned(),
@@ -5065,7 +5132,7 @@ mod tests {
     fn a_superuser_is_pulled_and_named_rather_than_filtered_out() {
         let pulled = assemble(&RawCatalog {
             roles: vec![RawRole {
-                name: "deploy".to_owned(),
+                name: "deploy".to_owned().into(),
                 superuser: true,
             }],
             ..RawCatalog::default()

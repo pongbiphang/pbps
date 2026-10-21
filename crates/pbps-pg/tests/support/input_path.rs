@@ -39,7 +39,7 @@ async fn gate_all(conn: &mut Conn, trusted: &[&str], names: &[(&str, &str)]) -> 
         })
         .collect();
     let columns: Vec<Added<'_>> = types.iter().map(|t| Added::new(t, false)).collect();
-    let trusted: Vec<String> = trusted.iter().map(|t| (*t).to_owned()).collect();
+    let trusted: Vec<pbps_model::RoleName> = trusted.iter().map(|t| (*t).into()).collect();
     input_path::read(conn, Within::OwnTransaction, &trusted, &columns).await
 }
 
@@ -89,7 +89,7 @@ fn owner_reasons(reasons: &[Reason]) -> Vec<&OwnerReason> {
 fn actors(reasons: &[Reason]) -> BTreeSet<String> {
     owner_reasons(reasons)
         .iter()
-        .map(|o| o.actor.clone())
+        .map(|o| o.actor.raw().to_owned())
         .collect()
 }
 
@@ -439,7 +439,7 @@ async fn user_code_on_the_input_path_is_refused_by_name_wherever_it_sits() {
                     // The owner of what is called: the deployer's own routine,
                     // or the engine's bootstrap superuser for a built-in.
                     if case.why == Why::NotBuiltin {
-                        assert_eq!(hit.owner, me_name, "{what}");
+                        assert_eq!(hit.owner, me_name.clone().into(), "{what}");
                     }
                     assert_eq!(
                         matches!(hit.used_by.part, Part::Default),
@@ -523,8 +523,8 @@ async fn a_type_an_expression_names_is_on_the_input_path() {
         let owners = owner_reasons(all);
         assert_eq!(owners.len(), 1, "{all:?}");
         assert_eq!(owners[0].ty, "app.owned_by_stranger");
-        assert_eq!(owners[0].owner, stranger);
-        assert_eq!(owners[0].actor, stranger);
+        assert_eq!(owners[0].owner, stranger.clone().into());
+        assert_eq!(owners[0].actor, stranger.clone().into());
         drop(me);
         db.drop().await;
     }
@@ -948,8 +948,8 @@ async fn the_owner_of_a_type_that_runs_code_must_be_trusted() {
             owner_reasons(all),
             vec![&OwnerReason {
                 ty: "app.by_stranger".to_owned(),
-                owner: stranger.clone(),
-                actor: stranger.clone(),
+                owner: stranger.clone().into(),
+                actor: stranger.clone().into(),
             }],
             "on {label}"
         );
@@ -994,7 +994,9 @@ async fn the_owner_of_a_type_that_runs_code_must_be_trusted() {
             let path = gate(&mut me, &[ghost], name).await;
             assert_eq!(
                 path,
-                InputPath::Unreadable(Unreadable::TrustedRolesMissing(vec![ghost.to_owned()])),
+                InputPath::Unreadable(Unreadable::TrustedRolesMissing(vec![
+                    ghost.to_owned().into()
+                ])),
                 "{name} on {label}"
             );
             assert!(!path.is_admitted());
@@ -1002,17 +1004,17 @@ async fn the_owner_of_a_type_that_runs_code_must_be_trusted() {
         let missing = input_path::missing_roles(
             &mut me,
             &[
-                stranger.clone(),
-                ghost.to_owned(),
-                ghost.to_owned(),
-                String::new(),
+                stranger.clone().into(),
+                ghost.to_owned().into(),
+                ghost.to_owned().into(),
+                pbps_model::RoleName::default(),
             ],
         )
         .await
         .unwrap();
-        assert_eq!(missing, vec![String::new(), ghost.to_owned()]);
+        assert_eq!(missing, vec![pbps_model::RoleName::default(), ghost.into()]);
         assert!(
-            input_path::missing_roles(&mut me, &[stranger.clone(), listed.clone()])
+            input_path::missing_roles(&mut me, &[stranger.clone().into(), listed.clone().into()])
                 .await
                 .unwrap()
                 .is_empty()
@@ -1058,7 +1060,11 @@ async fn an_untrusted_role_that_can_act_as_a_trusted_owner_is_named() {
             BTreeSet::from([inheritor.clone(), administrator.clone()]),
             "on {label}"
         );
-        assert!(owner_reasons(all).iter().all(|o| o.owner == pal));
+        assert!(
+            owner_reasons(all)
+                .iter()
+                .all(|o| o.owner == pal.clone().into())
+        );
         assert!(!actors(all).contains(&inert));
         // The same type, once the owner and the two are declared.
         let declared = gate(

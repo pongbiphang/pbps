@@ -496,7 +496,12 @@ impl Dialect for Mssql {
         validate::module(id, module)
     }
 
-    fn validate_role(&self, name: &str, role: &Role, schema: &Schema) -> Vec<DialectError> {
+    fn validate_role(
+        &self,
+        name: &pbps_model::RoleName,
+        role: &Role,
+        schema: &Schema,
+    ) -> Vec<DialectError> {
         validate::role(name, role, schema)
     }
 

@@ -30,7 +30,7 @@ pub async fn scope_facts(
     conn: &mut impl pbps_db::transport::QueryConnection,
     scope: &environment::Scope<'_>,
     authorization_schemas: &[String],
-    planned_principals: &[String],
+    planned_principals: &[pbps_model::RoleName],
 ) -> Result<
     (
         pbps_db::resolver::environment::CatalogFacts,

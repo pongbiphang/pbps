@@ -132,16 +132,16 @@ async fn the_pull_keeps_project_ledger_names_beside_the_real_ledger() {
         "{:?}",
         pulled.schema.modules
     );
-    let grants = &pulled.schema.roles[&role].grants;
+    let grants = &pulled.schema.roles[role.as_str()].grants;
     for name in ["app.__pbps_state", "app.__pbps_lock"] {
         assert!(
-            grants.keys().any(|target| target.to_string() == name),
+            grants.keys().any(|target| target.raw().to_string() == name),
             "{name}: {grants:?}"
         );
     }
     for name in [pbps_pg::state::STATE_TABLE, pbps_pg::state::LOCK_TABLE] {
         assert!(
-            !grants.keys().any(|target| target.to_string() == name),
+            !grants.keys().any(|target| target.raw().to_string() == name),
             "{name}: {grants:?}"
         );
     }
@@ -13032,7 +13032,7 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
         ]
         .into_iter()
         .collect(),
-        roles: vec![recipient.clone()],
+        roles: vec![recipient.clone().into()],
         ..Default::default()
     };
     let ask = doctor::Ask {
@@ -13062,7 +13062,7 @@ async fn doctor_grant_authority_preserves_overloads_and_inherited_rights() {
         assert!(gaps.iter().any(|g| g.securable() == expected), "{gaps:?}");
     }
     let adopted = pbps_db::doctor::GrantTargets {
-        roles: vec![recipient.clone()],
+        roles: vec![recipient.clone().into()],
         managed_modules: ["shared.f".parse().unwrap()].into_iter().collect(),
         ..Default::default()
     };
@@ -15443,7 +15443,7 @@ async fn a_module_carrying_what_a_rebuild_would_destroy_refuses_and_names_it() {
     // not refuse at all.
     let grant_of = |name: &str, permissions: &[pbps_model::Permission]| {
         pbps_model::PlannedChange::new(pbps_model::Change::Grant {
-            role: reader.clone(),
+            role: reader.clone().into(),
             target: pbps_model::GrantTarget::Object(
                 format!("{s}.{name}").parse().expect("an object name"),
             ),
@@ -27740,12 +27740,12 @@ async fn every_grant_the_emitter_writes_is_one_this_engine_runs() {
             permissions.iter().copied().collect();
         for change in [
             Change::Grant {
-                role: role.clone(),
+                role: role.clone().into(),
                 target: target.clone(),
                 permissions: permissions.clone(),
             },
             Change::Revoke {
-                role: role.clone(),
+                role: role.clone().into(),
                 target: target.clone(),
                 permissions: permissions.clone(),
             },
@@ -27826,10 +27826,14 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
         ("app.f", Permission::Select),
         ("app.f(integer)", Permission::Execute),
     ] {
-        let problems = pg.validate_role(&role, &granting(spelled, permission), &declared);
+        let problems = pg.validate_role(
+            &pbps_model::RoleName::from(&role),
+            &granting(spelled, permission),
+            &declared,
+        );
         assert!(problems.is_empty(), "{spelled}: {problems:?}");
         let change = Change::Grant {
-            role: role.clone(),
+            role: role.clone().into(),
             target: spelled.parse::<GrantTarget>().expect("a grant target"),
             permissions: [permission].into_iter().collect(),
         };
@@ -27842,7 +27846,11 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
     }
     // The bare name with `execute` on it: refused, and refused as the routine
     // it chose rather than as the table of the same name.
-    let problems = pg.validate_role(&role, &granting("app.f", Permission::Execute), &declared);
+    let problems = pg.validate_role(
+        &pbps_model::RoleName::from(&role),
+        &granting("app.f", Permission::Execute),
+        &declared,
+    );
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(
         problems[0].to_string().contains("app.f(integer)"),
@@ -27919,11 +27927,11 @@ async fn the_ledger_names_are_hidden_only_for_tables_in_its_schema() {
         pulled
             .schema
             .roles
-            .get(&role)
+            .get(role.as_str())
             .expect("its own role is in the pull")
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|name| name.raw().to_string())
             .collect::<Vec<_>>(),
         ["public.__pbps_state", "schema::public"],
         "the view's grant is read and the table's is not"
@@ -27988,7 +27996,11 @@ async fn the_schemas_the_reader_skips_are_the_ones_a_declaration_may_not_name() 
             format!("schema::{name}").parse().expect("a grant target"),
             [Permission::Usage].into_iter().collect(),
         );
-        let problems = pg.validate_role("app_reader", &role, &Schema::default());
+        let problems = pg.validate_role(
+            &pbps_model::RoleName::from("app_reader"),
+            &role,
+            &Schema::default(),
+        );
         assert_eq!(
             problems.is_empty(),
             sql_keeps,
@@ -28054,18 +28066,22 @@ async fn a_grant_in_the_public_schema_reaches_the_table_with_no_schema_grant() {
     let pulled_role = pulled
         .schema
         .roles
-        .get(&role)
+        .get(role.as_str())
         .expect("its own role is in the pull");
     assert_eq!(
         pulled_role
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|name| name.raw().to_string())
             .collect::<Vec<_>>(),
         ["public.pubt"],
         "no `schema::public` grant exists to be pulled — PUBLIC holds it"
     );
-    let problems = Postgres::new().validate_role(&role, pulled_role, &pulled.schema);
+    let problems = Postgres::new().validate_role(
+        &pbps_model::RoleName::from(&role),
+        pulled_role,
+        &pulled.schema,
+    );
     assert!(problems.is_empty(), "{problems:?}");
 
     cleanup_role(&mut db, &role).await;
@@ -28109,11 +28125,11 @@ async fn a_routine_grant_is_read_back_by_signature_whatever_spelling_granted_it(
         pulled
             .schema
             .roles
-            .get(&role)
+            .get(role.as_str())
             .expect("its own role is in the pull")
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|name| name.raw().to_string())
             .collect::<Vec<_>>(),
         ["app.solo(integer)", "schema::app"],
         "the catalog has the signature and only the signature"
@@ -28139,7 +28155,8 @@ async fn a_routine_grant_is_read_back_by_signature_whatever_spelling_granted_it(
         "app.solo".parse().expect("a grant target"),
         [Permission::Execute].into_iter().collect(),
     );
-    let problems = Postgres::new().validate_role(&role, &bare, &declared);
+    let problems =
+        Postgres::new().validate_role(&pbps_model::RoleName::from(&role), &bare, &declared);
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(
         problems[0].to_string().contains("app.solo(integer)"),
@@ -28201,7 +28218,10 @@ async fn the_owners_own_entry_in_a_touched_acl_is_not_read_as_an_unnameable_gran
         .await
         .expect("introspect");
     assert!(
-        pulled.unexpressible.iter().all(|u| u.role != owner),
+        pulled
+            .unexpressible
+            .iter()
+            .all(|u| u.role != owner.clone().into()),
         "{:?}",
         pulled.unexpressible
     );
@@ -28217,14 +28237,17 @@ async fn the_owners_own_entry_in_a_touched_acl_is_not_read_as_an_unnameable_gran
     let mine: Vec<&str> = pulled
         .unexpressible
         .iter()
-        .filter(|u| u.role == other)
+        .filter(|u| u.role == other.clone().into())
         .map(|u| u.what.as_str())
         .collect();
     assert_eq!(mine.len(), 1, "{mine:?}");
     assert!(mine[0].contains("a type"), "{}", mine[0]);
     assert!(mine[0].contains("app.money_kind"), "{}", mine[0]);
     assert!(
-        pulled.unexpressible.iter().all(|u| u.role != owner),
+        pulled
+            .unexpressible
+            .iter()
+            .all(|u| u.role != owner.clone().into()),
         "{:?}",
         pulled.unexpressible
     );
@@ -28288,11 +28311,11 @@ async fn a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded(
         pulled
             .schema
             .roles
-            .get(&role)
+            .get(role.as_str())
             .expect("its own role is in the pull")
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|name| name.raw().to_string())
             .collect::<Vec<_>>(),
         ["app.f(integer)", "schema::app"],
         "the routine stands; no grant on an object the pull left out does"
@@ -28300,7 +28323,7 @@ async fn a_grant_on_what_the_pull_cannot_carry_is_reported_rather_than_recorded(
     let mine: Vec<&str> = pulled
         .unexpressible
         .iter()
-        .filter(|u| u.role == role)
+        .filter(|u| u.role == role.clone().into())
         .map(|u| u.what.as_str())
         .collect();
     assert_eq!(mine.len(), 3, "{mine:?}");
@@ -28362,11 +28385,11 @@ async fn a_null_acl_is_the_engines_default_and_is_reported_rather_than_compared(
     let grants: Vec<String> = pulled
         .schema
         .roles
-        .get(&role)
+        .get(role.as_str())
         .expect("its own role is in the pull")
         .grants
         .keys()
-        .map(ToString::to_string)
+        .map(|name| name.raw().to_string())
         .collect();
     assert_eq!(grants, ["schema::app"]);
     assert!(
@@ -28549,18 +28572,30 @@ async fn nondefault_public_grants_are_reported_without_reporting_materialized_de
     let before_public = before_public.unwrap();
     // Other live tests create cluster roles concurrently, so pin this
     // fixture's role and the PUBLIC reporting boundary.
-    let role = pulled.schema.roles.get(&probe_role).expect("fixture role");
-    assert_eq!(Some(role), before_public.schema.roles.get(&probe_role));
+    let role = pulled
+        .schema
+        .roles
+        .get(probe_role.as_str())
+        .expect("fixture role");
+    assert_eq!(
+        Some(role),
+        before_public.schema.roles.get(probe_role.as_str())
+    );
     assert!(!pulled.schema.roles.contains_key("PUBLIC"));
     let own_findings = |p: &pbps_db::catalog::Pulled| {
         p.unexpressible
             .iter()
-            .filter(|u| u.role == probe_role)
+            .filter(|u| u.role.raw() == probe_role)
             .cloned()
             .collect::<Vec<_>>()
     };
     assert_eq!(own_findings(&pulled), own_findings(&before_public));
-    assert!(pulled.unexpressible.iter().all(|u| u.role != "PUBLIC"));
+    assert!(
+        pulled
+            .unexpressible
+            .iter()
+            .all(|u| u.role != "PUBLIC".into())
+    );
 }
 
 /// ADR-0010 §2. `ALTER DEFAULT PRIVILEGES` is scoped to the role that creates
@@ -28642,9 +28677,10 @@ async fn a_drop_role_blocked_from_another_database_is_reported_with_that_databas
         there.execute(&sql).await.expect(&sql);
     }
 
-    let blockers = pbps_pg::roles::drop_blockers(&mut here.conn, &role)
-        .await
-        .expect("read the blockers");
+    let blockers =
+        pbps_pg::roles::drop_blockers(&mut here.conn, &pbps_model::RoleName::from(&role))
+            .await
+            .expect("read the blockers");
     let named: Vec<String> = blockers
         .iter()
         .map(|b| b.rendered(Some(&here.name)))
@@ -28688,7 +28724,7 @@ async fn a_drop_role_blocked_from_another_database_is_reported_with_that_databas
         .expect("revoke");
     std::mem::drop(there);
     assert!(
-        pbps_pg::roles::drop_blockers(&mut here.conn, &role)
+        pbps_pg::roles::drop_blockers(&mut here.conn, &pbps_model::RoleName::from(&role))
             .await
             .expect("read the blockers again")
             .is_empty(),
@@ -28733,7 +28769,12 @@ async fn maintain_is_taken_at_seventeen_and_up_and_refused_below_it() {
         .expect("read the server version");
     assert!(here >= pbps_pg::roles::MAINTAIN_ARRIVED_IN, "{here}");
     assert!(
-        pbps_pg::roles::unsupported_permissions(here, "app_reader", &role_with_maintain).is_empty(),
+        pbps_pg::roles::unsupported_permissions(
+            here,
+            &pbps_model::RoleName::from("app_reader"),
+            &role_with_maintain
+        )
+        .is_empty(),
         "the gate has to agree with the engine that just took the grant"
     );
     cleanup_role(&mut db, &role).await;
@@ -28764,7 +28805,11 @@ async fn maintain_is_taken_at_seventeen_and_up_and_refused_below_it() {
         SYNTAX_ERROR,
         "`unrecognized privilege type \"maintain\"`: the parser stops at the word"
     );
-    let refusals = pbps_pg::roles::unsupported_permissions(then, "app_reader", &role_with_maintain);
+    let refusals = pbps_pg::roles::unsupported_permissions(
+        then,
+        &pbps_model::RoleName::from("app_reader"),
+        &role_with_maintain,
+    );
     assert_eq!(refusals.len(), 1, "{refusals:?}");
     assert!(
         refusals[0].to_string().contains("PostgreSQL 17"),
@@ -28784,13 +28829,13 @@ async fn a_declared_role_the_cluster_lacks_is_named_with_the_create_role_to_run(
     let present = least_privilege_role(&mut db, "present").await;
     let absent = format!("pbps_absent_{}", std::process::id());
 
-    let declared: std::collections::BTreeSet<&str> =
-        [present.as_str(), absent.as_str()].into_iter().collect();
+    let names: Vec<pbps_model::RoleName> = vec![present.clone().into(), absent.clone().into()];
+    let declared = names.iter().collect();
     let missing = pbps_pg::roles::missing_roles(&mut db.conn, &declared)
         .await
         .expect("ask the cluster");
-    assert_eq!(missing, vec![absent.clone()]);
-    let refusal = pbps_pg::roles::refuse_missing(&absent).to_string();
+    assert_eq!(missing, vec![pbps_model::RoleName::from(&absent)]);
+    let refusal = pbps_pg::roles::refuse_missing(&pbps_model::RoleName::from(&absent)).to_string();
     assert!(
         refusal.contains(&format!("CREATE ROLE \"{absent}\";")),
         "{refusal}"
@@ -28816,9 +28861,13 @@ async fn a_rename_is_evidence_only_when_the_old_name_is_gone_from_the_cluster() 
 
     // Only the old name: the rename has not been run.
     assert_eq!(
-        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
-            .await
-            .expect("ask the cluster"),
+        pbps_pg::roles::rename_evidence(
+            &mut db.conn,
+            &pbps_model::RoleName::from(&from),
+            &pbps_model::RoleName::from(&to)
+        )
+        .await
+        .expect("ask the cluster"),
         RenameEvidence::NotRunYet
     );
 
@@ -28830,14 +28879,22 @@ async fn a_rename_is_evidence_only_when_the_old_name_is_gone_from_the_cluster() 
         .await
         .expect("a second, unrelated role");
     assert_eq!(
-        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
-            .await
-            .expect("ask the cluster"),
+        pbps_pg::roles::rename_evidence(
+            &mut db.conn,
+            &pbps_model::RoleName::from(&from),
+            &pbps_model::RoleName::from(&to)
+        )
+        .await
+        .expect("ask the cluster"),
         RenameEvidence::BothPresent
     );
-    let refusal = pbps_pg::roles::refuse_rename(&from, &to, RenameEvidence::BothPresent)
-        .expect("two principals")
-        .to_string();
+    let refusal = pbps_pg::roles::refuse_rename(
+        &pbps_model::RoleName::from(&from),
+        &pbps_model::RoleName::from(&to),
+        RenameEvidence::BothPresent,
+    )
+    .expect("two principals")
+    .to_string();
     assert!(refusal.contains("different principal"), "{refusal}");
 
     // The rename actually performed: the old name is gone, and the role's oid
@@ -28853,12 +28910,23 @@ async fn a_rename_is_evidence_only_when_the_old_name_is_gone_from_the_cluster() 
         .await
         .expect("rename the role");
     assert_eq!(
-        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
-            .await
-            .expect("ask the cluster"),
+        pbps_pg::roles::rename_evidence(
+            &mut db.conn,
+            &pbps_model::RoleName::from(&from),
+            &pbps_model::RoleName::from(&to)
+        )
+        .await
+        .expect("ask the cluster"),
         RenameEvidence::Done
     );
-    assert!(pbps_pg::roles::refuse_rename(&from, &to, RenameEvidence::Done).is_none());
+    assert!(
+        pbps_pg::roles::refuse_rename(
+            &pbps_model::RoleName::from(&from),
+            &pbps_model::RoleName::from(&to),
+            RenameEvidence::Done
+        )
+        .is_none()
+    );
     assert_eq!(
         text(
             &mut db.conn,
@@ -28872,9 +28940,13 @@ async fn a_rename_is_evidence_only_when_the_old_name_is_gone_from_the_cluster() 
     // And with neither there, there is nothing to rename and nothing to grant.
     cleanup_role(&mut db, &to).await;
     assert_eq!(
-        pbps_pg::roles::rename_evidence(&mut db.conn, &from, &to)
-            .await
-            .expect("ask the cluster"),
+        pbps_pg::roles::rename_evidence(
+            &mut db.conn,
+            &pbps_model::RoleName::from(&from),
+            &pbps_model::RoleName::from(&to)
+        )
+        .await
+        .expect("ask the cluster"),
         RenameEvidence::NeitherPresent
     );
 
@@ -28908,11 +28980,11 @@ async fn a_least_privilege_role_can_read_the_roles_the_acls_and_the_drop_blocker
     let grants = pulled
         .schema
         .roles
-        .get(&role)
+        .get(role.as_str())
         .expect("its own role is in the pull")
         .grants
         .keys()
-        .map(ToString::to_string)
+        .map(|name| name.raw().to_string())
         .collect::<Vec<_>>();
     // `app.archive(integer)`, and the argument list is the identity the module
     // pull writes — not `IN integer`, which is what
@@ -28941,7 +29013,7 @@ async fn a_least_privilege_role_can_read_the_roles_the_acls_and_the_drop_blocker
             > 0
     );
     assert!(
-        !pbps_pg::roles::drop_blockers(&mut as_role, &role)
+        !pbps_pg::roles::drop_blockers(&mut as_role, &pbps_model::RoleName::from(&role))
             .await
             .expect("the blockers")
             .is_empty(),
@@ -29073,18 +29145,18 @@ async fn a_grant_on_something_the_declarations_cannot_name_is_reported_not_lost(
         pulled
             .schema
             .roles
-            .get(&role)
+            .get(role.as_str())
             .expect("its own role is in the pull")
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|name| name.raw().to_string())
             .collect::<Vec<_>>(),
         ["app.parent", "schema::app"]
     );
     let what: Vec<&str> = pulled
         .unexpressible
         .iter()
-        .filter(|u| u.role == role)
+        .filter(|u| u.role == role.clone().into())
         .map(|u| u.what.as_str())
         .collect();
     for named in [
@@ -34986,7 +35058,7 @@ async fn doctor_adopted_revoke_requires_the_original_grantor() {
         .await
         .unwrap();
     let grants = pbps_db::doctor::GrantTargets {
-        roles: vec![recipient.clone()],
+        roles: vec![recipient.clone().into()],
         managed_tables: ["public.t".parse().unwrap()].into_iter().collect(),
         ..Default::default()
     };
@@ -35156,7 +35228,7 @@ async fn the_nearest_inherited_grantor_decides_an_adopted_revoke() {
         roles.extend([o, h, b]);
     }
     let grants = pbps_db::doctor::GrantTargets {
-        roles: vec![recipient.clone()],
+        roles: vec![recipient.clone().into()],
         managed_tables: ["near", "far", "tied", "cut"]
             .iter()
             .map(|t| format!("public.{t}").parse().unwrap())
@@ -35171,7 +35243,7 @@ async fn the_nearest_inherited_grantor_decides_an_adopted_revoke() {
     let pulled = pbps_pg::catalog::introspect(&mut theirs).await.unwrap();
     let unrevocable_on = |table: &str| {
         pulled.unrevocable.iter().any(|u| {
-            u.role == recipient
+            u.role == recipient.clone().into()
                 && matches!(&u.target, pbps_model::GrantTarget::Object(o) if o.name == table)
         })
     };
@@ -35275,7 +35347,7 @@ async fn a_deep_or_diamond_membership_graph_still_finds_the_nearest_grantor() {
     }
     db.conn.execute(&sql).await.unwrap();
     let grants = pbps_db::doctor::GrantTargets {
-        roles: vec![recipient.clone()],
+        roles: vec![recipient.clone().into()],
         managed_tables: ["deep", "diamond"]
             .iter()
             .map(|t| format!("public.{t}").parse().unwrap())
@@ -35322,7 +35394,10 @@ async fn a_deep_or_diamond_membership_graph_still_finds_the_nearest_grantor() {
     db.drop().await;
     assert!(gaps.is_empty(), "{gaps:?}");
     assert!(
-        !pulled.unrevocable.iter().any(|u| u.role == recipient),
+        !pulled
+            .unrevocable
+            .iter()
+            .any(|u| u.role == recipient.clone().into()),
         "{:?}",
         pulled.unrevocable
     );
@@ -35410,7 +35485,7 @@ async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets(
     )).await.unwrap();
     // Ownership changes rewrite these ACLs' original grantors as well.
     let grants = pbps_db::doctor::GrantTargets {
-        roles: vec![recipient.clone()],
+        roles: vec![recipient.clone().into()],
         managed_tables: ["public.t".parse().unwrap()].into_iter().collect(),
         managed_modules: [
             "public.v".parse().unwrap(),
@@ -35449,7 +35524,7 @@ async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets(
     );
     ids.roles.insert(
         pbps_model::Uid::generate(pbps_model::UidKind::Role),
-        recipient.clone(),
+        recipient.clone().into(),
     );
     let scoped = pbps_diff::scope(
         &pulled.schema,
@@ -35457,13 +35532,18 @@ async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets(
         &grants.managed_modules,
         &Default::default(),
     );
-    let scoped_targets: Vec<_> = scoped.schema.roles[&recipient]
+    let scoped_targets: Vec<_> = scoped.schema.roles[recipient.as_str()]
         .grants
         .keys()
-        .map(ToString::to_string)
+        .map(|name| name.raw().to_string())
         .collect();
     let mut desired = scoped.schema.clone();
-    desired.roles.get_mut(&recipient).unwrap().grants.clear();
+    desired
+        .roles
+        .get_mut(recipient.as_str())
+        .unwrap()
+        .grants
+        .clear();
     let plan = pbps_diff::diff(
         pbps_diff::Side {
             schema: &scoped.schema,
@@ -35482,7 +35562,7 @@ async fn doctor_adopted_acl_scope_matches_the_differ_and_keeps_recorded_targets(
         .iter()
         .filter_map(|c| {
             if let pbps_model::Change::Revoke { target, .. } = &c.change {
-                Some(target.to_string())
+                Some(target.raw().to_string())
             } else {
                 None
             }
@@ -36117,7 +36197,7 @@ async fn doctor_reports_an_absent_target_of_a_recorded_only_grant() {
         [pbps_model::Permission::Execute].into_iter().collect(),
     );
     recorded.roles.insert(
-        reader.clone(),
+        reader.clone().into(),
         pbps_model::Role {
             grants,
             ..Default::default()
@@ -37448,4 +37528,58 @@ fn fixture_estimates(
     let ids = plan_fixture::ids(changes);
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
     pbps_pg::estimate::estimates(&names, strategy)
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB (see scripts/live-tests-pg.sh)"]
+async fn role_catalog_keeps_raw_owner_grantee_and_grantor_identity() {
+    let mut db = TestDb::create("role_name").await;
+    let owner =
+        pbps_model::RoleName::from(format!("r2084_o_{}\n\\\u{202e}名前", std::process::id()));
+    let reader =
+        pbps_model::RoleName::from(format!("r2084_r_{}\n\\\u{202e}名前", std::process::id()));
+    let qo = Postgres::new().quote_ident(owner.raw()).unwrap();
+    let qr = Postgres::new().quote_ident(reader.raw()).unwrap();
+    db.conn.execute(&format!("CREATE ROLE {qo}; CREATE ROLE {qr}; CREATE SCHEMA role_names AUTHORIZATION {qo}; CREATE TABLE role_names.t (id integer); ALTER TABLE role_names.t OWNER TO {qo}; SET ROLE {qo}; GRANT SELECT ON role_names.t TO {qr}; GRANT USAGE ON SCHEMA role_names TO {qr}; RESET ROLE")).await.unwrap();
+    let pulled = pbps_pg::catalog::introspect(&mut db.conn).await.unwrap();
+    assert_eq!(
+        pulled.owners[&pbps_model::GrantTarget::Object(TableName::new("role_names", "t"))],
+        owner
+    );
+    assert!(
+        pulled.schema.roles[reader.raw()]
+            .grants
+            .contains_key(&"role_names.t".parse().unwrap())
+    );
+    assert!(
+        !pulled
+            .schema
+            .roles
+            .contains_key(reader.shown().to_string().as_str())
+    );
+    let auth = pbps_pg::resolver::authorization::read(&mut db.conn, &["role_names".into()])
+        .await
+        .unwrap();
+    assert_eq!(auth.schemas["role_names"].owner, owner);
+    assert!(
+        auth.schemas["role_names"].acl[reader.raw()]
+            .iter()
+            .all(|grant| grant.grantor == owner)
+    );
+    let absent = pbps_model::RoleName::from(reader.shown().to_string());
+    assert_eq!(
+        pbps_pg::roles::missing_roles(&mut db.conn, &[&reader, &absent].into())
+            .await
+            .unwrap(),
+        vec![absent.clone()]
+    );
+    assert_eq!(
+        pbps_pg::input_path::missing_roles(&mut db.conn, &[reader, absent.clone()])
+            .await
+            .unwrap(),
+        vec![absent]
+    );
+    cleanup_role(&mut db, &qr).await;
+    cleanup_role(&mut db, &qo).await;
+    db.drop().await;
 }

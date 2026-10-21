@@ -795,7 +795,7 @@ pub enum Change {
     // out of `CreateTable`: they sort after the objects they name exist.
     CreateRole {
         uid: Uid,
-        name: String,
+        name: crate::RoleName,
     },
     /// Dropping a role that still has members is refused by the engine, and
     /// membership is each environment's own — so a connected plan lists the
@@ -804,27 +804,27 @@ pub enum Change {
     /// leaves the list empty (ADR-0005).
     DropRole {
         uid: Uid,
-        name: String,
+        name: crate::RoleName,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        members: Vec<String>,
+        members: Vec<crate::RoleName>,
     },
     RenameRole {
         uid: Uid,
-        from: String,
-        to: String,
+        from: crate::RoleName,
+        to: crate::RoleName,
     },
     /// Permissions added on one target. Only the ones that are new: restating
     /// what the role already holds would make the plan claim a widening that
     /// is not one.
     Grant {
-        role: String,
+        role: crate::RoleName,
         target: GrantTarget,
         permissions: BTreeSet<Permission>,
     },
     /// Permissions removed from one target — the ones the declaration no
     /// longer lists.
     Revoke {
-        role: String,
+        role: crate::RoleName,
         target: GrantTarget,
         permissions: BTreeSet<Permission>,
     },
@@ -1297,8 +1297,14 @@ impl Change {
             Change::CreateRole { name, .. }
             | Change::DropRole { name, .. }
             | Change::Grant { role: name, .. }
-            | Change::Revoke { role: name, .. } => format!("role {name}"),
-            Change::RenameRole { from, .. } => format!("role {from}"),
+            | Change::Revoke { role: name, .. } => {
+                // Canonical grouping key; it remains raw after #2084 step 5.
+                format!("role {}", name.raw())
+            }
+            Change::RenameRole { from, .. } => {
+                // Canonical grouping key; it remains raw after #2084 step 5.
+                format!("role {}", from.raw())
+            }
             // The routine, not the grantee. `PUBLIC` is every principal at
             // once, so grouping by it would put every such revoke in the plan
             // under one heading; grouping by the routine puts each beside the
@@ -1839,7 +1845,7 @@ impl Change {
     // Exhaustive rather than a wildcard: a change added later that moves a
     // permission has to be named here, or the permission it moves would be
     // compared against a state it was never part of.
-    pub fn grant(&self) -> Option<(&str, &GrantTarget, PermissionChange<'_>)> {
+    pub fn grant(&self) -> Option<(&crate::RoleName, &GrantTarget, PermissionChange<'_>)> {
         match self {
             Change::Grant {
                 role,
@@ -1910,13 +1916,13 @@ impl Change {
     // Exhaustive rather than a wildcard: a change added later that names a
     // role has to be classified here, or a caller asking what this plan
     // touched would be told "nothing" about it.
-    pub fn roles(&self) -> impl Iterator<Item = &str> {
+    pub fn roles(&self) -> impl Iterator<Item = &crate::RoleName> {
         let (one, two) = match self {
             Change::CreateRole { name, .. }
             | Change::DropRole { name, .. }
             | Change::Grant { role: name, .. }
-            | Change::Revoke { role: name, .. } => (Some(name.as_str()), None),
-            Change::RenameRole { from, to, .. } => (Some(from.as_str()), Some(to.as_str())),
+            | Change::Revoke { role: name, .. } => (Some(name), None),
+            Change::RenameRole { from, to, .. } => (Some(from), Some(to)),
             // `PUBLIC` is not a role name; it is every principal at once, and
             // no declaration, ids file or pull ever names it (ADR-0010 §5).
             Change::PublicExecution { .. } => (None, None),
@@ -2330,7 +2336,7 @@ impl Change {
     /// comparison here — its whole state is its name — so without this a
     /// `CREATE ROLE` that another session undid was recorded as success.
     // Exhaustive rather than a wildcard, as every accessor here is.
-    pub fn roles_after(&self) -> Vec<(&str, Presence)> {
+    pub fn roles_after(&self) -> Vec<(&crate::RoleName, Presence)> {
         match self {
             Change::CreateRole { name, .. } => vec![(name, Presence::Present)],
             Change::DropRole { name, .. } => vec![(name, Presence::Absent)],

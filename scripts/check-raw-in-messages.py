@@ -4,7 +4,8 @@
 A name or a free text that can come from an artifact has no `Display`: it is
 used as text only through `.shown()`, which escapes it, or `.raw()`, which does
 not (`pbps_model::Text`, `TableName`/`ObjectName`, `ColumnRef`, `RoutineArg`,
-`RoutineId`, `ModuleId` and `ColumnName` today; the remaining name types follow in #2084). The compiler forces that choice but cannot
+`RoutineId`, `ModuleId`, `ColumnName`, `RoleName` and `GrantTarget` today; the
+remaining name types follow in #2084). The compiler forces that choice but cannot
 stop `.raw()` being the one chosen for a message, and an unescaped line break in
 a message starts a line the tool never wrote. This is the one hole the types
 leave, so this check closes it.
@@ -66,6 +67,43 @@ SQL_BUILDERS = {
 # nature, a number for a known hole, which has to equal what the file holds -
 # a new one fails, and so does one fixed without lowering it.
 ALLOWED = {
+    "crates/pbps-cli/src/baseline.rs": (
+        2,
+        "role subjects are raw grouping keys, which remain raw after #2084 step 5",
+    ),
+    "crates/pbps-cli/src/declaration_file.rs": (
+        1,
+        "builds encoded role filenames from original bytes; the key remains raw after #2084 step 5",
+    ),
+    "crates/pbps-model/src/change.rs": (
+        2,
+        "role subjects are raw grouping and policy keys, which remain raw after #2084 step 5",
+    ),
+    "crates/pbps-cli/src/resolver/scope.rs": (
+        1,
+        "quotes a raw role into scratch SET ROLE SQL; SQL remains raw after #2084 step 5",
+    ),
+    "crates/pbps-mssql/src/resolver/authorization.rs": (
+        22,
+        "nineteen raw SQL operands and three raw test replay-row operands; "
+        "both retain their original spelling after #2084 step 5",
+    ),
+    "crates/pbps-pg/src/resolver/authorization.rs": (
+        5,
+        "quotes raw role names into reconstruction SQL; SQL remains raw after #2084 step 5",
+    ),
+    "crates/pbps-pg/src/resolver/externals.rs": (
+        1,
+        "quotes a raw role into externals USAGE SQL; SQL remains raw after #2084 step 5",
+    ),
+    "crates/pbps-pg/src/resolver.rs": (
+        1,
+        "quotes raw role names into cleanup SQL; SQL remains raw after #2084 step 5",
+    ),
+    "crates/pbps-pg/src/roles.rs": (
+        9,
+        "role refusals feed whole-escaped DialectError fields until #2084 step 5",
+    ),
     # The SQL builders. A name or a text is quoted through the dialect into a
     # statement, a probe or a row bind, and a `format!` is how the statement
     # is put together. Only formatting outside the bounded diagnostic sinks
@@ -96,7 +134,7 @@ ALLOWED = {
     # adapters and fixture builders are counted too, so a new raw message in
     # those files cannot hide behind their non-message uses.
     "crates/pbps-cli/src/report.rs": (
-        47,
+        56,
         "Canonical shell arguments and describe() names stay raw: the latter is "
         "the JSON `risks[].changes` text too and the report escapes it whole; "
         "#2084 step 5 removes that cover",
@@ -117,7 +155,7 @@ ALLOWED = {
         "until #2084 step 5",
     ),
     "crates/pbps-mssql/src/validate.rs": (
-        46,
+        50,
         "validation sentences, including the #2084 routine-argument refusal, "
         "feed whole-escaped DialectError fields; the #1450 declaration note "
         "feeds the whole-escaped `dialect.not-checked` note "
@@ -130,7 +168,7 @@ ALLOWED = {
         "until #2084 step 5",
     ),
     "crates/pbps-pg/src/validate.rs": (
-        10,
+        23,
         "structural and target-kind refusals feed whole-escaped DialectError::Invalid "
         "until #2084 step 5",
     ),
@@ -140,7 +178,7 @@ ALLOWED = {
         "DialectError::Invalid until #2084 step 5",
     ),
     "crates/pbps-policy/src/evaluate.rs": (
-        7,
+        10,
         "policy sentences are shared JSON and findings that report::changes "
         "escapes whole until #2084 step 5; subjects remain raw identity keys",
     ),
@@ -165,10 +203,11 @@ ALLOWED = {
         "remain raw after #2084 step 5",
     ),
     "crates/pbps-diff/src/schema_diff.rs": (
-        1,
+        11,
         "a baseline-key refusal projects ColumnName to str before Rust Debug, "
         "preserving the prior escaped string-list diagnostic without a type wrapper; "
-        "Rust Debug remains the escaping boundary after #2084 step 5",
+        "Rust Debug remains the escaping boundary after #2084 step 5; "
+        "ten role/target operands build raw test comparison labels",
     ),
     "crates/pbps-diff/src/identity.rs": (
         1,
@@ -188,9 +227,23 @@ ALLOWED = {
         "writes a trigger's fixture YAML; serialization remains raw after #2084 step 5",
     ),
     "crates/pbps-cli/src/dependents.rs": (
+        4,
+        "three Provenance.reason operands are shared plan JSON escaped whole by "
+        "report::changes until #2084 step 5; one role operand is a raw test ordering label",
+    ),
+    "crates/pbps-cli/src/dependents/schedule.rs": (
+        1,
+        "a raw role-drop label is test comparison data, retained after #2084 step 5",
+    ),
+    "crates/pbps-mssql/tests/support/resolver.rs": (
         3,
-        "Provenance.reason is shared plan JSON and escaped whole by report::changes "
-        "until #2084 step 5",
+        "two raw grant-row test labels and one raw DENY fixture SQL operand, "
+        "all retained after #2084 step 5",
+    ),
+    "crates/pbps-pg/tests/support/resolver.rs": (
+        11,
+        "ten raw role fixture SQL operands and one raw role:extra comparison key, "
+        "all retained after #2084 step 5",
     ),
     "crates/pbps-cli/src/adopt.rs": (
         3,

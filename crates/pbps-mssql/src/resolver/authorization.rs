@@ -49,8 +49,8 @@ const SYSTEM_SCHEMAS: &[&str] = &["sys", "INFORMATION_SCHEMA", "guest"];
 /// a revoke takes back only what that grantor granted.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct Grant {
-    pub grantee: String,
-    pub grantor: String,
+    pub grantee: pbps_model::RoleName,
+    pub grantor: pbps_model::RoleName,
     pub permission: String,
     pub state: String,
 }
@@ -60,7 +60,7 @@ pub struct Grant {
 /// can see (for reconstruction).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SchemaAuthorization {
-    pub owner: String,
+    pub owner: pbps_model::RoleName,
     pub permissions: BTreeSet<String>,
     pub grants: Vec<Grant>,
 }
@@ -70,7 +70,7 @@ pub struct SchemaAuthorization {
 /// `on` is the principal the permission is on.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub struct PrincipalGrant {
-    pub on: String,
+    pub on: pbps_model::RoleName,
     pub grant: Grant,
 }
 
@@ -101,9 +101,9 @@ pub struct AuthorizationContext {
     pub schemas: BTreeMap<String, SchemaAuthorization>,
     /// Roles the deployer is a member of, by the engine's `IS_ROLEMEMBER`,
     /// and whether each is one of the fixed `db_` roles.
-    pub roles: BTreeMap<String, bool>,
+    pub roles: BTreeMap<pbps_model::RoleName, bool>,
     /// Users the deployer may `EXECUTE AS`.
-    pub impersonation: BTreeSet<String>,
+    pub impersonation: BTreeSet<pbps_model::RoleName>,
     /// Every other row on a database principal held by the deployer or a
     /// role it is in (#1011, DEC-1011.1). Such a row decides what the deployer sees:
     /// `VIEW DEFINITION` on a role shows that role's grant rows. Left out of
@@ -117,11 +117,11 @@ pub struct AuthorizationContext {
     /// what `dbo` grants on the role (measured on 17.0); so scratch gives the
     /// role the same owner, and replays the rows on it under that owner.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub principal_owners: BTreeMap<String, String>,
+    pub principal_owners: BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
     /// The kind of every principal the context names that the deployer can
     /// see; one it cannot see is an owner or grantor it is not a member of,
     /// and is reproduced as a user.
-    pub principals: BTreeMap<String, PrincipalKind>,
+    pub principals: BTreeMap<pbps_model::RoleName, PrincipalKind>,
     /// Each principal a planned grant names, keyed by the plan's spelling:
     /// the catalog's spelling of it, or `None` when the catalog has no such
     /// principal ([`resolve_spellings`]). Every name is recorded, the ones the
@@ -129,7 +129,7 @@ pub struct AuthorizationContext {
     /// one that does not are sealed apart (#1013). Empty for a read that was
     /// given no planned grants, and then left out of the canonical form.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub spellings: BTreeMap<String, Option<String>>,
+    pub spellings: BTreeMap<pbps_model::RoleName, Option<pbps_model::RoleName>>,
 }
 
 impl AuthorizationContext {
@@ -141,7 +141,7 @@ impl AuthorizationContext {
     /// The catalog's name for a principal a planned grant names: the
     /// resolved spelling, or the name as planned when the catalog has no such
     /// principal yet.
-    fn catalog_name<'a>(&'a self, planned: &'a str) -> &'a str {
+    fn catalog_name<'a>(&'a self, planned: &'a pbps_model::RoleName) -> &'a pbps_model::RoleName {
         spelled(&self.spellings, planned)
     }
 }
@@ -174,16 +174,17 @@ impl AuthorizationContext {
 pub async fn resolve_spellings(
     conn: &mut impl QueryConnection,
     context: &mut AuthorizationContext,
-    planned: &[String],
+    planned: &[pbps_model::RoleName],
 ) -> Result<(), DbError> {
-    let names: BTreeSet<&str> = planned.iter().map(String::as_str).collect();
+    let names: BTreeSet<&str> = planned.iter().map(pbps_model::RoleName::raw).collect();
     let Some(sql) = spellings_query(&names) else {
         return Ok(());
     };
     let mut answered = BTreeMap::new();
     for row in conn.query(&sql).await? {
-        let planned = required(&row, "planned", "a planned principal's name")?;
-        let catalog = row.try_get::<&str>("name")?.map(str::to_owned);
+        let planned =
+            pbps_model::RoleName::from(required(&row, "planned", "a planned principal's name")?);
+        let catalog = row.try_get::<&str>("name")?.map(pbps_model::RoleName::from);
         answered.insert(planned, catalog);
     }
     // Each name comes back exactly once; one that did not is unread, and an
@@ -222,10 +223,13 @@ fn spellings_query(names: &BTreeSet<&str>) -> Option<String> {
 
 /// The catalog's name for `planned`, or `planned` itself when the catalog
 /// has none (or the name was never resolved).
-fn spelled<'a>(spellings: &'a BTreeMap<String, Option<String>>, planned: &'a str) -> &'a str {
+fn spelled<'a>(
+    spellings: &'a BTreeMap<pbps_model::RoleName, Option<pbps_model::RoleName>>,
+    planned: &'a pbps_model::RoleName,
+) -> &'a pbps_model::RoleName {
     spellings
         .get(planned)
-        .and_then(Option::as_deref)
+        .and_then(Option::as_ref)
         .unwrap_or(planned)
 }
 
@@ -235,7 +239,7 @@ fn spelled<'a>(spellings: &'a BTreeMap<String, Option<String>>, planned: &'a str
 /// does not take there either.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PlannedGrant {
-    pub principal: String,
+    pub principal: pbps_model::RoleName,
     pub schema: String,
     pub permission: String,
     pub revoke: bool,
@@ -277,7 +281,7 @@ pub async fn read(
     let principal = DeploymentPrincipal {
         login: required(row, "login", "the login")?,
         superuser: effective == "dbo",
-        effective,
+        effective: effective.into(),
     };
     // A user mapped from a Windows group has no default schema of its own;
     // the engine falls back to `dbo`, and so does the reproduction.
@@ -302,7 +306,7 @@ pub async fn read(
             .await?
         {
             roles.insert(
-                required(&row, "name", "a role's name")?,
+                required(&row, "name", "a role's name")?.into(),
                 required(&row, "fixed", "whether a role is fixed")? == "1",
             );
         }
@@ -317,12 +321,12 @@ pub async fn read(
     // effective answer and not in the rows replayed, and a scratch side
     // without them failed verification for an ordinary target (finding on
     // #611).
-    let mut holders: BTreeSet<String> = roles.keys().cloned().collect();
+    let mut holders: BTreeSet<pbps_model::RoleName> = roles.keys().cloned().collect();
     holders.insert(principal.effective.clone());
-    holders.insert("public".to_owned());
+    holders.insert("public".into());
     let holder_list = holders
         .iter()
-        .map(|name| literal(name))
+        .map(|name| literal(name.raw()))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -359,7 +363,7 @@ pub async fn read(
         {
             context
                 .impersonation
-                .insert(required(&row, "target", "an impersonation target")?);
+                .insert(required(&row, "target", "an impersonation target")?.into());
         }
         // Everything else on a principal, a DENY of IMPERSONATE included: the
         // granted IMPERSONATE rows are the list above, replayed as that.
@@ -376,10 +380,10 @@ pub async fn read(
             .await?
         {
             context.principal_grants.push(PrincipalGrant {
-                on: required(&row, "target", "the principal a permission is on")?,
+                on: required(&row, "target", "the principal a permission is on")?.into(),
                 grant: Grant {
-                    grantee: required(&row, "grantee", "a grantee")?,
-                    grantor: required(&row, "grantor", "a grantor")?,
+                    grantee: required(&row, "grantee", "a grantee")?.into(),
+                    grantor: required(&row, "grantor", "a grantor")?.into(),
                     permission: required(&row, "permission", "a permission")?,
                     state: required(&row, "state", "a permission's state")?,
                 },
@@ -437,7 +441,7 @@ pub async fn read(
         context.schemas.insert(
             name,
             SchemaAuthorization {
-                owner,
+                owner: owner.into(),
                 permissions,
                 grants,
             },
@@ -455,7 +459,7 @@ pub async fn read(
         )
         .await?
     {
-        let name = required(&row, "name", "a principal's name")?;
+        let name = pbps_model::RoleName::from(required(&row, "name", "a principal's name")?);
         if named.contains(&name) {
             let kind = match required(&row, "kind", "a principal's type")?.as_str() {
                 "R" => PrincipalKind::Role,
@@ -472,7 +476,7 @@ pub async fn read(
             {
                 context
                     .principal_owners
-                    .insert(name.clone(), owner.to_owned());
+                    .insert(name.clone(), owner.to_owned().into());
             }
             context.principals.insert(name, kind);
         }
@@ -512,8 +516,8 @@ async fn grants(conn: &mut impl QueryConnection, filter: &str) -> Result<Vec<Gra
         .await?
     {
         found.push(Grant {
-            grantee: required(&row, "grantee", "a grantee")?,
-            grantor: required(&row, "grantor", "a grantor")?,
+            grantee: required(&row, "grantee", "a grantee")?.into(),
+            grantor: required(&row, "grantor", "a grantor")?.into(),
             permission: required(&row, "permission", "a permission")?,
             state: required(&row, "state", "a permission's state")?,
         });
@@ -523,7 +527,10 @@ async fn grants(conn: &mut impl QueryConnection, filter: &str) -> Result<Vec<Gra
 }
 
 /// Every principal the context or the plan names.
-fn named_principals(context: &AuthorizationContext, planned: &[PlannedGrant]) -> BTreeSet<String> {
+fn named_principals(
+    context: &AuthorizationContext,
+    planned: &[PlannedGrant],
+) -> BTreeSet<pbps_model::RoleName> {
     let mut named = BTreeSet::new();
     named.insert(context.principal.effective.clone());
     named.extend(context.roles.keys().cloned());
@@ -555,8 +562,10 @@ fn named_principals(context: &AuthorizationContext, planned: &[PlannedGrant]) ->
 
 /// Whether a principal keeps its own name on scratch: the engine's built-in
 /// principals and the fixed roles, whose meaning is their identity.
-fn is_built_in(context: &AuthorizationContext, name: &str) -> bool {
-    BUILT_IN.contains(&name) || context.roles.get(name) == Some(&true) || is_fixed_role(name)
+fn is_built_in(context: &AuthorizationContext, name: &pbps_model::RoleName) -> bool {
+    BUILT_IN.contains(&name.raw())
+        || context.roles.get(name) == Some(&true)
+        || is_fixed_role(name.raw())
 }
 
 fn is_fixed_role(name: &str) -> bool {
@@ -579,10 +588,10 @@ fn is_fixed_role(name: &str) -> bool {
 /// there. Built-in principals map to themselves.
 #[derive(Debug, Clone)]
 pub struct PrincipalMap {
-    to_run_local: BTreeMap<String, String>,
+    to_run_local: BTreeMap<pbps_model::RoleName, pbps_model::RoleName>,
     /// The plan's spelling of a principal to the catalog's, so a planned
     /// grant finds the principal it names (#726).
-    spellings: BTreeMap<String, Option<String>>,
+    spellings: BTreeMap<pbps_model::RoleName, Option<pbps_model::RoleName>>,
 }
 
 impl PrincipalMap {
@@ -596,7 +605,7 @@ impl PrincipalMap {
                 let run_local = if is_built_in(context, &name) {
                     name.clone()
                 } else {
-                    format!("pbps_principal_{index}_{token}")
+                    format!("pbps_principal_{index}_{token}").into()
                 };
                 (name, run_local)
             })
@@ -607,12 +616,12 @@ impl PrincipalMap {
         }
     }
 
-    fn run_local(&self, logical: &str) -> Option<String> {
+    fn run_local(&self, logical: &pbps_model::RoleName) -> Option<pbps_model::RoleName> {
         let logical = spelled(&self.spellings, logical);
         self.to_run_local.get(logical).cloned()
     }
 
-    fn logical_of(&self, run_local: &str) -> Option<String> {
+    fn logical_of(&self, run_local: &pbps_model::RoleName) -> Option<pbps_model::RoleName> {
         self.to_run_local
             .iter()
             .find(|(_, run)| *run == run_local)
@@ -621,7 +630,7 @@ impl PrincipalMap {
 
     /// Every principal this run creates. They are database-scoped and go
     /// with the scratch database, so this is for the record, not for cleanup.
-    pub fn run_local_names(&self) -> Vec<String> {
+    pub fn run_local_names(&self) -> Vec<pbps_model::RoleName> {
         self.to_run_local
             .iter()
             .filter(|(logical, run)| logical != run)
@@ -632,7 +641,7 @@ impl PrincipalMap {
     /// The scratch user the compilation must `EXECUTE AS`, or `None` when
     /// the deployer is `dbo`: the run login owns its scratch database and is
     /// already `dbo` there.
-    pub fn deployer(&self, context: &AuthorizationContext) -> Option<String> {
+    pub fn deployer(&self, context: &AuthorizationContext) -> Option<pbps_model::RoleName> {
         if context.principal.superuser {
             return None;
         }
@@ -650,9 +659,10 @@ pub async fn reconstruct(
     context: &AuthorizationContext,
     run_login: &str,
 ) -> Result<(), DbError> {
-    let missing = |logical: &str| {
+    let missing = |logical: &pbps_model::RoleName| {
         DbError::BadRow(format!(
-            "the authorization reconstruction has no run-local principal for {logical}"
+            "the authorization reconstruction has no run-local principal for {logical}",
+            logical = logical.shown(),
         ))
     };
     for (logical, run) in &map.to_run_local {
@@ -660,9 +670,9 @@ pub async fn reconstruct(
             continue;
         }
         let statement = match context.principals.get(logical) {
-            Some(PrincipalKind::Role) => format!("CREATE ROLE {};", bracket(run)),
+            Some(PrincipalKind::Role) => format!("CREATE ROLE {};", bracket(run.raw())),
             Some(PrincipalKind::User) | None => {
-                format!("CREATE USER {} WITHOUT LOGIN;", bracket(run))
+                format!("CREATE USER {} WITHOUT LOGIN;", bracket(run.raw()))
             }
         };
         admin.query(&statement).await?;
@@ -673,8 +683,8 @@ pub async fn reconstruct(
         admin
             .query(&format!(
                 "ALTER AUTHORIZATION ON ROLE::{} TO {};",
-                bracket(&map.run_local(role).ok_or_else(|| missing(role))?),
-                bracket(&map.run_local(owner).ok_or_else(|| missing(owner))?)
+                bracket((map.run_local(role).ok_or_else(|| missing(role))?).raw()),
+                bracket((map.run_local(owner).ok_or_else(|| missing(owner))?).raw())
             ))
             .await?;
     }
@@ -682,7 +692,7 @@ pub async fn reconstruct(
         admin
             .query(&format!(
                 "ALTER USER {} WITH DEFAULT_SCHEMA = {};",
-                bracket(&deployer),
+                bracket(deployer.raw()),
                 bracket(&context.default_schema)
             ))
             .await?;
@@ -691,8 +701,8 @@ pub async fn reconstruct(
             admin
                 .query(&format!(
                     "ALTER ROLE {} ADD MEMBER {};",
-                    bracket(&role),
-                    bracket(&deployer)
+                    bracket(role.raw()),
+                    bracket(deployer.raw())
                 ))
                 .await?;
         }
@@ -701,8 +711,8 @@ pub async fn reconstruct(
             admin
                 .query(&format!(
                     "GRANT IMPERSONATE ON USER::{} TO {};",
-                    bracket(&target),
-                    bracket(&deployer)
+                    bracket(target.raw()),
+                    bracket(deployer.raw())
                 ))
                 .await?;
         }
@@ -719,32 +729,39 @@ pub async fn reconstruct(
         let statement = if name == "dbo" {
             format!(
                 "ALTER AUTHORIZATION ON SCHEMA::[dbo] TO {};",
-                bracket(&owner)
+                bracket(owner.raw())
             )
         } else {
             format!(
                 "CREATE SCHEMA {} AUTHORIZATION {};",
                 bracket(name),
-                bracket(&owner)
+                bracket(owner.raw())
             )
         };
-        if !(name == "dbo" && owner == "dbo") {
+        if !(name == "dbo" && owner.raw() == "dbo") {
             admin.query(&statement).await?;
         }
         let on = format!(" ON SCHEMA::{}", bracket(name));
         replay(admin, map, &schema.owner, &schema.grants, &on).await?;
     }
-    replay(admin, map, "dbo", &context.database_grants, "").await?;
+    replay(
+        admin,
+        map,
+        &pbps_model::RoleName::from("dbo"),
+        &context.database_grants,
+        "",
+    )
+    .await?;
     // Grouped by the principal they are on, each group a securable of its
     // own for `replay_order`, under that principal's owner. A role's is the
     // one read, or `dbo`; a user owns itself, and the engine records it as
     // the grantor of what `dbo` grants on it (measured on 17.0). A principal
     // the deployer cannot see was created as a user above, so it owns itself
     // on scratch too.
-    let mut on_principal: BTreeMap<&str, Vec<Grant>> = BTreeMap::new();
+    let mut on_principal: BTreeMap<&pbps_model::RoleName, Vec<Grant>> = BTreeMap::new();
     for held in &context.principal_grants {
         on_principal
-            .entry(held.on.as_str())
+            .entry(&held.on)
             .or_default()
             .push(held.grant.clone());
     }
@@ -758,10 +775,11 @@ pub async fn reconstruct(
             Some(PrincipalKind::Role) => "ROLE",
             Some(PrincipalKind::User) | None => "USER",
         };
-        let on = format!(" ON {class}::{}", bracket(&run));
+        let on = format!(" ON {class}::{}", bracket(run.raw()));
+        let default_owner = pbps_model::RoleName::from("dbo");
         let owner = match (context.principal_owners.get(logical), class) {
-            (Some(owner), _) => owner.as_str(),
-            (None, "ROLE") => "dbo",
+            (Some(owner), _) => owner,
+            (None, "ROLE") => &default_owner,
             (None, _) => logical,
         };
         replay(admin, map, owner, &grants, &on).await?;
@@ -786,7 +804,7 @@ enum Step<'a> {
     /// The grant option a grantor must hold before its rows can be replayed,
     /// which the deployment session could not see on the target.
     Enable {
-        grantor: &'a str,
+        grantor: &'a pbps_model::RoleName,
         permission: &'a str,
     },
 }
@@ -809,20 +827,23 @@ enum Step<'a> {
 /// deployer can see is replayed as it is. The added row is as invisible to
 /// the scratch deployer as the target's is to the real one, and `verify`
 /// refuses the reconstruction if it ever is not.
-fn replay_order<'a>(owner: &str, grants: &'a [Grant]) -> Result<Vec<Step<'a>>, DbError> {
+fn replay_order<'a>(
+    owner: &pbps_model::RoleName,
+    grants: &'a [Grant],
+) -> Result<Vec<Step<'a>>, DbError> {
     let mut steps = Vec::new();
     let mut pending: Vec<&Grant> = grants.iter().collect();
-    let mut able: BTreeSet<(&str, &str)> = BTreeSet::new();
+    let mut able: BTreeSet<(&pbps_model::RoleName, &str)> = BTreeSet::new();
     while !pending.is_empty() {
         let (ready, waiting): (Vec<_>, Vec<_>) = pending.into_iter().partition(|grant| {
-            grant.grantor == owner
-                || grant.grantor == "dbo"
-                || able.contains(&(grant.grantor.as_str(), grant.permission.as_str()))
+            &grant.grantor == owner
+                || grant.grantor.raw() == "dbo"
+                || able.contains(&(&grant.grantor, grant.permission.as_str()))
         });
         if ready.is_empty() {
             // The grantors nothing still pending could enable. A set with
             // none is a cycle of grant options, which no engine state is.
-            let roots: BTreeSet<(&str, &str)> = waiting
+            let roots: BTreeSet<(&pbps_model::RoleName, &str)> = waiting
                 .iter()
                 .filter(|grant| {
                     !waiting.iter().any(|other| {
@@ -831,12 +852,19 @@ fn replay_order<'a>(owner: &str, grants: &'a [Grant]) -> Result<Vec<Step<'a>>, D
                             && other.state == "GRANT_WITH_GRANT_OPTION"
                     })
                 })
-                .map(|grant| (grant.grantor.as_str(), grant.permission.as_str()))
+                .map(|grant| (&grant.grantor, grant.permission.as_str()))
                 .collect();
             if roots.is_empty() {
                 let stuck: Vec<String> = waiting
                     .iter()
-                    .map(|g| format!("{} to {} by {}", g.permission, g.grantee, g.grantor))
+                    .map(|g| {
+                        format!(
+                            "{} to {} by {}",
+                            g.permission,
+                            g.grantee.shown(),
+                            g.grantor.shown()
+                        )
+                    })
                     .collect();
                 return Err(DbError::BadRow(format!(
                     "grant rows name each other as the source of their grant option: {}",
@@ -856,7 +884,7 @@ fn replay_order<'a>(owner: &str, grants: &'a [Grant]) -> Result<Vec<Step<'a>>, D
         for grant in ready {
             steps.push(Step::Row(grant));
             if grant.state == "GRANT_WITH_GRANT_OPTION" {
-                able.insert((grant.grantee.as_str(), grant.permission.as_str()));
+                able.insert((&grant.grantee, grant.permission.as_str()));
             }
         }
         pending = waiting;
@@ -869,19 +897,20 @@ fn replay_order<'a>(owner: &str, grants: &'a [Grant]) -> Result<Vec<Step<'a>>, D
 async fn replay(
     admin: &mut impl QueryConnection,
     map: &PrincipalMap,
-    owner: &str,
+    owner: &pbps_model::RoleName,
     grants: &[Grant],
     on: &str,
 ) -> Result<(), DbError> {
     // `dbo` owns the database-level securable and is named by no row of a
     // context that grants nothing through it, so it may be absent from the map.
-    let local = |logical: &str| {
-        if logical == "dbo" {
-            return Ok("dbo".to_owned());
+    let local = |logical: &pbps_model::RoleName| {
+        if logical.raw() == "dbo" {
+            return Ok(pbps_model::RoleName::from("dbo"));
         }
         map.run_local(logical).ok_or_else(|| {
             DbError::BadRow(format!(
-                "the authorization reconstruction has no run-local principal for {logical}"
+                "the authorization reconstruction has no run-local principal for {logical}",
+                logical = logical.shown(),
             ))
         })
     };
@@ -892,8 +921,8 @@ async fn replay(
                 permission,
             } => format!(
                 "GRANT {permission}{on} TO {} WITH GRANT OPTION AS {};",
-                bracket(&local(grantor)?),
-                bracket(&local(owner)?)
+                bracket((local(grantor)?).raw()),
+                bracket((local(owner)?).raw())
             ),
             Step::Row(grant) => {
                 let (verb, option) = match grant.state.as_str() {
@@ -909,8 +938,8 @@ async fn replay(
                 format!(
                     "{verb} {}{on} TO {}{option} AS {};",
                     grant.permission,
-                    bracket(&local(&grant.grantee)?),
-                    bracket(&local(&grant.grantor)?)
+                    bracket((local(&grant.grantee)?).raw()),
+                    bracket((local(&grant.grantor)?).raw())
                 )
             }
         };
@@ -925,11 +954,14 @@ async fn replay(
 /// impersonation context on the last until the engine refuses the 33rd
 /// (measured on 17.0: error 15159, "maximum impersonation nesting level
 /// exceeded (limit 32)"), ending a long run on its own bookkeeping.
-pub async fn enter(conn: &mut impl QueryConnection, deployer: Option<&str>) -> Result<(), DbError> {
+pub async fn enter(
+    conn: &mut impl QueryConnection,
+    deployer: Option<&pbps_model::RoleName>,
+) -> Result<(), DbError> {
     if let Some(deployer) = deployer {
         conn.query(&format!(
             "IF USER_NAME() <> {name} EXECUTE AS USER = {name};",
-            name = literal(deployer)
+            name = literal(deployer.raw())
         ))
         .await?;
     }
@@ -953,7 +985,7 @@ pub async fn apply_planned(
         let principal = map.run_local(&grant.principal).ok_or_else(|| {
             DbError::BadRow(format!(
                 "a planned grant names the unmapped principal {}",
-                grant.principal
+                grant.principal.shown()
             ))
         })?;
         let statement = if grant.revoke {
@@ -961,14 +993,14 @@ pub async fn apply_planned(
                 "REVOKE {} ON SCHEMA::{} FROM {};",
                 grant.permission,
                 bracket(&grant.schema),
-                bracket(&principal)
+                bracket(principal.raw())
             )
         } else {
             format!(
                 "GRANT {} ON SCHEMA::{} TO {};",
                 grant.permission,
                 bracket(&grant.schema),
-                bracket(&principal)
+                bracket(principal.raw())
             )
         };
         deployer.query(&statement).await?;
@@ -995,7 +1027,8 @@ fn differences(
     target: &AuthorizationContext,
     reproduced: &AuthorizationContext,
 ) -> Vec<String> {
-    let logical = |name: &str| map.logical_of(name).unwrap_or_else(|| name.to_owned());
+    let logical =
+        |name: &pbps_model::RoleName| map.logical_of(name).unwrap_or_else(|| name.to_owned());
     let mapped = |grants: &[Grant]| -> Vec<Grant> {
         let mut grants: Vec<Grant> = grants
             .iter()
@@ -1047,7 +1080,7 @@ fn differences(
             found.push(format!("schema:{name}:grants"));
         }
     }
-    let roles: BTreeMap<String, bool> = reproduced
+    let roles: BTreeMap<pbps_model::RoleName, bool> = reproduced
         .roles
         .iter()
         .map(|(name, fixed)| (logical(name), *fixed))
@@ -1058,14 +1091,11 @@ fn differences(
         .collect::<BTreeSet<_>>()
     {
         if roles.get(name) != target.roles.get(name) {
-            found.push(format!("role:{name}"));
+            found.push(format!("role:{name}", name = name.shown(),));
         }
     }
-    let impersonation: BTreeSet<String> = reproduced
-        .impersonation
-        .iter()
-        .map(|n| logical(n))
-        .collect();
+    let impersonation: BTreeSet<pbps_model::RoleName> =
+        reproduced.impersonation.iter().map(&logical).collect();
     if impersonation != target.impersonation {
         found.push("impersonation".to_owned());
     }
@@ -1081,7 +1111,7 @@ fn differences(
     if principal_grants != target.principal_grants {
         found.push("principal:grants".to_owned());
     }
-    let principal_owners: BTreeMap<String, String> = reproduced
+    let principal_owners: BTreeMap<pbps_model::RoleName, pbps_model::RoleName> = reproduced
         .principal_owners
         .iter()
         .map(|(role, owner)| (logical(role), logical(owner)))
@@ -1094,9 +1124,47 @@ fn differences(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn principal_mapping_preserves_raw_owner_grantor_and_spelling_keys() {
+        let name = pbps_model::RoleName::from("role\nline\\\u{202e}名前");
+        let lookalike = pbps_model::RoleName::from(name.shown().to_string());
+        let mut context = context();
+        context.roles.insert(name.clone(), false);
+        context.roles.insert(lookalike.clone(), false);
+        context
+            .principal_owners
+            .insert(name.clone(), lookalike.clone());
+        context.spellings.insert(name.clone(), Some(name.clone()));
+        context.schemas.get_mut("app").unwrap().owner = name.clone();
+        context
+            .schemas
+            .get_mut("app")
+            .unwrap()
+            .grants
+            .push(grant(&lookalike, &name, "SELECT", "GRANT"));
+        let json: serde_json::Value = serde_json::from_slice(&context.canonical()).unwrap();
+        assert!(json["roles"].get(name.raw()).is_some());
+        assert!(json["roles"].get(lookalike.raw()).is_some());
+        assert_eq!(json["principal_owners"][name.raw()], lookalike.raw());
+        let map = PrincipalMap::generate(&context, &[], "hostile");
+        let run = map.run_local(&name).unwrap();
+        assert_ne!(Some(&run), map.run_local(&lookalike).as_ref());
+        assert_eq!(map.logical_of(&run), Some(name));
+        assert!(
+            map.run_local(&pbps_model::RoleName::from("absent"))
+                .is_none()
+        );
+    }
+
     use super::*;
 
-    fn grant(grantee: &str, grantor: &str, permission: &str, state: &str) -> Grant {
+    fn grant(
+        grantee: &pbps_model::RoleName,
+        grantor: &pbps_model::RoleName,
+        permission: &str,
+        state: &str,
+    ) -> Grant {
         Grant {
             grantee: grantee.into(),
             grantor: grantor.into(),
@@ -1111,12 +1179,19 @@ mod tests {
             .map(|step| match step {
                 Step::Row(g) => format!(
                     "{} {} to {} by {}",
-                    g.state, g.permission, g.grantee, g.grantor
+                    g.state,
+                    g.permission,
+                    g.grantee.raw(),
+                    g.grantor.raw()
                 ),
                 Step::Enable {
                     grantor,
                     permission,
-                } => format!("enable {permission} for {grantor}"),
+                } => format!(
+                    "enable {permission} for {grantor}",
+                    // Preserve the original spelling in this SQL or comparison fixture.
+                    grantor = grantor.raw(),
+                ),
             })
             .collect()
     }
@@ -1127,21 +1202,41 @@ mod tests {
         // only. The engine records a grantor other than the owner for a
         // grant-option holder and nobody else (measured), so the row is
         // replayable once `wgo` holds exactly that.
-        let invisible = [grant("dep", "wgo", "EXECUTE", "GRANT")];
+        let invisible = [grant(
+            &pbps_model::RoleName::from("dep"),
+            &pbps_model::RoleName::from("wgo"),
+            "EXECUTE",
+            "GRANT",
+        )];
         assert_eq!(
-            rows(&replay_order("app_owner", &invisible).unwrap()),
+            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &invisible).unwrap()),
             ["enable EXECUTE for wgo", "GRANT EXECUTE to dep by wgo"]
         );
 
         // A chain the deployer can see is replayed as it is, in dependency
         // order whatever order the rows were read in, with nothing added.
         let visible = [
-            grant("dep", "wgo", "EXECUTE", "GRANT"),
-            grant("wgo", "app_owner", "EXECUTE", "GRANT_WITH_GRANT_OPTION"),
-            grant("dep", "app_owner", "SELECT", "DENY"),
+            grant(
+                &pbps_model::RoleName::from("dep"),
+                &pbps_model::RoleName::from("wgo"),
+                "EXECUTE",
+                "GRANT",
+            ),
+            grant(
+                &pbps_model::RoleName::from("wgo"),
+                &pbps_model::RoleName::from("app_owner"),
+                "EXECUTE",
+                "GRANT_WITH_GRANT_OPTION",
+            ),
+            grant(
+                &pbps_model::RoleName::from("dep"),
+                &pbps_model::RoleName::from("app_owner"),
+                "SELECT",
+                "DENY",
+            ),
         ];
         assert_eq!(
-            rows(&replay_order("app_owner", &visible).unwrap()),
+            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &visible).unwrap()),
             [
                 "GRANT_WITH_GRANT_OPTION EXECUTE to wgo by app_owner",
                 "DENY SELECT to dep by app_owner",
@@ -1153,11 +1248,21 @@ mod tests {
         // grant option from the row that names `root`, never a second one
         // from the owner, which the deployer would see and the target lacks.
         let half = [
-            grant("dep", "mid", "EXECUTE", "GRANT"),
-            grant("mid", "root", "EXECUTE", "GRANT_WITH_GRANT_OPTION"),
+            grant(
+                &pbps_model::RoleName::from("dep"),
+                &pbps_model::RoleName::from("mid"),
+                "EXECUTE",
+                "GRANT",
+            ),
+            grant(
+                &pbps_model::RoleName::from("mid"),
+                &pbps_model::RoleName::from("root"),
+                "EXECUTE",
+                "GRANT_WITH_GRANT_OPTION",
+            ),
         ];
         assert_eq!(
-            rows(&replay_order("app_owner", &half).unwrap()),
+            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &half).unwrap()),
             [
                 "enable EXECUTE for root",
                 "GRANT_WITH_GRANT_OPTION EXECUTE to mid by root",
@@ -1168,11 +1273,21 @@ mod tests {
         // The grant option is per permission: holding it for one does not
         // make the grantor able for another.
         let other = [
-            grant("wgo", "app_owner", "SELECT", "GRANT_WITH_GRANT_OPTION"),
-            grant("dep", "wgo", "EXECUTE", "GRANT"),
+            grant(
+                &pbps_model::RoleName::from("wgo"),
+                &pbps_model::RoleName::from("app_owner"),
+                "SELECT",
+                "GRANT_WITH_GRANT_OPTION",
+            ),
+            grant(
+                &pbps_model::RoleName::from("dep"),
+                &pbps_model::RoleName::from("wgo"),
+                "EXECUTE",
+                "GRANT",
+            ),
         ];
         assert_eq!(
-            rows(&replay_order("app_owner", &other).unwrap()),
+            rows(&replay_order(&pbps_model::RoleName::from("app_owner"), &other).unwrap()),
             [
                 "GRANT_WITH_GRANT_OPTION SELECT to wgo by app_owner",
                 "enable EXECUTE for wgo",
@@ -1202,10 +1317,22 @@ mod tests {
     #[test]
     fn grant_options_that_only_name_each_other_are_refused() {
         let cycle = [
-            grant("a", "b", "SELECT", "GRANT_WITH_GRANT_OPTION"),
-            grant("b", "a", "SELECT", "GRANT_WITH_GRANT_OPTION"),
+            grant(
+                &pbps_model::RoleName::from("a"),
+                &pbps_model::RoleName::from("b"),
+                "SELECT",
+                "GRANT_WITH_GRANT_OPTION",
+            ),
+            grant(
+                &pbps_model::RoleName::from("b"),
+                &pbps_model::RoleName::from("a"),
+                "SELECT",
+                "GRANT_WITH_GRANT_OPTION",
+            ),
         ];
-        let refused = replay_order("app_owner", &cycle).unwrap_err().to_string();
+        let refused = replay_order(&pbps_model::RoleName::from("app_owner"), &cycle)
+            .unwrap_err()
+            .to_string();
         assert!(refused.contains("name each other"), "{refused}");
     }
 
@@ -1222,33 +1349,45 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
-            database_grants: vec![grant("dep", "dbo", "CREATE TABLE", "GRANT")],
+            database_grants: vec![grant(
+                &pbps_model::RoleName::from("dep"),
+                &pbps_model::RoleName::from("dbo"),
+                "CREATE TABLE",
+                "GRANT",
+            )],
             schemas: [(
                 "app".to_owned(),
                 SchemaAuthorization {
                     owner: "app_owner".into(),
                     permissions: ["ALTER", "SELECT"].into_iter().map(str::to_owned).collect(),
                     grants: vec![
-                        grant("dep", "app_owner", "ALTER", "GRANT_WITH_GRANT_OPTION"),
-                        grant("readers", "app_owner", "SELECT", "GRANT"),
+                        grant(
+                            &pbps_model::RoleName::from("dep"),
+                            &pbps_model::RoleName::from("app_owner"),
+                            "ALTER",
+                            "GRANT_WITH_GRANT_OPTION",
+                        ),
+                        grant(
+                            &pbps_model::RoleName::from("readers"),
+                            &pbps_model::RoleName::from("app_owner"),
+                            "SELECT",
+                            "GRANT",
+                        ),
                     ],
                 },
             )]
             .into_iter()
             .collect(),
-            roles: [
-                ("readers".to_owned(), false),
-                ("db_ddladmin".to_owned(), true),
-            ]
-            .into_iter()
-            .collect(),
-            impersonation: ["other".to_owned()].into_iter().collect(),
+            roles: [("readers".into(), false), ("db_ddladmin".into(), true)]
+                .into_iter()
+                .collect(),
+            impersonation: ["other".into()].into_iter().collect(),
             principal_grants: Vec::new(),
             principal_owners: BTreeMap::new(),
             principals: [
-                ("dep".to_owned(), PrincipalKind::User),
-                ("readers".to_owned(), PrincipalKind::Role),
-                ("other".to_owned(), PrincipalKind::User),
+                ("dep".into(), PrincipalKind::User),
+                ("readers".into(), PrincipalKind::Role),
+                ("other".into(), PrincipalKind::User),
             ]
             .into_iter()
             .collect(),
@@ -1279,14 +1418,22 @@ mod tests {
         ];
         let mut resolved = context();
         resolved.spellings = [
-            ("READERS".to_owned(), Some("readers".to_owned())),
-            ("PUBLIC".to_owned(), Some("public".to_owned())),
+            ("READERS".into(), Some("readers".into())),
+            ("PUBLIC".into(), Some("public".into())),
         ]
         .into_iter()
         .collect();
         let map = PrincipalMap::generate(&resolved, &planned, "tok");
-        assert_eq!(map.run_local("READERS"), map.run_local("readers"));
-        assert_eq!(map.run_local("PUBLIC").as_deref(), Some("public"));
+        assert_eq!(
+            map.run_local(&pbps_model::RoleName::from("READERS")),
+            map.run_local(&pbps_model::RoleName::from("readers"))
+        );
+        assert_eq!(
+            map.run_local(&pbps_model::RoleName::from("PUBLIC"))
+                .as_ref()
+                .map(pbps_model::RoleName::raw),
+            Some("public")
+        );
         // dep, readers, app_owner, other: nothing for either planned spelling.
         assert_eq!(
             map.run_local_names().len(),
@@ -1298,8 +1445,16 @@ mod tests {
         // Unresolved, the same plan names two more principals, which is the
         // clone the grant used to land on.
         let map = PrincipalMap::generate(&context(), &planned, "tok");
-        assert_ne!(map.run_local("READERS"), map.run_local("readers"));
-        assert_ne!(map.run_local("PUBLIC").as_deref(), Some("public"));
+        assert_ne!(
+            map.run_local(&pbps_model::RoleName::from("READERS")),
+            map.run_local(&pbps_model::RoleName::from("readers"))
+        );
+        assert_ne!(
+            map.run_local(&pbps_model::RoleName::from("PUBLIC"))
+                .as_ref()
+                .map(pbps_model::RoleName::raw),
+            Some("public")
+        );
         assert_eq!(
             map.run_local_names().len(),
             6,
@@ -1318,16 +1473,33 @@ mod tests {
         }];
         let map = PrincipalMap::generate(&context(), &planned, "tok");
         for built_in in ["dbo", "db_ddladmin"] {
-            assert_eq!(map.run_local(built_in).as_deref(), Some(built_in));
-            assert_eq!(map.logical_of(built_in).as_deref(), Some(built_in));
+            assert_eq!(
+                map.run_local(&pbps_model::RoleName::from(built_in))
+                    .as_ref()
+                    .map(pbps_model::RoleName::raw),
+                Some(built_in)
+            );
+            assert_eq!(
+                map.logical_of(&pbps_model::RoleName::from(built_in))
+                    .as_ref()
+                    .map(pbps_model::RoleName::raw),
+                Some(built_in)
+            );
         }
         for logical in ["dep", "readers", "app_owner", "other", "auditors"] {
-            let run = map.run_local(logical).expect(logical);
+            let run = map
+                .run_local(&pbps_model::RoleName::from(logical))
+                .expect(logical);
             assert!(
-                run.starts_with("pbps_principal_") && run.ends_with("_tok"),
-                "{run}"
+                run.raw().starts_with("pbps_principal_") && run.raw().ends_with("_tok"),
+                "{run}",
+                // Preserve the original spelling in this SQL or comparison fixture.
+                run = run.raw(),
             );
-            assert_eq!(map.logical_of(&run).as_deref(), Some(logical));
+            assert_eq!(
+                map.logical_of(&run).as_ref().map(pbps_model::RoleName::raw),
+                Some(logical)
+            );
         }
         // No production name is created on scratch, and no built-in is
         // recorded as something this run made.
@@ -1336,11 +1508,15 @@ mod tests {
         assert!(
             created
                 .iter()
-                .all(|name| name.starts_with("pbps_principal_"))
+                .all(|name| name.raw().starts_with("pbps_principal_"))
         );
         assert_eq!(
-            map.deployer(&context()).as_deref(),
-            map.run_local("dep").as_deref()
+            map.deployer(&context())
+                .as_ref()
+                .map(pbps_model::RoleName::raw),
+            map.run_local(&pbps_model::RoleName::from("dep"))
+                .as_ref()
+                .map(pbps_model::RoleName::raw)
         );
     }
 
@@ -1358,19 +1534,27 @@ mod tests {
         let mut target = context();
         target.principal_grants = vec![PrincipalGrant {
             on: "watched".into(),
-            grant: grant("dep", "leads", "VIEW DEFINITION", "GRANT"),
+            grant: grant(
+                &pbps_model::RoleName::from("dep"),
+                &pbps_model::RoleName::from("leads"),
+                "VIEW DEFINITION",
+                "GRANT",
+            ),
         }];
-        target.principal_owners = [("watched".to_owned(), "leads".to_owned())]
-            .into_iter()
-            .collect();
+        target.principal_owners = [("watched".into(), "leads".into())].into_iter().collect();
         let map = PrincipalMap::generate(&target, &[], "tok");
-        let run = |name: &str| map.run_local(name).unwrap();
+        let run = |name: &str| map.run_local(&pbps_model::RoleName::from(name)).unwrap();
         // The reproduction as scratch reports it: run-local names throughout.
         let mut reproduced = target.clone();
         reproduced.principal.login = "pbps_run_login".into();
         reproduced.principal.effective = run("dep");
-        reproduced.database_grants = vec![grant(&run("dep"), "dbo", "CREATE TABLE", "GRANT")];
-        reproduced.roles = [(run("readers"), false), ("db_ddladmin".to_owned(), true)]
+        reproduced.database_grants = vec![grant(
+            &run("dep"),
+            &pbps_model::RoleName::from("dbo"),
+            "CREATE TABLE",
+            "GRANT",
+        )];
+        reproduced.roles = [(run("readers"), false), ("db_ddladmin".into(), true)]
             .into_iter()
             .collect();
         reproduced.impersonation = [run("other")].into_iter().collect();
@@ -1485,7 +1669,12 @@ mod tests {
         let mut other = context();
         other.principal_grants.push(PrincipalGrant {
             on: "readers".into(),
-            grant: grant("dep", "dbo", "VIEW DEFINITION", "GRANT"),
+            grant: grant(
+                &pbps_model::RoleName::from("dep"),
+                &pbps_model::RoleName::from("dbo"),
+                "VIEW DEFINITION",
+                "GRANT",
+            ),
         });
         assert_ne!(other.canonical(), base);
     }

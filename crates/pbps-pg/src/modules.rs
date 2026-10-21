@@ -707,7 +707,7 @@ async fn described(conn: &mut Conn, catalog: &str, oid: i64) -> Result<String, D
 async fn read_relation(
     conn: &mut Conn,
     oid: i64,
-    declared: &BTreeMap<String, BTreeSet<Permission>>,
+    declared: &BTreeMap<pbps_model::RoleName, BTreeSet<Permission>>,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
     let rows = conn
@@ -756,7 +756,7 @@ async fn read_relation(
 async fn read_routine(
     conn: &mut Conn,
     oid: i64,
-    declared: &BTreeMap<String, BTreeSet<Permission>>,
+    declared: &BTreeMap<pbps_model::RoleName, BTreeSet<Permission>>,
     public_execution_settled: bool,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
@@ -959,8 +959,8 @@ async fn read_arriving_grants(
 }
 
 fn push_owner(row: &Row, carries: &mut Vec<Carried>) -> Result<(), DbError> {
-    let owner = text(row, "owner")?;
-    let deploying_as = text(row, "deploying_as")?;
+    let owner = pbps_model::RoleName::from(text(row, "owner")?);
+    let deploying_as = pbps_model::RoleName::from(text(row, "deploying_as")?);
     if owner == deploying_as {
         return Ok(());
     }
@@ -976,10 +976,16 @@ fn push_owner(row: &Row, carries: &mut Vec<Carried>) -> Result<(), DbError> {
             format!(
                 "`{owner}` owns it and this session is `{deploying_as}` -- and it is \
                  `SECURITY DEFINER`, so the rebuild would leave it running with this account's \
-                 privileges"
+                 privileges",
+                owner = owner.shown(),
+                deploying_as = deploying_as.shown(),
             )
         } else {
-            format!("`{owner}` owns it and this session is `{deploying_as}`")
+            format!(
+                "`{owner}` owns it and this session is `{deploying_as}`",
+                owner = owner.shown(),
+                deploying_as = deploying_as.shown(),
+            )
         },
     });
     Ok(())
@@ -1004,8 +1010,8 @@ fn grant_target(id: &ModuleId) -> Option<GrantTarget> {
 fn declared_grants(
     changes: &ChangeSet,
     target: &GrantTarget,
-) -> BTreeMap<String, BTreeSet<Permission>> {
-    let mut by_role: BTreeMap<String, BTreeSet<Permission>> = BTreeMap::new();
+) -> BTreeMap<pbps_model::RoleName, BTreeSet<Permission>> {
+    let mut by_role: BTreeMap<pbps_model::RoleName, BTreeSet<Permission>> = BTreeMap::new();
     for planned in &changes.changes {
         if let Change::Grant {
             role,
@@ -1063,7 +1069,7 @@ async fn read_acl(
     conn: &mut Conn,
     oid: i64,
     source: AclSource,
-    declared: &BTreeMap<String, BTreeSet<Permission>>,
+    declared: &BTreeMap<pbps_model::RoleName, BTreeSet<Permission>>,
     public_execution_settled: bool,
     carries: &mut Vec<Carried>,
 ) -> Result<(), DbError> {
@@ -1150,7 +1156,8 @@ async fn read_acl(
                        rebuild restores and nothing in this plan takes away again",
                 detail: format!(
                     "{who} no longer holds `{permission}`, which `acldefault` grants a freshly \
-                     created object of this kind"
+                     created object of this kind",
+                    who = pbps_model::escape::Escaped(who)
                 ),
             });
             continue;
@@ -1164,10 +1171,15 @@ async fn read_acl(
             });
             continue;
         }
+        // The empty grantee is PUBLIC above; every remaining name identifies a role.
+        let grantee = pbps_model::RoleName::from(grantee);
         if grantable {
             carries.push(Carried {
                 what: "a grant `WITH GRANT OPTION`, which the declarations hold no flag for",
-                detail: format!("`{grantee}` holds `{permission}` with the option to grant it on"),
+                detail: format!(
+                    "`{grantee}` holds `{permission}` with the option to grant it on",
+                    grantee = grantee.shown(),
+                ),
             });
             continue;
         }
@@ -1178,7 +1190,10 @@ async fn read_acl(
             carries.push(Carried {
                 what: "a grant the declarations do not hold on this target, which a rebuild \
                        would destroy without the plan restoring it",
-                detail: format!("`{grantee}` holds `{permission}`"),
+                detail: format!(
+                    "`{grantee}` holds `{permission}`",
+                    grantee = grantee.shown(),
+                ),
             });
         }
     }
@@ -2577,6 +2592,39 @@ fn a_routine_cannot_capture(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn declared_role_grant_keys_keep_raw_names_distinct_from_shown_lookalikes() {
+        let name = pbps_model::RoleName::from("role\nline\\\u{202e}名前");
+        let lookalike = pbps_model::RoleName::from(name.shown().to_string());
+        let target = pbps_model::GrantTarget::Schema("app".into());
+        let changes = pbps_model::ChangeSet {
+            changes: vec![
+                pbps_model::PlannedChange::new(pbps_model::Change::Grant {
+                    role: name.clone(),
+                    target: target.clone(),
+                    permissions: [pbps_model::Permission::Select].into(),
+                }),
+                pbps_model::PlannedChange::new(pbps_model::Change::Grant {
+                    role: lookalike.clone(),
+                    target: target.clone(),
+                    permissions: [pbps_model::Permission::Update].into(),
+                }),
+            ],
+        };
+        let grants = super::declared_grants(&changes, &target);
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[name.raw()], [pbps_model::Permission::Select].into());
+        assert_eq!(
+            grants[lookalike.raw()],
+            [pbps_model::Permission::Update].into()
+        );
+        assert!(
+            super::declared_grants(&changes, &pbps_model::GrantTarget::Schema("other".into()))
+                .is_empty()
+        );
+    }
+
     use super::*;
     use pbps_model::{Column, Module, ModuleKind, Table};
 

@@ -25,8 +25,8 @@ pub(super) struct Setting {
 }
 
 pub(super) struct Observation {
-    current_role: String,
-    session_role: String,
+    current_role: pbps_model::RoleName,
+    session_role: pbps_model::RoleName,
     settings: BTreeMap<String, Setting>,
     epoch: String,
 }
@@ -46,8 +46,8 @@ impl Observation {
                 .map_err(|_| Failure::Incomplete)
         };
         Ok(Facts {
-            current_role: role(&self.current_role)?,
-            session_role: role(&self.session_role)?,
+            current_role: role(self.current_role.raw())?,
+            session_role: role(self.session_role.raw())?,
             settings: self.settings.clone(),
         })
     }

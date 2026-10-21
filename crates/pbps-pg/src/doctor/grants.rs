@@ -82,7 +82,7 @@ pub(super) async fn missing(
         .filter_map(|name| identities.table(name).name().cloned())
         .collect();
     let mut managed_modules = granted.managed_modules.clone();
-    let mut roles: BTreeSet<String> = granted.roles.iter().cloned().collect();
+    let mut roles: BTreeSet<pbps_model::RoleName> = granted.roles.iter().cloned().collect();
     // Removed declarations still produce REVOKE statements. As in the other
     // engine, an unreadable ledger is reported by the ledger diagnosis itself.
     if let Ok(Some(recorded)) = crate::state::latest(conn).await {
@@ -184,7 +184,7 @@ pub(super) async fn missing(
     if !roles.is_empty() {
         let values = super::values_list(roles.len(), 1);
         let query = catalog_question(&values);
-        let params: Vec<_> = roles.iter().map(|r| Param::Str(r)).collect();
+        let params: Vec<_> = roles.iter().map(|r| Param::Str(r.raw())).collect();
         for row in crate::catalog::canonical_query(conn, &query, &params).await? {
             let Some(permission) = permission(&text(&row, "privilege")?) else {
                 continue;
@@ -201,14 +201,16 @@ pub(super) async fn missing(
             if !manages(&securable, &managed_tables, &managed_modules) {
                 continue;
             }
-            let grantor = super::spelled(&text(&row, "grantor")?);
+            let grantor = pbps_model::RoleName::from(text(&row, "grantor")?);
+            let quoted_grantor = super::spelled(grantor.raw());
             add_gap(
                 &mut gaps,
                 &row,
                 permission,
                 securable,
                 format!(
-                    "revoking this ACL needs its original grantor {grantor}; select that role explicitly when inherited grant paths compete"
+                    "revoking this ACL needs its original grantor {grantor}; select that role explicitly when inherited grant paths compete",
+                    grantor = pbps_model::escape::Escaped(&quoted_grantor)
                 ),
             )?;
         }

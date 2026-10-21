@@ -1,0 +1,7 @@
+role: "role\nline\r\e[31m\x9B\\‮名前"
+description: "a role's original text"
+renamed_from: "role\nline\r\e[31m\x9B\\‮名前before"
+
+grants:
+  "app.role\nline\r\e[31m\x9B\\‮名前": [select]
+  "schema::role\nline\r\e[31m\x9B\\‮名前": [execute]

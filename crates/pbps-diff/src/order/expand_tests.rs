@@ -39,9 +39,9 @@ fn drop(name: &str) -> PlannedChange {
 
 fn name(p: &PlannedChange) -> Option<(&str, bool)> {
     if let Change::CreateRole { name, .. } = &p.change {
-        Some((name, true))
+        Some(((name).raw(), true))
     } else if let Change::DropRole { name, .. } = &p.change {
-        Some((name, false))
+        Some(((name).raw(), false))
     } else {
         None
     }

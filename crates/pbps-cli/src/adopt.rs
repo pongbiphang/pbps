@@ -330,7 +330,7 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
     // Roles last: which grants survive depends on which objects did.
     let mut probe = schema.clone();
     probe.roles.clear();
-    let names: Vec<String> = schema.roles.keys().cloned().collect();
+    let names: Vec<pbps_model::RoleName> = schema.roles.keys().cloned().collect();
     for name in names {
         let role = schema.roles.get_mut(&name).expect("listed above");
         // Validation judges the declaration pull writes, not its internal ACL
@@ -344,7 +344,8 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
         if let Some(why) = whole {
             schema.roles.remove(&name);
             pulled.warnings.push(format!(
-                "role `{name}` was left out: `pbps validate` refuses its declaration — {why}"
+                "role `{name}` was left out: `pbps validate` refuses its declaration — {why}",
+                name = name.shown(),
             ));
         }
     }
@@ -396,7 +397,7 @@ fn a_trigger_target(schema: &Schema, on: &pbps_model::ObjectName) -> bool {
 /// schema needs `usage` on it" — and a grant validated on its own would fail
 /// that rule for want of the `usage` its role does hold.
 fn narrow_role(
-    name: &str,
+    name: &pbps_model::RoleName,
     role: &mut Role,
     probe: &mut Schema,
     dialect: &dyn Dialect,
@@ -429,7 +430,9 @@ fn narrow_role(
                         "role `{name}`: {} on `{target}` was left out: `pbps validate` refuses \
                          it — {}",
                         words.join(", "),
-                        fixed.join("; ")
+                        fixed.join("; "),
+                        target = target.shown(),
+                        name = name.shown(),
                     ),
                 });
                 problems = after;
@@ -462,7 +465,9 @@ fn narrow_role(
             role: name.to_owned(),
             what: format!(
                 "role `{name}`: {} on `{target}` was left out with the role",
-                words.join(", ")
+                words.join(", "),
+                target = target.shown(),
+                name = name.shown(),
             ),
             target: Some(target),
         });
@@ -474,7 +479,7 @@ fn narrow_role(
 /// the dialect's rules and the model's grant-target rule, which needs the
 /// schema's tables and modules but none of its other roles.
 fn role_problems(
-    name: &str,
+    name: &pbps_model::RoleName,
     role: &Role,
     probe: &mut Schema,
     dialect: &dyn Dialect,
@@ -995,15 +1000,15 @@ mod tests {
         let kept: Vec<String> = pulled.schema.roles["reader"]
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|target| target.raw().to_string())
             .collect();
         assert_eq!(kept, ["app.t", "schema::app"]);
         let mut left: Vec<String> = pulled
             .unexpressible
             .iter()
             .map(|u| {
-                assert_eq!(u.role, "reader");
-                u.target.as_ref().unwrap().to_string()
+                assert_eq!(u.role, ("reader").into());
+                u.target.as_ref().unwrap().raw().to_string()
             })
             .collect();
         left.sort();
@@ -1137,7 +1142,11 @@ mod tests {
             [Permission::Insert].into()
         );
         assert!(!grants.contains_key(&"app.marker_only".parse().unwrap()));
-        let written = pbps_load::render_role("writer", &pulled.schema.roles["writer"], &[]);
+        let written = pbps_load::render_role(
+            &pbps_model::RoleName::from("writer"),
+            &pulled.schema.roles["writer"],
+            &[],
+        );
         assert!(!written.contains("serial-sequences"), "{written}");
         assert!(written.contains("insert"), "{written}");
     }

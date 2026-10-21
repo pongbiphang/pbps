@@ -63,6 +63,16 @@ impl Role {
 
 /// What a grant applies to.
 ///
+/// ```compile_fail,E0277
+/// let target: pbps_model::GrantTarget = "schema::app".parse().unwrap();
+/// let _ = format!("{}", target);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let target: pbps_model::GrantTarget = "schema::app".parse().unwrap();
+/// let _ = target.to_string();
+/// ```
+///
 /// Written as `dbo.customer` for an object, `app.f(integer,text)` for a
 /// routine the engine identifies by signature, and `schema::dbo` for a whole
 /// schema — the `schema::` prefix is T-SQL's own spelling of the securable
@@ -97,13 +107,38 @@ impl GrantTarget {
     }
 }
 
-impl fmt::Display for GrantTarget {
+impl GrantTarget {
+    pub fn raw(&self) -> impl fmt::Display + Copy + '_ {
+        RawGrantTarget(self)
+    }
+
+    pub fn shown(&self) -> impl fmt::Display + Copy + '_ {
+        ShownGrantTarget(self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RawGrantTarget<'a>(&'a GrantTarget);
+
+impl fmt::Display for RawGrantTarget<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            // raw until #2084 step 3 (RoleName): this Display is also serialization.
+        match self.0 {
             GrantTarget::Object(o) => o.raw().fmt(f),
             GrantTarget::Routine(r) => r.raw().fmt(f),
             GrantTarget::Schema(s) => write!(f, "schema::{s}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ShownGrantTarget<'a>(&'a GrantTarget);
+
+impl fmt::Display for ShownGrantTarget<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            GrantTarget::Object(o) => o.shown().fmt(f),
+            GrantTarget::Routine(r) => r.shown().fmt(f),
+            GrantTarget::Schema(s) => write!(f, "schema::{}", crate::escape::Escaped(s)),
         }
     }
 }
@@ -155,7 +190,7 @@ impl TryFrom<String> for GrantTarget {
 
 impl From<GrantTarget> for String {
     fn from(t: GrantTarget) -> String {
-        t.to_string()
+        t.raw().to_string()
     }
 }
 
@@ -300,14 +335,16 @@ pub fn implied_serial_grants(schema: &mut crate::Schema) {
 pub fn check(schema: &crate::schema::Schema) -> Vec<String> {
     let mut problems = Vec::new();
     for (name, role) in &schema.roles {
-        if name.trim().is_empty() {
+        if name.raw().trim().is_empty() {
             problems.push("a role must have a name".to_owned());
         }
         for (target, permissions) in &role.grants {
             if permissions.is_empty() {
                 problems.push(format!(
                     "role `{name}`: `{target}` is listed with no permission — remove the line \
-                     or name one"
+                     or name one",
+                    name = name.shown(),
+                    target = target.shown()
                 ));
             }
             match target {
@@ -322,7 +359,8 @@ pub fn check(schema: &crate::schema::Schema) -> Vec<String> {
                         "role `{name}`: grants on `{object}`, which the declarations do not have; \
                          declare the object, or grant on `schema::{}` if it is outside pbps",
                         object.schema,
-                        object = object.shown()
+                        object = object.shown(),
+                        name = name.shown()
                     ));
                 }
                 // A signature names one overload, so nothing but that exact
@@ -339,7 +377,8 @@ pub fn check(schema: &crate::schema::Schema) -> Vec<String> {
                          have; declare the routine with that signature, or grant on \
                          `schema::{}` if it is outside pbps",
                         routine.name.schema,
-                        routine = routine.shown()
+                        routine = routine.shown(),
+                        name = name.shown()
                     ));
                 }
                 GrantTarget::Object(_) | GrantTarget::Routine(_) | GrantTarget::Schema(_) => {}
@@ -581,14 +620,15 @@ mod tests {
             "schema::legacy".parse().unwrap(),
             [Permission::Select].into_iter().collect(),
         );
-        s.roles.insert("app_reader".to_owned(), role.clone());
+        s.roles
+            .insert(("app_reader".to_owned()).into(), role.clone());
         assert_eq!(check(&s), Vec::<String>::new());
 
         role.grants.insert(
             "dbo.ghost".parse().unwrap(),
             [Permission::Select].into_iter().collect(),
         );
-        s.roles.insert("app_reader".to_owned(), role);
+        s.roles.insert(("app_reader".to_owned()).into(), role);
         let p = check(&s);
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("dbo.ghost"), "{p:?}");
@@ -601,7 +641,7 @@ mod tests {
         let mut role = Role::default();
         role.grants
             .insert("dbo.customer".parse().unwrap(), BTreeSet::new());
-        s.roles.insert("r".to_owned(), role);
+        s.roles.insert(("r".to_owned()).into(), role);
         let p = check(&s);
         assert!(p.iter().any(|m| m.contains("no permission")), "{p:?}");
     }
@@ -621,7 +661,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        a.roles.insert("r".to_owned(), role);
+        a.roles.insert(("r".to_owned()).into(), role);
         assert_ne!(a, b);
         let mut role = Role::default();
         role.grants.insert(
@@ -630,7 +670,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        b.roles.insert("r".to_owned(), role);
+        b.roles.insert(("r".to_owned()).into(), role);
         assert_eq!(a, b);
     }
 }

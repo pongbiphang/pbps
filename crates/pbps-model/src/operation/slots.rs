@@ -514,12 +514,12 @@ pub fn names(
     Ok(nx.names)
 }
 
-fn role_address(name: &str) -> Address {
+fn role_address(name: &crate::RoleName) -> Address {
     Address {
         kind: NameKind::Role,
         schema: String::new(),
         table: None,
-        name: name.to_owned(),
+        name: name.raw().to_owned(),
         signature: None,
     }
 }
@@ -570,6 +570,24 @@ pub fn baseline_names(owners: &dyn Owners, before: super::Snapshot<'_>) -> Vec<N
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn role_slots_keep_raw_names_distinct_from_their_shown_lookalikes() {
+        let name = crate::RoleName::from("role\nline\\\u{202e}名前");
+        let lookalike = crate::RoleName::from(name.shown().to_string());
+        let raw = super::role_address(&name);
+        assert_eq!(raw.name, name.raw());
+        assert_eq!(raw.kind, super::NameKind::Role);
+        assert_ne!(raw, super::role_address(&lookalike));
+        assert_eq!(
+            raw,
+            super::role_address(
+                &serde_json::from_str::<crate::RoleName>(&serde_json::to_string(&name).unwrap())
+                    .unwrap()
+            )
+        );
+    }
+
     use super::*;
 
     #[test]

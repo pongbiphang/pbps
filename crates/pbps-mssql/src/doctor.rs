@@ -2186,7 +2186,7 @@ pub async fn permissions(
     // it from the ids file before the plan that drops it runs). Tombstones
     // are not consulted: they are permanent, and a drop applied long ago
     // would keep the role requirements switched on forever.
-    let mut roles: BTreeSet<String> = granted.roles.iter().cloned().collect();
+    let mut roles: BTreeSet<pbps_model::RoleName> = granted.roles.iter().cloned().collect();
     roles.extend(recorded.roles.keys().cloned());
     // Any role-shaped demand switches the role requirements on: a managed
     // role by name, or a grant target the caller asks about.
@@ -2344,12 +2344,12 @@ pub async fn permissions(
         // In pieces for the same ceiling as every other list here (#351).
         // `IN ()` is not T-SQL, and an empty list is cut into no pieces, so
         // nothing is asked when no role is named.
-        let roles: Vec<&String> = roles.iter().collect();
+        let roles: Vec<&pbps_model::RoleName> = roles.iter().collect();
         for chunk in roles.chunks(MAX_PARAMETERS) {
             let mut params: Vec<Param<'_>> = Vec::new();
             let mut role_slots = Vec::new();
             for r in chunk {
-                params.push(Param::from(r.as_str()));
+                params.push(Param::from(r.raw()));
                 role_slots.push(format!("@P{}", params.len()));
             }
             let sql = format!(

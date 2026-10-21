@@ -81,7 +81,7 @@ pub async fn server_version_num(
 /// on a database the rest of the plan had already changed.
 pub fn unsupported_permissions(
     server_version_num: i64,
-    name: &str,
+    name: &pbps_model::RoleName,
     role: &Role,
 ) -> Vec<DialectError> {
     let mut errs = Vec::new();
@@ -95,7 +95,11 @@ pub fn unsupported_permissions(
                  server is {}; on an older one the engine answers `unrecognized privilege type \
                  \"maintain\"` -- measured on 16.15 -- which is a statement that would fail after \
                  everything ordered before it had run. Remove it, or upgrade the server",
-                rendered(server_version_num)
+                rendered(server_version_num),
+                // Whole-message escaping remains until #2084 step 5.
+                name = name.raw(),
+                // Whole-message escaping remains until #2084 step 5.
+                target = target.raw(),
             )));
         }
     }
@@ -121,14 +125,14 @@ fn rendered(server_version_num: i64) -> String {
 /// superuser-only.
 pub async fn missing_roles(
     conn: &mut Conn,
-    declared: &BTreeSet<&str>,
-) -> Result<Vec<String>, DbError> {
+    declared: &BTreeSet<&pbps_model::RoleName>,
+) -> Result<Vec<pbps_model::RoleName>, DbError> {
     let mut out = Vec::new();
     for name in declared {
         let rows = conn
             .query_with(
                 "SELECT 1 AS found FROM pg_catalog.pg_roles WHERE rolname = $1",
-                &[Param::Str(name)],
+                &[Param::Str(name.raw())],
             )
             .await?;
         if rows.is_empty() {
@@ -144,14 +148,17 @@ pub async fn missing_roles(
 /// Spelled out rather than described: "create the role first" sends whoever is
 /// holding the plan to the manual, and the `CREATE ROLE` they can paste is the
 /// difference between a refusal that blocks and one that unblocks.
-pub fn refuse_missing(name: &str) -> DialectError {
-    match crate::quote(name) {
+pub fn refuse_missing(name: &pbps_model::RoleName) -> DialectError {
+    // ByHand escapes the quoted SQL statement whole until #2084 step 5.
+    match crate::quote(name.raw()) {
         Ok(quoted) => DialectError::ByHand {
             dialect: DIALECT,
             why: format!(
                 "role `{name}` is declared here and the cluster does not have it. A PostgreSQL \
                  role is a cluster object, so pbps manages what a role is granted in this \
-                 database and not whether the role exists (ADR-0010 section 3)"
+                 database and not whether the role exists (ADR-0010 section 3)",
+                // Whole-message escaping remains until #2084 step 5.
+                name = name.raw(),
             ),
             statement: format!("CREATE ROLE {quoted};"),
         },
@@ -187,10 +194,12 @@ pub enum RenameEvidence {
 /// Which of the four the cluster is in, for a declared rename `from` -> `to`.
 pub async fn rename_evidence(
     conn: &mut Conn,
-    from: &str,
-    to: &str,
+    from: &pbps_model::RoleName,
+    to: &pbps_model::RoleName,
 ) -> Result<RenameEvidence, DbError> {
-    let present = |missing: &[String], name: &str| !missing.iter().any(|m| m == name);
+    let present = |missing: &[pbps_model::RoleName], name: &pbps_model::RoleName| {
+        !missing.iter().any(|m| m == name)
+    };
     let missing = missing_roles(conn, &[from, to].into_iter().collect()).await?;
     Ok(match (present(&missing, from), present(&missing, to)) {
         (false, true) => RenameEvidence::Done,
@@ -205,8 +214,13 @@ pub async fn rename_evidence(
 /// `None` where the evidence is [`RenameEvidence::Done`] — there is nothing to
 /// refuse, and the differ's silence about the rename is then correct.
 #[must_use]
-pub fn refuse_rename(from: &str, to: &str, evidence: RenameEvidence) -> Option<DialectError> {
-    let (quoted_from, quoted_to) = match (crate::quote(from), crate::quote(to)) {
+pub fn refuse_rename(
+    from: &pbps_model::RoleName,
+    to: &pbps_model::RoleName,
+    evidence: RenameEvidence,
+) -> Option<DialectError> {
+    // ByHand escapes the quoted SQL statement whole until #2084 step 5.
+    let (quoted_from, quoted_to) = match (crate::quote(from.raw()), crate::quote(to.raw())) {
         (Ok(f), Ok(t)) => (f, t),
         (Err(e), _) | (_, Err(e)) => return Some(e),
     };
@@ -221,12 +235,20 @@ pub fn refuse_rename(from: &str, to: &str, evidence: RenameEvidence) -> Option<D
              and it cannot tell which of the two its declarations mean: renaming the role would \
              move the grants, while granting to `{to}` would leave `{from}` holding everything \
              it holds now. Resolve the name collision by hand, preserving the intended \
-             principal and its grants, then plan again."
+             principal and its grants, then plan again.",
+            // Whole-message escaping remains until #2084 step 5.
+            from = from.raw(),
+            // Whole-message escaping remains until #2084 step 5.
+            to = to.raw(),
         ),
         RenameEvidence::NeitherPresent => format!(
             "neither `{from}` nor `{to}` is in the cluster, so there is no principal to rename \
              and none to grant on (ADR-0010 section 3). Restore the intended principal or correct \
-             the declarations, then plan again."
+             the declarations, then plan again.",
+            // Whole-message escaping remains until #2084 step 5.
+            from = from.raw(),
+            // Whole-message escaping remains until #2084 step 5.
+            to = to.raw(),
         ),
         RenameEvidence::NotRunYet => {
             return Some(DialectError::ByHand {
@@ -235,7 +257,11 @@ pub fn refuse_rename(from: &str, to: &str, evidence: RenameEvidence) -> Option<D
                     "`{from}` is still in the cluster and `{to}` is not: the rename this \
                      revision declares has not been run. A PostgreSQL role is a cluster object \
                      and pbps does not own it (ADR-0010 section 3); the grants follow the \
-                     role's oid, so nothing has to be re-granted afterwards"
+                     role's oid, so nothing has to be re-granted afterwards",
+                    // Whole-message escaping remains until #2084 step 5.
+                    from = from.raw(),
+                    // Whole-message escaping remains until #2084 step 5.
+                    to = to.raw(),
                 ),
                 statement: format!("ALTER ROLE {quoted_from} RENAME TO {quoted_to};"),
             });
@@ -247,7 +273,7 @@ pub fn refuse_rename(from: &str, to: &str, evidence: RenameEvidence) -> Option<D
 /// One reason the cluster will refuse `DROP ROLE`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DropBlocker {
-    pub role: String,
+    pub role: pbps_model::RoleName,
     /// The database the dependent objects are in. `None` is a dependency on a
     /// shared object — a database, a tablespace — which belongs to no one
     /// database.
@@ -297,7 +323,7 @@ impl DropBlocker {
         format!(
             "`{}` {what} {} {where_}; run {remedy} -- in that database, since neither statement \
              reaches beyond the one it runs in (ADR-0010 section 4)",
-            self.role,
+            self.role.shown(),
             plural(self.objects),
         )
     }
@@ -331,7 +357,10 @@ fn plural(n: i64) -> String {
 ///
 /// `pg_shdepend` is world-readable, so a least-privileged deployment account
 /// gets the same answer a superuser does.
-pub async fn drop_blockers(conn: &mut Conn, role: &str) -> Result<Vec<DropBlocker>, DbError> {
+pub async fn drop_blockers(
+    conn: &mut Conn,
+    role: &pbps_model::RoleName,
+) -> Result<Vec<DropBlocker>, DbError> {
     let mut out = Vec::new();
     for row in conn
         .query_with(
@@ -344,7 +373,7 @@ pub async fn drop_blockers(conn: &mut Conn, role: &str) -> Result<Vec<DropBlocke
                 AND sd.refobjid = (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = $1)
               GROUP BY 1, 2
               ORDER BY 1, 2",
-            &[Param::Str(role)],
+            &[Param::Str(role.raw())],
         )
         .await?
     {
@@ -378,16 +407,21 @@ mod tests {
     #[test]
     fn maintain_is_refused_below_seventeen_and_taken_at_or_above_it() {
         let role = role_with(Permission::Maintain);
-        let refused = unsupported_permissions(160_015, "app_reader", &role);
+        let refused =
+            unsupported_permissions(160_015, &pbps_model::RoleName::from("app_reader"), &role);
         assert_eq!(refused.len(), 1, "{refused:?}");
         let message = refused[0].to_string();
         assert!(message.contains("PostgreSQL 17"), "{message}");
         assert!(message.contains("16.15"), "{message}");
         assert!(
-            unsupported_permissions(170_000, "app_reader", &role).is_empty(),
+            unsupported_permissions(170_000, &pbps_model::RoleName::from("app_reader"), &role)
+                .is_empty(),
             "17.0 is the release that added it"
         );
-        assert!(unsupported_permissions(180_006, "app_reader", &role).is_empty());
+        assert!(
+            unsupported_permissions(180_006, &pbps_model::RoleName::from("app_reader"), &role)
+                .is_empty()
+        );
     }
 
     /// The negative case: an old server refuses `maintain` and nothing else.
@@ -402,7 +436,11 @@ mod tests {
             Permission::Trigger,
             Permission::Execute,
         ] {
-            let errs = unsupported_permissions(160_015, "app_reader", &role_with(permission));
+            let errs = unsupported_permissions(
+                160_015,
+                &pbps_model::RoleName::from("app_reader"),
+                &role_with(permission),
+            );
             assert!(errs.is_empty(), "{permission}: {errs:?}");
         }
     }
@@ -413,7 +451,7 @@ mod tests {
     #[test]
     fn a_blocker_outside_this_database_names_the_database_and_says_it_cannot_read_it() {
         let blocker = DropBlocker {
-            role: "app_reader".to_owned(),
+            role: "app_reader".to_owned().into(),
             database: Some("otherdb".to_owned()),
             deptype: 'a',
             objects: 1,
@@ -431,7 +469,7 @@ mod tests {
     #[test]
     fn ownership_and_a_grant_name_different_remedies() {
         let owns = DropBlocker {
-            role: "app_owner".to_owned(),
+            role: "app_owner".to_owned().into(),
             database: Some("appdb".to_owned()),
             deptype: 'o',
             objects: 3,
@@ -449,24 +487,43 @@ mod tests {
     /// holding what the old one still holds.
     #[test]
     fn a_rename_is_refused_unless_the_old_name_is_gone() {
-        assert!(refuse_rename("old", "new", RenameEvidence::Done).is_none());
-        let both = refuse_rename("old", "new", RenameEvidence::BothPresent)
-            .expect("two principals")
-            .to_string();
+        assert!(
+            refuse_rename(
+                &pbps_model::RoleName::from("old"),
+                &pbps_model::RoleName::from("new"),
+                RenameEvidence::Done
+            )
+            .is_none()
+        );
+        let both = refuse_rename(
+            &pbps_model::RoleName::from("old"),
+            &pbps_model::RoleName::from("new"),
+            RenameEvidence::BothPresent,
+        )
+        .expect("two principals")
+        .to_string();
         assert!(both.contains("different principal"), "{both}");
         assert!(!both.contains("ALTER ROLE"), "{both}");
         assert!(both.contains("then plan again"), "{both}");
-        let not_yet = refuse_rename("old", "new", RenameEvidence::NotRunYet)
-            .expect("the rename has not been run")
-            .to_string();
+        let not_yet = refuse_rename(
+            &pbps_model::RoleName::from("old"),
+            &pbps_model::RoleName::from("new"),
+            RenameEvidence::NotRunYet,
+        )
+        .expect("the rename has not been run")
+        .to_string();
         assert!(not_yet.contains("has not been run"), "{not_yet}");
         assert!(
             not_yet.contains(r#"ALTER ROLE "old" RENAME TO "new";"#),
             "{not_yet}"
         );
-        let neither = refuse_rename("old", "new", RenameEvidence::NeitherPresent)
-            .expect("no principal at all")
-            .to_string();
+        let neither = refuse_rename(
+            &pbps_model::RoleName::from("old"),
+            &pbps_model::RoleName::from("new"),
+            RenameEvidence::NeitherPresent,
+        )
+        .expect("no principal at all")
+        .to_string();
         assert!(neither.contains("no principal to rename"), "{neither}");
         assert!(!neither.contains("ALTER ROLE"), "{neither}");
         assert!(neither.contains("then plan again"), "{neither}");
@@ -474,9 +531,13 @@ mod tests {
 
     #[test]
     fn an_outstanding_role_rename_quotes_both_identifiers() {
-        let message = refuse_rename("old \"reader", "new \"reader", RenameEvidence::NotRunYet)
-            .expect("the rename has not been run")
-            .to_string();
+        let message = refuse_rename(
+            &pbps_model::RoleName::from("old \"reader"),
+            &pbps_model::RoleName::from("new \"reader"),
+            RenameEvidence::NotRunYet,
+        )
+        .expect("the rename has not been run")
+        .to_string();
         assert!(
             message.contains(r#"ALTER ROLE "old ""reader" RENAME TO "new ""reader";"#),
             "{message}"
@@ -486,7 +547,7 @@ mod tests {
     /// The refusal carries the statement, not a description of it.
     #[test]
     fn a_missing_role_is_refused_with_the_create_role_to_run() {
-        let message = refuse_missing("app reader").to_string();
+        let message = refuse_missing(&pbps_model::RoleName::from("app reader")).to_string();
         assert!(
             message.contains(r#"CREATE ROLE "app reader";"#),
             "{message}"

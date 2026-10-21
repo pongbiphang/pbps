@@ -1159,12 +1159,22 @@ fn run() -> anyhow::Result<()> {
             }
             .into(),
         ),
-        Command::RenameRole { from, to } => {
-            cmd_intent(&project, Intent::RenameRole { from, to }.into())
-        }
-        Command::DropRole { role, reason } => {
-            cmd_intent(&project, Intent::DropRole { role, reason }.into())
-        }
+        Command::RenameRole { from, to } => cmd_intent(
+            &project,
+            Intent::RenameRole {
+                from: from.into(),
+                to: to.into(),
+            }
+            .into(),
+        ),
+        Command::DropRole { role, reason } => cmd_intent(
+            &project,
+            Intent::DropRole {
+                role: role.into(),
+                reason,
+            }
+            .into(),
+        ),
         Command::MoveRows {
             table,
             max_rows,
@@ -1899,7 +1909,11 @@ pub(crate) fn routine_ids_as_the_dialect_spells_them(
                     "role {name}: `{first}` and `{target}` are one object to {}, which identifies \
                      a routine by argument type and discards the modifiers: both are `{spelled}`; \
                      grant it once",
-                    dialect.name()
+                    dialect.name(),
+                    name = name.shown(),
+                    first = first.shown(),
+                    target = target.shown(),
+                    spelled = spelled.shown(),
                 ));
                 continue;
             }
@@ -2071,7 +2085,10 @@ fn declaration_problems_with_sources(
     }
     for (name, role) in &schema.roles {
         for e in dialect.validate_role(name, role, schema) {
-            out.push(("dialect.rejected", format!("role {name}: {e}")));
+            out.push((
+                "dialect.rejected",
+                format!("role {name}: {e}", name = name.shown(),),
+            ));
         }
     }
     // And a third: a `depends_on:` naming a module nobody declared. It is

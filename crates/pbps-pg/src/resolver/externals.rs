@@ -493,7 +493,7 @@ pub async fn usage(
 /// file cannot know a run-owned deployer's generated name.
 pub async fn reproduce_usage(
     conn: &mut impl ExecuteConnection,
-    deployer: &str,
+    deployer: &pbps_model::RoleName,
     wanted: &BTreeMap<String, bool>,
 ) -> Result<(), DbError> {
     let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
@@ -502,7 +502,7 @@ pub async fn reproduce_usage(
             format!(
                 "GRANT USAGE ON SCHEMA {} TO {}",
                 quote(schema),
-                quote(deployer)
+                quote(deployer.raw())
             )
         } else {
             format!("REVOKE USAGE ON SCHEMA {} FROM PUBLIC", quote(schema))

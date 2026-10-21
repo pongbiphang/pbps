@@ -2163,7 +2163,9 @@ fn permission_list(
     if permissions.is_empty() {
         return Err(invalid(format!(
             "a grant on `{target}` names no permission, and `GRANT ON {target}` with nothing to \
-             grant is a syntax error"
+             grant is a syntax error",
+            // Whole-message escaping remains until #2084 step 5.
+            target = target.raw(),
         )));
     }
     Ok(permissions
@@ -2174,7 +2176,7 @@ fn permission_list(
 }
 
 fn serial_sequence_permission(
-    role: &str,
+    role: &pbps_model::RoleName,
     target: &GrantTarget,
     revoke: bool,
 ) -> Result<String, DialectError> {
@@ -2217,7 +2219,7 @@ BEGIN
     END LOOP;
 END",
         literal(&qualified(table)?),
-        literal(role),
+        literal(role.raw()),
     );
     let tag = dollar_tag(&body);
     Ok(format!("DO {tag}\n{body}\n{tag};"))
@@ -2225,7 +2227,7 @@ END",
 
 fn grant_statements(
     pg: &Postgres,
-    role: &str,
+    role: &pbps_model::RoleName,
     target: &GrantTarget,
     permissions: &BTreeSet<Permission>,
     revoke: bool,
@@ -2255,7 +2257,7 @@ fn grant_statements(
                     "{action} {} ON {} {direction} {};",
                     permission_list(&set, target)?,
                     securable(target, &set)?,
-                    quote(role)?,
+                    quote(role.raw())?,
                 ),
             )?);
         }
@@ -3657,21 +3659,33 @@ column.name.raw()
         // idea of who a principal is.
         Change::CreateRole { name, .. } => Err(by_hand(
             format!(
-                "`{name}` is a role, which on this engine lives in `pg_authid` and is shared by                  every database in the cluster; pbps manages what a role is granted here and not                  whether it exists (ADR-0010 section 3)"
+                "`{name}` is a role, which on this engine lives in `pg_authid` and is shared by                  every database in the cluster; pbps manages what a role is granted here and not                  whether it exists (ADR-0010 section 3)",
+                // Whole-message escaping remains until #2084 step 5.
+                name = name.raw(),
             ),
-            format!("CREATE ROLE {};", quote(name)?),
+            // ByHand escapes this SQL statement whole until #2084 step 5.
+            format!("CREATE ROLE {};", quote(name.raw())?),
         )),
         Change::DropRole { name, .. } => Err(by_hand(
             format!(
-                "`{name}` is a role, and dropping one is a cluster-wide act this database's                  catalog cannot even see the reasons for: measured, with every grant *this*                  database holds revoked, the engine still refuses with `1 object in database                  otherdb`. pbps revokes what the role was granted here and leaves the role                  (ADR-0010 section 3, section 4)"
+                "`{name}` is a role, and dropping one is a cluster-wide act this database's                  catalog cannot even see the reasons for: measured, with every grant *this*                  database holds revoked, the engine still refuses with `1 object in database                  otherdb`. pbps revokes what the role was granted here and leaves the role                  (ADR-0010 section 3, section 4)",
+                // Whole-message escaping remains until #2084 step 5.
+                name = name.raw(),
             ),
-            format!("DROP ROLE {};", quote(name)?),
+            // ByHand escapes this SQL statement whole until #2084 step 5.
+            format!("DROP ROLE {};", quote(name.raw())?),
         )),
         Change::RenameRole { from, to, .. } => Err(by_hand(
             format!(
-                "`{from}` is a role, and renaming one renames it in every database of the                  cluster; pbps does not own the principal (ADR-0010 section 3). The grants follow the                  role's oid rather than its name, so nothing here has to be re-granted afterwards"
+                "`{from}` is a role, and renaming one renames it in every database of the                  cluster; pbps does not own the principal (ADR-0010 section 3). The grants follow the                  role's oid rather than its name, so nothing here has to be re-granted afterwards",
+                // Whole-message escaping remains until #2084 step 5.
+                from = from.raw(),
             ),
-            format!("ALTER ROLE {} RENAME TO {};", quote(from)?, quote(to)?),
+            format!("ALTER ROLE {} RENAME TO {};",
+                // ByHand escapes this SQL statement whole until #2084 step 5.
+                quote(from.raw())?,
+                // ByHand escapes this SQL statement whole until #2084 step 5.
+                quote(to.raw())?),
         )),
         Change::Grant {
             role,
@@ -7183,13 +7197,13 @@ mod tests {
                 let role = "writer '$pbps$".to_owned();
                 let change = if revoke {
                     Change::Revoke {
-                        role,
+                        role: role.into(),
                         target,
                         permissions,
                     }
                 } else {
                     Change::Grant {
-                        role,
+                        role: role.into(),
                         target,
                         permissions,
                     }
@@ -7296,7 +7310,7 @@ mod tests {
         ];
         for (spelled, list, expected) in cases {
             let change = Change::Grant {
-                role: "app_reader".to_owned(),
+                role: "app_reader".to_owned().into(),
                 target: target(spelled),
                 permissions: permissions(&list),
             };
@@ -7322,7 +7336,7 @@ mod tests {
         let sql = sql_of(
             &pg,
             &Change::Revoke {
-                role: "app_reader".to_owned(),
+                role: "app_reader".to_owned().into(),
                 target: target("app.recent"),
                 permissions: permissions(&[Permission::Select]),
             },
@@ -7345,7 +7359,7 @@ mod tests {
         let sql = sql_of(
             &pg,
             &Change::Revoke {
-                role: "app_reader".to_owned(),
+                role: "app_reader".to_owned().into(),
                 target: target("app.recent"),
                 permissions: permissions(&[Permission::Select, Permission::Insert]),
             },
@@ -7445,14 +7459,14 @@ mod tests {
             (
                 Change::CreateRole {
                     uid: Uid::generate(UidKind::Role),
-                    name: "analyst".to_owned(),
+                    name: "analyst".to_owned().into(),
                 },
                 "CREATE ROLE \"analyst\";",
             ),
             (
                 Change::DropRole {
                     uid: Uid::generate(UidKind::Role),
-                    name: "analyst".to_owned(),
+                    name: "analyst".to_owned().into(),
                     members: Vec::new(),
                 },
                 "DROP ROLE \"analyst\";",
@@ -7460,8 +7474,8 @@ mod tests {
             (
                 Change::RenameRole {
                     uid: Uid::generate(UidKind::Role),
-                    from: "analyst".to_owned(),
-                    to: "reader".to_owned(),
+                    from: "analyst".to_owned().into(),
+                    to: "reader".to_owned().into(),
                 },
                 "ALTER ROLE \"analyst\" RENAME TO \"reader\";",
             ),
@@ -7486,7 +7500,7 @@ mod tests {
             let refusal = pg
                 .emit(
                     &Change::Grant {
-                        role: "app_reader".to_owned(),
+                        role: "app_reader".to_owned().into(),
                         target: target("app.customer"),
                         permissions: permissions(&[permission]),
                     },
@@ -7506,7 +7520,7 @@ mod tests {
         let refusal = Postgres::new()
             .emit(
                 &Change::Grant {
-                    role: "app_reader".to_owned(),
+                    role: "app_reader".to_owned().into(),
                     target: target("app.customer"),
                     permissions: BTreeSet::new(),
                 },

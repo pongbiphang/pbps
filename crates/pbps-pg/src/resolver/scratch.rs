@@ -106,7 +106,7 @@ pub struct Account {
     /// reading server files, signalling other backends, a checkpoint, a
     /// subscription. A compiled definition can use any of them before the
     /// plan is approved (#1678 security review).
-    pub predefined: Vec<String>,
+    pub predefined: Vec<pbps_model::RoleName>,
     /// Authority over a shared object other than the database it is in,
     /// held by a role in its [`REACH`] or by PUBLIC: owning
     /// another database or a tablespace, `ADMIN OPTION` on a role, a grant
@@ -119,7 +119,7 @@ pub struct Account {
     /// on 16 and 18 through an `INHERIT TRUE, SET FALSE` membership), so a
     /// compiled definition could signal that role's sessions in any
     /// database (#1678 review).
-    pub logins: Vec<String>,
+    pub logins: Vec<pbps_model::RoleName>,
     /// The scratch login is the target session's own login, whose sessions
     /// it may signal for the same reason. Set by the caller, which reads
     /// the target session.
@@ -191,18 +191,19 @@ impl Account {
         .chain(
             self.predefined
                 .iter()
-                .map(|role| format!("no membership in {role}")),
+                .map(|role| format!("no membership in {}", role.shown())),
         )
         .chain(
             self.shared
                 .iter()
                 .map(|authority| format!("no {authority}")),
         )
-        .chain(
-            self.logins.iter().map(|login| {
-                format!("no use of login role {login}, whose sessions it could signal")
-            }),
-        )
+        .chain(self.logins.iter().map(|login| {
+            format!(
+                "no use of login role {login}, whose sessions it could signal",
+                login = login.shown()
+            )
+        }))
         .chain(
             self.target_login.then(|| {
                 "a login other than the target's, whose sessions it could signal".to_owned()
@@ -423,7 +424,7 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
         ))
         .await?
         .iter()
-        .map(|row| text(row, "role"))
+        .map(|row| text(row, "role").map(pbps_model::RoleName::from))
         .collect::<Result<Vec<_>, _>>()?;
     // A subscription is the exception among shared objects: only a session
     // in its own database can alter or drop it (measured on 16 and 18), and
@@ -479,7 +480,7 @@ pub async fn account(conn: &mut impl QueryConnection) -> Result<Account, DbError
         ))
         .await?
         .iter()
-        .map(|row| text(row, "role"))
+        .map(|row| text(row, "role").map(pbps_model::RoleName::from))
         .collect::<Result<Vec<_>, _>>()?;
     let row = one(rows, "the scratch account's attributes")?;
     let flag = |field: &str| -> Result<bool, DbError> {
@@ -770,10 +771,11 @@ pub async fn revoke_usage(
             kept.extend(still_usable(conn, schema).await?);
             continue;
         }
-        let owner = text(row, "owner")?;
-        if owner != "pg_database_owner" {
+        let owner = pbps_model::RoleName::from(text(row, "owner")?);
+        if owner.raw() != "pg_database_owner" {
             return Err(DbError::BadRow(format!(
-                "schema {schema} is owned by {owner}, whose grants the scratch login cannot give up"
+                "schema {schema} is owned by {owner}, whose grants the scratch login cannot give up",
+                owner = owner.shown()
             )));
         }
         // One row per entry, each name already an identifier: a role's name

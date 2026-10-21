@@ -571,7 +571,7 @@ pub struct RawObjectDependency {
 /// (ADR-0005).
 #[derive(Debug, Clone)]
 pub struct RawRole {
-    pub name: String,
+    pub name: pbps_model::RoleName,
 }
 
 /// What a permission is on, as far as the catalog could name it.
@@ -607,7 +607,7 @@ pub enum Securable {
 /// object or a schema.
 #[derive(Debug, Clone)]
 pub struct RawPermission {
-    pub role: String,
+    pub role: pbps_model::RoleName,
     /// `sys.database_permissions.class`: 1 for an object, 3 for a schema, 0
     /// for the database itself, and the rest for classes the model does not
     /// hold (a type, an assembly, another principal, ...).
@@ -2176,7 +2176,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                         "role {}: {} is on {} this connection cannot name (the catalog \
                          returned no name for it, which is what a securable the account \
                          holds nothing on looks like); the declarations cannot express it",
-                        p.role,
+                        p.role.shown(),
                         p.permission,
                         if p.class == 3 {
                             "a schema"
@@ -2198,7 +2198,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     what: format!(
                         "role {}: {} on the database is not modelled; the declarations cannot \
                          express it",
-                        p.role, p.permission
+                        p.role.shown(),
+                        p.permission
                     ),
                 });
                 continue;
@@ -2210,7 +2211,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     what: format!(
                         "role {}: {} on a {} (class {}) is not modelled; the declarations \
                          cannot express it",
-                        p.role,
+                        p.role.shown(),
                         p.permission,
                         p.class_desc.to_ascii_lowercase().replace('_', " "),
                         p.class
@@ -2228,6 +2229,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         // such a name would be reported, and refused, where an ordinary grant
         // on the same object is ignored (`unexpressible_permissions`).
         if target
+            .raw()
             .to_string()
             .parse::<pbps_model::GrantTarget>()
             .as_ref()
@@ -2240,7 +2242,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     "role {}: {} on [{}].[{}] is on an object whose name contains a period or a \
                      parenthesis, which a declaration cannot spell; the declarations cannot \
                      express it",
-                    p.role,
+                    p.role.shown(),
                     p.permission,
                     match &p.securable {
                         Securable::Object { schema, .. } | Securable::Schema(schema) => schema,
@@ -2279,7 +2281,9 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 what: format!(
                     "role {}: {} on {target} is on an object pbps does not model, or could not \
                      read; the declarations cannot express it",
-                    p.role, p.permission
+                    p.role.shown(),
+                    p.permission,
+                    target = target.shown(),
                 ),
             });
             continue;
@@ -2291,7 +2295,9 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 what: format!(
                     "role {}: a column-level {} on {target} is not modelled; the declarations \
                      cannot express it",
-                    p.role, p.permission
+                    p.role.shown(),
+                    p.permission,
+                    target = target.shown(),
                 ),
             });
             continue;
@@ -2305,7 +2311,9 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     what: format!(
                         "role {}: DENY {} on {target} is not modelled (ADR-0005); the \
                          declarations cannot express it",
-                        p.role, p.permission
+                        p.role.shown(),
+                        p.permission,
+                        target = target.shown(),
                     ),
                 });
                 continue;
@@ -2317,7 +2325,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     what: format!(
                         "role {}: permission state `{other}` on {target} is not modelled; the \
                          declarations cannot express it",
-                        p.role
+                        p.role.shown(),
+                        target = target.shown(),
                     ),
                 });
                 continue;
@@ -2338,7 +2347,9 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     what: format!(
                         "role {}: {} on {target} is outside the permissions pbps manages on SQL \
                          Server; the declarations cannot express it",
-                        p.role, p.permission
+                        p.role.shown(),
+                        p.permission,
+                        target = target.shown(),
                     ),
                 });
                 continue;
@@ -2354,11 +2365,12 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     "role {}: {} on {target} is granted WITH GRANT OPTION, which the \
                      declarations cannot express; revoke the grant option by hand \
                      (`REVOKE GRANT OPTION FOR {} ON {} FROM {}`) to bring it under pbps",
-                    p.role,
+                    p.role.shown(),
                     permission.as_str(),
                     p.permission,
-                    target,
-                    p.role
+                    target.shown(),
+                    p.role.shown(),
+                    target = target.shown(),
                 ),
             });
             continue;
@@ -2386,7 +2398,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         owners: Default::default(),
         // This reader carries no object owner and no session role; both
         // belong to the PostgreSQL grantor rules (ADR-0010 §1).
-        session_role: String::new(),
+        session_role: Default::default(),
         // The same rules: this engine's `REVOKE` takes an `AS` clause and its
         // catalog records the grantor, so "no statement from this connection
         // could remove it" is a question with a different shape here, and no
@@ -3170,11 +3182,15 @@ mod tests {
         raw.permissions.push(grant(None, 3));
         let p = assemble(&raw);
         let role = &p.schema.roles["app_reader"];
-        let targets: Vec<String> = role.grants.keys().map(ToString::to_string).collect();
+        let targets: Vec<String> = role
+            .grants
+            .keys()
+            .map(|name| name.raw().to_string())
+            .collect();
         assert_eq!(targets, ["dbo.customer", "schema::dbo"]);
         assert!(p.warnings.is_empty(), "{:?}", p.warnings);
         assert_eq!(p.unexpressible.len(), 1, "{:?}", p.unexpressible);
-        assert_eq!(p.unexpressible[0].role, "app_reader");
+        assert_eq!(p.unexpressible[0].role, "app_reader".into());
         assert!(
             p.unexpressible[0].what.contains("dbo.order_seq")
                 && p.unexpressible[0].what.contains("does not model"),
@@ -3253,12 +3269,12 @@ mod tests {
         let targets: Vec<String> = p.schema.roles["app_reader"]
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|name| name.raw().to_string())
             .collect();
         assert_eq!(targets, ["dbo.customer"], "{:?}", p.unexpressible);
         assert_eq!(p.unexpressible.len(), 2, "{:?}", p.unexpressible);
         for u in &p.unexpressible {
-            assert_eq!(u.role, "app_reader");
+            assert_eq!(u.role, "app_reader".into());
             assert!(u.what.contains("period or a parenthesis"), "{u:?}");
         }
         let targets: Vec<Option<pbps_model::GrantTarget>> =
@@ -3321,7 +3337,11 @@ mod tests {
         );
         let what: Vec<&str> = p.unexpressible.iter().map(|u| u.what.as_str()).collect();
         assert_eq!(what.len(), 4, "{what:?}");
-        assert!(p.unexpressible.iter().all(|u| u.role == "app_reader"));
+        assert!(
+            p.unexpressible
+                .iter()
+                .all(|u| u.role == "app_reader".into())
+        );
         assert!(
             what.iter()
                 .any(|w| w.contains("WITH GRANT OPTION")
@@ -3380,11 +3400,15 @@ mod tests {
         let targets: Vec<String> = p.schema.roles["app_reader"]
             .grants
             .keys()
-            .map(ToString::to_string)
+            .map(|name| name.raw().to_string())
             .collect();
         assert_eq!(targets, ["dbo.customer"]);
         assert_eq!(p.unexpressible.len(), 2, "{:?}", p.unexpressible);
-        assert!(p.unexpressible.iter().all(|u| u.role == "app_reader"));
+        assert!(
+            p.unexpressible
+                .iter()
+                .all(|u| u.role == "app_reader".into())
+        );
         assert!(
             p.unexpressible.iter().all(|u| u.target.is_none()),
             "there is no name to scope the report by: {:?}",

@@ -270,7 +270,7 @@ pub struct RoutineReason {
     /// admitted. `None` for a function.
     pub runs: Option<String>,
     /// The role that owns the routine (an operator's own owner).
-    pub owner: String,
+    pub owner: pbps_model::RoleName,
     pub why: Why,
     pub used_by: Use,
 }
@@ -281,10 +281,10 @@ pub struct OwnerReason {
     /// The engine's identity for the type: `app.positive`.
     pub ty: String,
     /// The type's owner.
-    pub owner: String,
+    pub owner: pbps_model::RoleName,
     /// An untrusted role that can act as `owner`: `owner` itself when the owner
     /// is the untrusted role, a member of it otherwise.
-    pub actor: String,
+    pub actor: pbps_model::RoleName,
 }
 
 /// Why the read could not tell. Each is a different thing to fix.
@@ -293,7 +293,7 @@ pub enum Unreadable {
     /// A role declared trusted does not exist. Not an empty grant: a name that
     /// trusts nobody is a typo, and a typo that is silently ignored is a gate
     /// nobody reads.
-    TrustedRolesMissing(Vec<String>),
+    TrustedRolesMissing(Vec<pbps_model::RoleName>),
     /// The read failed, or the engine holds something this release cannot
     /// certify (an expression node it does not know, a built-in function the
     /// audited list names and the server lacks). What it found is unknown.
@@ -358,7 +358,7 @@ impl fmt::Display for Reason {
                         r.used_by,
                         r.kind.as_str(),
                         r.identity,
-                        r.owner
+                        r.owner.shown()
                     ),
                     Some(function) => write!(
                         f,
@@ -367,7 +367,7 @@ impl fmt::Display for Reason {
                         r.used_by,
                         r.kind.as_str(),
                         r.identity,
-                        r.owner
+                        r.owner.shown()
                     ),
                 }
             }
@@ -376,7 +376,8 @@ impl fmt::Display for Reason {
                 "the type `{}` is owned by `{}`, a role that is neither a superuser, nor able to \
                  become the deploying role or a superuser, nor declared trusted, and so it can \
                  change what that type runs",
-                o.ty, o.owner
+                o.ty,
+                o.owner.shown()
             ),
             Self::Owner(o) => write!(
                 f,
@@ -384,16 +385,18 @@ impl fmt::Display for Reason {
                  nor able to become the deploying role or a superuser, nor declared trusted, can \
                  act as it (by membership, or by granting it to itself) and so change what that \
                  type runs",
-                o.ty, o.owner, o.actor
+                o.ty,
+                o.owner.shown(),
+                o.actor.shown()
             ),
         }
     }
 }
 
-fn quoted(names: &[String]) -> String {
+fn quoted(names: &[pbps_model::RoleName]) -> String {
     names
         .iter()
-        .map(|n| format!("`{n}`"))
+        .map(|n| format!("`{n}`", n = n.shown(),))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -437,12 +440,12 @@ struct Facts {
 struct OwnedType {
     oid: Oid,
     ty: String,
-    owner: String,
+    owner: pbps_model::RoleName,
 }
 
 /// The verdict on what was read. `actors` maps a type to the untrusted roles
 /// that can act as its owner.
-fn verdict(facts: Facts, actors: &BTreeMap<Oid, Vec<String>>) -> InputPath {
+fn verdict(facts: Facts, actors: &BTreeMap<Oid, Vec<pbps_model::RoleName>>) -> InputPath {
     // A path that runs nothing asks nobody anything: no owner, no routine.
     if !facts.runs_code {
         return InputPath::Admitted(Admitted { runs_code: false });
@@ -514,7 +517,7 @@ impl<'a> Added<'a> {
 pub async fn read(
     conn: &mut Conn,
     within: Within,
-    trusted: &[String],
+    trusted: &[pbps_model::RoleName],
     added: &[Added<'_>],
 ) -> Vec<InputPath> {
     match read_all(conn, within, trusted, added).await {
@@ -528,7 +531,10 @@ pub async fn read(
 
 /// The names in `roles` that are not roles of this cluster, sorted. A role list
 /// that cannot be read is an error and never an empty answer.
-pub async fn missing_roles(conn: &mut Conn, roles: &[String]) -> Result<Vec<String>, DbError> {
+pub async fn missing_roles(
+    conn: &mut Conn,
+    roles: &[pbps_model::RoleName],
+) -> Result<Vec<pbps_model::RoleName>, DbError> {
     let json = json(roles)?;
     let rows = conn
         .query_with(
@@ -542,7 +548,7 @@ pub async fn missing_roles(conn: &mut Conn, roles: &[String]) -> Result<Vec<Stri
         )
         .await?;
     rows.iter()
-        .map(|row| Ok(need::<&str>(row, "name")?.to_owned()))
+        .map(|row| Ok(need::<&str>(row, "name")?.into()))
         .collect()
 }
 
@@ -556,7 +562,7 @@ const SAVEPOINT: &str = "pbps_input_path";
 async fn read_all(
     conn: &mut Conn,
     within: Within,
-    trusted: &[String],
+    trusted: &[pbps_model::RoleName],
     added: &[Added<'_>],
 ) -> Result<Vec<InputPath>, DbError> {
     match within {
@@ -596,7 +602,7 @@ async fn read_all(
 
 async fn read_each(
     conn: &mut Conn,
-    trusted: &[String],
+    trusted: &[pbps_model::RoleName],
     added: &[Added<'_>],
 ) -> Result<Vec<InputPath>, DbError> {
     // Names in the stored expressions' text, in the identities and in the
@@ -631,7 +637,7 @@ impl From<DbError> for Failure {
 
 async fn pass(
     conn: &mut Conn,
-    trusted: &[String],
+    trusted: &[pbps_model::RoleName],
     added: &[Added<'_>],
 ) -> Result<Vec<InputPath>, DbError> {
     let missing = missing_roles(conn, trusted).await?;
@@ -754,7 +760,7 @@ struct TypeRow {
     /// The engine's identity: `app.positive`, `app.positive[]`, `integer`.
     name: String,
     typtype: String,
-    owner: String,
+    owner: pbps_model::RoleName,
     /// A domain's DEFAULT as the stored node tree's text.
     default: Option<String>,
 }
@@ -956,7 +962,7 @@ async fn reach(conn: &mut Conn, roots: &[Oid]) -> Result<Vec<TypeRow>, DbError> 
             Ok(TypeRow {
                 oid: need(row, "oid")?,
                 name: need::<&str>(row, "name")?.to_owned(),
-                owner: need::<&str>(row, "owner")?.to_owned(),
+                owner: need::<&str>(row, "owner")?.into(),
                 // Only a domain has a default of this kind.
                 default: if typtype == "d" {
                     row.try_get::<&str>("default_expr")?.map(str::to_owned)
@@ -1018,7 +1024,7 @@ fn check_text(name: &str, contype: &str, expr: Option<&str>) -> Result<String, S
 
 struct OperatorRow {
     identity: String,
-    owner: String,
+    owner: pbps_model::RoleName,
     /// The function the operator runs.
     code: Oid,
 }
@@ -1038,7 +1044,7 @@ fn operator_function(oid: Oid, row: &OperatorRow) -> Result<Oid, String> {
 
 struct FunctionRow {
     identity: String,
-    owner: String,
+    owner: pbps_model::RoleName,
 }
 
 /// The functions and operators of the path that are not admitted, with where
@@ -1230,7 +1236,7 @@ async fn operator_rows(
                 need(row, "oid")?,
                 OperatorRow {
                     identity: need::<&str>(row, "identity")?.to_owned(),
-                    owner: need::<&str>(row, "owner")?.to_owned(),
+                    owner: need::<&str>(row, "owner")?.into(),
                     code: need(row, "code")?,
                 },
             ))
@@ -1264,7 +1270,7 @@ async fn function_rows(
                 need(row, "oid")?,
                 FunctionRow {
                     identity: need::<&str>(row, "identity")?.to_owned(),
-                    owner: need::<&str>(row, "owner")?.to_owned(),
+                    owner: need::<&str>(row, "owner")?.into(),
                 },
             ))
         })
@@ -1280,10 +1286,10 @@ async fn function_rows(
 /// declared trusted.
 async fn untrusted_actors(
     conn: &mut Conn,
-    trusted: &[String],
+    trusted: &[pbps_model::RoleName],
     types: &BTreeSet<Oid>,
-) -> Result<BTreeMap<Oid, Vec<String>>, DbError> {
-    let mut out: BTreeMap<Oid, Vec<String>> = BTreeMap::new();
+) -> Result<BTreeMap<Oid, Vec<pbps_model::RoleName>>, DbError> {
+    let mut out: BTreeMap<Oid, Vec<pbps_model::RoleName>> = BTreeMap::new();
     if types.is_empty() {
         return Ok(out);
     }
@@ -1312,13 +1318,57 @@ async fn untrusted_actors(
     for row in &rows {
         out.entry(need(row, "typ")?)
             .or_default()
-            .push(need::<&str>(row, "actor")?.to_owned());
+            .push(need::<&str>(row, "actor")?.into());
     }
     Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn owner_actor_and_missing_trust_diagnostics_show_role_names_once() {
+        let name = pbps_model::RoleName::from("role\nline\\\u{202e}名前");
+        let shown = r"role\nline\\\u{202e}名前";
+        let same = super::Reason::Owner(super::OwnerReason {
+            ty: "app.t".into(),
+            owner: name.clone(),
+            actor: name.clone(),
+        });
+        assert_eq!(
+            same.to_string(),
+            format!(
+                "the type `app.t` is owned by `{shown}`, a role that is neither a superuser, nor able to become the deploying role or a superuser, nor declared trusted, and so it can change what that type runs"
+            )
+        );
+        let different = super::Reason::Owner(super::OwnerReason {
+            ty: "app.t".into(),
+            owner: "owner".into(),
+            actor: name.clone(),
+        });
+        assert_eq!(
+            different.to_string(),
+            format!(
+                "the type `app.t` is owned by `owner`, and `{shown}`, a role that is neither a superuser, nor able to become the deploying role or a superuser, nor declared trusted, can act as it (by membership, or by granting it to itself) and so change what that type runs"
+            )
+        );
+        let missing =
+            super::InputPath::Unreadable(super::Unreadable::TrustedRolesMissing(vec![name]));
+        assert_eq!(
+            missing
+                .refusal(&pbps_model::TypeRef::new("app", "t").unwrap())
+                .unwrap(),
+            format!(
+                "the type `app.t` cannot be checked: the role(s) `{shown}` declared trusted do not exist"
+            )
+        );
+        assert!(
+            super::InputPath::Admitted(super::Admitted { runs_code: false })
+                .refusal(&pbps_model::TypeRef::new("app", "t").unwrap())
+                .is_none()
+        );
+    }
+
     use super::*;
 
     fn used(ty: &str) -> Use {
@@ -1335,7 +1385,7 @@ mod tests {
             kind: RoutineKind::Function,
             identity: "app.is_positive(integer)".to_owned(),
             runs: None,
-            owner: "alice".to_owned(),
+            owner: "alice".to_owned().into(),
             why: Why::NotBuiltin,
             used_by: used("app.positive"),
         }
@@ -1345,11 +1395,11 @@ mod tests {
         OwnedType {
             oid,
             ty: ty.to_owned(),
-            owner: owner.to_owned(),
+            owner: owner.to_owned().into(),
         }
     }
 
-    fn no_actors() -> BTreeMap<Oid, Vec<String>> {
+    fn no_actors() -> BTreeMap<Oid, Vec<pbps_model::RoleName>> {
         BTreeMap::new()
     }
 
@@ -1433,7 +1483,7 @@ mod tests {
             routines: vec![user_function()],
             types: vec![owned(40001, "app.mood", "mallory")],
         };
-        let actors = BTreeMap::from([(40001, vec!["mallory".to_owned()])]);
+        let actors = BTreeMap::from([(40001, vec!["mallory".into()])]);
         let InputPath::Admitted(admitted) = verdict(facts, &actors) else {
             panic!("a path that runs no code must be admitted");
         };
@@ -1480,8 +1530,7 @@ mod tests {
                 owned(40003, "app.pair", "deployer"),
             ],
         };
-        let actors =
-            BTreeMap::from([(40002, vec!["member_a".to_owned(), "owner_role".to_owned()])]);
+        let actors = BTreeMap::from([(40002, vec!["member_a".into(), "owner_role".into()])]);
         let InputPath::Refused(reasons) = verdict(facts, &actors) else {
             panic!("an untrusted actor must refuse");
         };
@@ -1535,7 +1584,9 @@ mod tests {
         for not in [
             InputPath::Refused(vec![Reason::Routine(user_function())]),
             InputPath::Unreadable(Unreadable::Failed("boom".to_owned())),
-            InputPath::Unreadable(Unreadable::TrustedRolesMissing(vec!["ghost".to_owned()])),
+            InputPath::Unreadable(Unreadable::TrustedRolesMissing(vec![
+                "ghost".to_owned().into(),
+            ])),
         ] {
             assert!(!not.is_admitted(), "{not:?}");
             assert!(not.refusal(&reference).is_some(), "{not:?}");
@@ -1548,10 +1599,11 @@ mod tests {
         let refused = InputPath::Refused(vec![Reason::Routine(user_function())])
             .refusal(&reference)
             .unwrap();
-        let missing =
-            InputPath::Unreadable(Unreadable::TrustedRolesMissing(vec!["ghost".to_owned()]))
-                .refusal(&reference)
-                .unwrap();
+        let missing = InputPath::Unreadable(Unreadable::TrustedRolesMissing(vec![
+            "ghost".to_owned().into(),
+        ]))
+        .refusal(&reference)
+        .unwrap();
         let failed = InputPath::Unreadable(Unreadable::Failed("boom".to_owned()))
             .refusal(&reference)
             .unwrap();
@@ -1576,8 +1628,8 @@ mod tests {
             .map(|i| {
                 Reason::Owner(OwnerReason {
                     ty: "app.positive".to_owned(),
-                    owner: "owner_role".to_owned(),
-                    actor: format!("member_{i:02}"),
+                    owner: "owner_role".to_owned().into(),
+                    actor: format!("member_{i:02}").into(),
                 })
             })
             .collect();
@@ -1701,7 +1753,7 @@ mod tests {
         // An operator with no function.
         let shell = OperatorRow {
             identity: "app.@+@(integer,integer)".to_owned(),
-            owner: "alice".to_owned(),
+            owner: "alice".to_owned().into(),
             code: 0,
         };
         assert!(operator_function(40000, &shell).is_err());

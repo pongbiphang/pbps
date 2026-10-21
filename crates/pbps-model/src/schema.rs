@@ -55,7 +55,7 @@ pub struct Schema {
     /// Defaulted on read: a snapshot written before roles existed describes an
     /// environment with no managed roles, not a broken file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub roles: BTreeMap<String, crate::role::Role>,
+    pub roles: BTreeMap<crate::RoleName, crate::role::Role>,
 }
 
 impl Schema {
@@ -592,7 +592,7 @@ impl RowPolicy {
                     .push("`to` must name at least one role, or be the scalar `public`".to_owned());
             }
             for role in roles {
-                match role.as_str() {
+                match role.raw() {
                     // PostgreSQL otherwise discards the named roles beside
                     // PUBLIC. Uppercase "PUBLIC" is a distinct legal role.
                     "public" => problems.push(
@@ -600,7 +600,8 @@ impl RowPolicy {
                             .to_owned(),
                     ),
                     "current_user" | "session_user" | "current_role" => problems.push(format!(
-                        "`{role}` is a session-dependent target; name a role explicitly"
+                        "`{role}` is a session-dependent target; name a role explicitly",
+                        role = role.shown()
                     )),
                     _ => {}
                 }
@@ -639,7 +640,7 @@ impl PolicyCommand {
 pub enum PolicyRoles {
     #[default]
     Public,
-    Roles(BTreeSet<String>),
+    Roles(BTreeSet<crate::RoleName>),
 }
 
 /// `PARTITION BY RANGE | LIST | HASH (…)` over plain columns (#1170,
