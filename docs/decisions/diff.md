@@ -7786,3 +7786,56 @@ the existing column/row/partition/literal/declared-dependency negatives, and
 `held_tables_and_readers_compile_with_their_keys_on_both_servers` and
 `callable_columns_precede_their_readers_and_real_cycles_are_refused_on_both_servers`
 on the pinned PostgreSQL 16 and 18 fixtures.
+
+
+<a id="dec-1959-4"></a>
+
+**DEC-1959.4. A partition's own default after a parent SET is an expansion
+obligation, and its restoration order is constraints consumed by settle.**
+Part of #1959, S7 PR3. The parent's `SET DEFAULT` recursively overwrites its
+partitions' defaults (DEC-1581.1). `order::parent_defaults::ParentDefaults`
+adds a missing `SetPartitionDefault` through `Rewrite::Add`, as a restoration
+of the existing parent operation. It uses the partition's real UID, the
+same declared own value and parent fallback, and the dialect's risks.
+It preserves the named refusal when no supplied identities name the partition.
+The existing driver retains its transformation, targeted-progress and budget
+checks. No new logical change, Change kind, SQL spelling or engine seam is added.
+
+An existing restoration is reused, including its complete payload and origin.
+The final parent SET on a column precedes the selected restoration through
+an Effect constraint with the Restoration reason; earlier sets retain their
+base order, so this one restoration serves them all. A partition created
+later already sets its own default and needs nothing extra. Inherited
+values and other columns do not acquire restorations. Equal `from` and `to`
+values still need this obligation: replaying the SET during a rebuild
+recursively overwrites a partition's distinct own default.
+
+The old loop inserted each missing or earlier restoration immediately after
+the parent in declaration order, reversing those peers. Parent edges alone
+with Sink retain the earlier peers' input order instead: `[Ra, Rb, P]`
+would become `[P, Ra, Rb]`, rather than `[P, Rb, Ra]`. Explicit Lexical
+compatibility constraints chain those restored peers in the old relative
+order, like DEC-1959.1's same-depth chain. **These compatibility constraints
+exist only for byte-identical output.** They add no rank, tie-break or pass.
+Later original restorations retain their place. The initial typed input
+identifies additions made in this expansion; diagnostic provenance does not
+decide their order, including on a re-run. The expansion returns only
+additions and edges; no production code locally removes, inserts or sorts
+operations to obtain this order. Schedule's existing Sink policy applies
+the constraints through the expansion driver's settle.
+
+The CLI keeps its existing call site and returns only the operation-count
+increase, not the number of rewrites. Only cfg(test) retains the frozen
+pre-conversion function from dd84f894. Each successful test-build call
+compares complete operations, serialized bytes, SQL and a fixed-metadata
+SavedPlan checksum; every outcome compares added counts or refusal text.
+New diagnostic restoration origins are checked separately and stay unsealed.
+The oracle runs on current PR1/PR2 inputs, rather than old #1503 output snapshots.
+
+Pinned by `parent_default_restorations_match_old_bytes_for_32_uid_seeds`,
+`restoration_compatibility_is_an_explicit_constraint_consumed_by_settle`,
+`parent_default_negatives_add_nothing_and_missing_identity_is_refused_by_name`,
+the existing split and woven partition-default pins, and the live
+`a_function_rebuilt_under_partition_defaults_keeps_each_partitions_own` and
+`a_partitions_default_taken_back_resolves_under_its_parents_schema` on the
+pinned PostgreSQL 16 and 18 fixtures.

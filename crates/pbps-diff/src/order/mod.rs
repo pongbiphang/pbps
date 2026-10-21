@@ -27,6 +27,7 @@ pub mod edges;
 pub mod expand;
 pub mod generated;
 pub mod new_tables;
+pub mod parent_defaults;
 mod rewrites;
 pub(crate) mod roles;
 pub mod schedule;

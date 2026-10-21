@@ -2022,88 +2022,44 @@ fn rests_on(later: &Change, earlier: &Change, dialect: &dyn Dialect) -> bool {
     takes_a_name(later).is_some_and(|t| frees_a_name(earlier) == Some(t))
 }
 
-#[allow(clippy::wildcard_enum_match_arm)]
 fn after_their_parents_defaults(
     cs: &mut ChangeSet,
     declared: &Schema,
     ids: &[&IdsFile],
     dialect: &dyn Dialect,
 ) -> Result<usize, String> {
-    let mut added = 0;
-    let mut i = 0;
-    while i < cs.changes.len() {
-        let Change::AlterColumnDefault {
-            column,
-            to: Some(_),
-            ..
-        } = &cs.changes[i].change
-        else {
-            i += 1;
-            continue;
-        };
-        let column = column.clone();
-        let own: Vec<(TableName, String)> = declared
-            .tables
-            .iter()
-            .filter_map(|(name, t)| {
-                let of = t
-                    .partition_of
-                    .as_ref()
-                    .filter(|of| of.parent == column.table)?;
-                let default = of.columns.get(&column.name)?.default.clone()?;
-                Some((name.clone(), default))
-            })
-            .collect();
-        for (partition, default) in own {
-            let sets = |c: &Change| {
-                matches!(c, Change::SetPartitionDefault { table, column: c, to: Some(_), .. }
-                    if *table == partition && *c == column.name)
-            };
-            let later = cs.changes[i + 1..].iter().any(|p| {
-                sets(&p.change)
-                    || matches!(&p.change, Change::CreateTable { name, .. } if *name == partition)
-            });
-            if later {
-                continue;
-            }
-            if let Some(k) = (0..i).rev().find(|&k| sets(&cs.changes[k].change)) {
-                let moved = cs.changes.remove(k);
-                i -= 1;
-                cs.changes.insert(i + 1, moved);
-            } else {
-                let uid = ids
-                    .iter()
-                    .find_map(|ids| ids.table_uid(&partition))
-                    .cloned()
-                    .ok_or_else(|| {
-                        format!(
-                            "no identity names the partition `{partition}`",
-                            partition = partition.shown()
-                        )
-                    })?;
-                let fallback = parent_default(declared, &partition, column.name.raw());
-                cs.changes.insert(
-                    i + 1,
-                    planned(
-                        Change::SetPartitionDefault {
-                            uid,
-                            table: partition,
-                            parent: column.table.clone(),
-                            column: column.name.clone(),
-                            from: None,
-                            to: Some(default),
-                            fallback,
-                        },
-                        dialect,
-                    ),
-                );
-                added += 1;
-            }
+    #[cfg(test)]
+    let mut old = cs.clone();
+    #[cfg(test)]
+    let expected =
+        parent_defaults_oracle::after_their_parents_defaults(&mut old, declared, ids, dialect);
+    let before = cs.changes.len();
+    let rule = pbps_diff::order::parent_defaults::ParentDefaults {
+        initial: &cs.changes,
+        declared,
+        ids,
+        dialect,
+    };
+    let result =
+        pbps_diff::order::expand::expand(cs.clone(), &rule, pbps_diff::order::expand::FACTOR).map(
+            |expanded| {
+                *cs = expanded.changes;
+                cs.changes.len() - before
+            },
+        );
+    #[cfg(test)]
+    {
+        assert_eq!(result, expected);
+        if result.is_ok() {
+            parent_defaults_oracle::same_plan(cs, &old, dialect);
         }
-        i += 1;
     }
-    Ok(added)
+    result
 }
+
+#[cfg(test)]
+#[path = "dependents/parent_defaults_oracle.rs"]
+mod parent_defaults_oracle;
 
 /// Takes the plan's `PUBLIC` decisions out, so that the passes below reorder
 /// modules and what may need them without them (#687).
