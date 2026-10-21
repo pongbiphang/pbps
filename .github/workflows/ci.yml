@@ -303,7 +303,7 @@ jobs:
       # the pressure the startup crashes in docs/PITFALLS.md warn about, and
       # it crashed this job the first time it was tried (#611). Skipped by
       # name here; unset, their variable makes them fail rather than pass.
-      - run: cargo test -p pbps-mssql --test live -- --ignored --skip a_real_express_target_is_an_edition_limitation --skip a_global_temporary_table_marks_one_instance_to_every_login_on_it
+      - run: cargo test -p pbps-mssql --test live -- --ignored --skip a_real_express_target_is_an_edition_limitation --skip a_global_temporary_table_marks_one_instance_to_every_login_on_it --skip scratch2236
         if: matrix.suite == 'dialect'
       # Driver error conversion is a separate test target, ignored by quick.
       - run: cargo test -p pbps-db --test live_mssql -- --ignored
@@ -331,6 +331,25 @@ jobs:
           if [ -n "$id" ]; then
             docker exec "$id" tail -n 300 /var/opt/mssql/log/errorlog >&2 || docker logs "$id" >&2 2>&1 || true
           fi
+
+  # Scratch separation needs two matching SQL Servers on its own runner.
+  resolver-mssql:
+    needs: [approve, lint]
+    if: ${{ github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.approve.outputs.checkout_sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: the SQL Server resolver fixtures and live regressions
+        run: |
+          source scripts/resolver-mssql-fixtures.sh
+          cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 scratch2236
+          cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 mssql_live_tests
 
   # The SQL Server TLS fixture starts its own disposable SQL Server (3 GiB
   # limit). Run in `live`, it sat beside that job's service container: two SQL
@@ -844,7 +863,7 @@ jobs:
 
   gate:
     name: ci-gate
-    needs: [approve, lint, quick, windows, live, live-transport-mssql, live-editions, live-pg, dev-rehearsal, release-linux, release-windows, msrv, compatibility]
+    needs: [approve, lint, quick, windows, live, resolver-mssql, live-transport-mssql, live-editions, live-pg, dev-rehearsal, release-linux, release-windows, msrv, compatibility]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
@@ -869,5 +888,5 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           EVENT: ${{ github.event_name }}
-          PR_OMITTED: live live-pg release-windows
+          PR_OMITTED: live live-pg resolver-mssql release-windows
         run: python3 scripts/ci_gate_verdict.py

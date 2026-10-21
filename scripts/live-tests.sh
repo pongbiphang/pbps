@@ -2,7 +2,7 @@
 # Runs the live SQL Server tests (SPEC §11.5) against a throwaway container.
 #
 # The containers are left running afterwards so re-runs are instant; remove
-# them with: docker rm -f pbps-test-mssql pbps-test-mssql-express
+# them with: docker rm -f pbps-test-mssql pbps-test-mssql-express pbps-test-mssql-scratch
 set -euo pipefail
 
 NAME=pbps-test-mssql
@@ -70,6 +70,8 @@ export PBPS_TEST_EXPRESS_DB="Server=localhost,$EXPRESS_PORT;User Id=sa;Password=
 python3 scripts/check-live-fixture.py --cell mssql2025 --container "$NAME" --port "$PORT"
 python3 scripts/check-live-fixture.py --cell mssql2025-express --container "$EXPRESS_NAME" --port "$EXPRESS_PORT"
 
+source scripts/resolver-mssql-fixtures.sh
+
 # The `--dev docker://` path starts a *second*, throwaway server of its own, so
 # it stays opt-in: naming an image here is what enables it. CI covers it in a
 # job of its own (`dev-rehearsal`) rather than alongside the service container,
@@ -84,7 +86,9 @@ export PBPS_TEST_DEV_IMAGE="${PBPS_TEST_DEV_IMAGE:-$IMAGE}"
 
 # The dialect's live tests, then the CLI's dev-database rehearsal (SPEC §9.3),
 # which needs the same server and is `#[ignore]`d for the same reason.
-cargo test -p pbps-mssql --test live -- --ignored "$@"
+cargo test -p pbps-mssql --test live -- --ignored --skip scratch2236 "$@"
+cargo test --profile live-test -p pbps-mssql --test live -- --ignored --test-threads=1 scratch2236 "$@"
+cargo test --profile live-test -p pbps-cli --lib -- --ignored --test-threads=1 mssql_live_tests "$@"
 # The seam's own error conversion on this driver (issue #167): measured
 # against a real server, `tiberius`'s `Display` already carries the server's
 # sentence, so this is a regression guard rather than a fix — see

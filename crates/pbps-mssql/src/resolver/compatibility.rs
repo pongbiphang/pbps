@@ -48,7 +48,7 @@ const MEASURED_MAJORS: std::ops::RangeInclusive<u32> = 17..=17;
 const BOXED_FAMILY: &[&str] = &["2", "3", "4"];
 
 /// Facts every database reports; a NULL here is unreadable, not absent.
-const OBSERVATIONS: &[&str] = &[
+pub(crate) const OBSERVATIONS: &[&str] = &[
     "product_version",
     "product_level",
     "host_platform",

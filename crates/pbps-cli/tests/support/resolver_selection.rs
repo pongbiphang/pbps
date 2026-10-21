@@ -398,36 +398,11 @@ pub fn required(server: &str, dialect: &str) {
         unchanged();
         report(output)
     };
-    // SQL Server has no binding adapter: an answered refusal, before any key
-    // or resource is looked for.
-    let unsupported = if dialect == "postgres" {
-        None
-    } else {
-        Some("resolver.unresolved")
-    };
+    // Both engines require the key before acquiring a scratch resource.
     let value = refused(&["--db", connection], 2);
-    assert_eq!(
-        value["findings"][0]["id"],
-        unsupported.unwrap_or("resolver.key"),
-        "{value}"
-    );
+    assert_eq!(value["findings"][0]["id"], "resolver.key", "{value}");
     let value = refused(&["--env", "prod"], 2);
-    assert_eq!(
-        value["findings"][0]["id"],
-        unsupported.unwrap_or("resolver.key"),
-        "{value}"
-    );
-    if let Some(id) = unsupported {
-        assert!(
-            value["findings"][0]["message"]
-                .as_str()
-                .unwrap()
-                .contains(&format!("{schema}.v")),
-            "the refusal names the declaration: {value}"
-        );
-        assert_eq!(value["findings"][0]["id"], id);
-        return;
-    }
+    assert_eq!(value["findings"][0]["id"], "resolver.key", "{value}");
     // With the key present the run starts, and finds no scratch server to
     // reach: an operational failure, not a finding (SPEC 9.8).
     successful(run(

@@ -1,0 +1,884 @@
+//! One inventory serves initial emptiness and final cleanup. Catalog reads
+//! are never allowed to fail into an empty result (DEC-2236.1).
+
+use super::{ident, literal, text};
+use pbps_db::transport::{ExecuteConnection, QueryConnection};
+use pbps_db::{DbError, Row};
+use std::collections::BTreeSet;
+
+/// Explicit ownership lives in these catalogs when they expose principal_id.
+pub(super) const OWNERSHIP_CATALOGS: &[&str] = &[
+    "schemas",
+    "objects",
+    "database_principals",
+    "types",
+    "assemblies",
+    "asymmetric_keys",
+    "certificates",
+    "symmetric_keys",
+    "service_contracts",
+    "service_message_types",
+    "services",
+    "routes",
+    "remote_service_bindings",
+    "fulltext_catalogs",
+    "fulltext_stoplists",
+    "registered_search_property_lists",
+    "xml_schema_collections",
+    "external_languages",
+    "external_models",
+];
+
+const CLASS_CATALOGS: &[(&str, &str)] = &[
+    ("APPLICATION ROLE", "database_principals"),
+    ("ASSEMBLY", "assemblies"),
+    ("ASYMMETRIC KEY", "asymmetric_keys"),
+    ("CERTIFICATE", "certificates"),
+    ("CONTRACT", "service_contracts"),
+    ("DATABASE", "databases"),
+    ("DATABASE SCOPED CREDENTIAL", "database_scoped_credentials"),
+    ("EXTERNAL LANGUAGE", "external_languages"),
+    ("EXTERNAL MODEL", "external_models"),
+    ("FULLTEXT CATALOG", "fulltext_catalogs"),
+    ("FULLTEXT STOPLIST", "fulltext_stoplists"),
+    ("MESSAGE TYPE", "service_message_types"),
+    ("OBJECT", "objects"),
+    ("REMOTE SERVICE BINDING", "remote_service_bindings"),
+    ("ROLE", "database_principals"),
+    ("ROUTE", "routes"),
+    ("SCHEMA", "schemas"),
+    ("SEARCH PROPERTY LIST", "registered_search_property_lists"),
+    ("SERVICE", "services"),
+    ("SYMMETRIC KEY", "symmetric_keys"),
+    ("TYPE", "types"),
+    ("USER", "database_principals"),
+    ("XML SCHEMA COLLECTION", "xml_schema_collections"),
+];
+
+const FIXED: &[&str] = &[
+    "dbo",
+    "guest",
+    "INFORMATION_SCHEMA",
+    "sys",
+    "db_owner",
+    "db_accessadmin",
+    "db_securityadmin",
+    "db_ddladmin",
+    "db_backupoperator",
+    "db_datareader",
+    "db_datawriter",
+    "db_denydatareader",
+    "db_denydatawriter",
+];
+
+#[derive(Debug)]
+pub struct Entry {
+    pub name: String,
+    drop: Option<String>,
+    rank: u16,
+    key: Option<Securable>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Securable {
+    Object(i32),
+    Principal(i32),
+}
+
+#[derive(Debug, Default)]
+pub struct Inventory {
+    pub entries: Vec<Entry>,
+    dependencies: BTreeSet<(Securable, Securable)>,
+}
+
+impl Inventory {
+    pub fn names(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    fn add(&mut self, name: String, drop: Option<String>, rank: u16, key: Option<Securable>) {
+        self.entries.push(Entry {
+            name,
+            drop,
+            rank,
+            key,
+        });
+    }
+}
+
+async fn rows(
+    conn: &mut impl QueryConnection,
+    catalog: &str,
+    sql: &str,
+) -> Result<Vec<Row>, DbError> {
+    conn.query(sql).await.map_err(|error| {
+        DbError::Refused(format!(
+            "the scratch inventory cannot read sys.{catalog}: {error}"
+        ))
+    })
+}
+
+/// Fixed database-level grants, read separately from system-object SELECTs.
+fn database_grants() -> BTreeSet<String> {
+    BTreeSet::from([
+        "dbo|dbo|CONNECT|GRANT".into(),
+        "public|dbo|VIEW ANY COLUMN ENCRYPTION KEY DEFINITION|GRANT".into(),
+        "public|dbo|VIEW ANY COLUMN MASTER KEY DEFINITION|GRANT".into(),
+    ])
+}
+
+pub async fn read(
+    conn: &mut impl QueryConnection,
+    sandbox: Option<&str>,
+) -> Result<Inventory, DbError> {
+    super::require_owner(conn).await?;
+    let mut result = Inventory::default();
+    let database = rows(
+        conn,
+        "databases",
+        "SELECT database_id FROM sys.databases WHERE database_id=DB_ID();",
+    )
+    .await?;
+    if database.len() != 1 {
+        return Err(DbError::Refused(
+            "sys.databases does not expose the scratch database to its inventory".into(),
+        ));
+    }
+    for row in rows(
+        conn,
+        "fn_builtin_permissions",
+        "SELECT DISTINCT CONVERT(nvarchar(60),class_desc) AS class FROM \
+         sys.fn_builtin_permissions(DEFAULT) WHERE class_desc=N'DATABASE' OR \
+         parent_class_desc IN(N'DATABASE',N'SCHEMA');",
+    )
+    .await?
+    {
+        let class = text(&row, "class")?;
+        if !CLASS_CATALOGS.iter().any(|(known, _)| *known == class) {
+            return Err(DbError::Refused(format!(
+                "the scratch inventory has no catalog for securable class {class}"
+            )));
+        }
+    }
+    for row in rows(
+        conn,
+        "schemas",
+        "SELECT name, USER_NAME(principal_id) AS owner FROM sys.schemas;",
+    )
+    .await?
+    {
+        let name = text(&row, "name")?;
+        if !FIXED.contains(&name.as_str()) {
+            result.add(
+                format!("SCHEMA {name}"),
+                Some(format!("DROP SCHEMA {};", ident(&name))),
+                90,
+                None,
+            );
+        } else if text(&row, "owner")? != name {
+            result.add(
+                format!("SCHEMA {name} owner"),
+                Some(format!(
+                    "ALTER AUTHORIZATION ON SCHEMA::{} TO {};",
+                    ident(&name),
+                    ident(&name)
+                )),
+                89,
+                None,
+            );
+        }
+    }
+    for name in FIXED {
+        let found = rows(
+            conn,
+            "schemas",
+            &format!("SELECT name FROM sys.schemas WHERE name={};", literal(name)),
+        )
+        .await?;
+        if found.len() != 1 {
+            result.add(format!("missing SCHEMA {name}"), None, 90, None);
+        }
+    }
+    let mut principals = BTreeSet::new();
+    for row in rows(
+        conn,
+        "database_principals",
+        "SELECT name,type,principal_id,owning_principal_id FROM sys.database_principals;",
+    )
+    .await?
+    {
+        let name = text(&row, "name")?;
+        principals.insert(name.clone());
+        if FIXED.contains(&name.as_str()) || name == "public" || sandbox == Some(name.as_str()) {
+            continue;
+        }
+        let kind = match text(&row, "type")?.as_str() {
+            "R" => "ROLE",
+            "A" => "APPLICATION ROLE",
+            "S" | "U" | "G" | "E" | "X" | "C" | "K" => "USER",
+            _ => "UNKNOWN PRINCIPAL",
+        };
+        let principal = row
+            .try_get::<i32>("principal_id")?
+            .map(Securable::Principal);
+        // Roles may own other roles. A rank alone cannot order a chain of
+        // principals, just as it cannot order schema-bound modules.
+        if let (Some(principal), Some(owner)) =
+            (principal, row.try_get::<i32>("owning_principal_id")?)
+        {
+            result
+                .dependencies
+                .insert((principal, Securable::Principal(owner)));
+        }
+        result.add(
+            format!("{kind} {name}"),
+            if kind == "UNKNOWN PRINCIPAL" {
+                None
+            } else {
+                Some(format!("DROP {kind} {};", ident(&name)))
+            },
+            100,
+            principal,
+        );
+    }
+    for name in FIXED.iter().copied().chain(["public"]) {
+        if !principals.contains(name) {
+            result.add(format!("missing principal {name}"), None, 100, None);
+        }
+    }
+    let mut memberships = BTreeSet::new();
+    for row in rows(
+        conn,
+        "database_role_members",
+        "SELECT USER_NAME(role_principal_id) AS role,USER_NAME(member_principal_id) AS \
+         member FROM sys.database_role_members;",
+    )
+    .await?
+    {
+        let role = text(&row, "role")?;
+        let member = text(&row, "member")?;
+        memberships.insert((role.clone(), member.clone()));
+        if role == "db_owner" && (member == "dbo" || sandbox == Some(member.as_str())) {
+            continue;
+        }
+        result.add(
+            format!("membership {role}<-{member}"),
+            Some(format!(
+                "ALTER ROLE {} DROP MEMBER {};",
+                ident(&role),
+                ident(&member)
+            )),
+            10,
+            None,
+        );
+    }
+    if !memberships.contains(&("db_owner".into(), "dbo".into())) {
+        result.add("missing membership db_owner<-dbo".into(), None, 10, None);
+    }
+    for row in rows(
+        conn,
+        "objects",
+        "SELECT o.object_id,o.parent_object_id,o.type,o.name,SCHEMA_NAME(o.schema_id) AS \
+         schema_name, OBJECT_NAME(o.parent_object_id) AS parent_name FROM sys.objects o \
+         WHERE o.is_ms_shipped=0 AND o.type<>N'TT';",
+    )
+    .await?
+    {
+        let name = text(&row, "name")?;
+        let schema = text(&row, "schema_name")?;
+        let qualified = format!("{}.{}", ident(&schema), ident(&name));
+        let kind = text(&row, "type")?;
+        let (drop, rank) = match kind.trim() {
+            "U" => (Some(format!("DROP TABLE {qualified};")), 50),
+            "V" => (Some(format!("DROP VIEW {qualified};")), 40),
+            "P" | "PC" => (Some(format!("DROP PROCEDURE {qualified};")), 40),
+            "FN" | "IF" | "TF" | "FS" | "FT" => (Some(format!("DROP FUNCTION {qualified};")), 60),
+            "AF" => (Some(format!("DROP AGGREGATE {qualified};")), 40),
+            "SN" => (Some(format!("DROP SYNONYM {qualified};")), 40),
+            "SO" => (Some(format!("DROP SEQUENCE {qualified};")), 60),
+            "SQ" => (Some(format!("DROP QUEUE {qualified};")), 50),
+            "TR" | "TA" => (Some(format!("DROP TRIGGER {qualified};")), 30),
+            "C" | "D" | "F" | "PK" | "UQ" | "EC" => {
+                let parent = row.try_get::<&str>("parent_name")?;
+                (
+                    parent.map(|parent| {
+                        format!(
+                            "ALTER TABLE {}.{} DROP CONSTRAINT {};",
+                            ident(&schema),
+                            ident(parent),
+                            ident(&name)
+                        )
+                    }),
+                    if kind.trim() == "F" { 18 } else { 20 },
+                )
+            }
+            "R" => (Some(format!("DROP RULE {qualified};")), 60),
+            _ => (None, 50),
+        };
+        result.add(
+            format!("OBJECT {} {schema}.{name}", kind.trim()),
+            drop,
+            rank,
+            row.try_get::<i32>("object_id")?.map(Securable::Object),
+        );
+    }
+    // Child catalogs are read even when sys.objects is empty: a DENY must
+    // refuse by catalog name, rather than certify a partial inventory.
+    for catalog in [
+        "columns",
+        "parameters",
+        "indexes",
+        "check_constraints",
+        "default_constraints",
+        "foreign_keys",
+        "key_constraints",
+        "sql_modules",
+    ] {
+        rows(
+            conn,
+            catalog,
+            &format!(
+                "SELECT c.object_id FROM sys.{catalog} c JOIN sys.objects o ON \
+                 o.object_id=c.object_id WHERE o.is_ms_shipped=0;"
+            ),
+        )
+        .await?;
+    }
+    rows(
+        conn,
+        "foreign_key_columns",
+        "SELECT c.constraint_object_id FROM sys.foreign_key_columns c JOIN sys.objects o ON \
+         o.object_id=c.constraint_object_id WHERE o.is_ms_shipped=0;",
+    )
+    .await?;
+    for row in rows(
+        conn,
+        "sql_expression_dependencies",
+        "SELECT referencing_id,referenced_id FROM sys.sql_expression_dependencies WHERE \
+         is_schema_bound_reference=1 AND referencing_id<>referenced_id;",
+    )
+    .await?
+    {
+        if let (Some(a), Some(b)) = (
+            row.try_get::<i32>("referencing_id")?,
+            row.try_get::<i32>("referenced_id")?,
+        ) {
+            result
+                .dependencies
+                .insert((Securable::Object(a), Securable::Object(b)));
+        }
+    }
+    for (catalog, kind, filter, rank, qualified) in [
+        ("types", "TYPE", "is_user_defined=1", 65, true),
+        ("assemblies", "ASSEMBLY", "is_user_defined=1", 70, false),
+        ("asymmetric_keys", "ASYMMETRIC KEY", "1=1", 80, false),
+        ("certificates", "CERTIFICATE", "1=1", 80, false),
+        ("symmetric_keys", "SYMMETRIC KEY", "1=1", 70, false),
+        (
+            "service_contracts",
+            "CONTRACT",
+            "service_contract_id>6",
+            45,
+            false,
+        ),
+        (
+            "service_message_types",
+            "MESSAGE TYPE",
+            "message_type_id>14",
+            55,
+            false,
+        ),
+        ("services", "SERVICE", "service_id>3", 25, false),
+        ("routes", "ROUTE", "name<>N'AutoCreatedLocal'", 45, false),
+        (
+            "remote_service_bindings",
+            "REMOTE SERVICE BINDING",
+            "1=1",
+            25,
+            false,
+        ),
+        (
+            "database_scoped_credentials",
+            "DATABASE SCOPED CREDENTIAL",
+            "1=1",
+            70,
+            false,
+        ),
+        (
+            "external_languages",
+            "EXTERNAL LANGUAGE",
+            "NOT (principal_id=4 AND ((external_language_id=1 AND language=N'R') OR \
+             (external_language_id=2 AND language=N'Python')))",
+            70,
+            false,
+        ),
+        ("external_models", "EXTERNAL MODEL", "1=1", 70, false),
+        ("fulltext_catalogs", "FULLTEXT CATALOG", "1=1", 70, false),
+        ("fulltext_stoplists", "FULLTEXT STOPLIST", "1=1", 70, false),
+        (
+            "registered_search_property_lists",
+            "SEARCH PROPERTY LIST",
+            "1=1",
+            70,
+            false,
+        ),
+        (
+            "xml_schema_collections",
+            "XML SCHEMA COLLECTION",
+            "schema_id<>4",
+            70,
+            true,
+        ),
+        ("partition_schemes", "PARTITION SCHEME", "1=1", 75, false),
+        (
+            "partition_functions",
+            "PARTITION FUNCTION",
+            "1=1",
+            80,
+            false,
+        ),
+        ("plan_guides", "PLAN GUIDE", "1=1", 30, false),
+        (
+            "event_notifications",
+            "EVENT NOTIFICATION",
+            "1=1",
+            25,
+            false,
+        ),
+        (
+            "database_audit_specifications",
+            "DATABASE AUDIT SPECIFICATION",
+            "1=1",
+            30,
+            false,
+        ),
+        (
+            "column_encryption_keys",
+            "COLUMN ENCRYPTION KEY",
+            "1=1",
+            70,
+            false,
+        ),
+        ("column_master_keys", "COLUMN MASTER KEY", "1=1", 75, false),
+    ] {
+        let projection = if qualified {
+            "name,SCHEMA_NAME(schema_id) AS schema_name"
+        } else if catalog == "external_languages" {
+            "language AS name"
+        } else {
+            "name"
+        };
+        for row in rows(
+            conn,
+            catalog,
+            &format!("SELECT {projection} FROM sys.{catalog} WHERE {filter};"),
+        )
+        .await?
+        {
+            let name = text(&row, "name")?;
+            let name = if qualified {
+                format!("{}.{}", ident(&text(&row, "schema_name")?), ident(&name))
+            } else {
+                ident(&name)
+            };
+            let drop = match kind {
+                "PLAN GUIDE" => Some(format!(
+                    "EXEC sys.sp_control_plan_guide N'DROP',{};",
+                    literal(&text(&row, "name")?)
+                )),
+                "EVENT NOTIFICATION" => {
+                    Some(format!("DROP EVENT NOTIFICATION {name} ON DATABASE;"))
+                }
+                "DATABASE AUDIT SPECIFICATION" => Some(format!(
+                    "ALTER DATABASE AUDIT SPECIFICATION {name} WITH (STATE=OFF); DROP \
+                     DATABASE AUDIT SPECIFICATION {name};"
+                )),
+                "SYMMETRIC KEY" if text(&row, "name")? == "##MS_DatabaseMasterKey##" => {
+                    Some("DROP MASTER KEY;".into())
+                }
+                _ => Some(format!("DROP {kind} {name};")),
+            };
+            let rank =
+                if kind == "SYMMETRIC KEY" && text(&row, "name")? == "##MS_DatabaseMasterKey##" {
+                    85
+                } else {
+                    rank
+                };
+            result.add(format!("{kind} {name}"), drop, rank, None);
+        }
+    }
+    rows(
+        conn,
+        "column_encryption_key_values",
+        "SELECT column_encryption_key_id FROM sys.column_encryption_key_values;",
+    )
+    .await?;
+    rows(
+        conn,
+        "database_audit_specification_details",
+        "SELECT database_specification_id FROM sys.database_audit_specification_details;",
+    )
+    .await?;
+    for row in rows(
+        conn,
+        "triggers",
+        "SELECT name FROM sys.triggers WHERE parent_class=0 AND is_ms_shipped=0;",
+    )
+    .await?
+    {
+        let name = text(&row, "name")?;
+        result.add(
+            format!("database trigger {name}"),
+            Some(format!("DROP TRIGGER {} ON DATABASE;", ident(&name))),
+            15,
+            None,
+        );
+    }
+    for row in rows(
+        conn,
+        "database_scoped_configurations",
+        "SELECT name FROM sys.database_scoped_configurations WHERE is_value_default=0;",
+    )
+    .await?
+    {
+        result.add(
+            format!("database scoped configuration {}", text(&row, "name")?),
+            None,
+            80,
+            None,
+        );
+    }
+    for row in rows(
+        conn,
+        "filegroups",
+        "SELECT name FROM sys.filegroups WHERE data_space_id<>1 OR name<>N'PRIMARY' OR \
+         is_default<>1 OR is_read_only<>0 OR is_autogrow_all_files<>0;",
+    )
+    .await?
+    {
+        let name = text(&row, "name")?;
+        result.add(
+            format!("FILEGROUP {name}"),
+            if name == "PRIMARY" {
+                None
+            } else {
+                Some(format!(
+                    "ALTER DATABASE CURRENT REMOVE FILEGROUP {};",
+                    ident(&name)
+                ))
+            },
+            85,
+            None,
+        );
+    }
+    for row in rows(
+        conn,
+        "database_files",
+        "SELECT name FROM sys.database_files WHERE file_id NOT IN(1,2) OR state<>0 OR \
+         is_read_only<>0;",
+    )
+    .await?
+    {
+        let name = text(&row, "name")?;
+        result.add(
+            format!("FILE {name}"),
+            Some(format!(
+                "ALTER DATABASE CURRENT REMOVE FILE {};",
+                ident(&name)
+            )),
+            82,
+            None,
+        );
+    }
+    properties(conn, &mut result).await?;
+    permissions(
+        conn,
+        &mut result,
+        sandbox.filter(|name| principals.contains(*name)),
+    )
+    .await?;
+    Ok(result)
+}
+
+async fn properties(
+    conn: &mut impl QueryConnection,
+    result: &mut Inventory,
+) -> Result<(), DbError> {
+    for row in rows(
+        conn,
+        "extended_properties",
+        "SELECT e.class,e.name,e.minor_id,SCHEMA_NAME(o.schema_id) AS schema_name,o.name AS \
+         object_name, COL_NAME(e.major_id,e.minor_id) AS column_name,SCHEMA_NAME(e.major_id) \
+         AS property_schema FROM sys.extended_properties e LEFT JOIN sys.objects o ON \
+         e.class=1 AND o.object_id=e.major_id;",
+    )
+    .await?
+    {
+        let name = text(&row, "name")?;
+        let class = row
+            .try_get::<u8>("class")?
+            .ok_or_else(|| DbError::BadRow("an extended property has no class".into()))?;
+        let suffix = match class {
+            0 => Some(String::new()),
+            1 => {
+                let schema = text(&row, "schema_name")?;
+                let object = text(&row, "object_name")?;
+                // sp_dropextendedproperty requires the object's actual kind;
+                // SQL Server accepts TABLE for its table properties only.
+                let kind = rows(
+                    conn,
+                    "objects",
+                    &format!(
+                        "SELECT type FROM sys.objects WHERE object_id=OBJECT_ID({});",
+                        literal(&format!("{}.{}", ident(&schema), ident(&object)))
+                    ),
+                )
+                .await?;
+                let kind = kind
+                    .first()
+                    .map(|row| text(row, "type"))
+                    .transpose()?
+                    .unwrap_or_default();
+                let level = match kind.trim() {
+                    "U" => Some("TABLE"),
+                    "V" => Some("VIEW"),
+                    "P" => Some("PROCEDURE"),
+                    "FN" | "IF" | "TF" => Some("FUNCTION"),
+                    "SO" => Some("SEQUENCE"),
+                    _ => None,
+                };
+                let column = row
+                    .try_get::<&str>("column_name")?
+                    .map(|column| format!(",@level2type=N'COLUMN',@level2name={}", literal(column)))
+                    .unwrap_or_default();
+                level.map(|kind| {
+                    format!(
+                        ",@level0type=N'SCHEMA',@level0name={},\
+                         @level1type=N'{kind}',@level1name={}{}",
+                        literal(&schema),
+                        literal(&object),
+                        column
+                    )
+                })
+            }
+            3 => Some(format!(
+                ",@level0type=N'SCHEMA',@level0name={}",
+                literal(&text(&row, "property_schema")?)
+            )),
+            _ => None,
+        };
+        result.add(
+            format!("extended property class {class} {name}"),
+            suffix.map(|suffix| {
+                format!(
+                    "EXEC sys.sp_dropextendedproperty @name={}{suffix};",
+                    literal(&name)
+                )
+            }),
+            0,
+            None,
+        );
+    }
+    Ok(())
+}
+
+async fn permissions(
+    conn: &mut impl QueryConnection,
+    result: &mut Inventory,
+    sandbox: Option<&str>,
+) -> Result<(), DbError> {
+    let mut database = BTreeSet::new();
+    let mut expected = database_grants();
+    if let Some(sandbox) = sandbox {
+        // CREATE USER supplies CONNECT automatically. This is run-owned
+        // setup, like its db_owner membership, and vanishes with the user.
+        expected.insert(format!("{sandbox}|dbo|CONNECT|GRANT"));
+    }
+    for row in rows(
+        conn,
+        "database_permissions",
+        "SELECT p.class,p.class_desc,p.permission_name,p.state_desc,\
+         USER_NAME(p.grantee_principal_id) AS grantee, USER_NAME(p.grantor_principal_id) AS \
+         grantor,OBJECT_SCHEMA_NAME(p.major_id) AS schema_name, OBJECT_NAME(p.major_id) AS \
+         object_name,COL_NAME(p.major_id,p.minor_id) AS column_name, SCHEMA_NAME(p.major_id) \
+         AS on_schema,USER_NAME(p.major_id) AS on_principal, CONVERT(int,\
+         OBJECTPROPERTYEX(p.major_id,N'IsMSShipped')) AS shipped, CONVERT(int,\
+         OBJECTPROPERTYEX(p.major_id,N'IsView')) AS is_view FROM sys.database_permissions p;",
+    )
+    .await?
+    {
+        let permission = text(&row, "permission_name")?;
+        let grantee = text(&row, "grantee")?;
+        let grantor = text(&row, "grantor")?;
+        let state = text(&row, "state_desc")?;
+        let class = row
+            .try_get::<u8>("class")?
+            .ok_or_else(|| DbError::BadRow("a permission has no class".into()))?;
+        if class == 1
+            && permission == "SELECT"
+            && row.try_get::<i32>("shipped")? == Some(1)
+            && row.try_get::<i32>("is_view")? == Some(1)
+        {
+            // Measured: these SELECTs do not participate in creation, cannot
+            // be schema-bound, and the sandbox can change them itself.
+            continue;
+        }
+        let key = format!("{grantee}|{grantor}|{permission}|{state}");
+        if class == 0 {
+            database.insert(key.clone());
+            if expected.contains(&key) {
+                continue;
+            }
+        }
+        let on = match class {
+            0 => Some(String::new()),
+            1 => {
+                let schema = text(&row, "schema_name")?;
+                let object = text(&row, "object_name")?;
+                Some(format!(
+                    " ON OBJECT::{}.{}{}",
+                    ident(&schema),
+                    ident(&object),
+                    row.try_get::<&str>("column_name")?
+                        .map(|column| format!(" ({})", ident(column)))
+                        .unwrap_or_default()
+                ))
+            }
+            3 => Some(format!(" ON SCHEMA::{}", ident(&text(&row, "on_schema")?))),
+            // Other permissions vanish with their securable or principal;
+            // retaining an unknown one refuses rather than guessing its SQL.
+            _ => None,
+        };
+        result.add(
+            format!("permission {} {key}", text(&row, "class_desc")?),
+            on.map(|on| {
+                format!(
+                    "REVOKE {permission}{on} FROM {} CASCADE AS {};",
+                    ident(&grantee),
+                    ident(&grantor)
+                )
+            }),
+            5,
+            None,
+        );
+    }
+    for missing in expected.difference(&database) {
+        let fields: Vec<_> = missing.split('|').collect();
+        result.add(
+            format!("missing permission {missing}"),
+            Some(format!("GRANT {} TO {};", fields[2], ident(fields[0]))),
+            5,
+            None,
+        );
+    }
+    Ok(())
+}
+
+pub async fn cleanup(
+    conn: &mut impl ExecuteConnection,
+    sandbox: Option<&str>,
+) -> Result<(), Vec<String>> {
+    let guard = sandbox.map(|sandbox| {
+        format!(
+            "IF USER_NAME() IS NULL OR USER_NAME() COLLATE Latin1_General_BIN2 <> {} COLLATE \
+             Latin1_General_BIN2 THROW 51000, 'scratch cleanup must execute as the sandbox', \
+             1;",
+            literal(sandbox)
+        )
+    });
+    if let Some(guard) = &guard {
+        conn.execute(guard)
+            .await
+            .map_err(|error| vec![error.to_string()])?;
+    }
+    let mut inventory = read(conn, sandbox)
+        .await
+        .map_err(|error| vec![error.to_string()])?;
+    let mut failed = Vec::new();
+    while !inventory.entries.is_empty() {
+        let position = inventory
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                entry.key.is_none_or(|key| {
+                    !inventory
+                        .dependencies
+                        .iter()
+                        .any(|(dependent, dependency)| {
+                            *dependency == key
+                                && inventory
+                                    .entries
+                                    .iter()
+                                    .any(|other| other.key == Some(*dependent))
+                        })
+                })
+            })
+            .min_by_key(|(_, entry)| entry.rank)
+            .map(|(position, _)| position);
+        let Some(position) = position else {
+            failed.extend(inventory.names());
+            break;
+        };
+        let entry = inventory.entries.remove(position);
+        match entry.drop {
+            Some(sql) => {
+                // A database DDL trigger is user code too. Every cleanup
+                // statement keeps the irreversible sandbox context; only
+                // dropping the sandbox itself may use the fresh account.
+                let sql = guard
+                    .as_ref()
+                    .map(|guard| format!("{guard} EXEC({});", literal(&sql)))
+                    .unwrap_or(sql);
+                if let Err(error) = conn.execute(&sql).await {
+                    failed.push(format!("{} ({error})", entry.name));
+                }
+            }
+            None => failed.push(format!("{}: no cleanup rule", entry.name)),
+        }
+    }
+    match read(conn, sandbox).await {
+        Ok(after) => failed.extend(after.names()),
+        Err(error) => failed.push(error.to_string()),
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed)
+    }
+}
+
+/// Called on a newly bound supplied-account session only after sandboxed
+/// cleanup has removed every other object, including database DDL triggers.
+pub async fn drop_sandbox(
+    conn: &mut impl ExecuteConnection,
+    sandbox: &str,
+) -> Result<(), Vec<String>> {
+    let before = read(conn, Some(sandbox))
+        .await
+        .map_err(|error| vec![error.to_string()])?;
+    if !before.is_empty() {
+        return Err(before.names());
+    }
+    conn.execute(&format!(
+        "IF USER_ID({0}) IS NOT NULL BEGIN IF IS_ROLEMEMBER(N'db_owner',{0})=1 ALTER ROLE \
+         db_owner DROP MEMBER {1}; DROP USER {1}; END;",
+        literal(sandbox),
+        ident(sandbox)
+    ))
+    .await
+    .map_err(|error| vec![format!("sandbox {sandbox} ({error})")])?;
+    let after = read(conn, None)
+        .await
+        .map_err(|error| vec![error.to_string()])?;
+    if after.is_empty() {
+        Ok(())
+    } else {
+        Err(after.names())
+    }
+}

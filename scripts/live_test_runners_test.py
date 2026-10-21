@@ -30,6 +30,60 @@ def job_commands(workflow, job):
 
 
 class LiveExecution(unittest.TestCase):
+    def test_resolver_fixtures_inherit_the_primary_name_and_reuse_exact_matches(self):
+        for primary in (None, "pbps2236.fixture"):
+            for reuse in (False, True):
+                with self.subTest(primary=primary, reuse=reuse):
+                    name = primary or "pbps-test-mssql"
+                    scratch = name + "-scratch"
+                    existing = name if reuse else (
+                        name.replace(".", "X") if primary else name + "-unrelated")
+                    with tempfile.TemporaryDirectory(prefix="pbps-mssql-names-") as directory:
+                        root = Path(directory)
+                        fake = root / "client"
+                        fake.write_text(f"#!{sys.executable}\n" + r'''
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ["PBPS_FIXTURE_CONTROL"])
+command = [Path(sys.argv[0]).name, *sys.argv[1:]]
+with (root / "calls").open("a") as log:
+    log.write(json.dumps(command) + "\n")
+if command[:2] == ["docker", "ps"]:
+    print(os.environ["PBPS_FIXTURE_EXISTING"])
+elif command[:2] == ["docker", "exec"]:
+    if "SELECT CONVERT" in command[-1]:
+        print("SQL_Latin1_General_CP1_CI_AS")
+elif command[:2] != ["docker", "run"] and command[0] != "python3":
+    raise RuntimeError("Unexpected external command: " + repr(command))
+''')
+                        fake.chmod(0o755)
+                        for client in ("docker", "python3"):
+                            (root / client).symlink_to(fake)
+                        env = dict(os.environ,
+                                   PATH=str(root) + os.pathsep + os.environ["PATH"],
+                                   PBPS_FIXTURE_CONTROL=str(root),
+                                   PBPS_FIXTURE_EXISTING=existing)
+                        env.pop("NAME", None)
+                        if primary:
+                            env["NAME"] = primary
+                        # No fixtures or live suites run: only the sourced helper's
+                        # real control flow reaches the fake external clients.
+                        result = subprocess.run(
+                            ["bash", "-c", "source scripts/resolver-mssql-fixtures.sh"],
+                            cwd=ROOT, env=env, text=True, capture_output=True, timeout=10)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        calls = [json.loads(line) for line in
+                                 (root / "calls").read_text().splitlines()]
+                        starts = [c[c.index("--name") + 1] for c in calls
+                                  if c[:2] == ["docker", "run"]]
+                        expected = [scratch] if reuse else [name, scratch]
+                        self.assertEqual(starts, expected)
+                        self.assertEqual({c[2] for c in calls if c[:2] == ["docker", "exec"]},
+                                         {name, scratch})
+                        validators = [c[c.index("--container") + 1] for c in calls
+                                      if c[0] == "python3"]
+                        self.assertEqual(validators, [name, scratch])
+
     def test_custom_collation_must_finish_before_clients_start(self):
         for runner in ('compatibility', 'local', 'ci'):
             with self.subTest(runner=runner):
@@ -71,6 +125,8 @@ elif command[:2] == ['docker', 'run']:
     print('owned-fixture')
 elif command[:2] == ['docker', 'exec']:
     if 'express' not in command[2]:
+        if "SERVERPROPERTY('Collation')" in command[command.index('-Q') + 1]:
+            print('SQL_Latin1_General_CP1_CI_AS')
         sys.exit(0)
     state = root / 'probes'
     count = int(state.read_text()) + 1 if state.exists() else 1

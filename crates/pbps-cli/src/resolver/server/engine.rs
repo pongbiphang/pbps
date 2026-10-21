@@ -16,6 +16,7 @@ use pbps_db::{Conn, DbError, Driver};
 use pbps_model::Hints;
 use pbps_model::resolver::{InputManifest, OutsideWrites, SurfaceResolution};
 
+mod mssql;
 mod postgres;
 
 // These are logical planning records, not a raw engine capture or a verifier.
@@ -33,6 +34,7 @@ fn unsupported() -> Error {
 #[derive(Clone)]
 pub enum Standard {
     Postgres(pbps_pg::resolver::standard::Standard),
+    Mssql,
 }
 
 impl From<&pbps_pg::resolver::standard::Standard> for Standard {
@@ -49,9 +51,7 @@ impl From<&Standard> for Standard {
 
 pub(super) enum Scratch<'a> {
     Postgres(postgres::Scratch<'a>),
-}
-pub(super) enum Fill {
-    Postgres(pbps_pg::resolver::draft::Fill),
+    Mssql(mssql::Scratch<'a>),
 }
 pub(super) enum Prepared {
     Postgres(postgres::Prepared),
@@ -78,14 +78,17 @@ pub fn declared_standard(
 ) -> Result<Standard, Error> {
     match driver {
         Driver::Postgres => Ok(Standard::Postgres(postgres::declared_standard(declared))),
-        Driver::Mssql => Err(unsupported()),
+        Driver::Mssql if declared.is_none() => Ok(Standard::Mssql),
+        Driver::Mssql => Err(Error::Unusable(
+            "SQL Server scratch does not accept a PostgreSQL standard declaration".into(),
+        )),
     }
 }
 
 pub(super) async fn reset_role(driver: Driver, admin: &mut Conn) -> Result<(), ProduceError> {
     match driver {
         Driver::Postgres => postgres::reset_role(admin).await,
-        Driver::Mssql => Err(ProduceError::Run(unsupported())),
+        Driver::Mssql => Ok(()),
     }
 }
 
@@ -119,39 +122,41 @@ pub(super) async fn scratch<'a>(
             .await?;
             Ok((provisioning, Scratch::Postgres(scratch)))
         }
-        (Driver::Mssql, Standard::Postgres(_)) => Err(ProduceError::Run(unsupported())),
-    }
-}
-
-pub(super) async fn fill(
-    driver: Driver,
-    target: &mut Conn,
-    binding: &BindingRequest<'_>,
-    extras: &[String],
-) -> Result<Fill, Error> {
-    match driver {
-        Driver::Postgres => postgres::fill(target, binding, extras)
-            .await
-            .map(Fill::Postgres),
-        Driver::Mssql => Err(unsupported()),
+        (Driver::Mssql, Standard::Mssql) => {
+            let (provisioning, scratch) =
+                mssql::scratch(target, admin, tokens, planned_identity, scratch).await?;
+            Ok((provisioning, Scratch::Mssql(scratch)))
+        }
+        (Driver::Mssql, Standard::Postgres(_)) | (Driver::Postgres, Standard::Mssql) => {
+            Err(ProduceError::Run(Error::Unusable(
+                "scratch standard and engine disagree".into(),
+            )))
+        }
     }
 }
 
 impl Scratch<'_> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare(
         &mut self,
         provisioning: Provisioning,
         admin: &mut Conn,
+        target_connection: &mut Conn,
         target: &CatalogFacts,
         authorization: &scope::Authorization,
         schemas: &[String],
-        fill: &Fill,
+        binding: &BindingRequest<'_>,
+        extras: &[String],
     ) -> Result<Prepared, Error> {
-        match (self, fill) {
-            (Self::Postgres(scratch), Fill::Postgres(fill)) => scratch
-                .prepare(provisioning, admin, target, authorization, schemas, fill)
-                .await
-                .map(Prepared::Postgres),
+        match self {
+            Self::Postgres(scratch) => {
+                let fill = postgres::fill(target_connection, binding, extras).await?;
+                scratch
+                    .prepare(provisioning, admin, target, authorization, schemas, &fill)
+                    .await
+                    .map(Prepared::Postgres)
+            }
+            Self::Mssql(scratch) => match scratch.prepare(provisioning, admin, target).await? {},
         }
     }
 
@@ -163,6 +168,7 @@ impl Scratch<'_> {
         dependencies: &pbps_model::ModuleDeps,
     ) -> Result<Binding, Error> {
         match self {
+            Self::Mssql(_) => Err(unsupported()),
             Self::Postgres(scratch) => scratch
                 .reconstruction(target, binding, ids, dependencies)
                 .await
@@ -179,6 +185,7 @@ impl Scratch<'_> {
         binding: &Binding,
     ) -> Result<Staged, Error> {
         match (self, prepared, binding) {
+            (Self::Mssql(_), Prepared::Postgres(_), Binding::Postgres(_)) => Err(unsupported()),
             (Self::Postgres(scratch), Prepared::Postgres(prepared), Binding::Postgres(binding)) => {
                 scratch
                     .compare_externals(provisioning, prepared, admin, target, binding)
@@ -195,12 +202,14 @@ impl Scratch<'_> {
     ) -> Result<(), Error> {
         match self {
             Self::Postgres(scratch) => scratch.restore_settings(admin, authorization).await,
+            Self::Mssql(_) => Err(unsupported()),
         }
     }
 
     pub(super) async fn release(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
         match self {
             Self::Postgres(scratch) => scratch.release(admin).await,
+            Self::Mssql(scratch) => scratch.release(admin).await,
         }
     }
 }
@@ -416,7 +425,7 @@ impl CompiledCapture {
 pub(super) async fn target_identity(driver: Driver, target: &mut Conn) -> Result<String, DbError> {
     match driver {
         Driver::Postgres => postgres::target_identity(target).await,
-        Driver::Mssql => Err(DbError::BadRow(NO_BINDING_ADAPTER.into())),
+        Driver::Mssql => pbps_mssql::resolver::scratch::cluster_identity(target).await,
     }
 }
 
@@ -438,7 +447,10 @@ pub(super) fn ordinary(
 ) -> Result<pbps_model::ChangeSet, Error> {
     match driver {
         Driver::Postgres => postgres::ordinary(base, desired, hints, extras),
-        Driver::Mssql => Err(unsupported()),
+        Driver::Mssql => pbps_diff::resolver::ordinary(base, desired, &pbps_mssql::Mssql, hints)
+            .map_err(|errors| {
+                Error::Binding(format!("ordinary typed plan cannot be formed: {errors:?}"))
+            }),
     }
 }
 
@@ -533,7 +545,18 @@ pub(super) fn docker(driver: Driver, password: &str) -> Result<Docker, ProduceEr
             port: 5432,
             readiness_query: "SELECT 1 AS ok",
         }),
-        Driver::Mssql => Err(ProduceError::Run(unsupported())),
+        Driver::Mssql => Ok(Docker {
+            driver,
+            environment: vec![
+                "ACCEPT_EULA=Y".into(),
+                format!(
+                    "MSSQL_SA_PASSWORD={}",
+                    pbps_mssql::resolver::scratch::password(password)
+                ),
+            ],
+            port: 1433,
+            readiness_query: "SELECT 1 AS ok",
+        }),
     }
 }
 
@@ -544,7 +567,11 @@ impl Docker {
                 "host=127.0.0.1 port={port} user=postgres password={password} dbname=postgres \
                  sslmode=disable"
             )),
-            Driver::Mssql => Err(ProduceError::Run(unsupported())),
+            Driver::Mssql => Ok(format!(
+                "Server=127.0.0.1,{port};Database=master;User \
+                 Id=sa;Password={};TrustServerCertificate=true",
+                pbps_mssql::resolver::scratch::password(password)
+            )),
         }
     }
 }

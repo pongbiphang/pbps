@@ -8,6 +8,7 @@ pub mod authorization;
 pub mod capture;
 pub mod compatibility;
 pub mod environment;
+pub mod scratch;
 
 use pbps_db::resolver::environment::DatabaseRecipe;
 use pbps_db::resolver::{Candidate, Discovery, Observation, ScratchNames};
@@ -160,6 +161,85 @@ pub fn scratch_database_ddl(
         ));
     }
     Ok(statements)
+}
+
+/// Records are owned by the CLI before this starts: a failure after LOGIN
+/// creation still needs both objects released (DEC-2236.1).
+pub async fn create_scratch(
+    conn: &mut impl pbps_db::transport::ExecuteConnection,
+    names: &ScratchNames,
+    recipe: &DatabaseRecipe,
+) -> Result<(), DbError> {
+    conn.execute(&format!(
+        "CREATE LOGIN [{}] WITH PASSWORD=N'{}', CHECK_POLICY=ON;",
+        names.login(),
+        scratch::password(names.password())
+    ))
+    .await?;
+    for statement in scratch_database_ddl(names, recipe)? {
+        conn.execute(&statement).await?;
+    }
+    // The loginless sandbox, rather than this login, executes SQL Server
+    // setup. Keep the database with its creator: unlike PostgreSQL's login
+    // connection, no ownership transfer is needed. Measured with exactly
+    // ALTER ANY LOGIN + CREATE ANY DATABASE, such a transfer adds an
+    // IMPERSONATE requirement and fails with 15151 (DEC-2236.1).
+    Ok(())
+}
+
+pub async fn drop_scratch(
+    conn: &mut impl pbps_db::transport::ExecuteConnection,
+    names: &ScratchNames,
+) -> Result<(), DbError> {
+    scratch::use_database(conn, "master").await?;
+    let database = conn
+        .execute(&format!(
+            "IF DB_ID(N'{0}') IS NOT NULL BEGIN ALTER DATABASE [{0}] SET SINGLE_USER WITH \
+             ROLLBACK IMMEDIATE; DROP DATABASE [{0}]; END;",
+            names.database()
+        ))
+        .await;
+    let login = conn
+        .execute(&format!(
+            "IF SUSER_ID(N'{0}') IS NOT NULL DROP LOGIN [{0}];",
+            names.login()
+        ))
+        .await;
+    database.and(login)
+}
+
+/// The reference is dropped immediately after reading, including on a failed
+/// read. A failed removal takes precedence and names the remaining resource.
+pub async fn fresh_reference(
+    conn: &mut impl pbps_db::transport::ExecuteConnection,
+    names: &ScratchNames,
+) -> Result<scratch::options::DatabaseOptions, DbError> {
+    let result = async {
+        conn.execute(&format!("CREATE DATABASE [{}];", names.database()))
+            .await?;
+        scratch::options::read(conn, names.database()).await
+    }
+    .await;
+    drop_reference(conn, names).await.map_err(|error| {
+        DbError::Refused(format!(
+            "reference database {} could not be released: {error}",
+            names.database()
+        ))
+    })?;
+    result
+}
+
+/// Idempotent so the CLI's recorded obligation can retry an interrupted
+/// reference release and retain its name alongside other cleanup failures.
+pub async fn drop_reference(
+    conn: &mut impl pbps_db::transport::ExecuteConnection,
+    names: &ScratchNames,
+) -> Result<(), DbError> {
+    conn.execute(&format!(
+        "IF DB_ID(N'{0}') IS NOT NULL DROP DATABASE [{0}];",
+        names.database()
+    ))
+    .await
 }
 
 const ENVIRONMENT: &str = "\

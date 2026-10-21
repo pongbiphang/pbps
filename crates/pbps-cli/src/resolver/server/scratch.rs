@@ -10,17 +10,19 @@
 //!
 //! - the scratch database is never the target's, read from the engines and
 //!   not from the two strings, which can spell one server two ways;
-//! - on the target's own cluster, the scratch account must be confined to
-//!   its database: no superuser, no `CREATEROLE`, no `CREATEDB`;
-//! - the database it compiles in holds nothing initdb did not create.
+//! - PostgreSQL keeps a confined account on the target's cluster; SQL Server
+//!   permits only supplied layout there and enters a loginless sandbox;
+//! - the database holds only the engine's own initial catalog inventory.
 //!
-//! The account decides how the run provisions scratch. A superuser on another
+//! The account decides how the run provisions scratch. On PostgreSQL a superuser on another
 //! cluster gets a run-owned login and database, the deployer's authorization reproduced, the
 //! declarations compiled as the reproduced deployer, all dropped afterwards.
 //! Any other account compiles as itself in the database its connection names,
 //! which it must own, and leaves it empty again with `DROP OWNED`. The scope
 //! is qualified under the compatibility rule that compares what each engine
 //! reports about itself.
+//! SQL Server records its run-owned resources before creation too, executes
+//! setup in a NO REVERT sandbox, and currently refuses at externals (#2237).
 
 use super::producer::{Identity, Opening, Sealing, Unsealed, request};
 use super::{BindingRequest, Error, ProduceError, ResolvedPlan, engine, resolution};
@@ -106,11 +108,6 @@ pub async fn produce_unsealed(
     externals: Option<&str>,
     provenance: &Provenance,
 ) -> Result<Unsealed, ProduceError> {
-    if driver != Driver::Postgres {
-        return Err(ProduceError::Run(Error::Binding(
-            "the resolver is implemented for PostgreSQL only".into(),
-        )));
-    }
     if binding.base != base.schema || binding.desired != desired.schema {
         return Err(ProduceError::Run(Error::Binding(
             "the binding request and recorded planning sides disagree".into(),
@@ -280,16 +277,17 @@ impl Run<'_> {
         let opening_catalog = target_catalog.clone();
         // What the externals file lacks is filled from the target (#1778,
         // DEC-1778.2); which of it the file holds is known once it has run.
-        let fill = engine::fill(driver, target, binding, &request.write_path_extras).await?;
         let mut prepared = self
             .state
             .prepare(
                 provisioning,
                 admin,
+                target,
                 &target_catalog,
                 &authorization,
                 &scope_schemas,
-                &fill,
+                binding,
+                &request.write_path_extras,
             )
             .await?;
         // The expected visibility is the deployer's after the plan's own
@@ -521,6 +519,9 @@ pub(super) mod fixtures;
 mod live_tests;
 
 #[cfg(test)]
+mod mssql_live_tests;
+
+#[cfg(test)]
 use super::engine::release_supplied;
 
 #[cfg(test)]
@@ -528,10 +529,9 @@ mod tests {
     use super::{BindingRequest, Driver, Error, ProduceError, Provenance, produce_unsealed};
     use pbps_model::{Hints, IdsFile, Schema};
 
-    /// The engine gate precedes request validation, key acquisition and both
-    /// connections. A lower-level caller gets the same refusal as before.
+    /// Both engines validate the binding sides and key before connecting.
     #[tokio::test]
-    async fn sql_server_target_refuses_before_binding_key_or_connections() {
+    async fn every_engine_validates_binding_sides_and_key_before_connections() {
         let schema = Schema::default();
         let mut different = Schema::default();
         different
@@ -581,13 +581,8 @@ mod tests {
                 Err(other) => panic!("not the first binding refusal: {other}"),
                 Ok(_) => panic!("a run without a key or connections"),
             };
-            assert_eq!(
-                run(Driver::Mssql).await,
-                "the resolver is implemented for PostgreSQL only"
-            );
-            // Negative: PostgreSQL passes the engine gate, then validates the
-            // sides before asking for the configured environment's key.
             let postgres = run(Driver::Postgres).await;
+            assert_eq!(run(Driver::Mssql).await, postgres);
             if disagrees {
                 assert_eq!(
                     postgres,
