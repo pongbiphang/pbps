@@ -2357,7 +2357,7 @@ fn a_new_table_generating_from_a_new_function_follows_its_create() {
 
 #[test]
 #[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-fn new_generated_expression_parts_apply_without_alteration_approvals_on_both_servers() {
+fn new_generated_expression_parts_keep_per_part_risks_on_both_servers() {
     for (k, server) in [old_server(), server()].iter().enumerate() {
         for case in ["partition", "later"] {
             check_safe_generated_creation(server, &format!("placeholder-risk-{k}-{case}"), case);
@@ -2367,7 +2367,7 @@ fn new_generated_expression_parts_apply_without_alteration_approvals_on_both_ser
 
 #[test]
 #[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
-fn split_generated_columns_and_validators_apply_without_alteration_approvals_on_both_servers() {
+fn split_generated_columns_and_validators_keep_per_part_risks_on_both_servers() {
     for (k, server) in [old_server(), server()].iter().enumerate() {
         for case in ["split", "split-rows"] {
             check_safe_generated_creation(server, &format!("split-risk-{k}-{case}"), case);
@@ -2445,8 +2445,14 @@ fn check_safe_generated_creation(server: &str, slug: &str, case: &str) {
     let script = std::fs::read_to_string(sql).unwrap();
     let saved: pbps_model::SavedPlan =
         serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
-    assert!(
-        saved.changes.gated_risks().is_empty(),
+    let expected = if seeded {
+        [pbps_model::RiskClass::Constraint].into()
+    } else {
+        Default::default()
+    };
+    assert_eq!(
+        saved.changes.gated_risks(),
+        expected,
         "{case}: {:?}",
         saved.changes
     );
@@ -2470,7 +2476,16 @@ fn check_safe_generated_creation(server: &str, slug: &str, case: &str) {
             );
         }
     }
-    succeeds(approved_apply(&d, connection, &plan, &[]));
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        if seeded {
+            &["--allow", "constraint"]
+        } else {
+            &[]
+        },
+    ));
     if seeded {
         assert_eq!(
             scalar(connection, "SELECT g::bigint FROM app.a WHERE id = 1"),

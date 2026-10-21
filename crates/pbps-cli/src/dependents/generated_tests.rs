@@ -8,6 +8,9 @@ use cases::shape;
 #[path = "generated_attachment_tests.rs"]
 mod attachments;
 
+#[path = "generated_part_risk_tests.rs"]
+mod part_risks;
+
 pub(crate) fn ordinary(
     schema: &Schema,
     ids: &IdsFile,

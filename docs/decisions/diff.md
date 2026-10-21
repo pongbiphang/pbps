@@ -7525,8 +7525,8 @@ Pinned by `generated_expression_installations_keep_their_creation_risks`,
 `generated_columns_and_validators_keep_their_creation_risks`,
 `preparing_generated_creation_parts_preserves_their_creation_risks`,
 `saved_creation_part_risks_require_a_preceding_create_of_the_same_table`,
-`new_generated_expression_parts_apply_without_alteration_approvals_on_both_servers`,
-`split_generated_columns_and_validators_apply_without_alteration_approvals_on_both_servers`,
+`new_generated_expression_parts_keep_per_part_risks_on_both_servers`,
+`split_generated_columns_and_validators_keep_per_part_risks_on_both_servers`,
 `a_standing_generated_expression_still_requires_narrowing_approval`, and
 `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.
 
@@ -7534,7 +7534,7 @@ Pinned by `generated_expression_installations_keep_their_creation_risks`,
 
 **DEC-1503.4. Every creation-part consumer uses the complete shape unless its
 reference is proven to resolve only the relation name; empty-table risks
-require every expression installation before every row write.** A prefix is
+require each receiving part before every row write.** A prefix is
 sufficient for a regclass name resolution, but not for a composite cast,
 array or row type use, column read, TABLE, or target-list-free INSERT.
 The dialect explicitly classifies these references. PostgreSQL reuses its
@@ -7563,19 +7563,29 @@ Creation-risk derivation resolves each row write and expression installation
 through PlanNames at that step, by table UID. If any installation follows an
 InsertRow, UpdateRow or DeleteRow into that identity, the family cannot claim
 empty-table context and retains intrinsic alteration risks, including
-narrowing. Another safe installation cannot certify the later one. Saved-plan
-validation calls the same derivation, so reordered or hand-built artifacts
+narrowing. Another safe installation cannot certify the later one. Each
+creation-eligible part must itself precede the owner's first classified row
+write: a safe installation cannot certify a later NOT NULL column, CHECK,
+key or index after rows or an attachment. The final resolver order re-derives
+the same risks before sealing its ordering proof and operation copies;
+ordinary planning derives them after settlement too. Scratch lowering only
+compiles SQL and grants no risk approval. Saved-plan validation calls the
+same derivation, so reordered or hand-built artifacts
 cannot suppress the approval with unsealed provenance or a preceding CREATE.
 
 Pinned by `only_proven_relation_name_literals_use_the_prefix`,
 `called_table_readers_require_full_shape_or_keep_the_named_hold`,
 `composite_consumers_and_views_wait_for_the_complete_table`,
 `creation_risks_require_all_installations_before_every_row_write`,
+`every_creation_risk_recipient_requires_its_own_empty_table_position`,
+`resolver_creation_risks_follow_the_settled_parts_and_seal_that_order`,
 `saved_creation_part_risks_require_a_preceding_create_of_the_same_table`, and
 the live `called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold`,
 `saved_rows_before_expression_installation_cannot_clear_narrowing`,
 `generated_table_parts_apply_with_the_declared_column_order_values_and_names`
 and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.
+The live `creation_parts_after_rows_keep_their_risks_on_both_servers` also
+measures late NOT NULL and CHECK parts on PostgreSQL 16 and 18.
 
 
 <a id="dec-1503-5"></a>

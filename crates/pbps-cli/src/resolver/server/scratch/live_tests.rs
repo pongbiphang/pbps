@@ -5794,9 +5794,9 @@ async fn resolver_generated_table_parts_seal_and_close_plain_exception_and_row_s
                 .with_resolution(plan.evidence)?;
                 let saved: pbps_model::SavedPlan =
                     serde_json::from_slice(&serde_json::to_vec(&saved)?)?;
-                // The unrelated consumer table's ordinary check retains its
-                // existing approval; the generated table's parts stay safe.
-                let expected = if case == "composite-check" {
+                // Validators after seed rows retain constraint approval;
+                // only parts before the first write finish an empty CREATE.
+                let expected = if case == "composite-check" || case == "rows" {
                     [pbps_model::RiskClass::Constraint].into()
                 } else {
                     Default::default()

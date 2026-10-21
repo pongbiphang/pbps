@@ -240,10 +240,9 @@ pub fn parts(
             .into_iter()
             .map(|change| {
                 let mut part = planned.clone();
-                // These finish CREATE on a new relation, before its seed
-                // rows. Reclassifying them as standing-table alterations
-                // would invent approvals that CREATE did not need
-                // (DEC-1503.3).
+                // The final typed order re-derives these provisional risks:
+                // only parts before the owner's first write finish an empty
+                // CREATE (DEC-1503.4). Lowering cannot certify a later position.
                 // CREATE builds its indexes transactionally on an empty
                 // relation. Splitting must not turn an inherited hint into
                 // concurrent DDL (SPEC 9.3.2).
@@ -374,7 +373,9 @@ pub fn risks(cs: &ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Vec<BTreeS
                 else {
                     return None;
                 };
-                if !installations.contains(owner) {
+                if !installations.contains(owner)
+                    || first_write.get(owner).is_some_and(|write| *write < at)
+                {
                     return None;
                 }
                 cs.changes[..at].iter().find_map(|p| {

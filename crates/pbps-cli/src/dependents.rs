@@ -1570,8 +1570,9 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
 /// `AlterColumnDefault` needs its uid.
 ///
 /// A new generated table's typed column parts are expanded first, retaining
-/// declaration order (DEC-1503.1). Its columns and validators finish CREATE
-/// with its creation risks (DEC-1503.3). Other added checks keep the existing
+/// declaration order (DEC-1503.1). Its parts finish CREATE with creation risks
+/// only before the first row write in the final order (DEC-1503.4).
+/// Other added checks keep the existing
 /// constraint approval, where the approver sees a separately added step.
 /// Unsplittable generations retain their whole-table hold when the connected
 /// capability cannot install an expression on the complete column shape.

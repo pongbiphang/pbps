@@ -5252,6 +5252,26 @@ fn preparing_generated_creation_parts_preserves_their_creation_risks() {
         "{:?}",
         prepared.changes
     );
+    let mut late = ordinary.clone();
+    let column = late.changes.remove(1);
+    late.changes.push(PlannedChange::new(Change::InsertRow {
+        table: name.clone(),
+        key_column: "id".into(),
+        identity_key: false,
+        key: "1".into(),
+        row: Default::default(),
+        defaults: Default::default(),
+        types: Default::default(),
+    }));
+    late.changes.push(column);
+    let prepared_late = prepare(&late);
+    assert!(
+        prepared_late.changes.changes.iter().any(|p| {
+            matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "z")
+                && p.risks.contains(&pbps_model::RiskClass::NotNull)
+        }),
+        "a lowering cannot borrow the earlier installation's empty context"
+    );
     let mut standing = prepared.changes;
     standing
         .changes
