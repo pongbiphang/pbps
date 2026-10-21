@@ -2988,7 +2988,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         Change::CreatePolicy { table, name, policy, .. } => {
             let targets = match &policy.to {
                 pbps_model::PolicyRoles::Public => "PUBLIC".to_owned(),
-                pbps_model::PolicyRoles::Roles(roles) => roles.iter().map(|r| quote(r)).collect::<Result<Vec<_>, _>>()?.join(", "),
+                pbps_model::PolicyRoles::Roles(roles) => roles.iter().map(|r| quote(r.raw())).collect::<Result<Vec<_>, _>>()?.join(", "),
             };
             let mut sql = format!("CREATE POLICY {} ON {} AS {} FOR {} TO {}",
                 quote(name)?, qualified(table)?, if policy.restrictive { "RESTRICTIVE" } else { "PERMISSIVE" },

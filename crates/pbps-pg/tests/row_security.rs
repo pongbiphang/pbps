@@ -160,13 +160,23 @@ fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags
         table: table.clone(),
         name: "a\"b".into(),
         policy: RowPolicy {
-            to: PolicyRoles::Roles(["PUBLIC".into(), "app_user".into()].into()),
+            to: PolicyRoles::Roles(
+                [
+                    "PUBLIC".into(),
+                    "app_user".into(),
+                    "role\"\n\u{202e}".into(),
+                ]
+                .into(),
+            ),
             using: Some("id>0".into()),
             ..Default::default()
         },
         origin: RowSecurityOrigin::Created,
     });
-    assert!(sql.contains("TO \"PUBLIC\", \"app_user\""), "{sql}");
+    assert!(
+        sql.contains("TO \"PUBLIC\", \"app_user\", \"role\"\"\n\u{202e}\""),
+        "{sql}"
+    );
     assert!(
         sql.contains("USING (id>0\n)") && !sql.contains("WITH CHECK"),
         "{sql}"

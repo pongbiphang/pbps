@@ -2679,7 +2679,7 @@ async fn refuse_missing_policy_roles(conn: &mut Conn, changes: &ChangeSet) -> an
         .collect();
     let recipients = policies
         .iter()
-        .flat_map(|(_, _, roles)| roles.iter().map(String::as_str))
+        .flat_map(|(_, _, roles)| roles.iter())
         .collect();
     let missing: BTreeSet<_> = pbps_pg::roles::missing_roles(conn, &recipients)
         .await?
@@ -2693,7 +2693,7 @@ async fn refuse_missing_policy_roles(conn: &mut Conn, changes: &ChangeSet) -> an
                     "policy `{}` on {} names missing cluster role `{}`; create it first, then plan again",
                     pbps_model::escape::Escaped(policy),
                     table.shown(),
-                    pbps_model::escape::Escaped(role)
+                    role.shown()
                 )
             })
         })
