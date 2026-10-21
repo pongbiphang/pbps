@@ -113,6 +113,7 @@ fn role_artifacts_keep_master_bytes_checksums_sql_and_declarations() {
             .map(|(name, role)| pbps_load::fmt::render_role(name, role, &pending))
             .collect::<Vec<_>>()
             .join("\n---\n");
+        // Historical fixture paths use `/` on every host.
         let files = schema
             .roles
             .keys()
@@ -121,9 +122,10 @@ fn role_artifacts_keep_master_bytes_checksums_sql_and_declarations() {
                     .unwrap()
                     .strip_prefix("schema")
                     .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_owned()
+                    .components()
+                    .map(|part| part.as_os_str().to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("/")
             })
             .collect::<Vec<_>>()
             .join("\n");
