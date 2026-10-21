@@ -106,6 +106,10 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                 )));
                 vec![&r.name.schema, &r.name.name]
             }
+            GrantTarget::Sequence(c) => {
+                errs.push(invalid(format!("role `{}`: `{}` is a serial sequence target, which SQL Server does not support", name.shown(), target.shown())));
+                vec![&c.table.schema, &c.table.name, c.name.raw()]
+            }
             GrantTarget::Schema(s) => vec![s],
         };
         for part in parts {
@@ -2847,6 +2851,38 @@ mod tests {
             assert!(super::has_permission(p), "{p:?}");
         }
         assert!(errors("schema::dbo", &super::PERMISSIONS).is_empty());
+    }
+
+    #[test]
+    fn serial_sequence_targets_are_refused_by_name_even_for_shared_permission_words() {
+        let errors = |target: &str, permissions: &[pbps_model::Permission]| {
+            let role = Role {
+                grants: [(
+                    target.parse().unwrap(),
+                    permissions.iter().copied().collect(),
+                )]
+                .into(),
+                ..Default::default()
+            };
+            super::role(&"reader".into(), &role, &Schema::default())
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        for permission in [
+            pbps_model::Permission::Usage,
+            pbps_model::Permission::Select,
+            pbps_model::Permission::Update,
+        ] {
+            let found = errors("sequence::dbo.customer.id", &[permission]);
+            assert!(
+                found
+                    .iter()
+                    .any(|e| e.contains("sequence::dbo.customer.id") && e.contains("SQL Server")),
+                "{found:?}"
+            );
+        }
+        assert!(errors("dbo.customer", &[pbps_model::Permission::Select]).is_empty());
     }
 
     #[test]

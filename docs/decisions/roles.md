@@ -1062,9 +1062,10 @@ permission, serialized as `serial-sequences`. It is appended to the model's
 permission order but excluded from its declarable words: YAML cannot spell
 it. Only PostgreSQL derives it on current and historical declarations.
 Live reads instead require the role's plain INSERT and plain USAGE on
-every serial-owned sequence in a non-empty set. Other sequence privileges,
-partial sets and USAGE without INSERT remain reported limitations. Grant
-options, PUBLIC, the owner/default ACL zero point and grantor-specific
+every serial-owned sequence in a non-empty set. Other serial-owned sequence
+privileges and USAGE without INSERT are explicit column targets
+(DEC-2199.1); partial USAGE sets beside INSERT and grants on other sequences
+remain reported limitations. Grant options, PUBLIC, the owner/default ACL zero point and grantor-specific
 revocability retain their existing meaning. Pull and documentation omit the
 marker; the ledger retains the access read back from the database.
 
@@ -1081,10 +1082,56 @@ change kind or sort class. Only declared roles receive this access. That
 re-grant is a second logical change beside the column's, so such a plan is
 not one `--staged` admits (DEC-1950.1).
 
-This covers INSERT, not `UPDATE ... SET col = DEFAULT`; calling `nextval`
-without INSERT requires explicit sequence grants, tracked by #2199. The
-first plan after upgrade proposes the missing grants where both the older
+This implication covers INSERT. Explicit sequence grants for
+`UPDATE ... SET col = DEFAULT`, `nextval` without INSERT, monitoring and
+`setval` are specified in DEC-2199.1. The first plan after upgrade proposes the missing grants where both the older
 record and the live database lack USAGE. Where USAGE was already granted
 by hand, the live read carries the marker while an older recorded state
 lacks it: that difference is drift, resolved through the ordinary baseline
 path, never by inventing access in an old record.
+
+<a id="dec-2199-1"></a>
+
+**DEC-2199.1. Explicit PostgreSQL sequence grants name the serial column,
+not its sequence's physical name.** Measured on PostgreSQL 16 and 18 with
+schema USAGE and no table privileges: sequence USAGE (`U` in the ACL) permits
+`nextval` and `currval` but not reading `last_value`; SELECT (`r`) permits
+reading `last_value` but not `nextval`; UPDATE (`w`) permits `setval` and
+`nextval`. INSERT alone does not serve these independent access needs.
+
+A role spells `sequence::app.orders.id: [usage]`, naming a declared serial
+column with `ValueSource::Sequence`. Only usage, select and update apply.
+Missing, plain and identity columns are refused by name; SQL Server refuses
+the target by name. Grant and Revoke resolve the owned sequence at execution
+time with `pg_catalog.pg_get_serial_sequence`, so generated, truncated and
+custom names work without guessing. Like DEC-1892.1, the block runs on the
+empty search path with no unqualified operator (DEC-1564.1).
+
+Explicit access and INSERT-implied USAGE are a union of actual privileges.
+Comparisons expand the table marker to column USAGE; only privileges absent
+from both sources are revoked. The compact marker still grants implied USAGE,
+while narrowing is per column so retained explicit access is never revoked.
+Pull retains the marker for the complete INSERT implication and writes only
+non-implied USAGE and all SELECT and UPDATE on accepted serials. Partial
+USAGE sets beside INSERT retain their limitation: declaring INSERT would
+imply the missing access. Privileges on other sequences remain limitations.
+Grant options, PUBLIC, the owner/default-ACL zero point and grantor-specific
+revocability retain their existing rules. Revocability is recorded against
+the exact sequence column even when USAGE folds into a table marker.
+
+Targets follow table and column UIDs through renames, as table targets do.
+A recreated sequence receives its explicit grants again, including a re-added
+column and a none-to-serial conversion. Existing Grant/Revoke ordering puts
+those grants after table creation, column addition and numbering conversion;
+no Change kind, sort class or reordering pass is added. The apply guard
+compares the same effective union and still refuses missing or unplanned ACLs.
+
+Tests: model target/JSON round trips and named validation for every permission
+and invalid column kind; loader/formatter positive and negative round trips;
+PostgreSQL and SQL Server validation and emit guards; pull's explicit/implicit
+split, unsupported ACLs and grantor-specific revocability; diff union,
+renames and sequence recreation ordering; apply read-back refusal cases;
+doctor sequence authority and documentation rendering. The CLI live flow on
+16 and 18 exercises independent USAGE, SELECT and UPDATE, custom sequence
+names, both union transitions, creation and conversion, table/column renames,
+empty subsequent plans, clean verify, pull and a standalone-sequence limitation.

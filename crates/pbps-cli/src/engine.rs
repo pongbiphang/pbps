@@ -1691,13 +1691,32 @@ pub fn owned_targets(
         // An owner neither the plan nor the read supplies is an object this
         // read did not cover. Absent, not empty — and not something this
         // check can refuse on.
-        let owner = if created.contains(target) {
+        let sequence_created = if let pbps_model::GrantTarget::Sequence(c) = target {
+            created.contains(&pbps_model::GrantTarget::Object(c.table.clone()))
+                || changes.changes.iter().any(|p| {
+                    if let pbps_model::Change::AddColumn { table, name, .. } = &p.change {
+                        return table == &c.table && name == &c.name;
+                    }
+                    if let pbps_model::Change::AlterColumnNumbering {
+                        column, from, to, ..
+                    } = &p.change
+                    {
+                        return column == c
+                            && !matches!(from, pbps_model::ValueSource::Sequence(_))
+                            && matches!(to, pbps_model::ValueSource::Sequence(_));
+                    }
+                    false
+                })
+        } else {
+            false
+        };
+        let owner = if created.contains(target) || sequence_created {
             (!session_role.raw().is_empty()).then_some(session_role)
         } else {
             owners.get(&stored_grant_target(&names, target))
         };
         if owner == Some(role) {
-            let when = if created.contains(target) {
+            let when = if created.contains(target) || sequence_created {
                 format!(
                     "role `{role}` will own `{target}`, because this plan creates it and \
                          the role that runs the statements owns what they create (measured)",
@@ -1820,6 +1839,11 @@ fn stored_grant_target(
     names: &pbps_model::plan_names::PlanNames<'_>,
     target: &pbps_model::GrantTarget,
 ) -> pbps_model::GrantTarget {
+    if let pbps_model::GrantTarget::Sequence(column) = target
+        && let Some(stored) = names.stored_column(column, pbps_model::plan_names::At::End)
+    {
+        return pbps_model::GrantTarget::Sequence(stored);
+    }
     if let pbps_model::GrantTarget::Object(table) = target
         && let Some(stored) = names.stored(table, pbps_model::plan_names::At::End)
     {
@@ -5206,6 +5230,32 @@ mod plan_name_tests {
             changes.changes[4].change,
             Change::AlterColumnExpression { .. }
         ));
+    }
+
+    #[test]
+    fn sequence_revocability_evidence_follows_both_table_and_column_renames() {
+        let (mut changes, ids) = crate::plan_fixture::chain();
+        changes.changes.push(PlannedChange::new(Change::Revoke {
+            role: "writer".into(),
+            target: "sequence::app.final_table.final_column".parse().unwrap(),
+            permissions: [Permission::Usage].into(),
+        }));
+        let mut found = pbps_db::catalog::Unrevocable {
+            role: "writer".into(),
+            target: "sequence::app.original_table.original_column"
+                .parse()
+                .unwrap(),
+            permission: Permission::Usage,
+            why: "the exact sequence grantor cannot be selected".into(),
+        };
+        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found.clone()]).is_err());
+        found.target = "sequence::app.original_table.other".parse().unwrap();
+        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found.clone()]).is_ok());
+        found.target = "sequence::app.original_table.original_column"
+            .parse()
+            .unwrap();
+        found.permission = Permission::Select;
+        assert!(unrevocable_grants(Driver::Postgres, &changes, &ids, &[found]).is_ok());
     }
 
     #[test]

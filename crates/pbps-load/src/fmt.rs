@@ -3186,4 +3186,36 @@ mod strategy_tests {
             .collect::<Vec<_>>()
             .join("\n")
     }
+    #[test]
+    fn serial_sequence_targets_parse_and_format_without_losing_permissions() {
+        let path = Path::new("reader.yml");
+        let yaml = "role: reader\ngrants:\n  sequence::app.orders.id: [usage, select, update]\n";
+        let loaded = crate::load_role_str(path, yaml).unwrap();
+        let out = render_role(&loaded.name, &loaded.role, &[]);
+        assert!(
+            out.contains("\"sequence::app.orders.id\": [select, update, usage]"),
+            "{out}"
+        );
+        assert_eq!(crate::load_role_str(path, &out).unwrap().role, loaded.role);
+        for target in ["sequence::app.orders", "sequence::app..id", "sequence::"] {
+            assert!(
+                crate::load_role_str(path, &yaml.replace("sequence::app.orders.id", target))
+                    .is_err()
+            );
+        }
+        assert!(
+            crate::load_role_str(
+                path,
+                &yaml.replace("usage, select, update", "serial-sequences")
+            )
+            .is_err()
+        );
+        assert!(
+            crate::load_role_str(
+                path,
+                "role: r\ngrants:\n  sequence::app.t.id: [usage]\n  SEQUENCE::app.t.id: [select]\n"
+            )
+            .is_err()
+        );
+    }
 }

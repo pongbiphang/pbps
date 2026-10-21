@@ -2689,8 +2689,200 @@ fn a_new_column_calling_a_function_that_reads_it_is_refused_by_name() {
     }
 }
 
+/// Explicit serial sequence privileges converge on both supported servers,
+/// including union transitions, new sequences, renames and non-serial limits.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn explicit_serial_sequence_grants_preserve_the_union_and_round_trip_on_both_servers() {
+    struct Roles(String, Vec<String>);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            for role in &self.1 {
+                let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {role}"));
+            }
+        }
+    }
+    for (version, server) in [
+        (16, std::env::var("PBPS_TEST_PG_OLD_DB").unwrap()),
+        (18, server()),
+    ] {
+        let roles = Roles(
+            server.clone(),
+            ["usage", "select", "update", "insert"]
+                .map(|kind| format!("pbps_seq2199_{kind}_{version}_{}", std::process::id()))
+                .into(),
+        );
+        for role in &roles.1 {
+            on_server(&server, &format!("CREATE ROLE {role} NOSUPERUSER"));
+        }
+        let own = OwnDatabase::new(&server, "sequence-grants2199");
+        let conn = own.connection();
+        assert_eq!(
+            scalar(
+                conn,
+                "SELECT current_setting('server_version_num')::bigint / 10000"
+            ),
+            version
+        );
+        on_server(conn, "CREATE SCHEMA app");
+        let d = Demo::new("sequence-grants2199");
+        let table = "table: app.t\ncolumns:\n  id: {type: serial, sequence: {name: custom2199}}\n  payload: {type: integer, nullable: false, default: 7}\nprimary_key: {name: t_pkey, columns: [id]}\n";
+        d.table(table);
+        let write_role = |i: usize, grants: &str| {
+            std::fs::write(
+                d.dir.join(format!("schema/role{i}.yml")),
+                format!(
+                    "role: {}\ngrants:\n  schema::app: [usage]\n{grants}",
+                    roles.1[i]
+                ),
+            )
+            .unwrap();
+        };
+        for (i, word) in ["usage", "select", "update"].iter().enumerate() {
+            write_role(i, &format!("  sequence::app.t.id: [{word}]\n"));
+        }
+        write_role(3, "  app.t: [insert]\n");
+        succeeds(d.run(&["validate"]));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["baseline", "--db", conn, "--reason", "empty database"]));
+        let plan = d.dir.join("plan.json");
+        let deploy = |extra: &[&str]| {
+            succeeds(d.run(&["plan"]));
+            if plan.exists() {
+                d.commit();
+            }
+            succeeds(d.run(&["plan", "--db", conn, "--out", plan.to_str().unwrap()]));
+            succeeds(approved_apply(&d, conn, &plan, extra));
+            succeeds(d.run(&["verify", "--db", conn]));
+            let out = succeeds(d.run(&["plan", "--db", conn]));
+            assert!(stdout(&out).contains("No changes"), "{}", stdout(&out));
+        };
+        deploy(&[]);
+        let as_role = |i: usize, sql: &str| {
+            try_on_server(conn, &format!("SET ROLE {}; {sql}; RESET ROLE", roles.1[i]))
+        };
+        as_role(0, "SELECT nextval('app.custom2199')").unwrap();
+        assert!(
+            as_role(0, "INSERT INTO app.t DEFAULT VALUES")
+                .unwrap_err()
+                .contains("permission denied")
+        );
+        assert!(as_role(0, "SELECT last_value FROM app.custom2199").is_err());
+        as_role(1, "SELECT last_value FROM app.custom2199").unwrap();
+        assert!(as_role(1, "SELECT nextval('app.custom2199')").is_err());
+        as_role(2, "SELECT setval('app.custom2199', 20)").unwrap();
+        as_role(2, "SELECT nextval('app.custom2199')").unwrap();
+        as_role(3, "INSERT INTO app.t DEFAULT VALUES").unwrap();
+
+        let pulled = Demo::new("sequence-grants2199-pull");
+        let output = succeeds(pulled.run(&["pull", "--db", conn]));
+        assert!(
+            !stderr(&output).contains("on sequence"),
+            "{}",
+            stderr(&output)
+        );
+        for (i, word) in ["usage", "select", "update", "insert"].iter().enumerate() {
+            let written = std::fs::read_to_string(
+                pulled.dir.join(format!("schema/roles/{}.yml", roles.1[i])),
+            )
+            .unwrap();
+            assert!(written.contains(word), "{written}");
+            assert_eq!(written.contains("sequence::app.t.id"), i != 3, "{written}");
+            assert!(!written.contains("serial-sequences"), "{written}");
+        }
+        succeeds(pulled.run(&["validate"]));
+
+        // INSERT takes over USAGE without revoking the existing ACL entry.
+        write_role(0, "  app.t: [insert]\n  sequence::app.t.id: [usage]\n");
+        deploy(&[]);
+        write_role(0, "  app.t: [insert]\n");
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let unchanged = succeeds(d.run(&["plan", "--db", conn]));
+        assert!(
+            stdout(&unchanged).contains("No changes"),
+            "{}",
+            stdout(&unchanged)
+        );
+        as_role(0, "SELECT nextval('app.custom2199')").unwrap();
+        // Explicit USAGE takes over while INSERT is removed.
+        write_role(0, "  sequence::app.t.id: [usage]\n");
+        deploy(&["--allow", "revoke"]);
+        as_role(0, "SELECT nextval('app.custom2199')").unwrap();
+        assert!(as_role(0, "INSERT INTO app.t DEFAULT VALUES").is_err());
+
+        // Grants follow sequence creation for both an added serial column and
+        // a plain column converted to serial in this same plan.
+        let extended = table.replace(
+            "  payload: {type: integer, nullable: false, default: 7}",
+            "  payload: {type: serial}\n  added: {type: serial}",
+        );
+        d.table(&extended);
+        write_role(
+            0,
+            "  sequence::app.t.id: [usage]\n  sequence::app.t.added: [usage]\n  sequence::app.t.payload: [usage]\n",
+        );
+        deploy(&["--allow", "numbering"]);
+        as_role(
+            0,
+            "SELECT nextval(pg_catalog.pg_get_serial_sequence('app.t', 'added'))",
+        )
+        .unwrap();
+        as_role(
+            0,
+            "SELECT nextval(pg_catalog.pg_get_serial_sequence('app.t', 'payload'))",
+        )
+        .unwrap();
+        as_role(3, "INSERT INTO app.t DEFAULT VALUES").unwrap();
+
+        // Existing table/column identity rules also carry the sequence grants.
+        let renamed = extended
+            .replace("table: app.t", "table: app.moved\nrenamed_from: app.t")
+            .replace(
+                "  id: {type: serial, sequence: {name: custom2199}}",
+                "  renamed: {type: serial, sequence: {name: custom2199}, renamed_from: id}",
+            )
+            .replace("columns: [id]", "columns: [renamed]");
+        d.table(&renamed);
+        for i in 0..4 {
+            let path = d.dir.join(format!("schema/role{i}.yml"));
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                path,
+                text.replace("app.t.id", "app.moved.renamed")
+                    .replace("app.t", "app.moved"),
+            )
+            .unwrap();
+        }
+        deploy(&["--allow", "rename"]);
+        as_role(0, "SELECT nextval('app.custom2199')").unwrap();
+        as_role(3, "INSERT INTO app.moved DEFAULT VALUES").unwrap();
+
+        write_role(0, "");
+        deploy(&["--allow", "revoke"]);
+        assert!(as_role(0, "SELECT nextval('app.custom2199')").is_err());
+        // Sequences outside a declared serial's ownership remain limitations.
+        on_server(
+            conn,
+            &format!(
+                "CREATE SEQUENCE app.standalone2199; GRANT USAGE ON SEQUENCE app.standalone2199 TO {}",
+                roles.1[0]
+            ),
+        );
+        let limited = Demo::new("sequence-grants2199-standalone");
+        let output = succeeds(limited.run(&["pull", "--db", conn]));
+        assert!(
+            stderr(&output).contains("USAGE on sequence")
+                && stderr(&output).contains("standalone2199"),
+            "{}",
+            stderr(&output)
+        );
+    }
+}
+
 /// INSERT carries its serial sequences' USAGE through apply and through a
-/// later column addition, without making explicit sequence access declarable.
+/// later column addition, while pull omits its implied sequence access.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn declared_insert_grants_serial_usage_and_keeps_it_on_new_sequences() {
@@ -2753,9 +2945,15 @@ fn declared_insert_grants_serial_usage_and_keeps_it_on_new_sequences() {
     );
     let beyond = succeeds(pulled.run(&["pull", "--db", connection, "--force"]));
     assert!(
-        stderr(&beyond).contains("SELECT on sequence"),
+        !stderr(&beyond).contains("SELECT on sequence"),
         "{}",
         stderr(&beyond)
+    );
+    let explicit =
+        std::fs::read_to_string(pulled.dir.join(format!("schema/roles/{}.yml", role.1))).unwrap();
+    assert!(
+        explicit.contains("\"sequence::app.t.id\": [select]"),
+        "{explicit}"
     );
     on_server(
         connection,
@@ -28736,7 +28934,8 @@ fn trap_operators(schema: &str) -> String {
 /// plan with its probes, an apply that drops a key the declaration never
 /// named, deletes a declared row a child could still reference, and updates
 /// and deletes rows by a `varchar` key, grants a declared INSERT's serial
-/// sequence USAGE (#1892), and `doctor` all run without springing one. On 16 and 18. Before, the apply's key lookup compared
+/// sequence USAGE (#1892) and explicit SELECT (#2199), and `doctor` all run
+/// without springing one. On 16 and 18. Before, the apply's key lookup compared
 /// `conrelid` with a `regclass` on `app`'s path and the trap there refused
 /// the plan, and a row write's `"k" = E'a'` called the `varchar` trap.
 #[test]
@@ -28821,7 +29020,7 @@ fn pbps_sql_calls_no_operator_a_schema_user_could_add() {
         write("v", &format!("{coded}    a: {{n: 5}}\n"));
         std::fs::write(
             d.dir.join(format!("schema/{writer}.yml")),
-            format!("role: {writer}\ngrants:\n  schema::app: [usage]\n  app.s: [insert]\n"),
+            format!("role: {writer}\ngrants:\n  schema::app: [usage]\n  app.s: [insert]\n  sequence::app.s.id: [select]\n"),
         )
         .unwrap();
         write(

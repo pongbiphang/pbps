@@ -157,10 +157,21 @@ mod tests {
         );
         schema
             .roles
+            .get_mut("retail_reporter")
+            .unwrap()
+            .grants
+            .insert(
+                "sequence::public.customer.id".parse().unwrap(),
+                [Permission::Usage].into(),
+            );
+        schema
+            .roles
             .insert("pending_access".into(), Role::default());
         for format in [Format::Markdown, Format::Html] {
             let out = render(&schema, &IdsFile::default(), format, "Schema");
             for expected in [
+                "sequence::public.customer.id",
+                "usage",
                 "Roles",
                 "retail_reporter",
                 "Read-only retail reporting",

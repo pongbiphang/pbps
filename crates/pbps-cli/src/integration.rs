@@ -853,6 +853,28 @@ mod tests {
     }
 
     #[test]
+    fn sequence_grants_use_the_published_schemas_existing_target_key_shape() {
+        let document = schema(SchemaKind::Declaration);
+        let validator = jsonschema::validator_for(&document).unwrap();
+        for (permissions, valid) in [
+            (serde_json::json!(["usage"]), true),
+            (serde_json::json!(["select", "update"]), true),
+            (serde_json::json!(["serial-sequences"]), false),
+            (serde_json::json!(["unknown"]), false),
+            (serde_json::json!("usage"), false),
+        ] {
+            let value = serde_json::json!({"role": "reader", "grants": {"sequence::app.orders.id": permissions}});
+            assert_eq!(validator.is_valid(&value), valid, "{value}");
+            let yaml = serde_json::to_string(&value).unwrap();
+            assert_eq!(
+                pbps_load::load_role_str(std::path::Path::new("reader.yml"), &yaml).is_ok(),
+                valid,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn row_security_declaration_schema_and_loader_agree() {
         let validator = jsonschema::validator_for(&schema(SchemaKind::Declaration)).unwrap();
         for (policy, valid) in [

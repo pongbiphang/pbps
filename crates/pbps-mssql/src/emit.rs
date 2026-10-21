@@ -1540,6 +1540,15 @@ fn securable(target: &GrantTarget) -> Result<String, DialectError> {
                 ),
             });
         }
+        GrantTarget::Sequence(_) => {
+            return Err(DialectError::Invalid {
+                dialect: DIALECT,
+                message: format!(
+                    "`{}` is a serial sequence target, which SQL Server does not support",
+                    target.shown()
+                ),
+            });
+        }
         GrantTarget::Schema(s) => format!("SCHEMA::{}", quote(s)?),
     })
 }
@@ -2273,6 +2282,43 @@ fn preserve_default_during_retype(
 mod tests {
     use super::*;
     use pbps_model::{CheckConstraint, ColumnRef, ColumnType, Identity, IndexColumn, Uid};
+
+    #[test]
+    fn serial_sequence_statements_are_refused_instead_of_granting_on_the_table() {
+        for revoke in [false, true] {
+            let target = "sequence::dbo.t.id".parse().unwrap();
+            let permissions = [Permission::Select].into();
+            let change = if revoke {
+                Change::Revoke {
+                    role: "r".into(),
+                    target,
+                    permissions,
+                }
+            } else {
+                Change::Grant {
+                    role: "r".into(),
+                    target,
+                    permissions,
+                }
+            };
+            let error = emit(&change, Strategy::default()).unwrap_err().to_string();
+            assert!(
+                error.contains("sequence::dbo.t.id") && error.contains("SQL Server"),
+                "{error}"
+            );
+        }
+        assert!(
+            emit(
+                &Change::Grant {
+                    role: "r".into(),
+                    target: "dbo.t".parse().unwrap(),
+                    permissions: [Permission::Select].into()
+                },
+                Strategy::default()
+            )
+            .is_ok()
+        );
+    }
 
     fn ty(s: &str) -> ColumnType {
         s.parse().unwrap()

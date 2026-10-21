@@ -1645,6 +1645,7 @@ async fn future_grant_candidates(
             .filter_map(|t| match t {
                 pbps_model::GrantTarget::Object(o) => Some(o.clone()),
                 pbps_model::GrantTarget::Routine(r) => Some(r.name.clone()),
+                pbps_model::GrantTarget::Sequence(c) => Some(c.table.clone()),
                 pbps_model::GrantTarget::Schema(_) => None,
             }),
     );
@@ -2334,6 +2335,9 @@ pub async fn permissions(
                     // (ADR-0009 §1).
                     pbps_model::GrantTarget::Routine(r) => {
                         objects.insert(r.name.clone());
+                    }
+                    pbps_model::GrantTarget::Sequence(c) => {
+                        objects.insert(c.table.clone());
                     }
                     pbps_model::GrantTarget::Schema(s) => {
                         schemas_wanted.insert(s.clone());

@@ -890,7 +890,7 @@ fn build<'v, 'p: 'v>(
                 // creates it. A routine target does not reach an apply on this
                 // engine at all — `validate::role` refuses it — and probing
                 // for it would be a probe for something no plan can hold.
-                pbps_model::GrantTarget::Object(_) | pbps_model::GrantTarget::Routine(_) => {
+                pbps_model::GrantTarget::Object(_) | pbps_model::GrantTarget::Routine(_) | pbps_model::GrantTarget::Sequence(_) => {
                     Ok(Vec::new())
                 }
             }

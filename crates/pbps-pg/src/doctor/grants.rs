@@ -49,11 +49,33 @@ pub(super) async fn missing(
     // grants must still be asked about under it.
     let mut future = std::collections::BTreeMap::<_, BTreeSet<_>>::new();
     for (target, permissions) in &granted.permissions {
-        let target = if let GrantTarget::Object(name) = target {
+        let sequence = if let GrantTarget::Sequence(c) = target {
+            Some(c)
+        } else {
+            None
+        };
+        let table = match target {
+            GrantTarget::Object(name) => Some(name),
+            GrantTarget::Sequence(c) => Some(&c.table),
+            GrantTarget::Schema(_) | GrantTarget::Routine(_) => None,
+        };
+        let target = if let Some(name) = table {
             match identities.table(name) {
                 Table::Recorded(current) => {
-                    recorded_targets.insert(GrantTarget::Object(current.clone()));
-                    GrantTarget::Object(current)
+                    let target = if let Some(c) = sequence {
+                        let Some(column) = identities.column(name, &current, &c.name) else {
+                            future
+                                .entry(target.clone())
+                                .or_default()
+                                .extend(permissions.iter().copied());
+                            continue;
+                        };
+                        GrantTarget::Sequence(current.column(column))
+                    } else {
+                        GrantTarget::Object(current)
+                    };
+                    recorded_targets.insert(target.clone());
+                    target
                 }
                 // The old occupant belongs to another identity. The new
                 // table's creator retains grant options even after revoking
@@ -97,7 +119,10 @@ pub(super) async fn missing(
                 // established, exactly as for a declared recorded target
                 // (#568). An exact routine overload the same: `REVOKE ... ON
                 // FUNCTION` fails on a missing one just as on a table.
-                if matches!(target, GrantTarget::Object(_) | GrantTarget::Routine(_)) {
+                if matches!(
+                    target,
+                    GrantTarget::Object(_) | GrantTarget::Routine(_) | GrantTarget::Sequence(_)
+                ) {
                     recorded_targets.insert(target.clone());
                 }
                 demands.entry(target).or_default().extend(permissions);
@@ -241,6 +266,7 @@ fn add_gap(
     if !flag(row, "usage_ok")? {
         let schema = match securable {
             Securable::Object(o) | Securable::Routine(o, _) => o.schema,
+            Securable::Sequence(c) => c.table.schema,
             Securable::Schema(_) => return Ok(()),
         };
         let gap = Gap {
@@ -264,6 +290,7 @@ fn manages(
 ) -> bool {
     match securable {
         Securable::Schema(_) => true,
+        Securable::Sequence(c) => tables.contains(&c.table),
         Securable::Object(o) => {
             tables.contains(o)
                 || modules.iter().any(|id| {
@@ -280,6 +307,16 @@ fn manages(
 
 fn question(target: &GrantTarget, right: Permission) -> (Securable, String, Vec<Param<'_>>) {
     match target {
+        GrantTarget::Sequence(c) => (
+            Securable::Sequence(c.clone()),
+            "SELECT COALESCE(pg_catalog.has_sequence_privilege(
+                        pg_catalog.pg_get_serial_sequence(pg_catalog.format('%I.%I', n.nspname, t.relname), $3), $4), true) AS held,
+                    pg_catalog.has_schema_privilege(n.oid, 'USAGE') AS usage_ok
+               FROM pg_catalog.pg_class t
+               JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
+              WHERE n.nspname = $1 AND t.relname = $2 AND t.relkind IN ('r', 'p')".to_owned(),
+            vec![Param::Str(&c.table.schema), Param::Str(&c.table.name), Param::Str(c.name.raw())],
+        ),
         GrantTarget::Schema(schema) => (
             Securable::Schema(schema.clone()),
             "SELECT n.oid IS NOT NULL AS present,
@@ -414,6 +451,27 @@ fn catalog_question(values: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_sequence_authority_uses_the_column_and_each_requested_privilege() {
+        let target = "sequence::app.t.id".parse().unwrap();
+        for right in [Permission::Usage, Permission::Select, Permission::Update] {
+            let (securable, sql, params) = question(&target, right);
+            assert_eq!(securable, Securable::Sequence("app.t.id".parse().unwrap()));
+            assert_eq!(params.len(), 3);
+            assert!(
+                sql.contains("pg_catalog.pg_get_serial_sequence")
+                    && sql.contains("has_sequence_privilege")
+            );
+            assert!(!sql.contains("has_table_privilege"));
+            assert!(manages(
+                &securable,
+                &[ObjectName::new("app", "t")].into(),
+                &BTreeSet::new()
+            ));
+            assert!(!manages(&securable, &BTreeSet::new(), &BTreeSet::new()));
+        }
+    }
 
     #[test]
     fn serial_grant_authority_is_asked_of_owned_sequences_and_not_the_table() {

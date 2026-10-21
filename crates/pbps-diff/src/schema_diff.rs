@@ -6253,29 +6253,60 @@ fn diff_roles(
     let manages_roles = dialect.manages_roles();
     // The table marker can stay equal while its set of sequences grows. Its
     // statement discovers that set after the column changes (DEC-1892.1).
-    let serial_creates: BTreeSet<TableName> = changes
+    let sequence_creates: BTreeSet<_> = changes
         .iter()
-        .filter_map(|change| {
-            let is_serial = |source: &ValueSource| matches!(source, ValueSource::Sequence(_));
-            if let Change::AddColumn { table, column, .. } = change {
-                return is_serial(&column.value_source).then(|| table.clone());
+        .flat_map(|change| {
+            if let Change::AddColumn {
+                table,
+                name,
+                column,
+                ..
+            } = change
+            {
+                return matches!(column.value_source, ValueSource::Sequence(_))
+                    .then(|| table.column(name))
+                    .into_iter()
+                    .collect::<Vec<_>>();
             }
             if let Change::AlterColumnNumbering {
                 column, from, to, ..
             } = change
             {
-                return (is_serial(to) && !is_serial(from)).then(|| column.table.clone());
+                return (matches!(to, ValueSource::Sequence(_))
+                    && !matches!(from, ValueSource::Sequence(_)))
+                .then(|| column.clone())
+                .into_iter()
+                .collect();
             }
             if let Change::CreateTable { name, table, .. } = change {
                 return table
                     .columns
-                    .values()
-                    .any(|c| is_serial(&c.value_source))
-                    .then(|| name.clone());
+                    .iter()
+                    .filter(|(_, c)| matches!(c.value_source, ValueSource::Sequence(_)))
+                    .map(|(column, _)| name.column(column))
+                    .collect();
             }
-            None
+            Vec::new()
         })
         .collect();
+    let serial_creates: BTreeSet<_> = sequence_creates
+        .iter()
+        .map(|column| &column.table)
+        .collect();
+    let effective = |role: &pbps_model::Role, schema: &Schema| {
+        let mut grants = pbps_model::role::effective_grants(role, &schema.tables);
+        // Keep the compact marker as the existing Grant statement. Individual
+        // column USAGE entries below are the union used for comparisons.
+        for (target, rights) in &role.grants {
+            if rights.contains(&Permission::SerialSequences) {
+                grants
+                    .entry(target.clone())
+                    .or_default()
+                    .insert(Permission::SerialSequences);
+            }
+        }
+        grants
+    };
     let mut dropped: Vec<pbps_model::Dropped> = changes.iter().filter_map(Change::drops).collect();
     // `Change::drops` answers `None` for `AlterModule` — the object is
     // restated, not removed, and every other reader of it wants exactly that
@@ -6316,8 +6347,22 @@ fn diff_roles(
         .map(|(uid, name)| (name, uid))
         .collect();
     let dropped_with_its_table = |target: &GrantTarget| -> bool {
-        matches!(target, GrantTarget::Object(o)
-            if base_uid.get(o).is_some_and(|uid| !declared.ids.tables.contains_key(*uid)))
+        match target {
+            GrantTarget::Object(o) => base_uid
+                .get(o)
+                .is_some_and(|uid| !declared.ids.tables.contains_key(*uid)),
+            GrantTarget::Sequence(c) => base
+                .ids
+                .columns
+                .iter()
+                .any(|(uid, from)| from == c && !declared.ids.columns.contains_key(uid)),
+            GrantTarget::Routine(_) | GrantTarget::Schema(_) => false,
+        }
+    };
+    let changing_hands_target = |target: &GrantTarget| match target {
+        GrantTarget::Object(table) => changing_hands.contains(table),
+        GrantTarget::Sequence(column) => changing_hands.contains(&column.table),
+        GrantTarget::Routine(_) | GrantTarget::Schema(_) => false,
     };
     let forward = |target: &GrantTarget| -> GrantTarget {
         match target {
@@ -6328,6 +6373,20 @@ fn diff_roles(
             // A routine's identity moves with its name, so a rename of the
             // object carries the signature with it unchanged: only tables are
             // renamed by uid here, and a routine is not a table.
+            GrantTarget::Sequence(column) => {
+                let final_column = base
+                    .ids
+                    .columns
+                    .iter()
+                    .find(|(_, c)| *c == column)
+                    .and_then(|(uid, _)| declared.ids.columns.get(uid))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let table = renamed.get(&column.table).copied().unwrap_or(&column.table);
+                        table.column(&column.name)
+                    });
+                GrantTarget::Sequence(final_column)
+            }
             GrantTarget::Routine(_) | GrantTarget::Schema(_) => target.clone(),
         }
     };
@@ -6357,7 +6416,8 @@ fn diff_roles(
         let Some(held) = base.schema.roles.get(name) else {
             continue;
         };
-        for (target, permissions) in &held.grants {
+        for (target, permissions) in &pbps_model::role::effective_grants(held, &base.schema.tables)
+        {
             if dropped_with_its_table(target) {
                 continue;
             }
@@ -6365,8 +6425,8 @@ fn diff_roles(
             // A `REVOKE` on an object this same plan drops would fail on an
             // object that is gone — the same rule the per-target comparison
             // below applies, and for the same reason.
-            let target_dropped = dropped.iter().any(|d| d.takes(&target))
-                && !matches!(&target, GrantTarget::Object(o) if changing_hands.contains(o));
+            let target_dropped =
+                dropped.iter().any(|d| d.takes(&target)) && !changing_hands_target(&target);
             if permissions.is_empty() || target_dropped {
                 continue;
             }
@@ -6433,7 +6493,7 @@ fn diff_roles(
         // The base grants, keyed by the name the target has after this plan.
         let mut before: BTreeMap<GrantTarget, BTreeSet<Permission>> = BTreeMap::new();
         if let Some(b) = base.schema.roles.get(base_name) {
-            for (target, permissions) in &b.grants {
+            for (target, permissions) in &effective(b, base.schema) {
                 if dropped_with_its_table(target) {
                     continue;
                 }
@@ -6443,12 +6503,13 @@ fn diff_roles(
                     .extend(permissions.iter().copied());
             }
         }
-        let targets: BTreeSet<&GrantTarget> = before.keys().chain(role.grants.keys()).collect();
+        let desired = effective(role, declared.schema);
+        let targets: BTreeSet<&GrantTarget> = before.keys().chain(desired.keys()).collect();
         for target in targets {
             // By whole identity: where routines overload, the drop of one
             // takes its own grants and leaves the sibling's to be compared.
-            let target_dropped = dropped.iter().any(|d| d.takes(target))
-                && !matches!(target, GrantTarget::Object(o) if changing_hands.contains(o));
+            let target_dropped =
+                dropped.iter().any(|d| d.takes(target)) && !changing_hands_target(target);
             // A DROP takes the object's permissions with it. An object this
             // plan drops and creates again under the same name — a table
             // replaced by a new one, a module changing kind — therefore has
@@ -6461,14 +6522,30 @@ fn diff_roles(
             } else {
                 before.get(target).cloned().unwrap_or_default()
             };
-            let d = role.grants.get(target).cloned().unwrap_or_default();
+            let d = desired.get(target).cloned().unwrap_or_default();
             let mut added: BTreeSet<Permission> = d.difference(&b).copied().collect();
             if d.contains(&Permission::SerialSequences)
                 && matches!(target, GrantTarget::Object(table) if serial_creates.contains(table))
             {
                 added.insert(Permission::SerialSequences);
             }
-            let removed: BTreeSet<Permission> = b.difference(&d).copied().collect();
+            if let GrantTarget::Sequence(column) = target {
+                if sequence_creates.contains(column) {
+                    added.extend(d.iter().copied());
+                }
+                if role
+                    .grants
+                    .get(&GrantTarget::Object(column.table.clone()))
+                    .is_some_and(|rights| rights.contains(&Permission::SerialSequences))
+                {
+                    // The table marker grants this same ACL entry once.
+                    added.remove(&Permission::Usage);
+                }
+            }
+            let mut removed: BTreeSet<Permission> = b.difference(&d).copied().collect();
+            // A marker's narrowing is settled per column: retained explicit
+            // USAGE must never be revoked by a table-wide statement.
+            removed.remove(&Permission::SerialSequences);
             if !added.is_empty() {
                 changes.push(Change::Grant {
                     role: name.clone(),
@@ -21341,6 +21418,312 @@ mod tests {
             }
         }
 
+        fn serial_side(grants: &[(&str, &[Permission])]) -> (Schema, IdsFile) {
+            let mut s = side(&[("r_aaaaaa", "writer", role(grants))]);
+            s.0.tables
+                .get_mut(&"dbo.customer".parse().unwrap())
+                .unwrap()
+                .columns["id"]
+                .value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+            s
+        }
+
+        #[test]
+        fn sequence_usage_is_revoked_only_after_both_sources_are_removed() {
+            use Permission::{Insert, SerialSequences, Usage};
+            let cases = [
+                (
+                    vec![
+                        ("dbo.customer", vec![Insert, SerialSequences]),
+                        ("sequence::dbo.customer.id", vec![Usage]),
+                    ],
+                    vec![("dbo.customer", vec![Insert, SerialSequences])],
+                    false,
+                ),
+                (
+                    vec![("dbo.customer", vec![Insert, SerialSequences])],
+                    vec![("sequence::dbo.customer.id", vec![Usage])],
+                    false,
+                ),
+                (
+                    vec![("sequence::dbo.customer.id", vec![Usage])],
+                    vec![("dbo.customer", vec![Insert, SerialSequences])],
+                    false,
+                ),
+                (
+                    vec![("sequence::dbo.customer.id", vec![Usage])],
+                    vec![],
+                    true,
+                ),
+                (
+                    vec![("dbo.customer", vec![Insert, SerialSequences])],
+                    vec![],
+                    true,
+                ),
+            ];
+            for (before, after, revoked) in cases {
+                fn as_refs<'a>(
+                    v: &'a [(&'a str, Vec<Permission>)],
+                ) -> Vec<(&'a str, &'a [Permission])> {
+                    v.iter().map(|(t, p)| (*t, p.as_slice())).collect()
+                }
+                let base = serial_side(&as_refs(&before));
+                let declared = serial_side(&as_refs(&after));
+                let mut changes = Vec::new();
+                diff_roles(
+                    Side {
+                        schema: &base.0,
+                        ids: &base.1,
+                    },
+                    Side {
+                        schema: &declared.0,
+                        ids: &declared.1,
+                    },
+                    &ClusterRoles,
+                    &mut changes,
+                );
+                assert_eq!(changes.iter().any(|c| matches!(c, Change::Revoke { target: GrantTarget::Sequence(_), permissions, .. } if permissions.contains(&Usage))), revoked, "{before:?} -> {after:?}: {changes:?}");
+                assert!(!changes.iter().any(|c| matches!(c, Change::Revoke { permissions, .. } if permissions.contains(&SerialSequences))));
+            }
+        }
+
+        #[test]
+        fn sequence_grants_follow_table_and_column_identity_without_permission_changes() {
+            let base = serial_side(&[(
+                "sequence::dbo.customer.id",
+                &[Permission::Usage, Permission::Select],
+            )]);
+            let mut declared = base.clone();
+            let mut table = declared
+                .0
+                .tables
+                .remove(&"dbo.customer".parse().unwrap())
+                .unwrap();
+            let column = table.columns.shift_remove("id").unwrap();
+            table.columns.insert("renamed".into(), column);
+            declared
+                .0
+                .tables
+                .insert("dbo.moved".parse().unwrap(), table);
+            *declared.1.tables.values_mut().next().unwrap() = "dbo.moved".parse().unwrap();
+            *declared.1.columns.values_mut().next().unwrap() = "dbo.moved.renamed".parse().unwrap();
+            declared.0.roles.insert(
+                "writer".into(),
+                role(&[(
+                    "sequence::dbo.moved.renamed",
+                    &[Permission::Usage, Permission::Select],
+                )]),
+            );
+            let mut changes = Vec::new();
+            diff_roles(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &mut changes,
+            );
+            assert!(changes.is_empty(), "{changes:?}");
+            declared.0.roles.get_mut("writer").unwrap().grants.clear();
+            diff_roles(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &mut changes,
+            );
+            assert!(
+                matches!(&changes[0], Change::Revoke { target, .. } if *target == "sequence::dbo.moved.renamed".parse().unwrap())
+            );
+        }
+
+        #[test]
+        fn sequence_grants_follow_the_surviving_table_into_a_retired_tables_name() {
+            let mut base = serial_side(&[("sequence::dbo.incoming.id", &[Permission::Usage])]);
+            let column_table = base.0.tables[&"dbo.customer".parse().unwrap()].clone();
+            base.0
+                .tables
+                .insert("dbo.incoming".parse().unwrap(), column_table);
+            base.1
+                .tables
+                .insert("t_bbbbbb".parse().unwrap(), "dbo.incoming".parse().unwrap());
+            base.1.columns.insert(
+                "c_bbbbbb".parse().unwrap(),
+                "dbo.incoming.id".parse().unwrap(),
+            );
+            let mut declared = serial_side(&[("sequence::dbo.customer.id", &[Permission::Usage])]);
+            declared.1.tables.clear();
+            declared
+                .1
+                .tables
+                .insert("t_bbbbbb".parse().unwrap(), "dbo.customer".parse().unwrap());
+            declared.1.columns.clear();
+            declared.1.columns.insert(
+                "c_bbbbbb".parse().unwrap(),
+                "dbo.customer.id".parse().unwrap(),
+            );
+            for removed_role in [false, true] {
+                let mut declared = declared.clone();
+                if removed_role {
+                    declared.0.roles.clear();
+                    declared.1.roles.clear();
+                }
+                let mut changes = vec![
+                    Change::DropTable {
+                        uid: "t_aaaaaa".parse().unwrap(),
+                        name: "dbo.customer".parse().unwrap(),
+                        detach_from: None,
+                    },
+                    Change::RenameTable {
+                        uid: "t_bbbbbb".parse().unwrap(),
+                        from: "dbo.incoming".parse().unwrap(),
+                        to: "dbo.customer".parse().unwrap(),
+                        defaults: Vec::new(),
+                    },
+                ];
+                diff_roles(
+                    Side {
+                        schema: &base.0,
+                        ids: &base.1,
+                    },
+                    Side {
+                        schema: &declared.0,
+                        ids: &declared.1,
+                    },
+                    &ClusterRoles,
+                    &mut changes,
+                );
+                assert_eq!(
+                    changes.len(),
+                    if removed_role { 3 } else { 2 },
+                    "{changes:?}"
+                );
+                if removed_role {
+                    assert!(
+                        matches!(changes.last().unwrap(), Change::Revoke { target, permissions, .. } if *target == "sequence::dbo.customer.id".parse().unwrap() && *permissions == [Permission::Usage].into())
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn sequence_grants_follow_column_creation_and_are_reapplied_after_recreation() {
+            let desired = serial_side(&[(
+                "sequence::dbo.customer.id",
+                &[Permission::Usage, Permission::Select, Permission::Update],
+            )]);
+            for shape in ["new table", "add", "convert", "readd", "unchanged"] {
+                let mut base = desired.clone();
+                if shape == "new table" {
+                    base.0.tables.clear();
+                    base.1.tables.clear();
+                    base.1.columns.clear();
+                    base.0.roles.clear();
+                    base.1.roles.clear();
+                } else if shape == "add" {
+                    base.0
+                        .tables
+                        .get_mut(&"dbo.customer".parse().unwrap())
+                        .unwrap()
+                        .columns
+                        .clear();
+                    base.1.columns.clear();
+                    base.0.roles.get_mut("writer").unwrap().grants.clear();
+                } else if shape == "convert" {
+                    base.0
+                        .tables
+                        .get_mut(&"dbo.customer".parse().unwrap())
+                        .unwrap()
+                        .columns["id"]
+                        .value_source = ValueSource::None;
+                    base.0.roles.get_mut("writer").unwrap().grants.clear();
+                }
+                let mut declared = desired.clone();
+                if shape == "readd" {
+                    declared.1.columns.clear();
+                    declared.1.columns.insert(
+                        "c_bbbbbb".parse().unwrap(),
+                        "dbo.customer.id".parse().unwrap(),
+                    );
+                }
+                // The ordinary ordering engine sees the same Grant target; no
+                // sequence-specific sort class or pass participates.
+                let changes = diff(
+                    Side {
+                        schema: &base.0,
+                        ids: &base.1,
+                    },
+                    Side {
+                        schema: &declared.0,
+                        ids: &declared.1,
+                    },
+                    &ClusterRoles,
+                    &Hints::default(),
+                )
+                .unwrap();
+                let grant = changes.changes.iter().position(|p| {
+                    matches!(
+                        p.change,
+                        Change::Grant {
+                            target: GrantTarget::Sequence(_),
+                            ..
+                        }
+                    )
+                });
+                if shape == "unchanged" {
+                    assert!(grant.is_none());
+                    continue;
+                }
+                let grant = grant.expect(shape);
+                assert!(grant > 0, "{shape}: {changes:?}");
+                assert!(
+                    changes.changes[..grant].iter().any(|p| matches!(
+                        p.change,
+                        Change::CreateTable { .. }
+                            | Change::AddColumn { .. }
+                            | Change::AlterColumnNumbering { .. }
+                    )),
+                    "{shape}: {changes:?}"
+                );
+                assert!(
+                    matches!(&changes.changes[grant].change, Change::Grant { permissions, .. } if *permissions == [Permission::Usage, Permission::Select, Permission::Update].into())
+                );
+            }
+            // Even equal textual grants need to be reapplied when an engine
+            // recreates the sequence during a numbering conversion.
+            let mut changes = vec![Change::AlterColumnNumbering {
+                uid: "c_aaaaaa".parse().unwrap(),
+                column: "dbo.customer.id".parse().unwrap(),
+                ty: ty("int"),
+                from: ValueSource::None,
+                to: ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
+            }];
+            diff_roles(
+                Side {
+                    schema: &desired.0,
+                    ids: &desired.1,
+                },
+                Side {
+                    schema: &desired.0,
+                    ids: &desired.1,
+                },
+                &ClusterRoles,
+                &mut changes,
+            );
+            assert!(
+                matches!(changes.last().unwrap(), Change::Grant { target: GrantTarget::Sequence(_), permissions, .. } if permissions.len() == 3)
+            );
+        }
+
         /// One table `dbo.customer` (uid t_aaaaaa) on both sides, plus the
         /// roles given, with `r_` uids minted from the name list.
         fn side(roles: &[(&str, &str, Role)]) -> (Schema, IdsFile) {
@@ -21385,15 +21768,18 @@ mod tests {
         }
 
         /// A dialect whose roles are the *cluster's*, not the database's —
-        /// PostgreSQL's answer (ADR-0010 §3, DECISIONS 211). Everything else
-        /// is `MinimalDialect`'s, so what a test using it shows is exactly the
-        /// difference this one capability makes.
+        /// PostgreSQL's answer (ADR-0010 §3, DECISIONS 211). Numbering changes
+        /// are admitted for serial grant ordering; other answers delegate to
+        /// `MinimalDialect`.
         #[derive(Debug, Clone, Copy, Default)]
         struct ClusterRoles;
 
         impl pbps_dialect::Dialect for ClusterRoles {
             fn name(&self) -> &'static str {
                 "cluster-roles"
+            }
+            fn changes_numbering(&self) -> bool {
+                true
             }
             fn manages_roles(&self) -> bool {
                 false
