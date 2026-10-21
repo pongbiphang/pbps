@@ -2,12 +2,12 @@
 //! the verdict. No later catalog read and no name-only ownership inference.
 
 use super::Error;
+use super::engine::BindingRecord;
 use pbps_db::resolver::capture::{Assessment, Verdict};
 use pbps_model::resolver::{
     BoundSurface, InputManifest, ObjectOwnership, Surface, SurfaceResolution,
 };
 use pbps_model::{ModuleId, Schema};
-use pbps_pg::resolver::capture::BindingRecord;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn required(schema: &Schema) -> BTreeSet<Surface> {

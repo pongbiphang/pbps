@@ -4,9 +4,9 @@
 //! UIDs distinguish a renamed old name from a new object reusing that name.
 
 use super::Error;
+use super::engine::BindingRecord;
 use pbps_model::resolver::{ObjectIdentity, ObjectOwnership, ObjectTransition, Surface};
 use pbps_model::{Change, ChangeSet, Schema};
-use pbps_pg::resolver::capture::BindingRecord;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]

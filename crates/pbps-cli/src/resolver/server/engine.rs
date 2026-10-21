@@ -1,171 +1,490 @@
-//! Engine routing for the dedicated-server profile.
+//! Engine routing for the scratch run. The CLI keeps the lifecycle; each
+//! adapter keeps the backend checks, reconstruction and private captures its
+//! engine needs. Only logical records and verdicts leave those captures.
 //!
 //! Instance SQL stays in the engine crates; this file only chooses which one
 //! answers. The binding calls below hand the PostgreSQL adapter the managed
 //! declarations and return its comparison; nothing here seals evidence.
 
-use pbps_db::Driver;
+use super::scratch::{Provenance, Provisioning, Tokens};
+use super::{BindingRequest, Error, ProduceError, ScopeRequest};
+use crate::resolver::scope;
+use pbps_db::fingerprint::EnvironmentFingerprintKey;
+use pbps_db::resolver::capture::{Assessment, CaptureDifference, CaptureError};
+use pbps_db::resolver::environment::CatalogFacts;
+use pbps_db::{Conn, DbError, Driver};
+use pbps_model::Hints;
+use pbps_model::resolver::{InputManifest, OutsideWrites, SurfaceResolution};
 
-use super::Error;
+mod postgres;
 
-// Binding resolution has one adapter, PostgreSQL's (#613); SQL Server's is
-// designed and built separately (#619, #620). The reconstruction, the
-// managed-name inventory and both captures are that adapter's private state,
-// as the target capture's are.
-pub(super) use pbps_pg::resolver::capture::{
-    CaptureScope, CompiledCapture, Managed, Paths, RecordedOwnership,
-};
-pub(super) use pbps_pg::resolver::reconstruct::Reconstruction;
+// These are logical planning records, not a raw engine capture or a verifier.
+pub(super) use pbps_pg::resolver::capture::BindingRecord;
 
 const NO_BINDING_ADAPTER: &str =
     "SQL Server has no binding adapter yet; its design and implementation are #619 and #620";
 
-/// Each routine the plan drops, with its declared signature spelled as the
-/// plan's `DROP` spells it, for the target capture to identify (#1148).
-pub(super) fn dropped_signatures(
-    extras: &[String],
-    routines: Vec<(pbps_model::ModuleId, pbps_model::ModuleKind)>,
-) -> Result<
-    Vec<(
-        pbps_model::ModuleId,
-        Option<pbps_pg::resolver::capture::DroppedSignature>,
-    )>,
-    String,
-> {
-    let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
-    routines
-        .into_iter()
-        .map(|(id, kind)| {
-            pbps_pg::resolver::reconstruct::dropped_signature(&dialect, &id, kind)
-                .map(|signature| (id, signature))
-                .map_err(|error| error.to_string())
-        })
-        .collect()
+fn unsupported() -> Error {
+    Error::Binding("the resolver is implemented for PostgreSQL only".into())
 }
 
-/// The desired namespace's scratch statements, for this engine.
-pub(super) fn reconstruction(
+/// The standard is engine-owned; the PostgreSQL conversion keeps callers of
+/// the supplied-server API from having to construct adapter state themselves.
+#[derive(Clone)]
+pub enum Standard {
+    Postgres(pbps_pg::resolver::standard::Standard),
+}
+
+impl From<&pbps_pg::resolver::standard::Standard> for Standard {
+    fn from(value: &pbps_pg::resolver::standard::Standard) -> Self {
+        Self::Postgres(value.clone())
+    }
+}
+
+impl From<&Standard> for Standard {
+    fn from(value: &Standard) -> Self {
+        value.clone()
+    }
+}
+
+pub(super) enum Scratch<'a> {
+    Postgres(postgres::Scratch<'a>),
+}
+pub(super) enum Fill {
+    Postgres(pbps_pg::resolver::draft::Fill),
+}
+pub(super) enum Prepared {
+    Postgres(postgres::Prepared),
+}
+pub(super) enum Binding {
+    Postgres(postgres::Binding),
+}
+pub(super) enum Chained {
+    Postgres(pbps_pg::resolver::externals::Created),
+}
+pub(super) enum Staged {
+    Postgres(pbps_pg::resolver::capture::Staged),
+}
+pub(super) enum CompiledCapture {
+    Postgres(postgres::Closing),
+}
+pub(super) enum CapturedInputs {
+    Postgres(pbps_pg::resolver::capture::CapturedInputs),
+}
+
+pub fn declared_standard(
     driver: Driver,
-    extras: &[String],
-    bootstrap: &[pbps_model::Change],
-) -> Result<Reconstruction, String> {
+    declared: Option<&pbps_config::resolver::ScratchStandard>,
+) -> Result<Standard, Error> {
     match driver {
-        Driver::Postgres => Reconstruction::new(
-            &pbps_pg::Postgres::with_write_path_extras(extras.to_vec()),
-            bootstrap,
-        )
-        .map_err(|error| error.to_string()),
-        Driver::Mssql => Err(NO_BINDING_ADAPTER.into()),
+        Driver::Postgres => Ok(Standard::Postgres(postgres::declared_standard(declared))),
+        Driver::Mssql => Err(unsupported()),
     }
 }
 
-/// Compiles the reconstruction's `steps` as whatever role the session is,
-/// over the run's ordinary connection.
-pub(crate) async fn compile(
-    reconstruction: &mut Reconstruction,
-    extras: &[String],
-    driver: Driver,
-    zone: Option<&pbps_model::SessionZone>,
-    connection: &mut impl pbps_db::transport::ExecuteConnection,
-    steps: std::ops::Range<usize>,
-) -> Result<(), Error> {
-    match (driver, zone) {
-        (Driver::Postgres, None) => Err(Error::Scope(
-            "the target reported no session time zone to compile in".into(),
-        )),
-        (Driver::Postgres, Some(zone)) => reconstruction
-            .compile_steps_in(
-                &pbps_pg::Postgres::with_write_path_extras(extras.to_vec()),
-                zone,
-                connection,
-                steps,
-            )
-            .await
-            .map_err(compile_failed),
-        (Driver::Mssql, _) => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
+pub(super) async fn reset_role(driver: Driver, admin: &mut Conn) -> Result<(), ProduceError> {
+    match driver {
+        Driver::Postgres => postgres::reset_role(admin).await,
+        Driver::Mssql => Err(ProduceError::Run(unsupported())),
     }
 }
 
-/// What a failed scratch compilation is. A declaration that did not compile
-/// is the binding's verdict; a catalog read around it, a transaction that
-/// would not open or commit, or a statement the connection or server
-/// interrupted, answered nothing (SPEC 9.8, #1575, #1597).
-pub(super) fn compile_failed(error: pbps_pg::resolver::reconstruct::ReconstructError) -> Error {
-    use pbps_pg::resolver::reconstruct::ReconstructError;
-    match error {
-        ReconstructError::Read { .. }
-        | ReconstructError::Interrupted { .. }
-        | ReconstructError::Transaction(_) => Error::Read(error.to_string()),
-        ReconstructError::Zone { .. } => Error::Scope(error.to_string()),
-        ReconstructError::Unsupported(_)
-        | ReconstructError::Emit { .. }
-        | ReconstructError::Compile { .. }
-        | ReconstructError::Cycle(_) => Error::Binding(error.to_string()),
-    }
-}
-
-/// Retain the final scratch read with its key and UID-qualified roots until
-/// final typed planning decides the one closing seal. Only logical binding
-/// records and the existing verdict leave this private capability.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn capture_desired_for_plan(
-    connection: &mut impl pbps_db::transport::QueryConnection,
-    base: &Managed,
-    desired: &Managed,
-    paths: &Paths,
-    key: &pbps_db::fingerprint::EnvironmentFingerprintKey,
-    principals: &crate::resolver::scope::Principals,
-    recorded: pbps_diff::Side<'_>,
-    reconstruction: &Reconstruction,
-    namespaces: &std::collections::BTreeSet<String>,
-    dropped_signatures: &std::collections::BTreeSet<pbps_pg::resolver::capture::DroppedSignature>,
-    staged: &std::collections::BTreeSet<pbps_db::resolver::capture::ObjectIdentity>,
-) -> Result<(CompiledCapture, CaptureScope), Error> {
-    use pbps_pg::resolver::capture;
-    // The principal map names the engine: only PostgreSQL's has an adapter.
-    match principals {
-        crate::resolver::scope::Principals::Postgres(roles) => {
-            let first = capture::capture(connection, &capture::managed_scope(desired))
-                .await
-                .map_err(catalog_read_failed)?;
-            // What an externals file staged is read and sealed on both sides, so
-            // the recheck compares the target's complete fingerprints of it
-            // (#1673).
-            let mut scope = capture::scope(&first, &[base, desired], paths);
-            scope.retained.extend(staged.iter().cloned());
-            let routines = recorded
-                .schema
-                .modules
-                .keys()
-                .filter_map(|id| {
-                    reconstruction
-                        .created(id)
-                        .map(|object| (id.clone(), object.clone()))
-                })
-                .collect();
-            let dropped = Default::default();
-            let ownership = capture::RecordedOwnership {
-                schema: recorded.schema,
-                ids: recorded.ids,
-                routines: &routines,
-                dropped: &dropped,
-                namespaces,
-            };
-            // The same lookups the opening sealed: the closing manifest records
-            // what each dropped signature names after the plan, normally none.
-            let captured = capture::capture_identifying_for_plan(
-                connection,
-                &scope,
-                dropped_signatures,
-                key,
-                roles,
-                &ownership,
+pub(super) async fn scratch<'a>(
+    driver: Driver,
+    target: &mut Conn,
+    admin: &mut Conn,
+    tokens: &Tokens,
+    planned_identity: &str,
+    scratch: &'a str,
+    request: &'a ScopeRequest,
+    standard: &'a Standard,
+    externals: Option<&'a str>,
+    provenance: &'a Provenance,
+) -> Result<(Provisioning, Scratch<'a>), ProduceError> {
+    match (driver, standard) {
+        (Driver::Postgres, Standard::Postgres(standard)) => {
+            let (provisioning, scratch) = postgres::scratch(
+                driver,
+                target,
+                admin,
+                tokens,
+                planned_identity,
+                scratch,
+                request,
+                standard,
+                externals,
+                provenance,
             )
-            .await
-            .map_err(catalog_read_failed)?;
-            Ok((captured, scope))
+            .await?;
+            Ok((provisioning, Scratch::Postgres(scratch)))
         }
-        _ => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
+        (Driver::Mssql, Standard::Postgres(_)) => Err(ProduceError::Run(unsupported())),
+    }
+}
+
+pub(super) async fn fill(
+    driver: Driver,
+    target: &mut Conn,
+    binding: &BindingRequest<'_>,
+    extras: &[String],
+) -> Result<Fill, Error> {
+    match driver {
+        Driver::Postgres => postgres::fill(target, binding, extras)
+            .await
+            .map(Fill::Postgres),
+        Driver::Mssql => Err(unsupported()),
+    }
+}
+
+impl Scratch<'_> {
+    pub(super) async fn prepare(
+        &mut self,
+        provisioning: Provisioning,
+        admin: &mut Conn,
+        target: &CatalogFacts,
+        authorization: &scope::Authorization,
+        schemas: &[String],
+        fill: &Fill,
+    ) -> Result<Prepared, Error> {
+        match (self, fill) {
+            (Self::Postgres(scratch), Fill::Postgres(fill)) => scratch
+                .prepare(provisioning, admin, target, authorization, schemas, fill)
+                .await
+                .map(Prepared::Postgres),
+        }
+    }
+
+    pub(super) async fn reconstruction(
+        &self,
+        target: &mut Conn,
+        binding: &BindingRequest<'_>,
+    ) -> Result<Binding, Error> {
+        match self {
+            Self::Postgres(scratch) => scratch
+                .reconstruction(target, binding)
+                .await
+                .map(Binding::Postgres),
+        }
+    }
+
+    pub(super) async fn compare_externals(
+        &self,
+        provisioning: Provisioning,
+        prepared: &mut Prepared,
+        admin: &mut Conn,
+        target: &mut Conn,
+        binding: &Binding,
+    ) -> Result<Staged, Error> {
+        match (self, prepared, binding) {
+            (Self::Postgres(scratch), Prepared::Postgres(prepared), Binding::Postgres(binding)) => {
+                scratch
+                    .compare_externals(provisioning, prepared, admin, target, binding)
+                    .await
+                    .map(Staged::Postgres)
+            }
+        }
+    }
+
+    pub(super) async fn restore_settings(
+        &self,
+        admin: &mut Conn,
+        authorization: &scope::Authorization,
+    ) -> Result<(), Error> {
+        match self {
+            Self::Postgres(scratch) => scratch.restore_settings(admin, authorization).await,
+        }
+    }
+
+    pub(super) async fn release(&mut self, admin: &mut Conn) -> Result<(), Vec<String>> {
+        match self {
+            Self::Postgres(scratch) => scratch.release(admin).await,
+        }
+    }
+}
+
+impl Prepared {
+    pub(super) fn catalog(&self) -> &CatalogFacts {
+        match self {
+            Self::Postgres(prepared) => &prepared.scratch_catalog,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn catalog_mut(&mut self) -> &mut CatalogFacts {
+        match self {
+            Self::Postgres(prepared) => &mut prepared.scratch_catalog,
+        }
+    }
+    pub(super) fn into_catalog(self) -> CatalogFacts {
+        match self {
+            Self::Postgres(prepared) => prepared.scratch_catalog,
+        }
+    }
+    pub(super) fn differences(&self) -> &[String] {
+        match self {
+            Self::Postgres(prepared) => &prepared.differences,
+        }
+    }
+    pub(super) fn supplied(&self) -> bool {
+        match self {
+            Self::Postgres(prepared) => prepared.compile.is_none() && prepared.capture.is_none(),
+        }
+    }
+    pub(super) fn split(&mut self, binding: &Binding) -> Option<usize> {
+        match (self, binding) {
+            (Self::Postgres(prepared), Binding::Postgres(binding)) => prepared.split(binding),
+        }
+    }
+    pub(super) fn has_filled(&self) -> bool {
+        match self {
+            Self::Postgres(prepared) => prepared.has_filled(),
+        }
+    }
+    pub(super) fn unfillable(&self) -> Vec<String> {
+        match self {
+            Self::Postgres(prepared) => prepared.unfillable(),
+        }
+    }
+    pub(super) fn waiting(&self) -> String {
+        match self {
+            Self::Postgres(prepared) => prepared.waiting(),
+        }
+    }
+}
+
+impl Binding {
+    pub(super) fn chains(&mut self, prepared: &Prepared) -> Vec<String> {
+        match (self, prepared) {
+            (Self::Postgres(binding), Prepared::Postgres(prepared)) => binding.chains(prepared),
+        }
+    }
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Postgres(binding) => binding.len(),
+        }
+    }
+    pub(super) async fn compile(
+        &mut self,
+        prepared: &mut Prepared,
+        admin: &mut Conn,
+        extras: &[String],
+        driver: Driver,
+        zone: Option<&pbps_model::SessionZone>,
+        steps: std::ops::Range<usize>,
+    ) -> Result<(), Error> {
+        match (self, prepared) {
+            (Self::Postgres(binding), Prepared::Postgres(prepared)) => {
+                let compile = match prepared.compile.as_mut() {
+                    Some(compile) => compile,
+                    None => &mut *admin,
+                };
+                binding.compile(extras, driver, zone, compile, steps).await
+            }
+        }
+    }
+    pub(super) async fn fill_chained(
+        &mut self,
+        prepared: &mut Prepared,
+        admin: &mut Conn,
+        split: usize,
+        outside: OutsideWrites,
+    ) -> Result<Chained, Error> {
+        match (self, prepared) {
+            (Self::Postgres(binding), Prepared::Postgres(prepared)) => binding
+                .fill_chained(prepared, admin, split, outside)
+                .await
+                .map(Chained::Postgres),
+        }
+    }
+    pub(super) async fn compare_chained(
+        &self,
+        prepared: &mut Prepared,
+        admin: &mut Conn,
+        target: &mut Conn,
+        chained: &Chained,
+    ) -> Result<Staged, Error> {
+        match (self, prepared, chained) {
+            (Self::Postgres(binding), Prepared::Postgres(prepared), Chained::Postgres(chained)) => {
+                binding
+                    .compare_chained(prepared, admin, target, chained)
+                    .await
+                    .map(Staged::Postgres)
+            }
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn capture_desired(
+        &self,
+        prepared: &mut Prepared,
+        admin: &mut Conn,
+        extras: &[String],
+        visibility: &std::collections::BTreeMap<String, pbps_db::resolver::Observation>,
+        schemas: &[String],
+        key: &EnvironmentFingerprintKey,
+        desired: pbps_diff::Side<'_>,
+        staged: &Staged,
+    ) -> Result<CompiledCapture, Error> {
+        match (self, prepared, staged) {
+            (Self::Postgres(binding), Prepared::Postgres(prepared), Staged::Postgres(staged)) => {
+                binding
+                    .capture_desired(
+                        prepared, admin, extras, visibility, schemas, key, desired, staged,
+                    )
+                    .await
+                    .map(CompiledCapture::Postgres)
+            }
+        }
+    }
+    pub(super) async fn capture_opening(
+        &self,
+        target: &mut Conn,
+        closing: &CompiledCapture,
+        key: &EnvironmentFingerprintKey,
+        base: pbps_diff::Side<'_>,
+    ) -> Result<(CapturedInputs, InputManifest), Error> {
+        match (self, closing) {
+            (Self::Postgres(binding), CompiledCapture::Postgres(closing)) => {
+                let (current, opening) =
+                    binding.capture_opening(target, closing, key, base).await?;
+                Ok((CapturedInputs::Postgres(current), opening))
+            }
+        }
+    }
+    pub(super) fn assess(
+        &mut self,
+        closing: &CompiledCapture,
+        current: &CapturedInputs,
+        staged: &Staged,
+    ) -> Assessment {
+        match (self, closing, current, staged) {
+            (
+                Self::Postgres(binding),
+                CompiledCapture::Postgres(closing),
+                CapturedInputs::Postgres(current),
+                Staged::Postgres(staged),
+            ) => binding.assess(closing, current, staged),
+        }
+    }
+}
+
+impl Staged {
+    pub(super) fn extend(&mut self, other: Self) {
+        match (self, other) {
+            (Self::Postgres(staged), Self::Postgres(other)) => staged.extend(other),
+        }
+    }
+    pub(super) fn changed_since(&self, current: &CapturedInputs) -> Vec<String> {
+        match (self, current) {
+            (Self::Postgres(staged), CapturedInputs::Postgres(current)) => {
+                staged.changed_since(current)
+            }
+        }
+    }
+    pub(super) fn through_shape_view(&self, error: Error) -> Error {
+        match self {
+            Self::Postgres(staged) => postgres::through_shape_view(error, staged),
+        }
+    }
+}
+
+pub(super) fn staged(driver: Driver) -> Result<Staged, Error> {
+    match driver {
+        Driver::Postgres => Ok(Staged::Postgres(Default::default())),
+        Driver::Mssql => Err(unsupported()),
+    }
+}
+
+impl CompiledCapture {
+    pub(super) fn planning_records(
+        &self,
+    ) -> Result<Vec<BindingRecord>, pbps_model::resolver::ManifestError> {
+        match self {
+            Self::Postgres(closing) => closing.planning_records(),
+        }
+    }
+    pub(super) fn seal_for_plan(
+        self,
+    ) -> Result<InputManifest, pbps_pg::resolver::capture::SealError> {
+        match self {
+            Self::Postgres(closing) => closing.seal_for_plan(),
+        }
+    }
+}
+
+pub(super) async fn target_identity(driver: Driver, target: &mut Conn) -> Result<String, DbError> {
+    match driver {
+        Driver::Postgres => postgres::target_identity(target).await,
+        Driver::Mssql => Err(DbError::BadRow(NO_BINDING_ADAPTER.into())),
+    }
+}
+
+pub(super) async fn recapture(
+    target: &mut Conn,
+    current: &CapturedInputs,
+) -> Result<Vec<CaptureDifference>, CaptureError> {
+    match current {
+        CapturedInputs::Postgres(current) => postgres::recapture(target, current).await,
+    }
+}
+
+pub(super) fn ordinary(
+    driver: Driver,
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    hints: &Hints,
+    extras: &[String],
+) -> Result<pbps_model::ChangeSet, Error> {
+    match driver {
+        Driver::Postgres => postgres::ordinary(base, desired, hints, extras),
+        Driver::Mssql => Err(unsupported()),
+    }
+}
+
+pub(super) fn plan(
+    driver: Driver,
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    hints: &Hints,
+    extras: &[String],
+    surfaces: &[SurfaceResolution],
+) -> Result<pbps_diff::resolver::Ordered, Error> {
+    match driver {
+        Driver::Postgres => postgres::plan(base, desired, hints, extras, surfaces),
+        Driver::Mssql => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
+    }
+}
+
+pub(super) fn surfaces(
+    driver: Driver,
+    base: pbps_diff::Side<'_>,
+    desired: pbps_diff::Side<'_>,
+    opening: &[BindingRecord],
+    compiled: &[BindingRecord],
+    assessment: &Assessment,
+) -> Result<Vec<SurfaceResolution>, Error> {
+    match driver {
+        Driver::Postgres => {
+            super::resolution::from_sides(base, desired, opening, compiled, assessment)
+        }
+        Driver::Mssql => Err(Error::Binding(NO_BINDING_ADAPTER.into())),
+    }
+}
+
+pub(super) fn reported_build(
+    driver: Driver,
+    key: &EnvironmentFingerprintKey,
+    catalog: &CatalogFacts,
+) -> Result<String, Error> {
+    match driver {
+        Driver::Postgres => postgres::reported_build(key, catalog),
+        Driver::Mssql => Err(Error::Scope("the resolver has no SQL Server rule".into())),
+    }
+}
+
+pub(super) fn reported_rule(driver: Driver) -> Result<&'static str, Error> {
+    match driver {
+        Driver::Postgres => Ok(pbps_pg::resolver::compatibility::REPORTED_RULE),
+        Driver::Mssql => Err(Error::Scope("the resolver has no SQL Server rule".into())),
     }
 }
 
@@ -188,21 +507,43 @@ pub(super) fn catalog_read_failed(error: pbps_db::resolver::capture::CaptureErro
     }
 }
 
-/// Each in-scope schema's effective path as the qualified scope measured it,
-/// with the configured extras for any schema it did not. An unreadable
-/// measurement is left out, which falls back to the whole write path.
-pub(super) fn paths(
-    extras: &[String],
-    visibility: &std::collections::BTreeMap<String, pbps_db::resolver::Observation>,
-) -> Paths {
-    let effective = visibility
-        .iter()
-        .filter_map(|(schema, observed)| {
-            let path: Vec<String> = serde_json::from_str(observed.value()?).ok()?;
-            Some((schema.clone(), path))
-        })
-        .collect();
-    Paths::new(extras.to_vec(), effective)
+#[cfg(test)]
+use postgres::compile_failed;
+
+#[cfg(test)]
+pub(super) use postgres::release_supplied;
+
+/// Values the runner needs to start and reach one engine's Docker image.
+/// Acquisition, deadlines and confirmed removal remain the runner's work.
+pub(super) struct Docker {
+    driver: Driver,
+    pub environment: Vec<String>,
+    pub port: u16,
+    pub readiness_query: &'static str,
+}
+
+pub(super) fn docker(driver: Driver, password: &str) -> Result<Docker, ProduceError> {
+    match driver {
+        Driver::Postgres => Ok(Docker {
+            driver,
+            environment: vec![format!("POSTGRES_PASSWORD={password}")],
+            port: 5432,
+            readiness_query: "SELECT 1 AS ok",
+        }),
+        Driver::Mssql => Err(ProduceError::Run(unsupported())),
+    }
+}
+
+impl Docker {
+    pub(super) fn connection(&self, port: u16, password: &str) -> Result<String, ProduceError> {
+        match self.driver {
+            Driver::Postgres => Ok(format!(
+                "host=127.0.0.1 port={port} user=postgres password={password} dbname=postgres \
+                 sslmode=disable"
+            )),
+            Driver::Mssql => Err(ProduceError::Run(unsupported())),
+        }
+    }
 }
 
 #[cfg(test)]
