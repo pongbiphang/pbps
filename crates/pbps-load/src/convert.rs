@@ -122,7 +122,7 @@ pub fn convert_role(src: &SourceFile, dto: RoleDto) -> Result<LoadedRole, Vec<Lo
                         format!("invalid grant target `{target}`: {e}"),
                         e.to_string(),
                     )
-                    .with_help("a target is `schema.object` or `schema::name`"),
+                    .with_help("a target is `schema.object`, `schema::name`, or `sequence::schema.table.column`"),
                 );
                 continue;
             }

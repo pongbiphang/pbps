@@ -1094,10 +1094,45 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     pulled
 }
 
+fn serial_sequence_targets(
+    raw: &RawCatalog,
+    schema: &pbps_model::Schema,
+) -> BTreeMap<ObjectName, pbps_model::ColumnRef> {
+    let tables: BTreeMap<_, _> = raw
+        .tables
+        .iter()
+        .map(|t| (t.oid, TableName::new(&t.schema, &t.name)))
+        .collect();
+    raw.columns
+        .iter()
+        .filter_map(|column| {
+            let table = tables.get(&column.table_oid)?;
+            let accepted = schema
+                .tables
+                .get(table)?
+                .columns
+                .get(column.name.as_str())?;
+            if !matches!(accepted.value_source, pbps_model::ValueSource::Sequence(_)) {
+                return None;
+            }
+            let serial = column.serial.as_ref()?;
+            Some((
+                ObjectName::new(&table.schema, &serial.name),
+                table.column(column.name.clone()),
+            ))
+        })
+        .collect()
+}
+
+struct ImpliedSequenceGrants {
+    targets: BTreeMap<(pbps_model::RoleName, ObjectName), ObjectName>,
+    inserting: BTreeSet<(pbps_model::RoleName, ObjectName)>,
+}
+
 fn implied_sequence_targets(
     raw: &RawCatalog,
     schema: &pbps_model::Schema,
-) -> BTreeMap<(pbps_model::RoleName, ObjectName), ObjectName> {
+) -> ImpliedSequenceGrants {
     let tables: BTreeMap<_, _> = raw
         .tables
         .iter()
@@ -1148,8 +1183,8 @@ fn implied_sequence_targets(
         }
     }
     let mut folded = BTreeMap::new();
-    for (role, table) in inserting {
-        if let Some(owned) = sequences.get(&table)
+    for (role, table) in &inserting {
+        if let Some(owned) = sequences.get(table)
             && owned
                 .iter()
                 .all(|sequence| usage.contains(&(role.clone(), sequence.clone())))
@@ -1159,7 +1194,10 @@ fn implied_sequence_targets(
             }
         }
     }
-    folded
+    ImpliedSequenceGrants {
+        targets: folded,
+        inserting,
+    }
 }
 
 /// The roles and what each holds in this database (ADR-0005, ADR-0010 §5).
@@ -1244,14 +1282,23 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
 
     // Every securable the read saw, owned by somebody — before a single ACL
     // row is looked at, because an object with no ACL rows is still owned.
+    let serial_targets = serial_sequence_targets(raw, &pulled.schema);
     for o in &raw.owners {
-        if let Ok(target) = target_named(
-            &o.schema,
-            o.object.as_deref(),
-            o.kind,
-            args_of(o.routine_oid, &signatures),
-            "",
-        ) {
+        let sequence = o
+            .object
+            .as_ref()
+            .filter(|_| o.kind == GrantedKind::Relation('S'))
+            .and_then(|object| serial_targets.get(&ObjectName::new(&o.schema, object)))
+            .map(|c| pbps_model::GrantTarget::Sequence(c.clone()));
+        if let Ok(target) = sequence.map(Ok).unwrap_or_else(|| {
+            target_named(
+                &o.schema,
+                o.object.as_deref(),
+                o.kind,
+                args_of(o.routine_oid, &signatures),
+                "",
+            )
+        }) {
             pulled.owners.insert(target, o.owner.clone());
         }
     }
@@ -1331,13 +1378,37 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             && g.column.is_none()
         {
             g.object.as_ref().and_then(|object| {
-                implied.get(&(grantee.to_owned(), ObjectName::new(&g.schema, object)))
+                implied
+                    .targets
+                    .get(&(grantee.to_owned(), ObjectName::new(&g.schema, object)))
             })
         } else {
             None
         };
         let target = match serial_table
             .map(|table| Ok(pbps_model::GrantTarget::Object(table.clone())))
+            .or_else(|| {
+                (g.kind == GrantedKind::Relation('S'))
+                    .then(|| {
+                        g.object
+                            .as_ref()
+                            .and_then(|object| {
+                                serial_targets.get(&ObjectName::new(&g.schema, object))
+                            })
+                            // USAGE beside INSERT belongs to the complete
+                            // marker. A partial set retains its limitation;
+                            // declaring it would imply the missing privileges.
+                            .filter(|c| {
+                                g.permission != "USAGE"
+                                    || g.grantable
+                                    || !implied
+                                        .inserting
+                                        .contains(&(grantee.clone(), c.table.clone()))
+                            })
+                            .map(|c| Ok(pbps_model::GrantTarget::Sequence(c.clone())))
+                    })
+                    .flatten()
+            })
             .unwrap_or_else(|| target_of(g, &signatures))
         {
             Ok(target) => target,
@@ -1510,8 +1581,22 @@ fn add_roles(raw: &RawCatalog, pulled: &mut Pulled) {
             );
             pulled.unrevocable.push(pbps_db::catalog::Unrevocable {
                 role: grantee.to_owned(),
-                target: target.clone(),
-                permission,
+                target: if serial_table.is_some() {
+                    pbps_model::GrantTarget::Sequence(
+                        serial_targets[&ObjectName::new(
+                            &g.schema,
+                            g.object.as_ref().expect("a sequence has a name"),
+                        )]
+                            .clone(),
+                    )
+                } else {
+                    target.clone()
+                },
+                permission: if serial_table.is_some() {
+                    pbps_model::Permission::Usage
+                } else {
+                    permission
+                },
                 why: format!(
                     // The grantor, never the owner: the owner's `REVOKE` leaves
                     // another grantor's entry standing and reports success
@@ -1740,6 +1825,11 @@ fn recorded(schema: &pbps_model::Schema, target: &pbps_model::GrantTarget) -> bo
             .any(|id| matches!(id, ModuleId::Routine(other) if other == r)),
         // Not an object the pull assembles: the model holds no list of
         // schemas, and a `schema::` target names one directly.
+        pbps_model::GrantTarget::Sequence(c) => schema
+            .tables
+            .get(&c.table)
+            .and_then(|t| t.columns.get(&c.name))
+            .is_some_and(|c| matches!(c.value_source, pbps_model::ValueSource::Sequence(_))),
         pbps_model::GrantTarget::Schema(_) => true,
     }
 }
@@ -4699,11 +4789,11 @@ mod tests {
             [Permission::Insert, Permission::SerialSequences].into()
         );
         assert_eq!(pulled.unrevocable.len(), 1);
-        assert_eq!(pulled.unrevocable[0].target, target);
         assert_eq!(
-            pulled.unrevocable[0].permission,
-            Permission::SerialSequences
+            pulled.unrevocable[0].target,
+            "sequence::app.t.id".parse().unwrap()
         );
+        assert_eq!(pulled.unrevocable[0].permission, Permission::Usage);
         raw.grants.reverse();
         let reversed = assemble(&raw);
         assert_eq!(pulled.schema, reversed.schema);
@@ -4711,70 +4801,128 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_or_unimplied_sequence_access_stays_a_limitation() {
+    fn pull_writes_only_sequence_permissions_not_covered_by_the_complete_insert_marker() {
         use pbps_model::Permission;
+        for insert in [false, true] {
+            let mut raw = serial_grant_catalog();
+            if !insert {
+                raw.grants.pop();
+            }
+            for permission in ["SELECT", "UPDATE"] {
+                raw.grants.push(grant(
+                    Some("writer"),
+                    Some("custom_seq"),
+                    GrantedKind::Relation('S'),
+                    permission,
+                ));
+            }
+            let pulled = assemble(&raw);
+            assert!(
+                pulled.unexpressible.is_empty(),
+                "{:?}",
+                pulled.unexpressible
+            );
+            let role = &pulled.schema.roles["writer"];
+            let declared: BTreeMap<_, _> = role
+                .declarable_grants()
+                .map(|(t, p)| (t.clone(), p))
+                .collect();
+            let mut expected = BTreeSet::from([Permission::Select, Permission::Update]);
+            if !insert {
+                expected.insert(Permission::Usage);
+            }
+            assert_eq!(
+                declared[&"sequence::app.t.other".parse().unwrap()],
+                expected
+            );
+            assert_eq!(
+                declared.contains_key(&"sequence::app.t.id".parse().unwrap()),
+                !insert
+            );
+            assert_eq!(
+                role.grants
+                    .get(&"app.t".parse().unwrap())
+                    .is_some_and(|p| p.contains(&Permission::SerialSequences)),
+                insert
+            );
+        }
+        let mut raw = serial_grant_catalog();
+        raw.grants.remove(1);
+        let pulled = assemble(&raw);
+        assert_eq!(pulled.unexpressible.len(), 1);
+        assert!(pulled.unexpressible[0].what.contains("USAGE on sequence"));
+        assert!(
+            !pulled.schema.roles["writer"]
+                .grants
+                .contains_key(&"sequence::app.t.id".parse().unwrap())
+        );
+        assert!(
+            !pulled.schema.roles["writer"].grants[&"app.t".parse().unwrap()]
+                .contains(&Permission::SerialSequences)
+        );
+    }
+
+    #[test]
+    fn unsupported_sequence_acl_shapes_keep_their_limitations_and_zero_points() {
         for case in [
-            "partial",
-            "no insert",
             "unowned",
-            "other privilege",
             "grant option",
             "default",
             "owner",
             "public",
+            "not serial",
+            "identity",
         ] {
             let mut raw = serial_grant_catalog();
             match case {
-                "partial" => {
-                    raw.grants.remove(1);
+                "unowned" => raw.grants[0].object = Some("unowned_seq".into()),
+                "grant option" => raw.grants[0].grantable = true,
+                "default" => raw.grants[0].defaulted = true,
+                "owner" => raw.grants[0].owner = "writer".into(),
+                "public" => raw.grants[0].grantee = None,
+                "not serial" => {
+                    raw.columns[0].serial = None;
+                    raw.columns[0].owned_sequence = None;
                 }
-                "no insert" => {
-                    raw.grants.pop();
-                }
-                "unowned" => {
-                    raw.grants[0].object = Some("unowned_seq".into());
-                }
-                "other privilege" => {
-                    raw.grants[0].permission = "SELECT".into();
-                }
-                "grant option" => {
-                    raw.grants[0].grantable = true;
-                }
-                "default" => {
-                    raw.grants[0].defaulted = true;
-                }
-                "owner" => {
-                    raw.grants[0].owner = "writer".into();
-                }
-                "public" => {
-                    raw.grants[0].grantee = None;
+                "identity" => {
+                    raw.columns[0].serial = None;
+                    raw.columns[0].default = None;
+                    raw.columns[0].owned_sequence = None;
+                    raw.columns[0].identity = Some(RawIdentity {
+                        always: true,
+                        seed: 1,
+                        increment: 1,
+                        min: 1,
+                        max: i64::from(i32::MAX),
+                        cycles: false,
+                        cache: 1,
+                        same_type: true,
+                    });
                 }
                 _ => unreachable!(),
             }
             let pulled = assemble(&raw);
-            assert!(!pulled.unexpressible.is_empty(), "{case}");
             assert!(
-                pulled.schema.roles["writer"]
+                !pulled.schema.roles["writer"]
                     .grants
-                    .values()
-                    .all(|held| !held.contains(&Permission::SerialSequences)),
+                    .contains_key(&"sequence::app.t.id".parse().unwrap()),
                 "{case}"
             );
+            if ["unowned", "grant option", "not serial", "identity"].contains(&case) {
+                assert!(!pulled.unexpressible.is_empty(), "{case}");
+            }
+            if case == "grant option" {
+                assert!(
+                    pulled
+                        .unexpressible
+                        .iter()
+                        .any(|e| e.what.contains("WITH GRANT OPTION"))
+                );
+            }
+            if case == "public" {
+                assert!(pulled.warnings.iter().any(|e| e.contains("PUBLIC")));
+            }
         }
-        let mut raw = serial_grant_catalog();
-        raw.grants.push(grant(
-            Some("writer"),
-            Some("t_id_seq"),
-            GrantedKind::Relation('S'),
-            "SELECT",
-        ));
-        let pulled = assemble(&raw);
-        assert_eq!(pulled.unexpressible.len(), 1);
-        assert!(pulled.unexpressible[0].what.contains("SELECT on sequence"));
-        assert!(
-            pulled.schema.roles["writer"].grants[&"app.t".parse().unwrap()]
-                .contains(&Permission::SerialSequences)
-        );
     }
 
     /// ADR-0010 §7's report names the sequence too, for the same reason: a
@@ -7905,5 +8053,31 @@ mod tests {
         assert!(!read.columns["id"].nullable);
         assert!(read.columns["note"].nullable);
         assert!(read.indexes.is_empty());
+    }
+    #[test]
+    fn serial_sequence_ownership_is_recorded_under_the_column_target() {
+        let mut raw = serial_grant_catalog();
+        for name in ["t_id_seq", "custom_seq", "unowned_seq"] {
+            raw.owners.push(RawOwner {
+                schema: "app".into(),
+                object: Some(name.into()),
+                kind: GrantedKind::Relation('S'),
+                routine_oid: None,
+                owner: "deployer".into(),
+            });
+        }
+        let pulled = assemble(&raw);
+        assert_eq!(pulled.owners.len(), 2);
+        for target in ["sequence::app.t.id", "sequence::app.t.other"] {
+            assert_eq!(
+                pulled.owners[&target.parse().unwrap()],
+                pbps_model::RoleName::from("deployer")
+            );
+        }
+        assert!(
+            !pulled
+                .owners
+                .contains_key(&"app.unowned_seq".parse().unwrap())
+        );
     }
 }

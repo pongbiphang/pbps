@@ -380,6 +380,7 @@ pub struct Held {
 pub enum Securable {
     Schema(String),
     Object(ObjectName),
+    Sequence(pbps_model::ColumnRef),
     Routine(ObjectName, Option<String>),
 }
 
@@ -387,6 +388,7 @@ impl std::fmt::Display for Securable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Securable::Schema(s) => write!(f, "SCHEMA {}", spelled(s)),
+            Securable::Sequence(c) => write!(f, "SEQUENCE owned by {}", c.shown()),
             // Each part quoted on its own and joined with a dot: `TABLE
             // "app"."a.b"` is one table, while `TABLE app.a.b` is a `b` in some
             // schema `app.a` — a different securable, and the one the reader

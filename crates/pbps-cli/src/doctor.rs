@@ -817,6 +817,9 @@ fn grant_targets(
                 pbps_model::GrantTarget::Routine(r) => {
                     objects.insert(r.name.clone());
                 }
+                pbps_model::GrantTarget::Sequence(c) => {
+                    objects.insert(c.table.clone());
+                }
                 pbps_model::GrantTarget::Schema(s) => {
                     schemas.insert(s.clone());
                 }

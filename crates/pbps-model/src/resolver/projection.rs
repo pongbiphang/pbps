@@ -826,7 +826,10 @@ pub(super) fn touches(c: &Change, surface: &Surface) -> bool {
         }
         Surface::Table(t) => {
             c.objects().any(|o| o == t)
-                || grant_target(c).is_some_and(|g| matches!(g, GrantTarget::Object(o) if o == t))
+                || grant_target(c).is_some_and(|g| {
+                    matches!(g, GrantTarget::Object(o) if o == t)
+                        || matches!(g, GrantTarget::Sequence(column) if &column.table == t)
+                })
         }
         Surface::Column(column) => {
             c.columns_redefined().iter().any(|(r, _)| r == column)

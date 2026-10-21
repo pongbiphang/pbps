@@ -429,6 +429,7 @@ enum TargetKind {
     View,
     Function,
     Procedure,
+    Sequence,
 }
 
 impl TargetKind {
@@ -443,6 +444,7 @@ impl TargetKind {
                 Select, Insert, Update, Delete, References, Truncate, Trigger, Maintain,
             ],
             TargetKind::Function | TargetKind::Procedure => &[Execute],
+            TargetKind::Sequence => &[Usage, Select, Update],
         }
     }
 
@@ -452,6 +454,7 @@ impl TargetKind {
             TargetKind::View => "a view",
             TargetKind::Function => "a function",
             TargetKind::Procedure => "a procedure",
+            TargetKind::Sequence => "a serial sequence",
         }
     }
 }
@@ -619,7 +622,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
         .filter(|(_, permissions)| permissions.contains(&Permission::Usage))
         .filter_map(|(target, _)| match target {
             GrantTarget::Schema(s) => Some(s.as_str()),
-            GrantTarget::Object(_) | GrantTarget::Routine(_) => None,
+            GrantTarget::Object(_) | GrantTarget::Routine(_) | GrantTarget::Sequence(_) => None,
         })
         .collect();
 
@@ -627,6 +630,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
         let parts: Vec<&str> = match target {
             GrantTarget::Object(o) => vec![&o.schema, &o.name],
             GrantTarget::Routine(r) => vec![&r.name.schema, &r.name.name],
+            GrantTarget::Sequence(c) => vec![&c.table.schema, &c.table.name, c.name.raw()],
             GrantTarget::Schema(s) => vec![s],
         };
         for part in parts {
@@ -735,7 +739,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                     )));
                 }
             }
-            GrantTarget::Object(_) | GrantTarget::Routine(_) => {
+            GrantTarget::Object(_) | GrantTarget::Routine(_) | GrantTarget::Sequence(_) => {
                 let schema_of = target.schema();
                 // §1, and it is checked once per target rather than once per
                 // permission: a grant with three permissions on a schema the
@@ -768,6 +772,7 @@ pub fn role(name: &pbps_model::RoleName, role: &Role, schema: &Schema) -> Vec<Di
                     // procedure was a function would be one more thing to
                     // disbelieve.
                     GrantTarget::Routine(r) => routine_kind(r, schema),
+                    GrantTarget::Sequence(_) => Some(TargetKind::Sequence),
                     GrantTarget::Schema(_) => unreachable!("matched above"),
                 };
                 let Some(kind) = kind else { continue };
@@ -1481,6 +1486,38 @@ mod tests {
 
     /// A name the engine cannot hold is refused wherever it appears — the
     /// role's own, and each half of a target's.
+
+    #[test]
+    fn serial_sequence_targets_admit_only_sequence_words_and_need_schema_usage() {
+        for permission in Permission::ALL {
+            let role = granting(&[
+                ("schema::app", &[Permission::Usage]),
+                ("sequence::app.t.id", &[permission]),
+            ]);
+            let errors = messages("reader", &role);
+            assert_eq!(
+                errors.is_empty(),
+                [Permission::Usage, Permission::Select, Permission::Update].contains(&permission),
+                "{permission}: {errors:?}"
+            );
+            if !errors.is_empty() {
+                assert!(
+                    errors.iter().any(
+                        |e| e.contains(permission.as_str()) && e.contains("sequence::app.t.id")
+                    )
+                );
+            }
+        }
+        let errors = messages(
+            "reader",
+            &granting(&[("sequence::app.t.id", &[Permission::Usage])]),
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("schema::app")),
+            "{errors:?}"
+        );
+    }
+
     #[test]
     fn a_name_the_engine_cannot_hold_is_refused_on_the_role_and_on_its_targets() {
         let long = "n".repeat(crate::MAX_IDENT_BYTES + 1);

@@ -417,6 +417,12 @@ fn creates_target(c: &Change, target: &GrantTarget) -> bool {
         GrantTarget::Routine(routine) => {
             matches!(c, Change::CreateModule { id, .. } if id == &pbps_model::ModuleId::Routine(routine.clone()))
         }
+        GrantTarget::Sequence(column) => {
+            matches!(c, Change::CreateTable { name, .. } | Change::RenameTable { to: name, .. } if name == &column.table)
+                || matches!(c, Change::RenameColumn { table, to, .. } if table == &column.table && to == &column.name)
+                || matches!(c, Change::AddColumn { table, name, .. } if table == &column.table && name == &column.name)
+                || matches!(c, Change::AlterColumnNumbering { column: changed, .. } if changed == column)
+        }
         GrantTarget::Schema(_) => false,
     }
 }
@@ -425,6 +431,7 @@ fn creates_target(c: &Change, target: &GrantTarget) -> bool {
 fn grant_matches(target: &GrantTarget, surface: &Surface) -> bool {
     match (target, surface) {
         (GrantTarget::Object(a), Surface::Table(b)) => a == b,
+        (GrantTarget::Sequence(c), Surface::Table(b)) => &c.table == b,
         (GrantTarget::Object(a), Surface::Module(pbps_model::ModuleId::Named(b))) => a == b,
         (GrantTarget::Routine(a), Surface::Module(pbps_model::ModuleId::Routine(b))) => a == b,
         _ => false,
@@ -453,4 +460,40 @@ fn a_prepared_default_rewrite_releases_then_provides_its_binding() {
     assert!(!provides(&drop.part_effects()).contains(&target));
     assert!(provides(&create.part_effects()).contains(&target));
     assert!(!release(&create.part_effects(), &target));
+}
+
+#[test]
+fn sequence_grants_follow_the_existing_table_and_column_rename_dependencies() {
+    let target = "sequence::app.new.new_id".parse().unwrap();
+    let table_rename = Change::RenameTable {
+        uid: "t_aaaaaa".parse().unwrap(),
+        from: "app.old".parse().unwrap(),
+        to: "app.new".parse().unwrap(),
+        defaults: Vec::new(),
+    };
+    let column_rename = Change::RenameColumn {
+        uid: "c_aaaaaa".parse().unwrap(),
+        table: "app.new".parse().unwrap(),
+        from: "old_id".into(),
+        to: "new_id".into(),
+        table_was: None,
+    };
+    assert!(creates_target(&table_rename, &target));
+    assert!(creates_target(&column_rename, &target));
+    assert!(!creates_target(
+        &column_rename,
+        &"sequence::app.new.other".parse().unwrap()
+    ));
+    assert!(!creates_target(
+        &table_rename,
+        &"sequence::app.unrelated.new_id".parse().unwrap()
+    ));
+    assert!(grant_matches(
+        &target,
+        &Surface::Table("app.new".parse().unwrap())
+    ));
+    assert!(!grant_matches(
+        &target,
+        &Surface::Table("app.other".parse().unwrap())
+    ));
 }

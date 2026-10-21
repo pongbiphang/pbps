@@ -238,6 +238,7 @@ pub fn scope(
             pbps_model::GrantTarget::Routine(r) => managed_modules
                 .iter()
                 .any(|id| matches!(id, ModuleId::Routine(other) if other == r)),
+            pbps_model::GrantTarget::Sequence(c) => managed.contains(&c.table),
             pbps_model::GrantTarget::Schema(_) => true,
         });
         scoped.roles.insert(name.clone(), kept);
@@ -964,6 +965,44 @@ mod tests {
                 [Permission::SerialSequences].into()
             )]
             .into()
+        );
+    }
+
+    #[test]
+    fn explicit_sequence_grants_are_scoped_to_the_serials_table() {
+        let mut live = schema(&["dbo.customer", "dbo.other"]);
+        live.roles.insert(
+            "reader".into(),
+            pbps_model::Role {
+                grants: [
+                    (
+                        "sequence::dbo.customer.id".parse().unwrap(),
+                        [pbps_model::Permission::Usage].into(),
+                    ),
+                    (
+                        "sequence::dbo.other.id".parse().unwrap(),
+                        [pbps_model::Permission::Select].into(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+        );
+        let mut recorded = ids(&[("t_aaaaaa", "dbo.customer")]);
+        recorded
+            .roles
+            .insert("r_aaaaaa".parse().unwrap(), "reader".into());
+        let scoped = scope(&live, &recorded, &BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(scoped.schema.roles["reader"].grants.len(), 1);
+        assert!(
+            scoped.schema.roles["reader"]
+                .grants
+                .contains_key(&"sequence::dbo.customer.id".parse().unwrap())
+        );
+        assert!(
+            !scoped.schema.roles["reader"]
+                .grants
+                .contains_key(&"sequence::dbo.other.id".parse().unwrap())
         );
     }
 

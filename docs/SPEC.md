@@ -723,8 +723,9 @@ grants:
 - **What is managed is the role and its grants; membership is not.** Who holds
   a role is each environment's own reality, never declared, compared or
   touched. Logins and users are server-level and out of scope.
-- **Grants are data**: a target — `schema.object`, or `schema::name` for a
-  whole schema — to a set of permissions. The set is the union of what the
+- **Grants are data**: a target — `schema.object`, `schema::name` for a
+  whole schema, or `sequence::schema.table.column` for a PostgreSQL serial's
+  owned sequence — to a set of permissions. The set is the union of what the
   supported engines grant ([ADR-0010 §6](ADR-0010-postgres-privileges.md)):
   `select`, `insert`, `update`, `delete`, `references`, `execute`, `alter`,
   `view-definition`, `usage`, `create`, `truncate`, `trigger`, `maintain`. A
@@ -738,6 +739,17 @@ grants:
   cluster object and the tool manages only what it is granted here.
 - **A grant's target must be declared** — the foreign-key-target rule applied
   to permissions — or be a `schema::` target. `validate` refuses the rest.
+- **PostgreSQL serial access**: INSERT on a declared table implies USAGE on
+  all sequences its serial columns own (DEC-1892.1). Explicit
+  `sequence::app.orders.id: [usage, select, update]` grants accept only those
+  three words and require a declared serial column (`ValueSource::Sequence`),
+  never an identity or plain column. SQL Server refuses this target by name.
+  Explicit and implied USAGE are unioned: removing either source keeps the
+  privilege while the other holds it. Pull writes only non-implied USAGE and
+  all SELECT and UPDATE; implied access remains an internal table marker.
+  Grants on sequences no accepted serial owns remain limitations. Sequence
+  names are resolved through the column when statements run; table/column
+  renames and recreated sequences retain the declared access (DEC-2199.1).
 - **Roles carry identity.** Drop + add would destroy membership, which the
   declarations cannot restore, so a role has an `r_` uid in the ids file
   (5.1), a rename needs intent (`pbps rename-role`, or `renamed_from:`) and is

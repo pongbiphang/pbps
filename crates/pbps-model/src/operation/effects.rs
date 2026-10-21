@@ -1069,6 +1069,7 @@ impl Cx<'_> {
             GrantTarget::Routine(routine) => {
                 Some(ObjectKey::Module(crate::ModuleId::Routine(routine.clone())))
             }
+            GrantTarget::Sequence(c) => self.table(&c.table).ok().map(ObjectKey::Table),
             GrantTarget::Schema(_) => None,
         }
     }

@@ -94,6 +94,8 @@ pub enum GrantTarget {
     Routine(crate::module::RoutineId),
     /// Every object in a schema, present and future.
     Schema(String),
+    /// The owned sequence of one declared serial column (DEC-2199.1).
+    Sequence(crate::ColumnRef),
 }
 
 impl GrantTarget {
@@ -103,6 +105,7 @@ impl GrantTarget {
             GrantTarget::Object(o) => &o.schema,
             GrantTarget::Routine(r) => &r.name.schema,
             GrantTarget::Schema(s) => s,
+            GrantTarget::Sequence(c) => &c.table.schema,
         }
     }
 }
@@ -126,6 +129,10 @@ impl fmt::Display for RawGrantTarget<'_> {
             GrantTarget::Object(o) => o.raw().fmt(f),
             GrantTarget::Routine(r) => r.raw().fmt(f),
             GrantTarget::Schema(s) => write!(f, "schema::{s}"),
+            GrantTarget::Sequence(c) => {
+                f.write_str("sequence::")?;
+                c.raw().fmt(f)
+            }
         }
     }
 }
@@ -139,6 +146,7 @@ impl fmt::Display for ShownGrantTarget<'_> {
             GrantTarget::Object(o) => o.shown().fmt(f),
             GrantTarget::Routine(r) => r.shown().fmt(f),
             GrantTarget::Schema(s) => write!(f, "schema::{}", crate::escape::Escaped(s)),
+            GrantTarget::Sequence(c) => write!(f, "sequence::{}", c.shown()),
         }
     }
 }
@@ -147,6 +155,12 @@ impl FromStr for GrantTarget {
     type Err = NameError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.get(..10)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sequence::"))
+        {
+            return s[10..].parse().map(GrantTarget::Sequence);
+        }
+
         // Not trimmed, on either side of the prefix. Measured on SQL Server
         // 2025: `CREATE SCHEMA [ app]` keeps its padding, `pull` renders the
         // target as a quoted `"schema:: app"`, and a trimmed reload named a
@@ -311,6 +325,16 @@ pub fn implied_serial_grants(schema: &mut crate::Schema) {
         })
         .map(|(name, _)| name)
         .collect();
+    let serial_columns: BTreeSet<_> = schema
+        .tables
+        .iter()
+        .flat_map(|(table, t)| {
+            t.columns
+                .iter()
+                .filter(|(_, c)| matches!(c.value_source, crate::ValueSource::Sequence(_)))
+                .map(|(name, _)| table.column(name))
+        })
+        .collect();
     for role in schema.roles.values_mut() {
         for (target, permissions) in &mut role.grants {
             if matches!(target, GrantTarget::Object(table) if serial_tables.contains(table))
@@ -319,7 +343,59 @@ pub fn implied_serial_grants(schema: &mut crate::Schema) {
                 permissions.insert(Permission::SerialSequences);
             }
         }
+        let implied: BTreeSet<_> = role
+            .grants
+            .iter()
+            .filter_map(|(target, rights)| match target {
+                GrantTarget::Object(table) if rights.contains(&Permission::SerialSequences) => {
+                    Some(table.clone())
+                }
+                GrantTarget::Object(_)
+                | GrantTarget::Sequence(_)
+                | GrantTarget::Routine(_)
+                | GrantTarget::Schema(_) => None,
+            })
+            .collect();
+        role.grants.retain(|target, rights| {
+            if let GrantTarget::Sequence(column) = target
+                && implied.contains(&column.table)
+                && serial_columns.contains(column)
+            {
+                rights.remove(&Permission::Usage);
+            }
+            !rights.is_empty()
+        });
     }
+}
+
+/// Expand the table marker into the actual column permissions for comparisons.
+/// The marker and explicit USAGE describe one ACL entry, never two revocations.
+pub fn effective_grants(
+    role: &Role,
+    tables: &BTreeMap<crate::TableName, crate::Table>,
+) -> BTreeMap<GrantTarget, BTreeSet<Permission>> {
+    let mut grants = role.grants.clone();
+    for (target, rights) in &role.grants {
+        if let GrantTarget::Object(table) = target
+            && rights.contains(&Permission::SerialSequences)
+        {
+            if let Some(t) = tables.get(table) {
+                for (name, column) in &t.columns {
+                    if matches!(column.value_source, crate::ValueSource::Sequence(_)) {
+                        grants
+                            .entry(GrantTarget::Sequence(table.column(name.clone())))
+                            .or_default()
+                            .insert(Permission::Usage);
+                    }
+                }
+            }
+            if let Some(rights) = grants.get_mut(target) {
+                rights.remove(&Permission::SerialSequences);
+            }
+        }
+    }
+    grants.retain(|_, rights| !rights.is_empty());
+    grants
 }
 
 /// What a role declaration must satisfy before anything is generated from it.
@@ -380,6 +456,29 @@ pub fn check(schema: &crate::schema::Schema) -> Vec<String> {
                         routine = routine.shown(),
                         name = name.shown()
                     ));
+                }
+                GrantTarget::Sequence(column) => {
+                    if !schema
+                        .tables
+                        .get(&column.table)
+                        .and_then(|table| table.columns.get(&column.name))
+                        .is_some_and(|c| matches!(c.value_source, crate::ValueSource::Sequence(_)))
+                    {
+                        problems.push(format!(
+                            "role `{}`: grants on `{}`, which must name a declared serial column with an owned sequence",
+                            name.shown(), target.shown()
+                        ));
+                    }
+                    for permission in permissions {
+                        if ![Permission::Usage, Permission::Select, Permission::Update]
+                            .contains(permission)
+                        {
+                            problems.push(format!(
+                                "role `{}`: `{permission}` on `{}` is not a sequence permission; use usage, select or update",
+                                name.shown(), target.shown()
+                            ));
+                        }
+                    }
                 }
                 GrantTarget::Object(_) | GrantTarget::Routine(_) | GrantTarget::Schema(_) => {}
             }
@@ -672,5 +771,172 @@ mod tests {
         );
         b.roles.insert(("r".to_owned()).into(), role);
         assert_eq!(a, b);
+    }
+    #[test]
+    fn sequence_targets_round_trip_and_require_a_declared_serial_and_sequence_words() {
+        let target: GrantTarget = "SEQUENCE::dbo.customer.id".parse().unwrap();
+        assert_eq!(
+            target,
+            GrantTarget::Sequence("dbo.customer.id".parse().unwrap())
+        );
+        assert_eq!(target.raw().to_string(), "sequence::dbo.customer.id");
+        assert_eq!(target.schema(), "dbo");
+        assert_eq!(
+            serde_json::from_str::<GrantTarget>(&serde_json::to_string(&target).unwrap()).unwrap(),
+            target
+        );
+        for bad in [
+            "sequence::",
+            "sequence::dbo.customer",
+            "sequence::dbo..id",
+            "sequence::dbo.customer.id.extra",
+            "sequencë::dbo.customer.id",
+        ] {
+            assert!(bad.parse::<GrantTarget>().is_err(), "{bad}");
+        }
+        let mut schema = schema_with_table();
+        schema.roles.insert(
+            "reader".into(),
+            Role {
+                grants: [(target.clone(), [Permission::Usage].into())].into(),
+                ..Default::default()
+            },
+        );
+        for source in [
+            crate::ValueSource::None,
+            crate::ValueSource::Identity(crate::Identity::new(1, 1)),
+            crate::ValueSource::Sequence(crate::OwnedSequence::serial()),
+        ] {
+            schema
+                .tables
+                .get_mut(&"dbo.customer".parse().unwrap())
+                .unwrap()
+                .columns["id"]
+                .value_source = source.clone();
+            for permission in Permission::ALL {
+                schema
+                    .roles
+                    .get_mut("reader")
+                    .unwrap()
+                    .grants
+                    .insert(target.clone(), [permission].into());
+                let problems = check(&schema);
+                let valid_source = matches!(source, crate::ValueSource::Sequence(_));
+                let valid_word = [Permission::Usage, Permission::Select, Permission::Update]
+                    .contains(&permission);
+                assert_eq!(
+                    problems.is_empty(),
+                    valid_source && valid_word,
+                    "{source:?} {permission}: {problems:?}"
+                );
+                assert!(
+                    problems
+                        .iter()
+                        .all(|p| p.contains("sequence::dbo.customer.id"))
+                );
+                if !valid_word {
+                    assert!(problems.iter().any(|p| p.contains(permission.as_str())));
+                }
+            }
+        }
+        schema
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .columns
+            .clear();
+        assert!(
+            check(&schema)
+                .iter()
+                .any(|p| p.contains("sequence::dbo.customer.id"))
+        );
+        schema.tables.clear();
+        assert!(
+            check(&schema)
+                .iter()
+                .any(|p| p.contains("sequence::dbo.customer.id"))
+        );
+    }
+
+    #[test]
+    fn explicit_usage_and_insert_have_one_effective_sequence_privilege() {
+        let mut schema = schema_with_table();
+        schema
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .columns["id"]
+            .value_source = crate::ValueSource::Sequence(crate::OwnedSequence::serial());
+        schema.roles.insert(
+            "writer".into(),
+            Role {
+                grants: [
+                    ("dbo.customer".parse().unwrap(), [Permission::Insert].into()),
+                    (
+                        "sequence::dbo.customer.id".parse().unwrap(),
+                        [Permission::Usage, Permission::Select].into(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+        );
+        implied_serial_grants(&mut schema);
+        let role = &schema.roles["writer"];
+        assert_eq!(
+            role.grants[&"sequence::dbo.customer.id".parse().unwrap()],
+            [Permission::Select].into()
+        );
+        assert_eq!(
+            effective_grants(role, &schema.tables)[&"sequence::dbo.customer.id".parse().unwrap()],
+            [Permission::Usage, Permission::Select].into()
+        );
+        assert!(
+            !effective_grants(role, &schema.tables)[&"dbo.customer".parse().unwrap()]
+                .contains(&Permission::SerialSequences)
+        );
+        let mut plain = schema.clone();
+        plain
+            .roles
+            .get_mut("writer")
+            .unwrap()
+            .grants
+            .remove(&"dbo.customer".parse().unwrap());
+        assert_eq!(
+            effective_grants(&plain.roles["writer"], &plain.tables)
+                [&"sequence::dbo.customer.id".parse().unwrap()],
+            [Permission::Select].into()
+        );
+    }
+    #[test]
+    fn the_insert_implication_does_not_hide_invalid_explicit_targets() {
+        let mut schema = schema_with_table();
+        let table = schema
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap();
+        let mut serial = Column::new("integer".parse().unwrap());
+        serial.value_source = crate::ValueSource::Sequence(crate::OwnedSequence::serial());
+        table.columns.insert("serial_id".into(), serial);
+        for invalid in ["id", "missing"] {
+            schema.roles.insert(
+                "writer".into(),
+                Role {
+                    grants: [
+                        ("dbo.customer".parse().unwrap(), [Permission::Insert].into()),
+                        (
+                            GrantTarget::Sequence(
+                                "dbo.customer".parse::<TableName>().unwrap().column(invalid),
+                            ),
+                            [Permission::Usage].into(),
+                        ),
+                    ]
+                    .into(),
+                    ..Default::default()
+                },
+            );
+            implied_serial_grants(&mut schema);
+            assert!(!check(&schema).is_empty(), "{invalid}");
+        }
     }
 }

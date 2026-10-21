@@ -3757,6 +3757,7 @@ pub(crate) fn permissions_the_managed_set_keeps<'a>(
             Some(pbps_model::GrantTarget::Routine(r)) => modules
                 .iter()
                 .any(|id| matches!(id, ModuleId::Routine(other) if other == r)),
+            Some(pbps_model::GrantTarget::Sequence(c)) => managed_tables.contains(&c.table),
             Some(pbps_model::GrantTarget::Schema(_)) | None => true,
         })
         .map(|u| u.what.as_str())
@@ -4379,9 +4380,9 @@ fn refuse_pinned_movement(
     // permissions it adds and the ones it takes away, kept apart because the
     // comparison below reconstructs the set rather than excusing it.
     type Permissions = BTreeSet<pbps_model::Permission>;
-    let mut granting: BTreeMap<(&pbps_model::RoleName, &pbps_model::GrantTarget), Permissions> =
+    let mut granting: BTreeMap<(pbps_model::RoleName, pbps_model::GrantTarget), Permissions> =
         BTreeMap::new();
-    let mut revoking: BTreeMap<(&pbps_model::RoleName, &pbps_model::GrantTarget), Permissions> =
+    let mut revoking: BTreeMap<(pbps_model::RoleName, pbps_model::GrantTarget), Permissions> =
         BTreeMap::new();
     // The columns this plan changes, under the table they are on, and the
     // objects it removes outright. Both are things the plan does to a
@@ -4399,7 +4400,22 @@ fn refuse_pinned_movement(
                 pbps_model::PermissionChange::Granted(p) => (&mut granting, p),
                 pbps_model::PermissionChange::Revoked(p) => (&mut revoking, p),
             };
-            side.entry((role, target)).or_default().extend(permissions);
+            let one = pbps_model::Role {
+                grants: [(target.clone(), permissions.clone())].into(),
+                ..Default::default()
+            };
+            // Statements carrying the marker operate on the sequences present
+            // when they run; grants follow creations, revokes precede drops.
+            let grant_tables = if matches!(p.change, pbps_model::Change::Grant { .. }) {
+                &after.tables
+            } else {
+                &before.tables
+            };
+            for (target, permissions) in pbps_model::role::effective_grants(&one, grant_tables) {
+                side.entry((role.clone(), target))
+                    .or_default()
+                    .extend(permissions);
+            }
         }
         for column in p.change.columns() {
             columns.entry(column.table).or_default().insert(column.name);
@@ -4840,8 +4856,8 @@ fn refuse_pinned_movement(
         .roles
         .iter()
         .map(|(name, role)| {
-            let grants = role
-                .grants
+            let effective = pbps_model::role::effective_grants(role, &before.tables);
+            let grants = effective
                 .iter()
                 // A grant on an object this plan drops goes with it: the engine
                 // removes a permission with its securable, so `diff_roles`
@@ -4850,6 +4866,29 @@ fn refuse_pinned_movement(
                 // By whole identity: dropping one overload leaves the
                 // sibling's grants standing, and standing grants are compared.
                 .filter(|(target, _)| !gone.iter().any(|d| d.takes(target)))
+                .filter(|(target, _)| {
+                    let pbps_model::GrantTarget::Sequence(column) = target else {
+                        return true;
+                    };
+                    use pbps_model::plan_names::{At, Holder};
+                    let Holder::Tracked(column_uid) = names.column_holder(column, At::Start) else {
+                        return true;
+                    };
+                    // The baseline uses starting names; a drop or numbering
+                    // change uses the names at its step. Only the UID survives
+                    // both renames and another column taking the vacated name.
+                    !changes.changes.iter().any(|p| {
+                        if let pbps_model::Change::DropColumn { uid, .. } = &p.change {
+                            return uid == column_uid;
+                        }
+                        if let pbps_model::Change::AlterColumnNumbering { uid, to, .. } = &p.change
+                        {
+                            return uid == column_uid
+                                && !matches!(to, pbps_model::ValueSource::Sequence(_));
+                        }
+                        false
+                    })
+                })
                 .map(|(target, held)| {
                     let target = match target {
                         pbps_model::GrantTarget::Object(object) => {
@@ -4861,6 +4900,21 @@ fn refuse_pinned_movement(
                         // beside a table `app.f`, and forwarding the routine's
                         // grant through the table's rename refused the apply
                         // for a grant that had, rightly, not moved.
+                        pbps_model::GrantTarget::Sequence(column) => {
+                            use pbps_model::plan_names::{At, Holder};
+                            let final_column = match names.column_holder(column, At::Start) {
+                                Holder::Tracked(uid) => names
+                                    .column_at(uid, At::End)
+                                    .and_then(|(table, name)| {
+                                        names
+                                            .table_at(table, At::End)
+                                            .map(|table| table.column(name))
+                                    })
+                                    .unwrap_or_else(|| column.clone()),
+                                Holder::Vacant | Holder::Unmanaged => column.clone(),
+                            };
+                            pbps_model::GrantTarget::Sequence(final_column)
+                        }
                         routine @ pbps_model::GrantTarget::Routine(_) => routine.clone(),
                         schema @ pbps_model::GrantTarget::Schema(_) => schema.clone(),
                     };
@@ -4876,11 +4930,24 @@ fn refuse_pinned_movement(
             )
         })
         .collect();
+    let after_roles: BTreeMap<_, _> = after
+        .roles
+        .iter()
+        .map(|(name, role)| {
+            (
+                name.clone(),
+                pbps_model::Role {
+                    description: role.description.clone(),
+                    grants: pbps_model::role::effective_grants(role, &after.tables),
+                },
+            )
+        })
+        .collect();
     let named_role = |n: &pbps_model::RoleName| roles.contains(n);
     compare(
         "role ",
         &before_roles,
-        &after.roles,
+        &after_roles,
         named_role,
         |_: &pbps_model::RoleName, was: &pbps_model::Role, now: &pbps_model::Role| was == now,
         &mut moved,
@@ -4926,8 +4993,7 @@ fn refuse_pinned_movement(
         grants: BTreeMap::new(),
     };
     let touched_roles = carried.iter().copied().chain(
-        after
-            .roles
+        after_roles
             .keys()
             .filter(|name| named_role(name) && !carried_roles.contains(*name))
             .map(|name| (name, &no_grants)),
@@ -4939,7 +5005,7 @@ fn refuse_pinned_movement(
         }
         // Every pair already uses its destination. A new role under a vacated
         // source name must not follow the old holder's rename (DEC-1988.1).
-        let Some(now) = after.roles.get(now_name) else {
+        let Some(now) = after_roles.get(now_name) else {
             // Created or dropped: named by the change that does it, and there
             // is no pair of grant sets to compare.
             continue;
@@ -4958,8 +5024,8 @@ fn refuse_pinned_movement(
                 granting
                     .keys()
                     .chain(revoking.keys())
-                    .filter(|(role, _)| *role == now_name)
-                    .map(|(_, target)| *target),
+                    .filter(|(role, _)| role == now_name)
+                    .map(|(_, target)| target),
             )
             .collect();
         for target in targets {
@@ -4971,8 +5037,12 @@ fn refuse_pinned_movement(
             // straight away was recorded as the plan's result (DECISIONS 160).
             let mut expected: Permissions = was.grants.get(target).cloned().unwrap_or_default();
             let mut held = now.grants.get(target).cloned().unwrap_or_default();
-            let adds = granting.get(&(now_name, target)).unwrap_or(&empty);
-            let removes = revoking.get(&(now_name, target)).unwrap_or(&empty);
+            let adds = granting
+                .get(&(now_name.clone(), target.clone()))
+                .unwrap_or(&empty);
+            let removes = revoking
+                .get(&(now_name.clone(), target.clone()))
+                .unwrap_or(&empty);
             match settled {
                 // Every statement has run, so what the plan asked for is part
                 // of the answer.

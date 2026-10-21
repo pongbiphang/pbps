@@ -2145,6 +2145,11 @@ fn securable(
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        GrantTarget::Sequence(_) => {
+            return Err(invalid(
+                "serial sequence grants require execution-time resolution".into(),
+            ));
+        }
         GrantTarget::Schema(s) => format!("SCHEMA {}", quote(s)?),
     })
 }
@@ -2232,6 +2237,35 @@ fn grant_statements(
     permissions: &BTreeSet<Permission>,
     revoke: bool,
 ) -> Result<Vec<Statement>, DialectError> {
+    if let GrantTarget::Sequence(column) = target {
+        if permissions
+            .iter()
+            .any(|p| ![Permission::Usage, Permission::Select, Permission::Update].contains(p))
+        {
+            return Err(invalid(format!(
+                "`{}` takes only usage, select and update",
+                target.shown()
+            )));
+        }
+        permission_list(permissions, target)?;
+        let sets: Vec<_> = if revoke {
+            permissions.iter().map(|p| BTreeSet::from([*p])).collect()
+        } else {
+            vec![permissions.clone()]
+        };
+        return sets.into_iter().map(|set| {
+            let (action, direction) = if revoke { ("REVOKE", "FROM") } else { ("GRANT", "TO") };
+            // pg_get_serial_sequence follows ownership, including custom and
+            // truncated names. %s is safe for its already quoted regclass text.
+            let body = format!(
+                "DECLARE pbps_sequence pg_catalog.text;\nBEGIN\n    pbps_sequence := pg_catalog.pg_get_serial_sequence({}, {});\n    IF pbps_sequence IS NULL THEN\n        RAISE EXCEPTION 'serial sequence is absent';\n    END IF;\n    EXECUTE pg_catalog.format('{action} {} ON SEQUENCE %s {direction} %I', pbps_sequence, {});\nEND",
+                literal(&qualified(&column.table)?), literal(column.name.raw()),
+                permission_list(&set, target)?, literal(role.raw()),
+            );
+            let tag = dollar_tag(&body);
+            Ok(Statement::new(format!("DO {tag}\n{body}\n{tag};")))
+        }).collect();
+    }
     let mut ordinary = permissions.clone();
     let serial = ordinary.remove(&Permission::SerialSequences);
     let mut statements = Vec::new();
@@ -9656,5 +9690,62 @@ mod tests {
                 "{variable} used unlabelled: {sql}"
             );
         }
+    }
+    #[test]
+    fn explicit_sequence_statements_resolve_the_column_without_guessing_its_sequence_name() {
+        let pg = Postgres::new();
+        for revoke in [false, true] {
+            let target = GrantTarget::Sequence(TableName::new("app", "t'$pbps$").column("id'"));
+            let permissions = [Permission::Usage, Permission::Select, Permission::Update].into();
+            let change = if revoke {
+                Change::Revoke {
+                    role: "reader'".into(),
+                    target,
+                    permissions,
+                }
+            } else {
+                Change::Grant {
+                    role: "reader'".into(),
+                    target,
+                    permissions,
+                }
+            };
+            let statements = pg.emit(&change, Strategy::default()).unwrap();
+            assert_eq!(statements.len(), if revoke { 3 } else { 1 });
+            for stmt in statements {
+                let sql = stmt.sql;
+                assert!(sql.starts_with("DO $pbps1$"), "{sql}");
+                assert!(sql.contains("pg_catalog.pg_get_serial_sequence"), "{sql}");
+                assert!(sql.contains("ON SEQUENCE %s"), "{sql}");
+                assert!(sql.contains("reader''"), "{sql}");
+                assert!(
+                    !sql.contains("search_path") && !sql.contains(" = "),
+                    "{sql}"
+                );
+                assert!(!sql.contains("_seq") || sql.contains("pg_get_serial_sequence"));
+            }
+        }
+        for permission in Permission::ALL {
+            let change = Change::Grant {
+                role: "reader".into(),
+                target: "sequence::app.t.id".parse().unwrap(),
+                permissions: [permission].into(),
+            };
+            assert_eq!(
+                pg.emit(&change, Strategy::default()).is_ok(),
+                [Permission::Usage, Permission::Select, Permission::Update].contains(&permission)
+            );
+        }
+        assert!(
+            pg.emit(
+                &Change::Grant {
+                    role: "reader".into(),
+                    target: "sequence::app.t.id".parse().unwrap(),
+                    permissions: BTreeSet::new()
+                },
+                Strategy::default()
+            )
+            .is_err()
+        );
     }
 }

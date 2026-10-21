@@ -1258,6 +1258,8 @@ impl Dropped {
         use crate::role::GrantTarget;
         match (self, target) {
             (Dropped::Table(t), GrantTarget::Object(o)) => o == t,
+            (Dropped::Table(t), GrantTarget::Sequence(c)) => &c.table == t,
+            (Dropped::Module(_), GrantTarget::Sequence(_)) => false,
             (Dropped::Module(id), GrantTarget::Object(o)) => {
                 matches!(id, ModuleId::Named(n) if n == o)
             }

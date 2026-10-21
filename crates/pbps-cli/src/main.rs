@@ -1902,7 +1902,8 @@ pub(crate) fn routine_ids_as_the_dialect_spells_them(
                     }
                 }
                 other @ (pbps_model::GrantTarget::Object(_)
-                | pbps_model::GrantTarget::Schema(_)) => other.clone(),
+                | pbps_model::GrantTarget::Schema(_)
+                | pbps_model::GrantTarget::Sequence(_)) => other.clone(),
             };
             if let Some(first) = spelled_from.get(&spelled) {
                 problems.push(format!(

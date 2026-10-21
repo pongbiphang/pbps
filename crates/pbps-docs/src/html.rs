@@ -387,6 +387,10 @@ mod tests {
                         [Permission::Usage].into(),
                     ),
                     (
+                        "sequence::dbo.t.id".parse().unwrap(),
+                        [Permission::Usage].into(),
+                    ),
+                    (
                         "public.report(integer)".parse().unwrap(),
                         [Permission::Execute].into(),
                     ),
@@ -399,6 +403,7 @@ mod tests {
             .insert("pending_access".into(), Role::default());
         let out = render(&schema, &IdsFile::default(), "Schema");
         for expected in [
+            "<tr><td><code>sequence::dbo.t.id</code></td><td>usage</td></tr>",
             "<h2>Roles</h2>",
             "<h3><code>dbo.t</code></h3>",
             "<p>Read-only reporting</p>",
