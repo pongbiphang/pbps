@@ -359,7 +359,9 @@ rename refuses only where it changes a retained policy's deparsed predicate:
 ordinary local scalar predicates and schema-only moves keeping a whole-row
 alias apply cleanly. Table/column renames under unmanaged policy owners also
 apply cleanly and do not enter these rename refusals. Whole owner-table
-drops release their policies before referenced table/column/routine teardown;
+drops release their policies before referenced table/column/routine teardown,
+including sequence references reached through column ownership in `pg_depend`.
+Renames and retypes preserve those sequences and need no such release edge;
 cycles still require individual policy planning from #1173. Policies are not
 silently rebuilt or removed by this slice.
 

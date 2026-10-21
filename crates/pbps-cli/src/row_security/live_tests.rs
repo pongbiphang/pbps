@@ -338,11 +338,124 @@ async fn check(connection: String, owner: String) {
         error.contains("tenant_rows") && error.contains("arrives with #1173"),
         "{error}"
     );
+    policy_sequence_bindings(&mut conn).await;
     policy_owner_drop_releases_column(&mut conn).await;
     policy_owner_teardowns(&mut conn).await;
     conn.execute("ALTER TABLE app.t DROP COLUMN extra; ROLLBACK")
         .await
         .unwrap();
+}
+
+async fn policy_sequence_bindings(conn: &mut Conn) {
+    conn.execute(
+        "CREATE SEQUENCE app.unowned_policy_sequence;
+         CREATE TABLE app.sequence_input (
+             id integer, identity_target integer GENERATED ALWAYS AS IDENTITY,
+             serial_target serial, unowned integer DEFAULT nextval('app.unowned_policy_sequence'));
+         CREATE TABLE app.sequence_owner(id integer);
+         CREATE POLICY identity_gate ON app.sequence_owner
+             USING (nextval('app.sequence_input_identity_target_seq')>0);
+         CREATE POLICY serial_gate ON app.sequence_owner
+             WITH CHECK (nextval('app.sequence_input_serial_target_seq')>0);
+         CREATE POLICY unowned_gate ON app.sequence_owner
+             USING (nextval('app.unowned_policy_sequence')>0);",
+    )
+    .await
+    .unwrap();
+    let input = TableName::new("app", "sequence_input");
+    let owner = TableName::new("app", "sequence_owner");
+    for (name, policy) in [
+        ("identity_target", "identity_gate"),
+        ("serial_target", "serial_gate"),
+    ] {
+        let column = input.column(name);
+        assert!(
+            pbps_pg::modules::policies_on_column(conn, &column)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let found = pbps_pg::modules::policies_on_column_removal(conn, &column)
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            vec![pbps_pg::modules::PolicyDependent {
+                table: owner.clone(),
+                name: policy.into(),
+            }]
+        );
+        let table_uid = Uid::derived(UidKind::Table, "sequence_input", 0);
+        let column_uid = Uid::derived(UidKind::Column, name, 0);
+        let mut ids = IdsFile::default();
+        ids.tables.insert(table_uid, input.clone());
+        ids.columns.insert(column_uid.clone(), column.clone());
+        let mut final_ids = ids.clone();
+        final_ids.columns.remove(&column_uid);
+        let changes = ChangeSet {
+            changes: vec![PlannedChange::new(Change::DropColumn {
+                uid: column_uid,
+                column,
+            })],
+        };
+        let error = crate::engine::check_module_dependents(
+            conn,
+            &changes,
+            &Default::default(),
+            &final_ids,
+            &ids,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains(policy)
+                && error.contains("sequence_owner")
+                && error.contains("arrives with #1173"),
+            "{error}"
+        );
+    }
+    // Merely defaulting from another sequence conveys no ownership, and an
+    // unrelated column is not bound just because its table owns a sequence.
+    for name in ["id", "unowned"] {
+        assert!(
+            pbps_pg::modules::policies_on_column_removal(conn, &input.column(name))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let found = pbps_pg::modules::policies_on_table(conn, &input)
+        .await
+        .unwrap();
+    assert_eq!(
+        found.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        vec!["identity_gate", "serial_gate"]
+    );
+    // Both engines preserve these sequence bindings through retype/rename;
+    // those reads must not acquire removal-only policy release requirements.
+    conn.execute(
+        "ALTER TABLE app.sequence_input ALTER COLUMN identity_target TYPE bigint;
+         ALTER TABLE app.sequence_input ALTER COLUMN serial_target TYPE bigint;
+         ALTER TABLE app.sequence_input RENAME COLUMN identity_target TO renamed_target;",
+    )
+    .await
+    .unwrap();
+    for name in ["renamed_target", "serial_target"] {
+        assert!(
+            pbps_pg::modules::policies_on_column(conn, &input.column(name))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            pbps_pg::modules::policies_on_column_removal(conn, &input.column(name))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }
 
 async fn policy_owner_drop_releases_column(conn: &mut Conn) {

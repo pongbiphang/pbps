@@ -3448,9 +3448,9 @@ mod definer_path_tests {
     }
 }
 
-/// Policies that actually bind this stored attribute. Relation-only edges
-/// (including EXISTS SELECT FROM) do not block a column alteration, measured
-/// on 16 and 18, and must not be expanded into every attribute.
+/// Catalog-proven policy dependents. Relation-only edges (including EXISTS
+/// SELECT FROM) do not block a column alteration, measured on 16 and 18, and
+/// must not be expanded into every attribute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDependent {
     pub table: TableName,
@@ -3467,53 +3467,90 @@ impl PolicyDependent {
     }
 }
 
+/// Direct attribute bindings, for edits that preserve its owned sequences.
 pub async fn policies_on_column(
     conn: &mut Conn,
     column: &pbps_model::ColumnRef,
 ) -> Result<Vec<PolicyDependent>, DbError> {
-    require_the_callers_transaction(conn).await?;
-    let rows = conn.query_with(
-        "SELECT DISTINCT p.polname, n.nspname, own.relname
-           FROM pg_catalog.pg_attribute a
-           JOIN pg_catalog.pg_class t ON t.oid = a.attrelid
-           JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
-           JOIN pg_catalog.pg_depend d ON d.refclassid = 'pg_catalog.pg_class'::regclass
-                AND d.refobjid = t.oid AND d.refobjsubid = a.attnum
-           JOIN pg_catalog.pg_policy p ON d.classid = 'pg_catalog.pg_policy'::regclass AND p.oid = d.objid
-           JOIN pg_catalog.pg_class own ON own.oid = p.polrelid
-           JOIN pg_catalog.pg_namespace n ON n.oid = own.relnamespace
-          WHERE tn.nspname = $1 AND t.relname = $2 AND a.attname = $3 AND a.attnum > 0 AND NOT a.attisdropped
-          ORDER BY 2, 3, 1",
-        &[Param::Str(&column.table.schema), Param::Str(&column.table.name), Param::Str(column.name.raw())]).await?;
-    rows.iter()
-        .map(|row| {
-            Ok(PolicyDependent {
-                name: text(row, "polname")?,
-                table: TableName::new(text(row, "nspname")?, text(row, "relname")?),
-            })
-        })
-        .collect()
+    policies_on_relation(conn, &column.table, Some(&column.name), false).await
 }
 
-/// All policy references to a stored table, including relation-only and
-/// attribute edges. Its own policies disappear automatically with the table.
+/// Column removal also removes every sequence it owns. Policies bind those
+/// sequences, not the owning attribute; renames and retypes keep them alive.
+pub async fn policies_on_column_removal(
+    conn: &mut Conn,
+    column: &pbps_model::ColumnRef,
+) -> Result<Vec<PolicyDependent>, DbError> {
+    policies_on_relation(conn, &column.table, Some(&column.name), true).await
+}
+
+/// All policy references to a stored table or its owned sequences, including
+/// relation-only and attribute edges. Its own policies disappear with it.
 pub async fn policies_on_table(
     conn: &mut Conn,
     table: &TableName,
 ) -> Result<Vec<PolicyDependent>, DbError> {
+    policies_on_relation(conn, table, None, true).await
+}
+
+async fn policies_on_relation(
+    conn: &mut Conn,
+    table: &TableName,
+    column: Option<&pbps_model::ColumnName>,
+    removal: bool,
+) -> Result<Vec<PolicyDependent>, DbError> {
     require_the_callers_transaction(conn).await?;
+    let mut params = vec![Param::Str(&table.schema), Param::Str(&table.name)];
+    let (attribute, subid, selected, external) = if let Some(column) = column {
+        params.push(Param::Str(column.raw()));
+        (
+            "JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid",
+            "a.attnum",
+            "AND a.attname=$3 AND a.attnum>0 AND NOT a.attisdropped",
+            "",
+        )
+    } else {
+        (
+            "",
+            "0",
+            "",
+            "WHERE p.polrelid NOT IN (SELECT oid FROM target)",
+        )
+    };
+    // Follow ownership from pg_depend, never a generated sequence spelling
+    // or a default expression. Both serial (a) and identity (i) sequences
+    // disappear with their owning column, including a whole-table removal.
+    let owned = if removal {
+        "UNION
+         SELECT s.oid, 0 FROM target t
+         JOIN pg_catalog.pg_depend ownership
+           ON ownership.refclassid='pg_catalog.pg_class'::regclass
+          AND ownership.refobjid=t.oid AND ownership.refobjsubid>0
+          AND (t.subid=0 OR ownership.refobjsubid=t.subid)
+          AND ownership.classid='pg_catalog.pg_class'::regclass
+          AND ownership.objsubid=0 AND ownership.deptype IN ('a','i')
+         JOIN pg_catalog.pg_class s ON s.oid=ownership.objid AND s.relkind='S'"
+    } else {
+        ""
+    };
     let rows = conn.query_with(
-        "SELECT DISTINCT p.polname, n.nspname, own.relname
-           FROM pg_catalog.pg_class t
-           JOIN pg_catalog.pg_namespace tn ON tn.oid = t.relnamespace
-           JOIN pg_catalog.pg_depend d ON d.refclassid = 'pg_catalog.pg_class'::regclass
-                AND d.refobjid = t.oid
-           JOIN pg_catalog.pg_policy p ON d.classid = 'pg_catalog.pg_policy'::regclass AND p.oid = d.objid
-           JOIN pg_catalog.pg_class own ON own.oid = p.polrelid
-           JOIN pg_catalog.pg_namespace n ON n.oid = own.relnamespace
-          WHERE tn.nspname = $1 AND t.relname = $2 AND p.polrelid <> t.oid
-          ORDER BY 2, 3, 1",
-        &[Param::Str(&table.schema), Param::Str(&table.name)]).await?;
+        &format!("WITH target AS (
+            SELECT t.oid, {subid} AS subid FROM pg_catalog.pg_class t
+            JOIN pg_catalog.pg_namespace tn ON tn.oid=t.relnamespace
+            {attribute}
+            WHERE tn.nspname=$1 AND t.relname=$2 {selected}
+         ), referenced AS (
+            SELECT oid, subid FROM target {owned}
+         )
+         SELECT DISTINCT p.polname, n.nspname, own.relname
+           FROM referenced r
+           JOIN pg_catalog.pg_depend d ON d.refclassid='pg_catalog.pg_class'::regclass
+                AND d.refobjid=r.oid AND (r.subid=0 OR d.refobjsubid=r.subid)
+           JOIN pg_catalog.pg_policy p ON d.classid='pg_catalog.pg_policy'::regclass AND p.oid=d.objid
+           JOIN pg_catalog.pg_class own ON own.oid=p.polrelid
+           JOIN pg_catalog.pg_namespace n ON n.oid=own.relnamespace
+          {external}
+          ORDER BY 2,3,1"), &params).await?;
     rows.iter()
         .map(|row| {
             Ok(PolicyDependent {

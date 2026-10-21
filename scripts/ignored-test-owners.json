@@ -692,6 +692,7 @@
         "row_security_adoption_preserves_policies_during_an_unrelated_column_migration",
         "row_security_column_renames_refuse_only_bound_policies",
         "row_security_created_policies_follow_routines_and_converge_after_apply_and_bootstrap",
+        "row_security_owned_sequence_removals_follow_policy_owner_drops",
         "row_security_renames_preserve_unmanaged_policy_owners",
         "row_security_policy_targets_must_exist_before_planning_or_bootstrap",
         "row_security_resolver_plans_apply_and_preserve_adopted_policies",

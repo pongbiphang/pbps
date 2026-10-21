@@ -31611,3 +31611,159 @@ fn row_security_policy_targets_must_exist_before_planning_or_bootstrap() {
         assert_eq!(json["data"]["changes"], 0, "{json}");
     }
 }
+
+/// Sequence ownership, not its spelling or the policy's direct column edges,
+/// makes a column/table removal wait for the table releasing that policy.
+#[test]
+#[ignore = "needs both live PostgreSQL versions"]
+fn row_security_owned_sequence_removals_follow_policy_owner_drops() {
+    for variable in ["PBPS_TEST_PG_OLD_DB", "PBPS_TEST_PG_DB"] {
+        let base = std::env::var(variable).unwrap();
+        for (kind, definition) in [
+            ("identity", "integer GENERATED ALWAYS AS IDENTITY"),
+            ("serial", "serial"),
+        ] {
+            for whole_table in [false, true] {
+                let slug = format!("rls_sequence1172_{kind}_{whole_table}");
+                let own = OwnDatabase::new(&base, &slug);
+                let connection = own.connection();
+                // a_input sorts before z_owner in the ordinary table-drop
+                // class, so both removal shapes need the catalog release edge.
+                on_server(
+                    connection,
+                    &format!(
+                        "CREATE SCHEMA app;
+                     CREATE TABLE app.a_input(id integer, target {definition});
+                     ALTER SEQUENCE app.a_input_target_seq RENAME TO \"number source\";
+                     INSERT INTO app.a_input(id) VALUES (7);
+                     CREATE TABLE app.z_owner(id integer);
+                     CREATE POLICY sequence_gate ON app.z_owner
+                       USING (nextval('app.\"number source\"'::regclass)>0)
+                       WITH CHECK (currval('app.\"number source\"'::regclass)>0);
+                     ALTER TABLE app.z_owner ENABLE ROW LEVEL SECURITY;"
+                    ),
+                );
+                let d = Demo::new(&slug);
+                succeeds(d.run(&["pull", "--db", connection]));
+                d.commit();
+                succeeds(d.run(&[
+                    "baseline",
+                    "--db",
+                    connection,
+                    "--reason",
+                    "adopt sequence-bound policy",
+                ]));
+                let input_path = d.dir.join("schema/app.a_input.yml");
+                // A sequence reference does not bind its column's spelling.
+                // Keep the earlier unbound-rename control on this same shape.
+                let original = std::fs::read_to_string(&input_path).unwrap();
+                std::fs::write(
+                    &input_path,
+                    rename_pulled_policy_column(&original, "target", "renamed_target"),
+                )
+                .unwrap();
+                let predicate = text_of(
+                    connection,
+                    "SELECT pg_get_expr(polqual,polrelid) FROM pg_policy WHERE polname='sequence_gate'",
+                );
+                policy_rename_applies_and_replans_empty(&d, connection);
+                assert_eq!(
+                    text_of(
+                        connection,
+                        "SELECT pg_get_expr(polqual,polrelid) FROM pg_policy WHERE polname='sequence_gate'"
+                    ),
+                    predicate
+                );
+                assert_eq!(
+                    text_of(
+                        connection,
+                        "SELECT pg_get_serial_sequence('app.a_input','renamed_target')"
+                    ),
+                    "app.\"number source\""
+                );
+
+                if whole_table {
+                    std::fs::remove_file(&input_path).unwrap();
+                    succeeds(d.run(&[
+                        "drop-table",
+                        "app.a_input",
+                        "--reason",
+                        "retire sequence input",
+                    ]));
+                } else {
+                    let table = std::fs::read_to_string(&input_path).unwrap();
+                    let mut removing = false;
+                    let edited = table
+                        .lines()
+                        .filter(|line| {
+                            if !line.starts_with("   ") {
+                                removing = *line == "  renamed_target:";
+                            }
+                            !removing
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        + "\n";
+                    assert!(!edited.contains("  renamed_target:"), "{edited}");
+                    assert_ne!(table, edited);
+                    std::fs::write(&input_path, edited).unwrap();
+                    succeeds(d.run(&[
+                        "drop",
+                        "app.a_input.renamed_target",
+                        "--reason",
+                        "retire sequence input",
+                    ]));
+                }
+                std::fs::remove_file(d.dir.join("schema/app.z_owner.yml")).unwrap();
+                succeeds(d.run(&[
+                    "drop-table",
+                    "app.z_owner",
+                    "--reason",
+                    "retire policy owner",
+                ]));
+                let plan = connected_artifact(&d, connection, false);
+                let saved: pbps_model::SavedPlan =
+                    serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+                assert!(
+                    matches!(&saved.changes.changes[..], [owner, removal]
+                    if matches!(&owner.change, pbps_model::Change::DropTable { name, .. } if name.name=="z_owner")
+                    && if whole_table {
+                        matches!(&removal.change, pbps_model::Change::DropTable { name, .. } if name.name=="a_input")
+                    } else {
+                        matches!(&removal.change, pbps_model::Change::DropColumn { column, .. }
+                            if column.table.name=="a_input" && column.name.raw()=="renamed_target")
+                    }),
+                    "{:?}",
+                    saved.changes
+                );
+                succeeds(approved_apply(
+                    &d,
+                    connection,
+                    &plan,
+                    &["--allow", "destructive"],
+                ));
+                succeeds(d.run(&["verify", "--db", connection]));
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT (to_regclass('app.\"number source\"') IS NULL)::int::bigint"
+                    ),
+                    1
+                );
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT count(*) FROM pg_policy WHERE polname='sequence_gate'"
+                    ),
+                    0
+                );
+                if !whole_table {
+                    assert_eq!(scalar(connection, "SELECT id::bigint FROM app.a_input"), 7);
+                }
+                let next = succeeds(d.run(&["plan", "--db", connection, "--format", "json"]));
+                let next: serde_json::Value = serde_json::from_str(&stdout(&next)).unwrap();
+                assert_eq!(next["data"]["changes"], 0, "{next}");
+            }
+        }
+    }
+}

@@ -5359,7 +5359,12 @@ async fn policy_dependents(
             names.column_at(uid, pbps_model::plan_names::At::Start)
             && let Some(table) = names.table_at(owner, pbps_model::plan_names::At::Start)
         {
-            pbps_pg::modules::policies_on_column(conn, &table.column(column)).await?
+            let column = table.column(column);
+            if matches!(&step.change, pbps_model::Change::DropColumn { .. }) {
+                pbps_pg::modules::policies_on_column_removal(conn, &column).await?
+            } else {
+                pbps_pg::modules::policies_on_column(conn, &column).await?
+            }
         } else {
             // A newly created column has no old catalog bindings.
             Vec::new()
