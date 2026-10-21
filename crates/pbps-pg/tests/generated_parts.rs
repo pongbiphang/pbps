@@ -841,3 +841,132 @@ fn creation_risks_require_all_installations_before_every_row_write() {
     }
     assert!(generated::risks(&unrelated, &ids, &pg)[install + 1].is_empty());
 }
+
+#[test]
+fn partition_membership_and_default_moves_cannot_certify_empty_creation() {
+    use pbps_model::{ChangeSet, PartitionBound, PartitionOf, PlannedChange, RiskClass};
+    let (mut schema, _) = fixture();
+    let parent = TableName::new("app", "a");
+    if let ValueSource::Generated(g) =
+        &mut schema.tables.get_mut(&parent).unwrap().columns["g"].value_source
+    {
+        g.expression = "app.f(z)".into();
+    }
+    let mut ids = identities(&schema);
+    let child = TableName::new("app", "child");
+    let leaf = TableName::new("app", "leaf");
+    let default = TableName::new("app", "default");
+    for (uid, name) in [
+        ("t_015036", &child),
+        ("t_015037", &leaf),
+        ("t_015038", &default),
+    ] {
+        ids.tables.insert(uid.parse().unwrap(), name.clone());
+    }
+    let pg = Postgres::new().with_server_version(180_000);
+    let create = PlannedChange::new(Change::CreateTable {
+        uid: ids.table_uid(&parent).unwrap().clone(),
+        name: parent.clone(),
+        table: Box::new(schema.tables[&parent].clone()),
+        beside_default: None,
+        moves_at_most: None,
+    });
+    let parts = generated::parts(
+        &create,
+        &ids,
+        &planned_functions(&schema),
+        &Default::default(),
+        &pg,
+    )
+    .unwrap()
+    .unwrap();
+    let install = parts
+        .iter()
+        .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        .unwrap();
+    let partition = |name: &TableName, parent: &TableName, source: Option<TableName>| {
+        PlannedChange::new(Change::CreateTable {
+            uid: ids.table_uid(name).unwrap().clone(),
+            name: name.clone(),
+            table: Box::new(Table {
+                partition_of: Some(PartitionOf {
+                    parent: parent.clone(),
+                    bound: PartitionBound::Default,
+                    columns: Default::default(),
+                }),
+                ..Default::default()
+            }),
+            beside_default: source,
+            moves_at_most: Some(1),
+        })
+    };
+    let row = |name: &TableName| {
+        PlannedChange::new(Change::InsertRow {
+            table: name.clone(),
+            key_column: "id".into(),
+            identity_key: false,
+            key: "1".into(),
+            row: Default::default(),
+            defaults: Default::default(),
+            types: Default::default(),
+        })
+    };
+    let attach = PlannedChange::new(Change::AttachPartition {
+        uid: ids.table_uid(&child).unwrap().clone(),
+        table: child.clone(),
+        parent: parent.clone(),
+        bound: PartitionBound::Default,
+        key: vec![],
+        shape: Box::default(),
+    });
+    let detach = PlannedChange::new(Change::DetachPartition {
+        uid: ids.table_uid(&child).unwrap().clone(),
+        table: child.clone(),
+        parent: parent.clone(),
+        names: vec![],
+        shape: Box::default(),
+    });
+    let drop = PlannedChange::new(Change::DropTable {
+        uid: ids.table_uid(&child).unwrap().clone(),
+        name: child.clone(),
+        detach_from: Some(parent.clone()),
+    });
+    for (writes, narrowing) in [
+        (vec![attach.clone()], true),
+        (vec![detach], true),
+        (vec![drop], true),
+        (vec![partition(&child, &parent, Some(default))], true),
+        (vec![partition(&child, &parent, None)], false),
+        (vec![partition(&child, &parent, None), row(&child)], true),
+        (
+            vec![
+                partition(&child, &parent, None),
+                partition(&leaf, &child, None),
+                row(&leaf),
+            ],
+            true,
+        ),
+        (vec![row(&child)], false),
+    ] {
+        let mut cs = ChangeSet {
+            changes: parts.clone(),
+        };
+        cs.changes.splice(install..install, writes.clone());
+        let mut final_ids = ids.clone();
+        for write in &writes {
+            if let Change::DropTable { uid, .. } = &write.change {
+                final_ids.tables.remove(uid);
+            }
+        }
+        PlanNames::of(&cs.changes, &final_ids).expect("each pin has a valid identity history");
+        let risks = generated::risks(&cs, &final_ids, &pg);
+        assert_eq!(
+            risks[install + writes.len()].contains(&RiskClass::Narrowing),
+            narrowing,
+            "{writes:?}"
+        );
+    }
+    let mut safe = ChangeSet { changes: parts };
+    safe.changes.push(attach);
+    assert!(!generated::risks(&safe, &ids, &pg)[install].contains(&RiskClass::Narrowing));
+}

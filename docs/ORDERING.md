@@ -578,6 +578,10 @@ is proven to resolve only the relation name; the reverse regclass pair still
 uses prefix edges. Creation risks require every installation before every row
 write into that table identity (DEC-1503.4). Selection walks the same lexical
 and declared module dependency edges as settlement (DEC-1503.5).
+The exhaustive structural classification also puts partition creates and
+attachments after their parent's complete columns. Attachments introduce
+standing rows for risk derivation, as do writes through current partition
+ancestors and DEFAULT moves (DEC-1503.6).
 
 ## Value flow
 

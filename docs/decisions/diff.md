@@ -7609,3 +7609,74 @@ Pinned by `transitive_table_readers_use_placeholders_and_keep_old_holds`,
 `placeholder_creates_do_not_claim_the_installed_expressions_bindings`,
 and the live `transitive_table_readers_apply_placeholders_or_keep_the_named_hold`
 and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.
+
+<a id="dec-1503-6"></a>
+
+**DEC-1503.6. One exhaustive Change classification supplies structural
+complete-table consumers and row writes for generated creation parts.**
+An attachment needs both the child's and the parent's complete columns.
+Ordering only newly created partitions left an ordinary standing table's
+ATTACH against the prefix. The existing structural edge now starts at
+`complete` for either form. The retained whole-table path uses the same
+classification, including offline and PostgreSQL 16. No pass or rank is added.
+
+Attaching a standing table also introduces its possibly populated rows into
+the parent. An attachment before any expression installation therefore loses
+the family's empty-table risk context, including `narrowing`, in ordinary
+planning and saved-plan validation. The derivation uses PlanNames at each
+step and records partition membership by UID: writes through a child reach
+all its current ancestors, including after renames. Detaching or deleting
+rows never restores an empty-table proof. A DEFAULT move records its source,
+new destination and parent; it cannot borrow an ordinary empty CREATE.
+
+The table below is exhaustive over Change kinds. "Write" means an operation
+that invalidates the empty-table proof; it includes removals conservatively.
+Column DDL can convert, fill or recompute existing values but cannot populate
+an empty table, so it does not invalidate that proof by itself. Such changes
+retain their intrinsic risks unless the existing creation-part eligibility
+rule explicitly admits them. A creation part follows its own column and
+validator chain rather than depending on itself as an external consumer.
+Installed expressions and module definitions additionally use the existing
+lexical references, with only proven relation-name references using the
+prefix (DEC-1503.4).
+
+| Change kind | Needs the complete table | Write invalidating emptiness |
+| --- | --- | --- |
+| `CreateTable`, ordinary | No; it supplies the table | No |
+| `CreateTable`, partition | Parent | No for an empty new partition; with `beside_default`, destination, DEFAULT source and parent are writes |
+| `AttachPartition` | Child and parent | Child and parent, even without declared DML |
+| `DetachPartition` | Child and parent | Child and parent; removal does not prove emptiness |
+| `DropTable` | No; only relation identity is needed | Dropped table and `detach_from` parent |
+| `RenameTable` | No; only relation identity is needed | No; identity and membership survive the rename |
+| `AddColumn`, `DropColumn`, `RenameColumn` | Owner, except the creation's own installation chain | No; filling or removing columns does not introduce rows |
+| `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`, `AlterColumnNumbering` | Column owner, except the creation's own installation chain | No; conversion and recomputation preserve an empty row set; defaults and numbering govern later writes |
+| `AddComputedColumn`, `DropComputedColumn` | Owner; SQL Server-only forms remain classified | No; computing or removing values does not introduce rows |
+| `SetColumnDeprecated` | Column owner | No |
+| `SetPartitionDefault`, `SetPartitionNotNull` | Partition | No; inherited/default definitions and validation do not introduce rows |
+| `SetPrimaryKey`, `AddUnique`, `DropUnique`, `DropForeignKey`, `AddCheck`, `DropCheck`, `AddIndex`, `DropIndex` | Owner, except the creation's own validator chain | No; validations and physical index work do not introduce rows |
+| `AddForeignKey` | Owner and referenced table, plus its supplied key | No; installing a cascading action does not execute it |
+| `InsertRow`, `UpdateRow`, `DeleteRow` | Written table; existing row/validator/trigger ordering remains | Written table and its current partition ancestors |
+| `CreateModule`, `AlterModule` | Trigger's `on` table and tables/types named by the definition | No at installation; a trigger or routine body is installed, not invoked. Its execution belongs to the invoking row operation |
+| `DropModule` | No | No; dropping a trigger or routine does not execute it |
+| `SetReplicaIdentity`, `SetStorageParameters`, `SetTablePersistence`, `SetIndexStorageParameters` | No; existing object identities suffice | No; physical storage rewrites preserve an empty row set |
+| `SetDataMode`, `SetEnsureKeys` | No; recorded declaration metadata | No; their DML is represented separately |
+| `CreateRole`, `DropRole`, `RenameRole`, `Grant`, `Revoke`, `PublicExecution` | No; name/permission operations | No |
+
+There is no separate inherit, copy, move-rows, truncate or trigger-execution
+Change variant. Partition inheritance is represented by CreateTable's
+`partition_of`, AttachPartition and DetachPartition; DEFAULT row copying and
+moving is represented by CreateTable's `beside_default`. The exhaustive match
+has no wildcard arm, so adding any future kind requires this decision again.
+Every kind has a unit pin, including trigger installation, DEFAULT moves,
+detach and the metadata-only negatives.
+
+Pinned by
+`every_change_kind_has_its_complete_shape_and_row_write_classification_pinned`,
+`attachments_follow_complete_columns_and_unsplit_attachments_keep_their_order`,
+`saved_creation_part_risks_require_a_preceding_create_of_the_same_table`,
+and the live
+`attached_generated_partitions_use_complete_shapes_and_preserve_recomputation_risks`.
+The live test executes connected and offline choices on PostgreSQL 16 and 18,
+keeps the whole-table fallback where SET EXPRESSION is unavailable, and on 18
+measures the populated attachment's recomputation with the required narrowing
+risk after rejecting a saved artifact that clears it.

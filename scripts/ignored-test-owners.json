@@ -183,6 +183,7 @@
         "dependents::generated_tests::generated_table_parts_apply_with_the_declared_column_order_values_and_names",
         "dependents::generated_tests::called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold",
         "dependents::generated_tests::transitive_table_readers_apply_placeholders_or_keep_the_named_hold",
+        "dependents::generated_tests::attachments::attached_generated_partitions_use_complete_shapes_and_preserve_recomputation_risks",
         "deploy::tests::a_probe_cannot_advance_a_sequence_named_in_a_declared_check",
         "deploy::tests::a_probe_is_answered_under_the_settings_the_statement_will_run_under",
         "deploy::tests::a_read_only_probe_still_refuses_a_violating_row",

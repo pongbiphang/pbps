@@ -5,6 +5,9 @@ use pbps_model::Generated;
 mod cases;
 use cases::shape;
 
+#[path = "generated_attachment_tests.rs"]
+mod attachments;
+
 pub(crate) fn ordinary(
     schema: &Schema,
     ids: &IdsFile,

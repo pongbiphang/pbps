@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Constraint, Schedule, Source};
 use pbps_dialect::Dialect;
+use pbps_model::TableName;
 use pbps_model::resolver::OrderReason;
 use pbps_model::{
     AddedRole, Change, ChangeSet, IdsFile, Module, ModuleDeps, ModuleId, ModuleKind, PlannedChange,
@@ -12,6 +13,118 @@ use pbps_model::{
 };
 
 pub const RULE: &str = "generated-new-table";
+
+/// Structural uses, separate from the lexical references in `texts`.
+/// Empty-table context is lost by row operations and membership changes,
+/// not by column DDL that can only rewrite rows already present (DEC-1503.6).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TableUse<'a> {
+    complete: Vec<&'a TableName>,
+    writes: Vec<&'a TableName>,
+    seed: Option<&'a TableName>,
+}
+
+fn table_use(change: &Change) -> TableUse<'_> {
+    let complete = |table| TableUse {
+        complete: vec![table],
+        ..Default::default()
+    };
+    match change {
+        Change::CreateTable {
+            name,
+            table,
+            beside_default,
+            ..
+        } => TableUse {
+            complete: table.partition_of.iter().map(|of| &of.parent).collect(),
+            writes: beside_default
+                .iter()
+                .flat_map(|source| {
+                    std::iter::once(name)
+                        .chain(std::iter::once(source))
+                        .chain(table.partition_of.iter().map(|of| &of.parent))
+                })
+                .collect(),
+            seed: None,
+        },
+        Change::AttachPartition { table, parent, .. }
+        | Change::DetachPartition { table, parent, .. } => TableUse {
+            complete: vec![table, parent],
+            writes: vec![table, parent],
+            seed: None,
+        },
+        Change::DropTable {
+            name, detach_from, ..
+        } => TableUse {
+            writes: std::iter::once(name).chain(detach_from).collect(),
+            ..Default::default()
+        },
+        Change::InsertRow { table, .. }
+        | Change::UpdateRow { table, .. }
+        | Change::DeleteRow { table, .. } => TableUse {
+            complete: vec![table],
+            writes: vec![table],
+            seed: Some(table),
+        },
+        Change::AddForeignKey {
+            table, constraint, ..
+        } => TableUse {
+            complete: vec![table, &constraint.references_table],
+            ..Default::default()
+        },
+        Change::AddColumn { table, .. }
+        | Change::RenameColumn { table, .. }
+        | Change::AddComputedColumn { table, .. }
+        | Change::DropComputedColumn { table, .. }
+        | Change::SetPartitionDefault { table, .. }
+        | Change::SetPartitionNotNull { table, .. }
+        | Change::SetPrimaryKey { table, .. }
+        | Change::AddUnique { table, .. }
+        | Change::DropUnique { table, .. }
+        | Change::DropForeignKey { table, .. }
+        | Change::AddCheck { table, .. }
+        | Change::DropCheck { table, .. }
+        | Change::AddIndex { table, .. }
+        | Change::DropIndex { table, .. } => complete(table),
+        Change::DropColumn { column, .. }
+        | Change::AlterColumnType { column, .. }
+        | Change::AlterColumnNullability { column, .. }
+        | Change::AlterColumnDefault { column, .. }
+        | Change::AlterColumnExpression { column, .. }
+        | Change::AlterColumnNumbering { column, .. }
+        | Change::SetColumnDeprecated { column, .. } => complete(&column.table),
+        Change::CreateModule { id, .. } | Change::AlterModule { id, .. } => TableUse {
+            // Installing a trigger binds its table but does not run its body.
+            // Invoking it is row work, ordered through the DML arm above.
+            complete: match id {
+                ModuleId::Trigger { on, .. } => vec![on],
+                ModuleId::Named(_) | ModuleId::Routine(_) => Vec::new(),
+            },
+            ..Default::default()
+        },
+        // These need only an existing name or change recorded metadata.
+        Change::RenameTable { .. }
+        | Change::SetReplicaIdentity { .. }
+        | Change::SetStorageParameters { .. }
+        | Change::SetTablePersistence { .. }
+        | Change::SetIndexStorageParameters { .. }
+        | Change::SetDataMode { .. }
+        | Change::SetEnsureKeys { .. }
+        | Change::DropModule { .. }
+        | Change::CreateRole { .. }
+        | Change::DropRole { .. }
+        | Change::RenameRole { .. }
+        | Change::Grant { .. }
+        | Change::Revoke { .. }
+        | Change::PublicExecution { .. } => TableUse::default(),
+    }
+}
+
+/// Structural consumers use the same rule for a split or a retained CREATE.
+/// Lexical expression and module references are handled by their callers.
+pub fn needs_complete(change: &Change, table: &TableName) -> bool {
+    table_use(change).complete.contains(&table)
+}
 
 #[allow(clippy::wildcard_enum_match_arm)]
 pub fn functions(changes: &[PlannedChange]) -> Vec<ModuleId> {
@@ -163,15 +276,45 @@ pub fn risks(cs: &ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Vec<BTreeS
         .then(|| PlanNames::of(&cs.changes, ids).ok())
         .flatten();
     let mut first_write = BTreeMap::new();
+    let mut parents = BTreeMap::new();
     for (at, p) in cs.changes.iter().enumerate() {
-        if matches!(
-            p.change,
-            Change::InsertRow { .. } | Change::UpdateRow { .. } | Change::DeleteRow { .. }
-        ) && let Some(table) = p.change.table()
-            && let Some(names) = &names
-            && let Holder::Tracked(owner) = names.holder(table, At::Before(at))
+        let Some(names) = &names else { continue };
+        // A row written through a partition is also a row of every ancestor.
+        // Resolve membership by UID so a rename cannot restore emptiness.
+        let membership = if let Change::CreateTable { uid, table, .. } = &p.change {
+            table.partition_of.as_ref().map(|of| (uid, &of.parent))
+        } else if let Change::AttachPartition { uid, parent, .. } = &p.change {
+            Some((uid, parent))
+        } else {
+            None
+        };
+        if let Some((child, parent)) = membership
+            && let Holder::Tracked(parent) = names.holder(parent, At::Before(at))
         {
-            first_write.entry(owner.clone()).or_insert(at);
+            parents.insert(child.clone(), parent.clone());
+        }
+        for table in table_use(&p.change).writes {
+            // A move from DEFAULT writes the newly created child too.
+            let boundary = if matches!(&p.change, Change::CreateTable { name, .. } if name == table)
+            {
+                At::After(at)
+            } else {
+                At::Before(at)
+            };
+            if let Holder::Tracked(owner) = names.holder(table, boundary) {
+                let mut owner = owner;
+                let mut visited = BTreeSet::new();
+                while visited.insert(owner.clone()) {
+                    first_write.entry(owner.clone()).or_insert(at);
+                    let Some(parent) = parents.get(owner) else {
+                        break;
+                    };
+                    owner = parent;
+                }
+            }
+        }
+        if let Change::DetachPartition { uid, .. } | Change::DropTable { uid, .. } = &p.change {
+            parents.remove(uid);
         }
     }
     let installations: BTreeSet<_> = cs
@@ -464,8 +607,13 @@ pub fn constraints(
             }
         }
         for (i, p) in cs.changes.iter().enumerate() {
-            if matches!(&p.change, Change::InsertRow { table, .. } | Change::UpdateRow { table, .. } | Change::DeleteRow { table, .. } if table == name)
-            {
+            let uses = table_use(&p.change);
+            // Creation parts have their own column/validator chain above.
+            // Every other structural consumer must wait for that chain.
+            if uses.complete.contains(&name) && !own.iter().any(|(part, _)| *part == i) {
+                edge(&mut out, complete, i);
+            }
+            if uses.seed == Some(name) {
                 edge(&mut out, complete, i);
                 for (part, p) in &own {
                     match &p.change {
@@ -500,10 +648,6 @@ pub fn constraints(
                     complete
                 };
                 edge(&mut out, shape, i);
-            }
-            if matches!(&p.change, Change::CreateTable { table, .. } if table.partition_of.as_ref().is_some_and(|of| &of.parent == name))
-            {
-                edge(&mut out, complete, i);
             }
         }
         for (i, p) in cs.changes.iter().enumerate() {
@@ -570,3 +714,7 @@ pub fn settle(
     *cs = settled.changes;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "generated_tests.rs"]
+mod tests;

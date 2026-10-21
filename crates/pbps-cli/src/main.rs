@@ -4734,6 +4734,38 @@ mod tests {
         safe_rows.changes.changes.push(write);
         validate_saved_plan(&safe_rows, &dialect)
             .expect("rows after installation retain creation context");
+        let mut attached = plan.clone();
+        let child = TableName::new("app", "child");
+        let child_uid = "t_015036".parse().unwrap();
+        attached.ids.tables.insert(child_uid, child.clone());
+        let attach = PlannedChange::new(Change::AttachPartition {
+            uid: attached.ids.table_uid(&child).unwrap().clone(),
+            table: child,
+            parent: name.clone(),
+            bound: pbps_model::PartitionBound::Default,
+            key: vec!["id".into()],
+            shape: Box::new(Table::default()),
+        });
+        attached.changes.changes.insert(1, attach.clone());
+        let encoded = serde_json::to_vec(&attached).unwrap();
+        attached = serde_json::from_slice(&encoded).unwrap();
+        assert!(
+            validate_saved_plan(&attached, &dialect)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent risks"),
+            "attached standing rows retain narrowing"
+        );
+        attached.changes.changes[2]
+            .risks
+            .insert(RiskClass::Narrowing);
+        validate_saved_plan(&attached, &dialect)
+            .expect("attachment before installation retains narrowing");
+        attached.changes.changes.remove(1);
+        attached.changes.changes[1].risks.clear();
+        attached.changes.changes.push(attach);
+        validate_saved_plan(&attached, &dialect)
+            .expect("attachment after installation preserves empty creation");
         let mut different = plan.clone();
         let other = TableName::new("app", "other");
         if let Change::CreateTable { uid, name, .. } = &mut different.changes.changes[0].change {

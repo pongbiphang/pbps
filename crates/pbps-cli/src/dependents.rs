@@ -4104,6 +4104,9 @@ fn names_column(change: &Change, table: &TableName, column: &str, partitions: &P
 /// that names no table is held to anything.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn touches(change: &Change, table: &TableName) -> bool {
+    if pbps_diff::order::generated::needs_complete(change, table) {
+        return true;
+    }
     match change {
         Change::AddForeignKey {
             table: t,
