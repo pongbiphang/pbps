@@ -191,6 +191,9 @@ jobs:
       # And that no operation key holds a uid a caller made up, and no
       # operation or its id can be serialized into a saved plan (#1961).
       - run: cargo test -p pbps-model --doc
+      # Intermediate settlements and external draft copies grant no SQL
+      # emission authority (DEC-1959.5).
+      - run: cargo test -p pbps-diff --doc
 
   # Development happens on Linux, so Windows coverage rests entirely on this
   # job: line endings, path separators and terminal detection are the kinds of

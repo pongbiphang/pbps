@@ -23,24 +23,33 @@
 //! name slots and its evidence (DEC-1968.2).
 
 pub mod commute;
+mod companions;
 pub mod edges;
 pub mod expand;
 pub mod generated;
 pub mod new_tables;
+pub(crate) mod normalization;
 pub mod parent_defaults;
 mod plan;
+pub(crate) mod rename_order;
+pub(crate) mod resolver_finish;
+pub(crate) mod resolver_prepare;
+pub mod resolver_remap;
 mod rewrites;
 pub(crate) mod roles;
 pub mod row_security;
+mod saved;
 pub mod schedule;
 pub mod shadow;
 pub mod slots;
 pub mod verify;
+pub mod writebacks;
 
 pub use edges::{Baseline, Because, Checks, Edge, Graph, Source, Unmet, graph};
-pub use plan::{OrderedPlan, PlanView};
+pub use plan::{OrderedPlan, PlanView, PlanningPlan, propose, singleton, take};
 pub use rewrites::before_rewrites;
 pub use roles::role_drops;
+pub use saved::{AdmissionError, AdmittedPlan, SealedPlan, admit, seal, validate_saved_plan};
 pub use schedule::{Constraint, Refusal, Schedule, Settled};
 pub use shadow::{Report, Shadowed, analyse};
 pub use verify::{Violation, verify};
@@ -55,3 +64,10 @@ mod schedule_tests;
 mod slot_tests;
 #[cfg(test)]
 mod tests;
+
+pub use companions::{
+    PublicDecisions, settle_public_execution, split_moving_defaults, take_public_execution,
+};
+pub use normalization::{drop_parameter_changes_of_rebuilt_indexes, normalize};
+
+pub use resolver_finish::reordered_operations;

@@ -21,6 +21,7 @@
 //! Pure over the dependents already read, so the ordering is testable without
 //! an engine; the reads are `engine::module_dependents`'.
 
+use pbps_diff::order::PlanningPlan;
 pub(crate) mod schedule;
 
 use pbps_model::ValueSource;
@@ -921,7 +922,7 @@ fn attached_at(changes: &[PlannedChange], holds: &Holds) -> Option<usize> {
 /// a change itself, `settle` does, over the edges each rewrite states
 /// (DEC-1958.2).
 fn weave(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
     sources: Sources<'_>,
@@ -1013,9 +1014,9 @@ fn weave(
         dialect,
         partitions,
     };
-    let given = std::mem::take(cs);
+    let given = pbps_diff::order::take(cs);
     #[cfg(test)]
-    let old = expansion_oracle::expand(given.clone(), &weave, expand::FACTOR);
+    let old = expansion_oracle::expand(given.changes().clone(), &weave, expand::FACTOR);
     let done = expand(given, &weave, expand::FACTOR);
     #[cfg(test)]
     split_oracle::same_expansion(&done, &old, dialect);
@@ -1025,7 +1026,7 @@ fn weave(
     // `CREATE`, as the differ's own do (#1483 review). The parameter change
     // it subsumes is removed after the driver, which cannot remove a logical
     // change (DEC-1958.4).
-    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut cs.changes, |p| &p.change);
+    pbps_diff::order::normalize(cs);
     Ok(added)
 }
 
@@ -1651,13 +1652,13 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
 // The complement is every change that writes no rows.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn split_new_tables(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
     dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> Result<usize, String> {
     #[cfg(test)]
-    let mut old = cs.clone();
+    let mut old = cs.changes().clone();
     #[cfg(test)]
     let expected = split_oracle::split_new_tables(&mut old, ids, deps, dialect);
 
@@ -1671,7 +1672,7 @@ fn split_new_tables(
 }
 
 fn expand_new_tables(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
     dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
@@ -1695,7 +1696,7 @@ fn expand_new_tables(
         dialect,
     };
     let before = cs.changes.len();
-    *cs = expand(std::mem::take(cs), &rule, expand::FACTOR)?.changes;
+    *cs = expand(pbps_diff::order::take(cs), &rule, expand::FACTOR)?.changes;
     Ok(generated + cs.changes.len() - before)
 }
 
@@ -1743,7 +1744,7 @@ mod expansion_oracle;
 /// as is one that would carry a change that could create a table, a column
 /// or a module: what rests on that is not read.
 fn before_its_partitions_indexes(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     declared: &Schema,
     dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> Result<(), String> {
@@ -1918,7 +1919,7 @@ fn before_its_partitions_indexes(
 /// over its range, a name it frees taken again, a row written into its
 /// parent: any of them in the stretch keeps the class order, and the
 /// pre-flight refuses the referencing rows by name, as before.
-fn after_the_rows_that_leave(cs: &mut ChangeSet, declared: &Schema) -> Result<(), String> {
+fn after_the_rows_that_leave(cs: &mut PlanningPlan, declared: &Schema) -> Result<(), String> {
     let referencing = |parent: &TableName| -> BTreeSet<&TableName> {
         declared
             .tables
@@ -2089,13 +2090,13 @@ fn rests_on(
 }
 
 fn after_their_parents_defaults(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     declared: &Schema,
     ids: &[&IdsFile],
     dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> Result<usize, String> {
     #[cfg(test)]
-    let mut old = cs.clone();
+    let mut old = cs.changes().clone();
     #[cfg(test)]
     let expected =
         parent_defaults_oracle::after_their_parents_defaults(&mut old, declared, ids, dialect);
@@ -2136,45 +2137,16 @@ mod parent_defaults_oracle;
 /// routine's create to another routine's revoke: a cycle where none exists.
 /// A decision depends only on its routine existing, so it is set aside and
 /// put back by [`settle_public_execution`] once the order is final.
-fn take_public_execution(cs: &mut ChangeSet) -> Vec<PlannedChange> {
-    let (decisions, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut cs.changes)
-        .into_iter()
-        .partition(|p| matches!(p.change, Change::PublicExecution { .. }));
-    cs.changes = rest;
-    decisions
+fn take_public_execution(cs: &mut PlanningPlan) -> pbps_diff::order::PublicDecisions {
+    pbps_diff::order::take_public_execution(cs)
 }
 
 /// Puts each `PUBLIC` decision back directly after the last `CREATE` or
 /// `ALTER` of its routine, which is where DEC-687.1 orders it. A decision
 /// on a routine this plan does not create or rebuild goes ahead of the roles
 /// and grants, where its class leaves it.
-fn settle_public_execution(cs: &mut ChangeSet, decisions: Vec<PlannedChange>) {
-    for decision in decisions {
-        let Change::PublicExecution { routine, .. } = &decision.change else {
-            cs.changes.push(decision);
-            continue;
-        };
-        let id = ModuleId::Routine(routine.clone());
-        let at = cs
-            .changes
-            .iter()
-            .rposition(|p| {
-                matches!(&p.change,
-                    Change::CreateModule { id: x, .. } | Change::AlterModule { id: x, .. } if *x == id)
-            })
-            .map(|i| i + 1)
-            .or_else(|| {
-                cs.changes.iter().position(|p| {
-                    matches!(
-                        p.change,
-                        Change::CreateRole { .. } | Change::Grant { .. } | Change::SetDataMode { .. }
-                        | Change::SetEnsureKeys { .. }
-                    )
-                })
-            })
-            .unwrap_or(cs.changes.len());
-        cs.changes.insert(at, decision);
-    }
+fn settle_public_execution(cs: &mut PlanningPlan, decisions: pbps_diff::order::PublicDecisions) {
+    pbps_diff::order::settle_public_execution(cs, decisions)
 }
 
 /// Moves what this plan adds that may call a function it creates or rebuilds
@@ -2216,7 +2188,7 @@ fn settle_public_execution(cs: &mut ChangeSet, decisions: Vec<PlannedChange>) {
 /// function the plan creates or rebuilds is placed by [`after_their_functions`].
 #[allow(clippy::wildcard_enum_match_arm)]
 fn after_the_rebuilds(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     released: &BTreeSet<ColumnRef>,
     deps: &ModuleDeps,
     declared: &pbps_model::Schema,
@@ -2415,102 +2387,12 @@ fn after_the_rebuilds(
 /// create and what is split off it carry the dialect's risks recomputed: a
 /// NOT NULL the create no longer sets is a risk of the change that does.
 fn split_moving_defaults(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     declared: &Schema,
     dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) {
     let functions = function_creates(cs);
-    let called_after = |text: &str, at: usize| {
-        functions
-            .iter()
-            .filter(|(f, created)| *created > at && pbps_pg::generated::may_call(text, f))
-            .map(|(_, created)| *created)
-            .max()
-    };
-    let late: BTreeSet<ColumnRef> = cs
-        .changes
-        .iter()
-        .enumerate()
-        .filter_map(|(j, p)| {
-            let Change::AddColumn {
-                table,
-                name,
-                column,
-                ..
-            } = &p.change
-            else {
-                return None;
-            };
-            column_expression(column)
-                .and_then(|text| called_after(text, j))
-                .map(|_| table.column(name))
-        })
-        .collect();
-    // Each split change, with the place it goes right after.
-    let mut sets: Vec<(usize, Change)> = Vec::new();
-    for (i, p) in cs.changes.iter_mut().enumerate() {
-        let Change::CreateTable {
-            uid,
-            name,
-            table,
-            beside_default: Some(_),
-            moves_at_most: _,
-        } = &mut p.change
-        else {
-            continue;
-        };
-        let Some(of) = table.partition_of.as_mut() else {
-            continue;
-        };
-        let parent = of.parent.clone();
-        let before = sets.len();
-        for (column, own) in &mut of.columns {
-            let added_late = late.contains(&parent.column(column));
-            let after = own
-                .default
-                .as_deref()
-                .and_then(|text| called_after(text, i));
-            if (after.is_some() || added_late)
-                && let Some(to) = own.default.take()
-            {
-                sets.push((
-                    after.unwrap_or(i),
-                    Change::SetPartitionDefault {
-                        uid: uid.clone(),
-                        table: name.clone(),
-                        parent: parent.clone(),
-                        column: column.clone(),
-                        from: None,
-                        to: Some(to),
-                        fallback: parent_default(declared, name, column.raw()),
-                    },
-                ));
-            }
-            if added_late && std::mem::take(&mut own.not_null) {
-                sets.push((
-                    i,
-                    Change::SetPartitionNotNull {
-                        uid: uid.clone(),
-                        table: name.clone(),
-                        column: column.clone(),
-                        not_null: true,
-                    },
-                ));
-            }
-        }
-        of.columns.retain(|_, c| c.default.is_some() || c.not_null);
-        if sets.len() > before {
-            p.risks = dialect.change_risks(&p.change);
-        }
-    }
-    // Each right after its place, inserted from the last place back so that
-    // the earlier places still hold; two after one place keep their order.
-    // One split off for a column the parent adds names that column, so the
-    // reorder holds it behind the column as it would have held the create.
-    sets.sort_by_key(|(after, _)| *after);
-    for (after, change) in sets.into_iter().rev() {
-        cs.changes.insert(after + 1, planned(change, dialect));
-    }
+    pbps_diff::order::split_moving_defaults(cs, declared, dialect, &functions);
 }
 
 /// The literals in the plan's expressions that may name a relation this plan
@@ -3656,12 +3538,12 @@ fn truncated(mut part: String) -> String {
 /// functions, with the two-plan remedy.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn after_their_functions(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     deps: &ModuleDeps,
     partitions: &Partitions,
 ) -> Result<usize, String> {
     #[cfg(test)]
-    let mut old = cs.clone();
+    let mut old = cs.changes().clone();
     #[cfg(test)]
     let expected = function_oracle::after_their_functions(&mut old, deps, partitions);
     let result = function_edges(cs, deps, partitions);
@@ -3679,7 +3561,7 @@ mod function_oracle;
 
 #[allow(clippy::wildcard_enum_match_arm)]
 fn function_edges(
-    cs: &mut ChangeSet,
+    cs: &mut PlanningPlan,
     deps: &ModuleDeps,
     partitions: &Partitions,
 ) -> Result<usize, String> {
@@ -4236,6 +4118,9 @@ mod part_effect_tests;
 mod physical_tests;
 
 #[cfg(test)]
+mod test_adapters;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn a_raw_qualified_row_type_matches_its_new_table_name() {
@@ -4253,6 +4138,10 @@ mod tests {
     }
 
     use super::fixture::{unaccounted, weave};
+    use super::test_adapters::{
+        after_the_rows_that_leave, after_their_parents_defaults, before_its_partitions_indexes,
+        settle_public_execution, split_moving_defaults, take_public_execution,
+    };
     use super::*;
     use pbps_model::{CheckConstraint, Column, Module, Table, TableName, Uid, UidKind};
 
@@ -4261,7 +4150,7 @@ mod tests {
         ids: &[&IdsFile],
         dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
     ) -> Result<usize, String> {
-        super::split_new_tables(cs, ids, &ModuleDeps::new(), dialect)
+        super::test_adapters::split_new_tables(cs, ids, &ModuleDeps::new(), dialect)
     }
 
     fn after_the_rebuilds(
@@ -4272,7 +4161,7 @@ mod tests {
         dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
     ) -> Result<usize, String> {
         let schedule = Schedule::new(cs.changes.len());
-        super::after_the_rebuilds(cs, released, deps, declared, schedule, dialect)
+        super::test_adapters::after_the_rebuilds(cs, released, deps, declared, schedule, dialect)
     }
 
     #[test]
@@ -5214,7 +5103,7 @@ mod tests {
             let sql = rendered(&cs);
             let schedule = Schedule::new(cs.changes.len());
             assert_eq!(
-                super::after_the_rebuilds(
+                super::test_adapters::after_the_rebuilds(
                     &mut cs,
                     &BTreeSet::new(),
                     &ModuleDeps::new(),
@@ -5254,7 +5143,7 @@ mod tests {
         order.edge(1, 0, Source::Effect, OrderReason::Identity);
         order.edge(0, 1, Source::Lexical, OrderReason::Structural);
         let original = cs.clone();
-        let why = super::after_the_rebuilds(
+        let why = super::test_adapters::after_the_rebuilds(
             &mut cs,
             &BTreeSet::new(),
             &ModuleDeps::new(),
@@ -5333,7 +5222,7 @@ mod tests {
             let original = cs.clone();
             let mut order = Schedule::new(cs.changes.len());
             order.edge(2, 0, Source::Effect, OrderReason::Identity);
-            let result = super::after_the_rebuilds(
+            let result = super::test_adapters::after_the_rebuilds(
                 &mut cs,
                 &BTreeSet::new(),
                 &ModuleDeps::new(),

@@ -72,7 +72,7 @@ fn analysed(
 fn settle(before: &Schema, after: &Schema, plan: ChangeSet) -> Result<ChangeSet, String> {
     let ids = IdsFile::default();
     order::before_rewrites(
-        plan,
+        pbps_diff::order::propose(plan),
         Side {
             schema: before,
             ids: &ids,
@@ -84,6 +84,7 @@ fn settle(before: &Schema, after: &Schema, plan: ChangeSet) -> Result<ChangeSet,
         &Mssql,
         &Default::default(),
     )
+    .map(|plan| plan.changes().clone())
 }
 fn release() -> Requirement {
     Requirement::BeforeRewrite(ObjectKey::Module(id("f")))
@@ -312,7 +313,7 @@ fn plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes() {
         },
     ]);
     let result = order::before_rewrites(
-        original.clone(),
+        pbps_diff::order::propose(original.clone()),
         Side {
             schema: &before,
             ids: &ids,
@@ -348,7 +349,7 @@ fn plans_without_before_rewrite_keep_identical_steps_sql_and_sealed_bytes() {
             ids.clone(),
         )
     };
-    let (old, new) = (seal(original), seal(result));
+    let (old, new) = (seal(original), seal(result.changes().clone()));
     assert_eq!(
         serde_json::to_vec(&old).unwrap(),
         serde_json::to_vec(&new).unwrap()
@@ -382,7 +383,7 @@ fn binding_releases_leave_computed_column_rebuilds_for_the_connected_stage() {
             changes: [1, 0, 2, 3, 4].map(|i| input.changes[i].clone()).to_vec(),
         };
         let result = order::before_rewrites(
-            input,
+            pbps_diff::order::propose(input),
             Side {
                 schema: &before,
                 ids: &ids,

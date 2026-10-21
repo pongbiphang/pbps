@@ -10,7 +10,7 @@ pub(super) fn split_new_tables(
     dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> Result<usize, String> {
     let empty = IdsFile::default();
-    let generated = pbps_diff::order::generated::expand(
+    let generated = pbps_diff::order::generated::legacy_expand(
         cs,
         ids.first().copied().unwrap_or(&empty),
         deps,
@@ -165,7 +165,7 @@ pub(super) fn same_plan(
 
 pub(super) fn same_expansion(
     actual: &Result<expand::Expanded, String>,
-    expected: &Result<expand::Expanded, String>,
+    expected: &Result<expansion_oracle::Expanded, String>,
     dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) {
     match (actual, expected) {
@@ -293,7 +293,9 @@ fn split_parts_match_the_frozen_plan_sql_and_checksum_for_32_uid_seeds() {
                     &dialect,
                     &Hints::default(),
                 )
-                .unwrap();
+                .unwrap()
+                .changes()
+                .clone();
                 match variant {
                     0 => {}
                     // No UID means a callable default stays in CREATE.
@@ -316,14 +318,23 @@ fn split_parts_match_the_frozen_plan_sql_and_checksum_for_32_uid_seeds() {
                 let mut expected = cs.clone();
                 let count =
                     split_new_tables(&mut expected, &[&ids], &ModuleDeps::new(), &dialect).unwrap();
-                let actual =
-                    super::split_new_tables(&mut cs, &[&ids], &ModuleDeps::new(), &dialect)
-                        .unwrap();
+                let actual = super::test_adapters::split_new_tables(
+                    &mut cs,
+                    &[&ids],
+                    &ModuleDeps::new(),
+                    &dialect,
+                )
+                .unwrap();
                 assert_eq!(actual, count);
                 same_plan(&cs, &expected, &dialect);
                 let once = cs.clone();
                 assert_eq!(
-                    super::split_new_tables(&mut cs, &[&ids], &ModuleDeps::new(), &dialect),
+                    super::test_adapters::split_new_tables(
+                        &mut cs,
+                        &[&ids],
+                        &ModuleDeps::new(),
+                        &dialect
+                    ),
                     Ok(0)
                 );
                 same_plan(&cs, &once, &dialect);
@@ -358,7 +369,12 @@ fn split_parts_match_the_frozen_plan_sql_and_checksum_for_32_uid_seeds() {
             };
             let given = no_functions.clone();
             assert_eq!(
-                super::split_new_tables(&mut no_functions, &[&ids], &ModuleDeps::new(), &dialect),
+                super::test_adapters::split_new_tables(
+                    &mut no_functions,
+                    &[&ids],
+                    &ModuleDeps::new(),
+                    &dialect
+                ),
                 Ok(0)
             );
             same_plan(&no_functions, &given, &dialect);

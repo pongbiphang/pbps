@@ -313,13 +313,23 @@ fn parent_default_restorations_match_old_bytes_for_32_uid_seeds() {
                         let expected_added =
                             placements.iter().filter(|&&position| position == 0).count();
                         assert_eq!(
-                            super::after_their_parents_defaults(&mut cs, &schema, &[&ids], &pg),
+                            super::test_adapters::after_their_parents_defaults(
+                                &mut cs,
+                                &schema,
+                                &[&ids],
+                                &pg
+                            ),
                             Ok(expected_added),
                             "{salt}/{version:?}/{placements:?}/{repeated}"
                         );
                         let once = cs.clone();
                         assert_eq!(
-                            super::after_their_parents_defaults(&mut cs, &schema, &[&ids], &pg),
+                            super::test_adapters::after_their_parents_defaults(
+                                &mut cs,
+                                &schema,
+                                &[&ids],
+                                &pg
+                            ),
                             Ok(0)
                         );
                         super::split_oracle::same_plan(&cs, &once, &pg);
@@ -361,7 +371,13 @@ fn restoration_compatibility_is_an_explicit_constraint_consumed_by_settle() {
         && e.after == 0
         && e.source == Source::Lexical
         && e.reason == OrderReason::Restoration));
-    assert_eq!(schedule.settle(cs).unwrap().sequence, [2, 1, 0]);
+    assert_eq!(
+        schedule
+            .settle(pbps_diff::order::propose(cs))
+            .unwrap()
+            .sequence,
+        [2, 1, 0]
+    );
 }
 
 #[test]
@@ -381,7 +397,7 @@ fn parent_default_negatives_add_nothing_and_missing_identity_is_refused_by_name(
         let mut cs = plan(changes, &pg);
         let original = cs.clone();
         assert_eq!(
-            super::after_their_parents_defaults(&mut cs, &schema, &[&ids], &pg),
+            super::test_adapters::after_their_parents_defaults(&mut cs, &schema, &[&ids], &pg),
             Ok(0)
         );
         super::split_oracle::same_plan(&cs, &original, &pg);
@@ -408,7 +424,12 @@ fn parent_default_negatives_add_nothing_and_missing_identity_is_refused_by_name(
         let mut cs = plan(vec![parent(&ids, "v", Some("app.f(1)"))], &pg);
         let original = cs.clone();
         assert_eq!(
-            super::after_their_parents_defaults(&mut cs, &declarations, &[&ids], &pg),
+            super::test_adapters::after_their_parents_defaults(
+                &mut cs,
+                &declarations,
+                &[&ids],
+                &pg
+            ),
             Ok(0)
         );
         super::split_oracle::same_plan(&cs, &original, &pg);
@@ -417,7 +438,7 @@ fn parent_default_negatives_add_nothing_and_missing_identity_is_refused_by_name(
     no_identity.tables.retain(|_, name| name != &partition(0));
     let mut cs = plan(vec![parent(&ids, "v", Some("app.f(1)"))], &pg);
     assert_eq!(
-        super::after_their_parents_defaults(&mut cs, &schema, &[&no_identity], &pg),
+        super::test_adapters::after_their_parents_defaults(&mut cs, &schema, &[&no_identity], &pg),
         Err("no identity names the partition `app.pa`".into())
     );
 }

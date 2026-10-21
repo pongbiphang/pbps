@@ -145,7 +145,7 @@ fn a_trigger_handover_is_pending_only_before_the_shared_schedule() {
             "an unsatisfied handover is enforced after scheduling"
         );
     }
-    let ordered = ops.reordered(&[1, 0]);
+    let ordered = crate::order::reordered_operations(&ops, &[1, 0]);
     assert!(
         !judge_slots(
             ordered.as_slice(),
@@ -209,7 +209,7 @@ impl Plan {
             schema: &self.after,
             ids: &self.after_ids,
         };
-        let ops = logical.reordered(order);
+        let ops = crate::order::reordered_operations(&logical, order);
         let slots = analyse(ops.as_slice(), &owners, before, dialect);
         let (violations, skipped) = verify(ops.as_slice(), &slots, dialect, facts, &owners, before);
         // The effects' replay on the same order: what the slots add to it.
@@ -336,7 +336,7 @@ fn a_claim_on_an_intermediate_name_held_at_that_statement_is_refused() {
         schema: &plan.before,
         ids: &plan.before_ids,
     };
-    let ops = logical.reordered(&[1, 0]);
+    let ops = crate::order::reordered_operations(&logical, &[1, 0]);
     let mut slots = analyse(ops.as_slice(), &owners, before, &exact);
     for fx in &mut slots.effects {
         fx.intermediate.clear();

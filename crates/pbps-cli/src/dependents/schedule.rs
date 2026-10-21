@@ -17,6 +17,7 @@
 //! passes run in `plan --db`'s order, and a caller that supplies the same
 //! facts gets the order it always got.
 
+use pbps_diff::order::PlanningPlan;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -141,7 +142,7 @@ impl fmt::Display for Skipped {
 /// The plan in its final order, and what it took to get there.
 #[derive(Debug)]
 pub(crate) struct Scheduled {
-    pub changes: ChangeSet,
+    pub changes: PlanningPlan,
     /// Changes the passes added: a dependent put back around a module, a
     /// partition's own default set again.
     pub added: usize,
@@ -181,7 +182,7 @@ impl std::error::Error for Refusal {}
 /// The plan is taken and returned rather than edited, so a refusal leaves no
 /// half-ordered plan behind.
 pub(crate) fn schedule(
-    mut cs: ChangeSet,
+    mut cs: PlanningPlan,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
     dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
@@ -299,14 +300,7 @@ pub(crate) fn schedule(
     {
         match facts.role_members {
             Some(members) => {
-                for p in &mut cs.changes {
-                    if let Change::DropRole {
-                        name, members: of, ..
-                    } = &mut p.change
-                    {
-                        *of = members.get(name).cloned().unwrap_or_default();
-                    }
-                }
+                pbps_diff::order::writebacks::role_members(&mut cs, members);
                 cs = pbps_diff::order::role_drops(cs).map_err(Refusal)?;
             }
             None => skipped.push(Skipped::RoleDrops),
@@ -392,10 +386,7 @@ pub(crate) fn schedule(
     }
     // The complete typed plan proves which additions finish a newly
     // generated table, even if an older lowering added them separately.
-    let risks = pbps_diff::order::generated::risks(&cs, declared.sources.after, dialect);
-    for (part, risks) in cs.changes.iter_mut().zip(risks) {
-        part.risks = risks;
-    }
+    pbps_diff::order::writebacks::creation_risks(&mut cs, declared.sources.after, dialect);
     // The verifier runs on the order this entry point settles, in tests and
     // debug builds (#1954, DEC-1954.6). On a connected SQL Server plan the
     // computed-column pass still follows, so that pair is recorded and not
@@ -645,7 +636,7 @@ mod tests {
         (schema, ids)
     }
 
-    fn differ_order(schema: &Schema, ids: &IdsFile) -> ChangeSet {
+    fn differ_order(schema: &Schema, ids: &IdsFile) -> PlanningPlan {
         pbps_diff::diff(
             pbps_diff::Side {
                 schema: &Schema::default(),
@@ -659,7 +650,7 @@ mod tests {
     }
 
     fn scheduled(
-        cs: ChangeSet,
+        cs: PlanningPlan,
         schema: &Schema,
         ids: &IdsFile,
         facts: &Facts<'_>,
@@ -1301,7 +1292,7 @@ mod tests {
         };
 
         fn after_the_rebuilds(
-            cs: &mut ChangeSet,
+            cs: &mut PlanningPlan,
             released: &BTreeSet<super::ColumnRef>,
             deps: &ModuleDeps,
             schema: &Schema,
@@ -1311,17 +1302,17 @@ mod tests {
             crate::dependents::after_the_rebuilds(cs, released, deps, schema, order, dialect)
         }
 
-        pub(super) fn bootstrap(mut cs: ChangeSet, schema: &Schema, ids: &IdsFile) -> ChangeSet {
+        pub(super) fn bootstrap(mut cs: PlanningPlan, schema: &Schema, ids: &IdsFile) -> ChangeSet {
             let decisions = take_public_execution(&mut cs);
             split_new_tables(&mut cs, &[ids], &ModuleDeps::new(), &pg()).unwrap();
             after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), schema, &pg())
                 .unwrap();
             after_their_parents_defaults(&mut cs, schema, &[ids], &pg()).unwrap();
             settle_public_execution(&mut cs, decisions);
-            cs
+            cs.changes().clone()
         }
 
-        pub(super) fn connected(mut cs: ChangeSet, schema: &Schema, ids: &IdsFile) -> ChangeSet {
+        pub(super) fn connected(mut cs: PlanningPlan, schema: &Schema, ids: &IdsFile) -> ChangeSet {
             let decisions = take_public_execution(&mut cs);
             let both = [ids, &IdsFile::default()];
             split_new_tables(&mut cs, &both, &ModuleDeps::new(), &pg()).unwrap();
@@ -1331,7 +1322,7 @@ mod tests {
             after_their_parents_defaults(&mut cs, schema, &both, &pg()).unwrap();
             before_its_partitions_indexes(&mut cs, schema, &pg()).unwrap();
             settle_public_execution(&mut cs, decisions);
-            cs
+            cs.changes().clone()
         }
     }
 
@@ -1404,12 +1395,18 @@ mod tests {
         )]);
         let nothing = ModuleDependents::from([(id("app.f(integer)"), Vec::new())]);
 
-        let offline = scheduled(plan(), &schema, &ids, &Facts::default()).unwrap();
+        let offline = scheduled(
+            pbps_diff::order::propose(plan()),
+            &schema,
+            &ids,
+            &Facts::default(),
+        )
+        .unwrap();
         assert_eq!(offline.skipped, [Skipped::Weave]);
         assert_eq!(offline.changes, plan());
 
         let empty = scheduled(
-            plan(),
+            pbps_diff::order::propose(plan()),
             &schema,
             &ids,
             &Facts::default().with_module_dependents(&nothing),
@@ -1418,7 +1415,7 @@ mod tests {
         assert_eq!(empty.skipped, []);
 
         let refused = scheduled(
-            plan(),
+            pbps_diff::order::propose(plan()),
             &schema,
             &ids,
             &Facts::default().with_module_dependents(&stranger),
@@ -1471,7 +1468,7 @@ mod tests {
         let sql_server = pbps_mssql::Mssql;
         let run = |facts: &Facts<'_>| {
             schedule(
-                plan(),
+                pbps_diff::order::propose(plan()),
                 &Declarations {
                     schema: &schema,
                     sources: Sources {
@@ -1520,7 +1517,7 @@ mod tests {
         super::role_order_oracle::legacy_order(&mut expected);
         assert_eq!(connected.changes, expected);
         assert_eq!(
-            serde_json::to_vec(&connected.changes).unwrap(),
+            serde_json::to_vec(&connected.changes.changes()).unwrap(),
             serde_json::to_vec(&expected).unwrap()
         );
         assert_eq!(
@@ -1555,7 +1552,7 @@ mod tests {
             members.push("member".into());
         }
         let unread = schedule(
-            supplied.clone(),
+            pbps_diff::order::propose(supplied.clone()),
             &Declarations {
                 schema: &schema,
                 sources: Sources {
@@ -1609,10 +1606,11 @@ mod tests {
                 }
                 let mut expected = input.clone();
                 super::role_order_oracle::legacy_order(&mut expected);
-                let actual = pbps_diff::order::role_drops(input).unwrap();
+                let actual =
+                    pbps_diff::order::role_drops(pbps_diff::order::propose(input)).unwrap();
                 assert_eq!(actual, expected);
                 assert_eq!(
-                    serde_json::to_vec(&actual).unwrap(),
+                    serde_json::to_vec(&actual.changes()).unwrap(),
                     serde_json::to_vec(&expected).unwrap()
                 );
                 assert_eq!(

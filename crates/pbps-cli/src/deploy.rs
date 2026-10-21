@@ -18,6 +18,7 @@
 //! reason it demands is what an audit asks for later.
 
 use anyhow::{Context as _, bail};
+use pbps_diff::order::PlanningPlan;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -493,7 +494,7 @@ pub(crate) fn refuse_uninventoried_occupants(
 /// Detached partitions hand over their exact catalog clone names the same
 /// way, retaining each detach's own block and guards (DEC-1558.1).
 pub(crate) fn order_carried_moves(
-    cs: &mut pbps_model::ChangeSet,
+    cs: &mut PlanningPlan,
     occupants: &[pbps_pg::catalog::NameOccupant],
     relations: &[(TableName, &'static str)],
     sides: (pbps_diff::Side<'_>, pbps_diff::Side<'_>),
@@ -6736,7 +6737,9 @@ pub fn cmd_plan_db(
         // read makes: the initial one, each re-derivation, and the resolver's
         // (#1516 review). One list, so a plan cannot carry one and not the
         // other.
-        let zero_sql: Vec<_> = takeovers.into_iter().chain(ensure_keys).collect();
+        let zero_sql = pbps_diff::order::writebacks::ScopeInput::new(
+            takeovers.into_iter().chain(ensure_keys).collect(),
+        );
         // The read-back goes in beside the overlaid base, for the comparisons
         // the engine makes by parse tree (an attach's checks and generation
         // expressions, #1642 review).
@@ -6756,11 +6759,10 @@ pub fn cmd_plan_db(
                 screen,
                 &read_back,
             )
-            .map(|mut changes| {
+            .map(|changes| {
                 // Re-derivations and resolver planning must retain the same
                 // zero-SQL changes as the initial connected plan.
-                changes.changes.extend(zero_sql.iter().cloned());
-                changes
+                zero_sql.append_to(changes)
             })
         };
         let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(crate::Unexpressible)?;
@@ -6834,8 +6836,7 @@ pub fn cmd_plan_db(
                         // The resolver's order, with the connected plan's
                         // zero-SQL changes after it, where `diff_here`
                         // keeps them.
-                        cs = unsealed.changes().clone();
-                        cs.changes.extend(zero_sql.iter().cloned());
+                        cs = zero_sql.append_to(unsealed.changes().clone());
                         resolution = Some((selection.name.clone(), unsealed, asked));
                     }
                     Err(crate::resolution::Refused::Finding(finding)) => {
@@ -7406,7 +7407,7 @@ pub fn cmd_plan_db(
             database_collation: baseline_collation,
             time_zone: baseline_zone,
         },
-        cs,
+        cs.changes().clone(),
         resolved.ids,
     );
     plan.module_deps = loaded.hints.module_deps.clone();
@@ -9724,6 +9725,19 @@ fn dropped_referrer_names(changes: &pbps_model::ChangeSet) -> BTreeSet<String> {
 
 #[cfg(test)]
 mod tests {
+    fn order_carried_moves(
+        cs: &mut pbps_model::ChangeSet,
+        occupants: &[pbps_pg::catalog::NameOccupant],
+        relations: &[(TableName, &'static str)],
+        sides: (pbps_diff::Side<'_>, pbps_diff::Side<'_>),
+        dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
+        catalog: &pbps_dialect::slots::CatalogFacts,
+    ) {
+        crate::test_planning(cs, |plan| {
+            super::order_carried_moves(plan, occupants, relations, sides, dialect, catalog)
+        })
+    }
+
     #[test]
     fn created_column_guard_keys_stay_raw_and_missing_names_are_shown_once() {
         use pbps_model::{Change, ChangeSet, Column, PlannedChange, Table};
@@ -12699,7 +12713,7 @@ mod tests {
         };
         assert!(refused(&changes), "the original order meets the clone");
         let original = changes.clone();
-        let order = |changes: &mut ChangeSet| {
+        let order = |changes: &mut pbps_model::ChangeSet| {
             order_carried_moves(
                 changes,
                 &occupants,
@@ -12997,7 +13011,9 @@ mod tests {
                 &pbps_pg::Postgres::new(),
                 &pbps_model::Hints::default(),
             )
-            .unwrap();
+            .unwrap()
+            .changes()
+            .clone();
             assert!(
                 plan.changes
                     .changes
@@ -21765,6 +21781,7 @@ mod tests {
 #[cfg(test)]
 mod plan_name_tests {
     use super::*;
+
     use pbps_model::{Change, PlannedChange, plan_names::PlanNames};
 
     #[test]

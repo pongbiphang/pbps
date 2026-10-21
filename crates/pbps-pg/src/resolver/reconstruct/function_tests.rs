@@ -181,6 +181,7 @@ async fn held_tables_and_readers_compile_with_their_keys_on_both_servers() {
             )
             .unwrap()
             .changes
+            .clone()
             .into_iter()
             .map(|p| p.change)
             .collect::<Vec<_>>();

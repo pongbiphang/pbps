@@ -167,6 +167,20 @@ pub struct LoweredPlan<P: ?Sized> {
     input: std::marker::PhantomData<fn(&P)>,
 }
 
+impl<P: ?Sized> std::ops::Deref for LoweredPlan<P> {
+    type Target = [Statement];
+    fn deref(&self) -> &[Statement] {
+        &self.statements
+    }
+}
+impl<'a, P: ?Sized> IntoIterator for &'a LoweredPlan<P> {
+    type Item = &'a Statement;
+    type IntoIter = std::slice::Iter<'a, Statement>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.statements.iter()
+    }
+}
+
 impl<P: ?Sized> LoweredPlan<P> {
     pub fn statements(&self) -> &[Statement] {
         &self.statements

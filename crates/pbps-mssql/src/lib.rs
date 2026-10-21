@@ -926,10 +926,7 @@ mod certified_emission_tests {
         let expected = dialect
             .emit(&changes.changes[0].change, changes.changes[0].strategy)
             .unwrap();
-        let ordered = pbps_diff::order::Schedule::new(1)
-            .settle(changes)
-            .unwrap()
-            .into_ordered();
+        let ordered = pbps_diff::order::singleton(changes.changes[0].clone());
         for mode in [PlanMode::Transactional, PlanMode::Staged] {
             let emitted = pbps_dialect::lower::lower_plan(
                 &ordered as &dyn pbps_diff::order::PlanView,

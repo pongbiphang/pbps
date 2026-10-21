@@ -11,6 +11,25 @@ Read this before adding a `Change` variant, a sort class or a reordering pass.
 A new variant needs a row in [the table below](#what-each-change-requires);
 `every_change_kind_has_a_row_in_the_ordering_audit` refuses one that has none.
 
+## Planning ownership
+
+Successful differ, expansion and settlement results are immutable
+`order::PlanningPlan` values. Order keeps the payload, original logical sources
+and the latest stage's proof together; callers supply facts, typed rewrites or
+constraints. `propose` starts fresh non-executable logical input, and cannot
+recertify an external payload copy for emission. Raw settlement stays inside
+order. Structural transformations invalidate the previous positional proof;
+each existing settlement records its own edges, without a constraint union.
+`OrderedPlan` has a private constructor and no public downgrade or generic
+empty-schedule finalizer (DEC-1959.5).
+
+S7 PR5a establishes this producer boundary. The existing scratch/lowering route
+moves in PR5b; artifact/apply migration and deletion of transitional raw consumer
+entries follow in PR5c. Only the completed family establishes end-to-end compiler
+enforcement. Loaded artifacts use the separate checked `AdmittedPlan` trust
+contract, never a claim that admission ordered them. The release verifier stays
+off, and no rank, tie-break or ordering pass is added.
+
 ## The mechanism
 
 The differ sorts every planned change by, in order:
@@ -68,7 +87,7 @@ The differ sorts every planned change by, in order:
 
 Then, in this order:
 
-- **`rename_order::order`** (`crates/pbps-diff/src/rename_order.rs`) puts a
+- **`rename_order::order`** (`crates/pbps-diff/src/order/rename_order.rs`) puts a
   table rename after the drops that release its target name (DECISIONS 496,
   DEC-496.1, DEC-536.1): a dropped table everywhere, an index on PostgreSQL
   (indexes share the relation namespace), a named constraint on SQL Server.

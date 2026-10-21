@@ -8717,6 +8717,8 @@ fn plan(
         &pbps_model::Hints::default(),
     )
     .expect("diff")
+    .changes()
+    .clone()
 }
 
 /// The declared side normalized the way introspection reports it, so the two

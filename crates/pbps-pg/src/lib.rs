@@ -773,6 +773,23 @@ fn default_problems(
 
 impl Dialect for Postgres {
     type Plan = dyn pbps_diff::order::PlanView;
+
+    fn validate_plan_analysis(
+        &self,
+        plan: &pbps_model::SavedPlan,
+    ) -> Result<(), pbps_dialect::PlanAnalysisError> {
+        plan.validate_analysis()?;
+        if let pbps_model::resolver::PlanAnalysis::Resolved(evidence) = &plan.analysis {
+            if plan.dialect != "postgres" {
+                return Err(pbps_dialect::PlanAnalysisError::Unsupported(
+                    plan.dialect.clone(),
+                ));
+            }
+            resolver::validate_evidence(evidence)?;
+        }
+        Ok(())
+    }
+
     fn emit_ordered(
         &self,
         plan: &Self::Plan,
@@ -3735,7 +3752,8 @@ mod tests {
         );
         diff(&read, &schema("app.u", serial(None)), &rename).expect("no name declared");
         assert!(renamed(
-            diff(&read, &schema("app.u", serial(Some("other_seq"))), &rename),
+            diff(&read, &schema("app.u", serial(Some("other_seq"))), &rename)
+                .map(|plan| plan.changes().clone()),
             "other_seq"
         ));
 
@@ -3749,7 +3767,8 @@ mod tests {
                 &schema("app.u", serial(Some("numbers"))),
                 &schema("app.u", serial(Some("t_id_seq"))),
                 &[]
-            ),
+            )
+            .map(|plan| plan.changes().clone()),
             "t_id_seq"
         ));
     }
@@ -7020,10 +7039,7 @@ mod certified_emission_tests {
         let expected = dialect
             .emit(&changes.changes[0].change, changes.changes[0].strategy)
             .unwrap();
-        let ordered = pbps_diff::order::Schedule::new(1)
-            .settle(changes)
-            .unwrap()
-            .into_ordered();
+        let ordered = pbps_diff::order::singleton(changes.changes[0].clone());
         for mode in [PlanMode::Transactional, PlanMode::Staged] {
             let emitted = pbps_dialect::lower::lower_plan(
                 &ordered as &dyn pbps_diff::order::PlanView,

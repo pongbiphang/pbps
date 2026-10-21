@@ -2218,15 +2218,39 @@ pub struct RangeSeries {
     pub partitions: Vec<SeriesPartition>,
 }
 
-/// Dialect knowledge that needs no database connection.
-/// The immutable payload interface does not grant emission authority. Each real
-/// engine fixes `Dialect::Plan` to pbps-diff's sealed `order::PlanView`.
+/// Pure evidence validation failures shared with saved-artifact admission.
+#[derive(Debug, thiserror::Error)]
+pub enum PlanAnalysisError {
+    #[error(transparent)]
+    Evidence(#[from] pbps_model::resolver::EvidenceError),
+    #[error("this build cannot enforce resolver evidence for {}", pbps_model::escape::Escaped(.0))]
+    Unsupported(String),
+}
+
+/// A read-only logical payload, without emission authority.
 pub trait PlanPayload {
     fn changes(&self) -> &pbps_model::ChangeSet;
 }
 
+/// Dialect knowledge that needs no database connection. Each real engine
+/// fixes `Plan` to pbps-diff's sealed `order::PlanView` (DEC-1959.5).
 pub trait Dialect {
     type Plan: ?Sized;
+
+    /// Pure engine-specific evidence validation at saved-artifact admission.
+    fn validate_plan_analysis(
+        &self,
+        plan: &pbps_model::SavedPlan,
+    ) -> Result<(), PlanAnalysisError> {
+        plan.validate_analysis()?;
+        if matches!(
+            &plan.analysis,
+            pbps_model::resolver::PlanAnalysis::Resolved(_)
+        ) {
+            return Err(PlanAnalysisError::Unsupported(plan.dialect.clone()));
+        }
+        Ok(())
+    }
 
     /// Emits one position of the engine's certified input. The associated type
     /// avoids a dialect -> diff dependency; concrete engines cannot substitute

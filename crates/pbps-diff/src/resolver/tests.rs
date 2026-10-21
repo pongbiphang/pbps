@@ -37,7 +37,7 @@ fn a_sealed_order_is_deterministic_and_detects_a_reordered_artifact() {
         ["role b", "role c", "role a"]
     );
     result.proof.validate(&result.changes).unwrap();
-    let mut edited = result.changes.clone();
+    let mut edited = result.changes.changes().clone();
     edited.changes.swap(0, 2);
     assert!(result.proof.validate(&edited).is_err());
 }
@@ -746,7 +746,7 @@ fn schema_authorization_precedes_binding_ddl_and_keeps_principal_creation() {
         .position(|p| matches!(p.change, Change::CreateModule { .. }))
         .unwrap();
     assert!(role < grant && grant < create);
-    let mut missing = ordered.changes.clone();
+    let mut missing = ordered.changes.changes().clone();
     missing.changes.swap(grant, create);
     assert!(ordered.proof.validate(&missing).is_err());
 }
@@ -1000,7 +1000,7 @@ fn splitting_table_creation_preserves_the_declared_index_layout() {
             .collect();
         assert_eq!(indexes, vec![clustered; 2]);
         ordered.proof.validate(&ordered.changes).unwrap();
-        let mut changed = ordered.changes.clone();
+        let mut changed = ordered.changes.changes().clone();
         for step in &mut changed.changes {
             if let Change::AddIndex { clustered, .. } = &mut step.change {
                 *clustered = !*clustered;
@@ -2725,7 +2725,10 @@ mod generated_surface_coverage {
         // plan's own check, which the replay refuses as a third instance.
         let mut order: Vec<usize> = (0..ops.len()).collect();
         order.swap(down, up);
-        match Incarnations::replay(planned.operations.reordered(&order).as_slice(), &owners) {
+        match Incarnations::replay(
+            crate::order::reordered_operations(&planned.operations, &order).as_slice(),
+            &owners,
+        ) {
             Err(ReplayError::Third { key: third, .. }) => assert_eq!(*third, key),
             other => panic!("replayed: {other:?}"),
         }
@@ -5060,7 +5063,10 @@ mod operations {
         // view as both instances, and is refused.
         let mut order: Vec<usize> = (0..planned.operations.len()).collect();
         order.swap(down, up);
-        match Incarnations::replay(planned.operations.reordered(&order).as_slice(), &owners) {
+        match Incarnations::replay(
+            crate::order::reordered_operations(&planned.operations, &order).as_slice(),
+            &owners,
+        ) {
             Err(ReplayError::Third { key: third, .. }) => assert_eq!(*third, key),
             other => panic!("replayed: {other:?}"),
         }

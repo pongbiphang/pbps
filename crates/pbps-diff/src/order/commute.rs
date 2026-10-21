@@ -48,7 +48,7 @@ pub fn read(
     };
     let logical = Operations::of_plan(&changes.changes, modes);
     let operations = match sequence {
-        Some(sequence) => logical.reordered(sequence),
+        Some(sequence) => crate::order::reordered_operations(&logical, sequence),
         None => logical,
     };
     let names = PlanNames::of(&changes.changes, desired.ids).map_err(|e| e.to_string())?;

@@ -1801,7 +1801,7 @@ pub(super) fn ordinary(
     desired: pbps_diff::Side<'_>,
     hints: &pbps_model::Hints,
     extras: &[String],
-) -> Result<pbps_model::ChangeSet, Error> {
+) -> Result<pbps_diff::order::PlanningPlan, Error> {
     let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
     pbps_diff::resolver::ordinary(base, desired, &dialect, hints).map_err(|errors| {
         Error::Binding(format!("ordinary typed plan cannot be formed: {errors:?}"))

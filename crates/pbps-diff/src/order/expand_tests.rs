@@ -312,7 +312,7 @@ fn expand<E: Expansion>(
     factor: usize,
 ) -> Result<super::expand::Expanded, String> {
     let old = legacy::expand(plan.clone(), rule, factor);
-    let now = current_expand(plan, rule, factor);
+    let now = current_expand(super::propose(plan), rule, factor);
     match (&now, &old) {
         (Ok(a), Ok(b)) => {
             assert_eq!(a.rewrites, b.rewrites);
@@ -356,7 +356,12 @@ impl Expansion for TailSplitter {
 
 #[test]
 fn every_tail_part_keeps_the_source_and_other_whole_steps_keep_their_order() {
-    let done = current_expand(plan(&["a", "split", "b"]), &TailSplitter, FACTOR).unwrap();
+    let done = current_expand(
+        super::propose(plan(&["a", "split", "b"])),
+        &TailSplitter,
+        FACTOR,
+    )
+    .unwrap();
     assert_eq!(done.rewrites, 1);
     assert_eq!(
         done.changes
@@ -389,7 +394,7 @@ fn every_tail_part_keeps_the_source_and_other_whole_steps_keep_their_order() {
 
 #[test]
 fn a_tail_split_does_not_escape_the_existing_budget() {
-    let err = current_expand(plan(&["split"]), &TailSplitter, 0).unwrap_err();
+    let err = current_expand(super::propose(plan(&["split"])), &TailSplitter, 0).unwrap_err();
     assert_eq!(
         err,
         "tail-splitter: the rewrite budget of 0 (0 per operation, 2 asked for) is spent and 1 remain unmet: 0"
@@ -420,6 +425,41 @@ impl Expansion for NonProgressingTail {
 
 #[test]
 fn a_tail_cannot_hide_an_unmet_split_obligation() {
-    let err = current_expand(plan(&["split"]), &NonProgressingTail, FACTOR).unwrap_err();
+    let err = current_expand(
+        super::propose(plan(&["split"])),
+        &NonProgressingTail,
+        FACTOR,
+    )
+    .unwrap_err();
     assert_eq!(err, "stuck-tail: a rewrite for 0 left it unmet");
+}
+
+#[test]
+fn expansions_keep_sources_assigned_before_an_earlier_settlement() {
+    use pbps_model::operation::{Origin, Source as LogicalSource};
+    let mut schedule = super::Schedule::new(2);
+    schedule.edge(1, 0, Source::Effect, OrderReason::Structural);
+    let input = schedule
+        .settle(super::propose(plan(&["a", "b"])))
+        .unwrap()
+        .into_planning();
+    let once = current_expand(input, &Toy(Mode::Meets), FACTOR)
+        .unwrap()
+        .changes;
+    let twice = current_expand(once.clone(), &Toy(Mode::Meets), FACTOR)
+        .unwrap()
+        .changes;
+    assert_eq!(once, twice);
+    for (part, origin) in once.changes.iter().zip(once.origins()) {
+        let (name, _) = name(part).expect("the toy has roles only");
+        assert_eq!(
+            origin.source(),
+            LogicalSource::Change(usize::from(name != "a"))
+        );
+        assert_eq!(
+            matches!(part.change, Change::CreateRole { .. }),
+            matches!(origin, Origin::Whole(_))
+        );
+    }
+    once.proof().validate(once.changes()).unwrap();
 }

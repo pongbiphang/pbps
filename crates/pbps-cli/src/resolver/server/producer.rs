@@ -85,7 +85,7 @@ pub(super) struct Identity {
 pub(super) fn seal(
     key: &EnvironmentFingerprintKey,
     sealed: Sealing,
-    changes: pbps_model::ChangeSet,
+    changes: pbps_diff::order::PlanningPlan,
     proof: pbps_model::resolver::OrderingProof,
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
@@ -208,7 +208,7 @@ pub(super) struct Opening {
 
 impl Unsealed {
     /// The plan in the resolver's own order.
-    pub fn changes(&self) -> &pbps_model::ChangeSet {
+    pub fn changes(&self) -> &pbps_diff::order::PlanningPlan {
         &self.ordered.changes
     }
 
@@ -324,19 +324,20 @@ impl Rechecked {
     /// order is a defect, refused here rather than sealed (#1516).
     pub fn seal(
         self,
-        changes: pbps_model::ChangeSet,
+        changes: pbps_diff::order::PlanningPlan,
         base: pbps_diff::Side<'_>,
         desired: pbps_diff::Side<'_>,
     ) -> Result<ResolvedPlan, Error> {
         let run = self.0;
-        let edges = remap(&run.ordered.changes, &changes, run.ordered.proof.edges())?;
-        let proof = pbps_model::resolver::OrderingProof::new(&changes, edges)
-            .map_err(|error| Error::Binding(format!("the final order: {error}")))?;
+        let changes =
+            pbps_diff::order::resolver_remap::finish(&run.ordered.changes, changes, describe)
+                .map_err(Error::Binding)?;
+        let proof = changes.proof().clone();
         seal(&run.key, run.sealing, changes, proof, base, desired)
     }
 
     /// The plan in the resolver's own order.
-    pub fn changes(&self) -> &pbps_model::ChangeSet {
+    pub fn changes(&self) -> &pbps_diff::order::PlanningPlan {
         self.0.changes()
     }
 }
@@ -355,12 +356,29 @@ tokio::task_local! {
     pub(super) static RECHECK_BUILD: Option<String>;
 }
 
+#[cfg(test)]
+fn remap(
+    before: &pbps_model::ChangeSet,
+    after: &pbps_model::ChangeSet,
+    edges: &BTreeSet<pbps_model::resolver::OrderEdge>,
+) -> Result<BTreeSet<pbps_model::resolver::OrderEdge>, Error> {
+    let expected = remap_oracle(before, after, edges);
+    let actual = pbps_diff::order::resolver_remap::remap(before, after, edges, describe)
+        .map_err(Error::Binding);
+    assert_eq!(
+        actual.as_ref().map_err(ToString::to_string),
+        expected.as_ref().map_err(ToString::to_string)
+    );
+    actual
+}
+
 /// The resolver's edges, from its own order to `after`, the order the
 /// caller's passes left. A change is matched by what it does, in order
 /// among equal ones ([`same_change`]); a pass may add changes and their
 /// findings, but not remove one the resolver ordered or put one before
 /// another the resolver ordered after it.
-fn remap(
+#[cfg(test)]
+fn remap_oracle(
     before: &pbps_model::ChangeSet,
     after: &pbps_model::ChangeSet,
     edges: &BTreeSet<pbps_model::resolver::OrderEdge>,
@@ -409,6 +427,7 @@ fn remap(
 /// role's members, which the resolver leaves empty (#1516 review). Every
 /// other field is the change's own, and a pass that rewrote one made
 /// another change.
+#[cfg(test)]
 fn same_change(then: &pbps_model::Change, now: &pbps_model::Change) -> bool {
     use pbps_model::Change::DropRole;
     if let (

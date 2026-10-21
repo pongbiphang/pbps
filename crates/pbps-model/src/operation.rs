@@ -922,13 +922,21 @@ impl Operations {
         Self { operations }
     }
 
-    /// The same operations, keeping their ids, in the order `sequence`
-    /// gives as positions into this one: how a scheduler hands back an
-    /// order without renumbering what it ordered.
+    /// Collects draft operations without conferring ordering or emission
+    /// authority. The order layer owns permutation and its certificate.
+    pub fn from_operations(operations: impl IntoIterator<Item = Operation>) -> Self {
+        Self {
+            operations: operations.into_iter().collect(),
+        }
+    }
+
+    /// The same operations, keeping their ids, in the order `sequence` gives.
+    /// Retained only as the model's frozen unit-test oracle.
     ///
     /// # Panics
     ///
     /// When `sequence` is not a permutation of the positions.
+    #[cfg(test)]
     pub fn reordered(&self, sequence: &[usize]) -> Self {
         let mut seen = vec![false; self.operations.len()];
         assert_eq!(sequence.len(), seen.len(), "not a permutation");

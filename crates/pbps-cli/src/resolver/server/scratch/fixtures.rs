@@ -225,6 +225,7 @@ impl Inputs {
         )
         .unwrap()
         .changes
+        .clone()
         .into_iter()
         .map(|planned| planned.change)
         .collect();

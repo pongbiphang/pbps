@@ -272,7 +272,7 @@ fn measure(shape: Shape, reversed: bool) -> Measured {
     let mut operations = Operations::of_plan(&changes.changes, ModuleEdits::InPlace);
     if reversed {
         let backwards: Vec<usize> = (0..operations.as_slice().len()).rev().collect();
-        operations = operations.reordered(&backwards);
+        operations = crate::order::reordered_operations(&operations, &backwards);
     }
     let names = PlanNames::of(&changes.changes, &ids).expect("plan names");
     let owners = PlanOwners::new(names, &base_ids, &ids);

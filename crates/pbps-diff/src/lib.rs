@@ -10,7 +10,6 @@
 pub mod identity;
 pub mod managed;
 pub mod order;
-mod rename_order;
 pub mod resolver;
 pub mod schema_diff;
 

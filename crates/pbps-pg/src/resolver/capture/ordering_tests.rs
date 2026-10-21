@@ -307,7 +307,7 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
             checksum: "00".repeat(32),
             database_collation: None,
         },
-        ordered.changes.clone(),
+        ordered.changes.clone().changes().clone(),
         wanted_ids.clone(),
     );
     let restored: pbps_model::SavedPlan =
@@ -502,7 +502,7 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
         grant < insert,
         "the approved grant must precede reference data"
     );
-    let mut missing_grant = data.changes.clone();
+    let mut missing_grant = data.changes.changes().clone();
     missing_grant.changes.remove(grant);
     target.execute("BEGIN").await.unwrap();
     let error = execute(&mut target, &missing_grant)
@@ -573,7 +573,7 @@ async fn new_table_online_indexes_are_transactional(target: &mut Conn) {
     target.execute("ROLLBACK").await.unwrap();
     let ordered = pbps_diff::resolver::plan(before, after, &hints, &[], &dialect).unwrap();
     let restored: ChangeSet =
-        serde_json::from_str(&serde_json::to_string(&ordered.changes).unwrap()).unwrap();
+        serde_json::from_str(&serde_json::to_string(&ordered.changes.changes()).unwrap()).unwrap();
     ordered.proof.validate(&restored).unwrap();
     target.execute("BEGIN").await.unwrap();
     execute(target, &restored)

@@ -82,7 +82,7 @@ fn violations(from: &str, to: &str, order: &[usize]) -> Vec<Violation> {
     let baseline = Baseline::of(was, &owners);
     let analysed = analyse(&ops, &owners, was, will, &Postgres::new());
     assert!(analysed.unowned.is_empty(), "{:?}", analysed.unowned);
-    let ordered = ops.reordered(order);
+    let ordered = pbps_diff::order::reordered_operations(&ops, order);
     let effects: Vec<_> = order.iter().map(|&i| analysed.effects[i].clone()).collect();
     pbps_diff::order::verify(ordered.as_slice(), &effects, &baseline, &Default::default())
 }

@@ -1032,6 +1032,7 @@ pub enum Part {
 /// its rebuild passes, and the connected plan after it weaves rebuilds in.
 // The complement creates no index part.
 #[allow(clippy::wildcard_enum_match_arm)]
+#[cfg(test)]
 pub fn drop_parameter_changes_of_rebuilt_indexes<T>(
     changes: &mut Vec<T>,
     change: impl Fn(&T) -> &Change,

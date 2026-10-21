@@ -98,7 +98,7 @@ fn run(
     declared: &ModuleDeps,
     checks: Checks,
 ) -> Vec<Violation> {
-    let reordered = ops.reordered(order);
+    let reordered = crate::order::reordered_operations(ops, order);
     let effects: Vec<Effects> = order.iter().map(|&i| fx[i].clone()).collect();
     verify_with(reordered.as_slice(), &effects, baseline, declared, checks)
 }
@@ -548,7 +548,7 @@ fn an_obligation_some_order_could_meet_but_this_one_meets_too_late_fails_the_run
     use super::shadow::{Shadowed, Stage, judge};
     let plan = create_then_add_column();
     let (ops, fx, baseline) = plan.analysed(ModuleEdits::InPlace);
-    let swapped = ops.reordered(&[1, 0]);
+    let swapped = crate::order::reordered_operations(&ops, &[1, 0]);
     let report = Shadowed {
         effects: vec![fx[1].clone(), fx[0].clone()],
         unowned: Vec::new(),
@@ -583,7 +583,7 @@ fn a_dependent_that_stands_throughout_is_recorded_and_one_the_plan_removes_late_
     // have been right.
     let both = two_dropped_tables();
     let (ops, fx, baseline) = both.analysed(ModuleEdits::InPlace);
-    let swapped = ops.reordered(&[1, 0]);
+    let swapped = crate::order::reordered_operations(&ops, &[1, 0]);
     let report = Shadowed {
         effects: vec![fx[1].clone(), fx[0].clone()],
         unowned: Vec::new(),
@@ -1455,7 +1455,7 @@ fn a_function_change_ahead_of_a_computed_column_is_connected_and_a_column_change
     use super::shadow::{Shadowed, Stage, judge};
     let judged_at =
         |stage: Stage, ops: &Operations, fx: &[Effects], baseline: &Baseline, order: &[usize]| {
-            let reordered = ops.reordered(order);
+            let reordered = crate::order::reordered_operations(ops, order);
             let effects: Vec<Effects> = order.iter().map(|&i| fx[i].clone()).collect();
             let report = Shadowed {
                 effects,
@@ -1945,7 +1945,7 @@ fn settled(
     order: &[usize],
     hoist: bool,
 ) -> Vec<usize> {
-    let reordered = ops.reordered(order);
+    let reordered = crate::order::reordered_operations(ops, order);
     let effects: Vec<Effects> = order.iter().map(|&i| fx[i].clone()).collect();
     let g = graph(
         reordered.as_slice(),
@@ -1961,7 +1961,7 @@ fn settled(
     let changes = pbps_model::ChangeSet {
         changes: reordered.iter().map(|o| o.planned().clone()).collect(),
     };
-    let settled = schedule.settle(changes).unwrap();
+    let settled = schedule.settle_raw(changes).unwrap();
     settled.sequence.iter().map(|&i| order[i]).collect()
 }
 
@@ -2384,7 +2384,7 @@ fn a_key_the_plan_makes_and_ends_is_not_found_after_its_ending() {
     let replay = |order: [usize; 3]| {
         let fx = [make.clone(), end.clone(), need.clone()];
         let at: Vec<usize> = order.to_vec();
-        let reordered = ops.reordered(&at);
+        let reordered = crate::order::reordered_operations(&ops, &at);
         let effects: Vec<Effects> = at.iter().map(|&i| fx[i].clone()).collect();
         super::verify::verify_with(
             reordered.as_slice(),
@@ -4928,7 +4928,7 @@ fn a_before_rewrite_requirement_orders_every_other_rewrite_without_requiring_pre
                 .any(|v| matches!(v, Violation::Edge { .. }))
         );
         let settled = super::Schedule::of_graph(&graph, ops.as_slice())
-            .settle(pbps_model::ChangeSet {
+            .settle_raw(pbps_model::ChangeSet {
                 changes: logical.clone(),
             })
             .unwrap();

@@ -251,7 +251,8 @@ fn function_windows_match_old_bytes_for_32_uid_seeds_and_named_cycles() {
                 ["app.reader".parse().unwrap()].into(),
             )]
             .into();
-            let result = super::after_their_functions(&mut cs, &deps, &Partitions::default());
+            let result =
+                super::test_adapters::after_their_functions(&mut cs, &deps, &Partitions::default());
             if case == "cycle" {
                 let why = result.unwrap_err();
                 assert!(
@@ -320,7 +321,7 @@ async fn callable_columns_precede_their_readers_and_real_cycles_are_refused_on_b
                 routine("app.free", "SELECT 9 AS n", ModuleKind::View),
                 routine("app.f()", "() RETURNS integer LANGUAGE sql IMMUTABLE RETURN 7", ModuleKind::Function),
             ].into_iter().map(PlannedChange::new).collect() };
-            assert_eq!(super::after_their_functions(&mut cs, &ModuleDeps::new(), &Partitions::default()), Ok(1));
+            assert_eq!(super::test_adapters::after_their_functions(&mut cs, &ModuleDeps::new(), &Partitions::default()), Ok(1));
             let pg = pbps_pg::Postgres::new();
             for p in &cs.changes {
                 for sql in pg.emit(&p.change, p.strategy)? { conn.execute(&sql.sql).await?; }
@@ -331,7 +332,7 @@ async fn callable_columns_precede_their_readers_and_real_cycles_are_refused_on_b
                 column("h", "app.cycle()"),
                 routine("app.cycle()", "() RETURNS integer LANGUAGE sql IMMUTABLE AS $$ SELECT h FROM app.t $$", ModuleKind::Function),
             ].into_iter().map(PlannedChange::new).collect() };
-            let why = super::after_their_functions(&mut cycle, &ModuleDeps::new(), &Partitions::default()).unwrap_err();
+            let why = super::test_adapters::after_their_functions(&mut cycle, &ModuleDeps::new(), &Partitions::default()).unwrap_err();
             assert!(why.contains("app.t.h") && why.contains("app.cycle()"), "{why}");
             // Measure both directions: neither CREATE FUNCTION before its
             // column nor ADD COLUMN before its function can execute.

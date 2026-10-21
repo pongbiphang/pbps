@@ -84,16 +84,19 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
         )
         .unwrap();
         generated::expand(&mut cs, &ids, &Default::default(), &pg).unwrap();
-        cs.changes
-            .push(pbps_model::PlannedChange::new(Change::InsertRow {
-                table: TableName::new("app", "a"),
-                key_column: "id".into(),
-                identity_key: false,
-                key: "1".into(),
-                row: pbps_model::Row([("z".into(), pbps_model::Value::Int(3))].into()),
-                defaults: Default::default(),
-                types: [("z".into(), "integer".parse().unwrap())].into(),
-            }));
+        cs =
+            pbps_diff::order::writebacks::PlanningInput::new(vec![pbps_model::PlannedChange::new(
+                Change::InsertRow {
+                    table: TableName::new("app", "a"),
+                    key_column: "id".into(),
+                    identity_key: false,
+                    key: "1".into(),
+                    row: pbps_model::Row([("z".into(), pbps_model::Value::Int(3))].into()),
+                    defaults: Default::default(),
+                    types: [("z".into(), "integer".parse().unwrap())].into(),
+                },
+            )])
+            .append_to(cs);
         generated::settle(&mut cs, &schema, &Default::default(), &pg).unwrap();
         let ops = Operations::of_plan(&cs.changes, ModuleEdits::InPlace);
         let owners = PlanOwners::new(PlanNames::of(&cs.changes, &ids).unwrap(), &no_ids, &ids);
@@ -147,7 +150,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
         } else {
             assert!(
                 !verify(
-                    ops.reordered(&order).as_slice(),
+                    pbps_diff::order::reordered_operations(&ops, &order).as_slice(),
                     &effects,
                     &baseline,
                     &Default::default()

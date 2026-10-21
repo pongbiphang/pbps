@@ -11,7 +11,7 @@ pbps-model     Domain model. Dialect-agnostic, span-free, serializes to JSON:
                the ids file, the state snapshot, the saved plan, the drift report
 pbps-config    Project configuration (pbps.yml): paths, environments, hooks
 pbps-load      YAML -> model; the only crate that may depend on serde-saphyr
-pbps-diff      model <-> ids comparison -> ChangeSet. Produces no SQL. Also owns
+pbps-diff      model <-> ids comparison -> immutable PlanningPlan. Produces no SQL. Also owns
                the managed-set scope and observed identity
 pbps-dialect   Dialect abstraction. Pure: types, validation, emit, preflight
                probes, shared operational row-work answers. Connection-bound
@@ -19,7 +19,8 @@ pbps-dialect   Dialect abstraction. Pure: types, validation, emit, preflight
                crate, not trait methods; pbps-cli::engine routes to them
 pbps-mssql     SQL Server: type catalogue, validation, the T-SQL emitter (the
                only place a change becomes SQL), catalog introspection,
-               the ledger/lock statements, rename impact
+               the ledger/lock statements, rename impact. Depends on pbps-diff
+               for sealed plan emission inputs, as pbps-pg does (DEC-1959.5)
 pbps-pg        PostgreSQL: the same responsibilities as pbps-mssql, as far as
                Phase 5 has built them. Everything unbuilt refuses by name
 pbps-db        Connections plus transaction framing. Owns "there is a network";

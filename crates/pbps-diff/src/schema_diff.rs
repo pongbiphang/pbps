@@ -404,7 +404,7 @@ pub fn diff(
     declared: Side<'_>,
     dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
-) -> Result<ChangeSet, Vec<DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
     diff_rebuilding(base, declared, dialect, hints, &BTreeSet::new())
 }
 
@@ -428,7 +428,7 @@ pub fn diff_rebuilding(
     dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
-) -> Result<ChangeSet, Vec<DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
     rebuilding_by(
         base,
         declared,
@@ -482,7 +482,7 @@ pub fn diff_read_back(
     also: &BTreeSet<ModuleId>,
     screen: Screen,
     read_back: &Schema,
-) -> Result<ChangeSet, Vec<DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
     rebuilding_by(
         base,
         declared,
@@ -503,7 +503,7 @@ pub fn diff_connected(
     dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
-) -> Result<ChangeSet, Vec<DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
     rebuilding_by(
         base,
         declared,
@@ -526,7 +526,7 @@ pub(crate) fn rebuilding_by(
     rebinding: Rebinding,
     screen: Screen,
     read_back: Option<&Schema>,
-) -> Result<ChangeSet, Vec<DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<DiffError>> {
     let d = diff_partial_rebuilding(
         base, declared, dialect, hints, also, rebinding, screen, read_back,
     );
@@ -537,7 +537,7 @@ pub(crate) fn rebuilding_by(
         if rebinding == Rebinding::Candidates {
             crate::order::shadow::observe_plan(base, declared, dialect, hints, &d.changes);
         }
-        Ok(d.changes)
+        Ok(crate::order::propose(d.changes))
     } else {
         Err(d.errors)
     }
@@ -1244,7 +1244,7 @@ pub(crate) fn diff_partial_rebuilding(
     // exactly as a plan would be.
     // After every pass that rebuilds an index: its `CREATE` carries the
     // declared parameters (#1483 review).
-    pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
+    crate::order::drop_parameter_changes_of_rebuilt_indexes(&mut changes, |c| c);
     let mut planned: Vec<PlannedChange> = changes.into_iter().map(PlannedChange::new).collect();
     for p in &mut planned {
         p.risks = dialect.change_risks(&p.change);
@@ -1532,12 +1532,12 @@ pub(crate) fn diff_partial_rebuilding(
         false
     }
     for (rename, to) in &vacates {
-        let folded = crate::rename_order::case_folded(to.raw());
+        let folded = crate::order::rename_order::case_folded(to.raw());
         for vacating in vacates.keys() {
             if vacating != rename
                 && vacating.0 == rename.0
                 && vacating.1 != *to
-                && crate::rename_order::case_folded(vacating.1.raw()) == folded
+                && crate::order::rename_order::case_folded(vacating.1.raw()) == folded
                 && !reaches(&waits, vacating, rename)
             {
                 waits
@@ -2026,7 +2026,7 @@ pub(crate) fn diff_partial_rebuilding(
     // sides of every comparison, a third of a 4,000-table plan's CPU
     // (#1908). The cache keeps equal keys in their original order, as the
     // stable sort did, so the order is the same.
-    planned.sort_by_cached_key(|p| {
+    crate::order::normalization::sort_draft(&mut planned, |p| {
         let (class, within) = sort_class(&p.change);
         (
             class,
@@ -2057,7 +2057,7 @@ pub(crate) fn diff_partial_rebuilding(
             format!("{:?}", p.change),
         )
     });
-    for cycle in crate::rename_order::order(&mut planned, base, &renames, dialect) {
+    for cycle in crate::order::rename_order::order(&mut planned, base, &renames, dialect) {
         errs.push(DiffError::TableRenameCycle { renames: cycle });
     }
     Diffed {
@@ -7455,6 +7455,8 @@ mod tests {
             &Hints::default(),
         )
         .unwrap()
+        .changes()
+        .clone()
     }
 
     /// `MinimalDialect`, except that `int` and `integer` are one type, as
@@ -9541,6 +9543,7 @@ mod tests {
             outcome(declared, intents)
                 .unwrap_or_else(|e| panic!("refused: {e:?}"))
                 .changes
+                .clone()
                 .into_iter()
                 .map(|p| p.change)
                 .collect()
@@ -9832,7 +9835,13 @@ mod tests {
                 &MinimalDialect,
                 &Hints::default(),
             )
-            .map(|cs| cs.changes.into_iter().map(|p| p.change).collect::<Vec<_>>())
+            .map(|cs| {
+                cs.changes
+                    .clone()
+                    .into_iter()
+                    .map(|p| p.change)
+                    .collect::<Vec<_>>()
+            })
             .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
         };
         let from = |base: &Schema, revisions: &[(&Schema, &[Intent])]| {
@@ -16278,7 +16287,10 @@ mod tests {
         declared: Side<'_>,
         dialect: &(impl Dialect + ?Sized),
     ) -> ChangeSet {
-        diff(base, declared, dialect, &Hints::default()).unwrap()
+        diff(base, declared, dialect, &Hints::default())
+            .unwrap()
+            .changes()
+            .clone()
     }
 
     /// DEC-981.3, the other two release paths: a table rename vacating a name
@@ -21224,6 +21236,8 @@ mod tests {
             &Hints::default(),
         )
         .unwrap()
+        .changes()
+        .clone()
     }
 
     #[test]
@@ -23011,6 +23025,8 @@ mod tests {
                 hints,
             )
             .unwrap()
+            .changes()
+            .clone()
         }
 
         fn decided(cs: &ChangeSet) -> Vec<(String, PublicAccess, RoutineOrigin)> {
@@ -23423,7 +23439,10 @@ mod tests {
         };
         let mut legacy = cs.clone();
         crate::order::roles::legacy::legacy_order(&mut legacy);
-        cs = crate::order::role_drops(cs).unwrap();
+        cs = crate::order::role_drops(crate::order::propose(cs))
+            .unwrap()
+            .changes()
+            .clone();
         assert_eq!(cs, legacy);
         assert_eq!(
             crate::order::roles::legacy::checksum(&cs),
@@ -23446,7 +23465,10 @@ mod tests {
         let before = format!("{:?}", flat.changes);
         let mut legacy = flat.clone();
         crate::order::roles::legacy::legacy_order(&mut legacy);
-        flat = crate::order::role_drops(flat).unwrap();
+        flat = crate::order::role_drops(crate::order::propose(flat))
+            .unwrap()
+            .changes()
+            .clone();
         assert_eq!(flat, legacy);
         assert_eq!(format!("{:?}", flat.changes), before);
     }

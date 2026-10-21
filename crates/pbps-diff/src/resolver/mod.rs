@@ -3,7 +3,7 @@
 
 mod assess;
 mod graph;
-mod prepare;
+use crate::order::resolver_prepare as prepare;
 
 #[cfg(test)]
 mod part_effect_tests;
@@ -11,7 +11,9 @@ mod part_effect_tests;
 // Count actual classifier calls in tests, including a caller that accidentally
 // bypasses a pass cache, rather than measuring a synthetic cache-only loop.
 #[inline]
-fn part_effects(change: &pbps_model::Change) -> Vec<pbps_model::part_effects::PartEffect<'_>> {
+pub(crate) fn part_effects(
+    change: &pbps_model::Change,
+) -> Vec<pbps_model::part_effects::PartEffect<'_>> {
     #[cfg(test)]
     part_effect_tests::record_projection();
     change.part_effects()
@@ -21,13 +23,14 @@ pub use assess::{Answer, Assessment, assess};
 
 #[cfg(test)]
 use crate::order::Source;
+use crate::order::resolver_finish::settle;
 use crate::order::{Baseline, Checks, Schedule, analyse, graph};
 use pbps_dialect::Dialect;
 use pbps_model::escape::Escaped;
 use pbps_model::operation::{ModuleEdits, Operations, PlanOwners, Snapshot};
 #[cfg(test)]
 use pbps_model::resolver::OrderReason;
-use pbps_model::resolver::{OrderingProof, Surface, SurfaceResolution};
+use pbps_model::resolver::{Surface, SurfaceResolution};
 use pbps_model::{ChangeSet, IdsFile};
 use std::collections::BTreeSet;
 
@@ -77,8 +80,10 @@ pub fn removal_spelling(
 /// Output for the evidence seal. The final emitter receives `changes` exactly
 /// as ordered here; it has no reason to choose another order.
 pub struct Ordered {
-    pub changes: ChangeSet,
-    pub proof: OrderingProof,
+    pub changes: crate::order::PlanningPlan,
+    /// Proof observation retained for existing evidence consumers;
+    /// the immutable plan holds its own matching proof inside order.
+    pub proof: pbps_model::resolver::OrderingProof,
 }
 
 /// The typed plan resolver planning starts from: [`crate::diff`] without
@@ -90,7 +95,7 @@ pub fn ordinary(
     desired: crate::Side<'_>,
     dialect: &(impl Dialect + ?Sized),
     hints: &pbps_model::Hints,
-) -> Result<ChangeSet, Vec<crate::DiffError>> {
+) -> Result<crate::order::PlanningPlan, Vec<crate::DiffError>> {
     crate::schema_diff::rebuilding_by(
         base,
         desired,
@@ -129,7 +134,7 @@ pub struct Planned {
     /// The ordinary plan the resolver started from: what an operation's
     /// [`pbps_model::operation::Source::Change`] counts positions in, and the
     /// order a step's names are in force in.
-    pub logical: ChangeSet,
+    pub logical: crate::order::PlanningPlan,
 }
 
 /// [`plan`] and the operations it orders. [`plan`] is this, so the order and
@@ -174,31 +179,16 @@ pub fn plan_operations(
         desired,
         dialect,
     );
-    let (mut ordered, sequence) = settle(prepared.changes, &schedule)?;
-    // Settlement can put a validator after seed rows. Preparation's empty
-    // context cannot certify that final position (DEC-1503.4); seal the same
-    // risks saved-plan validation will derive, including in operation copies.
-    let risks = crate::order::generated::risks(&ordered.changes, desired.ids, dialect);
-    for (part, risks) in ordered.changes.changes.iter_mut().zip(risks) {
-        part.risks = risks;
-    }
-    ordered.proof = OrderingProof::new(&ordered.changes, ordered.proof.edges().clone())
-        .map_err(|_| Error::Edge)?;
-    // Keep IDs assigned in expansion order even when settlement moves parts.
-    let mut classified = vec![None; sequence.len()];
-    for (&from, part) in sequence.iter().zip(&ordered.changes.changes) {
-        classified[from] = Some(part.clone());
-    }
-    let operations = Operations::expanded(
+    let (ordered, sequence) = settle(prepared.changes, &schedule)?;
+    let (ordered, operations) = crate::order::resolver_finish::finish(
+        ordered,
+        &sequence,
         logical.changes.len(),
-        prepared.origins.into_iter().zip(
-            classified
-                .into_iter()
-                .map(|part| part.expect("settlement is a permutation of the prepared changes")),
-        ),
+        prepared.origins,
+        desired.ids,
+        dialect,
         module_edits,
-    )
-    .reordered(&sequence);
+    )?;
     #[cfg(any(test, debug_assertions))]
     crate::order::shadow::observe(
         base,
@@ -339,7 +329,7 @@ fn prepare(
     hints: &pbps_model::Hints,
     resolution: &[SurfaceResolution],
     dialect: &(impl Dialect + ?Sized),
-) -> Result<(ChangeSet, prepare::Prepared), Error> {
+) -> Result<(crate::order::PlanningPlan, prepare::Prepared), Error> {
     prepare::coverage(base, desired, resolution)?;
     let ordinary = ordinary(base, desired, dialect, hints)
         .map_err(|e| Error::Diff(e.into_iter().map(|e| e.to_string()).collect()))?;
@@ -401,28 +391,6 @@ fn order(
         schedule.edge(edge.before, edge.after, source, edge.reason);
     }
     settle(changes, &schedule).map(|(ordered, _)| ordered)
-}
-
-/// The ordered plan and the positions it took its steps from. The order the
-/// steps arrive in is the tie-break: it preserves the differ's identity and
-/// data order wherever no dependency requires movement (DEC-1956.2). A cycle
-/// is refused by name (DEC-1956.3).
-fn settle(changes: ChangeSet, schedule: &Schedule) -> Result<(Ordered, Vec<usize>), Error> {
-    use crate::order::Refusal;
-    let described = changes.clone();
-    let settled = schedule.settle(changes).map_err(|refusal| match refusal {
-        Refusal::Outside { .. } | Refusal::Mismatch { .. } => Error::Edge,
-        Refusal::Cycle { .. } | Refusal::Unmet(_) | Refusal::Kept(_) => {
-            Error::Cycle(refusal.describe(&described))
-        }
-    })?;
-    Ok((
-        Ordered {
-            changes: settled.changes,
-            proof: settled.proof,
-        },
-        settled.sequence,
-    ))
 }
 
 #[cfg(test)]
