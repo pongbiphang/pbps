@@ -7734,3 +7734,55 @@ Pinned by `split_parts_match_the_frozen_plan_sql_and_checksum_for_32_uid_seeds`,
 `a_tail_split_does_not_escape_the_existing_budget`, the existing progress,
 whole-only and final-obligation driver negatives, and the live
 `expanded_table_checks_indexes_and_defaults_execute_on_both_servers`.
+
+<a id="dec-1959-3"></a>
+
+**DEC-1959.3. The retained function holds and scratch phase order are
+constraints settled by Schedule, with the existing Sink tie-break.**
+Part of #1959, S7 PR2. The CLI keeps the same wait selection, held closure
+and conservative `needs` relation. Each callable column or retained whole
+table waits for the later function creates its expressions name. A held
+step follows every earlier step it needs; an otherwise free step follows
+any held predecessor it needs. Free steps are explicitly chained in their
+input order. Every edge stays inside the old first-waiter/last-function
+window, so its prefix and suffix retain their positions. There is no new
+rank, priority or Keep-based substitute for the free chain.
+
+Schedule's cycle waiting set replaces the local Kahn loop's unfinished
+steps in the existing diagnostic. The named functions, blockers and two-plan
+remedy remain unchanged, as does the early refusal of a held partition create
+that moves rows out of DEFAULT. Creation parts still use DEC-1503.6's shared
+structural classification and per-part risk rules; this conversion changes
+neither generated expansion nor the resolver engine seam.
+
+Scratch preserves the sequential compatibility of its retained whole-table
+holds. For each late table, a lexical scan partitions the preceding module
+projection into free peers and table-reader closure. Compatibility edges
+keep free peers before the complete table group, readers after it, and the
+remaining peers after those readers. The next table reads the projection
+returned by Schedule, rather than a locally spliced list. Edges also chain
+foreign keys naming late tables after the modules, and preserve the existing
+Tables, Keys, Modules and Expressions phase barriers. Only the scheduler's
+permutation is applied to lowering metadata; every source operation remains
+the actual typed expansion's change.
+
+Phase compatibility must settle separately before the existing generated
+constraints: those constraints may legitimately move a key across a phase
+boundary. Combining the phase barriers with them would invent a cycle that
+the previous stable phase sort did not impose. The emitted statements,
+metadata and binding/name trials are unchanged. No new ordering pass or
+SQL/name allocator is added.
+
+Both former movers live only under cfg(test). Every test-build CLI hold
+compares result/refusal, serialized plan bytes, SQL and a fixed-metadata
+saved-plan checksum with its frozen predecessor. Scratch compares every
+Step field and its SQL before the unchanged generated settlement, including
+phase, operation, names and binding metadata. The free-chain graph contract
+is checked separately so its required edges cannot silently disappear.
+
+Pinned by `function_windows_match_old_bytes_for_32_uid_seeds_and_named_cycles`,
+`multiple_holds_and_phase_peers_match_the_old_metadata_for_32_uid_seeds`,
+the existing column/row/partition/literal/declared-dependency negatives, and
+`held_tables_and_readers_compile_with_their_keys_on_both_servers` and
+`callable_columns_precede_their_readers_and_real_cycles_are_refused_on_both_servers`
+on the pinned PostgreSQL 16 and 18 fixtures.

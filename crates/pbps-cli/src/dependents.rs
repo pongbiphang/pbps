@@ -3625,6 +3625,29 @@ fn after_their_functions(
     deps: &ModuleDeps,
     partitions: &Partitions,
 ) -> Result<usize, String> {
+    #[cfg(test)]
+    let mut old = cs.clone();
+    #[cfg(test)]
+    let expected = function_oracle::after_their_functions(&mut old, deps, partitions);
+    let result = function_edges(cs, deps, partitions);
+    #[cfg(test)]
+    {
+        assert_eq!(result, expected);
+        split_oracle::same_plan(cs, &old, &pbps_pg::Postgres::new());
+    }
+    result
+}
+
+#[cfg(test)]
+#[path = "dependents/function_oracle.rs"]
+mod function_oracle;
+
+#[allow(clippy::wildcard_enum_match_arm)]
+fn function_edges(
+    cs: &mut ChangeSet,
+    deps: &ModuleDeps,
+    partitions: &Partitions,
+) -> Result<usize, String> {
     let functions = function_creates(cs);
     let Some(last) = functions.iter().map(|(_, at)| *at).max() else {
         return Ok(0);
@@ -3724,42 +3747,61 @@ fn after_their_functions(
             default = default.shown()
         ));
     }
-    let mut preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
-    let mut previous_free: Option<usize> = None;
+    let mut schedule = pbps_diff::order::Schedule::new(cs.changes.len());
+    let mut previous_free = None;
     for i in 0..n {
-        if held.contains(&i) {
-            preds[i].extend((0..i).filter(|&j| needs(window[i], window[j], deps, partitions)));
+        let earlier: Vec<_> = if held.contains(&i) {
+            (0..i).collect()
         } else {
-            preds[i].extend(
-                held.range(..i)
-                    .filter(|&&j| needs(window[i], window[j], deps, partitions)),
-            );
-            preds[i].extend(previous_free);
-            previous_free = Some(i);
+            held.range(..i).copied().collect()
+        };
+        for j in earlier {
+            if needs(window[i], window[j], deps, partitions) {
+                let declared = window[i]
+                    .module_id()
+                    .zip(window[j].module_id())
+                    .is_some_and(|(later, earlier)| {
+                        deps.get(later).is_some_and(|d| d.contains(earlier))
+                    });
+                schedule.edge(
+                    start + j,
+                    start + i,
+                    if declared {
+                        Source::Declared
+                    } else {
+                        Source::Lexical
+                    },
+                    OrderReason::Structural,
+                );
+            }
+        }
+        if !held.contains(&i) {
+            // Keep the free chain as edges. Keep is a refusal guard, not an
+            // ordering constraint, and would not preserve this base order.
+            if let Some(before) = previous_free {
+                schedule.edge(before, start + i, Source::Lexical, OrderReason::Structural);
+            }
+            previous_free = Some(start + i);
         }
     }
-    // A column follows the creates its text names. One that may also need the
-    // column keeps both edges: that is the cycle refused below.
     for (at, named) in &waits {
-        preds[at - start].extend(named.iter().map(|create| create - start));
+        for &create in named {
+            schedule.edge(create, *at, Source::Lexical, OrderReason::Structural);
+        }
     }
-    // Kahn's algorithm, always taking the earliest ready change, so that what
-    // nothing holds back keeps its place.
-    let mut done = vec![false; n];
-    let mut order: Vec<usize> = Vec::with_capacity(n);
-    while let Some(i) = (0..n).find(|&i| !done[i] && preds[i].iter().all(|&j| done[j])) {
-        done[i] = true;
-        order.push(i);
-    }
-    if order.len() < n {
-        return Err(cycle(cs, start, &waits, &done, &window, deps, partitions));
-    }
-    let mut taken: Vec<Option<PlannedChange>> = cs.changes.drain(start..=last).map(Some).collect();
-    let placed: Vec<PlannedChange> = order
-        .iter()
-        .map(|&i| taken[i].take().expect("each change is ordered once"))
-        .collect();
-    cs.changes.splice(start..start, placed);
+    #[cfg(test)]
+    function_oracle::free_chain(&schedule, start, last, &held);
+    // All edges stay inside the old window. Sink emits the unchanged prefix
+    // first and the suffix last; only held steps can pass the free chain.
+    let settled = schedule.settle(cs.clone()).map_err(|refusal| {
+        if let pbps_diff::order::Refusal::Cycle { waiting, .. } = &refusal {
+            let done: Vec<bool> = (start..=last).map(|at| !waiting.contains(&at)).collect();
+            cycle(cs, start, &waits, &done, &window, deps, partitions)
+        } else {
+            refusal.describe(cs)
+        }
+    })?;
+    *cs = settled.changes;
     Ok(waits.len())
 }
 

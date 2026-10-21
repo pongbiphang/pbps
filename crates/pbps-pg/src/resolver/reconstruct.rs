@@ -3,7 +3,8 @@
 //!
 //! The statements are the emitter's own: a fresh bootstrap of the declared
 //! schema, so what scratch binds is what these declarations bind when they are
-//! created. Only the *order* is this module's. The ordinary plan order puts
+//! created. This module supplies constraints; the scheduler owns their order.
+//! The ordinary plan order puts
 //! tables, with their defaults, checks and indexes, ahead of every module
 //! (`order_key` in pbps-diff), and an expression calling a managed function
 //! then either fails or binds whatever else of that name exists already —
@@ -67,6 +68,7 @@ pub enum ReconstructError {
 /// An unsplittable table whose generation still calls a declared function
 /// after the shared expansion (DEC-1503.1): a suffix partition key or a read
 /// of a later column, without a known expression-replacement capability.
+#[derive(Clone)]
 struct Late {
     table: pbps_model::TableName,
     steps: std::ops::Range<usize>,
@@ -122,6 +124,7 @@ impl Nameable {
 pub type Named = (Nameable, String, String);
 
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 struct Step {
     phase: Phase,
     operation: usize,
@@ -565,10 +568,24 @@ impl Reconstruction {
                 }
             }
         }
-        let mut steps = after_their_functions(steps, late, &functions, &foreign)?;
-        // Stable: within a phase the differ's order stands, which for modules
-        // is its dependency order.
-        steps.sort_by_key(|step| step.phase);
+        #[cfg(test)]
+        let expected = function_oracle::after_their_functions(
+            steps.clone(),
+            late.clone(),
+            &functions,
+            &foreign,
+        )
+        .map(|mut steps| {
+            steps.sort_by_key(|step| step.phase);
+            steps
+        });
+        let ordered = function_edges(steps, late, &functions, &foreign, &expanded);
+        #[cfg(test)]
+        assert_eq!(
+            ordered, expected,
+            "scratch statements and every Step field must match the frozen hold and phase sort"
+        );
+        let steps = ordered?;
         let mut schedule = pbps_diff::order::Schedule::new(steps.len());
         for edge in edges {
             let before = steps.iter().rposition(|s| s.operation == edge.before);
@@ -577,25 +594,7 @@ impl Reconstruction {
                 schedule.edge(before, after, edge.source, edge.reason);
             }
         }
-        // The scheduler owns the permutation; scratch only applies it to its
-        // lowering metadata, before #1778 chooses any transaction boundary.
-        let order_plan = pbps_model::ChangeSet {
-            changes: steps
-                .iter()
-                .map(|s| {
-                    pbps_model::PlannedChange::new(expanded.changes[s.operation].change.clone())
-                })
-                .collect(),
-        };
-        let settled = schedule
-            .settle(order_plan.clone())
-            .map_err(|e| ReconstructError::Cycle(e.describe(&order_plan)))?;
-        let mut taken: Vec<_> = steps.into_iter().map(Some).collect();
-        let steps = settled
-            .sequence
-            .iter()
-            .map(|&i| taken[i].take().expect("a settled order is a permutation"))
-            .collect();
+        let steps = settle_steps(steps, schedule, &expanded)?;
 
         Ok(Self {
             steps,
@@ -996,24 +995,64 @@ async fn routines(
         .collect()
 }
 
-/// What creating a table or view makes nameable before it compiles: the
-/// relation with its row type, which always has its name. Its array type is
-/// read back once it exists ([`array_type`]).
-/// Keeps the legacy whole-table hold for the unsplittable shapes left
-/// by the shared expansion, as the ordinary plan does (DEC-1503.1). The table
-/// and what it holds that runs before the modules join the modules phase
-/// after the last function its generation text names. A module ahead of it
-/// that names the table, or names something so moved, follows it; a foreign
-/// key naming such a table waits for the end of the modules. A function the
-/// table calls that would itself have to follow the table is a cycle no
-/// order compiles. Other steps keep their place.
-fn after_their_functions(
+#[cfg(test)]
+#[path = "reconstruct/function_oracle.rs"]
+mod function_oracle;
+
+fn edge(schedule: &mut pbps_diff::order::Schedule, before: usize, after: usize) {
+    schedule.edge(
+        before,
+        after,
+        pbps_diff::order::Source::Lexical,
+        pbps_model::resolver::OrderReason::Structural,
+    );
+}
+
+/// Peers keep their input order, and a block follows the preceding block.
+/// These are compatibility edges, not a new priority or a pre-sort.
+fn block(schedule: &mut pbps_diff::order::Schedule, previous: &mut Option<usize>, peers: &[usize]) {
+    for &at in peers {
+        if let Some(before) = *previous {
+            edge(schedule, before, at);
+        }
+        *previous = Some(at);
+    }
+}
+
+/// Apply only the scheduler's permutation to lowering metadata. Operations
+/// remain the typed expansion's own changes, with no fabricated identities.
+fn settle_steps(
     steps: Vec<Step>,
+    schedule: pbps_diff::order::Schedule,
+    expanded: &pbps_model::ChangeSet,
+) -> Result<Vec<Step>, ReconstructError> {
+    let order_plan = pbps_model::ChangeSet {
+        changes: steps
+            .iter()
+            .map(|s| pbps_model::PlannedChange::new(expanded.changes[s.operation].change.clone()))
+            .collect(),
+    };
+    let settled = schedule
+        .settle(order_plan.clone())
+        .map_err(|e| ReconstructError::Cycle(e.describe(&order_plan)))?;
+    let mut taken: Vec<_> = steps.into_iter().map(Some).collect();
+    Ok(settled
+        .sequence
+        .iter()
+        .map(|&i| taken[i].take().expect("a settled order is a permutation"))
+        .collect())
+}
+
+/// State the retained whole-table holds, reader closures and phase barriers
+/// as constraints, leaving every permutation to Schedule (DEC-1959.3).
+fn function_edges(
+    mut steps: Vec<Step>,
     late: Vec<Late>,
     functions: &[(usize, String)],
     foreign: &BTreeSet<usize>,
+    expanded: &pbps_model::ChangeSet,
 ) -> Result<Vec<Step>, ReconstructError> {
-    let late: Vec<(Late, Vec<usize>)> = late
+    let late: Vec<_> = late
         .into_iter()
         .filter_map(|table| {
             let called: Vec<usize> = functions
@@ -1029,11 +1068,6 @@ fn after_their_functions(
             (!called.is_empty()).then_some((table, called))
         })
         .collect();
-    if late.is_empty() {
-        return Ok(steps);
-    }
-    // A literal counts: an OID-alias literal such as `'app.n'::regclass`
-    // names the table to the engine as the step compiles (DEC-1364.1).
     let names = |at: usize, name: &str| {
         steps[at]
             .statements
@@ -1041,22 +1075,20 @@ fn after_their_functions(
             .any(|sql| crate::generated::may_call(sql, name))
     };
     let early = |at: usize| matches!(steps[at].phase, Phase::Tables | Phase::Keys);
-    // A foreign key naming a late table waits for the end of the modules:
-    // it names only tables, and every table exists by then.
-    let keys: Vec<usize> = foreign
+    let keys: Vec<_> = foreign
         .iter()
         .copied()
         .filter(|&at| late.iter().any(|(table, _)| names(at, &table.table.name)))
         .collect();
-    let mut modules: Vec<usize> = (0..steps.len())
+    // The projection contains metadata positions only. Each subsequent order
+    // is produced by Schedule, never by splicing this list around a callee.
+    let mut modules: Vec<_> = (0..steps.len())
         .filter(|&at| steps[at].phase == Phase::Modules)
         .collect();
-    // Steps already moved for an earlier table. A table that names one of
-    // them, such as by an OID-alias literal in its generated column, follows
-    // it as it follows its own functions.
-    let mut delayed: BTreeSet<usize> = BTreeSet::new();
+    let mut placed: BTreeSet<_> = modules.iter().copied().collect();
+    let mut delayed = BTreeSet::new();
     for (table, called) in &late {
-        let group: Vec<usize> = table
+        let group: Vec<_> = table
             .steps
             .clone()
             .filter(|&at| early(at) && !keys.contains(&at))
@@ -1072,10 +1104,9 @@ fn after_their_functions(
                             .any(|(_, _, name)| group.iter().any(|&own| names(own, name))))
             })
             .map_or(0, |position| position + 1);
-        delayed.extend(group.iter().copied());
         let mut held = BTreeSet::from([table.table.name.clone()]);
-        let mut kept = Vec::new();
-        let mut moved = Vec::new();
+        let mut free = Vec::new();
+        let mut readers = Vec::new();
         for &at in &modules[..point] {
             if held.iter().any(|name| {
                 if name == &table.table.name {
@@ -1095,34 +1126,55 @@ fn after_their_functions(
                     )));
                 }
                 held.extend(steps[at].names.iter().map(|(_, _, name)| name.clone()));
-                moved.push(at);
+                readers.push(at);
             } else {
-                kept.push(at);
+                free.push(at);
             }
         }
-        kept.extend(group);
-        kept.extend(moved);
-        kept.extend_from_slice(&modules[point..]);
-        modules = kept;
+        let mut schedule = pbps_diff::order::Schedule::new(steps.len());
+        let mut previous = None;
+        // The last callee (or a delayed name it uses) stays before the table.
+        // Readers follow the complete group; later peers keep following those
+        // readers, as the old hold did. Sink alone would not retain that barrier.
+        block(&mut schedule, &mut previous, &free);
+        block(&mut schedule, &mut previous, &group);
+        block(&mut schedule, &mut previous, &readers);
+        block(&mut schedule, &mut previous, &modules[point..]);
+        placed.extend(group.iter().copied());
+        delayed.extend(group);
+        modules = schedule
+            .sequence()
+            .map_err(|e| ReconstructError::Cycle(e.to_string()))?
+            .into_iter()
+            .filter(|at| placed.contains(at))
+            .collect();
     }
-    modules.extend(keys);
-    let placed: BTreeSet<usize> = modules.iter().copied().collect();
-    let order: Vec<usize> = (0..steps.len())
-        .filter(|at| !placed.contains(at) && early(*at))
-        .chain(modules)
-        .chain((0..steps.len()).filter(|&at| steps[at].phase == Phase::Expressions))
-        .collect();
-    let mut taken: Vec<Option<Step>> = steps.into_iter().map(Some).collect();
-    Ok(order
-        .into_iter()
-        .map(|at| {
-            let mut step = taken[at].take().expect("each step is placed once");
-            if placed.contains(&at) {
-                step.phase = Phase::Modules;
-            }
-            step
-        })
-        .collect())
+    placed.extend(keys.iter().copied());
+    for &at in &placed {
+        steps[at].phase = Phase::Modules;
+    }
+
+    let mut schedule = pbps_diff::order::Schedule::new(steps.len());
+    let mut previous = None;
+    for phase in [
+        Phase::Tables,
+        Phase::Keys,
+        Phase::Modules,
+        Phase::Expressions,
+    ] {
+        if phase == Phase::Modules {
+            block(&mut schedule, &mut previous, &modules);
+            block(&mut schedule, &mut previous, &keys);
+        } else {
+            let peers: Vec<_> = (0..steps.len())
+                .filter(|&at| steps[at].phase == phase)
+                .collect();
+            block(&mut schedule, &mut previous, &peers);
+        }
+    }
+    // Phase compatibility is settled before generated-part constraints, which
+    // may legitimately move a key across a phase boundary (DEC-1959.3).
+    settle_steps(steps, schedule, expanded)
 }
 
 fn relation(schema: &str, name: &str) -> Vec<(Nameable, String, String)> {
@@ -1233,6 +1285,8 @@ pub(crate) fn fixture_ids(bootstrap: &[Change]) -> pbps_model::IdsFile {
     ids
 }
 
+#[cfg(test)]
+mod function_tests;
 #[cfg(test)]
 mod tests;
 

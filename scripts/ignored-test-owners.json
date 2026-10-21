@@ -180,6 +180,7 @@
         "darwin"
       ],
       "cases": [
+        "dependents::function_oracle::callable_columns_precede_their_readers_and_real_cycles_are_refused_on_both_servers",
         "dependents::split_oracle::expanded_table_checks_indexes_and_defaults_execute_on_both_servers",
         "dependents::generated_tests::generated_table_parts_apply_with_the_declared_column_order_values_and_names",
         "dependents::generated_tests::called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold",
@@ -1194,6 +1195,7 @@
         "darwin"
       ],
       "cases": [
+        "resolver::reconstruct::function_tests::held_tables_and_readers_compile_with_their_keys_on_both_servers",
         "catalog::tests::a_failed_canonical_permission_query_restores_both_transaction_scopes",
         "catalog::tests::partition_membership_is_scoped_and_shared_by_the_catalog_parts",
         "catalog::tests::row_security_is_read_coherently_but_adoption_waits_for_planning",
