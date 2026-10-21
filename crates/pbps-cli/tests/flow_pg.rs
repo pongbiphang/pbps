@@ -2708,8 +2708,8 @@ fn a_partitioned_parents_serial_round_trips_without_partition_drift() {
             ALTER TABLE app.p ATTACH PARTITION app.p2 FOR VALUES FROM (10) TO (20)",
         );
         // ATTACH does not copy the default (#2218), whereas ADD COLUMN
-        // reaches the existing partitions (#2219). Neither changes the
-        // read/create slice's model or permits those changes in its differ.
+        // reaches the existing partitions (DEC-2219.1). The two operations
+        // therefore need different handling of the copied default.
         assert_eq!(
             scalar(
                 src,
@@ -2894,6 +2894,331 @@ fn an_attached_partition_takes_its_serial_parents_default_on_both_servers() {
             ),
             0
         );
+    }
+}
+
+/// A standing parent's serial edits recurse into declared, plan-attached and
+/// external partitions on both servers; own defaults survive the parent's
+/// recursion, and a source put on continues past rows in every partition.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_standing_parents_serial_changes_reach_every_partition_on_both_servers() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [(16, old), (18, server())] {
+        let own = OwnDatabase::new(&server, "serial-parent-changes");
+        let connection = own.connection();
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT current_setting('server_version_num')::bigint / 10000"
+            ),
+            version
+        );
+        on_server(
+            connection,
+            "CREATE SCHEMA app;
+            CREATE TABLE app.p (v integer) PARTITION BY RANGE (v);
+            CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (0) TO (10);
+            CREATE TABLE app.t (discarded integer, v integer);
+            ALTER TABLE app.t DROP COLUMN discarded;
+            CREATE TABLE app.e (v integer) PARTITION BY RANGE (v);
+            CREATE TABLE app.e1 PARTITION OF app.e DEFAULT;
+            INSERT INTO app.p1 VALUES (1);
+            INSERT INTO app.t VALUES (11);
+            INSERT INTO app.e1 VALUES (1)",
+        );
+        let d = Demo::new("serial-parent-changes");
+        succeeds(d.run(&["pull", "--db", connection, "--partitions-external", "app.e"]));
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "adopt partition trees",
+        ]));
+        let parent_path = d.dir.join("schema/app.p.yml");
+        let external_path = d.dir.join("schema/app.e.yml");
+        let write = |column: Option<&str>, own: bool| {
+            let column = column.map(|c| format!("  id: {c}\n")).unwrap_or_default();
+            let override_column = if own {
+                "    columns:\n      id: {default: '-7'}\n"
+            } else {
+                ""
+            };
+            std::fs::write(&parent_path, format!("table: app.p\ncolumns:\n  v: {{type: integer}}\n{column}partition_by: [v]\npartitions:\n  p1:\n    from: [0]\n    to: [10]\n{override_column}  t: {{from: [10], to: [20]}}\n")).unwrap();
+            std::fs::write(&external_path, format!("table: app.e\ncolumns:\n  v: {{type: integer}}\n{column}partition_by: [v]\npartitions: external\n")).unwrap();
+        };
+        let apply = || {
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            let plan = d.dir.join("plan.json");
+            let output =
+                succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+            succeeds(approved_apply(
+                &d,
+                connection,
+                &plan,
+                &["--allow", "constraint,numbering,destructive"],
+            ));
+            let next = succeeds(d.run(&["plan", "--db", connection]));
+            assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+            succeeds(d.run(&["verify", "--db", connection]));
+            stdout(&output)
+        };
+        // Attach in its own plan: #1692 still refuses a simultaneous change
+        // to the parent's columns, even when the engine could recurse it.
+        std::fs::remove_file(d.dir.join("schema/app.t.yml")).unwrap();
+        write(None, false);
+        assert!(apply().contains("attach table app.t to app.p"));
+        on_server(
+            connection,
+            "INSERT INTO app.p (v) VALUES (2), (12);
+            INSERT INTO app.t (v) VALUES (13);
+            INSERT INTO app.e (v) VALUES (2)",
+        );
+        for (phase, column, numbered) in [
+            ("add", Some("{type: bigserial}"), true),
+            (
+                "retune",
+                Some("{type: bigserial, sequence: {max: 1000}}"),
+                true,
+            ),
+            ("give-up", Some("{type: bigint, nullable: false}"), false),
+            ("put-on", Some("{type: bigserial}"), true),
+            (
+                "plain-default",
+                Some("{type: bigint, nullable: false, default: '42'}"),
+                false,
+            ),
+            ("replace-default", Some("{type: bigserial}"), true),
+            ("drop", None, false),
+        ] {
+            // The largest existing value lives in the attached partition,
+            // and in the external partition of the other parent. Continuing
+            // from ONLY the parent would start at 1 and fail these checks.
+            let floors = if matches!(phase, "put-on" | "replace-default") {
+                let (attached, external) = if phase == "put-on" {
+                    (500, 700)
+                } else {
+                    (1500, 1700)
+                };
+                on_server(
+                    connection,
+                    &format!(
+                        "INSERT INTO app.t (v, id) VALUES (14, {attached});
+                    INSERT INTO app.e1 (v, id) VALUES (3, {external})"
+                    ),
+                );
+                Some([attached + 1, external + 1])
+            } else {
+                None
+            };
+            let counters = (phase == "retune").then(|| {
+                ["app.p_id_seq", "app.e_id_seq"]
+                    .map(|s| scalar(connection, &format!("SELECT last_value FROM {s}")))
+            });
+            write(column, column.is_some());
+            if column.is_none() {
+                succeeds(d.run(&[
+                    "intent",
+                    "--drop",
+                    "app.p.id",
+                    "retire numbering column",
+                    "--drop",
+                    "app.e.id",
+                    "retire numbering column",
+                ]));
+            }
+            if matches!(phase, "give-up" | "drop") {
+                // A dependency outside the partition tree must still block
+                // the sequence drop; only recursively removed defaults go.
+                on_server(
+                    connection,
+                    "CREATE VIEW app.sequence_user AS SELECT nextval('app.p_id_seq') AS n",
+                );
+                let refused = d.run(&["plan", "--db", connection]);
+                assert_ne!(code(&refused), 0);
+                assert!(
+                    stderr(&refused).contains("drop_blockers")
+                        && stderr(&refused).contains("sequence_user"),
+                    "{}",
+                    stderr(&refused)
+                );
+                on_server(connection, "DROP VIEW app.sequence_user");
+            }
+            apply();
+            if let Some(counters) = counters {
+                for (i, sequence) in ["app.p_id_seq", "app.e_id_seq"].into_iter().enumerate() {
+                    assert_eq!(
+                        scalar(connection, &format!("SELECT last_value FROM {sequence}")),
+                        counters[i],
+                        "retuning keeps the counter"
+                    );
+                }
+            }
+            if column.is_none() {
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT count(*) FROM pg_attribute
+                    WHERE attrelid IN ('app.p'::regclass, 'app.p1'::regclass, 'app.t'::regclass,
+                        'app.e'::regclass, 'app.e1'::regclass)
+                    AND attname = 'id' AND NOT attisdropped"
+                    ),
+                    0
+                );
+                assert_eq!(
+                    scalar(
+                        connection,
+                        "SELECT count(*) FROM pg_class c JOIN pg_namespace n
+                    ON n.oid = c.relnamespace WHERE n.nspname = 'app' AND c.relkind = 'S'"
+                    ),
+                    0
+                );
+                on_server(
+                    connection,
+                    "INSERT INTO app.p (v) VALUES (3), (14);
+                    INSERT INTO app.p1 (v) VALUES (4); INSERT INTO app.t (v) VALUES (15);
+                    INSERT INTO app.e (v) VALUES (4); INSERT INTO app.e1 (v) VALUES (5)",
+                );
+                continue;
+            }
+            assert_eq!(
+                scalar(connection, "INSERT INTO app.p1 (v) VALUES (3) RETURNING id"),
+                -7,
+                "{phase}: own default"
+            );
+            if phase == "add" {
+                for parent in ["app.p", "app.e"] {
+                    assert_eq!(
+                        scalar(
+                            connection,
+                            &format!("SELECT count(*) FROM {parent} WHERE id IS NULL")
+                        ),
+                        0
+                    );
+                    assert_eq!(
+                        scalar(
+                            connection,
+                            &format!("SELECT count(DISTINCT id) FROM {parent}")
+                        ),
+                        scalar(connection, &format!("SELECT count(*) FROM {parent}"))
+                    );
+                }
+            }
+            // Remove the override in a separate plan, then exercise both
+            // writers on every partition with the inherited final source.
+            write(column, false);
+            apply();
+            for (i, (parent, sequence, writers)) in [
+                (
+                    "app.p",
+                    "app.p_id_seq",
+                    vec![("app.p", 4), ("app.p", 14), ("app.p1", 5), ("app.t", 15)],
+                ),
+                ("app.e", "app.e_id_seq", vec![("app.e", 4), ("app.e1", 5)]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if numbered {
+                    if let Some(floors) = floors {
+                        assert_eq!(
+                            scalar(connection, &format!("SELECT last_value FROM {sequence}")),
+                            floors[i],
+                            "{phase}: all rows counted"
+                        );
+                    }
+                    for (writer, v) in writers {
+                        let before = scalar(
+                            connection,
+                            &format!(
+                                "SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM {sequence}"
+                            ),
+                        );
+                        assert_eq!(
+                            scalar(
+                                connection,
+                                &format!("INSERT INTO {writer} (v) VALUES ({v}) RETURNING id")
+                            ),
+                            before,
+                            "{phase}: {writer}"
+                        );
+                        assert_eq!(
+                            scalar(connection, &format!("SELECT last_value FROM {sequence}")),
+                            before
+                        );
+                    }
+                } else {
+                    assert_eq!(
+                        scalar(
+                            connection,
+                            &format!("SELECT (to_regclass('{sequence}') IS NULL)::int::bigint")
+                        ),
+                        1
+                    );
+                    for (writer, v) in writers {
+                        if phase == "plain-default" {
+                            assert_eq!(
+                                scalar(
+                                    connection,
+                                    &format!("INSERT INTO {writer} (v) VALUES ({v}) RETURNING id")
+                                ),
+                                42
+                            );
+                        } else {
+                            let error = try_on_server(
+                                connection,
+                                &format!("INSERT INTO {writer} (v) VALUES ({v})"),
+                            )
+                            .unwrap_err();
+                            assert!(error.contains("null value"), "{phase}: {writer}: {error}");
+                        }
+                    }
+                }
+                assert_eq!(
+                    scalar(
+                        connection,
+                        &format!("SELECT count(*) FROM {parent} WHERE id IS NULL")
+                    ),
+                    0
+                );
+            }
+            succeeds(d.run(&["verify", "--db", connection]));
+            if phase == "retune" {
+                for sequence in ["app.p_id_seq", "app.e_id_seq"] {
+                    assert_eq!(
+                        scalar(
+                            connection,
+                            &format!(
+                                "SELECT seqmax FROM pg_sequence WHERE seqrelid = '{sequence}'::regclass"
+                            )
+                        ),
+                        1000
+                    );
+                }
+            }
+            if phase == "replace-default" {
+                // Serial/identity conversion remains a named refusal, rather
+                // than leaving direct writers broken on PostgreSQL 16.
+                write(
+                    Some("{type: bigint, nullable: false, identity: [1, 1]}"),
+                    false,
+                );
+                let refused = d.run(&["plan", "--db", connection]);
+                assert_ne!(code(&refused), 0);
+                assert!(
+                    stderr(&refused).contains("#1681") && stderr(&refused).contains("app.p.id"),
+                    "{}",
+                    stderr(&refused)
+                );
+            }
+            // Keep a standing own default for the next parent's edit, so its
+            // restoration is tested even where its declared text is unchanged.
+            write(column, true);
+            apply();
+        }
     }
 }
 

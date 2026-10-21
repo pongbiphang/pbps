@@ -6145,10 +6145,10 @@ mod tests {
         }
     }
 
-    /// Read/create support must not admit a standing parent's column edits
-    /// before their partition-default handling exists (DEC-2217.1).
+    /// A standing parent's serial changes use the ordinary table's changes;
+    /// identity conversions still name their partition limitation (DEC-2219.1).
     #[test]
-    fn a_standing_parents_serial_column_changes_name_their_partition_support_issue() {
+    fn a_standing_parents_serial_changes_plan_but_identity_conversions_are_refused() {
         use pbps_model::{
             Change, Column, Hints, IdsFile, Intent, OwnedSequence, Schema, ValueSource,
         };
@@ -6197,6 +6197,26 @@ mod tests {
                 })),
                 "changing numbering to or from a `serial`",
             ),
+            (
+                Some(serial.clone()),
+                Some(ValueSource::Default("42".into())),
+                "changing numbering to or from a `serial`",
+            ),
+            (
+                Some(ValueSource::Default("42".into())),
+                Some(serial.clone()),
+                "changing numbering to or from a `serial`",
+            ),
+            (
+                Some(serial.clone()),
+                Some(ValueSource::Identity(pbps_model::Identity::new(1, 1))),
+                "identity conversion",
+            ),
+            (
+                Some(ValueSource::Identity(pbps_model::Identity::new(1, 1))),
+                Some(serial.clone()),
+                "identity conversion",
+            ),
             (Some(serial.clone()), None, "dropping a `serial` column"),
         ] {
             for partitioned in [true, false] {
@@ -6228,15 +6248,18 @@ mod tests {
                     &Postgres::new(),
                     &Hints::default(),
                 );
-                if partitioned {
+                if partitioned && what == "identity conversion" {
                     let errors = outcome.expect_err(what);
                     assert!(
-                        matches!(errors.as_slice(), [pbps_diff::DiffError::SerialChangeOnPartitionedParent { what: named, .. }] if *named == what),
+                        matches!(
+                            errors.as_slice(),
+                            [pbps_diff::DiffError::NumberingChangeOnPartitionedTable { .. }]
+                        ),
                         "{errors:?}"
                     );
                     let message = errors[0].to_string();
                     assert!(
-                        message.contains("app.t.n") && message.contains("#2219"),
+                        message.contains("app.t.n") && message.contains("#1681"),
                         "{message}"
                     );
                 } else {
@@ -6246,7 +6269,8 @@ mod tests {
                             (what, &p.change),
                             ("adding a `serial` column", Change::AddColumn { .. })
                                 | (
-                                    "changing numbering to or from a `serial`",
+                                    "changing numbering to or from a `serial`"
+                                        | "identity conversion",
                                     Change::AlterColumnNumbering { .. }
                                 )
                                 | ("dropping a `serial` column", Change::DropColumn { .. })

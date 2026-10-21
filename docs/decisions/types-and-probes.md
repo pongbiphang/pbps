@@ -2339,15 +2339,15 @@ take the identity's value instead. A serial's ordinary default has neither
 restriction.
 
 This is #1893 part A, read and create. Part B (#2218) leaves attaching a
-table without the parent's serial default for its own change. Until part C
-(#2219), adding or dropping a serial column on an existing partitioned
-parent, or changing numbering to or from a serial there (including a
-retune), is refused by name citing #2219. Plain tables retain those changes.
+table without the parent's serial default for its own change. DEC-2219.1
+extends this to adding or dropping a serial column on an existing
+partitioned parent, retuning it, and changing between a serial and no source
+or a plain default. Identity changes retain the #1681 refusal.
 
 Pinned by `a_partitioned_parents_serial_holds_only_its_same_column_same_text_copies`,
 `a_serial_that_is_nullable_defaulted_on_a_partition_or_misnamed_is_refused`,
 `a_created_partitioned_parent_owns_its_serial_and_its_partition_owns_none`,
-`a_standing_parents_serial_column_changes_name_their_partition_support_issue`,
+`a_standing_parents_serial_changes_plan_but_identity_conversions_are_refused`,
 `a_partitions_own_default_can_override_a_serial_but_not_an_identity`
 and, live on 16 and 18,
 `a_partitioned_parents_serial_round_trips_without_partition_drift` (SQL-created
@@ -2399,3 +2399,60 @@ and default removal), and, live on 16 and 18,
 (managed parent creation, SQL-created table attached by a plan, numbered
 direct inserts, empty next plan, clean verify, own-default removal, and
 whole-tree pull and external refusals for serial and plain defaults).
+
+<a id="dec-2219-1"></a>
+
+**DEC-2219.1. A standing partitioned parent's serial changes recurse into
+all its partitions, and declared own defaults are restored afterward.**
+(#2219; #1893 part C; extends DEC-2217.1)
+
+Measured on PostgreSQL 16 and 18 with populated partitions, one created by
+`PARTITION OF` and one ordinary table attached afterward: `ADD COLUMN n
+bigserial` gives both the parent's `nextval` default and numbers their
+existing rows. Retuning that sequence with `MAXVALUE 1000` keeps numbering.
+The parent's `DROP DEFAULT` and `SET DEFAULT nextval(...)` recurse into both
+partitions, overwriting an own default (DEC-1578.1). `DROP COLUMN` takes the
+owned sequence with it. Identity inheritance differs: adding an identity
+after giving up a serial reaches the partitions on 18, restarting below
+existing values, but does not reach them on 16, where direct inserts fail
+NOT NULL.
+
+The differ therefore admits adding a serial column, retuning its options,
+giving it up for no source or a plain default, putting it on a column with
+no source or a plain default, and dropping its column. The existing
+`AddColumn`, `AlterColumnNumbering`, `AlterColumnDefault` and `DropColumn`
+carry these changes; there is no new change kind, sort class or reordering
+pass. A source put on retains DEC-1889.1's locked continuation past the
+column's MAX (MIN counting down), whose parent read includes every
+partition's rows. Engine recursion covers external partitions as well
+(DEC-1533.1); pbps declares and changes none of their own defaults. The
+drop-blocker probe likewise counts the defaults that recursive `DROP COLUMN`
+or a serial's `DROP DEFAULT` removes before `DROP SEQUENCE`, matching
+partition columns by name rather than attribute number. Dependencies outside
+the tree still block the drop.
+
+`diff_partition_columns` restores a declared partition's own default after
+the parent's change, including a new serial column and numbering changes.
+The existing parent-column classification includes numbering changes, both
+for that ordering and for the unchanged #1692 refusal of a parent's column
+change beside an attach, detach or partition drop. The existing later rank
+for a partition's own default follows numbering changes as it follows plain
+default changes. A serial on a partition itself stays refused. Every
+identity change on a partitioned table or partition, including either
+direction of serial/identity conversion, retains
+`NumberingChangeOnPartitionedTable`, naming #1681. No producer of
+`SerialChangeOnPartitionedParent` remains, so that variant is removed.
+
+Tests: `a_standing_parents_serial_changes_restore_its_partitions_own_default`
+covers every admitted change, external parents, restored own defaults,
+unchanged declarations, identity conversions and the attach/detach/drop
+same-plan negatives.
+`a_standing_parents_serial_changes_plan_but_identity_conversions_are_refused`
+covers the PostgreSQL plans and named conversion refusals. Live on 16 and
+18, `a_standing_parents_serial_changes_reach_every_partition_on_both_servers`
+applies every change to declared, plan-attached and external partitions,
+re-plans to nothing and verifies cleanly after each apply, checks direct and
+parent-routed writers, restores own defaults, continues beyond rows in the
+attached and external partitions, confirms source and column removal, and
+refuses an identity conversion by name and a sequence dependency outside
+the partition tree.

@@ -301,25 +301,19 @@ pub async fn drop_blockers(
                     detached.insert(clone);
                 }
             }
-            // An owned sequence given up goes with the default that calls
-            // it, which the same statement drops first: read as standing,
-            // the default blocked every such change (#1930 review).
-            if let Change::AlterColumnNumbering {
+            // Giving up a serial drops its default first, and dropping its
+            // column drops the default with it. Both recurse into every
+            // partition (DEC-2219.1), including external partitions.
+            if let Change::DropColumn { column, .. }
+            | Change::AlterColumnNumbering {
                 column,
                 from: pbps_model::ValueSource::Sequence(_),
                 ..
             } = &cs[index].change
-                && let Some(default) = default_row(
-                    conn,
-                    &classes,
-                    sources,
-                    index,
-                    &column.table,
-                    column.name.raw(),
-                )
-                .await?
             {
-                removals.push((index, default));
+                for default in recursed_defaults(conn, &classes, sources, index, column).await? {
+                    removals.push((index, default));
+                }
             }
         } else if let Change::SetPrimaryKey {
             table,
@@ -608,6 +602,45 @@ async fn default_row(
         })
         .transpose()
         .map_err(Into::into)
+}
+
+/// The defaults removed by recursive DROP DEFAULT or DROP COLUMN. Match each
+/// partition column by name, since an attached table can have a different
+/// attribute number. Defaults outside this tree remain blockers.
+async fn recursed_defaults(
+    conn: &mut Conn,
+    classes: &Classes,
+    sources: &PhysicalSources<'_>,
+    index: usize,
+    column: &pbps_model::ColumnRef,
+) -> Result<Vec<Address>, ImpactError> {
+    let Some((table, name)) = stored(sources, index, &column.table, Some(column.name.raw()))?
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(on) = relation(conn, classes, &table, name.as_deref()).await? else {
+        return Ok(Vec::new());
+    };
+    let rows = conn
+        .query_with(
+            "SELECT d.oid::int8 AS oid FROM pg_catalog.pg_attrdef d
+         JOIN pg_catalog.pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+         JOIN pg_catalog.pg_attribute parent ON parent.attrelid = $1::int8::oid
+             AND parent.attnum = $2::int8 AND parent.attname = a.attname
+         WHERE d.adrelid = parent.attrelid OR d.adrelid IN
+             (SELECT relid FROM pg_catalog.pg_partition_tree(parent.attrelid))",
+            &[Param::I64(on.object), Param::I64(on.part)],
+        )
+        .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(Address {
+                class: classes.default,
+                object: required(row, "oid")?,
+                part: 0,
+            })
+        })
+        .collect()
 }
 
 /// Whether a numbering change drops the sequence its column was numbered
