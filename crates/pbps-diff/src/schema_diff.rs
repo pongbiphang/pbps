@@ -66,28 +66,16 @@ pub enum DiffError {
     )]
     SequenceChangeUnsupported { column: ColumnRef },
 
-    /// A numbering source, an identity or an owned sequence, added, removed,
-    /// retuned or converted on a partitioned table or a partition (#1889):
-    /// the partitions' sources must be accounted for too (#1681, #2219).
+    /// An identity changed on a partitioned table, or any numbering source
+    /// changed on a partition itself: identity inheritance differs between
+    /// supported PostgreSQL versions (#1681, DEC-2219.1).
     #[error(
-        "column {column}: its identity or `serial` sequence changes on a partitioned table or a \
-         partition, which is not planned yet (issues #1681, #2219). Make the change by hand, \
-         then pull.",
+        "column {column}: its identity changes on a partitioned table, or its numbering source \
+         changes on a partition, which is not planned yet (issue #1681). Make the change by \
+         hand, then pull.",
         column = .column.shown(),
     )]
     NumberingChangeOnPartitionedTable { column: ColumnRef },
-
-    /// A parent's serial is held and created, but changing its columns must
-    /// account for every partition's copy of the default (DEC-2217.1).
-    #[error(
-        "column {column}: {what} on an existing partitioned parent is not planned yet \
-         (issue #2219). Make the change by hand, then pull.",
-        column = .column.shown(),
-    )]
-    SerialChangeOnPartitionedParent {
-        column: ColumnRef,
-        what: &'static str,
-    },
 
     /// An identity or owned sequence kept, whose increment changes sign
     /// (#1889): the sequence keeps the bounds of the direction it was made
@@ -1722,14 +1710,15 @@ pub(crate) fn diff_partial_rebuilding(
         .any(|p| matches!(p.change, Change::SetTablePersistence { .. }))
         .then(|| ForeignKeyGraph::of(declared.schema));
     let deepest = fk_graph.as_ref().map_or(0, ForeignKeyGraph::deepest);
-    // A parent's column default or NULL-ness this plan changes, which the
-    // engine recurses into every partition: a partition's own on that
+    // A parent's column default, numbering source or NULL-ness this plan
+    // changes, which the engine recurses into every partition: its own on that
     // column is set after it, or the parent's would overwrite it (#1687).
     let parent_moved: BTreeSet<(TableName, ColumnName)> = planned
         .iter()
         .filter_map(|p| {
             // A retype carries its NOT NULL change with it (#1692 review).
             if let Change::AlterColumnDefault { column, .. }
+            | Change::AlterColumnNumbering { column, .. }
             | Change::AlterColumnNullability { column, .. } = &p.change
             {
                 Some((column.table.clone(), column.name.clone()))
@@ -2075,14 +2064,6 @@ fn diff_columns(
         let Some(base_ref) = base_cols.get(uid) else {
             // Present only on the declared side: a new column.
             if let Some(c) = declared_table.columns.get(&declared_ref.name) {
-                if matches!(&c.value_source, ValueSource::Sequence(_))
-                    && (base_table.partition_by.is_some() || declared_table.partition_by.is_some())
-                {
-                    errs.push(DiffError::SerialChangeOnPartitionedParent {
-                        column: declared_ref.clone(),
-                        what: "adding a `serial` column",
-                    });
-                }
                 // The change does not carry the table's persistence, and the
                 // emitter creates the sequence logged (#1631).
                 if let ValueSource::Sequence(_) = &c.value_source
@@ -2124,9 +2105,10 @@ fn diff_columns(
         let (from_ty, to_ty) = (norm(&base_col.ty), norm(&col.ty));
         let mut recomputed = false;
         // A numbering source changed in place (#1889, DEC-1889.1), where the
-        // engine has an `ALTER` for it and the table takes it. A partitioned
-        // table's sources need their partition handling (#1681, #2219),
-        // and an owned sequence is created logged,
+        // engine has an `ALTER` for it and the table takes it. A parent's
+        // serial default recurses into its partitions (DEC-2219.1); an
+        // identity still needs its partition handling (#1681). An owned
+        // sequence is created logged,
         // which an `UNLOGGED` table's would not be (#1631).
         //
         // A plain default on either side is not the change's: one given up
@@ -2149,17 +2131,9 @@ fn diff_columns(
                         column: declared_ref.clone(),
                     }
                 });
-            } else if (matches!(from, ValueSource::Sequence(_))
-                || matches!(to, ValueSource::Sequence(_)))
-                && (base_table.partition_by.is_some() || declared_table.partition_by.is_some())
-            {
-                errs.push(DiffError::SerialChangeOnPartitionedParent {
-                    column: declared_ref.clone(),
-                    what: "changing numbering to or from a `serial`",
-                });
             } else if [base_table, declared_table]
                 .iter()
-                .any(|t| t.partition_by.is_some() || t.partition_of.is_some())
+                .any(|t| t.partition_of.is_some() || (identity && t.partition_by.is_some()))
             {
                 errs.push(DiffError::NumberingChangeOnPartitionedTable {
                     column: declared_ref.clone(),
@@ -2370,17 +2344,6 @@ fn diff_columns(
     // Present only on the base side: a dropped column.
     for (uid, base_ref) in &base_cols {
         if !declared_cols.contains_key(uid) {
-            if (base_table.partition_by.is_some() || declared_table.partition_by.is_some())
-                && base_table
-                    .columns
-                    .get(&base_ref.name)
-                    .is_some_and(|c| matches!(&c.value_source, ValueSource::Sequence(_)))
-            {
-                errs.push(DiffError::SerialChangeOnPartitionedParent {
-                    column: declared_table_name.column(base_ref.name.clone()),
-                    what: "dropping a `serial` column",
-                });
-            }
             changes.push(Change::DropColumn {
                 uid: uid.clone(),
                 // The **declared** table, with the column's base name. Only
@@ -4466,7 +4429,6 @@ fn refuse_partition_changes(
             } else if let Change::AddColumn { column: c, .. } = change
                 && (match &c.value_source {
                     ValueSource::Identity(_) => true,
-                    // A serial addition is refused in diff_columns (#2219).
                     ValueSource::None
                     | ValueSource::Default(_)
                     | ValueSource::Sequence(_)
@@ -4750,6 +4712,7 @@ fn parent_column(change: &Change) -> Option<&ColumnName> {
         | Change::AlterColumnType { column, .. }
         | Change::AlterColumnNullability { column, .. }
         | Change::AlterColumnDefault { column, .. }
+        | Change::AlterColumnNumbering { column, .. }
         | Change::SetColumnDeprecated { column, .. } => Some(&column.name),
         _ => None,
     }
@@ -4864,6 +4827,8 @@ fn diff_partition_columns(
         let now_default = theirs.and_then(parent_default);
         // An omitted sequence name is unknown in a declaration, not a
         // request to replace the name a read knows (DEC-1631.1).
+        // A new column's own default is new too, so the comparison below
+        // already restores it after AddColumn (DEC-2219.1).
         let default_moved = theirs_was.is_some()
             && if let (Some(ValueSource::Sequence(was)), Some(ValueSource::Sequence(now))) =
                 (&was_default, &now_default)
@@ -12239,6 +12204,177 @@ mod tests {
         }
     }
 
+    /// Serial changes recurse into a standing parent's partitions. An own
+    /// default follows the recursion, including an override on a new column.
+    #[test]
+    fn a_standing_parents_serial_changes_restore_its_partitions_own_default() {
+        use pbps_model::{
+            Identity, OwnedSequence, PartitionBound, PartitionBy, PartitionColumn, PartitionOf,
+        };
+
+        let serial = ValueSource::Sequence(OwnedSequence::serial());
+        let retuned = ValueSource::Sequence(OwnedSequence {
+            options: pbps_model::SequenceOptions {
+                max: Some(1000),
+                ..Default::default()
+            },
+            ..OwnedSequence::serial()
+        });
+        let tree = |source: Option<ValueSource>, own: bool, external: bool| {
+            let mut parent = table(&[("v", Column::new(ty("integer")))]);
+            if let Some(source) = source {
+                let mut c = Column::new(ty("bigint")).not_null();
+                c.value_source = source;
+                parent.columns.insert("id".into(), c);
+            }
+            parent.partition_by = Some(PartitionBy {
+                external,
+                columns: vec!["v".into()],
+                strategy: Default::default(),
+            });
+            let mut schema = schema_of("app.p", parent);
+            if !external {
+                schema.tables.insert(
+                    "app.a".parse().unwrap(),
+                    Table {
+                        partition_of: Some(PartitionOf {
+                            parent: "app.p".parse().unwrap(),
+                            bound: PartitionBound::Default,
+                            columns: if own {
+                                [(
+                                    "id".into(),
+                                    PartitionColumn {
+                                        default: Some("7".into()),
+                                        not_null: false,
+                                    },
+                                )]
+                                .into()
+                            } else {
+                                Default::default()
+                            },
+                        }),
+                        ..Default::default()
+                    },
+                );
+            }
+            schema
+        };
+        let outcome = |base: &Schema, declared: &Schema, intents: &[Intent]| {
+            let base_ids = crate::resolve(base, &IdsFile::default(), &[], &ctx())
+                .unwrap()
+                .ids;
+            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                .unwrap()
+                .ids;
+            diff(
+                Side {
+                    schema: base,
+                    ids: &base_ids,
+                },
+                Side {
+                    schema: declared,
+                    ids: &declared_ids,
+                },
+                &SerialDefaults,
+                &Hints::default(),
+            )
+        };
+        for (from, to) in [
+            (None, Some(serial.clone())),
+            (Some(serial.clone()), Some(retuned)),
+            (Some(serial.clone()), Some(ValueSource::None)),
+            (
+                Some(serial.clone()),
+                Some(ValueSource::Default("42".into())),
+            ),
+            (Some(ValueSource::None), Some(serial.clone())),
+            (
+                Some(ValueSource::Default("42".into())),
+                Some(serial.clone()),
+            ),
+            (Some(serial.clone()), None),
+        ] {
+            for external in [false, true] {
+                for own in [false, true] {
+                    let base = tree(from.clone(), own && from.is_some(), external);
+                    let declared = tree(to.clone(), own && to.is_some(), external);
+                    let intents = if to.is_none() {
+                        vec![Intent::DropColumn {
+                            column: "app.p.id".parse().unwrap(),
+                            reason: "retired".parse().unwrap(),
+                        }]
+                    } else {
+                        vec![]
+                    };
+                    let cs = outcome(&base, &declared, &intents)
+                        .unwrap_or_else(|e| panic!("{from:?} -> {to:?}: {e:?}"));
+                    let parent = cs
+                        .changes
+                        .iter()
+                        .rposition(|p| p.change.table() == Some(&TableName::new("app", "p")))
+                        .unwrap();
+                    let own_step = cs.changes.iter().position(|p| matches!(&p.change, Change::SetPartitionDefault { to: Some(d), .. } if d == "7"));
+                    if own && to.is_some() && !external {
+                        assert!(
+                            own_step.is_some_and(|i| i > parent),
+                            "{from:?} -> {to:?}: {cs:?}"
+                        );
+                    } else {
+                        assert!(own_step.is_none(), "no override to restore: {cs:?}");
+                    }
+                    assert!(outcome(&declared, &declared, &[]).unwrap().is_empty());
+                }
+            }
+        }
+        // Neither direction of a serial/identity conversion has uniform
+        // partition inheritance on 16 and 18; name the identity limitation.
+        let identity = ValueSource::Identity(Identity::new(1, 1));
+        for (from, to) in [
+            (serial.clone(), identity.clone()),
+            (identity, serial.clone()),
+        ] {
+            let errors = outcome(
+                &tree(Some(from), false, false),
+                &tree(Some(to), false, false),
+                &[],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(errors.as_slice(), [DiffError::NumberingChangeOnPartitionedTable { column }] if column == &"app.p.id".parse().unwrap()),
+                "{errors:?}"
+            );
+        }
+        // The existing two-plan rule also covers numbering changes. Exercise
+        // attach, detach and drop separately, without weakening #1692.
+        for transition in ["attach", "detach", "drop"] {
+            let mut base = tree(Some(ValueSource::None), false, false);
+            let mut declared = tree(Some(serial.clone()), false, false);
+            let mut plain = declared.tables[&TableName::new("app", "p")].clone();
+            plain.partition_by = None;
+            let intents = match transition {
+                "attach" => {
+                    plain.columns["id"].value_source = ValueSource::None;
+                    base.tables.insert(TableName::new("app", "a"), plain);
+                    vec![]
+                }
+                "detach" => {
+                    declared.tables.insert(TableName::new("app", "a"), plain);
+                    vec![]
+                }
+                "drop" => {
+                    declared.tables.remove(&TableName::new("app", "a"));
+                    vec![Intent::DropTable {
+                        table: TableName::new("app", "a"),
+                        reason: "retired".parse().unwrap(),
+                    }]
+                }
+                _ => unreachable!(),
+            };
+            let errors = outcome(&base, &declared, &intents).unwrap_err();
+            assert!(errors.iter().any(|e| matches!(e, DiffError::PartitionedTableChange { what, .. } if what.iter().any(|w| w.contains("separate plans")))), "{transition}: {errors:?}");
+        }
+    }
+
     /// Returning opaque text proves that the differ uses the dialect's
     /// answer without constructing SQL or a generated sequence name itself.
     struct SerialDefaults;
@@ -12246,6 +12382,9 @@ mod tests {
     impl Dialect for SerialDefaults {
         fn name(&self) -> &'static str {
             "serial-defaults"
+        }
+        fn changes_numbering(&self) -> bool {
+            true
         }
         fn owned_sequence_default(
             &self,
