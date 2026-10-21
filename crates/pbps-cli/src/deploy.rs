@@ -4870,20 +4870,20 @@ fn refuse_pinned_movement(
                     let pbps_model::GrantTarget::Sequence(column) = target else {
                         return true;
                     };
+                    use pbps_model::plan_names::{At, Holder};
+                    let Holder::Tracked(column_uid) = names.column_holder(column, At::Start) else {
+                        return true;
+                    };
+                    // The baseline uses starting names; a drop or numbering
+                    // change uses the names at its step. Only the UID survives
+                    // both renames and another column taking the vacated name.
                     !changes.changes.iter().any(|p| {
-                        if let pbps_model::Change::DropColumn {
-                            column: dropped, ..
-                        } = &p.change
-                        {
-                            return dropped == column;
+                        if let pbps_model::Change::DropColumn { uid, .. } = &p.change {
+                            return uid == column_uid;
                         }
-                        if let pbps_model::Change::AlterColumnNumbering {
-                            column: changed,
-                            to,
-                            ..
-                        } = &p.change
+                        if let pbps_model::Change::AlterColumnNumbering { uid, to, .. } = &p.change
                         {
-                            return changed == column
+                            return uid == column_uid
                                 && !matches!(to, pbps_model::ValueSource::Sequence(_));
                         }
                         false

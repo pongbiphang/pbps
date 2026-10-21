@@ -330,3 +330,164 @@ fn serial_usage_readback_tracks_the_union_and_refuses_missing_or_unplanned_acces
     }]);
     compare(&cs, &ids, &preserved, &before).unwrap();
 }
+
+#[test]
+fn serial_sequence_grants_disappear_with_the_column_uid_across_renames() {
+    use pbps_diff::{Side, diff};
+    use pbps_model::{Column, Hints, OwnedSequence, Table, TableName, ValueSource};
+
+    for rename_table in [false, true] {
+        for rename_column in [false, true] {
+            for drop_column in [true, false] {
+                let from = TableName::new("app", "original");
+                let to = if rename_table {
+                    TableName::new("app", "renamed")
+                } else {
+                    from.clone()
+                };
+                let mut table = Table::default();
+                for name in ["id", "other"] {
+                    let mut sequence = OwnedSequence::serial();
+                    sequence.name = Some(format!("serial_{name}"));
+                    let mut column = Column::new("integer".parse().unwrap()).not_null();
+                    column.value_source = ValueSource::Sequence(sequence);
+                    table.columns.insert(name.into(), column);
+                }
+                let before = Schema {
+                    tables: [(from.clone(), table)].into(),
+                    roles: [(
+                        "reader".into(),
+                        Role {
+                            grants: [
+                                (
+                                    GrantTarget::Schema("app".into()),
+                                    [Permission::Usage].into(),
+                                ),
+                                (
+                                    GrantTarget::Sequence(from.column("id")),
+                                    [Permission::Usage].into(),
+                                ),
+                                (
+                                    GrantTarget::Sequence(from.column("other")),
+                                    [Permission::Select].into(),
+                                ),
+                            ]
+                            .into(),
+                            ..Default::default()
+                        },
+                    )]
+                    .into(),
+                    ..Default::default()
+                };
+                let before_ids = IdsFile {
+                    tables: [("t_aaaaaa".parse().unwrap(), from.clone())].into(),
+                    columns: [
+                        ("c_aaaaaa".parse().unwrap(), from.column("id")),
+                        ("c_bbbbbb".parse().unwrap(), from.column("other")),
+                    ]
+                    .into(),
+                    roles: [("r_aaaaaa".parse().unwrap(), "reader".into())].into(),
+                    ..Default::default()
+                };
+                let mut after = before.clone();
+                let mut after_ids = before_ids.clone();
+                let mut table = after.tables.remove(&from).unwrap();
+                let mut column = table.columns.shift_remove("id").unwrap();
+                if drop_column {
+                    after_ids.columns.remove(&"c_aaaaaa".parse().unwrap());
+                } else {
+                    column.value_source = ValueSource::None;
+                    let name = if rename_column { "renamed_id" } else { "id" };
+                    table.columns.insert(name.into(), column);
+                    after_ids
+                        .columns
+                        .insert("c_aaaaaa".parse().unwrap(), to.column(name));
+                }
+                // A dropped name can pass to another serial column. Its
+                // sequence and grant survive under that different UID.
+                let survivor = if drop_column && rename_column {
+                    "id"
+                } else {
+                    "other"
+                };
+                let column = table.columns.shift_remove("other").unwrap();
+                table.columns.insert(survivor.into(), column);
+                after.tables.insert(to.clone(), table);
+                after_ids
+                    .tables
+                    .insert("t_aaaaaa".parse().unwrap(), to.clone());
+                after_ids
+                    .columns
+                    .insert("c_bbbbbb".parse().unwrap(), to.column(survivor));
+                let target = GrantTarget::Sequence(to.column(survivor));
+                after.roles.get_mut("reader").unwrap().grants = [
+                    (
+                        GrantTarget::Schema("app".into()),
+                        [Permission::Usage].into(),
+                    ),
+                    (target.clone(), [Permission::Select].into()),
+                ]
+                .into();
+                let pg = pbps_pg::Postgres::new();
+                let cs = diff(
+                    Side {
+                        schema: &before,
+                        ids: &before_ids,
+                    },
+                    Side {
+                        schema: &after,
+                        ids: &after_ids,
+                    },
+                    &pg,
+                    &Hints::default(),
+                )
+                .unwrap();
+                if drop_column {
+                    assert!(
+                        cs.changes.iter().all(|p| p.change.grant().is_none()),
+                        "{cs:?}"
+                    );
+                    assert!(cs.changes.iter().any(|p| matches!(&p.change,
+                        Change::DropColumn { uid, column } if *uid == "c_aaaaaa".parse().unwrap() && column == &to.column("id"))), "{cs:?}");
+                }
+                let check = |after: &Schema| {
+                    refuse_pinned_movement(
+                        &pg,
+                        Read::transactional(Plan {
+                            changes: &cs,
+                            ids: &after_ids,
+                        }),
+                        &before,
+                        after,
+                        "test",
+                    )
+                };
+                let result = check(&after);
+                assert!(
+                    result.is_ok(),
+                    "table rename={rename_table}, column rename={rename_column}, drop={drop_column}: {result:?}"
+                );
+                let mut missing = after.clone();
+                missing
+                    .roles
+                    .get_mut("reader")
+                    .unwrap()
+                    .grants
+                    .remove(&target);
+                let error = check(&missing).unwrap_err().to_string();
+                assert!(error.contains("role reader"), "{error}");
+                let mut widened = after.clone();
+                widened
+                    .roles
+                    .get_mut("reader")
+                    .unwrap()
+                    .grants
+                    .get_mut(&target)
+                    .unwrap()
+                    .insert(Permission::Update);
+                let error = check(&widened).unwrap_err().to_string();
+                assert!(error.contains("role reader"), "{error}");
+            }
+        }
+    }
+}
