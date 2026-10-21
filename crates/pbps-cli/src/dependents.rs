@@ -1000,7 +1000,13 @@ fn weave(
         dialect,
         partitions,
     };
-    *cs = expand(std::mem::take(cs), &weave, expand::FACTOR)?.changes;
+    let given = std::mem::take(cs);
+    #[cfg(test)]
+    let old = expansion_oracle::expand(given.clone(), &weave, expand::FACTOR);
+    let done = expand(given, &weave, expand::FACTOR);
+    #[cfg(test)]
+    split_oracle::same_expansion(&done, &old, dialect);
+    *cs = done?.changes;
     let added = cs.changes.len() - before;
     // A rebuild woven in here carries the index's declared parameters in its
     // `CREATE`, as the differ's own do (#1483 review). The parameter change
@@ -1204,6 +1210,7 @@ impl Expansion for Weave<'_> {
                 Ok(Rewrite::Split {
                     at,
                     parts: Box::new([planned(removal, dialect), planned(restoration, dialect)]),
+                    tail: Vec::new(),
                     // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
                     reason: format!("{} depends on `{root}`", d.described, root = root.raw()),
                 })
@@ -1589,6 +1596,26 @@ fn split_new_tables(
     deps: &ModuleDeps,
     dialect: &dyn Dialect,
 ) -> Result<usize, String> {
+    #[cfg(test)]
+    let mut old = cs.clone();
+    #[cfg(test)]
+    let expected = split_oracle::split_new_tables(&mut old, ids, deps, dialect);
+
+    let result = expand_new_tables(cs, ids, deps, dialect);
+    #[cfg(test)]
+    {
+        assert_eq!(result, expected);
+        split_oracle::same_plan(cs, &old, dialect);
+    }
+    result
+}
+
+fn expand_new_tables(
+    cs: &mut ChangeSet,
+    ids: &[&IdsFile],
+    deps: &ModuleDeps,
+    dialect: &dyn Dialect,
+) -> Result<usize, String> {
     let empty = IdsFile::default();
     let generated = pbps_diff::order::generated::expand(
         cs,
@@ -1596,95 +1623,31 @@ fn split_new_tables(
         deps,
         dialect,
     )?;
-    let Some(last) = last_function_create(cs) else {
+    if last_function_create(cs).is_none() {
         return Ok(0);
-    };
+    }
     let taken = defaults_taken_by_rows(cs);
     let functions = function_creates(cs);
-    let calls = |text: &str| calls_one_of(text, &functions);
-    let mut added = generated;
-    for i in (0..last).rev() {
-        let Change::CreateTable { name, table, .. } = &mut cs.changes[i].change else {
-            continue;
-        };
-        let name = name.clone();
-        let mut parts: Vec<Change> = Vec::new();
-        let calling: Vec<String> = table
-            .checks
-            .iter()
-            .filter(|(_, check)| calls(&check.expression))
-            .map(|(n, _)| n.clone())
-            .collect();
-        for check in calling {
-            if let Some(constraint) = table.checks.remove(&check) {
-                parts.push(Change::AddCheck {
-                    table: name.clone(),
-                    name: check,
-                    constraint,
-                });
-            }
-        }
-        let filtered: Vec<String> = table
-            .indexes
-            .iter()
-            .filter(|(_, index)| index.holds_expression() && calls(&index_text(index)))
-            .map(|(n, _)| n.clone())
-            .collect();
-        for index in filtered {
-            if let Some(spec) = table.indexes.remove(&index) {
-                // Never the clustered index, which cannot be filtered; asked
-                // of the table anyway, so the split cannot say otherwise.
-                let clustered = table.index_is_clustered(&index);
-                parts.push(Change::AddIndex {
-                    table: name.clone(),
-                    name: index,
-                    index: Box::new(spec),
-                    clustered,
-                });
-            }
-        }
-        for (column, spec) in table.columns.iter_mut() {
-            let column_ref = ColumnRef::new(name.clone(), column.clone());
-            if taken.contains(&column_ref) {
-                continue;
-            }
-            let Some(uid) = ids.iter().find_map(|ids| ids.column_uid(&column_ref)) else {
-                continue;
-            };
-            match &mut spec.value_source {
-                ValueSource::Default(default) if calls(default) => {
-                    let to = std::mem::take(default);
-                    spec.value_source = ValueSource::None;
-                    parts.push(Change::AlterColumnDefault {
-                        uid: uid.clone(),
-                        column: column_ref,
-                        from: None,
-                        to: Some(to),
-                    });
-                }
-                ValueSource::None
-                | ValueSource::Default(_)
-                | ValueSource::Identity(_)
-                | ValueSource::Sequence(_)
-                | ValueSource::Generated(_) => {}
-            }
-        }
-        if parts.is_empty() {
-            continue;
-        }
-        // The table's own change no longer carries what moved out of it, so
-        // its risks are recomputed with the rest.
-        let table_change = cs.changes[i].change.clone();
-        let provenance = cs.changes[i].provenance.clone();
-        cs.changes[i] = planned(table_change, dialect);
-        cs.changes[i].provenance = provenance;
-        added += parts.len();
-        for (k, part) in parts.into_iter().enumerate() {
-            cs.changes.insert(i + 1 + k, planned(part, dialect));
-        }
-    }
-    Ok(added)
+    let rule = pbps_diff::order::new_tables::NewTables {
+        ids,
+        functions: &functions,
+        taken: &taken,
+        dialect,
+    };
+    let before = cs.changes.len();
+    *cs = expand(std::mem::take(cs), &rule, expand::FACTOR)?.changes;
+    Ok(generated + cs.changes.len() - before)
 }
+
+#[cfg(test)]
+#[path = "dependents/split_oracle.rs"]
+mod split_oracle;
+
+#[cfg(test)]
+use pbps_diff::order;
+#[cfg(test)]
+#[path = "../../pbps-diff/tests/support/expansion.rs"]
+mod expansion_oracle;
 
 /// Sets each partition's own default again after its parent's (#1588,
 /// DEC-1581.1). Returns how many changes it added.

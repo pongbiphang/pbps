@@ -180,6 +180,7 @@
         "darwin"
       ],
       "cases": [
+        "dependents::split_oracle::expanded_table_checks_indexes_and_defaults_execute_on_both_servers",
         "dependents::generated_tests::generated_table_parts_apply_with_the_declared_column_order_values_and_names",
         "dependents::generated_tests::called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold",
         "dependents::generated_tests::transitive_table_readers_apply_placeholders_or_keep_the_named_hold",
