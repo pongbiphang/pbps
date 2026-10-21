@@ -330,7 +330,10 @@ impl Run<'_> {
             }
         }
         let extras = &request.write_path_extras;
-        let mut reconstruction = self.state.reconstruction(target, binding).await?;
+        let mut reconstruction = self
+            .state
+            .reconstruction(target, binding, desired.ids, &hints.module_deps)
+            .await?;
         let split = prepared.split(&reconstruction);
         let chains = reconstruction.chains(&prepared);
         let mut staged = if self.externals.is_some() || prepared.has_filled() {
@@ -452,7 +455,7 @@ impl Run<'_> {
             &records,
             &assessment,
         )?;
-        let ordered = engine::plan(driver, base, desired, hints, extras, &surfaces)?;
+        let ordered = reconstruction.plan(base, desired, hints, extras, &surfaces)?;
         let identity = Identity {
             rule: engine::reported_rule(driver)?,
             resolver_build: engine::reported_build(driver, self.key, prepared.catalog())?,

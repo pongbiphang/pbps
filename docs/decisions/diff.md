@@ -2771,8 +2771,8 @@ the `CREATE` give, the NOT NULL row on 18 under the same engine name.
 **Ordering.** That statement is part of the partition's `CreateTable`, which
 sorts ahead of the modules. In the ordinary plan, a default of its own that
 calls a function the plan creates therefore holds the whole partition after
-that function, as a generated column holds its table (DEC-1364.1). It is not
-split out into an `AlterColumnDefault` as a table column's default is: the
+that function (DEC-1364.1). Unlike a new table's generated suffix
+(DEC-1503.1), it is not split out into an `AlterColumnDefault`: the
 partition has no column, and no column uid, of its own. A new partition whose
 own default names a held new table follows it too. Scratch reconstruction
 sets every table's defaults in its expressions phase, after the modules; a
@@ -7369,3 +7369,324 @@ also covers the ordinary connected path: a separate function drop follows
 its computed column's drop through the existing catalog pass, while the
 binding release precedes its own callee rewrite. The saved plan applies,
 verifies and leaves an empty next plan.
+
+<a id="dec-1503-1"></a>
+
+**DEC-1503.1. A new PostgreSQL table exposes its relation before the generated
+expressions that call planned functions bind.** Holding the entire table
+made its relation, row type and engine-chosen array type arrive late. Naming
+consumers then needed predictions about collision spellings, including names
+PostgreSQL can change as another relation arrives. The expansion instead
+creates the prefix before the first such generated column, then adds every
+remaining column in declaration order. This is the primary path on every
+server and offline: learning a version does not change a splittable plan.
+Recorded column UIDs are retained; no Change variant, sort rank, name trial
+or type-identity format is introduced.
+
+Two shapes cannot use that split: a partition key in the suffix must exist
+in CREATE TABLE, and a generation cannot read a column absent from its
+creation statement, including a prefix generation reading the suffix. With
+an immutable connected capability at least
+`SET_EXPRESSION_ARRIVED_IN` (PostgreSQL 17), the table instead creates the
+full column shape, using typed NULL placeholders for generations that call
+planned functions, then the existing AlterColumnExpression installs their
+real expressions. Unknown/offline and
+older capabilities keep DEC-1274.2's whole-table hold for those two shapes.
+DEC-1503.4 additionally covers called functions that name the table or its types.
+The ordinary schedule, resolver preparation and scratch share these typed
+parts. The pure dialect chooses parts; the differ states edges and settles
+them, and scratch lowers the same parts before selecting any chained-fill
+transaction boundary. The bounded two-part Rewrite::Split cannot represent
+a declaration-length suffix and is not used.
+
+Prefix-only keys, checks and indexes stay in CREATE rather than adding
+statements whose inputs already fit the prefix. Indexes split
+out of CREATE retain its transactional behavior even when the
+table carried an online hint; a standing table's index retains its strategy.
+Column effects and explicit edges put seed rows after the complete columns
+and real expressions, and keep deferred validators after the rows
+and new triggers after them. Keys, indexes and referencing foreign keys
+follow their inputs. Modules naming the table follow its complete column
+shape, SELECT * included. DEC-1503.4 narrows the prefix exception to proven
+relation-name-only references and a called function that names neither the
+table nor its types. Called readers use a full-shape placeholder, or keep
+the named whole-table cycle without the capability. Existing lexical scans
+supply these conservative dependencies. Placeholder binding checks run at the real
+expression installation, and producer transitions prove their absent opening
+inventory from the preceding typed CREATE and recorded UIDs, never from
+unsealed provenance. Apply's created-table inventory includes the typed added
+column names while their existing field promises still reject wrong types,
+value sources or undeclared columns.
+
+Measured on PostgreSQL 16 and 18: the literal regclass consumer, reverse pair,
+array `_a` and colliding `_a_1` compile and apply with declared column order;
+plain splits keep the same SQL with known or unknown versions. A suffix
+partition key (including a real child), a generation reading a later column
+and stored values follow the selected path. Capture's existing refusal of
+regclass/regtype constants remains unchanged (capture/profile.rs); those
+name cases measure ordinary apply and scratch compile. Full producer sealing,
+saved-plan round-trip and target-only closing measure plain splits, the two
+exception shapes and seed rows. Qualification of partition-bound nodes is
+also unchanged; producer closing measures the partitioned parent, while
+ordinary apply measures its child.
+
+Pinned by `generated_table_parts_keep_names_early_and_columns_in_declaration_order_on_every_version`,
+`called_table_readers_require_full_shape_or_keep_the_named_hold`,
+`generated_table_parts_apply_with_the_declared_column_order_values_and_names`
+(`crates/pbps-cli/src/dependents/generated_tests.rs`),
+`an_offline_plan_creates_what_a_new_table_calls_before_it` and
+`a_bootstrap_creates_what_a_new_table_calls_before_it`
+(`crates/pbps-cli/tests/flow_pg.rs`),
+`placeholder_bindings_are_measured_at_the_real_expression_and_fill_uses_the_complete_shape`
+(`crates/pbps-pg/src/resolver/reconstruct/tests.rs`),
+`generated_creation_parts_provide_columns_before_rows_and_preserve_stored_value_effects`
+(`crates/pbps-pg/tests/generated_parts.rs`),
+`a_generated_placeholder_created_in_the_plan_has_no_opening_inventory`
+(`crates/pbps-cli/src/resolver/server/transitions_tests.rs`), and the live
+`scratch_generated_table_parts_compile_literal_and_collision_names_before_functions`
+and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`
+(`crates/pbps-cli/src/resolver/server/scratch/live_tests.rs`).
+
+
+<a id="dec-1503-2"></a>
+
+**DEC-1503.2. Creation parts keep each generation's inputs available when
+it binds, including a generation before the planned-function cut.** A
+prefix generation reading an ordinary suffix column becomes invalid if the
+suffix is removed: `id, a GENERATED AS (b * 2), g GENERATED AS (app.f(id)), b`
+cannot create its prefix without `b`. The shared parts helper therefore
+checks every generation for inputs that splitting would create later.
+A forward read entirely within the prefix remains splittable;
+scanning all later columns without considering the cut would unnecessarily
+hold it. This uses the existing lexical read scan and the two existing
+unsplittable paths, without a new ordering pass or edge kind.
+
+Connected PostgreSQL 17+ creates the full shape and replaces only the
+planned-function generation with SET EXPRESSION. The independent prefix
+generation retains its real text. Unknown/offline and PostgreSQL 16 retain
+the whole-table hold. The ordinary plan and scratch use the same choice.
+CHECKs, primary and unique keys, and index column, expression, INCLUDE and
+filter dependencies on suffix columns already move to the suffix. Foreign
+keys are already separate in the differ, and the raw creation-parts helper
+also moves every inline foreign key, including one on prefix-only columns.
+These shapes need no additional hold.
+
+Pinned by `a_prefix_generation_reading_a_removed_column_requires_the_full_creation_shape`,
+`prefix_generation_inputs_kept_in_create_do_not_prevent_the_suffix_split`,
+`prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait`
+and `a_primary_key_using_a_suffix_input_waits_for_its_column`
+(`crates/pbps-pg/tests/generated_parts.rs`),
+`only_unsplittable_generated_tables_use_known_set_expression_capability`,
+and the expanded live tests
+`generated_table_parts_apply_with_the_declared_column_order_values_and_names`
+and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.
+The live cases on PostgreSQL 16 and 18 check the declared column order,
+computed values, offline hold, connected version choice, and producer
+sealing and closing; prefix-only inputs remain controls for the ordinary split.
+
+<a id="dec-1503-3"></a>
+
+**DEC-1503.3. Generated-table creation parts retain their CREATE's risks;
+finishing a new table does not acquire standing-table alteration risks.**
+(#1503, PR #2222 ready review.) A connected PostgreSQL 17+ placeholder installs
+its real expression before seed rows. No standing value is recomputed, so
+classifying that installation as a standalone AlterColumnExpression invented
+a `narrowing` approval for an otherwise safe creation. The same mistake
+added `not-null` or `constraint` approvals to suffix columns, keys, checks,
+unique indexes and inline foreign keys split from the CREATE. These parts
+now retain their source creation's risk set through ordinary planning and
+resolver preparation, including a second lowering of its checks and indexes.
+The complete typed plan identifies a newly generated table by its column
+installation parts, so older lowering routes and separately emitted
+validators of that table receive the same context. Other new-table plans
+retain their existing classification.
+
+Saved-plan validation re-derives this context from the typed plan: an
+installation or validator must follow an ordinary CREATE of the same table
+UID, resolved through PlanNames. Provenance is diagnostic, absent after
+serialization, and proves no identity or absence of standing data. A missing CREATE, a different holder,
+a partition filled from a DEFAULT, and destructive changes cannot use that
+context to suppress their intrinsic risks. A standing table's SET EXPRESSION
+still carries `narrowing`, even with a forged creation-part annotation.
+The normal column and part guards still check source kinds, fields, names
+and complete primary-key, unique, check and index inventories. Risk approval
+does not grant ownership of an undeclared field or object.
+
+Measured on PostgreSQL 16 and 18: the suffix partition-key and later-column
+shapes retain their old hold on 16 and use placeholders on 18; both apply
+without alteration approvals. The plain split also adds NOT NULL columns,
+keys, CHECKs and unique indexes without those approvals. Seed rows follow
+the complete columns and real expression. A populated standing table refuses
+an unapproved expression rewrite and recomputes its stored value only after
+`--allow narrowing`. The resolver's sealed creation parts keep the same risks
+through saved-plan validation and target-only closing.
+
+Pinned by `generated_expression_installations_keep_their_creation_risks`,
+`generated_columns_and_validators_keep_their_creation_risks`,
+`preparing_generated_creation_parts_preserves_their_creation_risks`,
+`saved_creation_part_risks_require_a_preceding_create_of_the_same_table`,
+`new_generated_expression_parts_keep_per_part_risks_on_both_servers`,
+`split_generated_columns_and_validators_keep_per_part_risks_on_both_servers`,
+`a_standing_generated_expression_still_requires_narrowing_approval`, and
+`resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.
+
+<a id="dec-1503-4"></a>
+
+**DEC-1503.4. Every creation-part consumer uses the complete shape unless its
+reference is proven to resolve only the relation name; empty-table risks
+require each receiving part before every row write.** A prefix is
+sufficient for a regclass name resolution, but not for a composite cast,
+array or row type use, column read, TABLE, or target-list-free INSERT.
+The dialect explicitly classifies these references. PostgreSQL reuses its
+identifier, literal and code scans: a single literal cast to regclass, with
+parentheses and the supported built-in casts, is proven name-only. An unknown
+form requires the complete shape. Array references include collision suffixes
+seen in the text and conservative truncated-name candidates; no allocated
+array name is predicted. The reverse held pair retains its prefix-to-name
+edges and succeeds. Replacing its CHECK with a composite cast closes a named
+cycle, while a one-way composite consumer waits for the complete columns.
+
+A planned function called by a generation that names the table or its types
+requires full-shape CREATE with placeholders on connected PostgreSQL 17+.
+Unknown/offline and older capabilities keep the whole-table hold and its
+named cycle refusal. A function that names neither still permits the primary
+split. This replaces the NATURAL, star-versus-multiplication and row-alias
+whole-row detectors, rather than adding SQL constructs to them. Ordinary
+planning, resolver preparation and scratch use the same expansion; both
+retained-hold readers use the same table/type reference scan. Every consumer,
+including a new table's CHECK/default/generation, row defaults and types, and
+modules, receives the corresponding name-only or complete-shape edge through
+the existing settle. No ordering pass or rank is added. Capture's existing
+regclass/regtype constant refusal is unchanged.
+
+Creation-risk derivation resolves each row write and expression installation
+through PlanNames at that step, by table UID. If any installation follows an
+InsertRow, UpdateRow or DeleteRow into that identity, the family cannot claim
+empty-table context and retains intrinsic alteration risks, including
+narrowing. Another safe installation cannot certify the later one. Each
+creation-eligible part must itself precede the owner's first classified row
+write: a safe installation cannot certify a later NOT NULL column, CHECK,
+key or index after rows or an attachment. The final resolver order re-derives
+the same risks before sealing its ordering proof and operation copies;
+ordinary planning derives them after settlement too. Scratch lowering only
+compiles SQL and grants no risk approval. Saved-plan validation calls the
+same derivation, so reordered or hand-built artifacts
+cannot suppress the approval with unsealed provenance or a preceding CREATE.
+
+Pinned by `only_proven_relation_name_literals_use_the_prefix`,
+`called_table_readers_require_full_shape_or_keep_the_named_hold`,
+`composite_consumers_and_views_wait_for_the_complete_table`,
+`creation_risks_require_all_installations_before_every_row_write`,
+`every_creation_risk_recipient_requires_its_own_empty_table_position`,
+`resolver_creation_risks_follow_the_settled_parts_and_seal_that_order`,
+`saved_creation_part_risks_require_a_preceding_create_of_the_same_table`, and
+the live `called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold`,
+`saved_rows_before_expression_installation_cannot_clear_narrowing`,
+`generated_table_parts_apply_with_the_declared_column_order_values_and_names`
+and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.
+The live `creation_parts_after_rows_keep_their_risks_on_both_servers` also
+measures late NOT NULL and CHECK parts on PostgreSQL 16 and 18.
+
+
+<a id="dec-1503-5"></a>
+
+**DEC-1503.5. Creation-part selection follows the same transitive module
+relation as settlement.** A generation calling a planned function can reach
+a table reader through any number of new or altered modules. Selection walks
+the provider edges built by the same helper as ordering: the dialect's
+`generation_may_call` scan or a declared module dependency, with the same
+self and same-name exclusions. A visited set terminates cycles without
+hiding them from settlement. Every reachable complete-shape reader selects
+the existing placeholder on connected PostgreSQL 17+; unknown/offline and
+older servers keep the whole-table hold. A reachable function cycle still
+receives the existing named refusal. Unreachable readers and name-independent
+chains retain the primary split.
+
+Ordinary planning, resolver preparation and scratch reconstruction pass the
+same declared module dependencies into the shared expansion. A placeholder's
+provisional attrdef does not claim the final expression's observed binding:
+only an installation with matching column identity, from/to expressions and
+logical source certifies that distinction. A CREATE already containing the
+final expression, or an unrelated later rewrite, keeps its own binding edges.
+This changes
+neither capture's regclass/regtype constant refusal nor transaction boundaries,
+and adds no ordering pass or rank. The direct-only selection was wrong because
+its graph differed from the constraints it later asked settle to satisfy.
+
+Pinned by `transitive_table_readers_use_placeholders_and_keep_old_holds`,
+`declared_callee_dependencies_share_the_ordering_closure`,
+`scratch_transitive_readers_share_lexical_and_declared_dependency_closures`,
+`placeholder_creates_do_not_claim_the_installed_expressions_bindings`,
+and the live `transitive_table_readers_apply_placeholders_or_keep_the_named_hold`
+and `resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes`.
+
+<a id="dec-1503-6"></a>
+
+**DEC-1503.6. One exhaustive Change classification supplies structural
+complete-table consumers and row writes for generated creation parts.**
+An attachment needs both the child's and the parent's complete columns.
+Ordering only newly created partitions left an ordinary standing table's
+ATTACH against the prefix. The existing structural edge now starts at
+`complete` for either form. The retained whole-table path uses the same
+classification, including offline and PostgreSQL 16. No pass or rank is added.
+
+Attaching a standing table also introduces its possibly populated rows into
+the parent. An attachment before any expression installation therefore loses
+the family's empty-table risk context, including `narrowing`, in ordinary
+planning and saved-plan validation. The derivation uses PlanNames at each
+step and records partition membership by UID: writes through a child reach
+all its current ancestors, including after renames. Detaching or deleting
+rows never restores an empty-table proof. A DEFAULT move records its source,
+new destination and parent; it cannot borrow an ordinary empty CREATE.
+
+The table below is exhaustive over Change kinds. "Write" means an operation
+that invalidates the empty-table proof; it includes removals conservatively.
+Column DDL can convert, fill or recompute existing values but cannot populate
+an empty table, so it does not invalidate that proof by itself. Such changes
+retain their intrinsic risks unless the existing creation-part eligibility
+rule explicitly admits them. A creation part follows its own column and
+validator chain rather than depending on itself as an external consumer.
+Installed expressions and module definitions additionally use the existing
+lexical references, with only proven relation-name references using the
+prefix (DEC-1503.4).
+
+| Change kind | Needs the complete table | Write invalidating emptiness |
+| --- | --- | --- |
+| `CreateTable`, ordinary | No; it supplies the table | No |
+| `CreateTable`, partition | Parent | No for an empty new partition; with `beside_default`, destination, DEFAULT source and parent are writes |
+| `AttachPartition` | Child and parent | Child and parent, even without declared DML |
+| `DetachPartition` | Child and parent | Child and parent; removal does not prove emptiness |
+| `DropTable` | No; only relation identity is needed | Dropped table and `detach_from` parent |
+| `RenameTable` | No; only relation identity is needed | No; identity and membership survive the rename |
+| `AddColumn`, `DropColumn`, `RenameColumn` | Owner, except the creation's own installation chain | No; filling or removing columns does not introduce rows |
+| `AlterColumnType`, `AlterColumnNullability`, `AlterColumnDefault`, `AlterColumnExpression`, `AlterColumnNumbering` | Column owner, except the creation's own installation chain | No; conversion and recomputation preserve an empty row set; defaults and numbering govern later writes |
+| `AddComputedColumn`, `DropComputedColumn` | Owner; SQL Server-only forms remain classified | No; computing or removing values does not introduce rows |
+| `SetColumnDeprecated` | Column owner | No |
+| `SetPartitionDefault`, `SetPartitionNotNull` | Partition | No; inherited/default definitions and validation do not introduce rows |
+| `SetPrimaryKey`, `AddUnique`, `DropUnique`, `DropForeignKey`, `AddCheck`, `DropCheck`, `AddIndex`, `DropIndex` | Owner, except the creation's own validator chain | No; validations and physical index work do not introduce rows |
+| `AddForeignKey` | Owner and referenced table, plus its supplied key | No; installing a cascading action does not execute it |
+| `InsertRow`, `UpdateRow`, `DeleteRow` | Written table; existing row/validator/trigger ordering remains | Written table and its current partition ancestors |
+| `CreateModule`, `AlterModule` | Trigger's `on` table and tables/types named by the definition | No at installation; a trigger or routine body is installed, not invoked. Its execution belongs to the invoking row operation |
+| `DropModule` | No | No; dropping a trigger or routine does not execute it |
+| `SetReplicaIdentity`, `SetStorageParameters`, `SetTablePersistence`, `SetIndexStorageParameters` | No; existing object identities suffice | No; physical storage rewrites preserve an empty row set |
+| `SetDataMode`, `SetEnsureKeys` | No; recorded declaration metadata | No; their DML is represented separately |
+| `CreateRole`, `DropRole`, `RenameRole`, `Grant`, `Revoke`, `PublicExecution` | No; name/permission operations | No |
+
+There is no separate inherit, copy, move-rows, truncate or trigger-execution
+Change variant. Partition inheritance is represented by CreateTable's
+`partition_of`, AttachPartition and DetachPartition; DEFAULT row copying and
+moving is represented by CreateTable's `beside_default`. The exhaustive match
+has no wildcard arm, so adding any future kind requires this decision again.
+Every kind has a unit pin, including trigger installation, DEFAULT moves,
+detach and the metadata-only negatives.
+
+Pinned by
+`every_change_kind_has_its_complete_shape_and_row_write_classification_pinned`,
+`attachments_follow_complete_columns_and_unsplit_attachments_keep_their_order`,
+`saved_creation_part_risks_require_a_preceding_create_of_the_same_table`,
+and the live
+`attached_generated_partitions_use_complete_shapes_and_preserve_recomputation_risks`.
+The live test executes connected and offline choices on PostgreSQL 16 and 18,
+keeps the whole-table fallback where SET EXPRESSION is unavailable, and on 18
+measures the populated attachment's recomputation with the required narrowing
+risk after rejecting a saved artifact that clears it.

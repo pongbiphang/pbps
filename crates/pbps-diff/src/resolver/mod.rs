@@ -143,6 +143,11 @@ pub fn plan_operations(
     dialect: &dyn Dialect,
 ) -> Result<Planned, Error> {
     let (logical, prepared) = prepare(base, desired, hints, resolution, dialect)?;
+    let module_edits = if dialect.rebuilds_modules() {
+        ModuleEdits::Rebuilt
+    } else {
+        ModuleEdits::InPlace
+    };
     let operations = Operations::expanded(
         logical.changes.len(),
         prepared
@@ -150,11 +155,7 @@ pub fn plan_operations(
             .iter()
             .cloned()
             .zip(prepared.changes.changes.iter().cloned()),
-        if dialect.rebuilds_modules() {
-            ModuleEdits::Rebuilt
-        } else {
-            ModuleEdits::InPlace
-        },
+        module_edits,
     );
     // Who owns each step's table comes from where the step came from, read
     // against the logical plan's own name history (#1871): the graph keeps
@@ -173,8 +174,31 @@ pub fn plan_operations(
         desired,
         dialect,
     );
-    let (ordered, sequence) = settle(prepared.changes, &schedule)?;
-    let operations = operations.reordered(&sequence);
+    let (mut ordered, sequence) = settle(prepared.changes, &schedule)?;
+    // Settlement can put a validator after seed rows. Preparation's empty
+    // context cannot certify that final position (DEC-1503.4); seal the same
+    // risks saved-plan validation will derive, including in operation copies.
+    let risks = crate::order::generated::risks(&ordered.changes, desired.ids, dialect);
+    for (part, risks) in ordered.changes.changes.iter_mut().zip(risks) {
+        part.risks = risks;
+    }
+    ordered.proof = OrderingProof::new(&ordered.changes, ordered.proof.edges().clone())
+        .map_err(|_| Error::Edge)?;
+    // Keep IDs assigned in expansion order even when settlement moves parts.
+    let mut classified = vec![None; sequence.len()];
+    for (&from, part) in sequence.iter().zip(&ordered.changes.changes) {
+        classified[from] = Some(part.clone());
+    }
+    let operations = Operations::expanded(
+        logical.changes.len(),
+        prepared.origins.into_iter().zip(
+            classified
+                .into_iter()
+                .map(|part| part.expect("settlement is a permutation of the prepared changes")),
+        ),
+        module_edits,
+    )
+    .reordered(&sequence);
     #[cfg(any(test, debug_assertions))]
     crate::order::shadow::observe(
         base,
@@ -237,6 +261,9 @@ fn scheduled(
         &crate::order::slots::edges(&slots, None, &[]),
     );
     for c in graph::constraints(changes, origins, owners, resolution, base, desired) {
+        schedule.edge(c.before, c.after, c.source, c.reason);
+    }
+    for c in crate::order::generated::constraints(changes, desired.schema, declared, dialect) {
         schedule.edge(c.before, c.after, c.source, c.reason);
     }
     // Unknown effects do not establish independence: keep every pair rather

@@ -12,3 +12,6 @@ pub mod scope;
 pub mod server;
 
 pub mod sealing;
+
+#[cfg(test)]
+pub(crate) mod generated_fixtures;

@@ -2291,9 +2291,9 @@ fn a_new_column_calling_a_new_function_follows_its_create() {
 }
 
 /// A new table whose generated column calls a function the same plan creates
-/// follows that `CREATE FUNCTION` whole, with its column order, and a new
-/// function reading the table follows the table. One plan applies; DEC-1364.1
-/// used to leave this to the engine, which refused the table.
+/// creates its prefix first and adds its suffix after that `CREATE FUNCTION`,
+/// keeping column order. A new function reading the table follows its full
+/// shape (DEC-1503.1).
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_new_table_generating_from_a_new_function_follows_its_create() {
@@ -2306,7 +2306,8 @@ fn a_new_table_generating_from_a_new_function_follows_its_create() {
         d.dir.join("schema/app.n.yml"),
         "table: app.n\ncolumns:\n  id: {type: integer, nullable: false}\n  \
          c: {type: integer, generated: {expression: 'app.g(id)', stored: true}}\n  \
-         after: {type: integer}\nprimary_key: [id]\n",
+         after: {type: integer}\nprimary_key: [id]\n\
+         data:\n  mode: ensure\n  rows:\n    1: {after: 7}\n",
     )
     .unwrap();
     let (plan, script) = connected_plan(&d, connection);
@@ -2316,11 +2317,13 @@ fn a_new_table_generating_from_a_new_function_follows_its_create() {
             .unwrap_or_else(|| panic!("`{needle}` missing from:\n{script}"))
     };
     assert!(
-        at("CREATE FUNCTION \"app\".\"g\"") < at("CREATE TABLE \"app\".\"n\""),
+        at("CREATE TABLE \"app\".\"n\"") < at("CREATE FUNCTION \"app\".\"g\"")
+            && at("CREATE FUNCTION \"app\".\"g\"") < at("ADD COLUMN \"c\"")
+            && at("ADD COLUMN \"c\"") < at("ADD COLUMN \"after\""),
         "{script}"
     );
     assert!(
-        at("CREATE TABLE \"app\".\"n\"") < at("CREATE FUNCTION \"app\".\"a_reader\""),
+        at("ADD COLUMN \"after\"") < at("CREATE FUNCTION \"app\".\"a_reader\""),
         "{script}"
     );
     succeeds(approved_apply(
@@ -2329,6 +2332,13 @@ fn a_new_table_generating_from_a_new_function_follows_its_create() {
         &plan,
         &["--allow", "grant-widen"],
     ));
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT (c + after)::int8 FROM app.n WHERE id = 1"
+        ),
+        9
+    );
     on_server(connection, "INSERT INTO app.n (id, after) VALUES (3, 9)");
     assert_eq!(scalar(connection, "SELECT app.a_reader(3)::int8"), 6);
     assert_eq!(
@@ -2343,6 +2353,265 @@ fn a_new_table_generating_from_a_new_function_follows_its_create() {
     succeeds(d.run(&["verify", "--db", connection]));
     let next = succeeds(d.run(&["plan", "--db", connection]));
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn new_generated_expression_parts_keep_per_part_risks_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        for case in ["partition", "later"] {
+            check_safe_generated_creation(server, &format!("placeholder-risk-{k}-{case}"), case);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn split_generated_columns_and_validators_keep_per_part_risks_on_both_servers() {
+    for (k, server) in [old_server(), server()].iter().enumerate() {
+        for case in ["split", "split-rows"] {
+            check_safe_generated_creation(server, &format!("split-risk-{k}-{case}"), case);
+        }
+    }
+}
+
+fn check_safe_generated_creation(server: &str, slug: &str, case: &str) {
+    let own = OwnDatabase::new(server, slug);
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, slug, &ONE_COLUMN.replace("bigint", "integer"));
+    on_server(connection, "INSERT INTO app.t (id) VALUES (1),(3)");
+    declare_function(&d, "f", "SELECT x * 2");
+    let modern = scalar(
+        connection,
+        "SELECT current_setting('server_version_num')::bigint",
+    ) >= pbps_pg::generated::SET_EXPRESSION_ARRIVED_IN;
+    let seeded = case == "split-rows" || (case == "later" && modern);
+    let expression = if case == "later" {
+        "app.f(z)"
+    } else {
+        "app.f(id)"
+    };
+    let key = if seeded { "[id]" } else { "[id, z]" };
+    let partition = if case == "partition" {
+        "partition_by: [z]\npartitions:\n  a_default: default\n"
+    } else {
+        ""
+    };
+    let foreign_key = if case == "split-rows" {
+        "foreign_keys:\n  a_source_fk:\n    columns: [id]\n    references: app.t(id)\n"
+    } else {
+        ""
+    };
+    let rows = if seeded {
+        "data:\n  mode: ensure\n  rows:\n    1: {z: 3}\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        d.dir.join("schema/app.a.yml"),
+        format!(
+            "table: app.a\ncolumns:\n  id: {{type: integer, nullable: false}}\n  \
+         g: {{type: integer, generated: {{expression: '{expression}', stored: true}}}}\n  \
+         z: {{type: integer, nullable: false}}\nprimary_key: {{name: a_pk, columns: {key}}}\n\
+         unique:\n  a_g: [g, z]\nchecks:\n  a_positive: g > 0\nindexes:\n  \
+         a_g_index: {{columns: [g]}}\n  a_g_unique_index: {{columns: [g, z], unique: true}}\n\
+         {partition}{foreign_key}"
+        ),
+    )
+    .unwrap();
+    succeeds(d.run(&["plan"]));
+    if seeded {
+        // Offline keeps the exception's whole-table hold. Mint its identities
+        // before adding rows, then measure the connected capability's plan.
+        use std::io::Write;
+        let mut table = std::fs::OpenOptions::new()
+            .append(true)
+            .open(d.dir.join("schema/app.a.yml"))
+            .unwrap();
+        table.write_all(rows.as_bytes()).unwrap();
+    }
+    d.commit();
+    let plan = d.dir.join("plan.json");
+    let sql = d.dir.join("plan.sql");
+    succeeds(d.run(&[
+        "plan",
+        "--db",
+        connection,
+        "--out",
+        plan.to_str().unwrap(),
+        "--sql",
+        sql.to_str().unwrap(),
+    ]));
+    let script = std::fs::read_to_string(sql).unwrap();
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    let expected = if seeded {
+        [pbps_model::RiskClass::Constraint].into()
+    } else {
+        Default::default()
+    };
+    assert_eq!(
+        saved.changes.gated_risks(),
+        expected,
+        "{case}: {:?}",
+        saved.changes
+    );
+    let placeholder = modern && matches!(case, "partition" | "later");
+    assert_eq!(script.contains("SET EXPRESSION"), placeholder, "{script}");
+    assert_eq!(
+        script.contains("ADD COLUMN \"g\""),
+        case.starts_with("split"),
+        "{script}"
+    );
+    if seeded {
+        let install = script.find(if placeholder {
+            "SET EXPRESSION"
+        } else {
+            "ADD COLUMN \"z\""
+        });
+        if let Some(install) = install {
+            assert!(
+                install < script.find("INSERT INTO \"app\".\"a\"").unwrap(),
+                "{script}"
+            );
+        }
+    }
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        if seeded {
+            &["--allow", "constraint"]
+        } else {
+            &[]
+        },
+    ));
+    if seeded {
+        assert_eq!(
+            scalar(connection, "SELECT g::bigint FROM app.a WHERE id = 1"),
+            if case == "later" { 6 } else { 2 }
+        );
+    }
+    on_server(connection, "INSERT INTO app.a (id,z) VALUES (3,5)");
+    assert_eq!(
+        scalar(connection, "SELECT g::bigint FROM app.a WHERE id = 3"),
+        if case == "later" { 10 } else { 6 }
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT attnum::bigint FROM pg_attribute WHERE attrelid='app.a'::regclass AND attname='z'"
+        ),
+        3
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*) FROM pg_constraint WHERE conrelid='app.a'::regclass AND conname IN ('a_pk','a_g','a_positive','a_source_fk')"
+        ),
+        if case == "split-rows" { 4 } else { 3 }
+    );
+    succeeds(d.run(&["verify", "--db", connection]));
+    let next = succeeds(d.run(&["plan", "--db", connection]));
+    assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 18; set PBPS_TEST_PG_DB"]
+fn a_standing_generated_expression_still_requires_narrowing_approval() {
+    let own = OwnDatabase::new(&server(), "standing-expression-risk-1503");
+    let connection = own.connection();
+    on_server(
+        connection,
+        "CREATE SCHEMA app; CREATE TABLE app.t \
+        (id integer NOT NULL, g integer GENERATED ALWAYS AS (id * 2) STORED); \
+        INSERT INTO app.t (id) VALUES (3)",
+    );
+    let d = Demo::new("standing-expression-risk-1503");
+    succeeds(d.run(&["pull", "--db", connection]));
+    d.commit();
+    succeeds(d.run(&["baseline", "--db", connection, "--reason", "adopt"]));
+    d.table(
+        "table: app.t\ncolumns:\n  id: {type: integer, nullable: false}\n  \
+             g: {type: integer, generated: {expression: 'id * 3', stored: true}}\n",
+    );
+    let (plan, script) = connected_plan(&d, connection);
+    assert!(script.contains("SET EXPRESSION"), "{script}");
+    let saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    assert_eq!(
+        saved.changes.gated_risks(),
+        [pbps_model::RiskClass::Narrowing].into()
+    );
+    let refused = approved_apply(&d, connection, &plan, &[]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("narrowing"),
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert_eq!(scalar(connection, "SELECT g::bigint FROM app.t"), 6);
+    succeeds(approved_apply(
+        &d,
+        connection,
+        &plan,
+        &["--allow", "narrowing"],
+    ));
+    assert_eq!(scalar(connection, "SELECT g::bigint FROM app.t"), 9);
+    succeeds(d.run(&["verify", "--db", connection]));
+}
+
+#[test]
+#[ignore = "needs PostgreSQL 18; set PBPS_TEST_PG_DB"]
+fn saved_rows_before_expression_installation_cannot_clear_narrowing() {
+    use pbps_model::{Change, PlannedChange, RiskClass};
+    let own = OwnDatabase::new(&server(), "row-before-expression-1503");
+    let connection = own.connection();
+    let d = bootstrapped_demo(connection, "row-before-expression-1503", ONE_COLUMN);
+    declare_function(&d, "f", "SELECT x * 2");
+    std::fs::write(d.dir.join("schema/app.a.yml"), "table: app.a\ncolumns:\n  id: {type: integer, nullable: false}\n  g: {type: integer, generated: {expression: 'app.f(z)', stored: true}}\n  z: {type: integer}\nprimary_key: [id]\n").unwrap();
+    d.commit();
+    let (plan, _) = connected_plan(&d, connection);
+    let mut saved: pbps_model::SavedPlan =
+        serde_json::from_slice(&std::fs::read(&plan).unwrap()).unwrap();
+    let install = saved
+        .changes
+        .changes
+        .iter()
+        .position(|p| matches!(p.change, Change::AlterColumnExpression { .. }))
+        .unwrap();
+    saved.changes.changes.insert(
+        install,
+        PlannedChange::new(Change::InsertRow {
+            table: pbps_model::TableName::new("app", "a"),
+            key_column: "id".into(),
+            identity_key: false,
+            key: "1".into(),
+            row: pbps_model::Row([("z".into(), pbps_model::Value::Int(3))].into()),
+            defaults: Default::default(),
+            types: [("z".into(), "integer".parse().unwrap())].into(),
+        }),
+    );
+    let pg = pbps_pg::Postgres::new().with_server_version(180_000);
+    let risks = pbps_diff::order::generated::risks(&saved.changes, &saved.ids, &pg);
+    assert!(risks[install + 1].contains(&RiskClass::Narrowing));
+    std::fs::write(&plan, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
+    let refused = approved_apply(&d, connection, &plan, &[]);
+    assert_ne!(code(&refused), 0);
+    assert!(
+        stderr(&refused).contains("inconsistent risks"),
+        "{}{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert_eq!(
+        scalar(
+            connection,
+            "SELECT count(*)::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='app' AND c.relname='a'"
+        ),
+        0
+    );
 }
 
 /// #1364, a corner #1350 recorded: a new column whose default or generation
@@ -25384,16 +25653,13 @@ fn a_default_naming_an_index_the_plan_creates_later_is_refused_and_two_plans_dep
     );
 }
 
-/// A bootstrap orders what a new table calls ahead of it, as `plan --db`
-/// does (#1585): a column default and a generated column calling declared
-/// functions bootstrap an empty database, verify and replan empty. Without
-/// the reordering passes the table was created first and the whole
-/// bootstrap rolled back on `function … does not exist`. The negative: a
-/// table that calls nothing is created where the differ puts it, before the
-/// functions, so the passes move only what calls one. A partitioned parent
-/// held behind its function takes its partition with it (#1586), and so does
-/// one whose generated column calls a built-in sharing a declared function's
-/// name, through bootstrap and through `plan --db` and `apply` alike.
+/// A bootstrap creates a new table's prefix before the functions its
+/// expressions call, then adds the generated suffix and sets the default
+/// after those functions, as `plan --db` does (DEC-1503.1). Both expressions
+/// bootstrap an empty database, verify and replan empty. The negative: a
+/// table that calls nothing stays before the functions. A partition waits
+/// for its parent's completed columns, including when a built-in shares a
+/// declared function's name, through bootstrap and `plan --db` alike.
 #[test]
 #[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
 fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
@@ -25426,8 +25692,7 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
     succeeds(d.run(&["pull", "--db", &src]));
     d.commit();
 
-    // The script orders each function ahead of the table that calls it,
-    // and leaves the table that calls nothing ahead of both.
+    // Relation names precede the functions; only the expressions wait.
     let sql = d.dir.join("boot.sql");
     succeeds(d.run(&["bootstrap", "--sql", sql.to_str().unwrap()]));
     let script = std::fs::read_to_string(&sql).unwrap();
@@ -25437,22 +25702,31 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
             .unwrap_or_else(|| panic!("{needle} is not in:\n{script}"))
     };
     let table = at("CREATE TABLE \"app\".\"t\"");
-    assert!(at("CREATE FUNCTION \"app\".\"zz\"\n") < table, "{script}");
+    let zz = at("CREATE FUNCTION \"app\".\"zz\"\n");
+    let double = at("CREATE FUNCTION \"app\".\"zz_double\"");
+    let generated = at("ALTER TABLE \"app\".\"t\" ADD COLUMN \"g\"");
+    assert!(table < double && double < generated, "{script}");
     assert!(
-        at("CREATE FUNCTION \"app\".\"zz_double\"") < table,
+        table < zz && zz < at("ALTER TABLE \"app\".\"t\" ALTER COLUMN \"note\" SET DEFAULT"),
         "{script}"
     );
+    let prefix = &script[table..script[table..].find(") USING heap;").unwrap() + table];
+    assert!(
+        prefix.contains("\"id\" integer") && prefix.contains("\"note\" text"),
+        "{script}"
+    );
+    assert!(!prefix.contains("GENERATED ALWAYS"), "{script}");
     assert!(
         at("CREATE TABLE \"app\".\"a_plain\"") < at("CREATE FUNCTION \"app\".\"zz\"\n"),
         "{script}"
     );
-    // Each parent before its partition (#1586).
+    // Each partition follows the last column its parent adds (#1586).
     assert!(
-        at("CREATE TABLE \"app\".\"ev\" (") < at("CREATE TABLE \"app\".\"ev_1\""),
+        at("ALTER TABLE \"app\".\"ev\" ADD COLUMN \"g\"") < at("CREATE TABLE \"app\".\"ev_1\""),
         "{script}"
     );
     assert!(
-        at("CREATE TABLE \"app\".\"ab\" (") < at("CREATE TABLE \"app\".\"ab_1\""),
+        at("ALTER TABLE \"app\".\"ab\" ADD COLUMN \"g\"") < at("CREATE TABLE \"app\".\"ab_1\""),
         "{script}"
     );
 
@@ -25509,14 +25783,12 @@ fn a_bootstrap_creates_what_a_new_table_calls_before_it() {
     assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
 }
 
-/// The offline `plan` orders what a new table calls ahead of it, as `plan
-/// --db` does (#1598): a generated column calling a declared function is
-/// created after that function, and a default calling one is set after it.
-/// Before the preview went through the same schedule as the connected plan
-/// (#1955), it showed the table created first, a script no engine runs. The
-/// negative: a table that calls nothing keeps its place, ahead of the
-/// function, so only what calls one moves. The script is the one `--out`
-/// records, so the preview and its artifact agree.
+/// The offline `plan` uses the same creation parts as `plan --db`
+/// (DEC-1503.1): a new table creates its prefix before the function its
+/// generated suffix calls, then adds that suffix after the function.
+/// A default calling a declared function is set after it too. Negative: a
+/// table that calls nothing keeps its place ahead of the functions. The
+/// script is the one `--out` records, so the preview and its artifact agree.
 #[test]
 fn an_offline_plan_creates_what_a_new_table_calls_before_it() {
     let d = Demo::new("preview-1598");
@@ -25568,8 +25840,10 @@ fn an_offline_plan_creates_what_a_new_table_calls_before_it() {
     };
     let zz = at("CREATE FUNCTION \"app\".\"zz\"\n");
     let double = at("CREATE FUNCTION \"app\".\"zz_double\"");
-    // A generated column stays in its table, so the table follows the function.
-    assert!(double < at("CREATE TABLE \"app\".\"gen\""), "{script}");
+    // Keeping the prefix early exposes the relation before the generation binds.
+    let prefix = at("CREATE TABLE \"app\".\"gen\" (\n    \"id\" integer NOT NULL\n) USING heap;");
+    let generated = at("ALTER TABLE \"app\".\"gen\" ADD COLUMN \"g\"");
+    assert!(prefix < double && double < generated, "{script}");
     // A default is split out of its table and set after the function.
     assert!(
         at("CREATE TABLE \"app\".\"dflt\"") < zz && zz < at("SET DEFAULT"),

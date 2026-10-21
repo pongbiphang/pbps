@@ -180,6 +180,11 @@
         "darwin"
       ],
       "cases": [
+        "dependents::generated_tests::generated_table_parts_apply_with_the_declared_column_order_values_and_names",
+        "dependents::generated_tests::called_table_readers_use_complete_shapes_and_old_servers_keep_the_hold",
+        "dependents::generated_tests::transitive_table_readers_apply_placeholders_or_keep_the_named_hold",
+        "dependents::generated_tests::attachments::attached_generated_partitions_use_complete_shapes_and_preserve_recomputation_risks",
+        "dependents::generated_tests::part_risks::creation_parts_after_rows_keep_their_risks_on_both_servers",
         "deploy::tests::a_probe_cannot_advance_a_sequence_named_in_a_declared_check",
         "deploy::tests::a_probe_is_answered_under_the_settings_the_statement_will_run_under",
         "deploy::tests::a_read_only_probe_still_refuses_a_violating_row",
@@ -521,6 +526,10 @@
         "a_new_column_calling_a_function_that_reads_it_is_refused_by_name",
         "a_new_column_calling_a_new_function_follows_its_create",
         "a_new_table_generating_from_a_new_function_follows_its_create",
+        "new_generated_expression_parts_keep_per_part_risks_on_both_servers",
+        "split_generated_columns_and_validators_keep_per_part_risks_on_both_servers",
+        "a_standing_generated_expression_still_requires_narrowing_approval",
+        "saved_rows_before_expression_installation_cannot_clear_narrowing",
         "a_new_column_calling_a_rebuilt_function_follows_the_rebuild",
         "a_new_tables_expressions_calling_a_rebuilt_function_follow_it",
         "a_newly_declared_name_the_database_already_uses_is_refused_before_the_plan",
@@ -1687,6 +1696,8 @@
       "validate_on": "linux",
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
+        "resolver::server::scratch::live_tests::scratch_generated_table_parts_compile_literal_and_collision_names_before_functions",
+        "resolver::server::scratch::live_tests::resolver_generated_table_parts_seal_and_close_plain_exception_and_row_shapes",
         "resolver::server::scratch::live_tests::resolver_answers_a_managed_question_without_root_or_observation",
         "resolver::server::scratch::live_tests::resolver_run_owned_reproduction_stays_linear_in_the_clusters_roles",
       "resolver::server::scratch::live_tests::postgres_request_counts_cover_batches_failures_and_connection_startup",

@@ -1569,14 +1569,13 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
 /// back to its default, #1030), and when no ids file names the column, since
 /// `AlterColumnDefault` needs its uid.
 ///
-/// Split this way, the table's check is added to an empty table, and it asks
-/// for `--allow constraint` as any added check does. The approver sees the
-/// constraint as its own step, where before it was inside `CREATE TABLE`.
-///
-/// A generated column is not split out. Its expression may call the function
-/// as a default's may, but the engine has no way to give an existing column
-/// one, and taken out of the table as a column of its own it would change the
-/// table's column order (DEC-1168.1, DEC-1364.1).
+/// A new generated table's typed column parts are expanded first, retaining
+/// declaration order (DEC-1503.1). Its parts finish CREATE with creation risks
+/// only before the first row write in the final order (DEC-1503.4).
+/// Other added checks keep the existing
+/// constraint approval, where the approver sees a separately added step.
+/// Unsplittable generations retain their whole-table hold when the connected
+/// capability cannot install an expression on the complete column shape.
 ///
 /// A partitioned table's default split out this way reaches every partition
 /// when it is set, measured on 16 and 18, a new partition's own default
@@ -1587,15 +1586,23 @@ fn column_expression(column: &pbps_model::Column) -> Option<&str> {
 fn split_new_tables(
     cs: &mut ChangeSet,
     ids: &[&IdsFile],
+    deps: &ModuleDeps,
     dialect: &dyn Dialect,
 ) -> Result<usize, String> {
+    let empty = IdsFile::default();
+    let generated = pbps_diff::order::generated::expand(
+        cs,
+        ids.first().copied().unwrap_or(&empty),
+        deps,
+        dialect,
+    )?;
     let Some(last) = last_function_create(cs) else {
         return Ok(0);
     };
     let taken = defaults_taken_by_rows(cs);
     let functions = function_creates(cs);
     let calls = |text: &str| calls_one_of(text, &functions);
-    let mut added = 0;
+    let mut added = generated;
     for i in (0..last).rev() {
         let Change::CreateTable { name, table, .. } = &mut cs.changes[i].change else {
             continue;
@@ -1668,7 +1675,9 @@ fn split_new_tables(
         // The table's own change no longer carries what moved out of it, so
         // its risks are recomputed with the rest.
         let table_change = cs.changes[i].change.clone();
+        let provenance = cs.changes[i].provenance.clone();
         cs.changes[i] = planned(table_change, dialect);
+        cs.changes[i].provenance = provenance;
         added += parts.len();
         for (k, part) in parts.into_iter().enumerate() {
             cs.changes.insert(i + 1 + k, planned(part, dialect));
@@ -2227,6 +2236,7 @@ fn after_the_rebuilds(
     deps: &ModuleDeps,
     declared: &pbps_model::Schema,
     mut schedule: Schedule,
+    dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let has_handovers = !schedule.constraints().is_empty();
     // A partition delayed past its trigger's release must take its readers
@@ -2297,7 +2307,7 @@ fn after_the_rebuilds(
             _ => None,
         })
         .collect();
-    let moves: Vec<bool> = cs.changes[..last]
+    let mut moves: Vec<bool> = cs.changes[..last]
         .iter()
         .map(|p| match &p.change {
             Change::AddCheck { constraint, .. } => calls(&constraint.expression),
@@ -2363,6 +2373,13 @@ fn after_the_rebuilds(
             _ => false,
         })
         .collect();
+    // New-table creation parts carry their own function and data edges.
+    // The older last-function barrier must not move them independently.
+    for (p, moves) in cs.changes[..last].iter().zip(&mut moves) {
+        if pbps_diff::order::generated::is_part(p) {
+            *moves = false;
+        }
+    }
     // Each addition that moves waits for the last function create, a
     // `Lexical` edge (#1967, DEC-1967.1): its text names a function the plan
     // creates or rebuilds, or it validates a column such text recomputes.
@@ -2388,7 +2405,9 @@ fn after_the_rebuilds(
         count
     };
     *cs = settled.changes;
-    Ok(count + after_their_functions(cs, deps, &Partitions::of(declared))?)
+    let held = after_their_functions(cs, deps, &Partitions::of(declared))?;
+    pbps_diff::order::generated::settle(cs, declared, deps, dialect)?;
+    Ok(count + held)
 }
 
 /// A create that moves rows out of a DEFAULT partition (#1547) is never held
@@ -3614,10 +3633,12 @@ fn truncated(mut part: String) -> String {
 /// Places a column this plan adds whose default or generation expression
 /// names a function the plan creates or rebuilds after that function's
 /// create, and whatever may need the column after the column (DEC-1364.1).
-/// A table the plan creates whose generated column does so is placed whole,
-/// since that column cannot leave the table without moving in its column
-/// order (DEC-1274.2). Returns how many it placed, or why no order performs
-/// them.
+/// New tables normally use creation parts (DEC-1503.1). Only a suffix
+/// partition key, a generation reading a later column, or a called function
+/// naming the table or its types reaches this hold
+/// without a known PostgreSQL 17+ expression-replacement capability; those
+/// tables keep DEC-1274.2's whole-table order. Returns how many it placed,
+/// or why no order performs them.
 ///
 /// The column cannot simply follow the last create, as a check does: a
 /// module the plan creates may read it, and measured on 18.6 the engine
@@ -3648,9 +3669,14 @@ fn after_their_functions(
     // Each such column, with the creates after it that its text names.
     let mut waits: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (i, p) in cs.changes[..last].iter().enumerate() {
-        // A new table's generated column stays in its CREATE TABLE, where
-        // its place in the column order is (DEC-1364.1), so the whole table
-        // waits instead. So does a new partition's own default (#1578),
+        // These columns belong to a new table's expansion, whose effects
+        // and explicit edges permit its functions to precede the seed rows.
+        if pbps_diff::order::generated::is_part(p) {
+            continue;
+        }
+        // Unsplittable shapes keep their generation in CREATE
+        // when expression replacement is unavailable (DEC-1503.1), so the
+        // whole table waits. So does a new partition's own default (#1578),
         // which has no column of its own to split into an
         // `AlterColumnDefault`; one beside a DEFAULT, whose create moves
         // rows, had its default split off already (`split_moving_defaults`).
@@ -3942,7 +3968,7 @@ fn needs(later: &Change, earlier: &Change, deps: &ModuleDeps, partitions: &Parti
 /// resolved as the default or check is installed (measured on 16 and 18),
 /// as `may_call` reads a function's (DEC-1364.1).
 fn names_new_table(table: &pbps_model::Table, made: &TableName) -> bool {
-    let named = |text: &str| pbps_pg::generated::may_call(text, &made.name);
+    let named = |text: &str| pbps_pg::Postgres::new().generation_names_table(text, made);
     let typed = |base: &str| base == made.name || base == made.raw().to_string();
     table.columns.values().any(|column| {
         typed(&column.ty.base)
@@ -3991,7 +4017,7 @@ fn reads_column(id: &ModuleId, definition: &str, table: &TableName, column: &str
 fn names_table(id: &ModuleId, definition: &str, table: &TableName) -> bool {
     id.attached_to()
         .is_some_and(|on| on.schema == table.schema && on.name == table.name)
-        || pbps_pg::generated::may_name(definition, &table.name)
+        || pbps_pg::Postgres::new().generation_names_table(definition, table)
 }
 
 /// Whether a change of a table may name the new column `column` of `table`.
@@ -4079,6 +4105,9 @@ fn names_column(change: &Change, table: &TableName, column: &str, partitions: &P
 /// that names no table is held to anything.
 #[allow(clippy::wildcard_enum_match_arm)]
 fn touches(change: &Change, table: &TableName) -> bool {
+    if pbps_diff::order::generated::needs_complete(change, table) {
+        return true;
+    }
     match change {
         Change::AddForeignKey {
             table: t,
@@ -4187,14 +4216,23 @@ mod tests {
     use super::*;
     use pbps_model::{CheckConstraint, Column, Module, Table, TableName, Uid, UidKind};
 
+    fn split_new_tables(
+        cs: &mut ChangeSet,
+        ids: &[&IdsFile],
+        dialect: &dyn Dialect,
+    ) -> Result<usize, String> {
+        super::split_new_tables(cs, ids, &ModuleDeps::new(), dialect)
+    }
+
     fn after_the_rebuilds(
         cs: &mut ChangeSet,
         released: &BTreeSet<ColumnRef>,
         deps: &ModuleDeps,
         declared: &Schema,
+        dialect: &dyn Dialect,
     ) -> Result<usize, String> {
         let schedule = Schedule::new(cs.changes.len());
-        super::after_the_rebuilds(cs, released, deps, declared, schedule)
+        super::after_the_rebuilds(cs, released, deps, declared, schedule, dialect)
     }
 
     fn pg() -> Box<dyn Dialect> {
@@ -4283,6 +4321,7 @@ mod tests {
             released,
             &ModuleDeps::new(),
             &pbps_model::Schema::default(),
+            pg().as_ref(),
         )
         .unwrap()
     }
@@ -5069,7 +5108,8 @@ mod tests {
                     &BTreeSet::new(),
                     &ModuleDeps::new(),
                     &Schema::default(),
-                    schedule
+                    schedule,
+                    pg().as_ref(),
                 ),
                 Ok(0)
             );
@@ -5109,6 +5149,7 @@ mod tests {
             &ModuleDeps::new(),
             &Schema::default(),
             order,
+            pg().as_ref(),
         )
         .unwrap_err();
         assert_eq!(
@@ -5187,6 +5228,7 @@ mod tests {
                 &ModuleDeps::new(),
                 &declaration,
                 order,
+                pg().as_ref(),
             );
             if row.is_some() {
                 let why = result.unwrap_err();
@@ -5238,12 +5280,11 @@ mod tests {
         }
     }
 
-    /// A new table whose generated column calls a new function cannot have
-    /// the column split out without changing its column order, so the whole
-    /// table follows the function, and a module naming the table follows the
-    /// table. A new table generating from nothing new does not wait.
+    /// Without a known SET EXPRESSION capability, a generation reading a
+    /// later column keeps the whole-table hold (DEC-1503.1). A reader waits
+    /// too; a table generating from nothing new remains before the function.
     #[test]
-    fn a_new_table_generating_from_a_new_function_follows_it_whole() {
+    fn a_generation_reading_a_later_column_keeps_the_whole_table_hold_offline() {
         let table = |name: &str, expression: &str| {
             let mut t = Table::default();
             t.columns.insert(
@@ -5256,6 +5297,8 @@ mod tests {
                 stored: true,
             });
             t.columns.insert("g".into(), g);
+            t.columns
+                .insert("later".into(), Column::new("integer".parse().unwrap()));
             Change::CreateTable {
                 uid: Uid::derived(UidKind::Table, name, 0),
                 name: name.parse().unwrap(),
@@ -5265,11 +5308,12 @@ mod tests {
             }
         };
         let mut cs = plan(vec![
-            table("app.n", "app.f(id)"),
+            table("app.n", "app.f(later)"),
             table("app.plain", "id * 2"),
             routine("app.a_reader()", "SELECT g FROM app.n LIMIT 1"),
             routine("app.f(integer)", "SELECT 1"),
         ]);
+        assert_eq!(split_new_tables(&mut cs, &[], pg().as_ref()), Ok(0));
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
@@ -5279,17 +5323,22 @@ mod tests {
             at(&|c| matches!(c, Change::CreateTable { name: n, .. } if n.raw().to_string() == name))
         };
         let order = names(&cs);
+        assert!(
+            table_at("app.plain") < created("app.f(integer)"),
+            "{order:?}"
+        );
         assert!(created("app.f(integer)") < table_at("app.n"), "{order:?}");
         assert!(table_at("app.n") < created("app.a_reader()"), "{order:?}");
         #[allow(clippy::wildcard_enum_match_arm)]
         match &cs.changes[table_at("app.n")].change {
             Change::CreateTable { table, .. } => {
                 assert_eq!(
-                    table.columns.keys().cloned().collect::<Vec<_>>(),
-                    [
-                        pbps_model::ColumnName::from("id"),
-                        pbps_model::ColumnName::from("g")
-                    ]
+                    table
+                        .columns
+                        .keys()
+                        .map(pbps_model::ColumnName::raw)
+                        .collect::<Vec<_>>(),
+                    ["id", "g", "later"]
                 );
             }
             other => panic!("{other:?}"),
@@ -5297,8 +5346,8 @@ mod tests {
     }
 
     /// A new partition's own default calling a new function holds the whole
-    /// partition after that function, as a generated column holds its table
-    /// (#1578, DEC-1364.1): the partition has no column of its own to split
+    /// partition after that function (#1578, DEC-1364.1): unlike a table's
+    /// generated suffix, the partition has no column of its own to split
     /// the default into. A partition whose own default calls nothing new, and
     /// its parent, keep their places.
     #[test]
@@ -5612,6 +5661,7 @@ mod tests {
             &BTreeSet::new(),
             &ModuleDeps::new(),
             &pbps_model::Schema::default(),
+            pg().as_ref(),
         )
         .unwrap_err();
         assert!(
@@ -5817,7 +5867,14 @@ mod tests {
                 },
             );
         }
-        after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), &declared).unwrap();
+        after_the_rebuilds(
+            &mut cs,
+            &BTreeSet::new(),
+            &ModuleDeps::new(),
+            &declared,
+            pg().as_ref(),
+        )
+        .unwrap();
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
         let table_at = |name: &str| {
@@ -5853,9 +5910,10 @@ mod tests {
         assert!(table_at("app.ev_ix_v") < function, "{order:?}");
     }
 
-    /// A new table held back for its generation expression does not drag an
-    /// unrelated new table behind it: when the function it calls reads that
-    /// other table, the order other table, function, generated table exists
+    /// An unsplittable table with a generation reading a later column
+    /// keeps the offline hold without dragging an unrelated table behind it:
+    /// when the function it calls reads that other table, the order other
+    /// table, function, generated table exists
     /// and is found. A new table that names the held one still follows it.
     #[test]
     fn a_held_new_table_leaves_unrelated_new_tables_free() {
@@ -5928,13 +5986,18 @@ mod tests {
             moves_at_most: None,
         };
         let mut cs = plan(vec![
-            new_table("app.n", &[("id", None), ("g", Some("app.f(id)"))], None),
+            new_table(
+                "app.n",
+                &[("id", None), ("g", Some("app.f(later)")), ("later", None)],
+                None,
+            ),
             new_table("app.other", &[("id", None)], None),
             new_table("app.child", &[("id", None)], Some("app.n")),
             literal_table(),
             literal_partition(),
             routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
         ]);
+        assert_eq!(split_new_tables(&mut cs, &[], pg().as_ref()), Ok(0));
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         let at =
             |f: &dyn Fn(&Change) -> bool| cs.changes.iter().position(|p| f(&p.change)).unwrap();
@@ -5953,19 +6016,25 @@ mod tests {
         // app.b waits for the earlier function but names app.a, which waits
         // for the later one.
         let mut cs = plan(vec![
-            new_table("app.a", &[("id", None), ("g", Some("app.f2(id)"))], None),
+            new_table(
+                "app.a",
+                &[("id", None), ("g", Some("app.f2(later)")), ("later", None)],
+                None,
+            ),
             new_table(
                 "app.b",
                 &[
                     ("id", None),
-                    ("g", Some("app.f1(id)")),
+                    ("g", Some("app.f1(later)")),
                     ("r", Some("'app.a'::regclass::oid::integer")),
+                    ("later", None),
                 ],
                 None,
             ),
             routine("app.f1(integer)", "SELECT 1"),
             routine("app.f2(integer)", "SELECT 2"),
         ]);
+        assert_eq!(split_new_tables(&mut cs, &[], pg().as_ref()), Ok(0));
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 2);
         let order = names(&cs);
         let position = |name: &str| {
@@ -5990,7 +6059,11 @@ mod tests {
             pbps_model::ValueSource::Default("'app.__a'::regtype::oid::integer".into());
         other.columns.insert("r".into(), r);
         let mut cs = plan(vec![
-            new_table("app.a", &[("id", None), ("g", Some("app.f(id)"))], None),
+            new_table(
+                "app.a",
+                &[("id", None), ("g", Some("app.f(later)")), ("later", None)],
+                None,
+            ),
             Change::CreateTable {
                 uid: Uid::derived(UidKind::Table, "app.other", 0),
                 name: "app.other".parse().unwrap(),
@@ -6000,6 +6073,7 @@ mod tests {
             },
             routine("app.f(integer)", "SELECT count(*)::integer FROM app.other"),
         ]);
+        assert_eq!(split_new_tables(&mut cs, &[], pg().as_ref()), Ok(0));
         assert_eq!(rebuilds(&mut cs, &BTreeSet::new()), 1);
         let order = names(&cs);
         let position = |name: &str| {
@@ -6169,7 +6243,8 @@ mod tests {
                 &mut cs,
                 &BTreeSet::new(),
                 &deps,
-                &pbps_model::Schema::default()
+                &pbps_model::Schema::default(),
+                pg().as_ref()
             ),
             Ok(1)
         );
@@ -6228,6 +6303,7 @@ mod tests {
                 &BTreeSet::new(),
                 &ModuleDeps::new(),
                 &pbps_model::Schema::default(),
+                pg().as_ref(),
             )
             .unwrap_err();
             assert!(why.contains("`app.t.g`"), "{why}");
@@ -6270,15 +6346,27 @@ mod tests {
             ])
         };
         let mut cs = changes("app.t_1");
-        let why = after_the_rebuilds(&mut cs, &BTreeSet::new(), &ModuleDeps::new(), &declared)
-            .unwrap_err();
+        let why = after_the_rebuilds(
+            &mut cs,
+            &BTreeSet::new(),
+            &ModuleDeps::new(),
+            &declared,
+            pg().as_ref(),
+        )
+        .unwrap_err();
         assert!(why.contains("`app.t.g`"), "{why}");
         assert!(why.contains("`app.v`"), "{why}");
         // Negative: a view over a table that is no partition of it is free to
         // go ahead, and the column follows the function.
         let mut other = changes("app.u_1");
         assert_eq!(
-            after_the_rebuilds(&mut other, &BTreeSet::new(), &ModuleDeps::new(), &declared),
+            after_the_rebuilds(
+                &mut other,
+                &BTreeSet::new(),
+                &ModuleDeps::new(),
+                &declared,
+                pg().as_ref()
+            ),
             Ok(1)
         );
         // Negative: without the declared partition the same plan orders, as
@@ -6289,7 +6377,8 @@ mod tests {
                 &mut unknown,
                 &BTreeSet::new(),
                 &ModuleDeps::new(),
-                &Schema::default()
+                &Schema::default(),
+                pg().as_ref()
             ),
             Ok(1)
         );
@@ -6328,6 +6417,7 @@ mod tests {
                 &BTreeSet::new(),
                 &ModuleDeps::new(),
                 &pbps_model::Schema::default(),
+                pg().as_ref(),
             )
         };
         let why = ordered(insert(&["g"], &[])).unwrap_err();
@@ -6734,6 +6824,7 @@ mod tests {
             &BTreeSet::new(),
             &ModuleDeps::new(),
             &Schema::default(),
+            pg().as_ref(),
         )
         .unwrap();
         assert_eq!(
@@ -6749,6 +6840,7 @@ mod tests {
             &BTreeSet::new(),
             &ModuleDeps::new(),
             &Schema::default(),
+            pg().as_ref(),
         )
         .unwrap();
         assert_eq!((again, &cs), (0, &settled));
@@ -9435,3 +9527,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod generated_tests;

@@ -1212,19 +1212,34 @@ pub(super) fn dropped_signatures(
 }
 
 /// The desired namespace's scratch statements, for this engine.
-pub(super) fn reconstruction(
+pub(in crate::resolver::server) fn reconstruction(
     driver: Driver,
     extras: &[String],
     bootstrap: &[pbps_model::Change],
+    ids: &pbps_model::IdsFile,
+    dependencies: &pbps_model::ModuleDeps,
+    version: i64,
 ) -> Result<Reconstruction, String> {
     match driver {
-        Driver::Postgres => Reconstruction::new(
-            &pbps_pg::Postgres::with_write_path_extras(extras.to_vec()),
+        Driver::Postgres => Reconstruction::with_dependencies(
+            &pbps_pg::Postgres::with_write_path_extras(extras.to_vec())
+                .with_server_version(version),
             bootstrap,
+            ids,
+            dependencies,
         )
         .map_err(|error| error.to_string()),
         Driver::Mssql => Err(super::NO_BINDING_ADAPTER.into()),
     }
+}
+
+/// Read once for both scratch expansion and the sealed producer's plan.
+pub(in crate::resolver::server) async fn generation_version(
+    target: &mut Conn,
+) -> Result<i64, String> {
+    pbps_pg::roles::server_version_num(target)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// What a failed scratch compilation is. A declaration that did not compile
@@ -1426,6 +1441,8 @@ pub(in crate::resolver::server) struct Binding {
     links: Vec<externals::Link>,
     routines: externals::ManagedRoutines,
     reconstruction: Reconstruction,
+    // Reconstruction and final planning must use the same measured capability.
+    generation_version: i64,
 }
 
 /// The fixed-key closing capture and the exact scope its opening read uses.
@@ -1443,6 +1460,8 @@ impl Scratch<'_> {
         &self,
         target: &mut Conn,
         binding: &BindingRequest<'_>,
+        ids: &pbps_model::IdsFile,
+        dependencies: &pbps_model::ModuleDeps,
     ) -> Result<Binding, Error> {
         let base_managed = Managed::from_schema(binding.base);
         let desired_managed = Managed::from_schema(binding.desired);
@@ -1462,14 +1481,23 @@ impl Scratch<'_> {
         any.extend(kept.iter().copied());
         let routines = externals::ManagedRoutines { desired: kept, any };
         let extras = &self.request.write_path_extras;
-        let reconstruction =
-            reconstruction(self.driver, extras, binding.bootstrap).map_err(Error::Binding)?;
+        let generation_version = generation_version(target).await.map_err(Error::Binding)?;
+        let reconstruction = reconstruction(
+            self.driver,
+            extras,
+            binding.bootstrap,
+            ids,
+            dependencies,
+            generation_version,
+        )
+        .map_err(Error::Binding)?;
         Ok(Binding {
             base_managed,
             desired_managed,
             links,
             routines,
             reconstruction,
+            generation_version,
         })
     }
 }
@@ -1780,16 +1808,20 @@ pub(super) fn ordinary(
     })
 }
 
-pub(super) fn plan(
-    base: pbps_diff::Side<'_>,
-    desired: pbps_diff::Side<'_>,
-    hints: &pbps_model::Hints,
-    extras: &[String],
-    surfaces: &[pbps_model::resolver::SurfaceResolution],
-) -> Result<pbps_diff::resolver::Ordered, Error> {
-    let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
-    pbps_diff::resolver::plan(base, desired, hints, surfaces, &dialect)
-        .map_err(|error| Error::Binding(error.to_string()))
+impl Binding {
+    pub(super) fn plan(
+        &self,
+        base: pbps_diff::Side<'_>,
+        desired: pbps_diff::Side<'_>,
+        hints: &pbps_model::Hints,
+        extras: &[String],
+        surfaces: &[pbps_model::resolver::SurfaceResolution],
+    ) -> Result<pbps_diff::resolver::Ordered, Error> {
+        let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec())
+            .with_server_version(self.generation_version);
+        pbps_diff::resolver::plan(base, desired, hints, surfaces, &dialect)
+            .map_err(|error| Error::Binding(error.to_string()))
+    }
 }
 
 pub(super) async fn reset_role(admin: &mut Conn) -> Result<(), ProduceError> {

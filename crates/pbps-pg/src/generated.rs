@@ -143,9 +143,111 @@ pub fn may_call(expression: &str, name: &str) -> bool {
             .any(|contents| crate::impact::mentions_in_literal(contents, name))
 }
 
+mod parts;
+pub(crate) use parts::parts;
+
+/// A consumer binds the full row shape even when it mentions no suffix
+/// column explicitly. Reuse the identifier/literal scans, rather than trying
+/// to recognize every SQL whole-row construct (DEC-1503.4).
+pub(crate) fn names_table(text: &str, table: &pbps_model::TableName) -> bool {
+    if may_call(text, &table.name) {
+        return true;
+    }
+    let array = format!("_{}", table.name);
+    // The catalog chooses collision suffixes. Consider every number present
+    // in the text instead of guessing which suffix this plan will allocate.
+    let mut regions = crate::LEXICON.string_literals(text);
+    regions.push(crate::LEXICON.code_only(text));
+    let numbers: std::collections::BTreeSet<_> = regions
+        .iter()
+        .flat_map(|region| region.split(|c: char| !c.is_ascii_digit()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Long names may be truncated for an array name. All character-boundary
+    // prefixes over-approximate those spellings without predicting one.
+    let ends: Vec<_> = if array.len() > 62 {
+        array
+            .char_indices()
+            .map(|(i, _)| i)
+            .filter(|i| *i > 1)
+            .chain([array.len()])
+            .collect()
+    } else {
+        vec![array.len()]
+    };
+    ends.into_iter().any(|end| {
+        may_call(text, &array[..end])
+            || numbers
+                .iter()
+                .any(|n| may_call(text, &format!("{}_{n}", &array[..end])))
+    })
+}
+
+/// Prove the narrow literal-regclass form, including parentheses and built-in
+/// casts used by the existing name fixtures. The existing lexer decodes the
+/// literal and masks comments. No other reference is assumed name-only.
+pub(crate) fn table_name_only(text: &str, table: &pbps_model::TableName) -> bool {
+    let literals = crate::LEXICON.string_literals(text);
+    if literals.len() != 1 || !crate::impact::mentions_in_literal(&literals[0], &table.name) {
+        return false;
+    }
+    let code = crate::LEXICON.code_only(text);
+    if names_table(&code, table) {
+        return false;
+    }
+    let casts: String = code
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace() && !matches!(c, '(' | ')'))
+        .collect();
+    let mut casts = casts.split("::");
+    casts.next() == Some("")
+        && matches!(casts.next(), Some("regclass" | "pg_catalog.regclass"))
+        && casts.all(|cast| {
+            matches!(
+                cast,
+                "oid"
+                    | "integer"
+                    | "bigint"
+                    | "text"
+                    | "pg_catalog.oid"
+                    | "pg_catalog.int4"
+                    | "pg_catalog.int8"
+                    | "pg_catalog.text"
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{may_call, may_name, may_read};
+
+    #[test]
+    fn only_proven_relation_name_literals_use_the_prefix() {
+        let table = pbps_model::TableName::new("app", "a");
+        for text in [
+            "'app.a'::regclass",
+            "('app.a'::regclass)::oid::integer",
+            "E'app.a'::pg_catalog.regclass",
+        ] {
+            assert!(super::names_table(text, &table));
+            assert!(super::table_name_only(text, &table), "{text}");
+        }
+        for text in [
+            "TABLE app.a",
+            "INSERT INTO app.a VALUES(1,2,3)",
+            "ROW(1,2,3)::app.a",
+            "'app.a'::regtype",
+            "'app._a'::regtype",
+            "'app._a_1'::regtype",
+            "'app.a'::regclass::text || 'app.a'::regtype::text",
+            "SELECT a.id FROM app.a",
+            r#"SELECT NULL::app.U&"_a_\0031""#,
+        ] {
+            assert!(super::names_table(text, &table), "{text}");
+            assert!(!super::table_name_only(text, &table), "{text}");
+        }
+        assert!(!super::names_table("x * 2 /* app.a */", &table));
+    }
 
     /// A function an OID-alias literal names is a call to the engine, so a
     /// name inside a literal counts; a longer name still does not

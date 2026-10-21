@@ -5770,7 +5770,7 @@ pub fn cmd_bootstrap(
     target: Option<&Target>,
     sql_out: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    let dialect = crate::dialect(project)?;
+    let mut dialect = crate::dialect(project)?;
     let mut loaded = crate::load(project, dialect.as_ref())?;
     let ids = crate::read_ids(project)?;
     refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
@@ -5822,6 +5822,7 @@ pub fn cmd_bootstrap(
     if let Some(target) = target {
         loaded.schema = db::runtime()?.block_on(async {
             let mut conn = db::connect(target).await?;
+            dialect = crate::engine::planning_dialect(&mut conn).await?;
             let mut unasked = Vec::new();
             let refused =
                 refuse_misspelt(&mut conn, &loaded.schema, &Default::default(), &mut unasked).await;

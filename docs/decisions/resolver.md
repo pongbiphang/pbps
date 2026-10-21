@@ -3452,15 +3452,17 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
   itself exists nowhere, so a shape naming it is not filled either.
 - **A chain is lifted for what fill writes.** A shape that names a managed
   relation's row type is created between two parts of the compile:
-  - the deployer's session compiles up to the step that creates the last
-    relation those shapes name, and commits;
+  - the deployer's session compiles up to the step that completes the last
+    column shape of every relation those shapes name, and commits;
   - the setup session creates the shape, as the externals file's owner
     would;
   - the deployer's session compiles the rest.
 
-  That step can be among the modules: a table whose generated column calls
-  a declared function follows the function there. The split waits for every
-  managed relation the shapes name, not the one the chain keeps. Each
+  That step can be among the modules: under DEC-1503.1 a split table creates
+  its prefix before a declared function its generation calls, then adds its
+  suffix after that function. Fill waits for the complete column shape.
+  The split waits for every managed relation the shapes name, not the one
+  the chain keeps. Each
   chained object carries its own prerequisites, so one waiting for a
   relation the compile does not create (a base table the plan renames) is
   dropped with what names it, and the rest are still filled. In the supplied
@@ -3472,10 +3474,10 @@ in that order, so the plan's ordering gains no edge and no pass (#1776).
   from scratch's catalog after fill, as created at the split. A module
   compiled before it that bound, say, a routine the target's call casts to a
   domain instead is then unresolved, never sealed.
-  - A generated column's expression compiles in its table's `CREATE TABLE`,
-    which can come before the split. So the check finds that step from the
-    column and counts what came after it: later modules too, since a table
-    whose expression calls a declared function is created among them. A
+  - A generated expression compiles at the step installing its real text:
+    CREATE TABLE, ADD COLUMN or SET EXPRESSION after the shared expansion
+    (DEC-1503.1). The check finds that step from the column and counts what
+    came after it, including modules or filled names. A
     plain default, a check or an index expression compiles after every
     module, so it keeps the rule it had.
   - Filled names are classified as the step names are. A sequence, like an
@@ -3522,7 +3524,7 @@ copy is not filled over), live; and the `resolver::draft` unit tests
 `reconstruct`'s
 `chained_shapes_wait_for_the_step_that_creates_what_they_name` and
 `names_created_between_steps_are_later_only_for_modules_before_them` and
-`a_generated_columns_later_names_follow_its_tables_step`.
+`a_generated_columns_later_names_follow_its_expression_step`.
 
 <a id="dec-2141-1"></a>
 

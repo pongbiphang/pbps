@@ -25,6 +25,7 @@
 pub mod commute;
 pub mod edges;
 pub mod expand;
+pub mod generated;
 mod rewrites;
 pub(crate) mod roles;
 pub mod schedule;

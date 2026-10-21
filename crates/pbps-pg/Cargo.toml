@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Scratch settles the same typed creation parts as deployment (#1503).
+pbps-diff.workspace = true
 pbps-model.workspace = true
 pbps-dialect.workspace = true
 # Promoted from a dev-dependency by introspection (Phase 5 step 3): `catalog`
@@ -29,9 +31,6 @@ thiserror.workspace = true
 rustix.workspace = true
 
 [dev-dependencies]
-# The live suite plans a migration the way `plan --db` does, so that what it
-# applies is a real `ChangeSet` and not a hand-built list of changes.
-pbps-diff.workspace = true
 # The commutation suite (#1965) declares its scenarios in YAML and loads them
 # the way `plan` loads a schema directory.
 pbps-load.workspace = true

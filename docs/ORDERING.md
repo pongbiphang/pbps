@@ -159,7 +159,15 @@ Then, in this order:
     one of the passes that read the catalog themselves and so stay
     `plan --db`'s own calls after `schedule` (DEC-1955.1).
   - `split_new_tables` splits the parts of a new table whose text names a
-    function the plan creates out of it, ahead of that create.
+    function the plan creates out of it, ahead of that create. A generated
+    column calling a planned function starts a declaration-order suffix;
+    its prefix creates the relation at its ordinary position. Only
+    unsplittable shapes use a typed placeholder and SET EXPRESSION with a
+    known PostgreSQL 17+ capability, or retain the whole-table hold without
+    it (DEC-1503.1). Resolver preparation and scratch share the same parts.
+    Those creation parts retain CREATE's risks through resolver preparation;
+    saved-plan validation proves their preceding CREATE by table identity
+    before deriving the same context (DEC-1503.3).
   - `split_moving_defaults` sets a create's own default after the last
     function its text may call, where the create moves rows out of a DEFAULT
     partition (DEC-1547.1).
@@ -178,6 +186,9 @@ Then, in this order:
     takes its effects graph's dependents with it, including a key's foreign
     keys and replica identity; unrelated additions retain their places
     (DEC-2100.3).
+    New-table creation parts state column-order, function, complete-shape,
+    row and validator edges through the same settlement mechanism
+    (DEC-1503.1).
   - `after_their_parents_defaults` then sets each partition's own default
     again after a parent's default the plan sets, which reaches every
     partition (DEC-1581.1).
@@ -439,7 +450,7 @@ and the expression-bearing changes that need a function.
 | `AddColumn` → a module created that reads it | content, over-approximated | class 8 before 14; reordered after a column that moves, when it names the column or its table | ✓ DEC-1364.1 |
 | Function rebuilt → default a row of the plan takes | content | stays ahead of the rows | ⧗ #1030 |
 | Function created → a new table's expression-bearing parts | content, over-approximated | `split_new_tables`, then `after_the_rebuilds`, when their text names the function | ✓ #1027, DEC-1364.1 |
-| Function created → a new table's generated column calling it | content | stays inside `CREATE TABLE`: split out, the column would move to the end of the table | ⧗ DEC-1364.1 |
+| Function created → a new table's generated column calling it | content, over-approximated | shared creation parts keep the prefix before the function, then add the suffix in declaration order; a suffix partition key or a generation reading a later column instead uses SET EXPRESSION on connected PostgreSQL 17+, retaining the whole-table hold otherwise | ✓ DEC-1503.1 |
 
 ### Something removed before what it blocks
 
@@ -557,10 +568,20 @@ What is left to the engine is recorded on #1350, each with a two-plan remedy:
 - an expression change still calling a function the plan rebuilds;
 - a function dropped after its release whose own body reads a column dropped
   or retyped earlier;
-- a default a plan row takes calling a rebuilt function (#1030);
-- a generated column of a table the plan creates calling a function the plan
-  creates or rebuilds: taken out of `CREATE TABLE`, the column would change
-  the table's column order (DEC-1364.1).
+- a default a plan row takes calling a rebuilt function (#1030).
+
+New tables use creation parts that preserve column order. A suffix partition
+key, a generation reading a later column, or a transitively called module
+naming the table or its types instead keeps the whole-table hold without a known
+PostgreSQL 17+ capability. Consumers use the complete shape unless a reference
+is proven to resolve only the relation name; the reverse regclass pair still
+uses prefix edges. Creation risks require each receiving part before every row
+write into that table identity (DEC-1503.4). Selection walks the same lexical
+and declared module dependency edges as settlement (DEC-1503.5).
+The exhaustive structural classification also puts partition creates and
+attachments after their parent's complete columns. Attachments introduce
+standing rows for risk derivation, as do writes through current partition
+ancestors and DEFAULT moves (DEC-1503.6).
 
 ## Value flow
 

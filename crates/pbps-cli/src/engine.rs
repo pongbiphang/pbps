@@ -3458,6 +3458,11 @@ pub async fn account_for_module_dependents(
             message: "SQL Server uses CREATE OR ALTER, so a module change drops nothing that depends on it".into(),
         });
     }
+    // Version is observed once, before the pure expansion. Ordinary CLI
+    // planning has no extra write-path schemas (DEC-1503.1).
+    let pg = pbps_pg::Postgres::new()
+        .with_server_version(pbps_pg::roles::server_version_num(conn).await?);
+    let dialect: &dyn pbps_dialect::Dialect = &pg;
     let mut found = module_dependents(conn, changes).await?;
     let untouched = crate::dependents::untouched_module_dependents(changes, &found, declared);
     if !untouched.is_empty() {
@@ -3519,6 +3524,18 @@ pub async fn account_for_module_dependents(
             "{dependents} dependent(s) of {} dropped or rebuilt module(s) removed before the drop; {added} change(s) added to the plan for them; {split} part(s) split out of new tables; {moved} addition(s) moved after the function(s) they call",
             found.len()
         ),
+    })
+}
+
+/// The connection's immutable planning capability, before any expansion.
+/// Offline callers retain their ordinary unknown-capability dialect.
+pub async fn planning_dialect(conn: &mut Conn) -> anyhow::Result<Box<dyn pbps_dialect::Dialect>> {
+    Ok(match conn.driver() {
+        Driver::Postgres => Box::new(
+            pbps_pg::Postgres::new()
+                .with_server_version(pbps_pg::roles::server_version_num(conn).await?),
+        ),
+        Driver::Mssql => Box::new(pbps_mssql::Mssql),
     })
 }
 

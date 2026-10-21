@@ -2337,6 +2337,38 @@ pub trait Dialect {
     /// [`normalize_definition`]: Dialect::normalize_definition
     fn lexicon(&self) -> Lexicon;
 
+    /// The parts of a new table whose generation needs a planned function.
+    /// Pure engine policy: callers supply recorded column identities and
+    /// whether a called reader needs the complete shape. Connection
+    /// capabilities are immutable inputs to the dialect.
+    fn generated_table_parts(
+        &self,
+        _change: &Change,
+        _ids: &pbps_model::IdsFile,
+        _functions: &[pbps_model::ModuleId],
+        _needs_complete_shape: bool,
+    ) -> Result<Option<Vec<Change>>, DialectError> {
+        Ok(None)
+    }
+
+    /// A creation-time reference, including OID-alias string literals on
+    /// engines that bind them. This is a lexical constraint, not a parser.
+    fn generation_may_call(&self, text: &str, name: &str) -> bool {
+        self.may_name(text, name)
+    }
+
+    /// Whether a consumer may name a table, its row type or its array type.
+    /// A positive answer requires the complete creation shape (DEC-1503.4).
+    fn generation_names_table(&self, text: &str, table: &pbps_model::TableName) -> bool {
+        self.generation_may_call(text, &table.name)
+    }
+
+    /// True only when every reference to this table merely resolves its
+    /// relation name. Unknown expression forms require the complete shape.
+    fn generation_table_name_only(&self, _text: &str, _table: &pbps_model::TableName) -> bool {
+        false
+    }
+
     /// Whether `text` may name `name` as an identifier: in code, never in a
     /// literal or a comment, ignoring case, and bounded by what cannot
     /// continue an identifier, so `[a]` and `a*2` name `a` and `amount` does

@@ -1466,10 +1466,10 @@ mod generated_surface_coverage {
         }
     }
 
-    /// A generation expression stays in its CREATE TABLE or ADD COLUMN, so
-    /// that step provides its `pg_attrdef` surface: a function the plan
-    /// creates and the expression calls is ordered before the table or
-    /// column, not after it (DEC-1274.2).
+    /// The step installing a generation expression provides its `pg_attrdef`
+    /// surface and follows the function it calls. This MinimalDialect fixture
+    /// keeps the expression in CREATE TABLE or ADD COLUMN; PostgreSQL expands
+    /// new tables into creation parts first (DEC-1503.1).
     #[test]
     fn a_generation_expression_waits_for_the_function_it_calls() {
         let function: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
@@ -5161,4 +5161,246 @@ fn two_reference_tables_referencing_each_other_plan_and_settle_in_the_differs_or
     .unwrap_or_else(|error| panic!("a cycle of reference tables is refused: {error:?}"));
     assert_eq!(ordered.changes, differ);
     ordered.proof.validate(&ordered.changes).unwrap();
+}
+
+#[test]
+fn preparing_generated_creation_parts_preserves_their_creation_risks() {
+    use pbps_model::{Column, Generated, IdsFile, Schema, Table, TableName, ValueSource};
+    let name = TableName::new("app", "a");
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let mut g = Column::new("integer".parse().unwrap());
+    g.value_source = ValueSource::Generated(Generated {
+        expression: "id * 2".into(),
+        stored: true,
+    });
+    table.columns.insert("g".into(), g);
+    let z = Column::new("integer".parse().unwrap()).not_null();
+    table.columns.insert("z".into(), z.clone());
+    table.checks.insert(
+        "positive".into(),
+        pbps_model::CheckConstraint {
+            expression: "g > 0".into(),
+        },
+    );
+    let desired = Schema {
+        tables: [(name.clone(), table.clone())].into(),
+        ..Default::default()
+    };
+    let identities = ids(&desired, &IdsFile::default());
+    table.columns.shift_remove("z");
+    if let ValueSource::Generated(g) = &mut table.columns["g"].value_source {
+        g.expression = "NULL::integer".into();
+    }
+    let mut ordinary = ChangeSet {
+        changes: vec![
+            PlannedChange::new(Change::CreateTable {
+                uid: identities.table_uid(&name).unwrap().clone(),
+                name: name.clone(),
+                table: Box::new(table),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+            PlannedChange::new(Change::AddColumn {
+                uid: identities.column_uid(&name.column("z")).unwrap().clone(),
+                table: name.clone(),
+                name: "z".into(),
+                column: Box::new(z),
+            }),
+            PlannedChange::new(Change::AlterColumnExpression {
+                uid: identities.column_uid(&name.column("g")).unwrap().clone(),
+                column: name.column("g"),
+                from: "NULL::integer".into(),
+                to: "id * 2".into(),
+            }),
+        ],
+    };
+    for part in &mut ordinary.changes {
+        part.risks.clear();
+        part.provenance = Some(pbps_model::Provenance {
+            rule: crate::order::generated::RULE,
+            role: pbps_model::AddedRole::SplitPart,
+            source: "app.a".into(),
+            reason: "typed creation part".into(),
+        });
+    }
+    let prepare = |cs: &ChangeSet| {
+        super::prepare::changes(
+            cs,
+            &Schema::default(),
+            &desired,
+            &identities,
+            &IdsFile::default(),
+            &BTreeSet::new(),
+            &Default::default(),
+            &pbps_dialect::MinimalDialect,
+        )
+        .unwrap()
+    };
+    let prepared = prepare(&ordinary);
+    assert!(
+        prepared
+            .changes
+            .changes
+            .iter()
+            .any(|p| matches!(p.change, Change::AddCheck { .. }))
+    );
+    assert!(
+        prepared.changes.gated_risks().is_empty(),
+        "{:?}",
+        prepared.changes
+    );
+    let mut late = ordinary.clone();
+    let column = late.changes.remove(1);
+    late.changes.push(PlannedChange::new(Change::InsertRow {
+        table: name.clone(),
+        key_column: "id".into(),
+        identity_key: false,
+        key: "1".into(),
+        row: Default::default(),
+        defaults: Default::default(),
+        types: Default::default(),
+    }));
+    late.changes.push(column);
+    let prepared_late = prepare(&late);
+    assert!(
+        prepared_late.changes.changes.iter().any(|p| {
+            matches!(&p.change, Change::AddColumn { name, .. } if name.raw() == "z")
+                && p.risks.contains(&pbps_model::RiskClass::NotNull)
+        }),
+        "a lowering cannot borrow the earlier installation's empty context"
+    );
+    let mut standing = prepared.changes;
+    standing
+        .changes
+        .retain(|p| !matches!(p.change, Change::CreateTable { .. }));
+    let unmarked = prepare(&standing);
+    assert!(
+        unmarked
+            .changes
+            .gated_risks()
+            .contains(&pbps_model::RiskClass::Narrowing)
+    );
+    assert!(
+        unmarked
+            .changes
+            .gated_risks()
+            .contains(&pbps_model::RiskClass::NotNull)
+    );
+    assert!(
+        unmarked
+            .changes
+            .gated_risks()
+            .contains(&pbps_model::RiskClass::Constraint)
+    );
+}
+
+#[test]
+fn placeholder_creates_do_not_claim_the_installed_expressions_bindings() {
+    use pbps_model::operation::{Origin, PlanOwners};
+    use pbps_model::resolver::{BoundSurface, ObjectIdentity};
+    use pbps_model::{
+        Column, Generated, IdsFile, Module, ModuleKind, Schema, Table, TableName, ValueSource,
+    };
+    let name = TableName::new("app", "a");
+    let column = name.column("g");
+    let function: pbps_model::ModuleId = "app.f(integer)".parse().unwrap();
+    let mut spec = Column::new("integer".parse().unwrap());
+    spec.value_source = ValueSource::Generated(Generated {
+        expression: "app.f(1)".into(),
+        stored: true,
+    });
+    let mut table = Table::default();
+    table.columns.insert("g".into(), spec);
+    let module = Module {
+        kind: ModuleKind::Function,
+        description: None,
+        definition: "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1".into(),
+    };
+    let desired = Schema {
+        tables: [(name.clone(), table.clone())].into(),
+        modules: [(function.clone(), module.clone())].into(),
+        ..Default::default()
+    };
+    let before_ids = IdsFile::default();
+    let ids = ids(&desired, &before_ids);
+    let base = Schema::default();
+    let observation = SurfaceResolution {
+        surface: Surface::Default(column.clone()),
+        current: None,
+        desired: Some(BoundSurface {
+            object: ObjectIdentity {
+                class: "pg_attrdef".into(),
+                name: vec!["app".into(), "a".into(), "g".into()],
+                signature: Vec::new(),
+            },
+            bindings: Vec::new(),
+            managed_inputs: [Surface::Module(function.clone())].into(),
+        }),
+    };
+    for placeholder in [true, false] {
+        let from = if placeholder {
+            "NULL::integer"
+        } else {
+            "app.f(1)"
+        };
+        let mut created = table.clone();
+        if let ValueSource::Generated(g) = &mut created.columns["g"].value_source {
+            g.expression = from.into();
+        }
+        let changes = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::CreateTable {
+                    uid: ids.table_uid(&name).unwrap().clone(),
+                    name: name.clone(),
+                    table: Box::new(created),
+                    beside_default: None,
+                    moves_at_most: None,
+                }),
+                PlannedChange::new(Change::CreateModule {
+                    id: function.clone(),
+                    module: Box::new(module.clone()),
+                }),
+                PlannedChange::new(Change::AlterColumnExpression {
+                    uid: ids.column_uid(&column).unwrap().clone(),
+                    column: column.clone(),
+                    from: from.into(),
+                    to: "app.f(1)".into(),
+                }),
+            ],
+        };
+        let owners = PlanOwners::new(
+            pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap(),
+            &before_ids,
+            &ids,
+        );
+        for same_source in [true, false] {
+            let origins = [
+                Origin::SplitPart(0),
+                Origin::Whole(1),
+                Origin::SplitPart(if same_source { 0 } else { 2 }),
+            ];
+            let edges = super::graph::constraints(
+                &changes,
+                &origins,
+                &owners,
+                std::slice::from_ref(&observation),
+                crate::Side {
+                    schema: &base,
+                    ids: &before_ids,
+                },
+                crate::Side {
+                    schema: &desired,
+                    ids: &ids,
+                },
+            );
+            assert!(edges.iter().any(|e| e.before == 1 && e.after == 2));
+            assert_eq!(
+                edges.iter().any(|e| e.before == 1 && e.after == 0),
+                !(placeholder && same_source)
+            );
+        }
+    }
 }

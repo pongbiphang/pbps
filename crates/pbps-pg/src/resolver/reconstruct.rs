@@ -64,9 +64,9 @@ pub enum ReconstructError {
     Cycle(String),
 }
 
-/// A table whose generated columns may call a declared function. Its
-/// `CREATE TABLE` must follow that function, and a generated column cannot be
-/// split out without changing the column order (DEC-1364.1).
+/// An unsplittable table whose generation still calls a declared function
+/// after the shared expansion (DEC-1503.1): a suffix partition key or a read
+/// of a later column, without a known expression-replacement capability.
 struct Late {
     table: pbps_model::TableName,
     steps: std::ops::Range<usize>,
@@ -124,6 +124,8 @@ pub type Named = (Nameable, String, String);
 #[derive(Debug, Clone)]
 struct Step {
     phase: Phase,
+    operation: usize,
+    table_part: Option<pbps_model::TableName>,
     /// What an error names: the declaration, never the statement text.
     declaration: String,
     statements: Vec<String>,
@@ -159,13 +161,115 @@ pub struct Reconstruction {
 impl Reconstruction {
     /// `bootstrap` is the plan from an empty schema to the desired one, as
     /// the differ produces it; its order among modules is kept.
-    pub fn new(dialect: &crate::Postgres, bootstrap: &[Change]) -> Result<Self, ReconstructError> {
+    pub fn new(
+        dialect: &crate::Postgres,
+        bootstrap: &[Change],
+        ids: &pbps_model::IdsFile,
+    ) -> Result<Self, ReconstructError> {
+        Self::with_dependencies(dialect, bootstrap, ids, &pbps_model::ModuleDeps::new())
+    }
+
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn with_dependencies(
+        dialect: &crate::Postgres,
+        bootstrap: &[Change],
+        ids: &pbps_model::IdsFile,
+        dependencies: &pbps_model::ModuleDeps,
+    ) -> Result<Self, ReconstructError> {
+        let mut declared = pbps_model::Schema::default();
+        for change in bootstrap {
+            match change {
+                Change::CreateTable { name, table, .. } => {
+                    declared.tables.insert(name.clone(), (**table).clone());
+                }
+                Change::CreateModule { id, module } => {
+                    declared.modules.insert(id.clone(), (**module).clone());
+                }
+                _ => {}
+            }
+        }
+        let mut expanded = pbps_model::ChangeSet {
+            changes: bootstrap
+                .iter()
+                .cloned()
+                .map(pbps_model::PlannedChange::new)
+                .collect(),
+        };
+        pbps_diff::order::generated::expand(&mut expanded, ids, dependencies, dialect)
+            .map_err(ReconstructError::Cycle)?;
+        pbps_diff::order::generated::settle(&mut expanded, &declared, dependencies, dialect)
+            .map_err(ReconstructError::Cycle)?;
+        let edges =
+            pbps_diff::order::generated::constraints(&expanded, &declared, dependencies, dialect);
         let mut steps = Vec::new();
         let mut late = Vec::new();
         let mut functions: Vec<(usize, String)> = Vec::new();
         let mut foreign = BTreeSet::new();
-        for change in bootstrap {
+        for (operation, planned) in expanded.changes.iter().enumerate() {
+            let change = &planned.change;
+            let first_step = steps.len();
             match change {
+                Change::AddColumn {
+                    table,
+                    name,
+                    column,
+                    ..
+                } => {
+                    let mut added = step(
+                        dialect,
+                        Phase::Modules,
+                        &format!("column {}", table.column(name).shown()),
+                        change,
+                        Vec::new(),
+                        None,
+                    )?;
+                    if matches!(column.value_source, ValueSource::Generated(_)) {
+                        added.generated.push(name.clone());
+                    }
+                    added.table_part = Some(table.clone());
+                    steps.push(added);
+                }
+                Change::AlterColumnExpression { column, .. } => {
+                    let mut installed = step(
+                        dialect,
+                        Phase::Modules,
+                        &format!("generation of {}", column.shown()),
+                        change,
+                        Vec::new(),
+                        None,
+                    )?;
+                    installed.generated.push(column.name.clone());
+                    installed.table_part = Some(column.table.clone());
+                    steps.push(installed);
+                }
+                Change::AddIndex { table, name, .. }
+                    if pbps_diff::order::generated::is_part(planned) =>
+                {
+                    steps.push(step(
+                        dialect,
+                        Phase::Modules,
+                        &format!("index {name} on {}", table.shown()),
+                        change,
+                        vec![(Nameable::Index, table.schema.clone(), name.clone())],
+                        None,
+                    )?);
+                }
+                Change::SetPrimaryKey { .. }
+                | Change::AddUnique { .. }
+                | Change::AddCheck { .. }
+                | Change::SetReplicaIdentity { .. }
+                | Change::AlterColumnDefault { .. }
+                    if pbps_diff::order::generated::is_part(planned) =>
+                {
+                    steps.push(step(
+                        dialect,
+                        Phase::Modules,
+                        &change.subject(),
+                        change,
+                        Vec::new(),
+                        None,
+                    )?);
+                }
                 // A bootstrap starts from nothing, so no partition is made
                 // beside a standing DEFAULT (#1547).
                 Change::CreateTable {
@@ -224,10 +328,19 @@ impl Reconstruction {
                         }
                     }
                     let declaration = format!("table {name}", name = name.shown());
+                    // Binding checks belong to the real expression's step,
+                    // never to a temporary typed-NULL placeholder.
                     let generated_columns: Vec<pbps_model::ColumnName> = bare
                         .columns
                         .iter()
-                        .filter(|(_, spec)| matches!(spec.value_source, ValueSource::Generated(_)))
+                        .filter(|(column, spec)| {
+                            matches!(spec.value_source, ValueSource::Generated(_))
+                                && !expanded.changes.iter().any(|p| {
+                                    matches!(&p.change,
+                                    Change::AlterColumnExpression { column: installed, .. }
+                                        if installed == &name.column(*column))
+                                })
+                        })
                         .map(|(column, _)| column.clone())
                         .collect();
                     steps.push(step(
@@ -405,13 +518,11 @@ impl Reconstruction {
                 | Change::DetachPartition { .. }
                 | Change::AttachPartition { .. }
                 | Change::RenameTable { .. }
-                | Change::AddColumn { .. }
                 | Change::DropColumn { .. }
                 | Change::RenameColumn { .. }
                 | Change::AlterColumnType { .. }
                 | Change::AlterColumnNullability { .. }
                 | Change::AlterColumnDefault { .. }
-                | Change::AlterColumnExpression { .. }
                 | Change::AlterColumnNumbering { .. }
                 | Change::SetColumnDeprecated { .. }
                 | Change::SetPrimaryKey { .. }
@@ -445,11 +556,47 @@ impl Reconstruction {
                     ));
                 }
             }
+            for made in &mut steps[first_step..] {
+                made.operation = operation;
+                if pbps_diff::order::generated::is_part(planned)
+                    && !matches!(change, Change::CreateTable { .. })
+                {
+                    made.phase = Phase::Modules;
+                }
+            }
         }
         let mut steps = after_their_functions(steps, late, &functions, &foreign)?;
         // Stable: within a phase the differ's order stands, which for modules
         // is its dependency order.
         steps.sort_by_key(|step| step.phase);
+        let mut schedule = pbps_diff::order::Schedule::new(steps.len());
+        for edge in edges {
+            let before = steps.iter().rposition(|s| s.operation == edge.before);
+            let after = steps.iter().position(|s| s.operation == edge.after);
+            if let (Some(before), Some(after)) = (before, after) {
+                schedule.edge(before, after, edge.source, edge.reason);
+            }
+        }
+        // The scheduler owns the permutation; scratch only applies it to its
+        // lowering metadata, before #1778 chooses any transaction boundary.
+        let order_plan = pbps_model::ChangeSet {
+            changes: steps
+                .iter()
+                .map(|s| {
+                    pbps_model::PlannedChange::new(expanded.changes[s.operation].change.clone())
+                })
+                .collect(),
+        };
+        let settled = schedule
+            .settle(order_plan.clone())
+            .map_err(|e| ReconstructError::Cycle(e.describe(&order_plan)))?;
+        let mut taken: Vec<_> = steps.into_iter().map(Some).collect();
+        let steps = settled
+            .sequence
+            .iter()
+            .map(|&i| taken[i].take().expect("a settled order is a permutation"))
+            .collect();
+
         Ok(Self {
             steps,
             dropped: BTreeMap::new(),
@@ -520,10 +667,13 @@ impl Reconstruction {
                     .generated
                     .iter()
                     .any(|generated| generated.raw() == column)
-                && step
-                    .names
-                    .iter()
-                    .any(|(kind, s, n)| *kind == Nameable::Relation && s == schema && n == table)
+                && (step
+                    .table_part
+                    .as_ref()
+                    .is_some_and(|t| t.schema == schema && t.name == table)
+                    || step.names.iter().any(|(kind, s, n)| {
+                        *kind == Nameable::Relation && s == schema && n == table
+                    }))
         })?;
         Some(self.names_after(at))
     }
@@ -598,11 +748,23 @@ impl Reconstruction {
         relations
             .iter()
             .map(|(schema, name)| {
-                self.steps.iter().position(|step| {
+                let created = self.steps.iter().any(|step| {
                     step.names
                         .iter()
                         .any(|(kind, s, n)| *kind == Nameable::Relation && s == schema && n == name)
-                })
+                });
+                created
+                    .then(|| {
+                        self.steps.iter().rposition(|step| {
+                            step.table_part
+                                .as_ref()
+                                .is_some_and(|t| &t.schema == schema && &t.name == name)
+                                || step.names.iter().any(|(kind, s, n)| {
+                                    *kind == Nameable::Relation && s == schema && n == name
+                                })
+                        })
+                    })
+                    .flatten()
             })
             .try_fold(0, |last, position| Some(last.max(position? + 1)))
     }
@@ -837,8 +999,8 @@ async fn routines(
 /// What creating a table or view makes nameable before it compiles: the
 /// relation with its row type, which always has its name. Its array type is
 /// read back once it exists ([`array_type`]).
-/// Places each table whose generated column may call a declared function
-/// after that function, as the ordinary plan does (DEC-1364.1). The table
+/// Keeps the legacy whole-table hold for the unsplittable shapes left
+/// by the shared expansion, as the ordinary plan does (DEC-1503.1). The table
 /// and what it holds that runs before the modules join the modules phase
 /// after the last function its generation text names. A module ahead of it
 /// that names the table, or names something so moved, follows it; a foreign
@@ -915,11 +1077,21 @@ fn after_their_functions(
         let mut kept = Vec::new();
         let mut moved = Vec::new();
         for &at in &modules[..point] {
-            if held.iter().any(|name| names(at, name)) {
+            if held.iter().any(|name| {
+                if name == &table.table.name {
+                    steps[at]
+                        .statements
+                        .iter()
+                        .any(|sql| crate::generated::names_table(sql, &table.table))
+                } else {
+                    names(at, name)
+                }
+            }) {
                 if called.contains(&at) {
                     return Err(ReconstructError::Cycle(format!(
-                        "table {}",
-                        table.table.shown()
+                        "table {} ({})",
+                        table.table.shown(),
+                        steps[at].declaration
                     )));
                 }
                 held.extend(steps[at].names.iter().map(|(_, _, name)| name.clone()));
@@ -1015,6 +1187,8 @@ fn step(
         .collect();
     Ok(Step {
         phase,
+        operation: 0,
+        table_part: None,
         declaration: declaration.to_owned(),
         statements,
         names,
@@ -1022,6 +1196,41 @@ fn step(
         module,
         created: None,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::wildcard_enum_match_arm)]
+pub(crate) fn fixture_ids(bootstrap: &[Change]) -> pbps_model::IdsFile {
+    let mut schema = pbps_model::Schema::default();
+    for change in bootstrap {
+        match change {
+            Change::CreateTable { name, table, .. } => {
+                schema.tables.insert(name.clone(), (**table).clone());
+            }
+            Change::CreateModule { id, module } => {
+                schema.modules.insert(id.clone(), (**module).clone());
+            }
+            _ => {}
+        }
+    }
+    let mut ids = pbps_diff::resolve(
+        &schema,
+        &pbps_model::IdsFile::default(),
+        &[],
+        &pbps_diff::Context {
+            operator: "reconstruction-fixture".into(),
+            today: "2026-10-19".into(),
+        },
+    )
+    .unwrap()
+    .ids;
+    for change in bootstrap {
+        if let Change::CreateTable { uid, name, .. } = change {
+            ids.tables.retain(|_, n| n != name);
+            ids.tables.insert(uid.clone(), name.clone());
+        }
+    }
+    ids
 }
 
 #[cfg(test)]

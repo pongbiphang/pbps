@@ -173,7 +173,7 @@ async fn analyze_on(
             .map_err(|e| e.to_string())?;
         let pg = dialect(case.extras);
         let mut reconstruction =
-            Reconstruction::new(&pg, &bootstrap(&case.desired.schema, case.extras))
+            build_reconstruction(&pg, &bootstrap(&case.desired.schema, case.extras))
                 .map_err(|e| e.to_string())?;
         let desired_managed = Managed::from_schema(&case.desired.schema);
         let base_managed = Managed::from_schema(&case.base.schema);
@@ -425,10 +425,9 @@ async fn related_tables_compile_on_scratch_with_their_foreign_key() {
     }
 }
 
-/// A table whose generated column calls a declared function compiles on
-/// scratch after that function, as the ordinary plan creates it (DEC-1364.1),
-/// so even an unchanged schema reaches a verdict instead of failing to
-/// compile the table before its function exists.
+/// Scratch exposes a new table's prefix before the function its generated
+/// suffix calls, then compiles that suffix after the function (DEC-1503.1),
+/// so even an unchanged schema reaches a verdict.
 #[tokio::test]
 #[ignore = "needs PostgreSQL 18 and 16; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
 async fn a_table_generating_from_a_declared_function_compiles_on_scratch() {
@@ -2606,7 +2605,7 @@ async fn a_scratch_backend_terminated_mid_statement_is_no_compile_verdict() {
                     .unwrap();
             }
             let pg = dialect(&[]);
-            let mut reconstruction = Reconstruction::new(&pg, &bootstrap(&desired.schema, &[]))
+            let mut reconstruction = build_reconstruction(&pg, &bootstrap(&desired.schema, &[]))
                 .expect("a view is reconstructible");
             let mut scratch = databases.scratch(&name).await;
             let compiled = reconstruction
@@ -2654,7 +2653,7 @@ async fn the_scratch_compiles_in_the_targets_zone_or_not_at_all() {
         let desired = Declared::default().view("app.v", "SELECT '2026-02-01'::timestamptz AS at");
         let pg = dialect(&[]);
         let taipei = pbps_model::SessionZone::new("Asia/Taipei").unwrap();
-        let mut reconstruction = Reconstruction::new(&pg, &bootstrap(&desired.schema, &[]))
+        let mut reconstruction = build_reconstruction(&pg, &bootstrap(&desired.schema, &[]))
             .expect("a view is reconstructible");
         let mut scratch = databases.scratch(&name).await;
         let compiled = reconstruction.compile(&pg, &taipei, &mut scratch).await;
@@ -2671,7 +2670,7 @@ async fn the_scratch_compiles_in_the_targets_zone_or_not_at_all() {
         assert_eq!(at, Some(1), "{variable}: compiled in another zone");
 
         let unknown = pbps_model::SessionZone::new("Nowhere/Else").unwrap();
-        let mut reconstruction = Reconstruction::new(&pg, &bootstrap(&desired.schema, &[]))
+        let mut reconstruction = build_reconstruction(&pg, &bootstrap(&desired.schema, &[]))
             .expect("a view is reconstructible");
         let refused = reconstruction.compile(&pg, &unknown, &mut scratch).await;
         drop(scratch);
@@ -2842,4 +2841,15 @@ async fn an_unstaged_external_object_of_any_class_is_refused_by_name() {
             "{variable}: {conditions:?}"
         );
     }
+}
+
+fn build_reconstruction(
+    pg: &crate::Postgres,
+    changes: &[pbps_model::Change],
+) -> Result<Reconstruction, crate::resolver::reconstruct::ReconstructError> {
+    Reconstruction::new(
+        pg,
+        changes,
+        &crate::resolver::reconstruct::fixture_ids(changes),
+    )
 }

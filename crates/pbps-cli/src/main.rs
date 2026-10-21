@@ -3924,6 +3924,7 @@ pub(crate) fn validate_saved_plan(
         .context("the plan's post-apply identity mapping is inconsistent")?;
     public_execution_decisions_match_their_modules(&plan.changes, dialect)?;
 
+    let risks = pbps_diff::order::generated::risks(&plan.changes, &plan.ids, dialect);
     for (index, planned) in plan.changes.changes.iter().enumerate() {
         // A saved artifact need not have passed this build's differ. Refuse
         // every operation carrying a complete table shape (DEC-1172.1).
@@ -3943,8 +3944,8 @@ pub(crate) fn validate_saved_plan(
                 name.shown()
             );
         }
-        let expected = dialect.change_risks(&planned.change);
-        if planned.risks != expected {
+        let expected = &risks[index];
+        if &planned.risks != expected {
             let names = |risks: &std::collections::BTreeSet<pbps_model::RiskClass>| {
                 risks
                     .iter()
@@ -3958,7 +3959,7 @@ pub(crate) fn validate_saved_plan(
                  `pbps plan --db`.",
                 index + 1,
                 names(&planned.risks),
-                names(&expected)
+                names(expected)
             );
         }
     }
@@ -4641,6 +4642,182 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn saved_creation_part_risks_require_a_preceding_create_of_the_same_table() {
+        use pbps_model::{
+            Change, ChangeSet, IdsFile, PlanBaseline, PlanOrigin, PlannedChange, Provenance,
+            RiskClass, SavedPlan, Table, TableName,
+        };
+        let dialect = pbps_pg::Postgres::new().with_server_version(180_000);
+        let name = TableName::new("app", "t");
+        let table: Table = serde_json::from_str(
+            r#"{"columns":{"id":{"type":"integer","nullable":true},"g":{"type":"integer","nullable":true,"generated":{"expression":"NULL::integer","stored":true}}}}"#,
+        ).unwrap();
+        let create = PlannedChange::new(Change::CreateTable {
+            uid: "t_015030".parse().unwrap(),
+            name: name.clone(),
+            table: Box::new(table),
+            beside_default: None,
+            moves_at_most: None,
+        });
+        let mut expression = PlannedChange::new(Change::AlterColumnExpression {
+            uid: "c_015032".parse().unwrap(),
+            column: name.column("g"),
+            from: "NULL::integer".into(),
+            to: "id * 2".into(),
+        });
+        expression.risks.clear();
+        expression.provenance = Some(Provenance {
+            rule: pbps_diff::order::generated::RULE,
+            role: pbps_model::AddedRole::SplitPart,
+            source: "app.t".into(),
+            reason: "creation expression".into(),
+        });
+        let mut ids = IdsFile::default();
+        ids.tables.insert("t_015030".parse().unwrap(), name.clone());
+        ids.columns
+            .insert("c_015031".parse().unwrap(), name.column("id"));
+        ids.columns
+            .insert("c_015032".parse().unwrap(), name.column("g"));
+        let mut plan = SavedPlan::new(
+            PlanOrigin::Database,
+            dialect.name(),
+            "2026-10-19T00:00:00Z",
+            PlanBaseline {
+                time_zone: None,
+                description: "creation risk context".into(),
+                checksum: "a".repeat(64),
+                database_collation: None,
+            },
+            ChangeSet {
+                changes: vec![create, expression],
+            },
+            ids,
+        );
+        let encoded = serde_json::to_string(&plan).unwrap();
+        plan = serde_json::from_str(&encoded).unwrap();
+        validate_saved_plan(&plan, &dialect)
+            .expect("the typed CREATE proves the empty-table context");
+        plan.changes.changes[1].risks.insert(RiskClass::Narrowing);
+        assert!(
+            validate_saved_plan(&plan, &dialect)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent risks")
+        );
+        plan.changes.changes[1].risks.clear();
+        let write = PlannedChange::new(Change::InsertRow {
+            table: name.clone(),
+            key_column: "id".into(),
+            identity_key: false,
+            key: "1".into(),
+            row: pbps_model::Row::default(),
+            defaults: Default::default(),
+            types: Default::default(),
+        });
+        let mut reordered = plan.clone();
+        reordered.changes.changes.insert(1, write.clone());
+        assert!(
+            validate_saved_plan(&reordered, &dialect)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent risks")
+        );
+        reordered.changes.changes[2]
+            .risks
+            .insert(RiskClass::Narrowing);
+        validate_saved_plan(&reordered, &dialect)
+            .expect("a row before installation retains narrowing");
+        let mut safe_rows = plan.clone();
+        safe_rows.changes.changes.push(write);
+        validate_saved_plan(&safe_rows, &dialect)
+            .expect("rows after installation retain creation context");
+        let mut attached = plan.clone();
+        let child = TableName::new("app", "child");
+        let child_uid = "t_015036".parse().unwrap();
+        attached.ids.tables.insert(child_uid, child.clone());
+        let attach = PlannedChange::new(Change::AttachPartition {
+            uid: attached.ids.table_uid(&child).unwrap().clone(),
+            table: child,
+            parent: name.clone(),
+            bound: pbps_model::PartitionBound::Default,
+            key: vec!["id".into()],
+            shape: Box::new(Table::default()),
+        });
+        attached.changes.changes.insert(1, attach.clone());
+        let encoded = serde_json::to_vec(&attached).unwrap();
+        attached = serde_json::from_slice(&encoded).unwrap();
+        assert!(
+            validate_saved_plan(&attached, &dialect)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent risks"),
+            "attached standing rows retain narrowing"
+        );
+        attached.changes.changes[2]
+            .risks
+            .insert(RiskClass::Narrowing);
+        validate_saved_plan(&attached, &dialect)
+            .expect("attachment before installation retains narrowing");
+        attached.changes.changes.remove(1);
+        attached.changes.changes[1].risks.clear();
+        attached.changes.changes.push(attach);
+        validate_saved_plan(&attached, &dialect)
+            .expect("attachment after installation preserves empty creation");
+        let mut different = plan.clone();
+        let other = TableName::new("app", "other");
+        if let Change::CreateTable { uid, name, .. } = &mut different.changes.changes[0].change {
+            *uid = "t_015033".parse().unwrap();
+            *name = other.clone();
+        }
+        different
+            .ids
+            .tables
+            .insert("t_015033".parse().unwrap(), other.clone());
+        different
+            .ids
+            .columns
+            .insert("c_015034".parse().unwrap(), other.column("id"));
+        different
+            .ids
+            .columns
+            .insert("c_015035".parse().unwrap(), other.column("g"));
+        assert!(
+            validate_saved_plan(&different, &dialect)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent risks"),
+            "an unrelated CREATE proves nothing about a standing table"
+        );
+        let mut filled = plan.clone();
+        if let Change::CreateTable { beside_default, .. } = &mut filled.changes.changes[0].change {
+            *beside_default = Some(TableName::new("app", "old_default"));
+        }
+        assert!(
+            validate_saved_plan(&filled, &dialect)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent risks"),
+            "a CREATE that moves standing rows cannot prove an empty table"
+        );
+        plan.changes.changes.remove(0);
+        plan.changes.changes[0].provenance = Some(Provenance {
+            rule: pbps_diff::order::generated::RULE,
+            role: pbps_model::AddedRole::SplitPart,
+            source: "app.t".into(),
+            reason: "forged creation context".into(),
+        });
+        assert!(
+            validate_saved_plan(&plan, &dialect)
+                .unwrap_err()
+                .to_string()
+                .contains("inconsistent risks"),
+            "forged provenance cannot remove a standing expression's narrowing risk"
+        );
+        plan.changes.changes[0].risks.insert(RiskClass::Narrowing);
+        validate_saved_plan(&plan, &dialect).expect("a standing expression retains narrowing");
     }
 
     #[test]

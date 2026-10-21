@@ -105,7 +105,7 @@ fn bootstrap() -> Vec<Change> {
 /// reproduced.
 #[test]
 fn expressions_wait_for_every_module_and_modules_keep_the_differs_order() {
-    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap()).unwrap();
+    let reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap()).unwrap();
     let phases: Vec<_> = reconstruction
         .steps
         .iter()
@@ -150,7 +150,7 @@ fn expressions_wait_for_every_module_and_modules_keep_the_differs_order() {
 /// has none.
 #[test]
 fn later_names_are_what_became_nameable_after_the_module() {
-    let mut reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap()).unwrap();
+    let mut reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap()).unwrap();
     let routine = |argument: &str| ObjectIdentity {
         class: "pg_proc".into(),
         name: vec!["app".into(), "f".into()],
@@ -272,7 +272,7 @@ fn a_split_foreign_key_follows_every_table() {
             "() RETURNS integer LANGUAGE sql RETURN 1",
         ),
     ];
-    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap).unwrap();
     let phases: Vec<_> = reconstruction
         .steps
         .iter()
@@ -295,15 +295,13 @@ fn a_split_foreign_key_follows_every_table() {
     );
 }
 
-/// A table whose generated column calls a declared function cannot have
-/// the column split out without changing its column order, so the table
-/// follows the function on scratch, as in the ordinary plan (DEC-1364.1):
-/// its plain index with it, a view naming it after it, and a foreign key
-/// naming it once every module exists. A table generating from nothing
-/// declared keeps its place, and a function that needs the table it is
-/// called from is refused by name.
+/// Scratch creates the prefix and its plain index before the generation's
+/// function, then adds the generated suffix (DEC-1503.1). Readers and foreign
+/// keys wait for the columns they may need. A table generating from nothing
+/// declared keeps its place; a generation function needing the whole table
+/// closes a named cycle.
 #[test]
-fn a_table_generating_from_a_declared_function_compiles_after_it() {
+fn generated_columns_and_readers_follow_functions_but_relation_names_precede_them() {
     use pbps_model::{Column, ForeignKey, Generated, Index, IndexColumn, IndexKey, Module, Schema};
     let generated = |expression: &str| {
         let mut column = Column::new("integer".parse().unwrap());
@@ -421,7 +419,7 @@ fn a_table_generating_from_a_declared_function_compiles_after_it() {
         .collect::<Vec<_>>()
     };
     let reconstruction =
-        Reconstruction::new(&crate::Postgres::new(), &bootstrap(&schema(false))).unwrap();
+        build_reconstruction(&crate::Postgres::new(), &bootstrap(&schema(false))).unwrap();
     let order: Vec<_> = reconstruction
         .steps
         .iter()
@@ -434,7 +432,8 @@ fn a_table_generating_from_a_declared_function_compiles_after_it() {
             .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
     };
     assert!(
-        at("function app.f(integer)") < at("table app.n"),
+        at("table app.n") < at("function app.f(integer)")
+            && at("function app.f(integer)") < at("column app.n.g"),
         "{order:?}"
     );
     assert!(at("table app.n") < at("index n_ix on app.n"), "{order:?}");
@@ -445,18 +444,18 @@ fn a_table_generating_from_a_declared_function_compiles_after_it() {
         .rposition(|(_, d)| *d == "table app.plain")
         .unwrap();
     assert!(
-        at("view app.v") < key,
-        "the key waits for every module: {order:?}"
+        at("column app.n.g") < key,
+        "the key waits for the target's columns: {order:?}"
     );
-    assert_eq!(order[key].0, Phase::Modules, "{order:?}");
+
     assert_eq!(
         order[at("table app.plain")],
         (Phase::Tables, "table app.plain")
     );
-    assert_eq!(
-        Reconstruction::new(&crate::Postgres::new(), &bootstrap(&schema(true))).unwrap_err(),
-        ReconstructError::Cycle("table app.n".into())
-    );
+    let why = build_reconstruction(&crate::Postgres::new(), &bootstrap(&schema(true)))
+        .unwrap_err()
+        .to_string();
+    assert!(why.contains("app.n") && why.contains("app.f"), "{why}");
 }
 
 /// A partition's own default is set on scratch in its own step after its
@@ -544,7 +543,7 @@ fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
     .into_iter()
     .map(|planned| planned.change)
     .collect();
-    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap).unwrap();
     let order: Vec<_> = reconstruction
         .steps
         .iter()
@@ -577,7 +576,7 @@ fn a_partitions_own_default_is_set_after_its_parents_and_its_functions() {
 /// namespace from one would reproduce neither side.
 #[test]
 fn a_change_no_bootstrap_contains_is_refused_by_kind() {
-    let refused = Reconstruction::new(
+    let refused = build_reconstruction(
         &crate::Postgres::new(),
         &[Change::DropTable {
             uid: Uid::generate(UidKind::Table),
@@ -622,7 +621,7 @@ fn an_index_replica_identity_is_set_after_its_index() {
         beside_default: None,
         moves_at_most: None,
     }];
-    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap).unwrap();
     let phases: Vec<_> = reconstruction
         .steps
         .iter()
@@ -642,13 +641,12 @@ fn an_index_replica_identity_is_set_after_its_index() {
     assert!(last.contains("REPLICA IDENTITY USING INDEX"), "{last}");
 }
 
-/// Two tables held behind different functions keep the order between them:
-/// `app.b` calls the earlier function and another of its generated columns
-/// names `app.a` in an OID-alias literal, resolved as the table is created
-/// (measured on 18), while `app.a` waits for the later function. Placing
-/// `app.b` after its own function alone would create it before `app.a`.
+/// Two tables calling different functions expose their prefixes before
+/// either function (DEC-1503.1). A generated suffix of `app.b` can therefore
+/// name `app.a` in an OID-alias literal even though `app.a`'s own generation
+/// calls the later function.
 #[test]
-fn a_held_table_naming_another_held_table_follows_it() {
+fn split_generated_tables_expose_names_before_either_function() {
     use pbps_model::{Column, Generated, Module, Schema};
     let generated = |expression: &str| {
         let mut column = Column::new("integer".parse().unwrap());
@@ -711,7 +709,7 @@ fn a_held_table_naming_another_held_table_follows_it() {
     .into_iter()
     .map(|planned| planned.change)
     .collect();
-    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &changes).unwrap();
+    let reconstruction = build_reconstruction(&crate::Postgres::new(), &changes).unwrap();
     let order: Vec<_> = reconstruction
         .steps
         .iter()
@@ -724,11 +722,13 @@ fn a_held_table_naming_another_held_table_follows_it() {
             .unwrap_or_else(|| panic!("{declaration} missing from {order:?}"))
     };
     assert!(
-        at("function app.f1(integer)") < at("table app.b"),
+        at("table app.b") < at("function app.f1(integer)")
+            && at("function app.f1(integer)") < at("column app.b.g"),
         "{order:?}"
     );
     assert!(
-        at("function app.f2(integer)") < at("table app.a"),
+        at("table app.a") < at("function app.f2(integer)")
+            && at("function app.f2(integer)") < at("column app.a.g"),
         "{order:?}"
     );
     assert!(at("table app.a") < at("table app.b"), "{order:?}");
@@ -771,9 +771,9 @@ fn a_compile_failure_is_a_verdict_only_when_the_server_judged_the_statement() {
     )));
 }
 
-/// A fill's chained shapes go just after the step that creates the last
-/// managed relation they name, which for a table generating from a declared
-/// function is among the modules, after that function (#1778).
+/// A fill's chained shapes wait for the last managed relation's complete
+/// column shape. A split table exposes its prefix before the function and
+/// finishes its generated suffix after it (DEC-1503.1, #1778).
 #[test]
 fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
     use pbps_model::{Column, Generated, Module, Schema};
@@ -830,7 +830,7 @@ fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
     .into_iter()
     .map(|planned| planned.change)
     .collect();
-    let reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
+    let reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap).unwrap();
     let at = |declaration: &str| {
         reconstruction
             .steps
@@ -844,14 +844,15 @@ fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
             .map(|(schema, name)| ((*schema).to_owned(), (*name).to_owned()))
             .collect::<BTreeSet<_>>()
     };
-    assert!(at("function app.f(integer)") < at("table app.n"));
+    assert!(at("table app.n") < at("function app.f(integer)"));
+    assert!(at("function app.f(integer)") < at("column app.n.g"));
     assert_eq!(
         reconstruction.after_creating(&named(&[("app", "n")])),
-        Some(at("table app.n") + 1)
+        Some(at("column app.n.g") + 1)
     );
     assert_eq!(
         reconstruction.after_creating(&named(&[("app", "plain"), ("app", "n")])),
-        Some(at("table app.n") + 1),
+        Some(at("column app.n.g") + 1),
         "the last of them"
     );
     assert_eq!(
@@ -870,7 +871,7 @@ fn chained_shapes_wait_for_the_step_that_creates_what_they_name() {
 /// (#1778).
 #[test]
 fn names_created_between_steps_are_later_only_for_modules_before_them() {
-    let mut reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap()).unwrap();
+    let mut reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap()).unwrap();
     let view = ObjectIdentity {
         class: "pg_class".into(),
         name: vec!["app".into(), "v".into()],
@@ -895,11 +896,11 @@ fn names_created_between_steps_are_later_only_for_modules_before_them() {
     assert!(later(&reconstruction), "created after the view compiled");
 }
 
-/// A generated column's expression compiles in its table's step, so what
-/// came after that step is later for it; a plain column, or a table no
-/// step creates, has no such step (#1778).
+/// A generated expression's own installation step decides which names
+/// arrived later, including when ADD COLUMN follows the prefix CREATE
+/// (DEC-1503.1, #1778). A plain column or absent table has no such step.
 #[test]
-fn a_generated_columns_later_names_follow_its_tables_step() {
+fn a_generated_columns_later_names_follow_its_expression_step() {
     use pbps_model::{Column, Generated, Module, Schema};
     let mut generated = Column::new("integer".parse().unwrap());
     generated.value_source = pbps_model::ValueSource::Generated(Generated {
@@ -962,13 +963,13 @@ fn a_generated_columns_later_names_follow_its_tables_step() {
     .into_iter()
     .map(|planned| planned.change)
     .collect();
-    let mut reconstruction = Reconstruction::new(&crate::Postgres::new(), &bootstrap).unwrap();
-    let table = reconstruction
+    let mut reconstruction = build_reconstruction(&crate::Postgres::new(), &bootstrap).unwrap();
+    let expression = reconstruction
         .steps
         .iter()
-        .position(|step| step.declaration == "table app.n")
+        .position(|step| step.declaration == "column app.n.g")
         .unwrap();
-    let later: Vec<_> = reconstruction.steps[table + 1..]
+    let later: Vec<_> = reconstruction.steps[expression + 1..]
         .iter()
         .flat_map(|step| step.names.clone())
         .collect();
@@ -991,12 +992,163 @@ fn a_generated_columns_later_names_follow_its_tables_step() {
             .later_names_generated("app", "x", "g")
             .is_none()
     );
-    reconstruction.created_before(table + 1, vec![(Nameable::Type, "ext".into(), "d".into())]);
+    reconstruction.created_before(
+        expression + 1,
+        vec![(Nameable::Type, "ext".into(), "d".into())],
+    );
     assert!(
         reconstruction
             .later_names_generated("app", "n", "g")
             .unwrap()
             .contains(&(Nameable::Type, "ext", "d")),
-        "a fill after the table"
+        "a fill after the expression"
     );
+}
+
+fn build_reconstruction(
+    pg: &crate::Postgres,
+    changes: &[pbps_model::Change],
+) -> Result<Reconstruction, crate::resolver::reconstruct::ReconstructError> {
+    Reconstruction::new(
+        pg,
+        changes,
+        &crate::resolver::reconstruct::fixture_ids(changes),
+    )
+}
+
+#[test]
+fn placeholder_bindings_are_measured_at_the_real_expression_and_fill_uses_the_complete_shape() {
+    let mut column = Column::new("integer".parse().unwrap());
+    column.value_source = ValueSource::Generated(pbps_model::Generated {
+        expression: "app.f(z)".into(),
+        stored: true,
+    });
+    let mut table = Table::default();
+    table.columns.insert("g".into(), column);
+    table
+        .columns
+        .insert("z".into(), Column::new("integer".parse().unwrap()));
+    let changes = vec![
+        Change::CreateTable {
+            uid: Uid::generate(UidKind::Table),
+            name: TableName::new("app", "a"),
+            table: Box::new(table),
+            beside_default: None,
+            moves_at_most: None,
+        },
+        module(
+            "app.f(integer)",
+            ModuleKind::Function,
+            "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1",
+        ),
+    ];
+    let pg = crate::Postgres::new().with_server_version(180_000);
+    let reconstruction = build_reconstruction(&pg, &changes).unwrap();
+    let expression = reconstruction
+        .steps
+        .iter()
+        .position(|s| s.declaration == "generation of app.a.g")
+        .unwrap();
+    assert_eq!(
+        reconstruction
+            .steps
+            .iter()
+            .filter(|s| s.generated.contains(&"g".into()))
+            .count(),
+        1
+    );
+    assert!(
+        reconstruction
+            .later_names_generated("app", "a", "g")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reconstruction.after_creating(&[("app".into(), "a".into())].into()),
+        Some(expression + 1)
+    );
+    // With unknown capabilities the old whole-table hold still owns the
+    // generated binding; no placeholder or SET EXPRESSION is emitted.
+    let unknown = build_reconstruction(&crate::Postgres::new(), &changes).unwrap();
+    assert!(
+        !unknown
+            .steps
+            .iter()
+            .any(|s| s.declaration == "generation of app.a.g")
+    );
+}
+
+#[test]
+fn scratch_transitive_readers_share_lexical_and_declared_dependency_closures() {
+    let mut table = Table::default();
+    table
+        .columns
+        .insert("id".into(), Column::new("integer".parse().unwrap()));
+    let mut column = Column::new("integer".parse().unwrap());
+    column.value_source = ValueSource::Generated(pbps_model::Generated {
+        expression: "app.f(id)".into(),
+        stored: true,
+    });
+    table.columns.insert("g".into(), column);
+    table
+        .columns
+        .insert("z".into(), Column::new("integer".parse().unwrap()));
+    for declared in [false, true] {
+        let changes = vec![
+            Change::CreateTable {
+                uid: Uid::generate(UidKind::Table),
+                name: TableName::new("app", "a"),
+                table: Box::new(table.clone()),
+                beside_default: None,
+                moves_at_most: None,
+            },
+            module(
+                "app.g(integer)",
+                ModuleKind::Function,
+                "(integer) RETURNS integer LANGUAGE sql IMMUTABLE BEGIN ATOMIC SELECT z FROM app.a LIMIT 1; SELECT $1 * 2; END",
+            ),
+            module(
+                "app.f(integer)",
+                ModuleKind::Function,
+                if declared {
+                    "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN $1 * 2"
+                } else {
+                    "(integer) RETURNS integer LANGUAGE sql IMMUTABLE RETURN app.g($1)"
+                },
+            ),
+        ];
+        let deps = if declared {
+            [(
+                "app.f(integer)".parse().unwrap(),
+                ["app.g(integer)".parse().unwrap()].into(),
+            )]
+            .into()
+        } else {
+            Default::default()
+        };
+        let ids = crate::resolver::reconstruct::fixture_ids(&changes);
+        let pg = crate::Postgres::new().with_server_version(180_000);
+        let reconstruction = Reconstruction::with_dependencies(&pg, &changes, &ids, &deps).unwrap();
+        let sql = reconstruction
+            .steps
+            .iter()
+            .flat_map(|s| &s.statements)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains("SET EXPRESSION"), "{sql}");
+        // An unrelated reader does not make the generation's callee a reader.
+        if declared {
+            let reconstruction =
+                Reconstruction::with_dependencies(&pg, &changes, &ids, &Default::default())
+                    .unwrap();
+            assert!(
+                reconstruction
+                    .steps
+                    .iter()
+                    .flat_map(|s| &s.statements)
+                    .all(|sql| !sql.contains("SET EXPRESSION"))
+            );
+        }
+    }
 }

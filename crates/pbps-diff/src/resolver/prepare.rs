@@ -206,6 +206,36 @@ pub(super) fn changes(
     let names = ids.index();
     let mut changes: Vec<(Origin, PlannedChange)> = Vec::new();
     for (position, planned) in ordinary.changes.iter().enumerate() {
+        if let Some(parts) = crate::order::generated::parts(
+            planned,
+            ids,
+            &ordinary.changes,
+            &hints.module_deps,
+            dialect,
+        )
+        .map_err(Error::Names)?
+        {
+            // Lower the same typed parts before the resolver's ordinary
+            // expression splits, retaining their one logical source.
+            let split = self::changes(
+                &ChangeSet { changes: parts },
+                base,
+                desired,
+                ids,
+                before_ids,
+                &BTreeSet::new(),
+                hints,
+                dialect,
+            )?;
+            changes.extend(
+                split
+                    .changes
+                    .changes
+                    .into_iter()
+                    .map(|part| (Origin::SplitPart(position), part)),
+            );
+            continue;
+        }
         let expanded = match &planned.change {
             Change::CreateTable {
                 uid,
@@ -604,10 +634,14 @@ pub(super) fn changes(
     let mut all: Vec<(Origin, PlannedChange)> = changes.into_iter().chain(added).collect();
     pbps_model::change::drop_parameter_changes_of_rebuilt_indexes(&mut all, |(_, p)| &p.change);
     let (origins, changes) = all.into_iter().unzip();
-    Ok(Prepared {
-        changes: ChangeSet { changes },
-        origins,
-    })
+    let mut changes = ChangeSet { changes };
+    // Preparation may split a creation part again. Derive its risks from
+    // the complete typed context, as saved-plan validation does.
+    let risks = crate::order::generated::risks(&changes, ids, dialect);
+    for (part, risks) in changes.changes.iter_mut().zip(risks) {
+        part.risks = risks;
+    }
+    Ok(Prepared { changes, origins })
 }
 
 /// A column's default, where its value comes from one: not an identity's,
