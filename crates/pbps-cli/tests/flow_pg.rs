@@ -31069,7 +31069,7 @@ fn row_security_created_policies_follow_routines_and_converge_after_apply_and_bo
         succeeds(d.run(&["bootstrap", "--db", connection]));
         declare_function(&d, "visible", "SELECT x");
         let path = d.dir.join("schema/app.docs.yml");
-        let declaration = "table: app.docs\ncolumns:\n  id: {type: integer, nullable: false}\n  extra: {type: integer}\nprimary_key: [id]\nchecks: {tenant_rows: 'id > 0'}\nrow_security: {enabled: true, forced: true}\nrow_policies:\n  tenant_rows:\n    using: 'app.visible(id) > 0'\n";
+        let declaration = "table: app.docs\ncolumns:\n  id: {type: integer, nullable: false}\n  extra: {type: integer, generated: {expression: 'app.visible(id)', stored: true}}\nprimary_key: [id]\nchecks: {tenant_rows: 'id > 0'}\nrow_security: {enabled: true, forced: true}\nrow_policies:\n  tenant_rows:\n    using: 'app.visible(id) > 0 AND extra > 0'\n";
         std::fs::write(&path, declaration).unwrap();
         let plan = connected_artifact(&d, connection, false);
         let saved: pbps_model::SavedPlan =
@@ -31085,6 +31085,11 @@ fn row_security_created_policies_follow_routines_and_converge_after_apply_and_bo
         assert!(
             at(|c| matches!(c, pbps_model::Change::CreateModule { .. }))
                 < at(|c| matches!(c, pbps_model::Change::CreatePolicy { .. }))
+        );
+        assert!(
+            at(
+                |c| matches!(c, pbps_model::Change::AddColumn { name, .. } if name.raw() == "extra")
+            ) < at(|c| matches!(c, pbps_model::Change::CreatePolicy { .. }))
         );
         assert!(
             at(|c| matches!(c, pbps_model::Change::CreatePolicy { .. }))

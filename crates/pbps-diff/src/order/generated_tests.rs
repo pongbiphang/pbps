@@ -614,6 +614,36 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         None,
     );
 
+    pin(
+        Change::CreatePolicy {
+            table: table.clone(),
+            name: "visible".into(),
+            policy: RowPolicy {
+                using: Some("id > 0".into()),
+                ..Default::default()
+            },
+            origin: RowSecurityOrigin::Created,
+        },
+        vec![&table],
+        vec![],
+        None,
+    );
+    pin(
+        Change::SetRowSecurity {
+            uid,
+            table: table.clone(),
+            from: RowSecurity::default(),
+            to: RowSecurity {
+                enabled: true,
+                forced: true,
+            },
+            origin: RowSecurityOrigin::Created,
+        },
+        vec![&table],
+        vec![],
+        None,
+    );
+
     // A missing pin must fail even if a new variant was classified to compile.
     let source = include_str!("../../../pbps-model/src/change.rs");
     let variants = source
@@ -636,4 +666,82 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
         variants,
         "each Change kind needs a classification pin"
     );
+}
+
+#[test]
+fn policy_setup_waits_for_complete_generated_columns_without_invalidating_emptiness() {
+    let table = TableName::new("app", "a");
+    let uid: Uid = "t_011720".parse().unwrap();
+    let column = Column::new("integer".parse().unwrap());
+    let mut full = Table::default();
+    full.columns.insert("id".into(), column.clone());
+    let mut generated = column;
+    generated.value_source = ValueSource::Generated(Generated {
+        expression: "id * 2".into(),
+        stored: true,
+    });
+    full.columns.insert("g".into(), generated.clone());
+    let declared = Schema {
+        tables: [(table.clone(), full.clone())].into(),
+        ..Default::default()
+    };
+    full.columns.shift_remove(&ColumnName::from("g"));
+    let part = |change| {
+        let mut p = PlannedChange::new(change);
+        p.provenance = Some(Provenance {
+            rule: super::RULE,
+            role: AddedRole::SplitPart,
+            source: "app.a".into(),
+            reason: "generated suffix".into(),
+        });
+        p
+    };
+    let policy = |owner| {
+        PlannedChange::new(Change::CreatePolicy {
+            table: owner,
+            name: "visible".into(),
+            policy: RowPolicy {
+                using: Some("g > 0".into()),
+                with_check: Some("g < 10".into()),
+                ..Default::default()
+            },
+            origin: RowSecurityOrigin::Created,
+        })
+    };
+    let cs = ChangeSet {
+        changes: vec![
+            part(Change::CreateTable {
+                uid: uid.clone(),
+                name: table.clone(),
+                table: Box::new(full),
+                beside_default: None,
+                moves_at_most: None,
+            }),
+            policy(table.clone()),
+            PlannedChange::new(Change::SetRowSecurity {
+                uid,
+                table: table.clone(),
+                from: RowSecurity::default(),
+                to: RowSecurity {
+                    enabled: true,
+                    forced: true,
+                },
+                origin: RowSecurityOrigin::Created,
+            }),
+            policy(TableName::new("app", "other")),
+            part(Change::AddColumn {
+                uid: "c_011722".parse().unwrap(),
+                table,
+                name: "g".into(),
+                column: Box::new(generated),
+            }),
+        ],
+    };
+    let pg = pbps_dialect::MinimalDialect;
+    let constraints = super::constraints(&cs, &declared, &ModuleDeps::new(), &pg);
+    assert!(constraints.iter().any(|e| e.before == 4 && e.after == 1));
+    assert!(constraints.iter().any(|e| e.before == 4 && e.after == 2));
+    assert!(!constraints.iter().any(|e| e.before == 4 && e.after == 3));
+    assert_eq!(super::texts(&cs.changes[1].change), vec!["g > 0", "g < 10"]);
+    assert!(super::texts(&cs.changes[2].change).is_empty());
 }

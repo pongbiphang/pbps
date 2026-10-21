@@ -323,12 +323,6 @@ pub(crate) fn schedule(
         declared.module_deps,
     )
     .map_err(Refusal)?;
-    // The complete typed plan proves which additions finish a newly
-    // generated table, even if an older lowering added them separately.
-    let risks = pbps_diff::order::generated::risks(&cs, declared.sources.after, dialect);
-    for (part, risks) in cs.changes.iter_mut().zip(risks) {
-        part.risks = risks;
-    }
     let edges = pbps_diff::order::row_security::edges(cs.changes.iter().map(|p| &p.change));
     let releases = if dialect.name() == "postgres" {
         match facts.policy_dependents {
@@ -395,6 +389,12 @@ pub(crate) fn schedule(
                 ))
             })?
             .changes;
+    }
+    // The complete typed plan proves which additions finish a newly
+    // generated table, even if an older lowering added them separately.
+    let risks = pbps_diff::order::generated::risks(&cs, declared.sources.after, dialect);
+    for (part, risks) in cs.changes.iter_mut().zip(risks) {
+        part.risks = risks;
     }
     // The verifier runs on the order this entry point settles, in tests and
     // debug builds (#1954, DEC-1954.6). On a connected SQL Server plan the
@@ -526,6 +526,11 @@ fn policy_release_schedule(
         pbps_diff::order::Checks::ALL,
     );
     let mut schedule = pbps_diff::order::Schedule::of_graph(&graph, operations.as_slice());
+    for edge in
+        pbps_diff::order::generated::constraints(cs, declared.schema, declared.module_deps, dialect)
+    {
+        schedule.edge(edge.before, edge.after, edge.source, edge.reason);
+    }
     let slots = pbps_diff::order::slots::analyse(operations.as_slice(), &owners, before, dialect);
     if !slots.unowned.is_empty() || !slots.unlowered.is_empty() {
         return Err(Refusal(

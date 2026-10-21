@@ -7716,6 +7716,7 @@ prefix (DEC-1503.4).
 | `CreateModule`, `AlterModule` | Trigger's `on` table and tables/types named by the definition | No at installation; a trigger or routine body is installed, not invoked. Its execution belongs to the invoking row operation |
 | `DropModule` | No | No; dropping a trigger or routine does not execute it |
 | `SetReplicaIdentity`, `SetStorageParameters`, `SetTablePersistence`, `SetIndexStorageParameters` | No; existing object identities suffice | No; physical storage rewrites preserve an empty row set |
+| `CreatePolicy`, `SetRowSecurity` | Owner; policies bind complete columns before flags activate them | No; installing or activating policies does not introduce rows |
 | `SetDataMode`, `SetEnsureKeys` | No; recorded declaration metadata | No; their DML is represented separately |
 | `CreateRole`, `DropRole`, `RenameRole`, `Grant`, `Revoke`, `PublicExecution` | No; name/permission operations | No |
 
