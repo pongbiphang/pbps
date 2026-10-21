@@ -7690,3 +7690,47 @@ The live test executes connected and offline choices on PostgreSQL 16 and 18,
 keeps the whole-table fallback where SET EXPRESSION is unavailable, and on 18
 measures the populated attachment's recomputation with the required narrowing
 risk after rejecting a saved artifact that clears it.
+
+<a id="dec-1959-2"></a>
+
+**DEC-1959.2. Callable checks, expression indexes and defaults of new tables
+are split by an expansion; Split has two required parts and a variable tail.**
+Part of #1959, S7 PR1. The generated-table expansion still runs first and
+keeps DEC-1503.6's exhaustive structural-use classification and per-part
+creation-risk derivation. The remaining `split_new_tables` work is
+`order::new_tables::NewTables`: one obligation for each earlier CREATE whose
+check, expression-bearing index or eligible default may call a planned
+function. It replaces that whole change with its bare CREATE, then checks,
+indexes and defaults in their existing order. A row-consumed default or one
+without a recorded column UID stays in CREATE. No part is added solely to
+break a cycle, so no breaker is introduced.
+
+The existing two-part Split cannot describe several deferred expressions.
+Its required pair remains an array; an optional tail cannot make a split
+empty or unary. Existing callers pass an empty tail. Every part receives the
+same logical source and SplitPart role, and the existing whole-only guard,
+transformation contract, targeted-progress check and fixed rewrite budget
+are unchanged. The tail is consumed in the same rewrite, not by repeatedly
+splitting a part the contract forbids splitting.
+
+This expansion moves no existing step. Its parts replace CREATE in place,
+and its final schedule has no edges: the existing Sink tie-break preserves
+that order. The existing lexical and generated-part constraints subsequently
+place the expressions; no rank, tie-break or reordering pass is added.
+Ordinary split parts keep their previous intrinsic risk classification.
+Generated creation parts keep their existing marker and typed risk rules;
+diagnostic provenance is never evidence of an empty table. The resolver's
+engine seam and its lowering remain unchanged.
+
+Only cfg(test) contains the frozen pre-conversion split and driver. Every
+cfg(test) split call compares the result count, serialized plan bytes,
+emitted SQL and fixed-metadata saved-plan checksum. Every weave call that
+reaches the driver and every existing driver pin also compares the old
+driver's result or refusal, including its rewrite count and provenance. Newly reported split origins are tested
+separately and remain absent from saved plans (DEC-1958.3).
+
+Pinned by `split_parts_match_the_frozen_plan_sql_and_checksum_for_32_uid_seeds`,
+`every_tail_part_keeps_the_source_and_other_whole_steps_keep_their_order`,
+`a_tail_split_does_not_escape_the_existing_budget`, the existing progress,
+whole-only and final-obligation driver negatives, and the live
+`expanded_table_checks_indexes_and_defaults_execute_on_both_servers`.

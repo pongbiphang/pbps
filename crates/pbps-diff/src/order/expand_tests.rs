@@ -5,7 +5,9 @@ use pbps_model::resolver::OrderReason;
 use pbps_model::{AddedRole, Change, ChangeSet, PlannedChange};
 
 use super::edges::Source;
-use super::expand::{Added, Addition, Anchor, Expansion, FACTOR, Order, Rewrite, Step, expand};
+use super::expand::{
+    Added, Addition, Anchor, Expansion, FACTOR, Order, Rewrite, Step, expand as current_expand,
+};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -190,6 +192,7 @@ impl Expansion for Splitter {
         Ok(Rewrite::Split {
             at: *at,
             parts: Box::new([drop("x"), create("y")]),
+            tail: Vec::new(),
             reason: "edited in one step".into(),
         })
     }
@@ -236,6 +239,7 @@ impl Expansion for SplitsItsOwn {
             Rewrite::Split {
                 at: 0,
                 parts: Box::new([drop("x"), drop("y")]),
+                tail: Vec::new(),
                 reason: String::new(),
             }
         })
@@ -295,4 +299,127 @@ impl Expansion for Undoes {
 fn a_final_order_that_unmeets_an_obligation_is_refused() {
     let err = expand(plan(&["a"]), &Undoes, FACTOR).unwrap_err();
     assert_eq!(err, "undoes: the final order leaves 1 unmet: a");
+}
+
+// Every existing driver pin, including refusals, exercises the frozen driver.
+use crate::order;
+#[path = "../../tests/support/expansion.rs"]
+mod legacy;
+
+fn expand<E: Expansion>(
+    plan: ChangeSet,
+    rule: &E,
+    factor: usize,
+) -> Result<super::expand::Expanded, String> {
+    let old = legacy::expand(plan.clone(), rule, factor);
+    let now = current_expand(plan, rule, factor);
+    match (&now, &old) {
+        (Ok(a), Ok(b)) => {
+            assert_eq!(a.rewrites, b.rewrites);
+            assert_eq!(a.changes, b.changes);
+            for (a, b) in a.changes.changes.iter().zip(&b.changes.changes) {
+                assert_eq!(a.provenance, b.provenance);
+            }
+        }
+        (Err(a), Err(b)) => assert_eq!(a, b),
+        _ => panic!("driver disagreement: {now:?} / {old:?}"),
+    }
+    now
+}
+
+struct TailSplitter;
+
+impl Expansion for TailSplitter {
+    type Obligation = usize;
+
+    fn rule(&self) -> &'static str {
+        "tail-splitter"
+    }
+
+    fn unmet(&self, plan: &[PlannedChange]) -> Result<Vec<usize>, String> {
+        Splitter.unmet(plan)
+    }
+
+    fn expand(&self, _: &[PlannedChange], at: &usize) -> Result<Rewrite, String> {
+        Ok(Rewrite::Split {
+            at: *at,
+            parts: Box::new([drop("x"), create("y")]),
+            tail: vec![create("z"), drop("w")],
+            reason: "all parts serve the same logical change".into(),
+        })
+    }
+
+    fn order(&self, _: &[PlannedChange]) -> Result<Vec<Order>, String> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn every_tail_part_keeps_the_source_and_other_whole_steps_keep_their_order() {
+    let done = current_expand(plan(&["a", "split", "b"]), &TailSplitter, FACTOR).unwrap();
+    assert_eq!(done.rewrites, 1);
+    assert_eq!(
+        done.changes
+            .changes
+            .iter()
+            .filter_map(name)
+            .collect::<Vec<_>>(),
+        [
+            ("a", true),
+            ("x", false),
+            ("y", true),
+            ("z", true),
+            ("w", false),
+            ("b", true)
+        ]
+    );
+    for part in &done.changes.changes[1..5] {
+        let origin = part.provenance.as_ref().unwrap();
+        assert_eq!(origin.rule, "tail-splitter");
+        assert_eq!(origin.role, AddedRole::SplitPart);
+        assert_eq!(origin.source, "role split");
+        assert_eq!(origin.reason, "all parts serve the same logical change");
+    }
+    assert!(done.changes.changes[0].provenance.is_none());
+    assert!(done.changes.changes[5].provenance.is_none());
+    let again = current_expand(done.changes.clone(), &TailSplitter, FACTOR).unwrap();
+    assert_eq!(again.rewrites, 0);
+    assert_eq!(again.changes, done.changes);
+}
+
+#[test]
+fn a_tail_split_does_not_escape_the_existing_budget() {
+    let err = current_expand(plan(&["split"]), &TailSplitter, 0).unwrap_err();
+    assert_eq!(
+        err,
+        "tail-splitter: the rewrite budget of 0 (0 per operation, 2 asked for) is spent and 1 remain unmet: 0"
+    );
+}
+
+struct NonProgressingTail;
+
+impl Expansion for NonProgressingTail {
+    type Obligation = usize;
+    fn rule(&self) -> &'static str {
+        "stuck-tail"
+    }
+    fn unmet(&self, plan: &[PlannedChange]) -> Result<Vec<usize>, String> {
+        Splitter.unmet(plan)
+    }
+    fn expand(&self, plan: &[PlannedChange], at: &usize) -> Result<Rewrite, String> {
+        let mut rewrite = TailSplitter.expand(plan, at)?;
+        if let Rewrite::Split { parts, .. } = &mut rewrite {
+            parts[0] = create("split");
+        }
+        Ok(rewrite)
+    }
+    fn order(&self, _: &[PlannedChange]) -> Result<Vec<Order>, String> {
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn a_tail_cannot_hide_an_unmet_split_obligation() {
+    let err = current_expand(plan(&["split"]), &NonProgressingTail, FACTOR).unwrap_err();
+    assert_eq!(err, "stuck-tail: a rewrite for 0 left it unmet");
 }

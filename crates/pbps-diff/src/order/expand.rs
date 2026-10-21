@@ -2,8 +2,8 @@
 //! contract §4, slice S6b, #1958).
 //!
 //! An [`Expansion`] names the obligations a plan leaves unmet and answers
-//! each with a [`Rewrite`]: steps added at an anchor, a whole step split in
-//! two, and the edges that order them. [`expand`] applies one rewrite at a
+//! each with a [`Rewrite`]: steps added at an anchor, a whole step split into
+//! parts, and the edges that order them. [`expand`] applies one rewrite at a
 //! time and orders the plan through [`Schedule::settle`] after each, so no
 //! rule moves a step itself. After every rewrite it checks:
 //!
@@ -81,10 +81,12 @@ pub struct Order {
 /// What an expansion answers one obligation with.
 #[derive(Debug, Clone)]
 pub enum Rewrite {
-    /// The whole step at `at` replaced, in place, by its two parts.
+    /// The whole step at `at` replaced, in place, by at least two parts (DEC-1959.2).
     Split {
         at: usize,
         parts: Box<[PlannedChange; 2]>,
+        /// Extra parts of the same logical change, in declaration order.
+        tail: Vec<PlannedChange>,
         reason: String,
     },
     /// Steps added, steps respelled for where the edges take them, and the
@@ -236,11 +238,17 @@ impl State {
     ) -> Result<(), String> {
         let n = self.changes.len();
         match rewrite {
-            Rewrite::Split { at, parts, reason } => {
+            Rewrite::Split {
+                at,
+                parts,
+                tail,
+                reason,
+            } => {
                 let Some(Origin::Whole(i)) = self.origins.get(at).cloned() else {
                     return Err(format!("{rule}: only a whole step splits, not step {at}"));
                 };
-                let parts = (*parts).map(|mut p| {
+                let count = parts.len() + tail.len();
+                let parts = (*parts).into_iter().chain(tail).map(|mut p| {
                     p.provenance = Some(Provenance {
                         rule,
                         role: AddedRole::SplitPart,
@@ -251,7 +259,7 @@ impl State {
                 });
                 self.changes.splice(at..=at, parts);
                 self.origins
-                    .splice(at..=at, [Origin::SplitPart(i), Origin::SplitPart(i)]);
+                    .splice(at..=at, std::iter::repeat_n(Origin::SplitPart(i), count));
             }
             Rewrite::Add {
                 added,

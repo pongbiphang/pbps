@@ -158,7 +158,11 @@ Then, in this order:
     is refused by name (DEC-1956.3). `release_generated_inputs` is
     one of the passes that read the catalog themselves and so stay
     `plan --db`'s own calls after `schedule` (DEC-1955.1).
-  - `split_new_tables` splits the parts of a new table whose text names a
+  - `split_new_tables` runs `order::new_tables::NewTables` through the expansion
+    driver, after the shared generated-table expansion (DEC-1959.2). A
+    multi-part `Rewrite::Split` keeps the table and deferred expressions
+    adjacent; the existing lexical edges below place them. It splits the
+    parts of a new table whose text names a
     function the plan creates out of it, ahead of that create. A generated
     column calling a planned function starts a declaration-order suffix;
     its prefix creates the relation at its ordinary position. Only
