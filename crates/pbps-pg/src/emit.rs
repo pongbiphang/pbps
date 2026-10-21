@@ -756,6 +756,19 @@ pub(crate) fn owned_sequence(
     )
 }
 
+/// A partition's fallback must call the same sequence as its parent,
+/// including an explicit or truncated name, rather than owning a new one.
+pub(crate) fn owned_sequence_default(
+    table: &TableName,
+    column: &str,
+    sequence: &pbps_model::OwnedSequence,
+) -> Result<String, DialectError> {
+    Ok(format!(
+        "pg_catalog.nextval({}::regclass)",
+        literal(&qualified(&owned_sequence(table, column, sequence))?)
+    ))
+}
+
 /// The `CREATE SEQUENCE` a `serial` column's table or `ADD COLUMN` runs
 /// first, and the `OWNED BY` it runs after, or nothing for any other column.
 ///
@@ -1169,8 +1182,8 @@ fn column_definition(
     s.push_str(null_clause(column.nullable));
     if let pbps_model::ValueSource::Sequence(sequence) = &column.value_source {
         s.push_str(&format!(
-            " DEFAULT pg_catalog.nextval({}::regclass)",
-            literal(&qualified(&owned_sequence(table, name, sequence))?)
+            " DEFAULT {}",
+            owned_sequence_default(table, name, sequence)?
         ));
     }
     if let Some(expr) = default {
@@ -6468,6 +6481,66 @@ mod tests {
         assert!(sql[0].contains("PARTITION OF \"app\".\"p\""), "{sql:?}");
         assert!(!sql[0].contains("SEQUENCE"), "{sql:?}");
         assert!(!sql[0].contains("DEFAULT pg_catalog.nextval"), "{sql:?}");
+    }
+
+    #[test]
+    fn a_partitions_serial_fallback_calls_its_parents_generated_or_explicit_sequence() {
+        let pg = Postgres::new();
+        for (table, explicit, expected) in [
+            ("p".to_owned(), None, "p_id_seq".to_owned()),
+            ("p".repeat(60), None, format!("{}_id_seq", "p".repeat(56))),
+            (
+                "p".to_owned(),
+                Some("parent's \"numbers\""),
+                "parent''s \"\"numbers\"\"".to_owned(),
+            ),
+        ] {
+            let parent = name("app", &table);
+            let sequence = pbps_model::OwnedSequence {
+                name: explicit.map(str::to_owned),
+                ..pbps_model::OwnedSequence::serial()
+            };
+            let mut change = Change::SetPartitionDefault {
+                uid: Uid::generate(UidKind::Table),
+                table: name("other", "p2"),
+                parent: parent.clone(),
+                column: "id".into(),
+                from: None,
+                to: None,
+                fallback: Some(pg.owned_sequence_default(&parent, "id", &sequence).unwrap()),
+            };
+            let sql = sql_of(&pg, &change).join("\n");
+            assert!(sql.contains(&format!(
+                "ALTER TABLE \"other\".\"p2\" ALTER COLUMN \"id\" SET DEFAULT pg_catalog.nextval('\"app\".\"{expected}\"'::regclass)"
+            )), "{sql}");
+            assert!(!sql.contains("CREATE SEQUENCE"), "{sql}");
+            // A declared override wins over the fallback, and the rebuild
+            // form without either still drops the default entirely.
+            let Change::SetPartitionDefault { to, .. } = &mut change else {
+                unreachable!()
+            };
+            *to = Some("7".into());
+            let sql = sql_of(&pg, &change).join("\n");
+            assert!(sql.contains("SET DEFAULT 7"), "{sql}");
+            assert!(!sql.contains("nextval"), "{sql}");
+            let Change::SetPartitionDefault { to, fallback, .. } = &mut change else {
+                unreachable!()
+            };
+            *to = None;
+            *fallback = None;
+            assert!(sql_of(&pg, &change)[0].contains("DROP DEFAULT"));
+        }
+        assert!(
+            pg.owned_sequence_default(
+                &name("app", "p"),
+                "id",
+                &pbps_model::OwnedSequence {
+                    name: Some("bad\0name".into()),
+                    ..pbps_model::OwnedSequence::serial()
+                }
+            )
+            .is_err()
+        );
     }
 
     fn sql_of(pg: &Postgres, change: &Change) -> Vec<String> {

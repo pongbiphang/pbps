@@ -2638,6 +2638,22 @@ pub trait Dialect {
         sequence.name.clone()
     }
 
+    /// The default calling an owned sequence, for a partition taking its
+    /// parent's default back (DEC-2218.1). The dialect owns both the name
+    /// and the expression; the differ must not invent either. Engines that
+    /// hold no owned sequence refuse rather than silently dropping it.
+    fn owned_sequence_default(
+        &self,
+        _table: &TableName,
+        _column: &str,
+        _sequence: &pbps_model::OwnedSequence,
+    ) -> Result<String, DialectError> {
+        Err(DialectError::Unsupported {
+            dialect: self.name(),
+            feature: "an owned sequence default".into(),
+        })
+    }
+
     /// Whether a module is also a constraint under its own name in its
     /// schema, which a retry that yields to constraints finds taken (#1112):
     /// PostgreSQL's constraint trigger has a `pg_constraint` row. The default,

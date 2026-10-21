@@ -2739,6 +2739,164 @@ fn a_partitioned_parents_serial_round_trips_without_partition_drift() {
     }
 }
 
+/// An attach needs the same copied serial default as PARTITION OF, while a
+/// hand-attached tree without it stays outside pull (DEC-2218.1). External
+/// partitions follow the existing plain-default parent's reader behavior.
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn an_attached_partition_takes_its_serial_parents_default_on_both_servers() {
+    let old = std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB");
+    for (version, server) in [(16, old), (18, server())] {
+        let own = OwnDatabase::new(&server, "serial_attach");
+        let connection = own.connection();
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT current_setting('server_version_num')::bigint / 10000"
+            ),
+            version
+        );
+        on_server(
+            connection,
+            "CREATE SCHEMA app;
+            CREATE TABLE app.t (id bigint NOT NULL, v integer)",
+        );
+        let d = Demo::new("serial-attach");
+        succeeds(d.run(&["pull", "--db", connection]));
+        d.commit();
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "adopt ordinary table",
+        ]));
+        let parent = "table: app.p\ncolumns:\n  id: {type: bigserial}\n  v: {type: integer}\n\
+                      partition_by: [v]\npartitions:\n  p1: {from: [0], to: [10]}\n";
+        let path = d.dir.join("schema/app.p.yml");
+        std::fs::write(&path, parent).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, connection, &plan, &[]));
+        // The ordinary SQL-created table is now declared under the parent,
+        // keeping its identity so this is ATTACH rather than PARTITION OF.
+        std::fs::remove_file(d.dir.join("schema/app.t.yml")).unwrap();
+        let attached = format!("{parent}  t: {{from: [10], to: [20]}}\n");
+        std::fs::write(&path, &attached).unwrap();
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        let output =
+            succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+        assert!(
+            stdout(&output).contains("attach table app.t to app.p"),
+            "{}",
+            stdout(&output)
+        );
+        let applied = approved_apply(&d, connection, &plan, &["--allow", "constraint"]);
+        // Exercise the direct writer before reporting apply's read-back
+        // refusal too: without the copy it rolls the attach back, and the
+        // ordinary table still exposes the missing default as NOT NULL.
+        on_server(
+            connection,
+            "INSERT INTO app.p (v) VALUES (1);
+            INSERT INTO app.t (v) VALUES (11)",
+        );
+        succeeds(applied);
+        assert_eq!(scalar(connection, "SELECT id FROM app.t WHERE v = 11"), 2);
+        assert_eq!(scalar(connection, "SELECT last_value FROM app.p_id_seq"), 2);
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        succeeds(d.run(&["verify", "--db", connection]));
+
+        // An own default wins, and removing it later takes the very same
+        // serial fallback back rather than dropping the default entirely.
+        let overridden = format!(
+            "{parent}  t:\n    from: [10]\n    to: [20]\n    columns:\n      id: {{default: '0'}}\n"
+        );
+        for (text, expected) in [(&overridden, 0), (&attached, 3)] {
+            std::fs::write(&path, text).unwrap();
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&["plan", "--db", connection, "--out", plan.to_str().unwrap()]));
+            succeeds(approved_apply(&d, connection, &plan, &[]));
+            on_server(connection, "INSERT INTO app.t (v) VALUES (12)");
+            assert_eq!(
+                scalar(
+                    connection,
+                    "SELECT id FROM app.t WHERE v = 12 ORDER BY id DESC LIMIT 1"
+                ),
+                expected
+            );
+            succeeds(d.run(&["verify", "--db", connection]));
+            let next = succeeds(d.run(&["plan", "--db", connection]));
+            assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        }
+
+        let negative = OwnDatabase::new(&server, "serial_attach_pull");
+        let src = negative.connection();
+        on_server(src, "CREATE SCHEMA app;
+            CREATE TABLE app.serial_parent (id bigserial, v integer) PARTITION BY RANGE (v);
+            CREATE TABLE app.serial_copy PARTITION OF app.serial_parent FOR VALUES FROM (0) TO (10);
+            CREATE TABLE app.serial_missing (id bigint NOT NULL, v integer);
+            ALTER TABLE app.serial_parent ATTACH PARTITION app.serial_missing FOR VALUES FROM (10) TO (20);
+            CREATE TABLE app.plain_parent (id bigint NOT NULL DEFAULT 42, v integer) PARTITION BY RANGE (v);
+            CREATE TABLE app.plain_copy PARTITION OF app.plain_parent FOR VALUES FROM (0) TO (10);
+            CREATE TABLE app.plain_missing (id bigint NOT NULL, v integer);
+            ALTER TABLE app.plain_parent ATTACH PARTITION app.plain_missing FOR VALUES FROM (10) TO (20)");
+        on_server(src, "INSERT INTO app.serial_parent (v) VALUES (11)");
+        for kind in ["serial", "plain"] {
+            let error = try_on_server(
+                src,
+                &format!("INSERT INTO app.{kind}_missing (v) VALUES (12)"),
+            )
+            .unwrap_err();
+            assert!(error.contains("null value"), "{error}");
+        }
+        let pulled = Demo::new("serial-attach-missing-copy");
+        let output = succeeds(pulled.run(&["pull", "--db", src]));
+        let loaded = pbps_load::load_schema_dir(&pulled.dir.join("schema")).unwrap();
+        assert!(
+            loaded.schema.tables.is_empty(),
+            "{:?}",
+            loaded.schema.tables
+        );
+        for kind in ["serial", "plain"] {
+            for member in ["parent", "copy", "missing"] {
+                assert!(
+                    stderr(&output).contains(&format!("app.{kind}_{member}")),
+                    "{}",
+                    stderr(&output)
+                );
+            }
+            // Naming external partitions does not bypass the tree predicate.
+            let external = Demo::new(&format!("{kind}-attach-external"));
+            let output = external.run(&[
+                "pull",
+                "--db",
+                src,
+                "--partitions-external",
+                &format!("app.{kind}_parent"),
+            ]);
+            assert_ne!(code(&output), 0, "{}", stdout(&output));
+            assert!(
+                stderr(&output).contains("this database has no partitioned parent"),
+                "{}",
+                stderr(&output)
+            );
+        }
+        assert_eq!(
+            scalar(
+                src,
+                "SELECT count(*) FROM pg_attrdef WHERE adrelid IN
+            ('app.serial_missing'::regclass, 'app.plain_missing'::regclass)"
+            ),
+            0
+        );
+    }
+}
+
 /// `verify` compares two reads, and each knows the sequence name it leaves
 /// out: a `serial`'s sequence renamed by hand since the baseline is drift
 /// that names its column (#1631), and one a plan can express, as the

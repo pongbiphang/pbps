@@ -2356,3 +2356,46 @@ re-pull, numbered inserts, a partition's own non-sequence default used only
 by direct inserts, shared and differing-default limitations, and the
 measured attach/add behavior). Restoring the old reader restriction makes
 the live test fail.
+
+<a id="dec-2218-1"></a>
+
+**DEC-2218.1. Attaching a table without its serial parent's default restores
+the same fallback as a plain-default parent.** (#2218; #1893 part B)
+
+Measured on PostgreSQL 16 and 18: `PARTITION OF` copies a `bigserial`
+parent's `nextval` default, but `ATTACH PARTITION` of an ordinary table
+without a default does not. Inserts through the parent still number from
+its sequence; direct inserts into the attached partition fail NOT NULL.
+So pbps's attach sets that missing copy, unless the partition declares an
+own default. Removing an own default later restores the same fallback.
+An identity keeps its existing rules, and a table owning a sequence of its
+own is not treated as an unnumbered table to attach.
+
+The differ asks the dialect for an owned sequence's default. PostgreSQL's
+emitter computes the name through `owned_sequence` and `generated_name`,
+including truncation or an explicit `sequence: {name: ...}`, and quotes the
+qualified sequence in `pg_catalog.nextval(...::regclass)`. The concrete
+expression travels in the existing `SetPartitionDefault::fallback` string,
+as a plain default does. Neither the Change shape nor any saved format
+changes; the dialect-neutral differ computes no PostgreSQL name or SQL.
+
+Pull keeps DEC-1578.1's tree predicate unchanged. A live partition without
+its parent's default leaves the whole tree out, naming the parent and
+every partition, for serial and plain-default parents alike. External
+partitions remain unmanaged under DEC-1533.1: pbps sets nothing on them.
+The reader applies that same predicate before external handover, so
+`pull --partitions-external` naming either missing-copy parent refuses it
+as no partitioned parent by that name that pull keeps. External does not
+bypass the existing plain-default limitation.
+
+Pinned by
+`an_attached_partition_takes_its_serial_parents_default_unless_it_declares_its_own`
+(dialect-supplied attach and restored fallback, own-default and identity
+negatives),
+`a_partitions_serial_fallback_calls_its_parents_generated_or_explicit_sequence`
+(generated, truncated and explicit names, quoting, own-default precedence
+and default removal), and, live on 16 and 18,
+`an_attached_partition_takes_its_serial_parents_default_on_both_servers`
+(managed parent creation, SQL-created table attached by a plan, numbered
+direct inserts, empty next plan, clean verify, own-default removal, and
+whole-tree pull and external refusals for serial and plain defaults).
