@@ -3018,7 +3018,19 @@ async fn ask_about_partition_defaults(
                 .to_owned(),
         )
     } else {
-        match enabled_ddl_event_triggers(conn).await {
+        match immutable_partition_inputs(conn, schema).await {
+            Ok(true) => None,
+            Ok(false) => Some(
+                "a referenced input path can run non-immutable code before approval".to_owned(),
+            ),
+            Err(e) => Some(format!(
+                "cannot determine referenced input-path volatility: {}",
+                redacted(e)
+            )),
+        }
+    };
+    if refused.is_none() {
+        refused = match enabled_ddl_event_triggers(conn).await {
             Ok(names) if names.is_empty() => None,
             Ok(names) => Some(format!(
                 "the target has the enabled DDL event trigger(s) {}, which this check's \
@@ -3026,8 +3038,8 @@ async fn ask_about_partition_defaults(
                 listed(names)
             )),
             Err(e) => Some(format!("cannot read the target's event triggers: {e}")),
-        }
-    };
+        };
+    }
     // A domain's CHECK runs when the parse reads a literal as a composite,
     // array or range over that domain, and it runs as this role: storing
     // `'(5)'::app.c` runs it, measured on 16 and 18. A check another role
@@ -3101,6 +3113,18 @@ async fn ask_about_partition_defaults(
             )
         })),
     }
+}
+
+// Unlike source-review eligibility, volatility includes built-ins such as
+// sequence operations. Keep this at the probe boundary so connected bootstrap
+// and direct catalog callers cannot bypass it (DEC-2181.2).
+async fn immutable_partition_inputs(conn: &mut Conn, schema: &Schema) -> Result<bool, DbError> {
+    let references: Vec<_> = crate::type_refs::references(&[schema], &Default::default())
+        .into_iter()
+        .collect();
+    let types =
+        crate::type_refs::read(conn, crate::pins::Within::OwnTransaction, &references).await?;
+    crate::input_path::probes_are_immutable(conn, &types).await
 }
 
 /// Whether a declared text could name a temporary schema (`pg_temp_N`,

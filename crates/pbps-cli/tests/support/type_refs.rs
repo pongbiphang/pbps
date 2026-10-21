@@ -2328,6 +2328,93 @@ fn bootstrap_refuses_before_partition_default_parsing_can_advance_a_sequence() {
     );
 }
 
+fn builtin_partition_probe(bootstrap: bool) {
+    let mut observed = Vec::new();
+    for server in servers() {
+        // Stable is also non-immutable; immutable built-ins retain the probe.
+        for (check, unchecked) in [
+            ("pg_catalog.nextval('app.calls') > 0", true),
+            ("pg_catalog.current_setting('server_version') <> ''", true),
+            ("pg_catalog.length(VALUE) > 0", false),
+        ] {
+            let own = OwnDatabase::new(&server, "builtin_partition_probe");
+            let db = own.connection();
+            on_server(
+                db,
+                &format!(
+                    "CREATE SCHEMA app; CREATE SEQUENCE app.calls;
+                     CREATE DOMAIN app.checked AS varchar CHECK ({check});
+                     CREATE TABLE app.t(id integer PRIMARY KEY, n app.checked[] DEFAULT '{{}}'::app.checked[]) PARTITION BY RANGE(id);
+                     CREATE TABLE app.low PARTITION OF app.t FOR VALUES FROM (0) TO (10)"
+                ),
+            );
+            let d = Demo::new("builtin-partition-probe");
+            d.table(&partition_review_declarations(""));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            succeeds(d.run(&[
+                "baseline",
+                "--db",
+                db,
+                "--reason",
+                "existing partition tree",
+            ]));
+            d.table(&partition_review_declarations(
+                "    columns:\n      n: {default: \"'{x}'::app.checked[]\"}\n",
+            ));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+            assert_eq!(
+                scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+                0
+            );
+            let output = if bootstrap {
+                // This command cannot build over an existing managed table.
+                // Its earlier probe must not change a sequence before refusal.
+                let out = d.run(&["bootstrap", "--db", db]);
+                assert_ne!(code(&out), 0, "{}", stdout(&out));
+                assert!(stderr(&out).contains("already has"), "{}", stderr(&out));
+                out
+            } else {
+                succeeds(d.run(&["plan", "--db", db]))
+            };
+            let message = stderr(&output);
+            observed.push((
+                text_scalar(db, "SELECT current_setting('server_version')"),
+                check,
+                scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+                message
+                    .contains("a referenced input path can run non-immutable code before approval"),
+                unchecked,
+                message,
+            ));
+        }
+    }
+    assert!(
+        observed.iter().all(|(_, _, called, _, _, _)| *called == 0),
+        "a pre-approval probe changed a sequence: {observed:?}"
+    );
+    assert!(
+        observed.iter().all(
+            |(_, _, _, warning, unchecked, message)| warning == unchecked
+                && message.contains("not checked before the plan") == *unchecked
+        ),
+        "only non-immutable paths remain unchecked: {observed:?}"
+    );
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn plan_probes_do_not_run_nextval_in_domain_checks_and_only_probe_immutable_paths() {
+    builtin_partition_probe(false);
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18"]
+fn bootstrap_probes_do_not_run_nextval_in_domain_checks_and_only_probe_immutable_paths() {
+    builtin_partition_probe(true);
+}
+
 #[test]
 #[ignore = "needs live PostgreSQL 16 and 18"]
 fn reviewed_domain_defaults_execute_at_ddl_time_but_sql_running_builtins_stay_refused() {

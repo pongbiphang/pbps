@@ -93,7 +93,7 @@ pub fn references(schemas: &[&Schema], changes: &ChangeSet) -> BTreeSet<TypeRef>
         .collect()
 }
 
-async fn read(
+pub(crate) async fn read(
     conn: &mut Conn,
     within: Within,
     references: &[TypeRef],

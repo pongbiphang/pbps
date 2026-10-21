@@ -440,6 +440,8 @@ fn why_not_admitted(oid: Oid, runs_sql: &BTreeSet<Oid>) -> Option<Why> {
 struct Facts {
     /// Some domain on the path has a CHECK or a DEFAULT.
     runs_code: bool,
+    /// Includes built-ins: rollback does not undo every non-immutable call.
+    non_immutable: bool,
     /// The routines that are not admitted, with where each is used.
     routines: Vec<RoutineReason>,
     /// The types on the path that a role can change (OID at or above 16384),
@@ -688,6 +690,53 @@ async fn read_each(
         .collect())
 }
 
+/// A pre-approval probe may not execute non-immutable input-path code, even
+/// built-ins admitted by the deployment gate. Read facts twice as the gate
+/// does; this is catalog inspection, never evaluation of the expressions.
+pub(crate) async fn probes_are_immutable(
+    conn: &mut Conn,
+    types: &[UserType],
+) -> Result<bool, DbError> {
+    if types.is_empty() {
+        return Ok(true);
+    }
+    conn.begin(&OWN_TRANSACTION).await?;
+    let result = async {
+        conn.query("SELECT pg_catalog.set_config('search_path', '', true) AS was_set")
+            .await?;
+        let mut passes = Vec::new();
+        for _ in 0..2 {
+            let major = server_major(conn).await?;
+            let denied = runs_sql_oids(conn).await?.map_err(DbError::BadRow)?;
+            let mut facts = Vec::new();
+            for ty in types {
+                for own_default in [true, false] {
+                    facts.push(
+                        gather(conn, major, &denied, Added::new(ty, own_default))
+                            .await
+                            .map_err(|e| match e {
+                                Failure::Read(e) => e,
+                                Failure::Uncertified(why) => DbError::BadRow(why),
+                            })?,
+                    );
+                }
+            }
+            passes.push(facts);
+        }
+        if passes[0] != passes[1] {
+            return Err(DbError::BadRow(
+                "the input path changed while its probe eligibility was being read".to_owned(),
+            ));
+        }
+        Ok(passes[0].iter().all(|f| !f.non_immutable))
+    }
+    .await;
+    let closed = conn.rollback(&OWN_TRANSACTION).await;
+    let immutable = result?;
+    closed?;
+    Ok(immutable)
+}
+
 /// Why one type cannot be certified, or that the whole read failed.
 enum Failure {
     /// The engine or the connection failed: no type was learned.
@@ -842,6 +891,7 @@ async fn gather(
     if added.array && added.fill == Fill::Null {
         return Ok(Facts {
             runs_code: false,
+            non_immutable: false,
             routines: Vec::new(),
             types: Vec::new(),
         });
@@ -856,6 +906,7 @@ async fn gather(
             })?;
         return Ok(Facts {
             runs_code: false,
+            non_immutable: false,
             routines: Vec::new(),
             // PostgreSQL keeps an array's owner equal to its element type's.
             // Check that owner without visiting the unevaluated element path.
@@ -1002,7 +1053,7 @@ async fn gather(
         roots = next;
     }
 
-    let routines =
+    let (routines, non_immutable) =
         unadmitted_routines(conn, runs_sql, &functions, &operators, &row_compares).await?;
     let owned = types
         .values()
@@ -1015,6 +1066,7 @@ async fn gather(
         .collect();
     Ok(Facts {
         runs_code,
+        non_immutable,
         routines,
         types: owned,
     })
@@ -1164,18 +1216,20 @@ fn operator_function(oid: Oid, row: &OperatorRow) -> Result<Oid, String> {
 struct FunctionRow {
     identity: String,
     owner: pbps_model::RoleName,
+    volatility: String,
 }
 
 /// The functions and operators of the path that are not admitted, with where
-/// each is used. A built-in function is judged by its OID alone and is looked up
-/// only when it is on [`RUNS_SQL`].
+/// each is used, and whether any executed routine is non-immutable. Built-ins
+/// also need a catalog read: deployment eligibility alone does not make them
+/// safe to execute in a plan-time probe.
 async fn unadmitted_routines(
     conn: &mut Conn,
     runs_sql: &BTreeSet<Oid>,
     functions: &BTreeMap<Oid, Vec<Use>>,
     operators: &BTreeMap<Oid, Vec<Use>>,
     row_compares: &BTreeMap<(Oid, Oid), Vec<Use>>,
-) -> Result<Vec<RoutineReason>, Failure> {
+) -> Result<(Vec<RoutineReason>, bool), Failure> {
     let mut operator_ids: BTreeSet<Oid> = operators.keys().copied().collect();
     operator_ids.extend(row_compares.keys().map(|(operator, _)| *operator));
     let operator_rows = operator_rows(conn, &operator_ids.into_iter().collect::<Vec<_>>()).await?;
@@ -1197,9 +1251,7 @@ async fn unadmitted_routines(
         )
         .chain(supports.values())
     {
-        if why_not_admitted(*oid, runs_sql).is_some() {
-            wanted.insert(*oid);
-        }
+        wanted.insert(*oid);
     }
     let function_rows = function_rows(conn, &wanted.iter().copied().collect::<Vec<_>>()).await?;
     let function = |oid: Oid| -> Result<&FunctionRow, Failure> {
@@ -1207,6 +1259,18 @@ async fn unadmitted_routines(
             Failure::Uncertified(format!("the function with OID {oid} is not in the catalog"))
         })
     };
+    let mut non_immutable = false;
+    for oid in &wanted {
+        match function(*oid)?.volatility.as_str() {
+            "i" => {}
+            "s" | "v" => non_immutable = true,
+            other => {
+                return Err(Failure::Uncertified(format!(
+                    "the function with OID {oid} has unknown volatility `{other}`"
+                )));
+            }
+        }
+    }
 
     // An operator node also names the function it runs (`opfuncid`), which is
     // checked like any other so that a node that disagrees with the catalog
@@ -1288,7 +1352,7 @@ async fn unadmitted_routines(
             });
         }
     }
-    Ok(out)
+    Ok((out, non_immutable))
 }
 
 /// The btree comparison function (support function 1) of the operator family
@@ -1377,6 +1441,7 @@ async fn function_rows(
         .query(&format!(
             "SELECT p.oid::pg_catalog.int8 AS oid,
                     i.identity AS identity,
+                    p.provolatile::pg_catalog.text AS volatility,
                     ow.rolname::pg_catalog.text AS owner
                FROM pg_catalog.pg_proc p
                JOIN pg_catalog.pg_roles ow ON ow.oid = p.proowner
@@ -1393,6 +1458,7 @@ async fn function_rows(
                 FunctionRow {
                     identity: need::<&str>(row, "identity")?.to_owned(),
                     owner: need::<&str>(row, "owner")?.into(),
+                    volatility: need::<&str>(row, "volatility")?.to_owned(),
                 },
             ))
         })
@@ -1603,6 +1669,7 @@ mod tests {
         // runs, so nothing is asked.
         let facts = Facts {
             runs_code: false,
+            non_immutable: false,
             routines: vec![user_function()],
             types: vec![owned(40001, "app.mood", "mallory")],
         };
@@ -1617,6 +1684,7 @@ mod tests {
     fn a_path_that_runs_code_is_admitted_when_it_is_built_in_and_owned_by_the_trusted() {
         let facts = Facts {
             runs_code: true,
+            non_immutable: false,
             routines: Vec::new(),
             types: vec![owned(40002, "app.positive", "deployer")],
         };
@@ -1630,6 +1698,7 @@ mod tests {
     fn skipping_empty_array_elements_retains_the_target_owner_check() {
         let facts = Facts {
             runs_code: false,
+            non_immutable: false,
             routines: Vec::new(),
             types: vec![owned(40002, "app.checked", "owner_role")],
         };
@@ -1648,6 +1717,7 @@ mod tests {
     fn a_user_routine_refuses_a_path_that_runs_code_and_is_named() {
         let facts = Facts {
             runs_code: true,
+            non_immutable: false,
             routines: vec![user_function()],
             types: vec![owned(40002, "app.positive", "deployer")],
         };
@@ -1665,6 +1735,7 @@ mod tests {
     fn an_untrusted_owner_refuses_and_every_untrusted_actor_is_named() {
         let facts = Facts {
             runs_code: true,
+            non_immutable: false,
             routines: Vec::new(),
             types: vec![
                 owned(40002, "app.positive", "owner_role"),
@@ -1695,6 +1766,7 @@ mod tests {
     fn reasons_are_sorted_and_not_repeated() {
         let facts = Facts {
             runs_code: true,
+            non_immutable: false,
             routines: vec![user_function(), user_function()],
             types: Vec::new(),
         };

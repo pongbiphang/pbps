@@ -510,6 +510,8 @@
         "type_refs::immediate_bootstrap_requires_reviewed_plans_for_user_written_type_roots",
         "type_refs::partition_default_parsing_runs_domain_checks_only_after_source_approval",
         "type_refs::bootstrap_refuses_before_partition_default_parsing_can_advance_a_sequence",
+        "type_refs::plan_probes_do_not_run_nextval_in_domain_checks_and_only_probe_immutable_paths",
+        "type_refs::bootstrap_probes_do_not_run_nextval_in_domain_checks_and_only_probe_immutable_paths",
         "type_refs::reviewed_domain_defaults_execute_at_ddl_time_but_sql_running_builtins_stay_refused",
         "type_refs::set_default_and_create_parse_nested_domain_literals_while_stored_values_do_not_recheck",
         "type_refs::generated_expression_replacement_rechecks_domains_on_18_and_is_refused_on_16",
