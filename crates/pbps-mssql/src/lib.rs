@@ -51,6 +51,50 @@ pub mod validate;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Mssql;
 
+/// Match managed names within one snapshot: case-only neighbours disable
+/// folding, and function calls must not be confused with alias columns.
+fn schema_bound_callees(
+    dialect: &Mssql,
+    caller: &ModuleId,
+    module: &Module,
+    schema: &Schema,
+) -> std::collections::BTreeSet<ModuleId> {
+    let calls = dialect.qualified_calls(&module.definition);
+    let managed: Vec<_> = schema
+        .modules
+        .keys()
+        .filter_map(ModuleId::referenced_name)
+        .collect();
+    schema
+        .modules
+        .iter()
+        .filter_map(|(callee, definition)| {
+            if callee == caller {
+                return None;
+            }
+            let name = callee.referenced_name()?;
+            let folded = |other: &TableName| {
+                other.schema.to_lowercase() == name.schema.to_lowercase()
+                    && other.name.to_lowercase() == name.name.to_lowercase()
+            };
+            let unambiguous = !managed.iter().any(|other| other != &name && folded(other));
+            let bound = if definition.kind == pbps_model::ModuleKind::Function {
+                calls.iter().any(|(schema, leaf)| {
+                    (schema == &name.schema && leaf == &name.name)
+                        || (unambiguous
+                            && schema.to_lowercase() == name.schema.to_lowercase()
+                            && leaf.to_lowercase() == name.name.to_lowercase())
+                })
+            } else {
+                dialect.may_name_qualified_exact(&module.definition, &name.schema, &name.name)
+                    || (unambiguous
+                        && dialect.may_name_qualified(&module.definition, &name.schema, &name.name))
+            };
+            bound.then(|| callee.clone())
+        })
+        .collect()
+}
+
 impl Dialect for Mssql {
     fn name(&self) -> &'static str {
         types::DIALECT
@@ -97,62 +141,39 @@ impl Dialect for Mssql {
             && module.kind == pbps_model::ModuleKind::Function
             && introspect::function_is_schema_bound(&module.definition)
         {
-            // A function is bound by a call, `schema.name(`: a two-part name
-            // alone may be an alias's column, `app.g` under alias `app`,
-            // and two edited functions spelling each other's names that way
-            // would read as a cycle the engine does not have. Any other
-            // module is bound by its name, as a view in FROM is.
-            let calls = self.qualified_calls(&module.definition);
-            let managed: Vec<_> = after
-                .schema
-                .modules
-                .keys()
-                .filter_map(ModuleId::referenced_name)
-                .collect();
-            for (callee, callee_module) in after
-                .schema
-                .modules
-                .iter()
-                .filter(|(callee, _)| *callee != id)
-            {
-                let Some(name) = callee.referenced_name() else {
-                    continue;
-                };
-                // Case-only neighbours prove that this catalog distinguishes
-                // them. Keep the case-insensitive fallback for a unique name,
-                // including the caller among its possible exact holders.
-                let folded = |other: &TableName| {
-                    other.schema.to_lowercase() == name.schema.to_lowercase()
-                        && other.name.to_lowercase() == name.name.to_lowercase()
-                };
-                let unambiguous = !managed.iter().any(|other| other != &name && folded(other));
-                let bound = if callee_module.kind == pbps_model::ModuleKind::Function {
-                    calls.iter().any(|(schema, leaf)| {
-                        (schema == &name.schema && leaf == &name.name)
-                            || (unambiguous
-                                && schema.to_lowercase() == name.schema.to_lowercase()
-                                && leaf.to_lowercase() == name.name.to_lowercase())
-                    })
-                } else {
-                    self.may_name_qualified_exact(&module.definition, &name.schema, &name.name)
-                        || (unambiguous
-                            && self.may_name_qualified(
-                                &module.definition,
-                                &name.schema,
-                                &name.name,
-                            ))
-                };
-                if bound {
-                    // Exists alone does not state which definition a binding
-                    // needs. Final joins the callee's in-place rewrite without
-                    // a new pass or a positional dependency (DEC-2192.1).
-                    fx.requires.push(Requirement::Is(
-                        ObjectKey::Module(callee.clone()),
-                        Incarnation::Final,
-                    ));
+            for callee in schema_bound_callees(self, id, module, after.schema) {
+                fx.requires.push(Requirement::Is(
+                    ObjectKey::Module(callee),
+                    Incarnation::Final,
+                ));
+            }
+        }
+        // The old binding survives until this payload releases it. A split
+        // caller releases at DROP, never at its later CREATE (DEC-2228.1).
+        let releasing = if let Change::AlterModule { id, module } = op.change() {
+            Some((id, Some(module.as_ref())))
+        } else if let Change::DropModule { id, .. } = op.change() {
+            Some((id, None))
+        } else {
+            None
+        };
+        if let Some((id, replacement)) = releasing
+            && let Some(old) = before.schema.modules.get(id)
+            && old.kind == pbps_model::ModuleKind::Function
+            && introspect::function_is_schema_bound(&old.definition)
+        {
+            let kept = replacement
+                .filter(|module| introspect::function_is_schema_bound(&module.definition))
+                .map(|module| schema_bound_callees(self, id, module, after.schema))
+                .unwrap_or_default();
+            for callee in schema_bound_callees(self, id, old, before.schema) {
+                if !kept.contains(&callee) {
+                    fx.requires
+                        .push(Requirement::BeforeRewrite(ObjectKey::Module(callee)));
                 }
             }
         }
+
         // A computed column the plan replaces under its own name with an
         // expression that no longer reads what the step changes does not
         // stand in its way: its baseline incarnation goes, and a requirement

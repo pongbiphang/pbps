@@ -40,6 +40,8 @@ pub enum Because {
     Creates(ObjectKey),
     /// The earlier rewrites what the later requires, or reads the new name of.
     Rewrites(ObjectKey),
+    /// The earlier releases what would block the later rewrite.
+    BeforeRewrite(ObjectKey),
     /// The later removes what the earlier requires.
     Removes(ObjectKey),
     /// The earlier removes what the later needs gone.
@@ -118,6 +120,27 @@ impl Graph {
     pub fn edges_from(&self, source: Source) -> impl Iterator<Item = &Edge> {
         self.edges.iter().filter(move |e| e.source == source)
     }
+}
+
+/// The connected computed-column pass owns these release edges. An earlier
+/// schedule cannot apply their lexical approximation before that pass reads
+/// the catalog (DEC-1431.1, DEC-2228.1).
+pub(crate) fn connected_module_release(edge: &Edge, operations: &[Operation]) -> bool {
+    matches!(
+        &edge.because,
+        Because::Frees(ObjectKey::Part {
+            part: pbps_model::operation::PartKey::Computed(_),
+            ..
+        }) | Because::Precedes(ObjectKey::Part {
+            part: pbps_model::operation::PartKey::Computed(_),
+            ..
+        })
+    ) && [edge.before, edge.after].into_iter().any(|at| {
+        matches!(
+            operations[at].change(),
+            pbps_model::Change::AlterModule { .. } | pbps_model::Change::DropModule { .. }
+        )
+    })
 }
 
 /// What the baseline holds. Rows and permissions are not in it, and
@@ -236,7 +259,8 @@ fn normalised(effects: &Effects, incarnations: bool) -> Effects {
                 other @ (Requirement::Exists(_)
                 | Requirement::Bound(..)
                 | Requirement::Absent(_)
-                | Requirement::Reads(_)) => other.clone(),
+                | Requirement::Reads(_)
+                | Requirement::BeforeRewrite(_)) => other.clone(),
             })
             .collect(),
     }
@@ -471,6 +495,11 @@ pub fn graph(
                             operation: b,
                             requirement: requirement.clone(),
                         });
+                    }
+                }
+                Requirement::BeforeRewrite(_) => {
+                    for &a in rewriters {
+                        edge(b, a, Source::Effect, Because::BeforeRewrite(key.clone()));
                     }
                 }
                 Requirement::Reads(_) => {

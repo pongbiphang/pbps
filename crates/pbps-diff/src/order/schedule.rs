@@ -549,7 +549,8 @@ pub fn reason(edge: &Edge, operations: &[Operation]) -> OrderReason {
             Because::Creates(key)
             | Because::Removes(key)
             | Because::Frees(key)
-            | Because::Precedes(key) => of_key(key),
+            | Because::Precedes(key)
+            | Because::BeforeRewrite(key) => of_key(key),
             // A rename moves the address its reader spells.
             Because::Rewrites(key) => {
                 let renames = |i: usize| {

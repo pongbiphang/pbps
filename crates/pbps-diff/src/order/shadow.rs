@@ -118,7 +118,8 @@ pub(crate) fn observe_plan(
 #[cfg(any(test, debug_assertions))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
-    /// The class order, before the shared schedule releases constraint slots.
+    /// The class order, before the shared schedule releases constraint slots
+    /// and baseline bindings.
     BeforeSchedule,
     /// Before the connected passes: a computed column and its function may
     /// still be in the wrong order.
@@ -324,14 +325,25 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
                 before,
                 after,
                 edge,
-            } if (module_op(*before) || module_op(*after))
-                && matches!(
-                    &edge.because,
-                    Because::Frees(key) | Because::Precedes(key) if computed(key)
-                ) =>
-            {
+            } if stage != Stage::Final && super::edges::connected_module_release(edge, ops) => {
                 format!(
                     "connected {} must precede {} because {:?}",
+                    name(*before),
+                    name(*after),
+                    edge.because
+                )
+            }
+            // The shared schedule owns this edge. Before it runs, record
+            // it rather than rejecting the class order it will repair.
+            Violation::Edge {
+                before,
+                after,
+                edge,
+            } if stage == Stage::BeforeSchedule
+                && matches!(edge.because, Because::BeforeRewrite(_)) =>
+            {
+                format!(
+                    "scheduled {} must precede {} because {:?}",
                     name(*before),
                     name(*after),
                     edge.because
@@ -352,9 +364,11 @@ pub(crate) fn judge(ops: &[Operation], report: &Report, stage: Stage) -> (Vec<St
             }
         })
         .collect();
-    let any = violations
-        .iter()
-        .any(|v| !v.starts_with("unprovided ") && !v.starts_with("connected "));
+    let any = violations.iter().any(|v| {
+        !v.starts_with("unprovided ")
+            && !v.starts_with("connected ")
+            && !v.starts_with("scheduled ")
+    });
     (violations, any)
 }
 
