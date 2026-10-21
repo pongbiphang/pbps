@@ -1,6 +1,6 @@
 //! Sealing a run's answer into the plan's evidence, and the run's errors.
 
-use super::{Error, ResolvedPlan, ScopeRequest, transitions};
+use super::{Error, ResolvedPlan, ScopeRequest, engine, transitions};
 use crate::resolver::scope;
 use pbps_db::fingerprint::EnvironmentFingerprintKey;
 use pbps_model::Hints;
@@ -8,19 +8,16 @@ use pbps_model::resolver::{Qualification, ResolverEvidence, ResolverRuntime};
 use std::collections::BTreeSet;
 
 pub(super) fn request(
+    driver: pbps_db::Driver,
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
     hints: &Hints,
     extras: &[String],
 ) -> Result<ScopeRequest, Error> {
-    let dialect = pbps_pg::Postgres::with_write_path_extras(extras.to_vec());
     // The same plan `pbps_diff::resolver::plan` starts from: without
     // ADR-0013's candidate rebuilds, or the scope qualified here and the
     // grants sealed at the end could describe two different plans.
-    let ordinary =
-        pbps_diff::resolver::ordinary(base, desired, &dialect, hints).map_err(|errors| {
-            Error::Binding(format!("ordinary typed plan cannot be formed: {errors:?}"))
-        })?;
+    let ordinary = engine::ordinary(driver, base, desired, hints, extras)?;
     let planned = scope::planned_schema_grants(&ordinary).map_err(Error::Scope)?;
     let mut schemas = BTreeSet::new();
     for schema in [base.schema, desired.schema] {
@@ -204,7 +201,7 @@ pub(super) struct Opening {
     pub scope_schemas: Vec<String>,
     /// The opening capture: its scope, which holds the externals file's staged
     /// objects, and its dropped signatures are captured again.
-    pub current: pbps_pg::resolver::capture::CapturedInputs,
+    pub current: engine::CapturedInputs,
     /// The `system_identifier` the planning read recorded (DEC-1685.1).
     pub planned_identity: String,
 }
@@ -245,7 +242,7 @@ impl Unsealed {
         let read = |what: &'static str| {
             move |error: pbps_db::DbError| Error::Read(format!("the recheck's {what}: {error}"))
         };
-        let identity = pbps_pg::resolver::scratch::cluster_identity(target)
+        let identity = engine::target_identity(self.opening.driver, target)
             .await
             .map_err(read("cluster identity"))?;
         if identity != self.opening.planned_identity {
@@ -279,16 +276,10 @@ impl Unsealed {
         if catalog != self.sealing.opening_catalog {
             changed.push("the target's reported facts".to_owned());
         }
-        let canonical = |authorization: &scope::Authorization| match authorization {
-            scope::Authorization::Postgres(context) => Some(context.canonical()),
-            scope::Authorization::Mssql(_) => None,
-        };
-        if canonical(&authorization).is_none()
-            || canonical(&authorization) != canonical(&self.sealing.authorization)
-        {
+        if !authorization.same_context(&self.sealing.authorization) {
             changed.push("the target deployer's authorization".to_owned());
         }
-        let (_, differences) = pbps_pg::resolver::capture::recapture(target, &self.opening.current)
+        let differences = engine::recapture(target, &self.opening.current)
             .await
             .map_err(|error| Error::Read(format!("the recheck's capture: {error}")))?;
         changed.extend(differences.iter().map(|difference| {

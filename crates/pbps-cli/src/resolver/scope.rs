@@ -321,6 +321,16 @@ pub(crate) fn planned_schema_grants(
 }
 
 impl Authorization {
+    /// The publication recheck compares the engine's complete context, before
+    /// any grant projection, rather than only its persisted digest.
+    pub(crate) fn same_context(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Postgres(left), Self::Postgres(right)) => left.canonical() == right.canonical(),
+            (Self::Postgres(_), Self::Mssql(_))
+            | (Self::Mssql(_), Self::Postgres(_) | Self::Mssql(_)) => false,
+        }
+    }
+
     /// The name of the versioned authorization rule the context was read
     /// under.
     pub(crate) fn rule(&self) -> &'static str {

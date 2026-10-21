@@ -9,7 +9,7 @@
 //! It talks to whatever `docker` the runner has: Docker, rootless Docker, or
 //! Podman through its compatible command or socket (`DOCKER_HOST`).
 
-use super::super::{Error, ProduceError};
+use super::super::{Error, ProduceError, engine};
 use pbps_config::resolver::PullPolicy;
 use pbps_db::{Conn, Driver};
 use std::time::Duration;
@@ -36,7 +36,7 @@ pub async fn with_container<T>(
 ) -> Result<T, ProduceError> {
     bind_target(driver, target_connection, planned_identity).await?;
     acquire(image, pull).await?;
-    let container = Container::start(image).await?;
+    let container = Container::start(driver, image).await?;
     let outcome = match container.ready(driver, READY).await {
         Ok(()) => run(&container.connection).await,
         Err(error) => Err(error),
@@ -61,7 +61,7 @@ async fn bind_target(
                 "the target could not be connected: {error}"
             )))
         })?;
-    let identity = pbps_pg::resolver::scratch::cluster_identity(&mut target)
+    let identity = engine::target_identity(driver, &mut target)
         .await
         .map_err(|error| {
             ProduceError::Run(Error::Read(format!(
@@ -108,22 +108,25 @@ async fn acquire(image: &str, pull: PullPolicy) -> Result<(), ProduceError> {
 struct Container {
     id: String,
     connection: String,
+    engine: engine::Docker,
     /// Set once `remove` confirmed it gone, so the drop guard stands down.
     removed: bool,
 }
 
 impl Container {
-    async fn start(image: &str) -> Result<Self, ProduceError> {
+    async fn start(driver: Driver, image: &str) -> Result<Self, ProduceError> {
         let password = format!("{:032x}", rand::random::<u128>());
+        let engine = engine::docker(driver, &password)?;
         // Named by the run before it is asked for, so a `docker run` that
         // created the container and then failed, timed out or was cancelled
         // leaves one this run can still name and remove.
         let mut container = Self {
             id: format!("pbps-scratch-{:016x}", rand::random::<u64>()),
             connection: String::new(),
+            engine,
             removed: false,
         };
-        let args = run_args(&container.id, &password, image);
+        let args = run_args(&container.id, &container.engine, image);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         let started = match run_to_end(&args).await {
             Ok(started) => {
@@ -135,10 +138,16 @@ impl Container {
             }
         };
         let port = match started {
-            Ok(_) => docker(&["port", &container.id, "5432/tcp"])
-                .await
-                .map_err(|why| ProduceError::Acquire(format!("its published port: {why}")))
-                .and_then(|text| published_port(&text).map_err(ProduceError::Acquire)),
+            Ok(_) => docker(&[
+                "port",
+                &container.id,
+                &format!("{}/tcp", container.engine.port),
+            ])
+            .await
+            .map_err(|why| ProduceError::Acquire(format!("its published port: {why}")))
+            .and_then(|text| {
+                published_port(&text, container.engine.port).map_err(ProduceError::Acquire)
+            }),
             Err(error) => Err(error),
         };
         let port = match port {
@@ -150,10 +159,7 @@ impl Container {
                 };
             }
         };
-        container.connection = format!(
-            "host=127.0.0.1 port={port} user=postgres password={password} dbname=postgres \
-             sslmode=disable"
-        );
+        container.connection = container.engine.connection(port, &password)?;
         Ok(container)
     }
 
@@ -168,7 +174,7 @@ impl Container {
                 let mut conn = Conn::connect(driver, &self.connection)
                     .await
                     .map_err(|error| error.to_string())?;
-                conn.query("SELECT 1 AS ok")
+                conn.query(self.engine.readiness_query)
                     .await
                     .map(|_| ())
                     .map_err(|error| error.to_string())
@@ -297,8 +303,8 @@ pub(super) fn process_label() -> String {
 }
 
 /// The `docker run` that starts the scratch server.
-fn run_args(name: &str, password: &str, image: &str) -> Vec<String> {
-    [
+fn run_args(name: &str, engine: &engine::Docker, image: &str) -> Vec<String> {
+    let mut args: Vec<String> = [
         "run",
         "--detach",
         // Any pull the policy allows was made by `acquire`; an image that
@@ -314,17 +320,22 @@ fn run_args(name: &str, password: &str, image: &str) -> Vec<String> {
         // owner, and what lets the live tests count only their own (#2095).
         "--label",
         &process_label(),
-        "--env",
-        &format!("POSTGRES_PASSWORD={password}"),
-        // An omitted host port: Docker and Podman both pick a free one, on
-        // loopback only, so nothing off this host can reach the server.
-        "--publish",
-        "127.0.0.1::5432",
-        image,
     ]
     .into_iter()
     .map(str::to_owned)
-    .collect()
+    .collect();
+    for variable in &engine.environment {
+        args.push("--env".into());
+        args.push(variable.clone());
+    }
+    // An omitted host port: Docker and Podman both pick a free one, on
+    // loopback only, so nothing off this host can reach the server.
+    args.extend([
+        "--publish".into(),
+        format!("127.0.0.1::{}", engine.port),
+        image.into(),
+    ]);
+    args
 }
 
 /// A `docker run` that did not finish leaves the daemon's create request
@@ -379,7 +390,7 @@ async fn run_to_end(args: &[&str]) -> Result<Result<String, String>, String> {
 
 /// Exactly the one loopback mapping asked for. Accepting any line, or any
 /// suffix, would hide a second, public bind.
-fn published_port(text: &str) -> Result<u16, String> {
+fn published_port(text: &str, container_port: u16) -> Result<u16, String> {
     text.trim()
         .strip_prefix("127.0.0.1:")
         .filter(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
@@ -387,7 +398,7 @@ fn published_port(text: &str) -> Result<u16, String> {
         .filter(|port| *port != 0)
         .ok_or_else(|| {
             format!(
-                "docker did not publish exactly one loopback port for 5432: {}",
+                "docker did not publish exactly one loopback port for {container_port}: {}",
                 text.trim()
             )
         })
@@ -449,7 +460,8 @@ mod tests {
     /// be fetched, not only at the inspection before it.
     #[test]
     fn the_launch_never_pulls_and_publishes_on_loopback_only() {
-        let args = run_args("pbps-scratch-0", "secret", "postgres:18");
+        let engine = super::engine::docker(Driver::Postgres, "secret").unwrap();
+        let args = run_args("pbps-scratch-0", &engine, "postgres:18");
         let after = |flag: &str| {
             let at = args
                 .iter()
@@ -458,6 +470,18 @@ mod tests {
             args[at + 1].as_str()
         };
         assert_eq!(after("--pull"), "never");
+        assert_eq!(after("--env"), "POSTGRES_PASSWORD=secret");
+        assert_eq!(engine.readiness_query, "SELECT 1 AS ok");
+        assert_eq!(
+            engine.connection(41417, "secret").unwrap(),
+            "host=127.0.0.1 port=41417 user=postgres password=secret dbname=postgres sslmode=disable"
+        );
+        let Err(super::ProduceError::Run(super::Error::Binding(reason))) =
+            super::engine::docker(Driver::Mssql, "secret")
+        else {
+            panic!("SQL Server has no Docker scratch adapter");
+        };
+        assert_eq!(reason, "the resolver is implemented for PostgreSQL only");
         assert_eq!(after("--publish"), "127.0.0.1::5432");
         assert_eq!(after("--name"), "pbps-scratch-0");
         let labels: Vec<&str> = args
@@ -522,6 +546,7 @@ mod tests {
             connection: format!(
                 "host=127.0.0.1 port={port} user=postgres password=x dbname=postgres sslmode=disable"
             ),
+            engine: super::engine::docker(Driver::Postgres, "x").unwrap(),
             // Nothing was started: the drop guard has nothing to remove.
             removed: true,
         };
@@ -563,7 +588,7 @@ mod tests {
 
     #[test]
     fn only_one_loopback_mapping_is_a_published_port() {
-        assert_eq!(published_port("127.0.0.1:41417\n"), Ok(41417));
+        assert_eq!(published_port("127.0.0.1:41417\n", 5432), Ok(41417));
         // Negative: a public, IPv6, zero or second bind is not.
         for text in [
             "0.0.0.0:49154",
@@ -573,7 +598,7 @@ mod tests {
             "127.0.0.1:41417\n0.0.0.0:41417\n",
             "",
         ] {
-            assert!(published_port(text).is_err(), "{text:?}");
+            assert!(published_port(text, 5432).is_err(), "{text:?}");
         }
     }
 }

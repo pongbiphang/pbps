@@ -370,9 +370,7 @@ mod producer {
                 pbps_model::resolver::OutsideWrites::Allowed
             }
         };
-        let run = async |scratch: &str,
-                         standard: &pbps_pg::resolver::standard::Standard,
-                         provenance: Provenance| {
+        let run = async |scratch: &str, standard: &scratch::Standard, provenance: Provenance| {
             scratch::produce_unsealed(
                 driver,
                 scratch,
@@ -405,7 +403,8 @@ mod producer {
                 };
                 run(
                     &scratch,
-                    &scratch::declared_standard(standard.as_ref()),
+                    &scratch::declared_standard(driver, standard.as_ref())
+                        .map_err(|error| refused(request, ProduceError::Run(error)))?,
                     provenance,
                 )
                 .await
@@ -425,7 +424,12 @@ mod producer {
                     image,
                     *pull,
                     async |scratch: &str| {
-                        run(scratch, &scratch::declared_standard(None), provenance).await
+                        run(
+                            scratch,
+                            &scratch::declared_standard(driver, None).map_err(ProduceError::Run)?,
+                            provenance,
+                        )
+                        .await
                     },
                 )
                 .await
@@ -878,21 +882,21 @@ mod tests {
             pbps_db::Driver::Mssql,
         );
         assert_eq!(mssql.id, "resolver.unresolved");
-        assert!(
-            mssql.message.contains("PostgreSQL only")
-                && mssql
-                    .message
-                    .contains("SQL Server resolution is not built yet"),
-            "{}",
-            mssql.message
+        assert_eq!(
+            mssql.message,
+            format!(
+                "the selected resolver `local` cannot answer the binding questions of {}: \
+                 the resolver answers for PostgreSQL only; SQL Server resolution is not built yet \
+                 (#619, #620).",
+                named(&assessment),
+            ),
         );
-        assert!(
-            mssql
-                .remedy
-                .as_deref()
-                .is_some_and(|r| r.contains("Select no resolver")),
-            "{:?}",
-            mssql.remedy
+        assert_eq!(
+            mssql.remedy.as_deref(),
+            Some(
+                "Select no resolver for this environment: without one, the existing protection \
+                  keeps deciding (DEC-1515.1)."
+            ),
         );
         let postgres = refusal(
             "postgres://pbps@127.0.0.1:1/pbps",
