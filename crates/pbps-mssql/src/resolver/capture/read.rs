@@ -90,7 +90,7 @@ pub(super) struct ForeignKey {
     /// The key constraint whose index the key binds, or `None` when it binds
     /// a unique index that is no constraint, named then by `index`.
     pub key: Option<i64>,
-    pub index: String,
+    pub index: pbps_model::ObjectLocalName,
     pub on_delete: String,
     pub on_update: String,
     pub disabled: bool,
@@ -219,7 +219,7 @@ pub(super) struct Catalog {
     pub keys: BTreeMap<i64, Key>,
     /// Each table's unique indexes that are no constraint, by the table's
     /// object id: a foreign key may bind one as it binds a key.
-    pub unique_indexes: BTreeMap<i64, BTreeMap<String, Key>>,
+    pub unique_indexes: BTreeMap<i64, BTreeMap<pbps_model::ObjectLocalName, Key>>,
     /// Each foreign key, by its object id.
     pub foreign_keys: BTreeMap<i64, ForeignKey>,
     /// Every row of each view in `columns::VIEWS` that describes something
@@ -1043,13 +1043,14 @@ pub(super) async fn read(
             row.flag("descending")?,
         ));
     }
-    let mut unique_indexes: BTreeMap<i64, BTreeMap<String, Key>> = BTreeMap::new();
+    let mut unique_indexes: BTreeMap<i64, BTreeMap<pbps_model::ObjectLocalName, Key>> =
+        BTreeMap::new();
     for row in rows(conn, UNIQUE_INDEXES).await? {
         let row = Text(&row);
         let index = unique_indexes
             .entry(row.number("id")?)
             .or_default()
-            .entry(row.required("name")?)
+            .entry(row.required("name")?.into())
             .or_default();
         index.index = row.required("index")?;
         index.disabled = row.flag("disabled")?;
@@ -1067,7 +1068,7 @@ pub(super) async fn read(
             ForeignKey {
                 referenced: row.number("referenced")?,
                 key: row.optional_number("key")?,
-                index: row.required("index")?,
+                index: row.required("index")?.into(),
                 on_delete: row.required("on_delete")?,
                 on_update: row.required("on_update")?,
                 disabled: row.flag("disabled")?,

@@ -1136,10 +1136,10 @@ mod tests {
                     )
                 });
                 let dependent = at(
-                    &|change| matches!(change, Change::AddForeignKey { name, .. } if name == "dependent"),
+                    &|change| matches!(change, Change::AddForeignKey { name, .. } if name.raw() == "dependent"),
                 );
                 let unrelated = at(
-                    &|change| matches!(change, Change::AddForeignKey { name, .. } if name == "unrelated"),
+                    &|change| matches!(change, Change::AddForeignKey { name, .. } if name.raw() == "unrelated"),
                 );
                 assert!(release < claim, "{kind}, drop={drop_trigger}: {changes:?}");
                 if kind != "check" {

@@ -37,8 +37,8 @@ impl<'a> Slot<'a> {
     fn index(part: &'a IndexPart) -> Self {
         match part {
             IndexPart::PrimaryKey => Self::PrimaryKey,
-            IndexPart::Unique(name) => Self::Unique(name),
-            IndexPart::Index(name) => Self::Index(name),
+            IndexPart::Unique(name) => Self::Unique(name.raw()),
+            IndexPart::Index(name) => Self::Index(name.raw()),
         }
     }
 
@@ -82,11 +82,11 @@ impl<'a> Slot<'a> {
 
     fn all(table: &Fields<'a>) -> BTreeSet<Self> {
         std::iter::once(Self::PrimaryKey)
-            .chain(table.unique.keys().map(|n| Self::Unique(n)))
-            .chain(table.foreign_keys.keys().map(|n| Self::ForeignKey(n)))
+            .chain(table.unique.keys().map(|n| Self::Unique(n.raw())))
+            .chain(table.foreign_keys.keys().map(|n| Self::ForeignKey(n.raw())))
             .chain(table.row_policies.keys().map(|n| Self::Policy(n)))
-            .chain(table.checks.keys().map(|n| Self::Check(n)))
-            .chain(table.indexes.keys().map(|n| Self::Index(n)))
+            .chain(table.checks.keys().map(|n| Self::Check(n.raw())))
+            .chain(table.indexes.keys().map(|n| Self::Index(n.raw())))
             .chain(table.computed.keys().map(|n| Self::Computed(n.raw())))
             .collect()
     }
@@ -187,8 +187,8 @@ impl<'a> PartChanges<'a> {
         // Own the selector before mutating the table it may borrow from.
         let selector = match expected_holder {
             Some(Slot::PrimaryKey) => None,
-            Some(Slot::Unique(n)) => Some(pbps_model::Clustered::Unique(n.to_owned())),
-            Some(Slot::Index(n)) => Some(pbps_model::Clustered::Index(n.to_owned())),
+            Some(Slot::Unique(n)) => Some(pbps_model::Clustered::Unique(n.to_owned().into())),
+            Some(Slot::Index(n)) => Some(pbps_model::Clustered::Index(n.to_owned().into())),
             None => Some(pbps_model::Clustered::Heap),
             Some(Slot::ForeignKey(_) | Slot::Check(_) | Slot::Computed(_) | Slot::Policy(_)) => {
                 unreachable!("only index-backed parts hold rows")
@@ -204,19 +204,19 @@ impl<'a> PartChanges<'a> {
                                 table.primary_key = Some(value.clone())
                             }
                             PartDefinition::Unique(value, _) => {
-                                table.unique.insert(name, value.clone());
+                                table.unique.insert(name.into(), value.clone());
                             }
                             PartDefinition::ForeignKey(value) => {
-                                table.foreign_keys.insert(name, value.clone());
+                                table.foreign_keys.insert(name.into(), value.clone());
                             }
                             PartDefinition::Policy(value) => {
                                 table.row_policies.insert(name, value.clone());
                             }
                             PartDefinition::Check(value) => {
-                                table.checks.insert(name, value.clone());
+                                table.checks.insert(name.into(), value.clone());
                             }
                             PartDefinition::Index(value, _) => {
-                                table.indexes.insert(name, value.clone());
+                                table.indexes.insert(name.into(), value.clone());
                             }
                             PartDefinition::Computed(value) => {
                                 table.computed.insert(name.into(), value.clone());
@@ -474,8 +474,8 @@ pub(super) fn created_layout(expected: &Table, now: &Fields<'_>, whole: bool) ->
 fn holder<'a>(table: &Fields<'a>) -> Option<Slot<'a>> {
     match table.clustered {
         None if table.primary_key.is_some() => Some(Slot::PrimaryKey),
-        Some(pbps_model::Clustered::Unique(n)) => Some(Slot::Unique(n)),
-        Some(pbps_model::Clustered::Index(n)) => Some(Slot::Index(n)),
+        Some(pbps_model::Clustered::Unique(n)) => Some(Slot::Unique(n.raw())),
+        Some(pbps_model::Clustered::Index(n)) => Some(Slot::Index(n.raw())),
         None | Some(pbps_model::Clustered::Heap) => None,
     }
 }
@@ -542,4 +542,88 @@ fn part_as_planned(
             now.persisted == was.persisted && (!was.not_null || now.not_null)
         }
     })
+}
+
+#[cfg(test)]
+mod local_name_key_tests {
+    use super::*;
+    use pbps_model::{CheckConstraint, Index, IndexColumn, PlannedChange};
+
+    #[test]
+    fn created_parts_and_selector_reads_keep_raw_names_through_the_borrowed_slots() {
+        const RAW: &str = "part\nline\\slash\u{200b}";
+        const SHOWN: &str = r"part\nline\\slash\u{200b}";
+        let name = TableName::new("app", "t");
+        let index = Index {
+            columns: vec![IndexColumn::column("id")],
+            include: vec![],
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        let changes = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::AddUnique {
+                    table: name.clone(),
+                    name: format!("uq{RAW}").into(),
+                    constraint: pbps_model::UniqueConstraint {
+                        columns: vec!["id".into()],
+                        storage_parameters: Default::default(),
+                    },
+                    clustered: false,
+                }),
+                PlannedChange::new(Change::AddForeignKey {
+                    table: name.clone(),
+                    name: format!("fk{RAW}").into(),
+                    constraint: Box::new(pbps_model::ForeignKey {
+                        columns: vec!["id".into()],
+                        references_table: TableName::new("app", "parent"),
+                        references_columns: vec!["id".into()],
+                        on_delete: Default::default(),
+                        on_update: Default::default(),
+                    }),
+                }),
+                PlannedChange::new(Change::AddCheck {
+                    table: name.clone(),
+                    name: format!("ck{RAW}").into(),
+                    constraint: CheckConstraint {
+                        expression: "id > 0".into(),
+                    },
+                }),
+                PlannedChange::new(Change::AddIndex {
+                    table: name.clone(),
+                    name: format!("ix{RAW}").into(),
+                    index: Box::new(index.clone()),
+                    clustered: false,
+                }),
+            ],
+        };
+        let ids = pbps_model::IdsFile {
+            tables: [("t_aaaaaa".parse().unwrap(), name.clone())].into(),
+            ..Default::default()
+        };
+        let names = PlanNames::of(&changes.changes, &ids).unwrap();
+        let parts = PartChanges::of(&changes, &names);
+        let mut table = Table::default();
+        parts.created(&name, &mut table);
+        assert!(table.unique.contains_key(format!("uq{RAW}").as_str()));
+        assert!(table.foreign_keys.contains_key(format!("fk{RAW}").as_str()));
+        assert!(table.checks.contains_key(format!("ck{RAW}").as_str()));
+        assert!(table.indexes.contains_key(format!("ix{RAW}").as_str()));
+        assert!(!table.indexes.contains_key(format!("ix{SHOWN}").as_str()));
+        let mut other = index.clone();
+        other.unique = true;
+        table.indexes.insert(format!("ix{SHOWN}").into(), other);
+        let selector = IndexPart::Index(format!("ix{RAW}").into());
+        assert_eq!(
+            Slot::index(&selector).read(&Fields::of(&table)),
+            Some(PartDefinition::Index(&index, false))
+        );
+        let other_selector = IndexPart::Index(format!("ix{SHOWN}").into());
+        assert_ne!(
+            Slot::index(&other_selector).read(&Fields::of(&table)),
+            Some(PartDefinition::Index(&index, false))
+        );
+    }
 }

@@ -54,12 +54,12 @@ pub enum Event<'p> {
     },
     AddForeignKey {
         table: &'p TableName,
-        name: &'p String,
+        name: &'p pbps_model::ObjectLocalName,
         constraint: &'p ForeignKey,
     },
     DropForeignKey {
         table: &'p TableName,
-        name: &'p String,
+        name: &'p pbps_model::ObjectLocalName,
     },
     AttachPartition {
         table: &'p TableName,
@@ -297,13 +297,13 @@ pub struct View<'v, 'p> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Removal {
     Table,
-    Keys(Vec<String>),
+    Keys(Vec<pbps_model::ObjectLocalName>),
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Removed {
     pub stored_table: TableName,
-    pub constraint: Option<String>,
+    pub constraint: Option<pbps_model::ObjectLocalName>,
 }
 
 impl<'p> View<'_, 'p> {

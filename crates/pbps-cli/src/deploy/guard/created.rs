@@ -234,27 +234,51 @@ impl Created<'_> {
         );
         named(
             "unique",
-            self.finished.unique.keys().map(String::as_str).collect(),
-            now.unique.keys().map(String::as_str).collect(),
+            self.finished
+                .unique
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect(),
+            now.unique
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect(),
         );
         named(
             "foreign key",
             self.finished
                 .foreign_keys
                 .keys()
-                .map(String::as_str)
+                .map(pbps_model::ObjectLocalName::raw)
                 .collect(),
-            now.foreign_keys.keys().map(String::as_str).collect(),
+            now.foreign_keys
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect(),
         );
         named(
             "check",
-            self.finished.checks.keys().map(String::as_str).collect(),
-            now.checks.keys().map(String::as_str).collect(),
+            self.finished
+                .checks
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect(),
+            now.checks
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect(),
         );
         named(
             "index",
-            self.finished.indexes.keys().map(String::as_str).collect(),
-            now.indexes.keys().map(String::as_str).collect(),
+            self.finished
+                .indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect(),
+            now.indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect(),
         );
         // Created inside the `CREATE TABLE`, never split out of it, so the
         // payload names every one (#1174 review).
@@ -354,7 +378,8 @@ impl Created<'_> {
                 moved.push(format!(
                     "{now_name} unique `{n}` is not the one this plan's `CREATE TABLE` \
                      declares",
-                    now_name = now_name.shown()
+                    now_name = now_name.shown(),
+                    n = n.shown(),
                 ));
             }
         }
@@ -369,7 +394,8 @@ impl Created<'_> {
             {
                 moved.push(format!(
                     "{now_name} foreign key `{n}` is not the one this plan adds",
-                    now_name = now_name.shown()
+                    now_name = now_name.shown(),
+                    n = n.shown(),
                 ));
             }
         }
@@ -380,7 +406,8 @@ impl Created<'_> {
                 moved.push(format!(
                     "{now_name} index `{n}` is not the one this plan's `CREATE TABLE` \
                      declares",
-                    now_name = now_name.shown()
+                    now_name = now_name.shown(),
+                    n = n.shown(),
                 ));
             }
         }

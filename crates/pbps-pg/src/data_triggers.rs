@@ -46,7 +46,7 @@ pub struct Guard {
 pub struct Dropped {
     pub modules: BTreeSet<ModuleId>,
     /// Referencing table and constraint name, as `pg_constraint` spells them.
-    pub foreign_keys: BTreeSet<(TableName, String)>,
+    pub foreign_keys: BTreeSet<(TableName, pbps_model::ObjectLocalName)>,
     pub tables: BTreeSet<TableName>,
 }
 
@@ -802,7 +802,7 @@ fn gone(dropped: &Dropped) -> String {
             format!(
                 "({} AND declared.conname = {})",
                 of_table(table),
-                literal(name)
+                literal(name.raw())
             )
         })
         .collect();

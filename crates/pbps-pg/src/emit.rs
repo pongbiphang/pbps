@@ -70,7 +70,7 @@ pub(crate) fn drop_failed_index(build: &pbps_dialect::IndexBuild) -> Result<Stri
     Ok(format!(
         "DROP INDEX CONCURRENTLY {}.{};",
         quote(&build.table.schema)?,
-        quote(&build.name)?
+        quote(build.name.raw())?
     ))
 }
 
@@ -80,7 +80,7 @@ pub(crate) fn drop_scan_check(check: &pbps_dialect::ScanCheck) -> Result<String,
     Ok(format!(
         "ALTER TABLE {} DROP CONSTRAINT {};",
         qualified(&check.table)?,
-        quote(&check.name)?
+        quote(check.name.raw())?
     ))
 }
 
@@ -1212,7 +1212,7 @@ fn primary_key_clause(pk: &PrimaryKey) -> Result<String, DialectError> {
     let cols = column_list(&pk.columns)?;
     let with = key_index_parameters(&pk.storage_parameters)?;
     Ok(match &pk.name {
-        Some(n) => format!("CONSTRAINT {} PRIMARY KEY ({cols}){with}", quote(n)?),
+        Some(n) => format!("CONSTRAINT {} PRIMARY KEY ({cols}){with}", quote(n.raw())?),
         // Unnamed leaves the server to invent one, which is a choice a user can
         // make and is emitted faithfully rather than named on their behalf.
         None => format!("PRIMARY KEY ({cols}){with}"),
@@ -1426,17 +1426,17 @@ fn detach_partition(
             // Only a key may be unnamed, and it keeps its name.
             continue;
         };
-        targets.push(literal(to));
-        let to = literal(to);
+        targets.push(literal(to.raw()));
+        let to = literal(to.raw());
         let found = match n.kind {
-            K::Check if to == literal(&n.parent) => continue,
+            K::Check if to == literal(n.parent.raw()) => continue,
             K::Check => {
                 checks.push(format!(
                     "{choose}\n\
                      \x20   tmp[{k}] := t;\n\
                      \x20   EXECUTE pg_catalog.format({constraint}, {from}, t);",
                     choose = choose_temporary(k),
-                    from = literal(&n.parent),
+                    from = literal(n.parent.raw()),
                 ));
                 None
             }
@@ -1452,7 +1452,7 @@ fn detach_partition(
                  AND pk.conrelid = {p}::pg_catalog.regclass::pg_catalog.oid \
                  AND pk.conname = {n}",
                 p = literal(&p),
-                n = literal(&n.parent)
+                n = literal(n.parent.raw())
             )),
             K::Index => Some(format!(
                 "SELECT ci.relname FROM pg_catalog.pg_inherits h \
@@ -1464,7 +1464,7 @@ fn detach_partition(
                  AND x.indrelid = {p}::pg_catalog.regclass::pg_catalog.oid \
                  AND pi.relname = {n}",
                 p = literal(&p),
-                n = literal(&n.parent)
+                n = literal(n.parent.raw())
             )),
         };
         let statement = if n.kind == K::Index {
@@ -1483,7 +1483,7 @@ fn detach_partition(
                  \x20       tmp[{k}] := t;\n\
                  \x20       EXECUTE pg_catalog.format({statement}, c, t);\n\
                  \x20   END IF;",
-                what = literal(&n.parent),
+                what = literal(n.parent.raw()),
                 t = literal(&q),
                 choose = choose_temporary(k),
             ));
@@ -1613,7 +1613,7 @@ fn choose_temporary(k: usize) -> String {
 fn drop_primary_key(table: &TableName, pk: &PrimaryKey) -> Result<String, DialectError> {
     let q = qualified(table)?;
     Ok(match &pk.name {
-        Some(n) => format!("ALTER TABLE {q} DROP CONSTRAINT {};", quote(n)?),
+        Some(n) => format!("ALTER TABLE {q} DROP CONSTRAINT {};", quote(n.raw())?),
         // Both interpolations are in **literal** position and neither is in
         // code position, which is the trap: the name is inside a `DO` body and
         // then again inside the format string that body executes, so quoting it
@@ -3533,7 +3533,7 @@ column.name.raw()
             match target {
                 // A unique constraint's index carries the constraint's name.
                 pbps_model::IndexPart::Unique(n) | pbps_model::IndexPart::Index(n) => {
-                    one(pg, table, alter(n)?)
+                    one(pg, table, alter(n.raw())?)
                 }
                 // The key's index is found when the statement runs, as an
                 // unnamed key's drop is: a pulled key carries its name, but a
@@ -3629,7 +3629,7 @@ column.name.raw()
             format!(
                 "ALTER TABLE {} ADD {};",
                 qualified(table)?,
-                unique_clause(name, constraint)?
+                unique_clause(name.raw(), constraint)?
             ),
         ),
 
@@ -3643,7 +3643,7 @@ column.name.raw()
             format!(
                 "ALTER TABLE {} ADD {};",
                 qualified(table)?,
-                foreign_key_clause(name, constraint)?
+                foreign_key_clause(name.raw(), constraint)?
             ),
         ),
 
@@ -3657,7 +3657,7 @@ column.name.raw()
             format!(
                 "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});",
                 qualified(table)?,
-                quote(name)?,
+                quote(name.raw())?,
                 verbatim(&constraint.expression)
             ),
         ),
@@ -3670,14 +3670,14 @@ column.name.raw()
             format!(
                 "ALTER TABLE {} DROP CONSTRAINT {};",
                 qualified(table)?,
-                quote(name)?
+                quote(name.raw())?
             ),
         ),
 
         Change::AddIndex {
             table, name, index, ..
         } => {
-            let sql = create_index(table, name, index, strategy)?;
+            let sql = create_index(table, name.raw(), index, strategy)?;
             if built_concurrently(index, strategy) {
                 // Alone in its batch and outside the transaction, because the
                 // engine says so in as many words: `CREATE INDEX CONCURRENTLY
@@ -3703,7 +3703,7 @@ column.name.raw()
         Change::DropIndex { table, name } => one(
             pg,
             table,
-            format!("DROP INDEX {}.{};", quote(&table.schema)?, quote(name)?),
+            format!("DROP INDEX {}.{};", quote(&table.schema)?, quote(name.raw())?),
         ),
 
         // The mode is a property of the declaration, not of the database: it
@@ -4124,7 +4124,7 @@ pub(crate) fn staged_attach(change: &Change) -> Option<Sql> {
     Some((|| {
         let name = scan_check_name(uid);
         let on = qualified(table)?;
-        let check = quote(&name)?;
+        let check = quote(name.raw())?;
         Ok(vec![
             Statement::new(format!(
                 "ALTER TABLE {on} ADD CONSTRAINT {check} CHECK ({expression}) NOT VALID;"
@@ -4146,8 +4146,8 @@ pub(crate) fn staged_attach(change: &Change) -> Option<Sql> {
 }
 
 /// The temporary CHECK's name for the table whose identity is `uid`.
-pub fn scan_check_name(uid: &pbps_model::Uid) -> String {
-    format!("{SCAN_CHECK_PREFIX}{uid}")
+pub fn scan_check_name(uid: &pbps_model::Uid) -> pbps_model::ObjectLocalName {
+    format!("{SCAN_CHECK_PREFIX}{uid}").into()
 }
 
 /// What every [`scan_check_name`] starts with, and no declared check may
@@ -4637,7 +4637,7 @@ fn create_table(
                 name,
                 &format!(
                     "ALTER TABLE {q} ADD CONSTRAINT {} CHECK ({});",
-                    quote(n)?,
+                    quote(n.raw())?,
                     verbatim(&c.expression)
                 ),
             )?);
@@ -4647,7 +4647,7 @@ fn create_table(
             out.push(on(
                 pg,
                 name,
-                &create_index(name, n, idx, Strategy::default())?,
+                &create_index(name, n.raw(), idx, Strategy::default())?,
             )?);
         }
         return Ok(out);
@@ -4746,7 +4746,7 @@ fn create_table(
         out.push(on(
             pg,
             name,
-            &format!("ALTER TABLE {q} ADD {};", unique_clause(n, u)?),
+            &format!("ALTER TABLE {q} ADD {};", unique_clause(n.raw(), u)?),
         )?);
     }
     for (n, c) in &table.checks {
@@ -4755,7 +4755,7 @@ fn create_table(
             name,
             &format!(
                 "ALTER TABLE {q} ADD CONSTRAINT {} CHECK ({});",
-                quote(n)?,
+                quote(n.raw())?,
                 verbatim(&c.expression)
             ),
         )?);
@@ -4764,7 +4764,7 @@ fn create_table(
         out.push(on(
             pg,
             name,
-            &format!("ALTER TABLE {q} ADD {};", foreign_key_clause(n, fk)?),
+            &format!("ALTER TABLE {q} ADD {};", foreign_key_clause(n.raw(), fk)?),
         )?);
     }
     for (n, idx) in &table.indexes {
@@ -4774,7 +4774,7 @@ fn create_table(
         out.push(on(
             pg,
             name,
-            &create_index(name, n, idx, Strategy::default())?,
+            &create_index(name, n.raw(), idx, Strategy::default())?,
         )?);
     }
     // Last: the index it may name is the last statement above (#1444).
@@ -4866,7 +4866,7 @@ fn set_replica_identity(
         // A UNIQUE constraint's index carries the constraint's name.
         Some(ReplicaIdentity::Unique(n) | ReplicaIdentity::Index(n)) => format!(
             "ALTER TABLE {q} REPLICA IDENTITY USING INDEX {};",
-            quote(n)?
+            quote(n.raw())?
         ),
         // Both interpolations in literal position, as in `drop_primary_key`.
         Some(ReplicaIdentity::PrimaryKey) => {
@@ -5614,7 +5614,7 @@ mod tests {
         let name = |kind, parent: &str, name: Option<&str>| DetachedName {
             kind,
             parent: parent.into(),
-            name: name.map(str::to_owned),
+            name: name.map(Into::into),
         };
         let detach = |table: &str, names: Vec<DetachedName>| {
             Postgres::new()
@@ -6439,7 +6439,7 @@ mod tests {
             c.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
                 start,
                 increment,
-                name: name.map(str::to_owned),
+                name: name.map(Into::into),
                 options: Default::default(),
             });
             c

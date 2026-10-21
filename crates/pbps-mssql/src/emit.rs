@@ -75,13 +75,13 @@ pub(crate) fn qualified(t: &TableName) -> Result<String, DialectError> {
 /// The table side, not the column side, because the columns that carry
 /// defaults are the ones most often spelled with an underscore (`created_at`,
 /// `is_active`). No environment was deployed under the old shape.
-pub fn default_constraint_name(table: &TableName, column: &str) -> String {
+pub fn default_constraint_name(table: &TableName, column: &str) -> pbps_model::ObjectLocalName {
     let full = format!("{DEFAULT_NAME_PREFIX}{}_{}", table.name, column);
     if !table.name.contains('_')
         && !ends_like_a_digest(&full)
         && utf16_units(&full) <= MAX_IDENT_CHARS
     {
-        return full;
+        return full.into();
     }
     digested_default_constraint_name(table, column)
 }
@@ -159,7 +159,10 @@ fn ends_like_a_digest(name: &str) -> bool {
 /// prefix. It is seeded with NUL between the parts: NUL is the one character
 /// [`quote`] refuses outright, so no name can contain one and no two different
 /// triples can spell the same seed.
-pub fn digested_default_constraint_name(table: &TableName, column: &str) -> String {
+pub fn digested_default_constraint_name(
+    table: &TableName,
+    column: &str,
+) -> pbps_model::ObjectLocalName {
     salted_default_constraint_name(table, column, None)
 }
 
@@ -168,7 +171,10 @@ pub fn digested_default_constraint_name(table: &TableName, column: &str) -> Stri
 /// one, unless that *is* the generated name — a table name with `_`, or one
 /// too long to keep — in which case a digest seeded with one more part, so
 /// it is a different name all the same.
-pub fn fallback_default_constraint_name(table: &TableName, column: &str) -> String {
+pub fn fallback_default_constraint_name(
+    table: &TableName,
+    column: &str,
+) -> pbps_model::ObjectLocalName {
     let digested = digested_default_constraint_name(table, column);
     if digested != default_constraint_name(table, column) {
         return digested;
@@ -178,7 +184,11 @@ pub fn fallback_default_constraint_name(table: &TableName, column: &str) -> Stri
 
 /// [`digested_default_constraint_name`], with `salt` as a fourth part of the
 /// seed when given. `None` is the generated digest, unchanged.
-fn salted_default_constraint_name(table: &TableName, column: &str, salt: Option<&[u8]>) -> String {
+fn salted_default_constraint_name(
+    table: &TableName,
+    column: &str,
+    salt: Option<&[u8]>,
+) -> pbps_model::ObjectLocalName {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -205,7 +215,7 @@ fn salted_default_constraint_name(table: &TableName, column: &str, salt: Option<
 
     let short_table = cut_to_utf16(&table.name, table_units);
     let short_column = cut_to_utf16(column, column_units);
-    format!("{DEFAULT_NAME_PREFIX}{short_table}_{short_column}_{digest}")
+    format!("{DEFAULT_NAME_PREFIX}{short_table}_{short_column}_{digest}").into()
 }
 
 /// Splits `budget` UTF-16 units between two parts that do not both fit.
@@ -726,7 +736,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             if let Some(expr) = to {
                 sql.push_str(&format!(
                     "ALTER TABLE {table} ADD CONSTRAINT {} DEFAULT ({}) FOR {};",
-                    quote(&default_constraint_name(&column.table, column.name.raw()))?,
+                    quote(default_constraint_name(&column.table, column.name.raw()).raw())?,
                     verbatim(expr),
                     quote(column.name.raw())?
                 ));
@@ -775,7 +785,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         } => one(format!(
             "ALTER TABLE {} ADD {}{};",
             qualified(table)?,
-            unique_clause(name, constraint, *clustered)?,
+            unique_clause(name.raw(), constraint, *clustered)?,
             online(strategy)
         )),
 
@@ -786,7 +796,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         } => one(format!(
             "ALTER TABLE {} ADD {};",
             qualified(table)?,
-            foreign_key_clause(name, constraint)?
+            foreign_key_clause(name.raw(), constraint)?
         )),
 
         Change::AddCheck {
@@ -796,7 +806,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         } => one(format!(
             "ALTER TABLE {} ADD CONSTRAINT {} CHECK ({});",
             qualified(table)?,
-            quote(name)?,
+            quote(name.raw())?,
             verbatim(&constraint.expression)
         )),
 
@@ -817,7 +827,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         | Change::DropCheck { table, name } => one(format!(
             "ALTER TABLE {} DROP CONSTRAINT {};",
             qualified(table)?,
-            quote(name)?
+            quote(name.raw())?
         )),
 
         Change::AddIndex {
@@ -825,7 +835,13 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
             name,
             index,
             clustered,
-        } => one(create_index(table, name, index, *clustered, strategy)?),
+        } => one(create_index(
+            table,
+            name.raw(),
+            index,
+            *clustered,
+            strategy,
+        )?),
 
         // No ONLINE clause, deliberately. SQL Server accepts `WITH (ONLINE =
         // ON)` on a drop only for a **clustered** index, where the drop rebuilds
@@ -838,7 +854,7 @@ pub fn emit(change: &Change, strategy: Strategy) -> Sql {
         // layout change's operational note names.
         Change::DropIndex { table, name } => one(format!(
             "DROP INDEX {} ON {};",
-            quote(name)?,
+            quote(name.raw())?,
             qualified(table)?
         )),
 
@@ -1695,7 +1711,7 @@ fn generated_column_definition(
     if let Some(expr) = default {
         s.push_str(&format!(
             " CONSTRAINT {} DEFAULT ({})",
-            quote(&default_constraint_name(table, name))?,
+            quote(default_constraint_name(table, name).raw())?,
             verbatim(expr)
         ));
     }
@@ -1747,7 +1763,10 @@ fn primary_key_clause(pk: &PrimaryKey, clustered: bool) -> Result<String, Dialec
         "NONCLUSTERED"
     };
     Ok(match &pk.name {
-        Some(n) => format!("CONSTRAINT {} PRIMARY KEY {layout} ({cols})", quote(n)?),
+        Some(n) => format!(
+            "CONSTRAINT {} PRIMARY KEY {layout} ({cols})",
+            quote(n.raw())?
+        ),
         // Unnamed leaves the server to invent one. That is a real choice a user
         // can make, so it is emitted faithfully rather than named on their behalf.
         None => format!("PRIMARY KEY {layout} ({cols})"),
@@ -2031,36 +2050,36 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
     // rebuilding them (#1178).
     let clustered_first = |clustered: bool| !clustered;
     let mut unique: Vec<_> = table.unique.iter().collect();
-    unique.sort_by_key(|(n, _)| clustered_first(table.unique_is_clustered(n)));
+    unique.sort_by_key(|(n, _)| clustered_first(table.unique_is_clustered(n.raw())));
     for (n, u) in unique {
         out.push(Statement::new(format!(
             "ALTER TABLE {qualified_name} ADD {};",
-            unique_clause(n, u, table.unique_is_clustered(n))?
+            unique_clause(n.raw(), u, table.unique_is_clustered(n.raw()))?
         )));
     }
     for (n, c) in &table.checks {
         out.push(Statement::new(format!(
             "ALTER TABLE {qualified_name} ADD CONSTRAINT {} CHECK ({});",
-            quote(n)?,
+            quote(n.raw())?,
             verbatim(&c.expression)
         )));
     }
     for (n, fk) in &table.foreign_keys {
         out.push(Statement::new(format!(
             "ALTER TABLE {qualified_name} ADD {};",
-            foreign_key_clause(n, fk)?
+            foreign_key_clause(n.raw(), fk)?
         )));
     }
     let mut indexes: Vec<_> = table.indexes.iter().collect();
-    indexes.sort_by_key(|(n, _)| clustered_first(table.index_is_clustered(n)));
+    indexes.sort_by_key(|(n, _)| clustered_first(table.index_is_clustered(n.raw())));
     for (n, idx) in indexes {
         // No ONLINE here: the table was created by the statement above it and
         // holds no rows, so there is nothing for an online build to spare.
         out.push(Statement::new(create_index(
             name,
-            n,
+            n.raw(),
             idx,
-            table.index_is_clustered(n),
+            table.index_is_clustered(n.raw()),
             Strategy::default(),
         )?));
     }
@@ -2086,23 +2105,23 @@ fn create_table(name: &TableName, table: &Table) -> Sql {
 fn rename_generated_default(
     table: &TableName,
     column: &str,
-    old: &str,
-    new: &str,
-    fallback: &str,
+    old: &pbps_model::ObjectLocalName,
+    new: &pbps_model::ObjectLocalName,
+    fallback: &pbps_model::ObjectLocalName,
 ) -> Result<Option<String>, DialectError> {
     if old == new {
         return Ok(None);
     }
     let schema = quote(&table.schema)?;
-    let at = |name: &str| -> Result<String, DialectError> {
-        Ok(literal(&format!("{schema}.{}", quote(name)?)))
+    let at = |name: &pbps_model::ObjectLocalName| -> Result<String, DialectError> {
+        Ok(literal(&format!("{schema}.{}", quote(name.raw())?)))
     };
-    let rename_to = |name: &str| -> Result<String, DialectError> {
+    let rename_to = |name: &pbps_model::ObjectLocalName| -> Result<String, DialectError> {
         Ok(format!(
             "IF OBJECT_ID({}) IS NULL EXEC sp_rename {}, {}, 'OBJECT'",
             at(name)?,
             at(old)?,
-            literal(name)
+            literal(name.raw())
         ))
     };
     let mut body = rename_to(new)?;
@@ -2117,7 +2136,7 @@ fn rename_generated_default(
          AND parent_column_id = COLUMNPROPERTY(OBJECT_ID({table}, N'U'), {}, 'ColumnId') \
          AND (name + N'|') COLLATE Latin1_General_BIN2 = {})\nBEGIN\n    {body}\nEND;",
         literal(column),
-        literal(&format!("{old}|")),
+        literal(&format!("{}|", old.raw())),
         table = literal(&qualified(table)?),
     )))
 }
@@ -2127,7 +2146,10 @@ fn rename_generated_default(
 /// (DEC-981.1). Always two different names. A later rename looks under both, so a default parked at its
 /// fallback still follows its table and column. Public so the connected
 /// plan's namespace walk (`pbps-cli`) moves defaults exactly as this emits.
-pub fn generated_default_names(table: &TableName, column: &str) -> Vec<String> {
+pub fn generated_default_names(
+    table: &TableName,
+    column: &str,
+) -> Vec<pbps_model::ObjectLocalName> {
     vec![
         default_constraint_name(table, column),
         fallback_default_constraint_name(table, column),
@@ -2213,7 +2235,7 @@ fn rename_table(from: &TableName, to: &TableName, defaults: &[ColumnName]) -> Sq
 fn drop_primary_key(table: &TableName, pk: &PrimaryKey) -> Result<Statement, DialectError> {
     let q = qualified(table)?;
     Ok(match &pk.name {
-        Some(n) => Statement::new(format!("ALTER TABLE {q} DROP CONSTRAINT {};", quote(n)?)),
+        Some(n) => Statement::new(format!("ALTER TABLE {q} DROP CONSTRAINT {};", quote(n.raw())?)),
         // The statement being built is a *string*, so the table name inside it
         // is in literal position and not in code position. `quote` is the
         // wrong tool there: it doubles `]`, and an apostrophe passes through
@@ -2940,9 +2962,16 @@ mod tests {
                 fallback == digested_default_constraint_name(&table, "d"),
                 !digested_already,
                 "{table}: {fallback}",
-                table = table.raw()
+                table = table.raw(),
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                fallback = fallback.raw(),
             );
-            assert!(fallback.starts_with("DF_pbps_"), "{fallback}");
+            assert!(
+                fallback.raw().starts_with("DF_pbps_"),
+                "{fallback}",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                fallback = fallback.raw(),
+            );
             assert_eq!(generated_default_names(&table, "d"), [generated, fallback]);
         }
         // And stable: the same column gets the same fallback on every run.
@@ -3160,11 +3189,26 @@ mod tests {
         let table = TableName::new("dbo", long_table.clone());
 
         let name = default_constraint_name(&table, &long_column);
-        assert!(name.chars().count() <= MAX_IDENT_CHARS, "{name}");
+        assert!(
+            name.raw().chars().count() <= MAX_IDENT_CHARS,
+            "{name}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            name = name.raw(),
+        );
         // The point of the length check is that `quote` accepts it. Asserting
         // the count alone would pass for a name `quote` still refuses.
-        assert!(quote(&name).is_ok(), "{name}");
-        assert!(name.starts_with("DF_"), "{name}");
+        assert!(
+            quote(name.raw()).is_ok(),
+            "{name}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            name = name.raw(),
+        );
+        assert!(
+            name.raw().starts_with("DF_"),
+            "{name}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            name = name.raw(),
+        );
 
         // Both call sites reach it: the column list of a `CREATE TABLE`, and
         // the `ADD CONSTRAINT` of a default change.
@@ -3179,7 +3223,11 @@ mod tests {
             beside_default: None,
             moves_at_most: None,
         });
-        assert!(created[0].contains(&format!("CONSTRAINT [{name}] DEFAULT (0\n)")));
+        assert!(created[0].contains(&format!(
+            "CONSTRAINT [{name}] DEFAULT (0\n)",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            name = name.raw(),
+        )));
 
         let altered = sql_of(&Change::AlterColumnDefault {
             uid: uid("c_k7x2mq"),
@@ -3188,7 +3236,11 @@ mod tests {
             to: Some("1".into()),
         });
         assert!(
-            altered[0].contains(&format!("ADD CONSTRAINT [{name}] DEFAULT (1\n) FOR")),
+            altered[0].contains(&format!(
+                "ADD CONSTRAINT [{name}] DEFAULT (1\n) FOR",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                name = name.raw(),
+            )),
             "{}",
             altered[0]
         );
@@ -3207,27 +3259,42 @@ mod tests {
         let column = "\u{1f601}".repeat(64);
 
         let name = default_constraint_name(&table, &column);
-        assert!(quote(&name).is_ok(), "{name}");
         assert!(
-            name.encode_utf16().count() <= MAX_IDENT_CHARS,
+            quote(name.raw()).is_ok(),
+            "{name}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            name = name.raw(),
+        );
+        assert!(
+            name.raw().encode_utf16().count() <= MAX_IDENT_CHARS,
             "{} units",
-            name.encode_utf16().count()
+            name.raw().encode_utf16().count()
         );
         // The character count alone would have passed here while the name was
         // nearly twice the width the server allows.
-        assert!(name.chars().count() <= MAX_IDENT_CHARS, "{name}");
+        assert!(
+            name.raw().chars().count() <= MAX_IDENT_CHARS,
+            "{name}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            name = name.raw(),
+        );
 
         // The cut never splits a character, so what is left is still the
         // characters it came from.
-        assert!(name.starts_with("DF_pbps_\u{1f600}"), "{name}");
+        assert!(
+            name.raw().starts_with("DF_pbps_\u{1f600}"),
+            "{name}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            name = name.raw(),
+        );
 
         // And the entry check is in units too: this one is 69 characters, so
         // a character count would have returned it whole at 133 units.
         let short_column = default_constraint_name(&table, "a");
         assert!(
-            short_column.encode_utf16().count() <= MAX_IDENT_CHARS,
+            short_column.raw().encode_utf16().count() <= MAX_IDENT_CHARS,
             "{} units",
-            short_column.encode_utf16().count()
+            short_column.raw().encode_utf16().count()
         );
         assert!(
             format!("DF_pbps_{}_a", table.name).chars().count() <= MAX_IDENT_CHARS,
@@ -3263,27 +3330,32 @@ mod tests {
     fn a_generated_default_name_that_fits_keeps_its_short_form() {
         assert_eq!(
             default_constraint_name(&tname("dbo.customer"), "status"),
-            "DF_pbps_customer_status"
+            "DF_pbps_customer_status".into()
         );
         assert_eq!(
             default_constraint_name(&tname("dbo.customer"), "created_at"),
-            "DF_pbps_customer_created_at",
+            "DF_pbps_customer_created_at".into(),
             "an underscore in the column does not make the boundary ambiguous"
         );
         // Exactly at the limit: "DF_pbps_" + 59 + "_" + 60 == 128.
         let table = TableName::new("dbo", "t".repeat(59));
         let column = "c".repeat(60);
         let name = default_constraint_name(&table, &column);
-        assert_eq!(name.chars().count(), MAX_IDENT_CHARS);
+        assert_eq!(name.raw().chars().count(), MAX_IDENT_CHARS);
         assert_eq!(
             name,
-            format!("DF_pbps_{}_{}", "t".repeat(59), "c".repeat(60))
+            format!("DF_pbps_{}_{}", "t".repeat(59), "c".repeat(60)).into()
         );
 
         // One more character, and it is cut rather than refused.
         let over = default_constraint_name(&table, &"c".repeat(61));
-        assert!(over.chars().count() <= MAX_IDENT_CHARS, "{over}");
-        assert!(over.len() < format!("DF_pbps_{}_{}", "t".repeat(59), "c".repeat(61)).len());
+        assert!(
+            over.raw().chars().count() <= MAX_IDENT_CHARS,
+            "{over}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            over = over.raw(),
+        );
+        assert!(over.raw().len() < format!("DF_pbps_{}_{}", "t".repeat(59), "c".repeat(61)).len());
     }
 
     /// #969: `DF_pbps_{table}_{column}` does not say where the table ends, so
@@ -3296,10 +3368,16 @@ mod tests {
         let b = default_constraint_name(&tname("dbo.a"), "b_c");
         assert_ne!(a, b);
         assert_eq!(
-            b, "DF_pbps_a_b_c",
+            b,
+            "DF_pbps_a_b_c".into(),
             "the table without an underscore keeps its short form"
         );
-        assert!(a.starts_with("DF_pbps_a_b_c_"), "{a}");
+        assert!(
+            a.raw().starts_with("DF_pbps_a_b_c_"),
+            "{a}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            a = a.raw(),
+        );
     }
 
     /// Review of #969: a column spelled like a digested name. `dbo.a.b_c_<the
@@ -3309,10 +3387,15 @@ mod tests {
     #[test]
     fn a_column_spelled_like_a_digest_does_not_take_a_digested_name() {
         let digested = default_constraint_name(&tname("dbo.a_b"), "c");
-        let suffix = &digested["DF_pbps_a_b_c_".len()..];
+        let suffix = &digested.raw()["DF_pbps_a_b_c_".len()..];
         let impostor = default_constraint_name(&tname("dbo.a"), &format!("b_c_{suffix}"));
         assert_ne!(digested, impostor);
-        assert!(ends_like_a_digest(&digested), "{digested}");
+        assert!(
+            ends_like_a_digest(digested.raw()),
+            "{digested}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            digested = digested.raw(),
+        );
         assert!(!ends_like_a_digest("DF_pbps_customer_status"));
         assert!(
             ends_like_a_digest("DF_pbps_t_c_0123456789ABCDEF"),
@@ -3339,12 +3422,17 @@ mod tests {
             all
         }
         let names = spellings(4);
-        let mut seen: BTreeMap<String, (String, String)> = BTreeMap::new();
+        let mut seen: BTreeMap<pbps_model::ObjectLocalName, (String, String)> = BTreeMap::new();
         for table in &names {
             for column in &names {
                 let name = default_constraint_name(&TableName::new("dbo", table.clone()), column);
                 if let Some(other) = seen.insert(name.clone(), (table.clone(), column.clone())) {
-                    panic!("{name} is both {other:?} and {:?}", (table, column));
+                    panic!(
+                        "{name} is both {other:?} and {:?}",
+                        (table, column),
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    );
                 }
             }
         }
@@ -3357,11 +3445,26 @@ mod tests {
     fn shortening_spends_the_budget_on_the_part_that_needs_it() {
         let table = TableName::new("dbo", "t".repeat(MAX_IDENT_CHARS));
         let name = default_constraint_name(&table, "id");
-        assert!(name.chars().count() <= MAX_IDENT_CHARS, "{name}");
-        assert!(name.contains("_id_"), "{name}");
+        assert!(
+            name.raw().chars().count() <= MAX_IDENT_CHARS,
+            "{name}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            name = name.raw(),
+        );
+        assert!(
+            name.raw().contains("_id_"),
+            "{name}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            name = name.raw(),
+        );
         // Far more than half the budget went to the table.
-        let kept = name.chars().filter(|c| *c == 't').count();
-        assert!(kept > MAX_IDENT_CHARS / 2, "{name}");
+        let kept = name.raw().chars().filter(|c| *c == 't').count();
+        assert!(
+            kept > MAX_IDENT_CHARS / 2,
+            "{name}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            name = name.raw(),
+        );
     }
 
     #[test]

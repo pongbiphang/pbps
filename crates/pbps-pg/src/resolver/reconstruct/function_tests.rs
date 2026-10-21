@@ -6,7 +6,7 @@ use pbps_model::{
     UidKind,
 };
 
-fn schema(reference: bool) -> Schema {
+fn schema(reference: bool, local_prefix: &str) -> Schema {
     let mut schema = Schema::default();
     for (name, function) in [("a", "f"), ("b", "h")] {
         let mut table = Table::default();
@@ -33,12 +33,12 @@ fn schema(reference: bool) -> Schema {
             .columns
             .insert("z".into(), Column::new("integer".parse().unwrap()));
         table.primary_key = Some(PrimaryKey {
-            name: Some(format!("{name}_pk")),
+            name: Some(format!("{local_prefix}{name}_pk").into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
         table.checks.insert(
-            format!("{name}_positive"),
+            format!("{local_prefix}{name}_positive").into(),
             pbps_model::CheckConstraint {
                 expression: "g >= 0".into(),
             },
@@ -85,6 +85,36 @@ fn schema(reference: bool) -> Schema {
     schema
 }
 
+#[test]
+fn reconstruction_fixture_local_names_keep_raw_prefixes_distinct_from_shown_lookalikes() {
+    const RAW: &str = "part\nline\\slash\u{200b}";
+    const SHOWN: &str = r"part\nline\\slash\u{200b}";
+    let schema = schema(false, RAW);
+    for name in ["a", "b"] {
+        let table = &schema.tables[&TableName::new("app", name)];
+        assert_eq!(
+            table.primary_key.as_ref().unwrap().name,
+            Some(pbps_model::ObjectLocalName::new(format!("{RAW}{name}_pk")))
+        );
+        assert_ne!(
+            table.primary_key.as_ref().unwrap().name,
+            Some(pbps_model::ObjectLocalName::new(format!(
+                "{SHOWN}{name}_pk"
+            )))
+        );
+        assert!(
+            table
+                .checks
+                .contains_key(format!("{RAW}{name}_positive").as_str())
+        );
+        assert!(
+            !table
+                .checks
+                .contains_key(format!("{SHOWN}{name}_positive").as_str())
+        );
+    }
+}
+
 fn bootstrap(schema: &Schema, seed: u32) -> (Vec<Change>, IdsFile) {
     let mut ids = IdsFile::default();
     let mut changes = Vec::new();
@@ -124,7 +154,7 @@ fn bootstrap(schema: &Schema, seed: u32) -> (Vec<Change>, IdsFile) {
 fn multiple_holds_and_phase_peers_match_the_old_metadata_for_32_uid_seeds() {
     for seed in 0..32 {
         for reference in [false, true] {
-            let schema = schema(reference);
+            let schema = schema(reference, "");
             let (changes, ids) = bootstrap(&schema, seed);
             for version in [None, Some(160_000), Some(170_000), Some(180_000)] {
                 let pg = version.map_or_else(crate::Postgres::new, |v| {
@@ -164,7 +194,7 @@ async fn held_tables_and_readers_compile_with_their_keys_on_both_servers() {
         let mut admin = Conn::connect(Driver::Postgres, &server).await.unwrap();
         let version = crate::roles::server_version_num(&mut admin).await.unwrap();
         for reference in [false, true] {
-            let schema = schema(reference);
+            let schema = schema(reference, "");
             let (_, ids) = bootstrap(&schema, 0);
             let pg = crate::Postgres::new().with_server_version(version);
             let changes = pbps_diff::diff(

@@ -166,12 +166,13 @@ pub fn refused_without_retention(
     problems
 }
 
-fn cascade_refusal(table: &TableName, key: &str) -> String {
+fn cascade_refusal(table: &TableName, key: &pbps_model::ObjectLocalName) -> String {
     format!(
         "foreign key `{key}` on `{table}` cascades, and `{table}` is system-versioned: SQL \
          Server 2016 refuses `ON DELETE CASCADE` and `ON UPDATE CASCADE` on a key from a \
          system-versioned table; use `no_action` for this target",
-        table = table.shown()
+        table = table.shown(),
+        key = key.shown()
     )
 }
 
@@ -366,5 +367,21 @@ mod tests {
             "{query}"
         );
         assert!(query.contains("AS has_retention"), "{query}");
+    }
+    #[test]
+    fn a_temporal_cascade_refusal_escapes_the_local_name_once() {
+        let mut change = key("dbo.t", ReferentialAction::Cascade);
+        let Change::AddForeignKey { name, .. } = &mut change.change else {
+            unreachable!()
+        };
+        *name = "fk\nline\\slash".into();
+        let changes = plan(vec![change]);
+        assert_eq!(
+            refused_without_retention(&changes, &[tname("dbo.t")].into()),
+            vec![
+                "foreign key `fk\\nline\\\\slash` on `dbo.t` cascades, and `dbo.t` is system-versioned: SQL Server 2016 refuses `ON DELETE CASCADE` and `ON UPDATE CASCADE` on a key from a system-versioned table; use `no_action` for this target"
+            ]
+        );
+        assert!(refused_without_retention(&changes, &BTreeSet::new()).is_empty());
     }
 }

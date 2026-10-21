@@ -1009,9 +1009,9 @@ fn parse_reference(
 /// under either.
 fn convert_foreign_keys(
     src: &SourceFile,
-    dtos: std::collections::BTreeMap<String, crate::dto::ForeignKeyDto>,
+    dtos: std::collections::BTreeMap<pbps_model::ObjectLocalName, crate::dto::ForeignKeyDto>,
     errs: &mut Vec<LoadError>,
-) -> std::collections::BTreeMap<String, ForeignKey> {
+) -> std::collections::BTreeMap<pbps_model::ObjectLocalName, ForeignKey> {
     let mut foreign_keys = std::collections::BTreeMap::new();
     for (k, fk) in dtos {
         match parse_reference(src, &fk.references) {
@@ -1035,9 +1035,9 @@ fn convert_foreign_keys(
 
 fn convert_indexes(
     src: &SourceFile,
-    dtos: std::collections::BTreeMap<String, crate::dto::IndexDto>,
+    dtos: std::collections::BTreeMap<pbps_model::ObjectLocalName, crate::dto::IndexDto>,
     errs: &mut Vec<LoadError>,
-) -> std::collections::BTreeMap<String, Index> {
+) -> std::collections::BTreeMap<pbps_model::ObjectLocalName, Index> {
     let mut indexes = std::collections::BTreeMap::new();
     for (k, ix) in dtos {
         let mut cols = Vec::with_capacity(ix.columns.len() + ix.keys.len());
@@ -1048,7 +1048,10 @@ fn convert_indexes(
             errs.push(LoadError::semantic(
                 src,
                 to_span(&ix.keys[0].defined),
-                format!("index `{k}` names its keys under both `columns:` and `keys:`"),
+                format!(
+                    "index `{k}` names its keys under both `columns:` and `keys:`",
+                    k = k.shown(),
+                ),
                 "one list or the other",
             ));
             ok = false;

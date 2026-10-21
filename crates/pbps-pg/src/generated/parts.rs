@@ -126,7 +126,7 @@ pub(crate) fn parts(
         if constraint.columns.iter().any(&late_column) {
             tail.push(Change::AddUnique {
                 table: name.clone(),
-                clustered: table.unique_is_clustered(&key),
+                clustered: table.unique_is_clustered(key.raw()),
                 name: key,
                 constraint,
             });
@@ -161,7 +161,7 @@ pub(crate) fn parts(
         if deferred {
             tail.push(Change::AddIndex {
                 table: name.clone(),
-                clustered: table.index_is_clustered(&key),
+                clustered: table.index_is_clustered(key.raw()),
                 name: key,
                 index: Box::new(index),
             });

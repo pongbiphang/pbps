@@ -599,7 +599,7 @@ async fn only_the_declared_types_own_default_is_on_the_input_path() {
                 "k_outer",
                 "app.k_inner",
                 Part::Check {
-                    constraint: "k_inner_check".to_owned(),
+                    constraint: "k_inner_check".into(),
                 },
             ),
         ] {

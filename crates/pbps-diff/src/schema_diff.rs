@@ -165,11 +165,11 @@ pub enum DiffError {
         "{table}: its foreign key `{key}` references {target}, which is unlogged, and \
          PostgreSQL lets only an unlogged table reference an unlogged one. Make {table} \
          unlogged too, or {target} permanent.",
-        table = .table.shown(), target = .target.shown(),
+        key = .key.shown(), table = .table.shown(), target = .target.shown(),
     )]
     PermanentReferencesUnlogged {
         table: TableName,
-        key: String,
+        key: pbps_model::ObjectLocalName,
         target: TableName,
     },
 
@@ -184,11 +184,11 @@ pub enum DiffError {
          is unlogged; a crash would empty {partition} and leave rows of {table} referencing \
          nothing, which PostgreSQL does not refuse through a partitioned table. Make \
          {partition} permanent, or {table} unlogged.",
-        table = .table.shown(), target = .target.shown(), partition = .partition.shown(),
+        key = .key.shown(), table = .table.shown(), target = .target.shown(), partition = .partition.shown(),
     )]
     PermanentReferencesUnloggedPartition {
         table: TableName,
-        key: String,
+        key: pbps_model::ObjectLocalName,
         target: TableName,
         partition: TableName,
     },
@@ -2798,7 +2798,7 @@ fn refuse_rows_referencing_late_inserts(
         .iter()
         .filter_map(|c| {
             if let Change::AddForeignKey { table, name, .. } = c {
-                Some((table, name.as_str()))
+                Some((table, name.raw()))
             } else {
                 None
             }
@@ -2813,7 +2813,7 @@ fn refuse_rows_referencing_late_inserts(
             continue;
         };
         for (name, fk) in &t.foreign_keys {
-            if added.contains(&(table, name.as_str())) {
+            if added.contains(&(table, name.raw())) {
                 continue;
             }
             if fk.references_table != *table
@@ -3125,7 +3125,7 @@ fn recreate_retyped_dependents(
         // and a second pair here would drop it twice.
         for (n, key) in &before.unique {
             if after.unique.get(n) == Some(key)
-                && before.unique_is_clustered(n) == after.unique_is_clustered(n)
+                && before.unique_is_clustered(n.raw()) == after.unique_is_clustered(n.raw())
                 && key.columns.iter().any(&key_column)
             {
                 changes.push(Change::DropUnique {
@@ -3136,7 +3136,7 @@ fn recreate_retyped_dependents(
                     table: name.clone(),
                     name: n.clone(),
                     constraint: key.clone(),
-                    clustered: after.unique_is_clustered(n),
+                    clustered: after.unique_is_clustered(n.raw()),
                 });
             }
         }
@@ -3155,7 +3155,7 @@ fn recreate_retyped_dependents(
         }
         for (n, index) in &before.indexes {
             if after.indexes.get(n) == Some(index)
-                && before.index_is_clustered(n) == after.index_is_clustered(n)
+                && before.index_is_clustered(n.raw()) == after.index_is_clustered(n.raw())
                 && (index
                     .columns
                     .iter()
@@ -3177,7 +3177,7 @@ fn recreate_retyped_dependents(
                     table: name.clone(),
                     name: n.clone(),
                     index: Box::new(index.clone()),
-                    clustered: after.index_is_clustered(n),
+                    clustered: after.index_is_clustered(n.raw()),
                 });
             }
         }
@@ -3406,7 +3406,8 @@ fn detached_names(
             declared.checks.remove(name);
         } else {
             what.push(format!(
-                "its own check `{name}` is not declared as it stands"
+                "its own check `{name}` is not declared as it stands",
+                name = name.shown(),
             ));
         }
     }
@@ -3415,7 +3416,8 @@ fn detached_names(
             declared.indexes.remove(name);
         } else {
             what.push(format!(
-                "its own index `{name}` is not declared as it stands"
+                "its own index `{name}` is not declared as it stands",
+                name = name.shown(),
             ));
         }
     }
@@ -3427,7 +3429,8 @@ fn detached_names(
             declared.foreign_keys.remove(name);
         } else {
             what.push(format!(
-                "its own foreign key `{name}` is not declared as it stands"
+                "its own foreign key `{name}` is not declared as it stands",
+                name = name.shown(),
             ));
         }
     }
@@ -3473,12 +3476,12 @@ fn detached_names(
     fn matched<V: PartialEq>(
         kind: DetachedKind,
         words: &str,
-        parent: &BTreeMap<String, V>,
-        declared: &BTreeMap<String, V>,
+        parent: &BTreeMap<pbps_model::ObjectLocalName, V>,
+        declared: &BTreeMap<pbps_model::ObjectLocalName, V>,
         names: &mut Vec<DetachedName>,
         what: &mut Vec<String>,
     ) {
-        let mut unused: Vec<(&String, &V)> = declared.iter().collect();
+        let mut unused: Vec<(&pbps_model::ObjectLocalName, &V)> = declared.iter().collect();
         for (from, definition) in parent {
             match unused.iter().position(|(_, d)| *d == definition) {
                 Some(at) => {
@@ -3489,11 +3492,17 @@ fn detached_names(
                         name: Some(to.clone()),
                     });
                 }
-                None => what.push(format!("its parent's {words} `{from}` is missing")),
+                None => what.push(format!(
+                    "its parent's {words} `{from}` is missing",
+                    from = from.shown(),
+                )),
             }
         }
         for (to, _) in unused {
-            what.push(format!("the {words} `{to}` is not its parent's"));
+            what.push(format!(
+                "the {words} `{to}` is not its parent's",
+                to = to.shown(),
+            ));
         }
     }
     matched(
@@ -3561,7 +3570,7 @@ struct Attached {
     defaultless: Vec<ColumnName>,
     /// The table's indexes dropped before the attach: every one the engine
     /// could adopt but for the one left to it.
-    displaced: Vec<String>,
+    displaced: Vec<pbps_model::ObjectLocalName>,
     /// The table's key and unique constraints dropped before the attach,
     /// whose index a plain unique index of the parent's could take.
     released: Vec<Change>,
@@ -3814,9 +3823,9 @@ fn attached(
     }
     // One to one: a second match would stay its own.
     fn unmatched<'a, V: PartialEq>(
-        own: &'a BTreeMap<String, V>,
-        parent: &BTreeMap<String, V>,
-    ) -> Vec<&'a String> {
+        own: &'a BTreeMap<pbps_model::ObjectLocalName, V>,
+        parent: &BTreeMap<pbps_model::ObjectLocalName, V>,
+    ) -> Vec<&'a pbps_model::ObjectLocalName> {
         let mut free: Vec<&V> = parent.values().collect();
         own.iter()
             .filter(|(_, d)| match free.iter().position(|p| p == d) {
@@ -3832,20 +3841,21 @@ fn attached(
     // By definition, storage parameters aside: measured on 16 and 18, the
     // engine adopts a key or an index whatever its own, which it keeps, and a
     // clone's are not held.
-    let unique = |t: &Table| -> BTreeMap<String, pbps_model::UniqueConstraint> {
-        t.unique
-            .iter()
-            .map(|(n, u)| {
-                let mut u = u.clone();
-                u.storage_parameters.clear();
-                (n.clone(), u)
-            })
-            .collect()
-    };
+    let unique =
+        |t: &Table| -> BTreeMap<pbps_model::ObjectLocalName, pbps_model::UniqueConstraint> {
+            t.unique
+                .iter()
+                .map(|(n, u)| {
+                    let mut u = u.clone();
+                    u.storage_parameters.clear();
+                    (n.clone(), u)
+                })
+                .collect()
+        };
     // An index as the engine matches it to adopt it: storage parameters
     // and sort order aside, measured on 16 and 18 (`DESC` and `NULLS FIRST`
     // adopted, another collation, operator class, `INCLUDE` or method not).
-    let index = |t: &Table| -> BTreeMap<String, Index> {
+    let index = |t: &Table| -> BTreeMap<pbps_model::ObjectLocalName, Index> {
         t.indexes
             .iter()
             .map(|(n, i)| {
@@ -3861,7 +3871,8 @@ fn attached(
     for name in unmatched(&unique(table), &unique(parent)) {
         what.push(format!(
             "its unique constraint `{name}` is not its parent's, and a partition holds none of \
-             its own yet"
+             its own yet",
+            name = name.shown(),
         ));
     }
     // Measured on 16 and 18: one equal to a parent's is taken as the
@@ -3869,7 +3880,7 @@ fn attached(
     // name (#1632). The plan then compares those with what the partition
     // declares of its own, as for any table. Validation keeps the partition
     // from declaring one equal to a parent's, so none of those is its own.
-    let own_foreign_keys: BTreeMap<String, pbps_model::ForeignKey> = table
+    let own_foreign_keys: BTreeMap<pbps_model::ObjectLocalName, pbps_model::ForeignKey> = table
         .foreign_keys
         .iter()
         .filter(|(_, fk)| !parent.foreign_keys.values().any(|p| p == *fk))
@@ -3881,7 +3892,8 @@ fn attached(
         if table_spelled.checks.get(name) != Some(p) {
             what.push(format!(
                 "its parent's check `{name}` is not on it under that name, which the engine \
-                 requires"
+                 requires",
+                name = name.shown(),
             ));
         }
     }
@@ -3892,7 +3904,7 @@ fn attached(
     // index keeps its name as the clone, so one whose name the declaration
     // gives an index of its own is never the one left (#1642 review).
     let (own_indexes, parents_indexes) = (index(table), index(parent));
-    let mut taken: BTreeSet<&String> = BTreeSet::new();
+    let mut taken: BTreeSet<&pbps_model::ObjectLocalName> = BTreeSet::new();
     let mut displaced = Vec::new();
     // An expression or a filter is matched by the engine on what it is
     // bound to and how it parses, which its text does not say: `n+1` and
@@ -3911,14 +3923,14 @@ fn attached(
         }
     }
     for definition in parents_indexes.values() {
-        let matches: Vec<&String> = own_indexes
+        let matches: Vec<&pbps_model::ObjectLocalName> = own_indexes
             .iter()
             .filter(|(n, d)| *d == definition && !taken.contains(n))
             .map(|(n, _)| n)
             .collect();
         let left = matches
             .iter()
-            .find(|n| !declared.indexes.contains_key(n.as_str()))
+            .find(|n| !declared.indexes.contains_key(n.raw()))
             .copied();
         for n in matches {
             taken.insert(n);
@@ -4048,7 +4060,8 @@ fn attached(
                 what.push(format!(
                     "the foreign key `{name}` of {other} references it, and nothing references a \
                      partition yet",
-                    other = other.shown()
+                    other = other.shown(),
+                    name = name.shown(),
                 ));
             }
         }
@@ -4647,14 +4660,15 @@ fn refuse_parent_index(
     // remedy being to drop or rename the partition's own first.
     if let Change::AddCheck { name, .. } = change {
         let held: Vec<String> = partitions()
-            .filter(|(_, t)| t.checks.contains_key(name.as_str()))
+            .filter(|(_, t)| t.checks.contains_key(name.raw()))
             .map(|(partition, _)| partition.shown().to_string())
             .collect();
         return (!held.is_empty()).then(|| {
             format!(
                 "add check `{name}`, a name {} holds as its own check, which the parent's would \
                  absorb; drop or rename the partition's own check in an earlier plan",
-                held.join(", ")
+                held.join(", "),
+                name = name.shown(),
             )
         });
     }
@@ -4672,6 +4686,7 @@ fn refuse_parent_index(
             "add unique index `{name}` without the partition key column `{missing}`, which \
              PostgreSQL refuses on a partitioned table; add `{missing}` to its columns",
             missing = missing.shown(),
+            name = name.shown(),
         ));
     }
     // Only an own index standing when the parent's is built: one the
@@ -4693,7 +4708,7 @@ fn refuse_parent_index(
                 .iter()
                 .filter(move |(own, _)| {
                     before.is_none_or(|b| {
-                        b.indexes.contains_key(own.as_str())
+                        b.indexes.contains_key(own.raw())
                             && !changes.iter().any(|c| {
                                 matches!(c, Change::DropIndex { table, name }
                                     if table == partition && name == *own)
@@ -4702,7 +4717,11 @@ fn refuse_parent_index(
                 })
                 .filter(|(_, own)| adopts(index, own))
                 .map(move |(own, _)| {
-                    format!("{partition}'s `{own}`", partition = partition.shown())
+                    format!(
+                        "{partition}'s `{own}`",
+                        partition = partition.shown(),
+                        own = own.shown(),
+                    )
                 })
         })
         .collect();
@@ -4711,7 +4730,8 @@ fn refuse_parent_index(
             "add index `{name}`, which can take {} as the partition's copy of it and leave the \
              partition without its own; drop or rename the partition's own index in an earlier \
              plan",
-            adopted.join(", ")
+            adopted.join(", "),
+            name = name.shown(),
         )
     })
 }
@@ -5450,11 +5470,11 @@ fn diff_replica_identity(
 /// `Some(None)` keeps a part without an edit; `None` replaces it. Keeping
 /// those answers distinct lets storage parameters change without a rebuild.
 fn by_name<T>(
-    base: &BTreeMap<String, T>,
-    declared: &BTreeMap<String, T>,
-    kept: impl Fn(&String, &T, &T) -> Option<Option<Change>>,
-    drop: impl Fn(&String) -> Change,
-    add: impl Fn(&String, &T) -> Change,
+    base: &BTreeMap<pbps_model::ObjectLocalName, T>,
+    declared: &BTreeMap<pbps_model::ObjectLocalName, T>,
+    kept: impl Fn(&pbps_model::ObjectLocalName, &T, &T) -> Option<Option<Change>>,
+    drop: impl Fn(&pbps_model::ObjectLocalName) -> Change,
+    add: impl Fn(&pbps_model::ObjectLocalName, &T) -> Change,
     changes: &mut Vec<Change>,
 ) {
     for (name, part) in declared {
@@ -5617,7 +5637,7 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
         &declared.unique,
         |n, b, d| {
             (unique_bare(b) == unique_bare(d)
-                && base.unique_is_clustered(n) == declared.unique_is_clustered(n))
+                && base.unique_is_clustered(n.raw()) == declared.unique_is_clustered(n.raw()))
             .then(|| {
                 parameters(
                     IndexPart::Unique(n.clone()),
@@ -5635,7 +5655,7 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
             table: name.clone(),
             name: n.clone(),
             constraint: c.clone(),
-            clustered: declared.unique_is_clustered(n),
+            clustered: declared.unique_is_clustered(n.raw()),
         },
         changes,
     );
@@ -5644,7 +5664,7 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
         &declared.indexes,
         |n, b, d| {
             (index_bare(b) == index_bare(d)
-                && base.index_is_clustered(n) == declared.index_is_clustered(n))
+                && base.index_is_clustered(n.raw()) == declared.index_is_clustered(n.raw()))
             .then(|| {
                 parameters(
                     IndexPart::Index(n.clone()),
@@ -5662,7 +5682,7 @@ fn diff_constraints(name: &TableName, base: &Table, declared: &Table, changes: &
             table: name.clone(),
             name: n.clone(),
             index: Box::new(ix.clone()),
-            clustered: declared.index_is_clustered(n),
+            clustered: declared.index_is_clustered(n.raw()),
         },
         changes,
     );
@@ -8017,7 +8037,7 @@ mod tests {
                 .filter_map(|p| match &p.change {
                     Change::DropIndex { name, .. }
                     | Change::DropUnique { name, .. }
-                    | Change::DropCheck { name, .. } => Some(name.clone()),
+                    | Change::DropCheck { name, .. } => Some(name.raw().to_owned()),
                     _ => None,
                 })
                 .collect();
@@ -8247,7 +8267,7 @@ mod tests {
         for t in tables {
             let mut table = table(&[("id", Column::new(ty("int")).not_null())]);
             table.primary_key = Some(PrimaryKey {
-                name: Some(format!("{t}_pkey")),
+                name: Some(format!("{t}_pkey").into()),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
             });
@@ -8264,7 +8284,7 @@ mod tests {
                 .columns
                 .insert(column.clone().into(), Column::new(ty("int")));
             table.foreign_keys.insert(
-                format!("fk{k}"),
+                format!("fk{k}").into(),
                 pbps_model::ForeignKey {
                     columns: vec![column.into()],
                     references_table: format!("public.{to}").parse().unwrap(),
@@ -8499,10 +8519,10 @@ mod tests {
             let last_switch = ["a", "b", "c", "d", "e"].map(at).into_iter().max().unwrap();
             for (table, key) in [("a", "fk0"), ("b", "fk1")] {
                 let drop = cs.changes.iter().position(|p| {
-                    matches!(&p.change, Change::DropForeignKey { table: tb, name } if *tb == t(table) && name == key)
+                    matches!(&p.change, Change::DropForeignKey { table: tb, name } if *tb == t(table) && name.raw() == key)
                 });
                 let add = cs.changes.iter().position(|p| {
-                    matches!(&p.change, Change::AddForeignKey { table: tb, name, .. } if *tb == t(table) && name == key)
+                    matches!(&p.change, Change::AddForeignKey { table: tb, name, .. } if *tb == t(table) && name.raw() == key)
                 });
                 assert!(
                     drop.is_some_and(|d| d < first_switch),
@@ -8518,7 +8538,7 @@ mod tests {
             // The keys outside the cycle stand through the switches.
             assert!(!cs.changes.iter().any(|p| matches!(
                 &p.change,
-                Change::DropForeignKey { name, .. } if name == "fk2" || name == "fk3"
+                Change::DropForeignKey { name, .. } if name.raw() == "fk2" || name.raw() == "fk3"
             )));
         }
     }
@@ -8602,7 +8622,7 @@ mod tests {
         )
         .errors;
         assert!(
-            errors.iter().any(|e| matches!(e, DiffError::PermanentReferencesUnlogged { key, .. } if key == "ch_pa")),
+            errors.iter().any(|e| matches!(e, DiffError::PermanentReferencesUnlogged { key, .. } if key.raw() == "ch_pa")),
             "{errors:?}"
         );
     }
@@ -11040,7 +11060,7 @@ mod tests {
         );
         assert!(matches!(
             &planned.changes[0].change,
-            Change::DropIndex { name, .. } if name == "t_id"
+            Change::DropIndex { name, .. } if name.raw() == "t_id"
         ));
         assert!(matches!(
             &planned.changes[2].change,
@@ -11118,8 +11138,16 @@ mod tests {
                 .changes
                 .iter()
                 .map(|p| match &p.change {
-                    Change::DropIndex { name, .. } => format!("drop {name}"),
-                    Change::AddIndex { name, .. } => format!("add {name}"),
+                    Change::DropIndex { name, .. } => format!(
+                        "drop {name}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    ),
+                    Change::AddIndex { name, .. } => format!(
+                        "add {name}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    ),
                     other => format!("{other:?}").split(' ').next().unwrap().to_owned(),
                 })
                 .collect();
@@ -11265,11 +11293,19 @@ mod tests {
             .take_while(|p| !matches!(p.change, Change::AttachPartition { .. }))
             .map(|p| {
                 if let Change::DropUnique { name, .. } = &p.change {
-                    format!("drop unique {name}")
+                    format!(
+                        "drop unique {name}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    )
                 } else if let Change::SetPrimaryKey { to: None, .. } = &p.change {
                     "drop key".to_owned()
                 } else if let Change::DropIndex { name, .. } = &p.change {
-                    format!("drop {name}")
+                    format!(
+                        "drop {name}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    )
                 } else {
                     format!("{:?}", p.change)
                 }
@@ -11350,9 +11386,17 @@ mod tests {
                 .iter()
                 .filter_map(|p| {
                     if let Change::DropIndex { name, .. } = &p.change {
-                        Some(format!("drop {name}"))
+                        Some(format!(
+                            "drop {name}",
+                            // Preserve raw comparison-label or fixture SQL bytes in test data.
+                            name = name.raw(),
+                        ))
                     } else if let Change::AddIndex { name, .. } = &p.change {
-                        Some(format!("add {name}"))
+                        Some(format!(
+                            "add {name}",
+                            // Preserve raw comparison-label or fixture SQL bytes in test data.
+                            name = name.raw(),
+                        ))
                     } else if let Change::AttachPartition { .. } = &p.change {
                         Some("attach".to_owned())
                     } else {
@@ -11648,9 +11692,11 @@ mod tests {
                 .position(|c| f(&c.change))
                 .unwrap_or_else(|| panic!("{:?}", planned.changes))
         };
-        let dropped = at(&|c| matches!(c, Change::DropForeignKey { name, .. } if name == "t_fk"));
+        let dropped =
+            at(&|c| matches!(c, Change::DropForeignKey { name, .. } if name.raw() == "t_fk"));
         let attach = at(&|c| matches!(c, Change::AttachPartition { .. }));
-        let added = at(&|c| matches!(c, Change::AddForeignKey { name, .. } if name == "t_fk"));
+        let added =
+            at(&|c| matches!(c, Change::AddForeignKey { name, .. } if name.raw() == "t_fk"));
         assert!(dropped < attach && attach < added, "{:?}", planned.changes);
         // Two equal to the parent's: the engine takes one by an order the
         // model does not hold, so both are dropped before the attach and
@@ -11672,7 +11718,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(i, c)| match &c.change {
-                Change::DropForeignKey { name, .. } => Some((i, name.as_str())),
+                Change::DropForeignKey { name, .. } => Some((i, name.raw())),
                 _ => None,
             })
             .collect();
@@ -11707,7 +11753,7 @@ mod tests {
         assert!(
             planned.changes.iter().any(|c| matches!(
                 &c.change,
-                Change::DropForeignKey { table, name } if table.raw().to_string() == "app.t" && name == "t_fk"
+                Change::DropForeignKey { table, name } if table.raw().to_string() == "app.t" && name.raw() == "t_fk"
             )),
             "{:?}",
             planned.changes
@@ -12058,7 +12104,13 @@ mod tests {
         assert_eq!(from.raw().to_string(), "app.ev");
         let pairs: Vec<(DetachedKind, &str, Option<&str>)> = names
             .iter()
-            .map(|n| (n.kind, n.parent.as_str(), n.name.as_deref()))
+            .map(|n| {
+                (
+                    n.kind,
+                    n.parent.raw(),
+                    n.name.as_ref().map(pbps_model::ObjectLocalName::raw),
+                )
+            })
             .collect();
         assert_eq!(
             pairs,
@@ -13064,7 +13116,12 @@ mod tests {
         };
         let pairs: Vec<(&str, Option<&str>)> = names
             .iter()
-            .map(|n| (n.parent.as_str(), n.name.as_deref()))
+            .map(|n| {
+                (
+                    n.parent.raw(),
+                    n.name.as_ref().map(pbps_model::ObjectLocalName::raw),
+                )
+            })
             .collect();
         assert_eq!(pairs, [("ev_n", Some("arch_n"))]);
 
@@ -13285,7 +13342,8 @@ mod tests {
             .map(|c| change_in_words(&c.change))
             .collect();
         let at = |f: &dyn Fn(&Change) -> bool| planned.changes.iter().position(|c| f(&c.change));
-        let fk = at(&|c| matches!(c, Change::DropForeignKey { name, .. } if name == "p_s_fk"));
+        let fk =
+            at(&|c| matches!(c, Change::DropForeignKey { name, .. } if name.raw() == "p_s_fk"));
         let table = at(&|c| matches!(c, Change::DropTable { name, .. } if *name == p));
         assert!(
             matches!((fk, table), (Some(fk), Some(table)) if fk < table),
@@ -13912,7 +13970,7 @@ mod tests {
                     storage_parameters: Default::default(),
                 });
                 t.foreign_keys
-                    .insert(format!("{}_other", &name[7..]), fk(other, "other"));
+                    .insert(format!("{}_other", &name[7..]).into(), fk(other, "other"));
                 t.unlogged = unlogged;
                 s.tables.insert(name.parse().unwrap(), t);
             }
@@ -14055,11 +14113,19 @@ mod tests {
                     Change::SetReplicaIdentity { table, to, .. } => format!(
                         "identity {table} {}",
                         to.as_ref()
-                            .map_or("default".to_owned(), ToString::to_string),
+                            .map_or("default".to_owned(), |identity| identity.raw().to_string()),
                         table = table.shown()
                     ),
-                    Change::AddIndex { name, .. } => format!("add {name}"),
-                    Change::DropIndex { name, .. } => format!("drop {name}"),
+                    Change::AddIndex { name, .. } => format!(
+                        "add {name}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    ),
+                    Change::DropIndex { name, .. } => format!(
+                        "drop {name}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    ),
                     Change::AlterColumnNullability { column, .. } => {
                         format!("tighten {}", column.name.shown())
                     }
@@ -14190,8 +14256,16 @@ mod tests {
                 ),
                 Change::AddIndex {
                     name, clustered, ..
-                } => format!("add {name} clustered={clustered}"),
-                Change::DropIndex { name, .. } => format!("drop {name}"),
+                } => format!(
+                    "add {name} clustered={clustered}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
+                Change::DropIndex { name, .. } => format!(
+                    "drop {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
                 other => format!("{other:?}"),
             })
             .collect();
@@ -14380,8 +14454,16 @@ mod tests {
             .map(|p| match &p.change {
                 Change::AddIndex {
                     name, clustered, ..
-                } => format!("add {name} clustered={clustered}"),
-                Change::DropIndex { name, .. } => format!("drop {name}"),
+                } => format!(
+                    "add {name} clustered={clustered}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
+                Change::DropIndex { name, .. } => format!(
+                    "drop {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
                 other => format!("{other:?}"),
             })
             .collect();
@@ -14992,7 +15074,7 @@ mod tests {
         sub.columns
             .insert("parent".into(), Column::new(ty("varchar(20)")).not_null());
         sub.foreign_keys.insert(
-            "fk_sub_status".to_owned(),
+            "fk_sub_status".into(),
             pbps_model::ForeignKey {
                 columns: vec!["parent".into()],
                 references_table: "dbo.status".parse().unwrap(),
@@ -15103,13 +15185,13 @@ mod tests {
             t.columns.get_mut("d").unwrap().value_source =
                 pbps_model::ValueSource::Default("GETDATE()".to_owned());
             t.checks.insert(
-                "ck_n".to_owned(),
+                "ck_n".into(),
                 pbps_model::CheckConstraint {
                     expression: "n > 0 AND n < 10".to_owned(),
                 },
             );
             t.indexes.insert(
-                "ix_n".to_owned(),
+                "ix_n".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
                         key: pbps_model::IndexKey::Column("n".into()),
@@ -15544,7 +15626,7 @@ mod tests {
             .columns
             .insert("parent".into(), Column::new(ty("varchar(20)")).not_null());
         child.foreign_keys.insert(
-            "fk_child_parent".to_owned(),
+            "fk_child_parent".into(),
             pbps_model::ForeignKey {
                 columns: vec!["parent".into()],
                 references_table: "dbo.parent".parse().unwrap(),
@@ -16349,7 +16431,11 @@ mod tests {
                         from = from.shown(),
                         to = to.shown()
                     )),
-                    Change::DropCheck { name, .. } => Some(format!("drop check {name}")),
+                    Change::DropCheck { name, .. } => Some(format!(
+                        "drop check {name}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    )),
                     _ => None,
                 })
                 .collect()
@@ -16767,7 +16853,11 @@ mod tests {
             .iter()
             .filter_map(|p| match &p.change {
                 Change::RenameTable { from, .. } => Some(from.raw().to_string()),
-                Change::DropCheck { name, .. } => Some(format!("drop {name}")),
+                Change::DropCheck { name, .. } => Some(format!(
+                    "drop {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                )),
                 _ => None,
             })
             .collect();
@@ -16893,11 +16983,11 @@ mod tests {
         };
         let child_key = at(&|c| {
             matches!(c, Change::DropForeignKey { table, name }
-                if table.raw().to_string() == "app.child" && name == "fk_child_target")
+                if table.raw().to_string() == "app.child" && name.raw() == "fk_child_target")
         });
         let own_key = at(&|c| {
             matches!(c, Change::DropForeignKey { table, name }
-                if table.raw().to_string() == "app.target" && name == "fk_target_parent")
+                if table.raw().to_string() == "app.target" && name.raw() == "fk_target_parent")
         });
         let drop = at(&|c| matches!(c, Change::DropTable { .. }));
         let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
@@ -16940,12 +17030,14 @@ mod tests {
                 .position(|p| f(&p.change))
                 .unwrap_or_else(|| panic!("{:?}", cs.changes))
         };
-        let drop_key =
-            at(&|c| matches!(c, Change::DropForeignKey { name, .. } if name == "fk_child_target"));
+        let drop_key = at(
+            &|c| matches!(c, Change::DropForeignKey { name, .. } if name.raw() == "fk_child_target"),
+        );
         let drop = at(&|c| matches!(c, Change::DropTable { .. }));
         let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
-        let add_key =
-            at(&|c| matches!(c, Change::AddForeignKey { name, .. } if name == "fk_child_target"));
+        let add_key = at(
+            &|c| matches!(c, Change::AddForeignKey { name, .. } if name.raw() == "fk_child_target"),
+        );
         assert!(
             drop_key < drop && drop < rename && rename < add_key,
             "{:?}",
@@ -16998,7 +17090,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter(
-                |(_, p)| matches!(&p.change, Change::DropForeignKey { name, .. } if name == "fk"),
+                |(_, p)| matches!(&p.change, Change::DropForeignKey { name, .. } if name.raw() == "fk"),
             )
             .map(|(i, _)| i)
             .collect();
@@ -17010,7 +17102,7 @@ mod tests {
         };
         let drop = at(&|c| matches!(c, Change::DropTable { .. }));
         let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
-        let add = at(&|c| matches!(c, Change::AddForeignKey { name, .. } if name == "fk"));
+        let add = at(&|c| matches!(c, Change::AddForeignKey { name, .. } if name.raw() == "fk"));
         assert_eq!(drops.len(), 2, "{:?}", cs.changes);
         // One at each table's address as it stands when it runs: the doomed
         // table's, and the renamed table's source.
@@ -17099,7 +17191,7 @@ mod tests {
         };
         let key = at(&|c| {
             matches!(c, Change::DropForeignKey { table, name }
-                if table.raw().to_string() == "app.other" && name == "fk_other_target")
+                if table.raw().to_string() == "app.other" && name.raw() == "fk_other_target")
         });
         let target = at(
             &|c| matches!(c, Change::DropTable { name, .. } if name.raw().to_string() == "app.target"),
@@ -18272,7 +18364,7 @@ mod tests {
     fn a_key_is_dropped_before_the_column_it_held_is_relaxed() {
         let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
         base_t.primary_key = Some(pbps_model::PrimaryKey {
-            name: Some("pk_t".to_owned()),
+            name: Some("pk_t".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
@@ -18401,7 +18493,7 @@ mod tests {
     fn a_replaced_key_is_dropped_before_its_old_columns_and_added_after_its_new_ones() {
         let mut base_t = table(&[("id", Column::new(ty("int")).not_null())]);
         base_t.primary_key = Some(pbps_model::PrimaryKey {
-            name: Some("pk_t".to_owned()),
+            name: Some("pk_t".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
@@ -18414,7 +18506,7 @@ mod tests {
             ("other", Column::new(ty("int")).not_null()),
         ]);
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
-            name: Some("pk_t".to_owned()),
+            name: Some("pk_t".into()),
             columns: vec!["other".into()],
             storage_parameters: Default::default(),
         });
@@ -18849,11 +18941,11 @@ mod tests {
                 "{cs:?}"
             );
             assert!(
-                matches!(&cs.changes[0].change, Change::DropForeignKey {name, ..} if name == "fk_kept")
+                matches!(&cs.changes[0].change, Change::DropForeignKey {name, ..} if name.raw() == "fk_kept")
             );
             assert!(
                 matches!(&cs.changes[3].change, Change::AddForeignKey {name, constraint, ..}
-                if name == "fk_kept" && **constraint == base.tables[&"dbo.child".parse().unwrap()].foreign_keys["fk_kept"])
+                if name.raw() == "fk_kept" && **constraint == base.tables[&"dbo.child".parse().unwrap()].foreign_keys["fk_kept"])
             );
             assert_eq!(cs.changes[0].risks, cs.changes[0].change.intrinsic_risks());
             assert!(
@@ -19635,7 +19727,11 @@ mod tests {
         fn constraints_share_namespace_with_tables(&self) -> bool {
             true
         }
-        fn generated_constraint_names(&self, name: &TableName, table: &Table) -> Vec<String> {
+        fn generated_constraint_names(
+            &self,
+            name: &TableName,
+            table: &Table,
+        ) -> Vec<pbps_model::ObjectLocalName> {
             table
                 .columns
                 .iter()
@@ -19646,7 +19742,9 @@ mod tests {
                     | ValueSource::Sequence(_)
                     | ValueSource::Generated(_) => false,
                 })
-                .map(|(column, _)| format!("df_{}_{column}", name.name, column = column.shown(),))
+                .map(|(column, _)| {
+                    format!("df_{}_{column}", name.name, column = column.shown(),).into()
+                })
                 .collect()
         }
         fn quote_ident(&self, ident: &str) -> Result<String, pbps_dialect::DialectError> {
@@ -20115,7 +20213,7 @@ mod tests {
         };
         let key = at(&|c| {
             matches!(c, Change::DropForeignKey { table, name }
-                if table.raw().to_string() == "app.child" && name == "fk_child_other")
+                if table.raw().to_string() == "app.child" && name.raw() == "fk_child_other")
         });
         let unique = at(&|c| matches!(c, Change::DropUnique { .. }));
         let rename = at(&|c| matches!(c, Change::RenameTable { .. }));
@@ -23640,7 +23738,7 @@ mod tests {
             .columns
             .insert("id".into(), Column::new("int".parse().unwrap()));
         base_t.primary_key = Some(pbps_model::PrimaryKey {
-            name: Some("PK__t__357D4CF8312E0151".to_owned()),
+            name: Some("PK__t__357D4CF8312E0151".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
@@ -23683,7 +23781,7 @@ mod tests {
             "a replaced key is its drop and its add: {changes:?}"
         );
         declared_t.primary_key = Some(pbps_model::PrimaryKey {
-            name: Some("pk_t".to_owned()),
+            name: Some("pk_t".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });

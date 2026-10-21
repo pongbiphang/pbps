@@ -124,25 +124,39 @@ pub fn declarations(schema: &Schema, policies: &Policies, ctx: &Context) -> Vec<
                             .map(|c| ("computed column", c.raw().to_owned())),
                     )
                     .collect(),
-                Naming::Index => table.indexes.keys().map(|i| ("index", i.clone())).collect(),
+                Naming::Index => table
+                    .indexes
+                    .keys()
+                    // Raw pattern input and shared finding text; rendering escapes once until #2084 step 5.
+                    .map(|i| ("index", i.raw().to_owned()))
+                    .collect(),
                 Naming::Constraint => table
                     .primary_key
                     .iter()
-                    .filter_map(|pk| pk.name.clone())
+                    // Raw pattern input and shared finding text; rendering escapes once until #2084 step 5.
+                    .filter_map(|pk| pk.name.as_ref().map(|n| n.raw().to_owned()))
                     .map(|n| ("primary key", n))
                     .chain(
                         table
                             .unique
                             .keys()
-                            .map(|n| ("unique constraint", n.clone())),
+                            // Raw pattern input and shared finding text; rendering escapes once until #2084 step 5.
+                            .map(|n| ("unique constraint", n.raw().to_owned())),
                     )
                     .chain(
                         table
                             .foreign_keys
                             .keys()
-                            .map(|n| ("foreign key", n.clone())),
+                            // Raw pattern input and shared finding text; rendering escapes once until #2084 step 5.
+                            .map(|n| ("foreign key", n.raw().to_owned())),
                     )
-                    .chain(table.checks.keys().map(|n| ("check constraint", n.clone())))
+                    .chain(
+                        table
+                            .checks
+                            .keys()
+                            // Raw pattern input and shared finding text; rendering escapes once until #2084 step 5.
+                            .map(|n| ("check constraint", n.raw().to_owned())),
+                    )
                     .collect(),
             };
             for (kind, n) in names {
@@ -733,7 +747,7 @@ mod tests {
             Column::new("text".parse::<ColumnType>().unwrap()),
         );
         t.indexes.insert(
-            "IX_customer".to_owned(),
+            "IX_customer".into(),
             pbps_model::Index {
                 columns: vec![],
                 include: vec![],

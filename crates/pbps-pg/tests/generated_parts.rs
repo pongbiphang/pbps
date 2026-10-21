@@ -399,29 +399,29 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
     assert!(
         parts
             .iter()
-            .any(|p| matches!(p, Change::AddUnique { name, .. } if name == "suffix_unique"))
+            .any(|p| matches!(p, Change::AddUnique { name, .. } if name.raw() == "suffix_unique"))
     );
     assert!(
         parts
             .iter()
-            .any(|p| matches!(p, Change::AddCheck { name, .. } if name == "suffix_unique"))
+            .any(|p| matches!(p, Change::AddCheck { name, .. } if name.raw() == "suffix_unique"))
     );
     assert!(
         parts
             .iter()
-            .any(|p| matches!(p, Change::AddIndex { name, .. } if name == "suffix_unique"))
+            .any(|p| matches!(p, Change::AddIndex { name, .. } if name.raw() == "suffix_unique"))
     );
     assert!(!table.unique.contains_key("suffix_input"));
     assert!(!table.checks.contains_key("suffix_input"));
     assert!(
         parts
             .iter()
-            .any(|p| matches!(p, Change::AddUnique { name, .. } if name == "suffix_input"))
+            .any(|p| matches!(p, Change::AddUnique { name, .. } if name.raw() == "suffix_input"))
     );
     assert!(
         parts
             .iter()
-            .any(|p| matches!(p, Change::AddCheck { name, .. } if name == "suffix_input"))
+            .any(|p| matches!(p, Change::AddCheck { name, .. } if name.raw() == "suffix_input"))
     );
     for name in [
         "suffix_input",
@@ -433,7 +433,7 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
         assert!(
             parts
                 .iter()
-                .any(|p| matches!(p, Change::AddIndex { name: n, .. } if n == name)),
+                .any(|p| matches!(p, Change::AddIndex { name: n, .. } if n.raw() == name)),
             "{name}"
         );
     }
@@ -442,7 +442,7 @@ fn prefix_keys_checks_and_indexes_stay_inline_while_suffix_constraints_wait() {
         assert!(
             parts
                 .iter()
-                .any(|p| matches!(p, Change::AddForeignKey { name: n, .. } if n == name)),
+                .any(|p| matches!(p, Change::AddForeignKey { name: n, .. } if n.raw() == name)),
             "{name}"
         );
     }

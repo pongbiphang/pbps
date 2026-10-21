@@ -394,13 +394,17 @@ fn index_names_created(change: &pbps_model::Change) -> Vec<TableName> {
     let in_schema = |t: &TableName, name: &str| TableName::new(t.schema.clone(), name);
     match change {
         Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
-            vec![in_schema(table, name)]
+            vec![in_schema(table, name.raw())]
         }
         Change::SetPrimaryKey {
             table,
             to: Some(key),
             ..
-        } => key.name.iter().map(|name| in_schema(table, name)).collect(),
+        } => key
+            .name
+            .iter()
+            .map(|name| in_schema(table, name.raw()))
+            .collect(),
         Change::DetachPartition { table, names, .. } => names
             .iter()
             .filter(|n| {
@@ -411,15 +415,15 @@ fn index_names_created(change: &pbps_model::Change) -> Vec<TableName> {
                         | pbps_model::DetachedKind::Index
                 )
             })
-            .filter_map(|n| n.name.as_deref())
+            .filter_map(|n| n.name.as_ref().map(pbps_model::ObjectLocalName::raw))
             .map(|name| in_schema(table, name))
             .collect(),
         Change::CreateTable { name, table, .. } => table
             .primary_key
             .iter()
-            .filter_map(|k| k.name.as_deref())
-            .chain(table.unique.keys().map(String::as_str))
-            .chain(table.indexes.keys().map(String::as_str))
+            .filter_map(|k| k.name.as_ref().map(pbps_model::ObjectLocalName::raw))
+            .chain(table.unique.keys().map(pbps_model::ObjectLocalName::raw))
+            .chain(table.indexes.keys().map(pbps_model::ObjectLocalName::raw))
             .map(|n| in_schema(name, n))
             .collect(),
         _ => Vec::new(),
@@ -719,7 +723,7 @@ pub(crate) fn detach_release_slots(
             })
             .collect();
         let [clone] = matching[..] else { continue };
-        if clone.name.name != *to {
+        if clone.name.name != to.raw() {
             releases.insert(
                 SlotKey {
                     namespace: Namespace::Relations(clone.name.schema.clone()),
@@ -1051,7 +1055,7 @@ impl<'a> Occupant<'a> {
         let at = |t: &TableName, name: &str| self.name.schema == t.schema && self.name.name == name;
         match change {
             Change::DropIndex { table, name } | Change::DropUnique { table, name } => {
-                at(table, name)
+                at(table, name.raw())
             }
             // A connected plan reads each key with the name its index has,
             // a numbered `<table>_pkey1` included (measured, #1723). An
@@ -1062,7 +1066,7 @@ impl<'a> Occupant<'a> {
                 from: Some(key),
                 ..
             } => match &key.name {
-                Some(name) => at(table, name),
+                Some(name) => at(table, name.raw()),
                 None => {
                     owned_by(table)
                         && self.found.owner.as_ref().is_some_and(|catalog| {
@@ -1270,7 +1274,7 @@ pub(crate) fn refuse_permanent_referencers(
                     Holder::Tracked(_) | Holder::Vacant => names.stored(table, At::Before(at)),
                 };
                 if let Some(stored) = stored {
-                    removals.push((at, stored, Some(name.as_str())));
+                    removals.push((at, stored, Some(name.raw())));
                 }
             }
             _ => {}
@@ -1478,7 +1482,9 @@ pub(crate) fn object_reads(
     use pbps_model::Change;
     use pbps_mssql::emit::default_constraint_name as generated;
     use pbps_mssql::emit::fallback_default_constraint_name as fallback_name;
-    let in_schema = |t: &TableName, name: String| TableName::new(t.schema.clone(), name);
+    let in_schema = |t: &TableName, name: pbps_model::ObjectLocalName| {
+        TableName::new(t.schema.clone(), name.into_raw())
+    };
     let mut names = created_object_names(cs);
     let mut parents = Vec::new();
     for (at, p) in cs.changes.iter().enumerate() {
@@ -1498,7 +1504,7 @@ pub(crate) fn object_reads(
                 // And the name a transfer gives it in the new schema before
                 // `sp_rename` runs, which such an object can hold too (#1362).
                 if from.schema != to.schema {
-                    names.push(in_schema(to, from.name.clone()));
+                    names.push(in_schema(to, from.name.clone().into()));
                 }
                 for c in defaults {
                     names.push(in_schema(to, generated(to, c.raw())));
@@ -1526,8 +1532,11 @@ pub(crate) fn object_reads(
             | Change::DropCheck { table, .. } => parents.push(now(table)),
             Change::SetPrimaryKey { table, to, .. } => {
                 parents.push(now(table));
-                if let Some(name) = to.as_ref().and_then(|k| k.name.as_deref()) {
-                    names.push(in_schema(table, name.to_owned()));
+                if let Some(name) = to
+                    .as_ref()
+                    .and_then(|k| k.name.as_ref().map(pbps_model::ObjectLocalName::raw))
+                {
+                    names.push(in_schema(table, name.into()));
                 }
             }
             Change::AddUnique { table, name, .. }
@@ -1748,8 +1757,8 @@ impl NameFacts {
             };
             let mut claims = vec![to.clone()];
             for c in defaults {
-                claims.push(in_schema(to, &generated(to, c.raw())));
-                claims.push(in_schema(to, &fallback_name(to, c.raw())));
+                claims.push(in_schema(to, generated(to, c.raw()).raw()));
+                claims.push(in_schema(to, fallback_name(to, c.raw()).raw()));
             }
             if from.schema != to.schema {
                 claims.push(in_schema(to, &from.name));
@@ -2084,9 +2093,9 @@ impl<'f> Walk<'f> {
                     step,
                     to,
                     column,
-                    in_schema(to, &old),
-                    in_schema(to, &generated(to, column.raw())),
-                    in_schema(to, &fallback_name(to, column.raw())),
+                    in_schema(to, old.raw()),
+                    in_schema(to, generated(to, column.raw()).raw()),
+                    in_schema(to, fallback_name(to, column.raw()).raw()),
                 );
             }
         }
@@ -2102,7 +2111,7 @@ impl<'f> Walk<'f> {
         use pbps_mssql::emit::generated_default_names as left_under;
         let in_schema = |t: &TableName, name: &str| TableName::new(t.schema.clone(), name);
         let default_of = |table: &TableName, column: &str| Entry {
-            name: in_schema(table, &generated(table, column)),
+            name: in_schema(table, generated(table, column).raw()),
             kind: "default constraint".into(),
             parent: Some(table.clone()),
             column: Some(column.into()),
@@ -2137,8 +2146,8 @@ impl<'f> Walk<'f> {
                 table_was,
                 ..
             } => {
-                let new = in_schema(table, &generated(table, to.raw()));
-                let fallback = in_schema(table, &fallback_name(table, to.raw()));
+                let new = in_schema(table, generated(table, to.raw()).raw());
+                let fallback = in_schema(table, fallback_name(table, to.raw()).raw());
                 for was in std::iter::once(table).chain(table_was) {
                     // Still under `from`: the walk renames the column's
                     // entries below, after the default has moved.
@@ -2147,7 +2156,7 @@ impl<'f> Walk<'f> {
                             step,
                             table,
                             from,
-                            in_schema(table, &old),
+                            in_schema(table, old.raw()),
                             new.clone(),
                             fallback.clone(),
                         );
@@ -2193,22 +2202,28 @@ impl<'f> Walk<'f> {
             Change::DropUnique { table, name }
             | Change::DropForeignKey { table, name }
             | Change::DropCheck { table, name } => {
-                let name = in_schema(table, name);
+                let name = in_schema(table, name.raw());
                 self.release(step, |h| h.name == name);
             }
             Change::AddUnique { table, name, .. } => {
-                self.claim(step, constraint(table, name, "unique constraint"));
+                self.claim(step, constraint(table, name.raw(), "unique constraint"));
             }
             Change::AddForeignKey { table, name, .. } => {
-                self.claim(step, constraint(table, name, "foreign key constraint"));
+                self.claim(
+                    step,
+                    constraint(table, name.raw(), "foreign key constraint"),
+                );
             }
             Change::AddCheck { table, name, .. } => {
-                self.claim(step, constraint(table, name, "check constraint"));
+                self.claim(step, constraint(table, name.raw(), "check constraint"));
             }
             Change::SetPrimaryKey {
                 table, from, to, ..
             } => {
-                match from.as_ref().map(|k| k.name.as_deref()) {
+                match from
+                    .as_ref()
+                    .map(|k| k.name.as_ref().map(pbps_model::ObjectLocalName::raw))
+                {
                     Some(Some(name)) => {
                         let name = in_schema(table, name);
                         self.release(step, |h| h.name == name);
@@ -2220,7 +2235,10 @@ impl<'f> Walk<'f> {
                     }),
                     None => {}
                 }
-                if let Some(name) = to.as_ref().and_then(|k| k.name.as_deref()) {
+                if let Some(name) = to
+                    .as_ref()
+                    .and_then(|k| k.name.as_ref().map(pbps_model::ObjectLocalName::raw))
+                {
                     self.claim(step, constraint(table, name, "primary key constraint"));
                 }
             }
@@ -2250,26 +2268,16 @@ impl<'f> Walk<'f> {
                 let named = table
                     .primary_key
                     .iter()
-                    .filter_map(|k| k.name.as_deref())
+                    .filter_map(|k| k.name.as_ref().map(pbps_model::ObjectLocalName::raw))
                     .map(|n| (n, "primary key constraint"))
-                    .chain(
-                        table
-                            .unique
-                            .keys()
-                            .map(|n| (n.as_str(), "unique constraint")),
-                    )
+                    .chain(table.unique.keys().map(|n| (n.raw(), "unique constraint")))
                     .chain(
                         table
                             .foreign_keys
                             .keys()
-                            .map(|n| (n.as_str(), "foreign key constraint")),
+                            .map(|n| (n.raw(), "foreign key constraint")),
                     )
-                    .chain(
-                        table
-                            .checks
-                            .keys()
-                            .map(|n| (n.as_str(), "check constraint")),
-                    );
+                    .chain(table.checks.keys().map(|n| (n.raw(), "check constraint")));
                 for (n, kind) in named {
                     self.claim(step, constraint(name, n, kind));
                 }
@@ -10781,11 +10789,17 @@ mod tests {
 
         // A generated default a column rename moves out of the way, when
         // nothing holds the name it moves to (#1147 review).
-        let generated = TableName::new("dbo", pbps_mssql::emit::default_constraint_name(&old, "c"));
-        let target = TableName::new("dbo", pbps_mssql::emit::default_constraint_name(&old, "d"));
+        let generated = TableName::new(
+            "dbo",
+            pbps_mssql::emit::default_constraint_name(&old, "c").into_raw(),
+        );
+        let target = TableName::new(
+            "dbo",
+            pbps_mssql::emit::default_constraint_name(&old, "d").into_raw(),
+        );
         let fallback = TableName::new(
             "dbo",
-            pbps_mssql::emit::fallback_default_constraint_name(&old, "d"),
+            pbps_mssql::emit::fallback_default_constraint_name(&old, "d").into_raw(),
         );
         let synonym_at = |name: &TableName| NameOccupant {
             wanted: name.clone(),
@@ -10940,7 +10954,7 @@ mod tests {
         };
         let drop_check = PlannedChange::new(Change::DropCheck {
             table: old.clone(),
-            name: target.name.clone(),
+            name: target.name.clone().into(),
         });
         refuse_occupied_objects(
             &plan(vec![drop_check, rename_column(), create_at(&generated)]),
@@ -11014,7 +11028,7 @@ mod tests {
         let named = |column: &str| {
             TableName::new(
                 "dbo",
-                pbps_mssql::emit::default_constraint_name(&old, column),
+                pbps_mssql::emit::default_constraint_name(&old, column).into_raw(),
             )
         };
         let default_at = |column: &str| NameOccupant {
@@ -11055,7 +11069,7 @@ mod tests {
             .expect("`a`'s default goes to its fallback while `b`'s name is held");
         let b_fallback = TableName::new(
             "dbo",
-            pbps_mssql::emit::fallback_default_constraint_name(&old, "b"),
+            pbps_mssql::emit::fallback_default_constraint_name(&old, "b").into_raw(),
         );
         assert!(
             refuse_occupied_objects(
@@ -11083,7 +11097,7 @@ mod tests {
         assert!(
             names.contains(&TableName::new(
                 "dbo",
-                pbps_mssql::emit::default_constraint_name(&renamed, "c")
+                pbps_mssql::emit::default_constraint_name(&renamed, "c").into_raw()
             )),
             "{names:?}"
         );
@@ -11235,7 +11249,7 @@ mod tests {
         assert!(
             names.contains(&TableName::new(
                 "dbo",
-                pbps_mssql::emit::fallback_default_constraint_name(&renamed, "c")
+                pbps_mssql::emit::fallback_default_constraint_name(&renamed, "c").into_raw()
             )),
             "{names:?}"
         );
@@ -11252,11 +11266,11 @@ mod tests {
         let default_on = |table: &TableName, column: &str| NameOccupant {
             wanted: TableName::new(
                 "dbo",
-                pbps_mssql::emit::default_constraint_name(table, column),
+                pbps_mssql::emit::default_constraint_name(table, column).into_raw(),
             ),
             name: TableName::new(
                 "dbo",
-                pbps_mssql::emit::default_constraint_name(table, column),
+                pbps_mssql::emit::default_constraint_name(table, column).into_raw(),
             ),
             kind: "default constraint".into(),
             parent: Some(table.clone()),
@@ -11299,7 +11313,7 @@ mod tests {
         .expect("`a`'s default takes its fallback while `b`'s is held");
         let a_fallback = TableName::new(
             "dbo",
-            pbps_mssql::emit::fallback_default_constraint_name(&b, "c"),
+            pbps_mssql::emit::fallback_default_constraint_name(&b, "c").into_raw(),
         );
         assert!(
             refuse_occupied_objects(
@@ -12284,7 +12298,7 @@ mod tests {
                 table: t.clone(),
                 from: None,
                 to: Some(PrimaryKey {
-                    name: name.map(str::to_owned),
+                    name: name.map(Into::into),
                     columns: vec!["n".into()],
                     storage_parameters: Default::default(),
                 }),
@@ -12362,7 +12376,7 @@ mod tests {
             pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
                 start,
                 increment: 1,
-                name: name.map(str::to_owned),
+                name: name.map(Into::into),
                 options: Default::default(),
             })
         };
@@ -14440,7 +14454,7 @@ mod tests {
         ChangeSet {
             changes: vec![PlannedChange::new(Change::AddCheck {
                 table: format!("{schema}.t").parse().expect("a table name"),
-                name: "t_ck".to_owned(),
+                name: "t_ck".into(),
                 constraint: CheckConstraint {
                     expression: expression.to_owned(),
                 },
@@ -14485,7 +14499,7 @@ mod tests {
         let changes = ChangeSet {
             changes: vec![PlannedChange::new(Change::AddCheck {
                 table: table.clone(),
-                name: "t_ck".to_owned(),
+                name: "t_ck".into(),
                 constraint: CheckConstraint {
                     expression: "d < '02/01/2026'".to_owned(),
                 },
@@ -15959,7 +15973,7 @@ mod tests {
             c.value_source = pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence {
                 start,
                 increment: 1,
-                name: name.map(str::to_owned),
+                name: name.map(Into::into),
                 options: Default::default(),
             });
             c
@@ -16173,7 +16187,7 @@ mod tests {
         let indexed = |s: Schema, column: &str| {
             let mut s = s;
             s.tables.get_mut(&named).unwrap().indexes.insert(
-                "s_ix".to_owned(),
+                "s_ix".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn::column(column)],
                     include: Vec::new(),
@@ -16293,7 +16307,7 @@ mod tests {
             );
             if let Some(name) = index {
                 t.indexes.insert(
-                    name.to_owned(),
+                    name.into(),
                     pbps_model::Index {
                         columns: vec![pbps_model::IndexColumn {
                             key: pbps_model::IndexKey::Column("note".into()),
@@ -16415,7 +16429,7 @@ mod tests {
             changes: vec![pbps_model::PlannedChange::new(
                 pbps_model::Change::AddIndex {
                     table: "dbo.t".parse().unwrap(),
-                    name: "ix_note".to_owned(),
+                    name: "ix_note".into(),
                     index: Box::new(pbps_model::Index {
                         columns: vec![pbps_model::IndexColumn {
                             key: pbps_model::IndexKey::Column("note".into()),
@@ -16465,7 +16479,7 @@ mod tests {
                 .unwrap()
                 .checks
                 .insert(
-                    "ix_note".to_owned(),
+                    "ix_note".into(),
                     pbps_model::CheckConstraint {
                         expression: expression.to_owned(),
                     },
@@ -18957,7 +18971,7 @@ mod tests {
         // An index nobody declared.
         let mut indexed = declared();
         indexed.indexes.insert(
-            "ix_rogue".to_owned(),
+            "ix_rogue".into(),
             pbps_model::Index {
                 columns: vec![pbps_model::IndexColumn {
                     key: pbps_model::IndexKey::Column("id".into()),
@@ -19006,13 +19020,13 @@ mod tests {
                 }),
                 pbps_model::PlannedChange::new(pbps_model::Change::AddForeignKey {
                     table: "dbo.new".parse().unwrap(),
-                    name: "fk_new".to_owned(),
+                    name: "fk_new".into(),
                     constraint: Box::new(fk.clone()),
                 }),
             ],
         };
         let mut keyed = declared();
-        keyed.foreign_keys.insert("fk_new".to_owned(), fk);
+        keyed.foreign_keys.insert("fk_new".into(), fk);
         refuse_unplanned_movement(
             &pbps_mssql::Mssql,
             &with_fk,
@@ -19077,7 +19091,7 @@ mod tests {
         let filtered = |filter: Option<&str>| {
             let mut t = declared();
             t.indexes.insert(
-                "ix_new".to_owned(),
+                "ix_new".into(),
                 pbps_model::Index {
                     columns: vec![pbps_model::IndexColumn {
                         key: pbps_model::IndexKey::Column("id".into()),
@@ -19120,7 +19134,7 @@ mod tests {
         let keyed = |name: Option<&str>, columns: &[&str]| {
             let mut t = declared();
             t.primary_key = Some(pbps_model::PrimaryKey {
-                name: name.map(str::to_owned),
+                name: name.map(Into::into),
                 columns: columns.iter().map(|c| (*c).into()).collect(),
                 storage_parameters: Default::default(),
             });
@@ -19214,14 +19228,14 @@ mod tests {
                 }),
                 pbps_model::PlannedChange::new(pbps_model::Change::AddForeignKey {
                     table: "dbo.new".parse().unwrap(),
-                    name: "fk_new".to_owned(),
+                    name: "fk_new".into(),
                     constraint: Box::new(fk),
                 }),
             ],
         };
         let read_back = |fk: pbps_model::ForeignKey| {
             let mut t = declared();
-            t.foreign_keys.insert("fk_new".to_owned(), fk);
+            t.foreign_keys.insert("fk_new".into(), fk);
             t
         };
         let planned = fk_to(&["id"], pbps_model::ReferentialAction::NoAction);
@@ -19594,7 +19608,7 @@ mod tests {
         };
         let schema_with = |unique: bool| {
             let mut t = pbps_model::Table::default();
-            t.indexes.insert("ix_note".to_owned(), index(unique));
+            t.indexes.insert("ix_note".into(), index(unique));
             let mut s = Schema::default();
             s.tables.insert("dbo.t".parse().unwrap(), t);
             s
@@ -19604,11 +19618,11 @@ mod tests {
             changes: vec![
                 pbps_model::PlannedChange::new(pbps_model::Change::DropIndex {
                     table: "dbo.t".parse().unwrap(),
-                    name: "ix_note".to_owned(),
+                    name: "ix_note".into(),
                 }),
                 pbps_model::PlannedChange::new(pbps_model::Change::AddIndex {
                     table: "dbo.t".parse().unwrap(),
-                    name: "ix_note".to_owned(),
+                    name: "ix_note".into(),
                     index: Box::new(index(true)),
                     clustered: false,
                 }),
@@ -19629,7 +19643,7 @@ mod tests {
             changes: vec![pbps_model::PlannedChange::new(
                 pbps_model::Change::DropIndex {
                     table: "dbo.t".parse().unwrap(),
-                    name: "ix_note".to_owned(),
+                    name: "ix_note".into(),
                 },
             )],
         };
@@ -21451,14 +21465,14 @@ mod tests {
 
         let adding_index = plan(pbps_model::Change::AddIndex {
             table: dbo_t.clone(),
-            name: "ix".to_owned(),
+            name: "ix".into(),
             index: Box::new(index("id", false)),
             clustered: false,
         });
         check(
             &adding_index,
             &with(&|t| {
-                t.indexes.insert("ix".to_owned(), index("id", false));
+                t.indexes.insert("ix".into(), index("id", false));
             }),
         )
         .expect("the index as planned");
@@ -21468,7 +21482,7 @@ mod tests {
         refused(
             &adding_index,
             &with(&|t| {
-                t.indexes.insert("ix".to_owned(), index("id", false));
+                t.indexes.insert("ix".into(), index("id", false));
                 t.clustered = Some(pbps_model::Clustered::Index("ix".into()));
             }),
             "the index came back clustered",
@@ -21480,7 +21494,7 @@ mod tests {
             &with(&|t| {
                 let mut gin = index("id", false);
                 gin.method = pbps_model::IndexMethod::Gin;
-                t.indexes.insert("ix".to_owned(), gin);
+                t.indexes.insert("ix".into(), gin);
             }),
             "the index came back under another method",
         );
@@ -21497,7 +21511,7 @@ mod tests {
         };
         let adding_expression = plan(pbps_model::Change::AddIndex {
             table: dbo_t.clone(),
-            name: "ix".to_owned(),
+            name: "ix".into(),
             index: Box::new(over(pbps_model::IndexKey::Expression("id+1".into()))),
             clustered: false,
         });
@@ -21505,7 +21519,7 @@ mod tests {
             &adding_expression,
             &with(&|t| {
                 t.indexes.insert(
-                    "ix".to_owned(),
+                    "ix".into(),
                     over(pbps_model::IndexKey::Expression("(id + 1)".into())),
                 );
             }),
@@ -21514,23 +21528,21 @@ mod tests {
         refused(
             &adding_expression,
             &with(&|t| {
-                t.indexes.insert(
-                    "ix".to_owned(),
-                    over(pbps_model::IndexKey::Column("id".into())),
-                );
+                t.indexes
+                    .insert("ix".into(), over(pbps_model::IndexKey::Column("id".into())));
             }),
             "the expression key came back as a column",
         );
         let adding_clustered = plan(pbps_model::Change::AddIndex {
             table: dbo_t.clone(),
-            name: "ix".to_owned(),
+            name: "ix".into(),
             index: Box::new(index("id", false)),
             clustered: true,
         });
         check(
             &adding_clustered,
             &with(&|t| {
-                t.indexes.insert("ix".to_owned(), index("id", false));
+                t.indexes.insert("ix".into(), index("id", false));
                 t.clustered = Some(pbps_model::Clustered::Index("ix".into()));
             }),
         )
@@ -21538,7 +21550,7 @@ mod tests {
         refused(
             &adding_clustered,
             &with(&|t| {
-                t.indexes.insert("ix".to_owned(), index("id", false));
+                t.indexes.insert("ix".into(), index("id", false));
             }),
             "the index came back nonclustered",
         );
@@ -21572,14 +21584,14 @@ mod tests {
         refused(
             &adding_index,
             &with(&|t| {
-                t.indexes.insert("ix".to_owned(), index("other", false));
+                t.indexes.insert("ix".into(), index("other", false));
             }),
             "an index of that name on another column",
         );
         refused(
             &adding_index,
             &with(&|t| {
-                t.indexes.insert("ix".to_owned(), index("id", true));
+                t.indexes.insert("ix".into(), index("id", true));
             }),
             "an index of that name, made unique by somebody",
         );
@@ -21589,14 +21601,14 @@ mod tests {
 
         let adding_unique = plan(pbps_model::Change::AddUnique {
             table: dbo_t.clone(),
-            name: "uq".to_owned(),
+            name: "uq".into(),
             constraint: unique("id"),
             clustered: false,
         });
         refused(
             &adding_unique,
             &with(&|t| {
-                t.unique.insert("uq".to_owned(), unique("other"));
+                t.unique.insert("uq".into(), unique("other"));
             }),
             "a unique of that name over another column",
         );
@@ -21611,7 +21623,7 @@ mod tests {
             &keying,
             &with(&|t| {
                 t.primary_key = Some(pbps_model::PrimaryKey {
-                    name: Some("PK__t__3213E83F".to_owned()),
+                    name: Some("PK__t__3213E83F".into()),
                     columns: vec!["id".into()],
                     storage_parameters: Default::default(),
                 });
@@ -21628,14 +21640,14 @@ mod tests {
 
         let adding_fk = plan(pbps_model::Change::AddForeignKey {
             table: dbo_t.clone(),
-            name: "fk".to_owned(),
+            name: "fk".into(),
             constraint: Box::new(fk(&dbo_p, pbps_model::ReferentialAction::Cascade)),
         });
         check(
             &adding_fk,
             &with(&|t| {
                 t.foreign_keys.insert(
-                    "fk".to_owned(),
+                    "fk".into(),
                     fk(&dbo_p, pbps_model::ReferentialAction::Cascade),
                 );
             }),
@@ -21645,7 +21657,7 @@ mod tests {
             &adding_fk,
             &with(&|t| {
                 t.foreign_keys.insert(
-                    "fk".to_owned(),
+                    "fk".into(),
                     fk(&dbo_p, pbps_model::ReferentialAction::NoAction),
                 );
             }),
@@ -21656,7 +21668,7 @@ mod tests {
         // its name is all a read-back can be held to (183).
         let adding_check = plan(pbps_model::Change::AddCheck {
             table: dbo_t.clone(),
-            name: "ck".to_owned(),
+            name: "ck".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "id > 0".to_owned(),
             },
@@ -21665,7 +21677,7 @@ mod tests {
             &adding_check,
             &with(&|t| {
                 t.checks.insert(
-                    "ck".to_owned(),
+                    "ck".into(),
                     pbps_model::CheckConstraint {
                         expression: "([id]>(0))".to_owned(),
                     },
@@ -22142,5 +22154,96 @@ mod plan_name_tests {
             stored_unlogged_parents(&names).is_empty(),
             "a new parent has no stored referencers"
         );
+    }
+}
+
+#[cfg(test)]
+mod local_name_key_tests {
+    use super::*;
+    use pbps_model::{Change, ChangeSet, Index, IndexColumn, PlannedChange};
+
+    #[test]
+    fn qualified_index_claims_and_constraint_reads_preserve_raw_local_names() {
+        const RAW: &str = "part\nline\\slash\u{200b}";
+        const SHOWN: &str = r"part\nline\\slash\u{200b}";
+        let table = TableName::new("app", "t");
+        let index = Index {
+            columns: vec![IndexColumn::column("id")],
+            include: vec![],
+            unique: false,
+            filter: None,
+            method: Default::default(),
+            storage_parameters: Default::default(),
+        };
+        let changes = ChangeSet {
+            changes: vec![
+                PlannedChange::new(Change::SetPrimaryKey {
+                    table: table.clone(),
+                    from: None,
+                    to: Some(pbps_model::PrimaryKey {
+                        name: Some(format!("pk{RAW}").into()),
+                        columns: vec!["id".into()],
+                        storage_parameters: Default::default(),
+                    }),
+                    nonclustered: false,
+                }),
+                PlannedChange::new(Change::AddUnique {
+                    table: table.clone(),
+                    name: format!("uq{RAW}").into(),
+                    constraint: pbps_model::UniqueConstraint {
+                        columns: vec!["id".into()],
+                        storage_parameters: Default::default(),
+                    },
+                    clustered: false,
+                }),
+                PlannedChange::new(Change::AddForeignKey {
+                    table: table.clone(),
+                    name: format!("fk{RAW}").into(),
+                    constraint: Box::new(pbps_model::ForeignKey {
+                        columns: vec!["id".into()],
+                        references_table: TableName::new("app", "parent"),
+                        references_columns: vec!["id".into()],
+                        on_delete: Default::default(),
+                        on_update: Default::default(),
+                    }),
+                }),
+                PlannedChange::new(Change::AddCheck {
+                    table: table.clone(),
+                    name: format!("ck{RAW}").into(),
+                    constraint: pbps_model::CheckConstraint {
+                        expression: "id > 0".into(),
+                    },
+                }),
+                PlannedChange::new(Change::AddIndex {
+                    table: table.clone(),
+                    name: format!("ix{RAW}").into(),
+                    index: Box::new(index),
+                    clustered: false,
+                }),
+            ],
+        };
+        let ids = IdsFile {
+            tables: [("t_aaaaaa".parse().unwrap(), table.clone())].into(),
+            ..Default::default()
+        };
+        let names = pbps_model::plan_names::PlanNames::of(&changes.changes, &ids).unwrap();
+        let claims: BTreeSet<_> = created_index_names(&changes).into_iter().collect();
+        assert_eq!(
+            claims,
+            ["pk", "uq", "ix"]
+                .into_iter()
+                .map(|prefix| TableName::new("app", format!("{prefix}{RAW}")))
+                .collect()
+        );
+        assert!(!claims.contains(&TableName::new("app", format!("ix{SHOWN}"))));
+        let (reads, parents) = object_reads(&changes, &names);
+        assert_eq!(
+            reads.into_iter().collect::<BTreeSet<_>>(),
+            ["pk", "uq", "fk", "ck"]
+                .into_iter()
+                .map(|prefix| TableName::new("app", format!("{prefix}{RAW}")))
+                .collect()
+        );
+        assert_eq!(parents, vec![table]);
     }
 }

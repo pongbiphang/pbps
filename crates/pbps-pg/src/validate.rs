@@ -78,11 +78,19 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         found.extend(key_columns("primary key", &pk.columns, table, true));
     }
     for (name, unique) in &table.unique {
-        let what = format!("unique constraint `{name}`");
+        let what = format!(
+            "unique constraint `{name}`",
+            // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+            name = name.raw(),
+        );
         found.extend(key_columns(&what, &unique.columns, table, true));
     }
     for (name, fk) in &table.foreign_keys {
-        let what = format!("foreign key `{name}`");
+        let what = format!(
+            "foreign key `{name}`",
+            // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+            name = name.raw(),
+        );
         found.extend(key_columns(&what, &fk.columns, table, false));
         if fk.columns.len() != fk.references_columns.len() {
             found.push(invalid(format!(
@@ -134,7 +142,9 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
         // separate tokens with, and neither sees a comment (DECISIONS 504).
         if crate::LEXICON.expression_in(&check.expression) == Expression::Absent {
             found.push(invalid(format!(
-                "check constraint `{name}` has an empty expression"
+                "check constraint `{name}` has an empty expression",
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                name = name.raw(),
             )));
         }
     }
@@ -146,36 +156,27 @@ pub(crate) fn table_structure(table: &Table) -> Vec<DialectError> {
     let constraints = table
         .primary_key
         .iter()
-        .filter_map(|key| key.name.as_deref().map(|name| ("primary key", name)))
-        .chain(
-            table
-                .unique
-                .keys()
-                .map(|name| ("unique constraint", name.as_str())),
-        )
-        .chain(
-            table
-                .foreign_keys
-                .keys()
-                .map(|name| ("foreign key", name.as_str())),
-        )
-        .chain(
-            table
-                .checks
-                .keys()
-                .map(|name| ("check constraint", name.as_str())),
-        );
+        .filter_map(|key| key.name.as_ref().map(|name| ("primary key", name)))
+        .chain(table.unique.keys().map(|name| ("unique constraint", name)))
+        .chain(table.foreign_keys.keys().map(|name| ("foreign key", name)))
+        .chain(table.checks.keys().map(|name| ("check constraint", name)));
     for (kind, name) in constraints {
-        if name.starts_with(crate::emit::SCAN_CHECK_PREFIX) {
+        if name.raw().starts_with(crate::emit::SCAN_CHECK_PREFIX) {
             found.push(invalid(format!(
                 "{kind} `{name}` starts with `{}`, which pbps keeps for the temporary \
                  CHECK of a staged attach; rename it",
-                crate::emit::SCAN_CHECK_PREFIX
+                crate::emit::SCAN_CHECK_PREFIX,
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                name = name.raw(),
             )));
         }
     }
     for (name, index) in &table.indexes {
-        let what = format!("index `{name}`");
+        let what = format!(
+            "index `{name}`",
+            // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+            name = name.raw(),
+        );
         // Column keys are held to the table; an expression key to being an
         // expression at all, as a filter is (DEC-1169.2). An index of
         // expression keys alone names no column and is not empty.

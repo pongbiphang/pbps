@@ -313,7 +313,7 @@ pub struct Statement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanCheck {
     pub table: TableName,
-    pub name: String,
+    pub name: pbps_model::ObjectLocalName,
     pub step: ScanCheckStep,
 }
 
@@ -345,7 +345,7 @@ pub struct RowWrite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexBuild {
     pub table: TableName,
-    pub name: String,
+    pub name: pbps_model::ObjectLocalName,
 }
 
 /// An object a statement creates, for a staged checkpoint to adopt.
@@ -383,7 +383,7 @@ impl Statement {
     pub fn scan_check(
         mut self,
         table: TableName,
-        name: impl Into<String>,
+        name: impl Into<pbps_model::ObjectLocalName>,
         step: ScanCheckStep,
     ) -> Self {
         self.scan_check = Some(ScanCheck {
@@ -399,7 +399,11 @@ impl Statement {
         self
     }
 
-    pub fn building_index(mut self, table: TableName, name: impl Into<String>) -> Self {
+    pub fn building_index(
+        mut self,
+        table: TableName,
+        name: impl Into<pbps_model::ObjectLocalName>,
+    ) -> Self {
         self.index_build = Some(IndexBuild {
             table,
             name: name.into(),
@@ -499,24 +503,42 @@ impl Unchecked {
     pub fn for_change(change: &Change, reason: impl Into<String>) -> Self {
         let description = match change {
             Change::AddCheck { table, name, .. } => {
-                format!("new check {name} on {table}", table = table.raw())
+                format!(
+                    "new check {name} on {table}",
+                    table = table.raw(),
+                    // Shared JSON/explain description is escaped once until #2084 step 5.
+                    name = name.raw(),
+                )
             }
             Change::AddUnique { table, name, .. } => {
                 format!(
                     "new unique constraint {name} on {table}",
-                    table = table.raw()
+                    table = table.raw(),
+                    // Shared JSON/explain description is escaped once until #2084 step 5.
+                    name = name.raw(),
                 )
             }
             Change::AddForeignKey { table, name, .. } => {
-                format!("new foreign key {name} on {table}", table = table.raw())
+                format!(
+                    "new foreign key {name} on {table}",
+                    table = table.raw(),
+                    // Shared JSON/explain description is escaped once until #2084 step 5.
+                    name = name.raw(),
+                )
             }
             Change::AddIndex { table, name, .. } => {
-                format!("new unique index {name} on {table}", table = table.raw())
+                format!(
+                    "new unique index {name} on {table}",
+                    table = table.raw(),
+                    // Shared JSON/explain description is escaped once until #2084 step 5.
+                    name = name.raw(),
+                )
             }
             Change::SetPrimaryKey { table, to, .. } => format!(
                 "new primary key {} on {table}",
                 to.as_ref()
-                    .and_then(|key| key.name.as_deref())
+                    // Shared JSON/explain description is escaped once until #2084 step 5.
+                    .and_then(|key| key.name.as_ref().map(pbps_model::ObjectLocalName::raw))
                     .unwrap_or("(unnamed)"),
                 table = table.raw()
             ),
@@ -2693,7 +2715,11 @@ pub trait Dialect {
     /// table moved to another schema carries them out of its source schema
     /// (review of #1346). The default, none, is right for an engine that names
     /// nothing on its own there.
-    fn generated_constraint_names(&self, _name: &TableName, _table: &Table) -> Vec<String> {
+    fn generated_constraint_names(
+        &self,
+        _name: &TableName,
+        _table: &Table,
+    ) -> Vec<pbps_model::ObjectLocalName> {
         Vec::new()
     }
 
@@ -3574,7 +3600,7 @@ pub fn check_history_names(schema: &Schema, dialect: &(impl Dialect + ?Sized)) -
                 .chain(table.checks.keys().cloned());
             for name in named {
                 held.insert(
-                    TableName::new(table_name.schema.clone(), name),
+                    TableName::new(table_name.schema.clone(), name.into_raw()),
                     format!(
                         "a constraint of `{table_name}`",
                         table_name = table_name.shown()
@@ -3674,7 +3700,8 @@ pub fn history_references_under(
                 dialect.name(),
                 table_name = table_name.shown(),
                 referenced = referenced.shown(),
-                versioned = versioned.shown()
+                versioned = versioned.shown(),
+                fk_name = fk_name.shown(),
             ));
         }
     }
@@ -3755,8 +3782,11 @@ pub fn check_partition_triggers(schema: &Schema, dialect: &(impl Dialect + ?Size
             }
             if dialect.declares_a_constraint(module) {
                 for (kind, held) in [
-                    ("check", table.checks.contains_key(trigger)),
-                    ("foreign key", table.foreign_keys.contains_key(trigger)),
+                    ("check", table.checks.contains_key(trigger.as_str())),
+                    (
+                        "foreign key",
+                        table.foreign_keys.contains_key(trigger.as_str()),
+                    ),
                 ] {
                     if held {
                         problems.push(format!(
@@ -3892,19 +3922,25 @@ fn declared_relation_claims<'a>(
         let mut declared: Vec<(&str, RelationClaim<'_>)> = Vec::new();
         for index_name in table.indexes.keys() {
             declared.push((
-                index_name.as_str(),
+                index_name.raw(),
                 unclaimed(format!(
                     "index `{table_name}.{index_name}`",
-                    table_name = table_name.shown()
+                    table_name = table_name.shown(),
+                    index_name = index_name.shown(),
                 )),
             ));
         }
-        if let Some(pk_name) = table.primary_key.as_ref().and_then(|pk| pk.name.as_deref()) {
+        if let Some(pk_name) = table
+            .primary_key
+            .as_ref()
+            .and_then(|pk| pk.name.as_ref().map(pbps_model::ObjectLocalName::raw))
+        {
             declared.push((
                 pk_name,
                 RelationClaim {
                     descriptor: format!(
                         "primary key `{table_name}.{pk_name}`",
+                        pk_name = pbps_model::escape::Escaped(pk_name),
                         table_name = table_name.shown()
                     ),
                     key_of: Some(table_name),
@@ -3913,11 +3949,12 @@ fn declared_relation_claims<'a>(
         }
         for unique_name in table.unique.keys() {
             declared.push((
-                unique_name.as_str(),
+                unique_name.raw(),
                 RelationClaim {
                     descriptor: format!(
                         "unique constraint `{table_name}.{unique_name}`",
-                        table_name = table_name.shown()
+                        table_name = table_name.shown(),
+                        unique_name = unique_name.shown(),
                     ),
                     key_of: Some(table_name),
                 },
@@ -4067,10 +4104,15 @@ pub fn check_index_names_with_sources(
             table
                 .primary_key
                 .iter()
-                .filter_map(|pk| pk.name.as_deref())
-                .chain(table.unique.keys().map(String::as_str))
-                .chain(table.foreign_keys.keys().map(String::as_str))
-                .chain(table.checks.keys().map(String::as_str))
+                .filter_map(|pk| pk.name.as_ref().map(pbps_model::ObjectLocalName::raw))
+                .chain(table.unique.keys().map(pbps_model::ObjectLocalName::raw))
+                .chain(
+                    table
+                        .foreign_keys
+                        .keys()
+                        .map(pbps_model::ObjectLocalName::raw),
+                )
+                .chain(table.checks.keys().map(pbps_model::ObjectLocalName::raw))
                 .map(move |name| ObjectName::new(table_name.schema.clone(), name))
         })
         .chain(
@@ -4339,31 +4381,17 @@ pub fn check_constraint_names(schema: &Schema, dialect: &(impl Dialect + ?Sized)
         let named = table
             .primary_key
             .as_ref()
-            .and_then(|pk| pk.name.as_deref())
+            .and_then(|pk| pk.name.as_ref().map(pbps_model::ObjectLocalName::raw))
             .map(|name| (name, "primary key"))
             .into_iter()
-            .chain(
-                table
-                    .unique
-                    .keys()
-                    .map(|n| (n.as_str(), "unique constraint")),
-            )
-            .chain(
-                table
-                    .foreign_keys
-                    .keys()
-                    .map(|n| (n.as_str(), "foreign key")),
-            )
-            .chain(
-                table
-                    .checks
-                    .keys()
-                    .map(|n| (n.as_str(), "check constraint")),
-            );
+            .chain(table.unique.keys().map(|n| (n.raw(), "unique constraint")))
+            .chain(table.foreign_keys.keys().map(|n| (n.raw(), "foreign key")))
+            .chain(table.checks.keys().map(|n| (n.raw(), "check constraint")));
         for (name, kind) in named {
             let claim_name = ObjectName::new(table_name.schema.clone(), name);
             let descriptor = format!(
                 "{kind} `{table_name}.{name}`",
+                name = pbps_model::escape::Escaped(name),
                 table_name = table_name.shown()
             );
             let claim = Claim {
@@ -5740,7 +5768,7 @@ mod tests {
 
     fn with_index(mut table: Table, name: &str) -> Table {
         table.indexes.insert(
-            name.to_owned(),
+            name.into(),
             Index {
                 columns: vec![IndexColumn {
                     key: pbps_model::IndexKey::Column("n".into()),
@@ -5759,7 +5787,7 @@ mod tests {
 
     fn with_primary_key(mut table: Table, name: &str) -> Table {
         table.primary_key = Some(PrimaryKey {
-            name: Some(name.to_owned()),
+            name: Some(name.into()),
             columns: vec!["n".into()],
             storage_parameters: Default::default(),
         });
@@ -5768,7 +5796,7 @@ mod tests {
 
     fn with_unique(mut table: Table, name: &str) -> Table {
         table.unique.insert(
-            name.to_owned(),
+            name.into(),
             UniqueConstraint {
                 columns: vec!["n".into()],
                 storage_parameters: Default::default(),
@@ -5779,7 +5807,7 @@ mod tests {
 
     fn with_check(mut table: Table, name: &str) -> Table {
         table.checks.insert(
-            name.to_owned(),
+            name.into(),
             CheckConstraint {
                 expression: "n > 0".to_owned(),
             },
@@ -5797,7 +5825,7 @@ mod tests {
 
     fn with_foreign_key(mut table: Table, name: &str) -> Table {
         table.foreign_keys.insert(
-            name.to_owned(),
+            name.into(),
             pbps_model::ForeignKey {
                 columns: vec!["n".into()],
                 references_table: "coll.parent".parse().unwrap(),

@@ -139,7 +139,7 @@ pub struct Estimate {
     source: CatalogSource,
     /// Catalog CHECKs removed before this statement, under its current table
     /// identity. A later removal cannot invalidate an earlier proof (479).
-    removed_checks: BTreeSet<String>,
+    removed_checks: BTreeSet<pbps_model::ObjectLocalName>,
     pub rewrite: Rewrite,
     pub reads: Reads,
     pub lock: Lock,
@@ -381,7 +381,8 @@ fn estimates_with(
     strategy: impl Fn(&pbps_model::PlannedChange) -> Strategy,
 ) -> Vec<(usize, Estimate)> {
     use pbps_model::plan_names::{At, Holder};
-    let mut removed_checks: BTreeMap<TableName, BTreeSet<String>> = BTreeMap::new();
+    let mut removed_checks: BTreeMap<TableName, BTreeSet<pbps_model::ObjectLocalName>> =
+        BTreeMap::new();
     names
         .changes()
         .iter()
@@ -517,7 +518,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             let of = match target {
                 pbps_model::IndexPart::PrimaryKey => "the primary key's index".to_owned(),
                 pbps_model::IndexPart::Unique(n) | pbps_model::IndexPart::Index(n) => {
-                    format!("index {n}")
+                    format!(
+                        "index {n}",
+                        // Shared estimate description is escaped by the report until #2084 step 5.
+                        n = n.raw(),
+                    )
                 }
             };
             e(
@@ -677,7 +682,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         ),
 
         Change::AddCheck { table, name, .. } => e(
-            format!("adding the check {name}"),
+            format!(
+                "adding the check {name}",
+                // Shared estimate description is escaped by the report until #2084 step 5.
+                name = name.raw(),
+            ),
             table,
             Rewrite::No,
             Reads::EveryRow,
@@ -685,7 +694,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
         ),
 
         Change::AddUnique { table, name, .. } => e(
-            format!("adding the unique constraint {name}"),
+            format!(
+                "adding the unique constraint {name}",
+                // Shared estimate description is escaped by the report until #2084 step 5.
+                name = name.raw(),
+            ),
             table,
             Rewrite::No,
             Reads::EveryRow,
@@ -712,7 +725,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             constraint,
         } => {
             let mut estimate = Estimate::new(
-                format!("adding the foreign key {name}"),
+                format!(
+                    "adding the foreign key {name}",
+                    // Shared estimate description is escaped by the report until #2084 step 5.
+                    name = name.raw(),
+                ),
                 table.clone(),
                 Rewrite::No,
                 Reads::EveryRow,
@@ -743,7 +760,11 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
             // takes the heavier one, which is the direction that surprises an
             // operator.
             e(
-                format!("building the index {name}"),
+                format!(
+                    "building the index {name}",
+                    // Shared estimate description is escaped by the report until #2084 step 5.
+                    name = name.raw(),
+                ),
                 table,
                 Rewrite::No,
                 Reads::EveryRow,

@@ -70,16 +70,16 @@ pub(crate) fn order(
                 if let Some(moving) = base.schema.tables.get(from) {
                     for carried in carried_names(moving, indexes, constraints)
                         .into_iter()
-                        .filter(|carried| !dropped_from(from, to, carried))
+                        .filter(|carried| !dropped_from(from, to, carried.raw()))
                     {
                         claims
-                            .entry(TableName::new(to.schema.clone(), carried))
+                            .entry(TableName::new(to.schema.clone(), carried.into_raw()))
                             .or_default()
                             .insert(i);
                     }
                     for generated in generated_names(dialect, from, moving, constraints) {
                         weak_claims
-                            .entry(TableName::new(to.schema.clone(), generated))
+                            .entry(TableName::new(to.schema.clone(), generated.into_raw()))
                             .or_default()
                             .insert(i);
                     }
@@ -90,7 +90,7 @@ pub(crate) fn order(
             if let Some(moving) = base.schema.tables.get(from) {
                 for generated in generated_names(dialect, to, moving, constraints) {
                     weak_claims
-                        .entry(TableName::new(to.schema.clone(), generated))
+                        .entry(TableName::new(to.schema.clone(), generated.into_raw()))
                         .or_default()
                         .insert(i);
                 }
@@ -125,7 +125,8 @@ pub(crate) fn order(
         if let Change::DropTable { name, .. } = &p.change
             && let Some(t) = base.schema.tables.get(name)
         {
-            let mut remaining: BTreeSet<&String> = t.foreign_keys.keys().collect();
+            let mut remaining: BTreeSet<&pbps_model::ObjectLocalName> =
+                t.foreign_keys.keys().collect();
             for (j, q) in planned.iter().enumerate() {
                 if let Change::DropForeignKey { table, name: fk } = &q.change
                     && table == name
@@ -161,12 +162,12 @@ pub(crate) fn order(
                 released.extend(
                     carried_names(t, indexes, constraints)
                         .into_iter()
-                        .map(|n| (n, true)),
+                        .map(|n| (n.into_raw(), true)),
                 );
                 released.extend(
                     generated_names(dialect, name, t, constraints)
                         .into_iter()
-                        .map(|n| (n, false)),
+                        .map(|n| (n.into_raw(), false)),
                 );
             }
             for (one, strong) in released {
@@ -293,8 +294,13 @@ pub(crate) fn order(
                 released.extend(
                     carried_names(moving, indexes, constraints)
                         .into_iter()
-                        .filter(|carried| !dropped_from(from, to, carried))
-                        .map(|carried| (TableName::new(from.schema.clone(), carried), true)),
+                        .filter(|carried| !dropped_from(from, to, carried.raw()))
+                        .map(|carried| {
+                            (
+                                TableName::new(from.schema.clone(), carried.into_raw()),
+                                true,
+                            )
+                        }),
                 );
             }
         }
@@ -304,7 +310,12 @@ pub(crate) fn order(
             released.extend(
                 generated_names(dialect, from, moving, constraints)
                     .into_iter()
-                    .map(|generated| (TableName::new(from.schema.clone(), generated), false)),
+                    .map(|generated| {
+                        (
+                            TableName::new(from.schema.clone(), generated.into_raw()),
+                            false,
+                        )
+                    }),
             );
         }
         for (name, strong) in &released {
@@ -650,8 +661,8 @@ fn carried_names(
     table: &pbps_model::schema::Table,
     indexes: bool,
     constraints: bool,
-) -> Vec<String> {
-    let mut names: Vec<String> = table.unique.keys().cloned().collect();
+) -> Vec<pbps_model::ObjectLocalName> {
+    let mut names: Vec<pbps_model::ObjectLocalName> = table.unique.keys().cloned().collect();
     names.extend(table.primary_key.as_ref().and_then(|pk| pk.name.clone()));
     if indexes {
         names.extend(table.indexes.keys().cloned());
@@ -671,7 +682,7 @@ fn generated_names(
     name: &TableName,
     table: &pbps_model::schema::Table,
     constraints: bool,
-) -> Vec<String> {
+) -> Vec<pbps_model::ObjectLocalName> {
     if constraints {
         dialect.generated_constraint_names(name, table)
     } else {
@@ -689,17 +700,17 @@ fn dropped_relation(
     constraints: bool,
 ) -> Option<(&TableName, &str)> {
     if let Change::DropUnique { table, name } = change {
-        return Some((table, name));
+        return Some((table, name.raw()));
     }
     if let Change::DropIndex { table, name } = change
         && indexes
     {
-        return Some((table, name));
+        return Some((table, name.raw()));
     }
     if let Change::DropCheck { table, name } | Change::DropForeignKey { table, name } = change
         && constraints
     {
-        return Some((table, name));
+        return Some((table, name.raw()));
     }
     if let Change::SetPrimaryKey {
         table,
@@ -708,7 +719,11 @@ fn dropped_relation(
         ..
     } = change
     {
-        return pk.name.as_deref().map(|name| (table, name));
+        return pk
+            .name
+            .as_ref()
+            .map(pbps_model::ObjectLocalName::raw)
+            .map(|name| (table, name));
     }
     None
 }

@@ -214,8 +214,18 @@ fn surface(surface: &Surface) -> String {
         Surface::Table(table) => format!("table {table}", table = table.raw()),
         Surface::Column(column) => format!("column {column}", column = column.raw()),
         Surface::Default(column) => format!("default {column}", column = column.raw()),
-        Surface::Check { table, name } => format!("check {table}.{name}", table = table.raw()),
-        Surface::Index { table, name } => format!("index {table}.{name}", table = table.raw()),
+        Surface::Check { table, name } => format!(
+            "check {table}.{name}",
+            table = table.raw(),
+            // Shared JSON/Text surface; rendering escapes once until #2084 step 5.
+            name = name.raw(),
+        ),
+        Surface::Index { table, name } => format!(
+            "index {table}.{name}",
+            table = table.raw(),
+            // Shared JSON/Text surface; rendering escapes once until #2084 step 5.
+            name = name.raw(),
+        ),
         Surface::Module(module) => format!("module {module}", module = module.raw()),
     }
 }

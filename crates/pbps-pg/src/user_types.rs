@@ -475,7 +475,7 @@ pub struct Domain {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainConstraint {
-    pub name: String,
+    pub name: pbps_model::ObjectLocalName,
     /// `pg_constraint.contype`, so a kind a later release adds still differs.
     pub contype: String,
     /// `convalidated`: `ADD CONSTRAINT … NOT VALID` and `VALIDATE CONSTRAINT`
@@ -1306,7 +1306,7 @@ async fn fetch_constraints(
             .entry(need(row, "typ")?)
             .or_default()
             .push(DomainConstraint {
-                name: need::<&str>(row, "name")?.to_owned(),
+                name: need::<&str>(row, "name")?.into(),
                 contype: need::<&str>(row, "contype")?.to_owned(),
                 validated: need(row, "validated")?,
                 definition: need::<&str>(row, "definition")?.to_owned(),
@@ -1617,7 +1617,7 @@ mod tests {
 
     fn constraint(name: &str, validated: bool, definition: &str) -> DomainConstraint {
         DomainConstraint {
-            name: name.to_owned(),
+            name: name.into(),
             contype: "c".to_owned(),
             validated,
             definition: definition.to_owned(),
@@ -1642,6 +1642,24 @@ mod tests {
                 ],
             }),
         }
+    }
+
+    #[test]
+    fn domain_constraint_names_keep_raw_fingerprint_bytes_and_distinct_identity() {
+        const RAW: &str = "ck\nline\\slash";
+        const SHOWN: &str = r"ck\nline\\slash";
+        let mut definition = domain();
+        let Body::Domain(body) = &mut definition.body else {
+            unreachable!()
+        };
+        body.constraints = vec![constraint(RAW, true, "CHECK ((VALUE > 0))")];
+        assert_eq!(definition.canonical()[4][6][0][0], serde_json::json!(RAW));
+        let original = definition.canonical();
+        let Body::Domain(body) = &mut definition.body else {
+            unreachable!()
+        };
+        body.constraints[0].name = SHOWN.into();
+        assert_ne!(definition.canonical(), original);
     }
 
     fn composite() -> Definition {
@@ -1910,7 +1928,7 @@ mod tests {
             ),
             (
                 "constraint name",
-                domain_of(|d| d.constraints[0].name = "renamed".to_owned()),
+                domain_of(|d| d.constraints[0].name = "renamed".into()),
             ),
             (
                 "constraint kind",

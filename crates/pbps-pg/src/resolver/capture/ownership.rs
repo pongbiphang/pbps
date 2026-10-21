@@ -269,7 +269,7 @@ pub(super) fn classify(
                 .filter(|object| {
                     object.class == "pg_constraint"
                         && object.name.len() == 1
-                        && object.name[0] == *check
+                        && object.name[0] == check.raw()
                         && object.signature.get(1) == Some(&table_id)
                 })
                 .cloned()
@@ -291,7 +291,7 @@ pub(super) fn classify(
         for index in table.indexes.keys() {
             let object = identity(
                 "pg_class",
-                vec![name.schema.clone(), index.clone()],
+                vec![name.schema.clone(), index.raw().to_owned()],
                 Vec::new(),
             );
             if capture.inputs.contains_key(&object) {
@@ -332,13 +332,13 @@ pub(super) fn classify(
         for (constraint_name, kind) in table
             .unique
             .keys()
-            .map(|name| (name.as_str(), "u"))
-            .chain(table.foreign_keys.keys().map(|name| (name.as_str(), "f")))
+            .map(|name| (name.raw(), "u"))
+            .chain(table.foreign_keys.keys().map(|name| (name.raw(), "f")))
             .chain(
                 table
                     .primary_key
                     .as_ref()
-                    .and_then(|key| key.name.as_deref())
+                    .and_then(|key| key.name.as_ref().map(pbps_model::ObjectLocalName::raw))
                     .map(|name| (name, "p")),
             )
         {

@@ -208,7 +208,7 @@ pub(super) fn classify(
             direct(
                 capture,
                 &mut owned,
-                object(name, check),
+                object(name, check.raw()),
                 &["C"],
                 Some(&table_id),
                 Surface::Check {
@@ -222,13 +222,13 @@ pub(super) fn classify(
         let keys = table
             .unique
             .keys()
-            .map(|key| (key.as_str(), "UQ"))
-            .chain(table.foreign_keys.keys().map(|key| (key.as_str(), "F")))
+            .map(|key| (key.raw(), "UQ"))
+            .chain(table.foreign_keys.keys().map(|key| (key.raw(), "F")))
             .chain(
                 table
                     .primary_key
                     .as_ref()
-                    .and_then(|key| key.name.as_deref())
+                    .and_then(|key| key.name.as_ref().map(pbps_model::ObjectLocalName::raw))
                     .map(|key| (key, "PK")),
             );
         for (key, expected) in keys {

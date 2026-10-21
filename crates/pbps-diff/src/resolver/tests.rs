@@ -1139,9 +1139,9 @@ fn a_replica_identity_keeps_its_order_against_its_tables_indexes() {
             .filter(|p| p.change.table() == Some(&"app.a".parse().unwrap()))
             .map(|p| {
                 if let Change::AddIndex { name, .. } = &p.change {
-                    format!("add {name}")
+                    format!("add {name}", name = name.shown(),)
                 } else if let Change::DropIndex { name, .. } = &p.change {
-                    format!("drop {name}")
+                    format!("drop {name}", name = name.shown(),)
                 } else if matches!(p.change, Change::SetReplicaIdentity { .. }) {
                     "identity".to_owned()
                 } else {
@@ -5104,7 +5104,7 @@ fn two_reference_tables_referencing_each_other_plan_and_settle_in_the_differs_or
         });
         table
             .foreign_keys
-            .insert(format!("fk_{name}"), reference(other, column));
+            .insert(format!("fk_{name}").into(), reference(other, column));
         table.data = Some(TableData {
             mode: DataMode::Exact,
             rows: [(

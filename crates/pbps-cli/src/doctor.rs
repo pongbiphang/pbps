@@ -980,7 +980,7 @@ fn surviving_keys(
         .iter()
         .filter_map(|planned| {
             if let pbps_model::Change::AddForeignKey { table, name, .. } = &planned.change {
-                Some((table, name.as_str()))
+                Some((table, name.raw()))
             } else {
                 None
             }
@@ -989,7 +989,7 @@ fn surviving_keys(
     let mut keys = pbps_db::doctor::DeclaredKeys::new();
     for (table_name, table) in &loaded.schema.tables {
         for (key_name, key) in &table.foreign_keys {
-            if !added.contains(&(table_name, key_name.as_str())) {
+            if !added.contains(&(table_name, key_name.raw())) {
                 keys.entry(table_name.clone())
                     .or_default()
                     .insert(key.references_table.clone());
@@ -1974,7 +1974,7 @@ mod tests {
         assert!(
             changes.changes.iter().any(|c| matches!(
                 &c.change,
-                pbps_model::Change::AddForeignKey { name, .. } if name == "fk_c_p"
+                pbps_model::Change::AddForeignKey { name, .. } if name.raw() == "fk_c_p"
             )),
             "the diff as written must re-add the key for this test to mean anything"
         );

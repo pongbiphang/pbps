@@ -14,7 +14,7 @@
 //! intent would make the same state compare unequal depending on whether an
 //! annotation happened to be present.
 
-use crate::ColumnName;
+use crate::{ColumnName, ObjectLocalName};
 use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
@@ -126,10 +126,9 @@ impl Schema {
                             fk.references_table.shown(),
                             say(&r.collation),
                             name = name.shown(),
-
                             local = local.shown(),
-
                             referenced = referenced.shown(),
+                            fk_name = fk_name.shown(),
                         ));
                     }
                 }
@@ -177,25 +176,13 @@ impl Table {
     /// collisions and any wider namespace belong to the dialect (decision 459).
     /// An unnamed primary key has no declared name to compare.
     pub fn constraint_name_conflicts(&self) -> Vec<String> {
-        let primary = self.primary_key.as_ref().and_then(|pk| pk.name.as_deref());
+        let primary = self.primary_key.as_ref().and_then(|pk| pk.name.as_ref());
         let names = primary
             .into_iter()
             .map(|name| (name, "primary key"))
-            .chain(
-                self.unique
-                    .keys()
-                    .map(|name| (name.as_str(), "unique constraint")),
-            )
-            .chain(
-                self.foreign_keys
-                    .keys()
-                    .map(|name| (name.as_str(), "foreign key")),
-            )
-            .chain(
-                self.checks
-                    .keys()
-                    .map(|name| (name.as_str(), "check constraint")),
-            );
+            .chain(self.unique.keys().map(|name| (name, "unique constraint")))
+            .chain(self.foreign_keys.keys().map(|name| (name, "foreign key")))
+            .chain(self.checks.keys().map(|name| (name, "check constraint")));
         let mut seen = BTreeMap::new();
         let mut problems = Vec::new();
         for (name, kind) in names {
@@ -203,7 +190,9 @@ impl Table {
                 std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(kind); }
                 std::collections::btree_map::Entry::Occupied(entry) => problems.push(format!(
                     "{} and {kind} are both named `{name}`; constraint names must be distinct within a table",
-                    entry.get()
+                    entry.get(),
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    name = name.raw(),
                 )),
             }
         }
@@ -218,12 +207,12 @@ impl Table {
 
     /// Whether the UNIQUE constraint `name`'s index is the clustered one.
     pub fn unique_is_clustered(&self, name: &str) -> bool {
-        matches!(&self.clustered, Some(Clustered::Unique(n)) if n == name)
+        matches!(&self.clustered, Some(Clustered::Unique(n)) if n.raw() == name)
     }
 
     /// Whether the index `name` is the clustered one.
     pub fn index_is_clustered(&self, name: &str) -> bool {
-        matches!(&self.clustered, Some(Clustered::Index(n)) if n == name)
+        matches!(&self.clustered, Some(Clustered::Index(n)) if n.raw() == name)
     }
 
     /// Why this table's [`Table::storage_parameters`] cannot be what they
@@ -256,7 +245,11 @@ impl Table {
         }
         for (name, unique) in &self.unique {
             found.extend(check(
-                &format!("unique constraint `{name}`: "),
+                &format!(
+                    "unique constraint `{name}`: ",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    name = name.raw(),
+                ),
                 &unique.storage_parameters,
                 &btree,
             ));
@@ -264,7 +257,11 @@ impl Table {
         for (name, index) in &self.indexes {
             let method = index.method;
             found.extend(check(
-                &format!("index `{name}`: "),
+                &format!(
+                    "index `{name}`: ",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    name = name.raw(),
+                ),
                 &index.storage_parameters,
                 &|n, v| crate::storage::canonical_index(method, n, v),
             ));
@@ -310,24 +307,46 @@ impl Table {
             Some(ReplicaIdentity::Unique(n)) => match self.unique.get(n) {
                 None => vec![format!(
                     "`replica_identity` names unique constraint `{n}`, which this table does not \
-                     declare"
+                     declare",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
                 )],
-                Some(u) => over(format!("unique constraint `{n}`"), &u.columns),
+                Some(u) => over(
+                    format!(
+                        "unique constraint `{n}`",
+                        // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                        n = n.raw(),
+                    ),
+                    &u.columns,
+                ),
             },
             Some(ReplicaIdentity::Index(n)) => match self.indexes.get(n) {
                 None => vec![format!(
-                    "`replica_identity` names index `{n}`, which this table does not declare"
+                    "`replica_identity` names index `{n}`, which this table does not declare",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
                 )],
                 Some(ix) if !ix.unique || ix.filter.is_some() => vec![format!(
                     "`replica_identity` names index `{n}`, which is not unique or is partial; \
-                     PostgreSQL takes only a unique, non-partial index"
+                     PostgreSQL takes only a unique, non-partial index",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
                 )],
                 Some(ix) => match ix.column_keys() {
                     None => vec![format!(
                         "`replica_identity` names index `{n}`, which holds an expression; \
-                         PostgreSQL takes only an index over plain columns"
+                         PostgreSQL takes only an index over plain columns",
+                        // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                        n = n.raw(),
                     )],
-                    Some(columns) => over(format!("index `{n}`"), &columns),
+                    Some(columns) => over(
+                        format!(
+                            "index `{n}`",
+                            // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                            n = n.raw(),
+                        ),
+                        &columns,
+                    ),
                 },
             },
         }
@@ -348,10 +367,14 @@ impl Table {
             ],
             Some(Clustered::Heap) => Vec::new(),
             Some(Clustered::Unique(n)) if !self.unique.contains_key(n) => vec![format!(
-                "`clustered` names unique constraint `{n}`, which this table does not declare"
+                "`clustered` names unique constraint `{n}`, which this table does not declare",
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
             )],
             Some(Clustered::Index(n)) if !self.indexes.contains_key(n) => vec![format!(
-                "`clustered` names index `{n}`, which this table does not declare"
+                "`clustered` names index `{n}`, which this table does not declare",
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
             )],
             Some(Clustered::Unique(_) | Clustered::Index(_)) => Vec::new(),
         }
@@ -442,16 +465,16 @@ pub struct Table {
     pub primary_key: Option<PrimaryKey>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub unique: BTreeMap<String, UniqueConstraint>,
+    pub unique: BTreeMap<ObjectLocalName, UniqueConstraint>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub foreign_keys: BTreeMap<String, ForeignKey>,
+    pub foreign_keys: BTreeMap<ObjectLocalName, ForeignKey>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub checks: BTreeMap<String, CheckConstraint>,
+    pub checks: BTreeMap<ObjectLocalName, CheckConstraint>,
 
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub indexes: BTreeMap<String, Index>,
+    pub indexes: BTreeMap<ObjectLocalName, Index>,
 
     /// Which index holds the table's rows, where that is not the default
     /// (SQL Server's clustered index, #1178).
@@ -958,10 +981,10 @@ pub enum Clustered {
     Heap,
     /// This UNIQUE constraint's index is the clustered one; the primary key,
     /// if any, is nonclustered.
-    Unique(String),
+    Unique(ObjectLocalName),
     /// This index is the clustered one; the primary key, if any, is
     /// nonclustered.
-    Index(String),
+    Index(ObjectLocalName),
 }
 
 /// What a PostgreSQL table's logical-replication records carry to identify
@@ -969,6 +992,16 @@ pub enum Clustered {
 /// owner by kind and declared name, as [`Clustered`] does: constraints and
 /// indexes are never renamed in place, so the selector follows a rename by
 /// being written with the new name.
+///
+/// ```compile_fail,E0277
+/// let identity = pbps_model::ReplicaIdentity::Index("ix".into());
+/// let _ = format!("{}", identity);
+/// ```
+///
+/// ```compile_fail,E0599
+/// let identity = pbps_model::ReplicaIdentity::Index("ix".into());
+/// let _ = identity.to_string();
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplicaIdentity {
@@ -982,20 +1015,53 @@ pub enum ReplicaIdentity {
     /// model does too.
     PrimaryKey,
     /// `USING INDEX` this UNIQUE constraint's index.
-    Unique(String),
+    Unique(ObjectLocalName),
     /// `USING INDEX` this unique index.
-    Index(String),
+    Index(ObjectLocalName),
 }
 
-/// As the declaration spells it.
-impl std::fmt::Display for ReplicaIdentity {
+/// Explicit projections retain declaration punctuation around the name.
+impl ReplicaIdentity {
+    /// Canonical declaration text for data and shared report sentences.
+    pub fn raw(&self) -> impl std::fmt::Display + Copy + '_ {
+        RawReplicaIdentity(self)
+    }
+    /// Human-readable declaration text with the name escaped once.
+    pub fn shown(&self) -> impl std::fmt::Display + Copy + '_ {
+        ShownReplicaIdentity(self)
+    }
+}
+#[derive(Clone, Copy)]
+struct RawReplicaIdentity<'a>(&'a ReplicaIdentity);
+#[derive(Clone, Copy)]
+struct ShownReplicaIdentity<'a>(&'a ReplicaIdentity);
+impl std::fmt::Display for RawReplicaIdentity<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Full => f.write_str("full"),
-            Self::Nothing => f.write_str("nothing"),
-            Self::PrimaryKey => f.write_str("primary_key"),
-            Self::Unique(n) => write!(f, "{{unique: {n}}}"),
-            Self::Index(n) => write!(f, "{{index: {n}}}"),
+        match self.0 {
+            ReplicaIdentity::Full => f.write_str("full"),
+            ReplicaIdentity::Nothing => f.write_str("nothing"),
+            ReplicaIdentity::PrimaryKey => f.write_str("primary_key"),
+            ReplicaIdentity::Unique(n) | ReplicaIdentity::Index(n) => {
+                f.write_str(if matches!(self.0, ReplicaIdentity::Unique(_)) {
+                    "{unique: "
+                } else {
+                    "{index: "
+                })?;
+                // Canonical data spelling; retained after #2084 step 5.
+                f.write_str(n.raw())?;
+                f.write_str("}")
+            }
+        }
+    }
+}
+impl std::fmt::Display for ShownReplicaIdentity<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            ReplicaIdentity::Full => f.write_str("full"),
+            ReplicaIdentity::Nothing => f.write_str("nothing"),
+            ReplicaIdentity::PrimaryKey => f.write_str("primary_key"),
+            ReplicaIdentity::Unique(n) => write!(f, "{{unique: {}}}", n.shown()),
+            ReplicaIdentity::Index(n) => write!(f, "{{index: {}}}", n.shown()),
         }
     }
 }
@@ -1316,7 +1382,7 @@ impl OwnedSequence {
 pub struct PrimaryKey {
     /// The constraint name. `None` leaves the database to name it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub name: Option<ObjectLocalName>,
     pub columns: Vec<ColumnName>,
 
     /// PostgreSQL index storage parameters (#1442), by name, each in its

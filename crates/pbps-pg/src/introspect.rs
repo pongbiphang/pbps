@@ -271,7 +271,7 @@ pub struct RawIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawConstraint {
     pub table_oid: i64,
-    pub name: String,
+    pub name: pbps_model::ObjectLocalName,
     /// `contype`: `p` primary key, `u` unique, `f` foreign key, `c` check,
     /// `n` not null (PostgreSQL 18+), `x` exclusion, `t` constraint trigger.
     pub kind: char,
@@ -335,7 +335,7 @@ pub struct RawConstraint {
 pub struct RawIndex {
     pub oid: i64,
     pub table_oid: i64,
-    pub name: String,
+    pub name: pbps_model::ObjectLocalName,
     pub unique: bool,
     pub primary: bool,
     pub exclusion: bool,
@@ -944,7 +944,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 if add_index(index, &parts, &mut table, &mut pulled) {
                     surviving.insert(index.oid);
                     if let Some(declared) = table.indexes.get_mut(&index.name) {
-                        let what = format!("index `{}`", index.name);
+                        let what = format!("index `{}`", index.name.shown());
                         declared.storage_parameters = index_parameters(
                             declared.method,
                             &index.reloptions,
@@ -1052,7 +1052,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .map_or(&[][..], Vec::as_slice)
         {
             let options = options_of(constraint.index_oid);
-            let what = format!("constraint `{}`", constraint.name);
+            let what = format!("constraint `{}`", constraint.name.shown());
             let target = match constraint.kind {
                 'p' => table
                     .primary_key
@@ -1073,7 +1073,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .map_or(&[][..], Vec::as_slice)
         {
             if let Some(declared) = table.indexes.get_mut(&index.name) {
-                let what = format!("index `{}`", index.name);
+                let what = format!("index `{}`", index.name.shown());
                 declared.storage_parameters =
                     index_parameters(declared.method, &index.reloptions, &what, &mut unread);
             }
@@ -2418,7 +2418,8 @@ fn replica_identity(
             if !held {
                 return Err(format!(
                     "its `REPLICA IDENTITY` is `{identity}`, which this pull leaves out, so the \
-                     identity cannot be declared"
+                     identity cannot be declared",
+                    identity = identity.shown(),
                 ));
             }
             identity
@@ -3010,7 +3011,7 @@ fn add_constraint(
                      nothing against it, ever. This model has no word for that -- read back it is \
                      an ordinary constraint, which a plan would recreate as one that enforces -- \
                      so it is left out. Its definition is `{}`.",
-                    raw.name,
+                    raw.name.shown(),
                     parts.name.shown(),
                     raw.definition
                 ),
@@ -3031,7 +3032,7 @@ fn add_constraint(
                      rows and for no table that inherits from it. This model holds only the \
                      expression, so it is left out rather than read back as a check a plan would \
                      recreate on the children too. Its definition is `{}`.",
-                    raw.name,
+                    raw.name.shown(),
                     parts.name.shown(),
                     raw.definition
                 ),
@@ -3054,7 +3055,7 @@ fn add_constraint(
                      here -- while the catalog still calls the constraint validated and enforced. \
                      This model holds only the constraint, so it is left out rather than read \
                      back as one whose checks are running. Its definition is `{}`.",
-                    raw.name,
+                    raw.name.shown(),
                     parts.name.shown(),
                     raw.definition
                 ),
@@ -3076,7 +3077,7 @@ fn add_constraint(
                      asks is about ranges, not values, and this model holds only the columns, so \
                      it is left out rather than read back as the constraint it is not. Its \
                      definition is `{}`.",
-                    raw.name,
+                    raw.name.shown(),
                     parts.name.shown(),
                     raw.definition
                 ),
@@ -3104,7 +3105,7 @@ fn add_constraint(
                      and this model holds a key constraint's key columns and nothing else. Read \
                      back it is the same constraint over a narrower index, so it is left out \
                      rather than read back as one that covers less than it does.",
-                    raw.name,
+                    raw.name.shown(),
                     parts.name.shown()
                 ),
             );
@@ -3126,7 +3127,7 @@ fn add_constraint(
                      admits at most one null key where an ordinary unique constraint admits any \
                      number. This model holds only `unique`, so the constraint is left out \
                      rather than read back as the weaker one it is not.",
-                    raw.name,
+                    raw.name.shown(),
                     parts.name.shown()
                 ),
             );
@@ -3143,7 +3144,7 @@ fn add_constraint(
                      checked immediately -- so a transaction that relies on `SET CONSTRAINTS`, or \
                      on rows that violate it in the middle of one, would break with no plan \
                      saying anything had changed. Its definition is `{}`.",
-                    raw.name,
+                    raw.name.shown(),
                     parts.name.shown(),
                     if raw.deferred {
                         " INITIALLY DEFERRED"
@@ -3197,7 +3198,7 @@ fn add_constraint(
                         "check constraint `{}` on `{}` is `NOT VALID`: it holds for new rows and \
                          has never been checked against the rows already there. This model holds \
                          only the expression, so it is read back as an ordinary check.",
-                        raw.name,
+                        raw.name.shown(),
                         parts.name.shown()
                     ),
                 );
@@ -3214,7 +3215,7 @@ fn add_constraint(
                     format!(
                         "check constraint `{}` on `{}` has no readable expression, so it is left \
                          out. Its definition is `{}`.",
-                        raw.name,
+                        raw.name.shown(),
                         parts.name.shown(),
                         raw.definition
                     ),
@@ -3239,7 +3240,7 @@ fn add_constraint(
                 "`{}` on `{}` is an exclusion constraint, which this model does not hold. It is \
                  left out of the pull, so a plan cannot see it and `verify` cannot report a \
                  change to it.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown()
             ),
         ),
@@ -3250,7 +3251,7 @@ fn add_constraint(
             format!(
                 "constraint `{}` on `{}` is of kind `{other}`, which this dialect does not read. \
                  Its definition is `{}`.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown(),
                 raw.definition
             ),
@@ -3283,7 +3284,7 @@ fn add_foreign_key(
                  table that this pull left out, so it is left out too -- read back it would be a \
                  key with nothing to point at, and recreating this schema would fail on it. Its \
                  definition is `{}`.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown(),
                 raw.definition
             ),
@@ -3303,7 +3304,7 @@ fn add_foreign_key(
                 "foreign key `{}` on `{}` is `NOT VALID`: rows already there have never been \
                  checked against it, and this model holds only the key. Read back it is an \
                  ordinary foreign key, which is one that would be validated on being recreated.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown()
             ),
         );
@@ -3320,7 +3321,7 @@ fn add_foreign_key(
             format!(
                 "foreign key `{}` on `{}` references a table this pull did not read, so it is \
                  left out. Its definition is `{}`.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown(),
                 raw.definition
             ),
@@ -3340,7 +3341,7 @@ fn add_foreign_key(
                  and this model holds only the action. Read back it would null or default every \
                  referencing column instead of the named ones, so it is left out. Its definition \
                  is `{}`.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown(),
                 raw.definition
             ),
@@ -3361,7 +3362,7 @@ fn add_foreign_key(
                  `MATCH SIMPLE`. The difference decides what happens to a row whose referencing \
                  columns are partly null -- accepted by SIMPLE, refused by FULL -- so the key is \
                  left out rather than read back as the one it is not.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown(),
                 match raw.match_type {
                     'f' => "FULL",
@@ -3398,7 +3399,7 @@ fn add_foreign_key(
                 format!(
                     "foreign key `{}` on `{}` names columns on `{references_table}` that this \
                      pull cannot resolve, so it is left out. Its definition is `{}`.",
-                    raw.name,
+                    raw.name.shown(),
                     parts.name.shown(),
                     raw.definition,
                     references_table = references_table.shown()
@@ -3419,7 +3420,7 @@ fn add_foreign_key(
                 "foreign key `{}` on `{}` is `ON DELETE {}` `ON UPDATE {}`, an action this \
                  model does not know, so the key is left out rather than read back as an action \
                  it is not.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown(),
                 action_name(raw.on_delete),
                 action_name(raw.on_update)
@@ -3468,14 +3469,20 @@ fn reference_columns(
 }
 
 /// A match type this engine has and this code has never seen.
-fn unknown_match(pulled: &mut Pulled, parts: &Parts, name: &str, kind: char) {
+fn unknown_match(
+    pulled: &mut Pulled,
+    parts: &Parts,
+    name: &pbps_model::ObjectLocalName,
+    kind: char,
+) {
     note(
         pulled,
         &parts.name,
         format!(
             "foreign key `{name}` on `{}` has the match type `{kind}`, which this dialect does \
              not know. It is left out rather than read back as the default one.",
-            parts.name.shown()
+            parts.name.shown(),
+            name = name.shown()
         ),
     );
 }
@@ -3493,7 +3500,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                 format!(
                     "index `{}` on `{}` uses the `{other}` method, and this model holds only \
                      `btree` and `gin`. It is left out of the pull, so a plan cannot see it.",
-                    raw.name,
+                    raw.name.shown(),
                     parts.name.shown()
                 ),
             );
@@ -3509,7 +3516,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             format!(
                 "index `{}` on `{}` is a GIN index over an expression, which this model does not \
                  hold. It is left out of the pull, so a plan cannot see it.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown()
             ),
         );
@@ -3528,7 +3535,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                  planner does not use it, which is what a `CREATE INDEX CONCURRENTLY` that \
                  failed leaves behind. It is left out of the pull, so a declaration of the same \
                  shape reads as an index that is missing rather than one that is present.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown()
             ),
         );
@@ -3543,7 +3550,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                  -- `COLLATE \"C\"` is the one that comes up -- and `IndexColumn` has no field \
                  for it. Read back it is an ordinary index, which compares different values \
                  equal, so it is left out.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown()
             ),
         );
@@ -3558,7 +3565,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                  where an ordinary unique index admits any number. This model holds only \
                  `unique:`, so the index is left out rather than read back as the weaker one it \
                  is not.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown()
             ),
         );
@@ -3571,7 +3578,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
             format!(
                 "index `{}` on `{}` enforces an exclusion constraint, which this model does not \
                  hold.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown()
             ),
         );
@@ -3604,7 +3611,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                     format!(
                         "index `{}` on `{}`: the catalog did not render its expression key at \
                          position {}, so the index is left out rather than read without it.",
-                        raw.name,
+                        raw.name.shown(),
                         parts.name.shown(),
                         position + 1
                     ),
@@ -3641,7 +3648,7 @@ fn add_index(raw: &RawIndex, parts: &Parts, table: &mut Table, pulled: &mut Pull
                     "index `{}` on `{}` orders `{name}` `{}` `NULLS {}`, and this model holds \
                      only the direction. Read back it is the default ordering for that \
                      direction, which puts the nulls at the other end.",
-                    raw.name,
+                    raw.name.shown(),
                     parts.name.shown(),
                     if descending { "DESC" } else { "ASC" },
                     if nulls_first { "FIRST" } else { "LAST" },
@@ -3699,7 +3706,7 @@ fn key_class(
             format!(
                 "index `{}` on `{}`: the catalog did not say which operator class orders \
                  `{column}`, so the index is left out rather than read as the default.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown()
             ),
         );
@@ -3712,7 +3719,7 @@ fn key_class(
             format!(
                 "index `{}` on `{}` {why}. Read back without it, it would be an ordinary index \
                  that answers different queries, so it is left out.",
-                raw.name,
+                raw.name.shown(),
                 parts.name.shown()
             ),
         );
@@ -3770,7 +3777,13 @@ fn key_class(
 /// not read as either of the other two. It happens when a pull reads the
 /// constraints of a table whose columns it could not read, which is what a
 /// permission the connection lacks looks like from here.
-fn unresolved(pulled: &mut Pulled, parts: &Parts, kind: &str, name: &str, attnum: i32) {
+fn unresolved(
+    pulled: &mut Pulled,
+    parts: &Parts,
+    kind: &str,
+    name: &pbps_model::ObjectLocalName,
+    attnum: i32,
+) {
     note(
         pulled,
         &parts.name,
@@ -3778,7 +3791,8 @@ fn unresolved(pulled: &mut Pulled, parts: &Parts, kind: &str, name: &str, attnum
             "{kind} `{name}` on `{}` names column number {attnum}, which this pull did not read \
              back. It is left out rather than read back with a column missing, because a key with \
              fewer columns than it has is a different key.",
-            parts.name.shown()
+            parts.name.shown(),
+            name = name.shown()
         ),
     );
 }
@@ -5743,7 +5757,7 @@ mod tests {
     fn constraint(table_oid: i64, name: &str, kind: char) -> RawConstraint {
         RawConstraint {
             table_oid,
-            name: name.to_owned(),
+            name: name.into(),
             kind,
             columns: Vec::new(),
             ref_columns: Vec::new(),
@@ -5770,7 +5784,7 @@ mod tests {
         RawIndex {
             oid,
             table_oid,
-            name: name.to_owned(),
+            name: name.into(),
             unique: false,
             primary: false,
             exclusion: false,
@@ -5901,7 +5915,14 @@ mod tests {
         };
         let pulled = assemble(&raw);
         assert!(only(&pulled).primary_key.is_some());
-        assert_eq!(only(&pulled).indexes.keys().collect::<Vec<_>>(), ["t_a_ix"]);
+        assert_eq!(
+            only(&pulled)
+                .indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["t_a_ix"]
+        );
     }
 
     /// #1633: `RESTRICT` is held as its own action on delete and on update,
@@ -6382,13 +6403,37 @@ mod tests {
         let pulled = assemble(&raw);
         assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
         let p1 = &pulled.schema.tables[&TableName::new("app", "p1")];
-        assert_eq!(p1.checks.keys().collect::<Vec<_>>(), ["p1_v_idx"]);
+        assert_eq!(
+            p1.checks
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["p1_v_idx"]
+        );
         assert_eq!(p1.checks["p1_v_idx"].expression, "(v > 0)");
-        assert_eq!(p1.indexes.keys().collect::<Vec<_>>(), ["ev_v_own"]);
+        assert_eq!(
+            p1.indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev_v_own"]
+        );
         assert!(p1.columns.is_empty(), "its columns are its parent's");
         let ev = &pulled.schema.tables[&TableName::new("app", "ev")];
-        assert_eq!(ev.checks.keys().collect::<Vec<_>>(), ["ev_ck"]);
-        assert_eq!(ev.indexes.keys().collect::<Vec<_>>(), ["ev_v"]);
+        assert_eq!(
+            ev.checks
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev_ck"]
+        );
+        assert_eq!(
+            ev.indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev_v"]
+        );
         // Negative: with nothing of its own, it reads as its bound alone.
         let bare = RawCatalog {
             constraints: raw.constraints[..2].to_vec(),
@@ -6608,7 +6653,11 @@ mod tests {
         assert!(pulled.limitations.is_empty(), "{:?}", pulled.limitations);
         let doc_1 = &pulled.schema.tables[&TableName::new("app", "doc_1")];
         assert_eq!(
-            doc_1.indexes.keys().collect::<Vec<_>>(),
+            doc_1
+                .indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
             ["doc_1_d", "doc_1_p"]
         );
         assert_eq!(doc_1.indexes["doc_1_d"].columns[0].opclass, None);
@@ -8251,5 +8300,119 @@ mod tests {
         assert!(column_type(&raw).is_ok());
         raw.user_type.as_mut().unwrap().defined = false;
         assert!(column_type(&raw).is_err());
+    }
+
+    #[test]
+    fn catalog_local_keys_and_replica_identity_distinguish_raw_and_shown_names() {
+        const RAW: &str = "part\nline\\slash\u{200b}";
+        const SHOWN: &str = r"part\nline\\slash\u{200b}";
+        let mut child = table(1, "child");
+        child.replica_identity = 'i';
+        child.identity_index = Some(400);
+        let mut raw = RawCatalog {
+            tables: vec![child, table(2, "parent")],
+            columns: vec![col(1, 1, "id", "integer"), col(2, 1, "id", "integer")],
+            ..Default::default()
+        };
+        for column in &mut raw.columns {
+            column.nullable = false;
+        }
+        for (oid, owner, name) in [
+            (200, 2, "pk_parent".to_owned()),
+            (300, 1, format!("pk{RAW}")),
+        ] {
+            let mut pk = constraint(owner, &name, 'p');
+            pk.columns = vec![1];
+            pk.index_oid = Some(oid);
+            raw.constraints.push(pk);
+            let mut backing = index(oid, owner, &name);
+            backing.unique = true;
+            backing.primary = true;
+            raw.indexes.push(backing);
+        }
+        for (i, text) in [RAW, SHOWN].into_iter().enumerate() {
+            let mut unique = constraint(1, &format!("uq{text}"), 'u');
+            unique.columns = vec![1];
+            unique.index_oid = Some(310 + i as i64);
+            raw.constraints.push(unique);
+            let mut backing = index(310 + i as i64, 1, &format!("uq{text}"));
+            backing.unique = true;
+            raw.indexes.push(backing);
+            let mut fk = constraint(1, &format!("fk{text}"), 'f');
+            fk.columns = vec![1];
+            fk.ref_columns = vec![1];
+            fk.ref_table = Some(2);
+            fk.index_oid = Some(200);
+            raw.constraints.push(fk);
+            let mut check = constraint(1, &format!("ck{text}"), 'c');
+            check.columns = vec![1];
+            check.expression = Some("id > 0".into());
+            raw.constraints.push(check);
+            let mut standalone = index(400 + i as i64, 1, &format!("ix{text}"));
+            standalone.unique = true;
+            raw.indexes.push(standalone);
+        }
+        let child = TableName::new("app", "child");
+        let pulled = assemble(&raw);
+        let table = &pulled.schema.tables[&child];
+        assert_eq!(
+            table
+                .primary_key
+                .as_ref()
+                .unwrap()
+                .name
+                .as_ref()
+                .unwrap()
+                .raw(),
+            format!("pk{RAW}")
+        );
+        for text in [RAW, SHOWN] {
+            assert!(table.unique.contains_key(format!("uq{text}").as_str()));
+            assert!(
+                table
+                    .foreign_keys
+                    .contains_key(format!("fk{text}").as_str())
+            );
+            assert!(table.checks.contains_key(format!("ck{text}").as_str()));
+            assert!(table.indexes.contains_key(format!("ix{text}").as_str()));
+        }
+        assert_eq!(
+            table.replica_identity,
+            Some(ReplicaIdentity::Index(format!("ix{RAW}").into()))
+        );
+        raw.tables[0].identity_index = Some(401);
+        let pulled = assemble(&raw);
+        assert_eq!(
+            pulled.schema.tables[&child].replica_identity,
+            Some(ReplicaIdentity::Index(format!("ix{SHOWN}").into()))
+        );
+
+        raw.indexes
+            .iter_mut()
+            .find(|i| i.oid == 400)
+            .unwrap()
+            .columns = vec![99];
+        raw.constraints
+            .iter_mut()
+            .find(|c| c.kind == 'f' && c.name.raw() == format!("fk{RAW}"))
+            .unwrap()
+            .match_type = '?';
+        let pulled = assemble(&raw);
+        assert!(
+            !pulled.schema.tables[&child]
+                .indexes
+                .contains_key(format!("ix{RAW}").as_str())
+        );
+        assert!(
+            pulled.schema.tables[&child]
+                .indexes
+                .contains_key(format!("ix{SHOWN}").as_str())
+        );
+        assert!(pulled.warnings.iter().any(|w| w == &format!(
+            "index `ix{SHOWN}` on `app.child` names column number 99, which this pull did not read back. It is left out rather than read back with a column missing, because a key with fewer columns than it has is a different key."
+        )), "{:?}", pulled.warnings);
+        assert!(pulled.warnings.iter().any(|w| w == &format!(
+            "foreign key `fk{SHOWN}` on `app.child` has the match type `?`, which this dialect does not know. It is left out rather than read back as the default one."
+        )), "{:?}", pulled.warnings);
     }
 }

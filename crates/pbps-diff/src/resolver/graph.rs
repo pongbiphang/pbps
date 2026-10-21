@@ -34,7 +34,7 @@ fn provides(parts: &[PartEffect<'_>]) -> BTreeSet<Surface> {
                 Effect::Created,
             ) => Some(Surface::Check {
                 table: (*table).clone(),
-                name: (*name).to_owned(),
+                name: (*name).into(),
             }),
             (
                 DependencyPart::Named {
@@ -45,7 +45,7 @@ fn provides(parts: &[PartEffect<'_>]) -> BTreeSet<Surface> {
                 Effect::Created,
             ) => Some(Surface::Index {
                 table: (*table).clone(),
-                name: (*name).to_owned(),
+                name: (*name).into(),
             }),
             _ => None,
         })
@@ -111,7 +111,7 @@ fn release(parts: &[PartEffect<'_>], surface: &Surface) -> bool {
                     table: target,
                     name: target_name,
                 },
-            ) => *table == target && *name == target_name,
+            ) => *table == target && *name == target_name.raw(),
             (DependencyPart::Table(table), Effect::Removed, surface) => {
                 table_of(surface).is_some_and(|target| *table == target)
             }
@@ -496,4 +496,67 @@ fn sequence_grants_follow_the_existing_table_and_column_rename_dependencies() {
         &target,
         &Surface::Table("app.other".parse().unwrap())
     ));
+}
+
+#[test]
+fn named_dependency_effects_keep_raw_check_and_index_surfaces_distinct_from_shown_names() {
+    const RAW: &str = "part\nline\\slash\u{200b}";
+    const SHOWN: &str = r"part\nline\\slash\u{200b}";
+    let table = pbps_model::TableName::new("app", "t");
+    for (create, remove, surface, lookalike) in [
+        (
+            Change::AddCheck {
+                table: table.clone(),
+                name: RAW.into(),
+                constraint: pbps_model::CheckConstraint {
+                    expression: "id > 0".into(),
+                },
+            },
+            Change::DropCheck {
+                table: table.clone(),
+                name: RAW.into(),
+            },
+            Surface::Check {
+                table: table.clone(),
+                name: RAW.into(),
+            },
+            Surface::Check {
+                table: table.clone(),
+                name: SHOWN.into(),
+            },
+        ),
+        (
+            Change::AddIndex {
+                table: table.clone(),
+                name: RAW.into(),
+                clustered: false,
+                index: Box::new(pbps_model::Index {
+                    columns: vec![pbps_model::IndexColumn::column("id")],
+                    include: vec![],
+                    unique: false,
+                    filter: None,
+                    method: Default::default(),
+                    storage_parameters: Default::default(),
+                }),
+            },
+            Change::DropIndex {
+                table: table.clone(),
+                name: RAW.into(),
+            },
+            Surface::Index {
+                table: table.clone(),
+                name: RAW.into(),
+            },
+            Surface::Index {
+                table: table.clone(),
+                name: SHOWN.into(),
+            },
+        ),
+    ] {
+        let created = provides(&create.part_effects());
+        assert!(created.contains(&surface));
+        assert!(!created.contains(&lookalike));
+        assert!(release(&remove.part_effects(), &surface));
+        assert!(!release(&remove.part_effects(), &lookalike));
+    }
 }

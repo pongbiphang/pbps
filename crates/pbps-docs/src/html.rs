@@ -212,8 +212,8 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
         facts.push(format!(
             "<strong>Primary key</strong>{}: {}",
             pk.name
-                .as_deref()
-                .map(|n| format!(" {}", code(n)))
+                .as_ref()
+                .map(|n| format!(" {}", code(n.raw())))
                 .unwrap_or_default(),
             columns(&pk.columns)
         ));
@@ -221,14 +221,14 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
     for (n, u) in &table.unique {
         facts.push(format!(
             "<strong>Unique</strong> {}: {}",
-            code(n),
+            code(n.raw()),
             columns(&u.columns)
         ));
     }
     for (n, fk) in &table.foreign_keys {
         facts.push(format!(
             "<strong>Foreign key</strong> {}: {} &rarr; {} ({})",
-            code(n),
+            code(n.raw()),
             columns(&fk.columns),
             code(&fk.references_table.raw().to_string()),
             columns(&fk.references_columns)
@@ -237,7 +237,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
     for (n, c) in &table.checks {
         facts.push(format!(
             "<strong>Check</strong> {}: {}",
-            code(n),
+            code(n.raw()),
             code(&c.expression)
         ));
     }
@@ -255,7 +255,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             .collect();
         facts.push(format!(
             "<strong>Index</strong> {}{}: {}",
-            code(n),
+            code(n.raw()),
             if ix.unique { " (unique)" } else { "" },
             cols.join(", ")
         ));

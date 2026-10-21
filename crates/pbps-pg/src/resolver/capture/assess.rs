@@ -33,7 +33,7 @@ pub struct Managed {
     /// Tables and views: relations with a row type and an array type.
     relations: BTreeSet<(String, String)>,
     /// Named indexes and keys: relations with no type.
-    indexes: BTreeSet<(String, String)>,
+    indexes: BTreeSet<(String, pbps_model::ObjectLocalName)>,
     /// Declared routines by name, each with its kind, which a dropped one's
     /// lookup must match (#1126).
     routines: BTreeMap<(String, String), BTreeMap<pbps_model::ModuleId, pbps_model::ModuleKind>>,
@@ -103,8 +103,13 @@ impl Managed {
         };
         self.relations
             .iter()
-            .chain(&self.indexes)
             .map(|key| set(CandidateClass::Relation, key))
+            .chain(self.indexes.iter().map(|(schema, name)| {
+                set(
+                    CandidateClass::Relation,
+                    &(schema.clone(), name.raw().to_owned()),
+                )
+            }))
             .chain(
                 self.routines
                     .keys()
@@ -117,7 +122,7 @@ impl Managed {
     /// named index or key.
     pub fn relation(&self, schema: &str, name: &str) -> bool {
         let key = (schema.to_owned(), name.to_owned());
-        self.relations.contains(&key) || self.indexes.contains(&key)
+        self.relations.contains(&key) || self.indexes.contains(&(key.0, key.1.into()))
     }
 
     /// Whether an object an externals file created holds a managed name: a
@@ -132,7 +137,9 @@ impl Managed {
         };
         let key = (schema.clone(), name.clone());
         match object.class.as_str() {
-            "pg_class" => self.relations.contains(&key) || self.indexes.contains(&key),
+            "pg_class" => {
+                self.relations.contains(&key) || self.indexes.contains(&(key.0, key.1.into()))
+            }
             "pg_type" => self.relations.contains(&key),
             _ => false,
         }
@@ -150,7 +157,8 @@ impl Managed {
         let key = |name: &str| (schema.clone(), name.to_owned());
         match class {
             CandidateClass::Relation => {
-                self.relations.contains(&key(name)) || self.indexes.contains(&key(name))
+                let key = key(name);
+                self.relations.contains(&key) || self.indexes.contains(&(key.0, key.1.into()))
             }
             // A table's or view's row type has its name, which no other type
             // can hold while the relation exists; an index has none. Its

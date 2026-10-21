@@ -102,7 +102,7 @@ fn dense(size: usize) -> Shape {
         let mut d = table(&columns);
         for c in 0..size / 16 {
             d.indexes.insert(
-                format!("ix{c}"),
+                format!("ix{c}").into(),
                 Index {
                     columns: vec![IndexColumn::column(format!("c{c}"))],
                     include: Vec::new(),
@@ -113,7 +113,7 @@ fn dense(size: usize) -> Shape {
                 },
             );
             d.checks.insert(
-                format!("ck{c}"),
+                format!("ck{c}").into(),
                 CheckConstraint {
                     expression: format!("c{c} > 0"),
                 },

@@ -147,14 +147,21 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             s,
             "\n- **Primary key**{}: {}",
             pk.name
-                .as_deref()
+                .as_ref()
+                .map(pbps_model::ObjectLocalName::raw)
                 .map(|n| format!(" `{n}`"))
                 .unwrap_or_default(),
             columns(&pk.columns)
         );
     }
     for (n, u) in &table.unique {
-        let _ = writeln!(s, "- **Unique** `{n}`: {}", columns(&u.columns));
+        let _ = writeln!(
+            s,
+            "- **Unique** `{n}`: {}",
+            columns(&u.columns),
+            // Document data uses its medium escaping; retained after #2084 step 5.
+            n = n.raw(),
+        );
     }
     for (n, fk) in &table.foreign_keys {
         let _ = writeln!(
@@ -162,11 +169,19 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             "- **Foreign key** `{n}`: {} → `{}` ({})",
             columns(&fk.columns),
             fk.references_table.raw(),
-            columns(&fk.references_columns)
+            columns(&fk.references_columns),
+            // Document data uses its medium escaping; retained after #2084 step 5.
+            n = n.raw(),
         );
     }
     for (n, c) in &table.checks {
-        let _ = writeln!(s, "- **Check** `{n}`: `{}`", c.expression);
+        let _ = writeln!(
+            s,
+            "- **Check** `{n}`: `{}`",
+            c.expression,
+            // Document data uses its medium escaping; retained after #2084 step 5.
+            n = n.raw(),
+        );
     }
     for (n, ix) in &table.indexes {
         let cols: Vec<String> = ix
@@ -184,7 +199,9 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
             s,
             "- **Index** `{n}`{}: {}",
             if ix.unique { " (unique)" } else { "" },
-            cols.join(", ")
+            cols.join(", "),
+            // Document data uses its medium escaping; retained after #2084 step 5.
+            n = n.raw(),
         );
         if !ix.include.is_empty() {
             let _ = write!(s, " including {}", columns(&ix.include));

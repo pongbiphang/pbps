@@ -48,7 +48,7 @@
 //! (DEC-1961.2). [`Incarnations::replay`] refuses a plan in which a key would
 //! need a third instance.
 
-use crate::ColumnName;
+use crate::{ColumnName, ObjectLocalName};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -259,12 +259,12 @@ pub enum ColumnKey {
 pub enum PartKey {
     /// One per table, and a declaration need not name it.
     PrimaryKey,
-    Unique(String),
-    ForeignKey(String),
-    Check(String),
+    Unique(ObjectLocalName),
+    ForeignKey(ObjectLocalName),
+    Check(ObjectLocalName),
     Policy(String),
     RowSecurity,
-    Index(String),
+    Index(ObjectLocalName),
     /// A SQL Server computed column, added and dropped whole by name.
     Computed(ColumnName),
 }
