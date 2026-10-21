@@ -2836,8 +2836,41 @@ fn explicit_serial_sequence_grants_preserve_the_union_and_round_trip_on_both_ser
         .unwrap();
         as_role(3, "INSERT INTO app.t DEFAULT VALUES").unwrap();
 
+        // Giving up a serial removes its sequence and both the explicit
+        // grant and the INSERT-implied access without a separate revoke.
+        let plain = extended.replace(
+            "  payload: {type: serial}",
+            "  payload: {type: integer, nullable: false, default: 7}",
+        );
+        d.table(&plain);
+        write_role(
+            0,
+            "  sequence::app.t.id: [usage]\n  sequence::app.t.added: [usage]\n",
+        );
+        deploy(&["--allow", "numbering"]);
+        assert_eq!(
+            scalar(
+                conn,
+                "SELECT CASE WHEN pg_catalog.pg_get_serial_sequence('app.t', 'payload') IS NULL THEN 1::bigint ELSE 0::bigint END"
+            ),
+            1
+        );
+        as_role(3, "INSERT INTO app.t DEFAULT VALUES").unwrap();
+        assert_eq!(
+            scalar(
+                conn,
+                "SELECT payload::bigint FROM app.t ORDER BY id DESC LIMIT 1"
+            ),
+            7
+        );
+        as_role(
+            0,
+            "SELECT nextval(pg_catalog.pg_get_serial_sequence('app.t', 'added'))",
+        )
+        .unwrap();
+
         // Existing table/column identity rules also carry the sequence grants.
-        let renamed = extended
+        let renamed = plain
             .replace("table: app.t", "table: app.moved\nrenamed_from: app.t")
             .replace(
                 "  id: {type: serial, sequence: {name: custom2199}}",

@@ -6351,11 +6351,26 @@ fn diff_roles(
             GrantTarget::Object(o) => base_uid
                 .get(o)
                 .is_some_and(|uid| !declared.ids.tables.contains_key(*uid)),
-            GrantTarget::Sequence(c) => base
-                .ids
-                .columns
-                .iter()
-                .any(|(uid, from)| from == c && !declared.ids.columns.contains_key(uid)),
+            GrantTarget::Sequence(c) => base.ids.columns.iter().any(|(uid, from)| {
+                // Keeping the column UID does not keep its serial sequence:
+                // changing to a default or identity removes the old sequence
+                // and its grants, so no separate revoke is needed.
+                from == c
+                    && declared
+                        .ids
+                        .columns
+                        .get(uid)
+                        .and_then(|column| {
+                            declared
+                                .schema
+                                .tables
+                                .get(&column.table)
+                                .and_then(|table| table.columns.get(&column.name))
+                        })
+                        .is_none_or(|column| {
+                            !matches!(column.value_source, ValueSource::Sequence(_))
+                        })
+            }),
             GrantTarget::Routine(_) | GrantTarget::Schema(_) => false,
         }
     };
@@ -21612,6 +21627,229 @@ mod tests {
                         matches!(changes.last().unwrap(), Change::Revoke { target, permissions, .. } if *target == "sequence::dbo.customer.id".parse().unwrap() && *permissions == [Permission::Usage].into())
                     );
                 }
+            }
+        }
+
+        #[test]
+        fn a_serial_conversion_takes_its_explicit_and_implied_grants_without_revokes() {
+            for source in [
+                ValueSource::None,
+                ValueSource::Default("7".into()),
+                ValueSource::Identity(pbps_model::Identity::new(1, 1)),
+            ] {
+                for implied in [false, true] {
+                    for removed_role in [false, true] {
+                        for renamed in [false, true] {
+                            let grants = if implied {
+                                vec![(
+                                    "dbo.customer",
+                                    vec![Permission::Insert, Permission::SerialSequences],
+                                )]
+                            } else {
+                                vec![(
+                                    "sequence::dbo.customer.id",
+                                    vec![Permission::Usage, Permission::Select, Permission::Update],
+                                )]
+                            };
+                            let grants: Vec<_> = grants
+                                .iter()
+                                .map(|(target, rights)| (*target, rights.as_slice()))
+                                .collect();
+                            let mut base = serial_side(&grants);
+                            let mut other = Column::new(ty("int"));
+                            other.value_source =
+                                ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+                            base.0
+                                .tables
+                                .get_mut(&"dbo.customer".parse().unwrap())
+                                .unwrap()
+                                .columns
+                                .insert("other".into(), other);
+                            base.1.columns.insert(
+                                "c_bbbbbb".parse().unwrap(),
+                                "dbo.customer.other".parse().unwrap(),
+                            );
+                            let mut declared = base.clone();
+                            declared
+                                .0
+                                .tables
+                                .get_mut(&"dbo.customer".parse().unwrap())
+                                .unwrap()
+                                .columns["id"]
+                                .value_source = source.clone();
+                            let target = if renamed {
+                                let mut table = declared
+                                    .0
+                                    .tables
+                                    .remove(&"dbo.customer".parse().unwrap())
+                                    .unwrap();
+                                let column = table.columns.shift_remove("id").unwrap();
+                                table.columns.insert("converted".into(), column);
+                                declared
+                                    .0
+                                    .tables
+                                    .insert("dbo.moved".parse().unwrap(), table);
+                                declared.1.tables.insert(
+                                    "t_aaaaaa".parse().unwrap(),
+                                    "dbo.moved".parse().unwrap(),
+                                );
+                                declared.1.columns.insert(
+                                    "c_aaaaaa".parse().unwrap(),
+                                    "dbo.moved.converted".parse().unwrap(),
+                                );
+                                declared.1.columns.insert(
+                                    "c_bbbbbb".parse().unwrap(),
+                                    "dbo.moved.other".parse().unwrap(),
+                                );
+                                "sequence::dbo.moved.converted"
+                            } else {
+                                "sequence::dbo.customer.id"
+                            };
+                            if removed_role {
+                                declared.0.roles.clear();
+                                declared.1.roles.clear();
+                            } else {
+                                declared.0.roles.insert(
+                                    "writer".into(),
+                                    if implied {
+                                        role(&[(
+                                            if renamed { "dbo.moved" } else { "dbo.customer" },
+                                            &[Permission::Insert, Permission::SerialSequences],
+                                        )])
+                                    } else {
+                                        Role::default()
+                                    },
+                                );
+                            }
+                            let changes = diff(
+                                Side {
+                                    schema: &base.0,
+                                    ids: &base.1,
+                                },
+                                Side {
+                                    schema: &declared.0,
+                                    ids: &declared.1,
+                                },
+                                &ClusterRoles,
+                                &Hints::default(),
+                            )
+                            .unwrap();
+                            assert!(
+                                changes.changes.iter().any(|p| matches!(
+                                    p.change,
+                                    Change::AlterColumnNumbering { .. }
+                                )),
+                                "{changes:?}"
+                            );
+                            assert!(!changes.changes.iter().any(|p| matches!(&p.change,
+                                Change::Revoke { target: revoked, .. } if *revoked == target.parse::<GrantTarget>().unwrap())),
+                                "source={source:?}, implied={implied}, removed role={removed_role}, renamed={renamed}: {changes:?}");
+                            // An unrelated serial survives the conversion. Its
+                            // permissions still need revoking with the role.
+                            let other = if renamed {
+                                "sequence::dbo.moved.other"
+                            } else {
+                                "sequence::dbo.customer.other"
+                            };
+                            assert_eq!(changes.changes.iter().any(|p| matches!(&p.change,
+                                Change::Revoke { target, permissions, .. } if *target == other.parse::<GrantTarget>().unwrap() && permissions.contains(&Permission::Usage))), implied && removed_role, "{changes:?}");
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_surviving_serial_still_revokes_removed_explicit_grants() {
+            let rights = [Permission::Usage, Permission::Select, Permission::Update];
+            let base = serial_side(&[("sequence::dbo.customer.id", &rights)]);
+            let mut declared = base.clone();
+            declared.0.roles.get_mut("writer").unwrap().grants.clear();
+            let changes = diff(
+                Side {
+                    schema: &base.0,
+                    ids: &base.1,
+                },
+                Side {
+                    schema: &declared.0,
+                    ids: &declared.1,
+                },
+                &ClusterRoles,
+                &Hints::default(),
+            )
+            .unwrap();
+            assert_eq!(changes.changes.len(), 1, "{changes:?}");
+            assert!(
+                matches!(&changes.changes[0].change, Change::Revoke { target, permissions, .. }
+                if *target == "sequence::dbo.customer.id".parse().unwrap() && *permissions == rights.into())
+            );
+        }
+
+        #[test]
+        fn retuning_a_serial_keeps_explicit_and_implied_sequence_grants() {
+            for grants in [
+                vec![(
+                    "sequence::dbo.customer.id",
+                    vec![Permission::Usage, Permission::Select, Permission::Update],
+                )],
+                vec![(
+                    "dbo.customer",
+                    vec![Permission::Insert, Permission::SerialSequences],
+                )],
+            ] {
+                let grants: Vec<_> = grants
+                    .iter()
+                    .map(|(target, rights)| (*target, rights.as_slice()))
+                    .collect();
+                let mut base = serial_side(&grants);
+                if let ValueSource::Sequence(sequence) = &mut base
+                    .0
+                    .tables
+                    .get_mut(&"dbo.customer".parse().unwrap())
+                    .unwrap()
+                    .columns["id"]
+                    .value_source
+                {
+                    sequence.name = Some("old_sequence".into());
+                }
+                let mut declared = base.clone();
+                if let ValueSource::Sequence(sequence) = &mut declared
+                    .0
+                    .tables
+                    .get_mut(&"dbo.customer".parse().unwrap())
+                    .unwrap()
+                    .columns["id"]
+                    .value_source
+                {
+                    sequence.start = 5;
+                    sequence.name = Some("renamed_sequence".into());
+                }
+                let changes = diff(
+                    Side {
+                        schema: &base.0,
+                        ids: &base.1,
+                    },
+                    Side {
+                        schema: &declared.0,
+                        ids: &declared.1,
+                    },
+                    &ClusterRoles,
+                    &Hints::default(),
+                )
+                .unwrap();
+                assert_eq!(changes.changes.len(), 1, "{changes:?}");
+                assert!(matches!(
+                    changes.changes[0].change,
+                    Change::AlterColumnNumbering {
+                        from: ValueSource::Sequence(_),
+                        to: ValueSource::Sequence(_),
+                        ..
+                    }
+                ));
+                assert!(
+                    changes.changes.iter().all(|p| p.change.grant().is_none()),
+                    "{changes:?}"
+                );
             }
         }
 
