@@ -180,6 +180,12 @@ Then, in this order:
     function create, so they run right after it in their order, and places a
     new column whose expression names one after that create, with what may
     read the column after it (DEC-942.1, DEC-1364.1, DEC-1967.1).
+    The retained `after_their_functions` hold is constraints too: callable
+    columns and whole-table holds wait for their named creates, the existing
+    `needs` closure follows them, and free peers are chained inside the old
+    window. Scratch uses constraints for its table groups, readers, foreign
+    keys and phase barriers; its generated constraints remain a subsequent
+    settlement (DEC-1959.3).
     A constraint trigger's companion-name handovers join the same settle,
     including its partition clones: the constraint addition, partition
     creation or attachment taking the name sinks after the module change
