@@ -59,6 +59,8 @@ mod benchmark;
 #[cfg(test)]
 mod expand_tests;
 #[cfg(test)]
+mod saved_tests;
+#[cfg(test)]
 mod schedule_tests;
 #[cfg(test)]
 mod slot_tests;

@@ -7039,15 +7039,83 @@ mod certified_emission_tests {
         let expected = dialect
             .emit(&changes.changes[0].change, changes.changes[0].strategy)
             .unwrap();
-        let ordered = pbps_diff::order::singleton(changes.changes[0].clone());
         for mode in [PlanMode::Transactional, PlanMode::Staged] {
+            let ordered = pbps_diff::order::singleton(changes.changes[0].clone(), mode);
             let emitted = pbps_dialect::lower::lower_plan(
                 &ordered as &dyn pbps_diff::order::PlanView,
                 &dialect,
-                mode,
             )
             .unwrap();
             assert_eq!(emitted.statements(), expected);
+        }
+    }
+
+    #[test]
+    fn partition_lowering_uses_each_certified_inputs_bound_mode() {
+        use pbps_diff::order::{PlanView, admit, seal, singleton};
+        use pbps_model::{
+            BoundDatum, IdsFile, PartitionBound, PlanBaseline, PlanOrigin, SavedPlan,
+        };
+
+        let dialect = Postgres::new();
+        let change = PlannedChange::new(Change::AttachPartition {
+            uid: "t_aaaaaa".parse().unwrap(),
+            table: "app.child".parse().unwrap(),
+            parent: "app.parent".parse().unwrap(),
+            bound: PartitionBound::Range {
+                from: vec![BoundDatum::Value("1".into())],
+                to: vec![BoundDatum::Value("5".into())],
+            },
+            key: vec!["id".into()],
+            shape: Box::default(),
+        });
+        let transactional = dialect.emit(&change.change, change.strategy).unwrap();
+        let staged = dialect
+            .emit_staged(&change.change, change.strategy)
+            .unwrap();
+        assert_eq!(transactional.len(), 1);
+        assert_eq!(staged.len(), 4);
+        assert_ne!(transactional, staged);
+
+        for mode in [PlanMode::Transactional, PlanMode::Staged] {
+            let ordered = singleton(change.clone(), mode);
+            let mut wire = SavedPlan::new(
+                PlanOrigin::Database,
+                dialect.name(),
+                "2026-10-22T00:00:00Z",
+                PlanBaseline {
+                    description: "target".into(),
+                    checksum: "baseline".into(),
+                    database_collation: None,
+                    time_zone: None,
+                },
+                ordered.changes().clone(),
+                IdsFile::default(),
+            );
+            wire.mode = mode;
+            let bytes = serde_json::to_string(&wire).unwrap();
+            let checksum = wire.checksum();
+            let admitted = admit(
+                serde_json::from_str(&bytes).unwrap(),
+                &dialect,
+                std::path::Path::new("plan.json"),
+                &checksum,
+            )
+            .unwrap();
+            let sealed = seal(ordered.clone(), wire).unwrap();
+            assert_eq!(serde_json::to_string(admitted.wire()).unwrap(), bytes);
+            assert_eq!(serde_json::to_string(sealed.wire()).unwrap(), bytes);
+            assert_eq!(admitted.checksum(), checksum);
+            assert_eq!(sealed.checksum(), checksum);
+            let expected = match mode {
+                PlanMode::Transactional => &transactional,
+                PlanMode::Staged => &staged,
+            };
+            for input in [&ordered as &dyn PlanView, &sealed, &admitted] {
+                assert_eq!(input.mode(), mode);
+                let lowered = pbps_dialect::lower::lower_plan(input, &dialect).unwrap();
+                assert_eq!(lowered.statements(), expected);
+            }
         }
     }
 }

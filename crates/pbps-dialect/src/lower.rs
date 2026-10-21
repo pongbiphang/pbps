@@ -212,17 +212,26 @@ where
 
 /// The whole certified sequence, in its execution mode. The generic input
 /// brand prevents a mock dialect's local fixture view reaching a real engine.
+/// A caller cannot replace the mode bound to that input:
+///
+/// ```compile_fail
+/// fn override_mode<D: pbps_dialect::Dialect + ?Sized>(plan: &D::Plan, dialect: &D)
+/// where D::Plan: pbps_dialect::PlanPayload {
+///     let _ = pbps_dialect::lower::lower_plan(
+///         plan, dialect, pbps_model::PlanMode::Staged,
+///     );
+/// }
+/// ```
 pub fn lower_plan<D: Dialect + ?Sized>(
     plan: &D::Plan,
     dialect: &D,
-    mode: pbps_model::PlanMode,
 ) -> Result<LoweredPlan<D::Plan>, DialectError>
 where
     D::Plan: crate::PlanPayload,
 {
     let mut statements = Vec::new();
     for position in 0..crate::PlanPayload::changes(plan).changes.len() {
-        statements.extend(match mode {
+        statements.extend(match crate::PlanPayload::mode(plan) {
             pbps_model::PlanMode::Transactional => dialect.emit_ordered(plan, position)?,
             pbps_model::PlanMode::Staged => dialect.emit_staged_ordered(plan, position)?,
         });

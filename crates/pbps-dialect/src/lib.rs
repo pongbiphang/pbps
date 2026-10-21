@@ -2230,6 +2230,7 @@ pub enum PlanAnalysisError {
 /// A read-only logical payload, without emission authority.
 pub trait PlanPayload {
     fn changes(&self) -> &pbps_model::ChangeSet;
+    fn mode(&self) -> pbps_model::PlanMode;
 }
 
 /// Dialect knowledge that needs no database connection. Each real engine

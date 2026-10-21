@@ -7930,6 +7930,10 @@ checksum, origin, identity, analysis, risk and mode checks retain their existing
 order and refusal priority. Newly saved artifacts bind metadata to the exact
 completed OrderedPlan. Wire fields, defaults, version, serialization order,
 checksum bytes and resolver fingerprints do not change.
+Admission computes the artifact checksum and checks the approved checksum,
+origin and dialect itself after the version refusal and before payload validation.
+Execution mode is bound to the certified input, checked when sealing metadata,
+and read by lowering rather than supplied by its caller.
 
 Dialect's associated plan input avoids a dependency cycle: concrete engines
 bind it to the sealed diff view, while pure semantic consumers remain generic.

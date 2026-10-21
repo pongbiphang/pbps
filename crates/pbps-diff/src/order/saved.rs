@@ -4,6 +4,7 @@
 use super::{OrderedPlan, PlanView};
 use pbps_dialect::{Dialect, PlanPayload};
 use pbps_model::{ChangeSet, SavedPlan};
+use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -28,6 +29,12 @@ macro_rules! refuse {
 /// A reviewed wire artifact accepted by the existing artifact checks. Its
 /// checksum-pinned sequence is trusted under SPEC's saved-plan contract;
 /// admission neither reorders it nor enables the deferred release verifier.
+///
+/// ```compile_fail
+/// fn unchecked(wire: pbps_model::SavedPlan) -> pbps_diff::order::AdmittedPlan {
+///     pbps_diff::order::AdmittedPlan { wire }
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct AdmittedPlan {
     wire: SavedPlan,
@@ -48,15 +55,58 @@ impl PlanPayload for AdmittedPlan {
     fn changes(&self) -> &ChangeSet {
         &self.wire.changes
     }
+    fn mode(&self) -> pbps_model::PlanMode {
+        self.wire.mode
+    }
 }
 impl super::plan::sealed::Sealed for AdmittedPlan {}
 impl PlanView for AdmittedPlan {}
 
 /// Accepts only checked wire bytes, never granting `OrderedPlan` authority.
+/// The checksum is computed here so the caller cannot substitute an unchecked
+/// fingerprint. Refusals retain apply's version/checksum/origin/dialect order.
 pub fn admit(
     plan: SavedPlan,
     dialect: &(impl Dialect + ?Sized),
+    plan_path: &Path,
+    approved_checksum: &str,
 ) -> Result<AdmittedPlan, AdmissionError> {
+    if plan.version != pbps_model::plan::CURRENT_VERSION {
+        refuse!(
+            "`{}` is a version {} plan and this tool understands version {}.\n\
+             Recompute it with `pbps plan --db ... --out ...` and review the new artifact for approval.",
+            plan_path.display(),
+            plan.version,
+            pbps_model::plan::CURRENT_VERSION
+        );
+    }
+    let plan_checksum = plan.checksum();
+    if plan_checksum != approved_checksum {
+        refuse!(
+            "`{}` no longer matches the artifact approved at the deployment gate.\n\
+             approved checksum: {approved_checksum}\n\
+             plan checksum now: {plan_checksum}\n\
+             Do not approve the new value implicitly: retrieve the reviewed artifact or run \
+             `pbps explain --plan ...` and send it through approval again.",
+            plan_path.display()
+        );
+    }
+    if !plan.origin.is_applyable() {
+        refuse!(
+            "`{}` is an offline preview, not an applyable plan.\n\
+             Recompute it against the target with `pbps plan --db ... --out {}`.",
+            plan_path.display(),
+            plan_path.display()
+        );
+    }
+    if plan.dialect != dialect.name() {
+        refuse!(
+            "`{}` was computed for {} and this project is {}",
+            plan_path.display(),
+            pbps_model::escape::Escaped(&plan.dialect),
+            dialect.name()
+        );
+    }
     validate_saved_plan(&plan, dialect)?;
     Ok(AdmittedPlan { wire: plan })
 }
@@ -82,14 +132,31 @@ impl std::ops::Deref for SealedPlan {
         &self.wire
     }
 }
+impl PlanPayload for SealedPlan {
+    fn changes(&self) -> &ChangeSet {
+        self.ordered.changes()
+    }
+    fn mode(&self) -> pbps_model::PlanMode {
+        self.ordered.mode()
+    }
+}
+impl super::plan::sealed::Sealed for SealedPlan {}
+impl PlanView for SealedPlan {}
 
 /// Metadata cannot replace a single operation, strategy or finding after
 /// ordering: the original proof must still describe the wire payload exactly.
-pub fn seal(
-    ordered: OrderedPlan,
-    wire: SavedPlan,
-) -> Result<SealedPlan, pbps_model::resolver::OrderError> {
-    ordered.proof().validate(&wire.changes)?;
+pub fn seal(ordered: OrderedPlan, wire: SavedPlan) -> Result<SealedPlan, AdmissionError> {
+    ordered
+        .proof()
+        .validate(&wire.changes)
+        .map_err(AdmissionError::from_error)?;
+    if ordered.mode() != wire.mode {
+        refuse!(
+            "the saved plan mode {} does not match the ordered plan mode {}",
+            wire.mode,
+            ordered.mode()
+        );
+    }
     Ok(SealedPlan { wire, ordered })
 }
 

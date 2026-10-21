@@ -2,7 +2,7 @@
 
 use pbps_dialect::PlanPayload;
 use pbps_model::resolver::OrderingProof;
-use pbps_model::{ChangeSet, PlannedChange};
+use pbps_model::{ChangeSet, PlanMode, PlannedChange};
 
 pub(super) mod sealed {
     pub trait Sealed {}
@@ -15,6 +15,7 @@ pub(super) mod sealed {
 /// struct Unordered(pbps_model::ChangeSet);
 /// impl pbps_dialect::PlanPayload for Unordered {
 ///     fn changes(&self) -> &pbps_model::ChangeSet { &self.0 }
+///     fn mode(&self) -> pbps_model::PlanMode { pbps_model::PlanMode::Transactional }
 /// }
 /// impl pbps_diff::order::PlanView for Unordered {}
 /// ```
@@ -163,19 +164,25 @@ pub struct OrderedPlan {
     changes: ChangeSet,
     origins: Vec<pbps_model::operation::Origin>,
     proof: OrderingProof,
+    mode: PlanMode,
 }
 
 impl OrderedPlan {
-    pub(super) fn new(plan: PlanningPlan) -> Self {
+    pub(super) fn new(plan: PlanningPlan, mode: PlanMode) -> Self {
         Self {
             changes: plan.payload,
             origins: plan.origins,
             proof: plan.proof,
+            mode,
         }
     }
 
     pub fn changes(&self) -> &ChangeSet {
         &self.changes
+    }
+
+    pub fn mode(&self) -> PlanMode {
+        self.mode
     }
 
     pub fn proof(&self) -> &OrderingProof {
@@ -190,6 +197,9 @@ impl PlanPayload for OrderedPlan {
     fn changes(&self) -> &ChangeSet {
         &self.changes
     }
+    fn mode(&self) -> PlanMode {
+        self.mode
+    }
 }
 impl sealed::Sealed for OrderedPlan {}
 impl PlanView for OrderedPlan {}
@@ -197,13 +207,13 @@ impl PlanView for OrderedPlan {}
 /// The real single-operation route used by emitter fixtures. A singleton has
 /// no inter-operation permutation; the same schedule still checks its shape.
 /// This cannot recertify a caller-reordered collection of operations.
-pub fn singleton(change: PlannedChange) -> OrderedPlan {
+pub fn singleton(change: PlannedChange, mode: PlanMode) -> OrderedPlan {
     let settled = super::Schedule::new(1)
         .settle(propose(ChangeSet {
             changes: vec![change],
         }))
         .expect("a single operation has no ordering cycle");
-    OrderedPlan::new(settled.changes)
+    OrderedPlan::new(settled.changes, mode)
 }
 
 #[cfg(test)]
