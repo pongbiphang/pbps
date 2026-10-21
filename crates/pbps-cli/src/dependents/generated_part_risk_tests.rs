@@ -390,7 +390,7 @@ async fn creation_parts_after_rows_keep_their_risks_on_both_servers() {
                 crate::validate_saved_plan(&plan, pg.as_ref()).unwrap();
                 let result: anyhow::Result<()> = async {
                     for part in &plan.changes.changes {
-                        for sql in pg.emit(&part.change, part.strategy)? {
+                        for sql in pg.legacy_emit(&part.change, part.strategy)? {
                             conn.execute(&sql.sql).await?;
                         }
                     }

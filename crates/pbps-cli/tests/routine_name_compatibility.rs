@@ -102,7 +102,7 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
             .changes
             .changes
             .iter()
-            .flat_map(|p| dialect.emit(&p.change, Default::default()).unwrap())
+            .flat_map(|p| dialect.legacy_emit(&p.change, Default::default()).unwrap())
             .map(|s| s.sql)
             .collect::<Vec<_>>()
             .join("\n");
@@ -232,7 +232,7 @@ fn a_routine_refusal_is_escaped_exactly_once() {
             }),
         };
         let error = pbps_pg::Postgres::new()
-            .emit(&change, Default::default())
+            .legacy_emit(&change, Default::default())
             .unwrap_err();
         assert_eq!(
             error.to_string(),

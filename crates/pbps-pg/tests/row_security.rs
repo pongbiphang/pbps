@@ -1,4 +1,5 @@
 use pbps_dialect::Dialect;
+use pbps_dialect::PlanDialect;
 use pbps_model::{Column, PolicyCommand, PolicyRoles, RowPolicy, Table, TableName};
 
 fn table() -> Table {
@@ -115,7 +116,12 @@ fn row_security_emission_preserves_targets_modes_omissions_and_independent_flags
     let pg = pbps_pg::Postgres::new();
     let table = TableName::new("app", "docs");
     let emit = |change| {
-        pg.emit(&change, Default::default())
+        let ordered = pbps_diff::order::singleton(
+            pbps_model::PlannedChange::new(change),
+            pbps_model::PlanMode::Transactional,
+            &pbps_pg::Postgres::new(),
+        );
+        pg.emit(&ordered, 0)
             .unwrap()
             .into_iter()
             .map(|s| s.sql)

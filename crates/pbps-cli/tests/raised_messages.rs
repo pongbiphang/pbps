@@ -8,7 +8,7 @@ const SHOWN: &str = r"name\n\u{1b}[31m\\'_%名前";
 
 fn sql(dialect: &dyn Dialect, change: &Change) -> String {
     dialect
-        .emit(change, Default::default())
+        .legacy_emit(change, Default::default())
         .unwrap()
         .into_iter()
         .map(|s| s.sql)

@@ -63,7 +63,7 @@ async fn a_new_columns_retype_has_no_stored_key_to_probe_but_a_missing_old_one_r
         .await
         .unwrap();
     for p in &changes {
-        for statement in Mssql.emit(&p.change, p.strategy).unwrap() {
+        for statement in Mssql.legacy_emit(&p.change, p.strategy).unwrap() {
             db.conn.execute(&statement.sql).await.unwrap();
         }
     }
@@ -136,7 +136,7 @@ async fn layout_estimates_measure_each_occupant_before_and_after_name_reuse() {
         .await
         .unwrap();
     for p in &changes {
-        for statement in Mssql.emit(&p.change, p.strategy).unwrap() {
+        for statement in Mssql.legacy_emit(&p.change, p.strategy).unwrap() {
             db.conn.execute(&statement.sql).await.unwrap();
         }
     }

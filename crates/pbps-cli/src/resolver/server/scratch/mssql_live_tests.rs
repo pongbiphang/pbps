@@ -44,13 +44,16 @@ async fn refusal_inner(target: &str, scratch: &str) -> ProduceError {
         schema: &schema,
         ids: &ids,
     };
+    let bootstrap =
+        pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default())
+            .expect("an empty SQL Server schema has an empty ordinary plan");
     match super::produce_unsealed(
         Driver::Mssql,
         scratch,
         target,
         &identity,
         &BindingRequest {
-            bootstrap: &[],
+            bootstrap: &bootstrap,
             base: &schema,
             desired: &schema,
         },
@@ -373,6 +376,9 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
         schema: &schema,
         ids: &ids,
     };
+    let bootstrap =
+        pbps_diff::resolver::ordinary(side, side, &pbps_mssql::Mssql, &Hints::default())
+            .expect("an empty SQL Server schema has an empty ordinary plan");
     let request =
         super::super::producer::request(Driver::Mssql, side, side, &Hints::default(), &[]).unwrap();
     for missing_marker in [false, true] {
@@ -409,7 +415,7 @@ async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
                     &authorization,
                     &[],
                     &BindingRequest {
-                        bootstrap: &[],
+                        bootstrap: &bootstrap,
                         base: &schema,
                         desired: &schema,
                     },

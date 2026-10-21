@@ -115,12 +115,11 @@ pub fn analyse(
         if let Change::RenameTable { from, to, .. } = op.change()
             && from.schema != to.schema
         {
-            match pbps_dialect::lower::lower(op, op.planned().strategy, dialect) {
+            match dialect.intermediate_tables(op.change(), op.planned().strategy) {
                 Ok(lowered) => {
                     fx.intermediate = lowered
-                        .intermediate_tables()
                         .into_iter()
-                        .filter_map(|t| table_slot(dialect, t))
+                        .filter_map(|t| table_slot(dialect, &t))
                         .collect();
                 }
                 Err(_) => out.unlowered.push(op.id()),

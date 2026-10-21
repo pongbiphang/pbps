@@ -10,12 +10,7 @@ pub(super) fn split_new_tables(
     dialect: &dyn Dialect,
 ) -> Result<usize, String> {
     let empty = IdsFile::default();
-    let generated = pbps_diff::order::generated::legacy_expand(
-        cs,
-        ids.first().copied().unwrap_or(&empty),
-        deps,
-        dialect,
-    )?;
+    let generated = generated_parts(cs, ids.first().copied().unwrap_or(&empty), deps, dialect)?;
     let Some(last) = last_function_create(cs) else {
         return Ok(0);
     };
@@ -117,7 +112,7 @@ pub(super) fn same_plan(actual: &ChangeSet, expected: &ChangeSet, dialect: &dyn 
             .iter()
             .map(|p| {
                 dialect
-                    .emit(&p.change, p.strategy)
+                    .legacy_emit(&p.change, p.strategy)
                     .map(|statements| statements.into_iter().map(|s| s.sql).collect::<Vec<_>>())
                     .map_err(|e| e.to_string())
             })
@@ -485,7 +480,7 @@ async fn expanded_table_checks_indexes_and_defaults_execute_on_both_servers() {
             );
             conn.execute("BEGIN").await?;
             for p in &cs.changes {
-                for statement in dialect.emit(&p.change, p.strategy)? {
+                for statement in dialect.legacy_emit(&p.change, p.strategy)? {
                     conn.execute(&statement.sql).await?;
                 }
             }
@@ -520,4 +515,26 @@ async fn expanded_table_checks_indexes_and_defaults_execute_on_both_servers() {
             .unwrap();
         result.unwrap();
     }
+}
+
+// Frozen generated expansion used by the pre-conversion split oracle.
+fn generated_parts(
+    cs: &mut ChangeSet,
+    ids: &IdsFile,
+    deps: &ModuleDeps,
+    dialect: &(impl Dialect + ?Sized),
+) -> Result<usize, String> {
+    let mut expanded = Vec::new();
+    let mut added = 0;
+    for p in &cs.changes {
+        match pbps_diff::order::generated::parts(p, ids, &cs.changes, deps, dialect)? {
+            Some(parts) => {
+                added += parts.len() - 1;
+                expanded.extend(parts);
+            }
+            None => expanded.push(p.clone()),
+        }
+    }
+    cs.changes = expanded;
+    Ok(added)
 }

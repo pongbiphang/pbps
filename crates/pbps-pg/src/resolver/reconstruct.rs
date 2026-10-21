@@ -77,15 +77,7 @@ struct Late {
     generated: Vec<String>,
 }
 
-/// When a step runs. Everything in one phase can be named by the phases
-/// after it; only modules name each other within a phase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Phase {
-    Tables,
-    Keys,
-    Modules,
-    Expressions,
-}
+use pbps_diff::order::scratch::Phase;
 
 /// What kind of object a step makes nameable, and so which bindings it
 /// could have taken over had it existed earlier.
@@ -127,13 +119,12 @@ pub type Named = (Nameable, String, String);
 
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
-struct Step {
+pub struct Metadata {
     phase: Phase,
     operation: usize,
     table_part: Option<pbps_model::TableName>,
     /// What an error names: the declaration, never the statement text.
     declaration: String,
-    statements: Vec<String>,
     /// What this step makes resolvable, for the order check: its kind,
     /// schema and name.
     names: Vec<(Nameable, String, String)>,
@@ -150,10 +141,51 @@ struct Step {
     created: Option<ObjectIdentity>,
 }
 
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+struct Step {
+    metadata: Metadata,
+    #[cfg(test)]
+    statements: Vec<String>,
+}
+impl std::ops::Deref for Step {
+    type Target = Metadata;
+    fn deref(&self) -> &Metadata {
+        &self.metadata
+    }
+}
+impl std::ops::DerefMut for Step {
+    fn deref_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
+    }
+}
+
+/// SQL-free lowering input. Lexical observations are finite answers from a
+/// private emitter probe, never a retained executable statement collection.
+#[derive(Debug, Clone)]
+pub struct Blueprint {
+    metadata: Metadata,
+    change: pbps_model::PlannedChange,
+    calls: BTreeSet<String>,
+    tables: BTreeSet<pbps_model::TableName>,
+}
+impl std::ops::Deref for Blueprint {
+    type Target = Metadata;
+    fn deref(&self) -> &Metadata {
+        &self.metadata
+    }
+}
+impl std::ops::DerefMut for Blueprint {
+    fn deref_mut(&mut self) -> &mut Metadata {
+        &mut self.metadata
+    }
+}
+
 /// The ordered scratch statements for one desired schema.
 #[derive(Debug, Clone)]
 pub struct Reconstruction {
     steps: Vec<Step>,
+    lowered: pbps_dialect::lower::LoweredPlan<ScratchEmitter>,
     /// Declared routines the plan drops, which are never compiled, and the
     /// catalog identity each declared signature names in the target
     /// capture's snapshot: `None` where it names none (#1063, #1124, #1148).
@@ -166,9 +198,15 @@ pub struct Reconstruction {
 impl Reconstruction {
     /// `bootstrap` is the plan from an empty schema to the desired one, as
     /// the differ produces it; its order among modules is kept.
+    ///
+    /// ```compile_fail
+    /// fn raw(pg: &pbps_pg::Postgres, changes: &[pbps_model::Change], ids: &pbps_model::IdsFile) {
+    ///     pbps_pg::resolver::reconstruct::Reconstruction::new(pg, changes, ids);
+    /// }
+    /// ```
     pub fn new(
         dialect: &crate::Postgres,
-        bootstrap: &[Change],
+        bootstrap: &pbps_diff::order::PlanningPlan,
         ids: &pbps_model::IdsFile,
     ) -> Result<Self, ReconstructError> {
         Self::with_dependencies(dialect, bootstrap, ids, &pbps_model::ModuleDeps::new())
@@ -177,35 +215,15 @@ impl Reconstruction {
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn with_dependencies(
         dialect: &crate::Postgres,
-        bootstrap: &[Change],
+        bootstrap: &pbps_diff::order::PlanningPlan,
         ids: &pbps_model::IdsFile,
         dependencies: &pbps_model::ModuleDeps,
     ) -> Result<Self, ReconstructError> {
-        let mut declared = pbps_model::Schema::default();
-        for change in bootstrap {
-            match change {
-                Change::CreateTable { name, table, .. } => {
-                    declared.tables.insert(name.clone(), (**table).clone());
-                }
-                Change::CreateModule { id, module } => {
-                    declared.modules.insert(id.clone(), (**module).clone());
-                }
-                _ => {}
-            }
-        }
-        let mut expanded = pbps_model::ChangeSet {
-            changes: bootstrap
-                .iter()
-                .cloned()
-                .map(pbps_model::PlannedChange::new)
-                .collect(),
-        };
-        pbps_diff::order::generated::legacy_expand(&mut expanded, ids, dependencies, dialect)
+        let prepared = pbps_diff::order::scratch::prepare(bootstrap, ids, dependencies, dialect)
             .map_err(ReconstructError::Cycle)?;
-        pbps_diff::order::generated::legacy_settle(&mut expanded, &declared, dependencies, dialect)
-            .map_err(ReconstructError::Cycle)?;
-        let edges =
-            pbps_diff::order::generated::constraints(&expanded, &declared, dependencies, dialect);
+        let expanded = prepared.changes();
+        #[cfg(test)]
+        let edges = prepared.edges().to_vec();
         let mut steps = Vec::new();
         let mut late = Vec::new();
         let mut functions: Vec<(usize, String)> = Vec::new();
@@ -585,9 +603,20 @@ impl Reconstruction {
                 }
             }
         }
+        // The same lexical questions as the previous SQL-based scan, with
+        // only their answers retained until the complete blueprint is ordered.
+        let names: BTreeSet<_> = steps
+            .iter()
+            .flat_map(|s| s.names.iter().map(|(_, _, n)| n.clone()))
+            .chain(late.iter().map(|t| t.table.name.clone()))
+            .collect();
+        let tables: BTreeSet<_> = late.iter().map(|t| t.table.clone()).collect();
+        for part in &mut steps {
+            part.observe(dialect, &names, &tables);
+        }
         #[cfg(test)]
         let expected = function_oracle::after_their_functions(
-            steps.clone(),
+            steps.iter().map(|part| part.reference(dialect)).collect(),
             late.clone(),
             &functions,
             &foreign,
@@ -596,25 +625,81 @@ impl Reconstruction {
             steps.sort_by_key(|step| step.phase);
             steps
         });
-        let ordered = function_edges(steps, late, &functions, &foreign, &expanded);
+        #[cfg(test)]
+        let expected_final = expected.clone().and_then(|steps| {
+            let mut schedule = pbps_diff::order::Schedule::new(steps.len());
+            for edge in &edges {
+                let before = steps.iter().rposition(|s| s.operation == edge.before);
+                let after = steps.iter().position(|s| s.operation == edge.after);
+                if let (Some(before), Some(after)) = (before, after) {
+                    schedule.edge(before, after, edge.source, edge.reason);
+                }
+            }
+            function_oracle::settle_steps(steps, &schedule, expanded)
+        });
+        let parts = steps
+            .into_iter()
+            .map(|part| pbps_diff::order::scratch::Part {
+                operation: part.operation,
+                slot: 0,
+                change: part.change.clone(),
+                phase: part.phase,
+                declaration: part.declaration.clone(),
+                names: part.names.iter().map(|(_, _, name)| name.clone()).collect(),
+                calls: part.calls.clone(),
+                tables: part.tables.clone(),
+                metadata: part,
+            })
+            .collect();
+        let late = late
+            .into_iter()
+            .map(|table| pbps_diff::order::scratch::HeldTable {
+                table: table.table,
+                steps: table.steps,
+                generated: table.generated,
+            })
+            .collect();
+        let input = ScratchBlueprint(pbps_diff::order::scratch::Input::new(
+            prepared, parts, late, functions, foreign,
+        ));
+        let ordered =
+            pbps_diff::order::scratch::settle(dialect, input).map_err(ReconstructError::Cycle);
         #[cfg(test)]
         assert_eq!(
-            ordered, expected,
+            ordered.as_ref().map(|plan| plan
+                .first()
+                .iter()
+                .map(|p| p.metadata.reference(dialect))
+                .collect::<Vec<_>>()),
+            expected.as_ref().cloned(),
             "scratch statements and every Step field must match the frozen hold and phase sort"
         );
-        let steps = ordered?;
-        let mut schedule = pbps_diff::order::Schedule::new(steps.len());
-        for edge in edges {
-            let before = steps.iter().rposition(|s| s.operation == edge.before);
-            let after = steps.iter().position(|s| s.operation == edge.after);
-            if let (Some(before), Some(after)) = (before, after) {
-                schedule.edge(before, after, edge.source, edge.reason);
-            }
-        }
-        let steps = settle_steps(steps, schedule, &expanded)?;
+        let ordered = ordered?;
+        let lowered = pbps_dialect::lower::lower_all(&ordered, &ScratchEmitter(dialect.clone()))
+            .expect("the identical private probes already validated these lowering parts");
+        let steps = ordered
+            .parts()
+            .iter()
+            .zip(lowered.groups())
+            .map(|(part, group)| {
+                let _ = group;
+                Step {
+                    metadata: part.metadata.metadata.clone(),
+                    #[cfg(test)]
+                    statements: group.statements().iter().map(|s| s.sql.clone()).collect(),
+                }
+            })
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        assert_eq!(
+            steps,
+            expected_final.expect("the successful scratch route has an oracle result"),
+            "the final scratch SQL and every Step field match both frozen settlements"
+        );
 
         Ok(Self {
             steps,
+            lowered,
             dropped: BTreeMap::new(),
             between: Vec::new(),
         })
@@ -837,17 +922,21 @@ impl Reconstruction {
         conn: &mut impl pbps_db::transport::ExecuteConnection,
         range: std::ops::Range<usize>,
     ) -> Result<(), ReconstructError> {
-        for step in &mut self.steps[range] {
+        for (step, group) in self.steps[range.clone()]
+            .iter_mut()
+            .zip(&self.lowered.groups()[range])
+        {
+            let declaration = step.declaration.clone();
             let failed = |reason: String| ReconstructError::Compile {
-                declaration: step.declaration.clone(),
+                declaration: declaration.clone(),
                 reason,
             };
             let unread = |reason: String| ReconstructError::Read {
-                declaration: step.declaration.clone(),
+                declaration: declaration.clone(),
                 reason,
             };
             let interrupted = |reason: String| ReconstructError::Interrupted {
-                declaration: step.declaration.clone(),
+                declaration: declaration.clone(),
                 reason,
             };
             let routine = match &step.module {
@@ -860,8 +949,8 @@ impl Reconstruction {
                 Some((schema, name)) => routines(conn, schema, name).await.map_err(unread)?,
                 None => Vec::new(),
             };
-            for statement in &step.statements {
-                conn.execute(statement).await.map_err(|error| {
+            for statement in group.statements() {
+                conn.execute(&statement.sql).await.map_err(|error| {
                     if judged_the_statement(&error) {
                         failed(error.to_string())
                     } else {
@@ -1016,184 +1105,6 @@ async fn routines(
 #[path = "reconstruct/function_oracle.rs"]
 mod function_oracle;
 
-fn edge(schedule: &mut pbps_diff::order::Schedule, before: usize, after: usize) {
-    schedule.edge(
-        before,
-        after,
-        pbps_diff::order::Source::Lexical,
-        pbps_model::resolver::OrderReason::Structural,
-    );
-}
-
-/// Peers keep their input order, and a block follows the preceding block.
-/// These are compatibility edges, not a new priority or a pre-sort.
-fn block(schedule: &mut pbps_diff::order::Schedule, previous: &mut Option<usize>, peers: &[usize]) {
-    for &at in peers {
-        if let Some(before) = *previous {
-            edge(schedule, before, at);
-        }
-        *previous = Some(at);
-    }
-}
-
-/// Apply only the scheduler's permutation to lowering metadata. Operations
-/// remain the typed expansion's own changes, with no fabricated identities.
-fn settle_steps(
-    steps: Vec<Step>,
-    schedule: pbps_diff::order::Schedule,
-    expanded: &pbps_model::ChangeSet,
-) -> Result<Vec<Step>, ReconstructError> {
-    let order_plan = pbps_model::ChangeSet {
-        changes: steps
-            .iter()
-            .map(|s| pbps_model::PlannedChange::new(expanded.changes[s.operation].change.clone()))
-            .collect(),
-    };
-    let settled = schedule
-        .settle(pbps_diff::order::propose(order_plan.clone()))
-        .map_err(|e| ReconstructError::Cycle(e.describe(&order_plan)))?;
-    let mut taken: Vec<_> = steps.into_iter().map(Some).collect();
-    Ok(settled
-        .sequence
-        .iter()
-        .map(|&i| taken[i].take().expect("a settled order is a permutation"))
-        .collect())
-}
-
-/// State the retained whole-table holds, reader closures and phase barriers
-/// as constraints, leaving every permutation to Schedule (DEC-1959.3).
-fn function_edges(
-    mut steps: Vec<Step>,
-    late: Vec<Late>,
-    functions: &[(usize, String)],
-    foreign: &BTreeSet<usize>,
-    expanded: &pbps_model::ChangeSet,
-) -> Result<Vec<Step>, ReconstructError> {
-    let late: Vec<_> = late
-        .into_iter()
-        .filter_map(|table| {
-            let called: Vec<usize> = functions
-                .iter()
-                .filter(|(_, name)| {
-                    table
-                        .generated
-                        .iter()
-                        .any(|text| crate::generated::may_call(text, name))
-                })
-                .map(|(at, _)| *at)
-                .collect();
-            (!called.is_empty()).then_some((table, called))
-        })
-        .collect();
-    let names = |at: usize, name: &str| {
-        steps[at]
-            .statements
-            .iter()
-            .any(|sql| crate::generated::may_call(sql, name))
-    };
-    let early = |at: usize| matches!(steps[at].phase, Phase::Tables | Phase::Keys);
-    let keys: Vec<_> = foreign
-        .iter()
-        .copied()
-        .filter(|&at| late.iter().any(|(table, _)| names(at, &table.table.name)))
-        .collect();
-    // The projection contains metadata positions only. Each subsequent order
-    // is produced by Schedule, never by splicing this list around a callee.
-    let mut modules: Vec<_> = (0..steps.len())
-        .filter(|&at| steps[at].phase == Phase::Modules)
-        .collect();
-    let mut placed: BTreeSet<_> = modules.iter().copied().collect();
-    let mut delayed = BTreeSet::new();
-    for (table, called) in &late {
-        let group: Vec<_> = table
-            .steps
-            .clone()
-            .filter(|&at| early(at) && !keys.contains(&at))
-            .collect();
-        let point = modules
-            .iter()
-            .rposition(|at| {
-                called.contains(at)
-                    || (delayed.contains(at)
-                        && steps[*at]
-                            .names
-                            .iter()
-                            .any(|(_, _, name)| group.iter().any(|&own| names(own, name))))
-            })
-            .map_or(0, |position| position + 1);
-        let mut held = BTreeSet::from([table.table.name.clone()]);
-        let mut free = Vec::new();
-        let mut readers = Vec::new();
-        for &at in &modules[..point] {
-            if held.iter().any(|name| {
-                if name == &table.table.name {
-                    steps[at]
-                        .statements
-                        .iter()
-                        .any(|sql| crate::generated::names_table(sql, &table.table))
-                } else {
-                    names(at, name)
-                }
-            }) {
-                if called.contains(&at) {
-                    return Err(ReconstructError::Cycle(format!(
-                        "table {} ({})",
-                        table.table.shown(),
-                        steps[at].declaration
-                    )));
-                }
-                held.extend(steps[at].names.iter().map(|(_, _, name)| name.clone()));
-                readers.push(at);
-            } else {
-                free.push(at);
-            }
-        }
-        let mut schedule = pbps_diff::order::Schedule::new(steps.len());
-        let mut previous = None;
-        // The last callee (or a delayed name it uses) stays before the table.
-        // Readers follow the complete group; later peers keep following those
-        // readers, as the old hold did. Sink alone would not retain that barrier.
-        block(&mut schedule, &mut previous, &free);
-        block(&mut schedule, &mut previous, &group);
-        block(&mut schedule, &mut previous, &readers);
-        block(&mut schedule, &mut previous, &modules[point..]);
-        placed.extend(group.iter().copied());
-        delayed.extend(group);
-        modules = schedule
-            .sequence()
-            .map_err(|e| ReconstructError::Cycle(e.to_string()))?
-            .into_iter()
-            .filter(|at| placed.contains(at))
-            .collect();
-    }
-    placed.extend(keys.iter().copied());
-    for &at in &placed {
-        steps[at].phase = Phase::Modules;
-    }
-
-    let mut schedule = pbps_diff::order::Schedule::new(steps.len());
-    let mut previous = None;
-    for phase in [
-        Phase::Tables,
-        Phase::Keys,
-        Phase::Modules,
-        Phase::Expressions,
-    ] {
-        if phase == Phase::Modules {
-            block(&mut schedule, &mut previous, &modules);
-            block(&mut schedule, &mut previous, &keys);
-        } else {
-            let peers: Vec<_> = (0..steps.len())
-                .filter(|&at| steps[at].phase == phase)
-                .collect();
-            block(&mut schedule, &mut previous, &peers);
-        }
-    }
-    // Phase compatibility is settled before generated-part constraints, which
-    // may legitimately move a key across a phase boundary (DEC-1959.3).
-    settle_steps(steps, schedule, expanded)
-}
-
 fn relation(schema: &str, name: &str) -> Vec<(Nameable, String, String)> {
     vec![(Nameable::Relation, schema.to_owned(), name.to_owned())]
 }
@@ -1244,27 +1155,72 @@ fn step(
     change: &Change,
     names: Vec<(Nameable, String, String)>,
     module: Option<ModuleId>,
-) -> Result<Step, ReconstructError> {
-    let statements = dialect
-        .emit(change, Strategy::default())
-        .map_err(|error| ReconstructError::Emit {
+) -> Result<Blueprint, ReconstructError> {
+    // Preserve the original refusal priority: validate each part at its old
+    // construction point, but retain no SQL until both ordering stages finish.
+    crate::emit::emit(dialect, change, Strategy::default()).map_err(|error| {
+        ReconstructError::Emit {
             declaration: declaration.to_owned(),
             reason: error.to_string(),
-        })?
-        .into_iter()
-        .map(|statement| statement.sql)
-        .collect();
-    Ok(Step {
-        phase,
-        operation: 0,
-        table_part: None,
-        declaration: declaration.to_owned(),
-        statements,
-        names,
-        generated: Vec::new(),
-        module,
-        created: None,
+        }
+    })?;
+    Ok(Blueprint {
+        metadata: Metadata {
+            phase,
+            operation: 0,
+            table_part: None,
+            declaration: declaration.to_owned(),
+            names,
+            generated: Vec::new(),
+            module,
+            created: None,
+        },
+        change: pbps_model::PlannedChange::new(change.clone()),
+        calls: BTreeSet::new(),
+        tables: BTreeSet::new(),
     })
+}
+
+impl Blueprint {
+    fn observe(
+        &mut self,
+        dialect: &crate::Postgres,
+        names: &BTreeSet<String>,
+        tables: &BTreeSet<pbps_model::TableName>,
+    ) {
+        let statements = crate::emit::emit(dialect, &self.change.change, self.change.strategy)
+            .expect("this part's private validation probe already succeeded");
+        self.calls = names
+            .iter()
+            .filter(|name| {
+                statements
+                    .iter()
+                    .any(|s| crate::generated::may_call(&s.sql, name))
+            })
+            .cloned()
+            .collect();
+        self.tables = tables
+            .iter()
+            .filter(|table| {
+                statements
+                    .iter()
+                    .any(|s| crate::generated::names_table(&s.sql, table))
+            })
+            .cloned()
+            .collect();
+    }
+
+    #[cfg(test)]
+    fn reference(&self, dialect: &crate::Postgres) -> Step {
+        Step {
+            metadata: self.metadata.clone(),
+            statements: crate::emit::emit(dialect, &self.change.change, self.change.strategy)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.sql)
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1330,4 +1286,48 @@ mod name_tests {
             .is_none()
         );
     }
+}
+
+/// Engine-owned scratch input. Only reconstruction can assemble its parts.
+///
+/// ```compile_fail
+/// fn forge(pg: &pbps_pg::Postgres,
+///          input: pbps_diff::order::scratch::Input<pbps_pg::resolver::reconstruct::Blueprint>) {
+///     pbps_diff::order::scratch::settle(pg, input).unwrap();
+/// }
+/// ```
+pub struct ScratchBlueprint(pbps_diff::order::scratch::Input<Blueprint>);
+impl pbps_diff::order::scratch::Engine for crate::Postgres {
+    type Input = ScratchBlueprint;
+    type Metadata = Blueprint;
+    fn blueprint(&self, input: Self::Input) -> pbps_diff::order::scratch::Input<Blueprint> {
+        input.0
+    }
+    fn phase(metadata: &mut Blueprint, phase: Phase) {
+        metadata.metadata.phase = phase;
+    }
+}
+#[derive(Debug, Clone)]
+struct ScratchEmitter(crate::Postgres);
+impl pbps_dialect::lower::Lowering for ScratchEmitter {
+    type Input = pbps_diff::order::scratch::ScratchPlan<crate::Postgres>;
+    fn emit_position(
+        &self,
+        input: &Self::Input,
+        position: usize,
+    ) -> Result<Vec<pbps_dialect::Statement>, pbps_dialect::DialectError> {
+        let part = &input.parts()[position].change;
+        crate::emit::emit(&self.0, &part.change, part.strategy)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_plan(changes: &[Change]) -> pbps_diff::order::PlanningPlan {
+    pbps_diff::order::propose(pbps_model::ChangeSet {
+        changes: changes
+            .iter()
+            .cloned()
+            .map(pbps_model::PlannedChange::new)
+            .collect(),
+    })
 }

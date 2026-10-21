@@ -3,7 +3,6 @@
 
 use super::*;
 use pbps_db::{Conn, Driver};
-use pbps_dialect::Dialect;
 use pbps_model::resolver::{BoundSurface, Surface, SurfaceResolution};
 use pbps_model::{Change, ChangeSet, Column, Hints, IdsFile, Module, ModuleKind, Schema, Table};
 use std::collections::BTreeMap;
@@ -180,7 +179,7 @@ fn resolution(before: &CapturedInputs, after: &CapturedInputs) -> Vec<SurfaceRes
 async fn execute(conn: &mut Conn, changes: &ChangeSet) -> Result<(), pbps_db::DbError> {
     for p in &changes.changes {
         for statement in crate::Postgres::default()
-            .emit(&p.change, p.strategy)
+            .legacy_emit(&p.change, p.strategy)
             .unwrap()
         {
             conn.execute(&statement.sql).await?;
@@ -582,7 +581,7 @@ async fn new_table_online_indexes_are_transactional(target: &mut Conn) {
     for step in &restored.changes {
         assert!(
             dialect
-                .emit(&step.change, step.strategy)
+                .legacy_emit(&step.change, step.strategy)
                 .unwrap()
                 .iter()
                 .all(|s| s.transactional)

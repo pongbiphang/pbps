@@ -119,3 +119,27 @@ pub(super) fn after_their_functions(
         })
         .collect())
 }
+
+// Frozen dd84f894 metadata permutation after raw lowering, retained only to
+// compare every final Step field with the blueprint-before-lowering route.
+pub(super) fn settle_steps(
+    steps: Vec<Step>,
+    schedule: &pbps_diff::order::Schedule,
+    expanded: &pbps_model::ChangeSet,
+) -> Result<Vec<Step>, ReconstructError> {
+    let order_plan = pbps_model::ChangeSet {
+        changes: steps
+            .iter()
+            .map(|s| pbps_model::PlannedChange::new(expanded.changes[s.operation].change.clone()))
+            .collect(),
+    };
+    let settled = schedule
+        .settle(pbps_diff::order::propose(order_plan.clone()))
+        .map_err(|e| ReconstructError::Cycle(e.describe(&order_plan)))?;
+    let mut taken: Vec<_> = steps.into_iter().map(Some).collect();
+    Ok(settled
+        .sequence
+        .iter()
+        .map(|&i| taken[i].take().expect("a settled order is a permutation"))
+        .collect())
+}

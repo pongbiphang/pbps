@@ -59,7 +59,7 @@ async fn estimates_measure_each_occupant_before_and_after_name_reuse() {
     assert_eq!(reports.len(), 2);
     assert!(reports.iter().all(|r| r.blocking.is_empty()));
     for p in &changes {
-        for statement in pg.emit(&p.change, p.strategy).unwrap() {
+        for statement in pg.legacy_emit(&p.change, p.strategy).unwrap() {
             db.conn.execute(&statement.sql).await.unwrap();
         }
     }
@@ -152,7 +152,7 @@ async fn a_detached_columns_estimate_keeps_its_catalog_spelling_after_rename() {
         .await
         .unwrap();
     for p in &changes {
-        for statement in pg.emit(&p.change, p.strategy).unwrap() {
+        for statement in pg.legacy_emit(&p.change, p.strategy).unwrap() {
             db.conn.execute(&statement.sql).await.unwrap();
         }
     }

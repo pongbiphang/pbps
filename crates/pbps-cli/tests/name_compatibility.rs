@@ -88,7 +88,7 @@ fn sql(plan: &SavedPlan, dialect: &dyn Dialect) -> String {
     plan.changes
         .changes
         .iter()
-        .flat_map(|p| dialect.emit(&p.change, Default::default()).unwrap())
+        .flat_map(|p| dialect.legacy_emit(&p.change, Default::default()).unwrap())
         .map(|s| s.sql)
         .collect::<Vec<_>>()
         .join("\n")
@@ -199,7 +199,9 @@ fn a_dialect_refusal_escapes_a_table_name_exactly_once() {
                 beside_default: None,
                 moves_at_most: None,
             };
-            let error = dialect.emit(&change, Default::default()).unwrap_err();
+            let error = dialect
+                .legacy_emit(&change, Default::default())
+                .unwrap_err();
             let pbps_dialect::DialectError::Invalid { dialect, .. } = &error else {
                 panic!("the empty table must be refused: {error:?}");
             };

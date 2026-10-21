@@ -3524,7 +3524,7 @@ async fn inet_into_cidr_is_a_narrowing_whose_probe_counts_the_rows_with_host_bit
             ),
             "{from} -> {to}: {step:#?}"
         );
-        let emitted = pg.emit(&step.changes[0].change, Strategy::default());
+        let emitted = pg.legacy_emit(&step.changes[0].change, Strategy::default());
         assert_eq!(emitted.is_err(), refused, "{from} -> {to}: {emitted:?}");
         if refused {
             assert!(
@@ -4119,7 +4119,7 @@ async fn sequence_options_round_trip_and_a_counter_past_a_new_bound_is_counted()
     in_a_transaction(&mut db).await;
     let mut refused = None;
     for stmt in Postgres::new()
-        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .legacy_emit(&cs.changes[0].change, cs.changes[0].strategy)
         .unwrap()
     {
         if let Err(e) = db.execute(&stmt.sql).await {
@@ -5246,7 +5246,11 @@ async fn array_columns_round_trip_and_widen_their_elements() {
     let e = refused
         .changes
         .iter()
-        .find_map(|p| Postgres::new().emit(&p.change, Default::default()).err())
+        .find_map(|p| {
+            Postgres::new()
+                .legacy_emit(&p.change, Default::default())
+                .err()
+        })
         .expect("the narrowing is refused")
         .to_string();
     assert!(e.contains("array's element type"), "{e}");
@@ -6150,7 +6154,7 @@ async fn list_and_hash_partition_trees_round_trip_and_take_rows() {
                     probe.description
                 );
             }
-            let attached = pg.emit(&step.changes[0].change, step.changes[0].strategy);
+            let attached = pg.legacy_emit(&step.changes[0].change, step.changes[0].strategy);
             let attached = attached.expect("emit").remove(0).sql;
             in_a_transaction(&mut conn).await;
             let refused = conn
@@ -6320,7 +6324,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         in_a_transaction(&mut conn).await;
         let stopped = conn
             .execute(
-                &pg.emit(&unallowed.changes[0].change, unallowed.changes[0].strategy)
+                &pg.legacy_emit(&unallowed.changes[0].change, unallowed.changes[0].strategy)
                     .expect("emit")
                     .remove(0)
                     .sql,
@@ -6351,7 +6355,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         assert_eq!(over_step.changes.len(), 1, "{over_step:#?}");
         let moving = &over_step.changes[0];
         let moving = pg
-            .emit(&moving.change, moving.strategy)
+            .legacy_emit(&moving.change, moving.strategy)
             .expect("emit")
             .remove(0)
             .sql;
@@ -6759,7 +6763,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         );
         let unlogged_moving = &unlogged_step.changes[0];
         let unlogged_moving = pg
-            .emit(&unlogged_moving.change, unlogged_moving.strategy)
+            .legacy_emit(&unlogged_moving.change, unlogged_moving.strategy)
             .expect("emit")
             .remove(0)
             .sql;
@@ -7000,7 +7004,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
         );
         let sr_moving = &sr_step.changes[0];
         let sr_moving = pg
-            .emit(&sr_moving.change, sr_moving.strategy)
+            .legacy_emit(&sr_moving.change, sr_moving.strategy)
             .expect("emit")
             .remove(0)
             .sql;
@@ -7052,7 +7056,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             .expect("the delete-publication probe");
         let ul_moving = &ul_step.changes[0];
         let ul_moving = pg
-            .emit(&ul_moving.change, ul_moving.strategy)
+            .legacy_emit(&ul_moving.change, ul_moving.strategy)
             .expect("emit")
             .remove(0)
             .sql;
@@ -7143,7 +7147,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             );
             let moving = &gx_step.changes[0];
             let moving = pg
-                .emit(&moving.change, moving.strategy)
+                .legacy_emit(&moving.change, moving.strategy)
                 .expect("emit")
                 .remove(0)
                 .sql;
@@ -7646,7 +7650,7 @@ async fn range_partitions_are_added_and_dropped_on_populated_trees() {
             let tp_probes = pg.fixture_preflight(&tp_step).probes;
             let tp_moving = &tp_step.changes[0];
             let tp_moving = pg
-                .emit(&tp_moving.change, tp_moving.strategy)
+                .legacy_emit(&tp_moving.change, tp_moving.strategy)
                 .expect("emit")
                 .remove(0)
                 .sql;
@@ -8068,7 +8072,7 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
             .await
             .expect("the triggers dropped");
             let sql: String = pg
-                .emit(&step.changes[0].change, Default::default())
+                .legacy_emit(&step.changes[0].change, Default::default())
                 .expect("emit")
                 .into_iter()
                 .map(|statement| statement.sql)
@@ -8135,7 +8139,7 @@ async fn an_attach_counts_the_rows_its_range_does_not_take() {
         let sql: Vec<String> = keyed
             .changes
             .iter()
-            .flat_map(|p| pg.emit(&p.change, Default::default()).expect("emit"))
+            .flat_map(|p| pg.legacy_emit(&p.change, Default::default()).expect("emit"))
             .map(|statement| statement.sql)
             .collect();
         let orphans = |c: &[(String, i64)]| one(c, "no matching parent");
@@ -8300,7 +8304,7 @@ async fn a_default_attach_counts_the_rows_another_partition_takes() {
         let replaced = plan(vec![detach("m_rest", "m"), attach("t", "m")]);
         assert_eq!(counted(&mut conn, &standing(&probes(&replaced))).await, 0);
         let sql = |change: &Change| -> String {
-            pg.emit(change, Default::default())
+            pg.legacy_emit(change, Default::default())
                 .expect("emit")
                 .into_iter()
                 .map(|statement| statement.sql)
@@ -8395,7 +8399,7 @@ async fn a_detach_takes_the_parent_before_the_partition() {
     .await
     .expect("the tree");
     let detach = Postgres::new()
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::DetachPartition {
                 uid: "t_aaaaaa".parse().unwrap(),
                 table: TableName::new(&s, "ev_1"),
@@ -8510,7 +8514,7 @@ async fn a_detach_calls_no_operator_a_schema_user_could_add() {
     };
     use pbps_model::DetachedKind as K;
     let detach = Postgres::new()
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::DetachPartition {
                 uid: "t_aaaaaa".parse().unwrap(),
                 table: TableName::new(&s, "ev_1"),
@@ -8600,7 +8604,7 @@ async fn a_detach_takes_free_temporaries_and_refuses_a_held_name_by_name() {
         .expect("the tree");
         let emit = |table: &str, names: Vec<DetachedName>| {
             Postgres::new()
-                .emit(
+                .legacy_emit(
                     &pbps_model::Change::DetachPartition {
                         uid: "t_aaaaaa".parse().unwrap(),
                         table: TableName::new(&s, table),
@@ -8705,7 +8709,7 @@ async fn a_detach_takes_free_temporaries_and_refuses_a_held_name_by_name() {
 /// only reaches the batch it is in.
 async fn apply(conn: &mut Conn, pg: &Postgres, cs: &pbps_model::ChangeSet) {
     for p in &cs.changes {
-        for stmt in pg.emit(&p.change, p.strategy).expect("emit") {
+        for stmt in pg.legacy_emit(&p.change, p.strategy).expect("emit") {
             conn.execute(&stmt.sql)
                 .await
                 .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
@@ -9180,7 +9184,7 @@ async fn temporary_relations_and_types_follow_the_declared_write_path() {
     // The same emitted statement without the final entry is the negative
     // control, even in a session whose explicit path names only the project.
     let baseline = Postgres::new()
-        .emit(&change("app"), Strategy::default())
+        .legacy_emit(&change("app"), Strategy::default())
         .unwrap()[0]
         .sql
         .replace(", \"pg_temp\"", "");
@@ -9198,7 +9202,10 @@ async fn temporary_relations_and_types_follow_the_declared_write_path() {
         ),
     ] {
         let pg = Postgres::with_write_path_extras(extras);
-        for statement in pg.emit(&change(schema), Strategy::default()).unwrap() {
+        for statement in pg
+            .legacy_emit(&change(schema), Strategy::default())
+            .unwrap()
+        {
             db.execute(&statement.sql).await.unwrap();
         }
         bindings.push(binds_to(&mut db, &format!("{schema}.bound"), "app").await);
@@ -9283,7 +9290,7 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
     let bare = Postgres::new();
     let mut refusals = Vec::new();
     for p in &cs.changes {
-        for stmt in bare.emit(&p.change, p.strategy).expect("emit") {
+        for stmt in bare.legacy_emit(&p.change, p.strategy).expect("emit") {
             if let Err(e) = conn.execute(&stmt.sql).await {
                 refusals.push(sqlstate(&e).to_owned());
             }
@@ -9350,7 +9357,7 @@ async fn an_unqualified_name_in_a_declared_expression_binds_through_the_write_pa
     let named = Postgres::with_write_path_extras(vec!["pg_catalog".into()]);
     let first = &cs.changes[0];
     let refusal = named
-        .emit(&first.change, first.strategy)
+        .legacy_emit(&first.change, first.strategy)
         .expect_err("a path that lists pg_catalog moves it behind the object's own schema");
     assert!(refusal.to_string().contains("pg_catalog"), "{refusal}");
     conn.drop().await;
@@ -9488,7 +9495,7 @@ async fn the_framing_pins_the_settings_that_decide_what_a_definition_means() {
         moves_at_most: None,
     };
     let statements = Postgres::new()
-        .emit(&change, Strategy::default())
+        .legacy_emit(&change, Strategy::default())
         .expect("emit");
 
     // Every statement of the change, because the check is added after the
@@ -9598,7 +9605,7 @@ async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transactio
     };
 
     let concurrent = Postgres::new()
-        .emit(&add("ix_plain", &plain), online)
+        .legacy_emit(&add("ix_plain", &plain), online)
         .expect("emit");
     assert_eq!(concurrent.len(), 1);
     assert!(
@@ -9615,7 +9622,7 @@ async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transactio
     );
 
     let ordinary = Postgres::new()
-        .emit(&add("ix_filtered", &filtered), online)
+        .legacy_emit(&add("ix_filtered", &filtered), online)
         .expect("emit");
     assert!(
         !ordinary[0].sql.contains("CONCURRENTLY"),
@@ -9770,7 +9777,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
         "(/* ) */ '01/02/2026')",
     ] {
         let refusal = Postgres::new()
-            .emit(&table(spelling), Strategy::default())
+            .legacy_emit(&table(spelling), Strategy::default())
             .unwrap_err();
         let message = refusal.to_string();
         assert!(message.contains("DateStyle"), "{spelling}: {message}");
@@ -9780,7 +9787,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
         );
     }
     Postgres::new()
-        .emit(&table("'2026-01-02'::date"), Strategy::default())
+        .legacy_emit(&table("'2026-01-02'::date"), Strategy::default())
         .expect("the resolved typed spelling is emitted as written");
     // And a type whose input function reads no setting is never in question.
     let mut plain = Table::default();
@@ -9788,7 +9795,7 @@ async fn a_default_whose_value_the_session_decides_is_refused_and_the_resolved_o
     n.value_source = pbps_model::ValueSource::Default("'7'".into());
     plain.columns.insert("n".into(), n);
     Postgres::new()
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::CreateTable {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                 name: TableName::new(&s, "plain"),
@@ -9827,7 +9834,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
 
     let column = TableName::new(&s, "t").column("c");
     let refusal = Postgres::new()
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                 column: column.clone(),
@@ -9847,7 +9854,7 @@ async fn a_type_change_that_would_need_a_using_clause_is_refused_by_name() {
     assert!(message.contains("`c`"), "{message}");
     // And nothing here emits one.
     let widened = Postgres::new()
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                 column,
@@ -10513,7 +10520,7 @@ async fn structural_declarations_and_the_engine_agree_on_refusals_and_legal_repe
             "{label}: {problems:?}"
         );
         let statements = pg
-            .emit(
+            .legacy_emit(
                 &pbps_model::Change::CreateTable {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                     name: name.clone(),
@@ -10621,7 +10628,7 @@ async fn installed_default_operator_classes_can_make_json_keys_valid() {
             "installed default json opclass: {problems:?}"
         );
         let statements = pg
-            .emit(
+            .legacy_emit(
                 &pbps_model::Change::CreateTable {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                     name,
@@ -10663,7 +10670,7 @@ async fn a_rename_across_schemas_is_two_statements_that_each_say_where_the_table
     let from = TableName::new(&s, "before");
     let to = TableName::new(&to_schema, "after");
     let statements = Postgres::new()
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::RenameTable {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),
                 from: from.clone(),
@@ -10714,7 +10721,7 @@ async fn an_unnamed_primary_key_is_dropped_by_the_name_the_catalog_holds() {
 
     let table = TableName::new(&s, odd);
     let statements = Postgres::new()
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::SetPrimaryKey {
                 table: table.clone(),
                 from: Some(PrimaryKey {
@@ -10913,7 +10920,7 @@ async fn the_framing_pins_what_an_ambiguous_temporal_literal_means() {
         moves_at_most: None,
     };
     let statements = Postgres::new()
-        .emit(&change, Strategy::default())
+        .legacy_emit(&change, Strategy::default())
         .expect("emit");
 
     async fn stored(conn: &mut Conn, schema: &str) -> String {
@@ -11081,7 +11088,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
     // So pbps does not emit either of them. The message names the zone and the
     // two-step remedy, because a refusal a reader cannot act on is a wall.
     let refusal = Postgres::new()
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                 column: pbps_model::ColumnRef {
@@ -11132,7 +11139,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
     );
     assert!(
         Postgres::new()
-            .emit(
+            .legacy_emit(
                 &pbps_model::Change::AlterColumnType {
                     uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                     column: pbps_model::ColumnRef {
@@ -11154,7 +11161,7 @@ async fn a_type_change_that_the_session_would_decide_is_refused_by_name() {
     );
 
     let kept_refusal = Postgres::new()
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::AlterColumnType {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Column),
                 column: pbps_model::ColumnRef {
@@ -11353,7 +11360,7 @@ async fn a_conversion_to_text_renders_under_the_framings_settings_and_not_the_op
     let framing = pg.transaction_framing(&pbps_model::SessionZone::utc());
     conn.begin(&framing).await.expect("begin");
     for change in [retype("b", "bytea"), retype("f", "double precision")] {
-        for stmt in pg.emit(&change, Strategy::default()).expect("emit") {
+        for stmt in pg.legacy_emit(&change, Strategy::default()).expect("emit") {
             conn.execute(&stmt.sql)
                 .await
                 .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
@@ -11553,7 +11560,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
     db.conn.execute("BEGIN").await.expect("begin");
     let mut refused = None;
     for p in migration.changes.iter().rev() {
-        for stmt in pg.emit(&p.change, p.strategy).expect("emit") {
+        for stmt in pg.legacy_emit(&p.change, p.strategy).expect("emit") {
             if let Err(e) = db.conn.execute(&stmt.sql).await {
                 refused = Some(e.to_string());
                 break;
@@ -14979,7 +14986,7 @@ async fn a_module_of_every_kind_survives_the_round_trip_as_the_same_object() {
     for id in first.keys().rev() {
         let kind = first[id].kind;
         for stmt in pg
-            .emit(
+            .legacy_emit(
                 &pbps_model::Change::DropModule {
                     id: id.clone(),
                     kind,
@@ -15115,7 +15122,7 @@ async fn two_overloads_of_one_name_are_two_objects_and_each_drop_names_one() {
 
     // And with the signature, exactly one goes.
     for stmt in pg
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::DropModule {
                 id: format!("{s}.f(integer)").parse().expect("a module id"),
                 kind: pbps_model::ModuleKind::Function,
@@ -17291,7 +17298,7 @@ async fn continued_routine_bodies_create_the_callee_first_and_ignore_string_data
     let pg = Postgres::new();
     let applied = async {
         for change in &changes.changes {
-            for statement in pg.emit(&change.change, change.strategy).unwrap() {
+            for statement in pg.legacy_emit(&change.change, change.strategy).unwrap() {
                 db.conn.execute(&statement.sql).await?;
             }
         }
@@ -17584,7 +17591,7 @@ async fn a_shadow_this_plan_introduces_rebuilds_the_module_in_the_same_plan() {
         .find(|p| matches!(p.change, pbps_model::Change::AlterModule { .. }))
         .expect("the synthesized rebuild");
     for stmt in pg
-        .emit(&rebuild.change, rebuild.strategy)
+        .legacy_emit(&rebuild.change, rebuild.strategy)
         .expect("emit the synthesized rebuild")
     {
         conn.execute(&stmt.sql)
@@ -18236,7 +18243,7 @@ async fn the_identity_a_routine_body_creates_is_the_key_the_gate_accepts_it_unde
             refusals.iter().map(ToString::to_string).collect::<Vec<_>>()
         );
         for statement in pg
-            .emit(
+            .legacy_emit(
                 &pbps_model::Change::CreateModule {
                     id: id.clone(),
                     module: Box::new(module.clone()),
@@ -18672,7 +18679,7 @@ async fn a_triggers_on_clause_is_what_decides_where_it_lands() {
             "{body} must be accepted"
         );
         for stmt in pg
-            .emit(
+            .legacy_emit(
                 &pbps_model::Change::CreateModule {
                     id: id.clone(),
                     module: Box::new(m),
@@ -19170,7 +19177,7 @@ async fn a_bodys_trailing_non_ascii_byte_reaches_the_engine() {
     let id: pbps_model::ModuleId = format!("{s}.v").parse().expect("a module id");
     let view = module(pbps_model::ModuleKind::View, " \n SELECT 1 AS x\u{a0}\n ");
     for statement in pg
-        .emit(
+        .legacy_emit(
             &pbps_model::Change::CreateModule {
                 id: id.clone(),
                 module: Box::new(view),
@@ -20064,7 +20071,7 @@ async fn a_hand_edited_row_is_seen_and_the_update_holds_what_the_plan_recorded()
     .await
     .expect("the second edit");
     let stmt = pg
-        .emit(&fix.changes[0].change, fix.changes[0].strategy)
+        .legacy_emit(&fix.changes[0].change, fix.changes[0].strategy)
         .expect("emit")
         .remove(0);
     let refusal = conn
@@ -20272,7 +20279,7 @@ async fn the_pre_delete_probe_counts_a_foreign_key_this_engine_never_stopped_enf
     // own block, so a child that arrived after the probe is refused rather
     // than cascaded away (DECISIONS 129).
     let stmt = pg
-        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .legacy_emit(&cs.changes[0].change, cs.changes[0].strategy)
         .expect("emit")
         .remove(0);
     let refusal = conn
@@ -20417,7 +20424,7 @@ async fn a_backslash_and_a_bytea_mean_one_thing_under_either_string_setting() {
     let sql: String = creation
         .changes
         .iter()
-        .flat_map(|p| pg.emit(&p.change, p.strategy).expect("emit"))
+        .flat_map(|p| pg.legacy_emit(&p.change, p.strategy).expect("emit"))
         .map(|st| st.sql)
         .collect::<Vec<_>>()
         .join("\n");
@@ -20735,7 +20742,7 @@ async fn a_trigger_that_undoes_a_row_write_rolls_the_statement_back() {
     for p in &creation.changes {
         statements.push((
             matches!(p.change, pbps_model::Change::InsertRow { .. }),
-            pg.emit(&p.change, p.strategy).expect("emit"),
+            pg.legacy_emit(&p.change, p.strategy).expect("emit"),
         ));
     }
     for (is_row, stmts) in &statements {
@@ -20835,7 +20842,7 @@ async fn a_child_row_that_arrives_after_the_probe_is_not_cascaded_away() {
         .expect("the arrival");
 
     let stmt = pg
-        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .legacy_emit(&cs.changes[0].change, cs.changes[0].strategy)
         .expect("emit")
         .remove(0);
     let refusal = conn
@@ -21122,7 +21129,7 @@ async fn a_referencing_row_the_session_cannot_see_refuses_the_delete() {
     let cs = plan(&base, &ids, &declared, &ids);
     let pg = Postgres::new();
     let stmt = pg
-        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .legacy_emit(&cs.changes[0].change, cs.changes[0].strategy)
         .expect("emit")
         .remove(0);
 
@@ -21389,7 +21396,7 @@ async fn a_row_that_references_only_itself_can_be_deleted() {
     // …and the statement's own guard has to agree, or a plan the probe passed
     // dies at apply time.
     let stmt = pg
-        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .legacy_emit(&cs.changes[0].change, cs.changes[0].strategy)
         .expect("emit")
         .remove(0);
     conn.execute(&stmt.sql)
@@ -21417,7 +21424,7 @@ async fn a_row_that_references_only_itself_can_be_deleted() {
         })
         .expect("the plan deletes `loop`");
     let stmt = pg
-        .emit(&doomed.change, doomed.strategy)
+        .legacy_emit(&doomed.change, doomed.strategy)
         .expect("emit")
         .remove(0);
     let refusal = conn
@@ -21592,7 +21599,7 @@ async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans
         })
         .expect("the delete");
     let stmt = pg
-        .emit(&delete.change, delete.strategy)
+        .legacy_emit(&delete.change, delete.strategy)
         .expect("emit")
         .remove(0);
     let aborted = conn
@@ -21736,7 +21743,7 @@ async fn a_trigger_that_respells_the_written_key_rolls_the_statement_back() {
     assert_eq!(cs.changes.len(), 1, "{cs:#?}");
     let pg = Postgres::new();
     let stmt = pg
-        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .legacy_emit(&cs.changes[0].change, cs.changes[0].strategy)
         .expect("emit")
         .remove(0);
 
@@ -21860,7 +21867,7 @@ async fn a_referencing_relation_is_counted_only_where_its_key_reaches() {
     // And the engine agrees, which is what makes the count right rather than
     // merely smaller.
     let stmt = pg
-        .emit(&cs.changes[0].change, cs.changes[0].strategy)
+        .legacy_emit(&cs.changes[0].change, cs.changes[0].strategy)
         .expect("emit")
         .remove(0);
     conn.execute(&stmt.sql).await.expect("the delete");
@@ -21907,7 +21914,7 @@ async fn a_referencing_relation_is_counted_only_where_its_key_reaches() {
         count.sql
     );
     let stmt = pg
-        .emit(&doomed.change, doomed.strategy)
+        .legacy_emit(&doomed.change, doomed.strategy)
         .expect("emit")
         .remove(0);
     let refusal = conn
@@ -22975,7 +22982,7 @@ async fn narrowing_projection_verdict(db: &mut Conn, cs: &pbps_model::ChangeSet)
     db.execute("BEGIN").await.unwrap();
     let mut error = None;
     'changes: for p in &cs.changes {
-        for sql in Postgres::new().emit(&p.change, p.strategy).unwrap() {
+        for sql in Postgres::new().legacy_emit(&p.change, p.strategy).unwrap() {
             if let Err(e) = db.execute(&sql.sql).await {
                 error = Some(sqlstate(&e).to_owned());
                 break 'changes;
@@ -27046,7 +27053,7 @@ async fn planned_key_collation_guards_match_the_engine_for_every_collation_pair(
                 probe.sql
             );
             let sql = &Postgres::new()
-                .emit(&cs.changes[0].change, Strategy::default())
+                .legacy_emit(&cs.changes[0].change, Strategy::default())
                 .unwrap()[0]
                 .sql;
             let result = conn.execute(sql).await;
@@ -27843,7 +27850,7 @@ async fn every_grant_the_emitter_writes_is_one_this_engine_runs() {
                 permissions: permissions.clone(),
             },
         ] {
-            for stmt in pg.emit(&change, Strategy::default()).expect("emit") {
+            for stmt in pg.legacy_emit(&change, Strategy::default()).expect("emit") {
                 db.conn
                     .execute(&stmt.sql)
                     .await
@@ -27930,7 +27937,7 @@ async fn a_bare_name_in_both_namespaces_grants_in_the_one_its_permissions_name()
             target: spelled.parse::<GrantTarget>().expect("a grant target"),
             permissions: [permission].into_iter().collect(),
         };
-        for stmt in pg.emit(&change, Strategy::default()).expect("emit") {
+        for stmt in pg.legacy_emit(&change, Strategy::default()).expect("emit") {
             db.conn
                 .execute(&stmt.sql)
                 .await
@@ -29422,7 +29429,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
     // numbers are about something real.
     let pg = Postgres::new();
     for change in &changes {
-        let statements = pg.emit(change, Strategy::default()).expect("emit");
+        let statements = pg.legacy_emit(change, Strategy::default()).expect("emit");
         let mut refused = None;
         for stmt in &statements {
             if let Err(e) = conn.execute(&stmt.sql).await {
@@ -29454,7 +29461,7 @@ async fn preflight_probes_count_the_rows_this_engine_would_refuse() {
     }
     // And now every statement runs, which is what makes a zero mean something.
     for change in &changes {
-        for stmt in pg.emit(change, Strategy::default()).expect("emit") {
+        for stmt in pg.legacy_emit(change, Strategy::default()).expect("emit") {
             conn.execute(&stmt.sql)
                 .await
                 .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
@@ -29557,10 +29564,15 @@ async fn a_key_into_a_created_empty_parent_counts_every_reference_the_child_hold
 
     // The engine's own verdict on the same statements.
     let pg = Postgres::new();
-    for stmt in pg.emit(&changes[0], Strategy::default()).expect("emit") {
+    for stmt in pg
+        .legacy_emit(&changes[0], Strategy::default())
+        .expect("emit")
+    {
         conn.execute(&stmt.sql).await.expect("create the parent");
     }
-    let statements = pg.emit(&changes[1], Strategy::default()).expect("emit");
+    let statements = pg
+        .legacy_emit(&changes[1], Strategy::default())
+        .expect("emit");
     let mut refused = None;
     for stmt in &statements {
         if let Err(e) = conn.execute(&stmt.sql).await {
@@ -29671,7 +29683,7 @@ async fn nulls_are_distinct_under_this_engines_unique_and_the_count_says_so() {
     // something: a partly-NULL tuple is not a duplicate of another one.
     let pg = Postgres::new();
     for change in [&single, &composite] {
-        for stmt in pg.emit(change, Strategy::default()).expect("emit") {
+        for stmt in pg.legacy_emit(change, Strategy::default()).expect("emit") {
             conn.execute(&stmt.sql)
                 .await
                 .unwrap_or_else(|e| panic!("the engine rejected:\n{}\n{e}", stmt.sql));
@@ -29966,7 +29978,7 @@ async fn a_plan_that_supplies_the_parent_row_first_is_not_refused_for_its_absenc
     let pg = Postgres::new();
     let key = &alone.changes[0];
     let refusal = conn
-        .execute(&pg.emit(&key.change, key.strategy).expect("emit")[0].sql)
+        .execute(&pg.legacy_emit(&key.change, key.strategy).expect("emit")[0].sql)
         .await
         .expect_err("and the engine refuses the key");
     assert_eq!(sqlstate(&refusal), "23503", "{refusal:?}");
@@ -30058,7 +30070,7 @@ async fn an_orphan_is_counted_under_the_referenced_columns_own_collation() {
 
     let pg = Postgres::new();
     let refusal = conn
-        .execute(&pg.emit(&key, Strategy::default()).expect("emit")[0].sql)
+        .execute(&pg.legacy_emit(&key, Strategy::default()).expect("emit")[0].sql)
         .await
         .expect_err("the engine refuses the key over that row");
     assert_eq!(sqlstate(&refusal), "23503", "{refusal:?}");
@@ -30068,7 +30080,7 @@ async fn an_orphan_is_counted_under_the_referenced_columns_own_collation() {
         .await
         .expect("delete the orphan");
     assert_eq!(one(&counts(&mut conn, &cs).await, "no matching parent"), 0);
-    conn.execute(&pg.emit(&key, Strategy::default()).expect("emit")[0].sql)
+    conn.execute(&pg.legacy_emit(&key, Strategy::default()).expect("emit")[0].sql)
         .await
         .expect("the engine takes the key once the row the probe named is gone");
 
@@ -31472,7 +31484,7 @@ async fn the_estimate_says_what_the_engine_does_about_rebuilding_the_table() {
             };
             let ours = one_estimate(&change, Strategy::default()).expect("an estimate");
             for statement in Postgres::new()
-                .emit(&change, Strategy::default())
+                .legacy_emit(&change, Strategy::default())
                 .expect("emit")
             {
                 conn.execute(&statement.sql).await.expect("add the column");
@@ -31971,7 +31983,9 @@ async fn nullability_folded_into_widening_keeps_unparsed_check_uncertainty() {
     };
     let mut ours = one_estimate(&change, Strategy::default()).unwrap();
     against(&mut db, &mut ours).await.unwrap();
-    let sql = Postgres::new().emit(&change, Strategy::default()).unwrap();
+    let sql = Postgres::new()
+        .legacy_emit(&change, Strategy::default())
+        .unwrap();
     assert_eq!(sql.len(), 1);
     let measured = nullability_scan(&mut db, &TableName::new("public", "t"), &sql[0].sql).await;
     db.drop().await;
@@ -32110,7 +32124,7 @@ async fn nullability_estimates_use_only_checks_surviving_to_the_statement() {
         let mut measured = None;
         for (i, p) in cs.changes.iter().enumerate() {
             if i == tighten {
-                let sql = Postgres::new().emit(&p.change, p.strategy).unwrap();
+                let sql = Postgres::new().legacy_emit(&p.change, p.strategy).unwrap();
                 assert_eq!(sql.len(), 1);
                 measured = Some(nullability_scan(&mut db, &target, &sql[0].sql).await);
             } else {
@@ -33385,7 +33399,7 @@ async fn a_key_between_two_created_tables_is_compared_as_the_engine_compares_it(
         let mut refused = None;
         for change in &cs.changes {
             for stmt in Postgres::new()
-                .emit(&change.change, change.strategy)
+                .legacy_emit(&change.change, change.strategy)
                 .expect("emit")
             {
                 if let Err(e) = conn.execute(&stmt.sql).await {
@@ -35000,7 +35014,7 @@ async fn concurrent_build_recovery_preserves_existing_objects_and_quotes_its_own
     db.execute("CREATE SCHEMA app; CREATE TABLE app.t(id integer); CREATE TABLE app.u(id integer); INSERT INTO app.t VALUES (1),(1); INSERT INTO app.u VALUES (2),(2)").await.unwrap();
     let emitted = |name: &str, unique: bool, online: bool| {
         Postgres::new()
-            .emit(
+            .legacy_emit(
                 &Change::AddIndex {
                     table: TableName::new("app", "t"),
                     name: name.into(),
@@ -35818,7 +35832,10 @@ async fn doctor_execute_change(
     conn: &mut Conn,
     change: &pbps_model::Change,
 ) -> Result<(), DbError> {
-    for statement in Postgres::new().emit(change, Default::default()).unwrap() {
+    for statement in Postgres::new()
+        .legacy_emit(change, Default::default())
+        .unwrap()
+    {
         conn.execute(&statement.sql).await?;
     }
     Ok(())

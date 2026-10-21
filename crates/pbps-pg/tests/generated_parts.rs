@@ -162,7 +162,7 @@ fn generated_creation_parts_provide_columns_before_rows_and_preserve_stored_valu
         let sql = cs
             .changes
             .iter()
-            .flat_map(|p| pg.emit(&p.change, p.strategy).unwrap())
+            .flat_map(|p| pg.legacy_emit(&p.change, p.strategy).unwrap())
             .map(|s| s.sql)
             .collect::<Vec<_>>()
             .join("\n");
@@ -239,7 +239,7 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
         .unwrap();
     assert!(!index.strategy.online);
     assert!(
-        !pg.emit(&index.change, index.strategy)
+        !pg.legacy_emit(&index.change, index.strategy)
             .unwrap()
             .iter()
             .any(|s| s.sql.contains("CONCURRENTLY"))
@@ -260,7 +260,7 @@ fn indexes_split_from_a_new_generated_table_remain_transactional_with_an_online_
         .is_none()
     );
     assert!(
-        pg.emit(&standing.change, standing.strategy)
+        pg.legacy_emit(&standing.change, standing.strategy)
             .unwrap()
             .iter()
             .any(|s| s.sql.contains("CONCURRENTLY"))
@@ -523,7 +523,9 @@ fn a_prefix_generation_reading_a_removed_column_requires_the_full_creation_shape
     assert!(
         matches!(&parts[1], Change::AlterColumnExpression { column, to, .. } if column.name.raw() == "g" && to == "app.f(id)")
     );
-    let sql = Postgres::new().emit(&parts[0], Default::default()).unwrap();
+    let sql = Postgres::new()
+        .legacy_emit(&parts[0], Default::default())
+        .unwrap();
     assert!(sql.iter().any(|s| s.sql.contains("b * 2")));
     assert!(!sql.iter().any(|s| s.sql.contains("app.f(id)")));
 }

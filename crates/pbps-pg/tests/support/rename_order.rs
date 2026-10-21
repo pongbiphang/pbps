@@ -214,7 +214,7 @@ async fn rename_dependencies_execute_with_their_statement_time_names() {
         db.conn.execute("BEGIN").await.unwrap();
         let blockers = physical_sources::reports(&mut db.conn, &replay).await;
         for p in &replay.changes {
-            for stmt in pg.emit(&p.change, p.strategy).unwrap() {
+            for stmt in pg.legacy_emit(&p.change, p.strategy).unwrap() {
                 sql.push(stmt.sql.clone());
                 if let Err(error) = db.conn.execute(&stmt.sql).await {
                     failure = Some((error.server_error_code(), error.to_string()));

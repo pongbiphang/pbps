@@ -1,18 +1,21 @@
 //! Lowering: an operation becomes its statements, with what the emitter
 //! already knows about running them (#1776 slice S1a, DEC-1961.1).
 //!
-//! [`Dialect::emit`] works one change at a time, so lowering an
-//! [`Operation`] is a regrouping, not a second emitter: it is `emit` on the
-//! operation's own change, and every fact about a statement is the one the
-//! emitter wrote on it. How a statement runs depends on more than its change
-//! — whether an index is built concurrently depends on the strategy — and
-//! deriving it anywhere else would be a second copy of the emitter's rules
-//! that drifts from the first.
+//! Certified input is grouped without changing the emitter's statements or
+//! execution metadata. A second copy of the emitter's rules would drift from
+//! the first, so private probes return observations and lowering retains the
+//! real emitter's complete groups, original IDs and sources.
 
-use pbps_model::operation::{Operation, OperationId, Operations};
-use pbps_model::{Strategy, TableName};
+#[cfg(test)]
+use pbps_model::Strategy;
+use pbps_model::TableName;
+use pbps_model::operation::OperationId;
+#[cfg(test)]
+use pbps_model::operation::{Operation, Operations};
 
-use crate::{Dialect, DialectError, PlanDialect, Released, Statement};
+#[cfg(test)]
+use crate::Dialect;
+use crate::{DialectError, PlanDialect, Released, Statement};
 
 /// Whether a statement can run inside the plan's transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,12 +79,17 @@ pub struct Step<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lowered {
     operation: OperationId,
+    origin: pbps_model::operation::Origin,
     statements: Vec<Statement>,
 }
 
 impl Lowered {
     pub fn operation(&self) -> OperationId {
         self.operation
+    }
+
+    pub fn origin(&self) -> &pbps_model::operation::Origin {
+        &self.origin
     }
 
     pub fn statements(&self) -> &[Statement] {
@@ -134,111 +142,169 @@ fn intermediate<'s, A: PartialEq + 's>(renames: impl Iterator<Item = &'s [(A, A)
         .collect()
 }
 
+/// An observation of private emitter output, without an execution authority.
+pub fn intermediate_tables(statements: &[Statement]) -> Vec<TableName> {
+    intermediate(statements.iter().map(|s| s.renames.as_slice()))
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
 /// The statements of one operation, as the dialect emits its change under
 /// `strategy`.
-pub fn lower(
+#[cfg(test)]
+fn legacy_lower(
     operation: &Operation,
     strategy: Strategy,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<Lowered, DialectError> {
     Ok(Lowered {
         operation: operation.id(),
-        statements: dialect.emit(operation.change(), strategy)?,
+        origin: operation.origin().clone(),
+        statements: dialect.legacy_emit(operation.change(), strategy)?,
     })
 }
 
 /// Every operation lowered in order, each under the strategy its own planned
 /// change carries.
-pub fn lower_all(
+#[cfg(test)]
+fn legacy_lower_all(
     operations: &Operations,
     dialect: &(impl Dialect + ?Sized),
 ) -> Result<Vec<Lowered>, DialectError> {
     operations
         .iter()
-        .map(|op| lower(op, op.planned().strategy, dialect))
+        .map(|op| legacy_lower(op, op.planned().strategy, dialect))
         .collect()
 }
 
-/// A complete sequence of statements tied to the engine's associated plan
-/// input. Construction stays here; a caller cannot replace or permute it.
-#[derive(Debug, Clone)]
-pub struct LoweredPlan<P: ?Sized> {
-    statements: Vec<Statement>,
-    input: std::marker::PhantomData<fn(&P)>,
+/// A pure emitter whose associated input is selected by its implementation.
+/// The resulting collection is branded by this emitter, so a caller-defined
+/// emitter or scratch engine cannot manufacture a real engine's lowered plan.
+pub trait Lowering: Sized {
+    type Input: crate::PlanPayload + ?Sized;
+    fn emit_position(
+        &self,
+        input: &Self::Input,
+        position: usize,
+    ) -> Result<Vec<Statement>, DialectError>;
+}
+impl<D: PlanDialect> Lowering for D
+where
+    D::Plan: crate::PlanPayload,
+{
+    type Input = D::Plan;
+    fn emit_position(
+        &self,
+        input: &Self::Input,
+        position: usize,
+    ) -> Result<Vec<Statement>, DialectError> {
+        match crate::PlanPayload::mode(input) {
+            pbps_model::PlanMode::Transactional => self.emit(input, position),
+            pbps_model::PlanMode::Staged => self.emit_staged(input, position),
+        }
+    }
 }
 
-impl<P: ?Sized> std::ops::Deref for LoweredPlan<P> {
+/// Immutable operation groups and their statement sequence, branded by the
+/// actual emitter. Construction requires a concrete emitter: a trait object
+/// cannot erase the engine brand. There is no public constructor, raw conversion or mutable
+/// view. Cloning a read-only observation cannot replace this authority.
+///
+/// ```compile_fail
+/// fn edit<E: ?Sized>(plan: &mut pbps_dialect::lower::LoweredPlan<E>) {
+///     plan.reverse();
+/// }
+/// ```
+/// ```compile_fail
+/// fn forge<E: ?Sized>() -> pbps_dialect::lower::LoweredPlan<E> {
+///     pbps_dialect::lower::LoweredPlan::default()
+/// }
+/// ```
+#[derive(Debug)]
+pub struct LoweredPlan<E: ?Sized> {
+    groups: Vec<Lowered>,
+    statements: Vec<Statement>,
+    emitter: std::marker::PhantomData<fn(&E) -> &E>,
+}
+impl<E: ?Sized> Clone for LoweredPlan<E> {
+    fn clone(&self) -> Self {
+        Self {
+            groups: self.groups.clone(),
+            statements: self.statements.clone(),
+            emitter: std::marker::PhantomData,
+        }
+    }
+}
+impl<E: ?Sized> std::ops::Deref for LoweredPlan<E> {
     type Target = [Statement];
     fn deref(&self) -> &[Statement] {
         &self.statements
     }
 }
-impl<'a, P: ?Sized> IntoIterator for &'a LoweredPlan<P> {
+impl<'a, E: ?Sized> IntoIterator for &'a LoweredPlan<E> {
     type Item = &'a Statement;
     type IntoIter = std::slice::Iter<'a, Statement>;
     fn into_iter(self) -> Self::IntoIter {
         self.statements.iter()
     }
 }
-
-impl<P: ?Sized> LoweredPlan<P> {
+impl<E: ?Sized> LoweredPlan<E> {
     pub fn statements(&self) -> &[Statement] {
         &self.statements
     }
+    pub fn groups(&self) -> &[Lowered] {
+        &self.groups
+    }
 }
 
-/// One certified position, preserving the operation's statement group.
-pub fn lower_ordered<D: PlanDialect + ?Sized>(
-    plan: &D::Plan,
+/// One position of the associated certified input, preserving its original
+/// operation ID, source and indivisible statement group.
+pub fn lower<E: Lowering>(
+    plan: &E::Input,
     position: usize,
-    dialect: &D,
-) -> Result<Lowered, DialectError>
-where
-    D::Plan: crate::PlanPayload,
-{
-    let operations = Operations::of_plan(
-        &crate::PlanPayload::changes(plan).changes,
-        pbps_model::operation::ModuleEdits::InPlace,
-    );
+    emitter: &E,
+) -> Result<Lowered, DialectError> {
+    let operations = crate::PlanPayload::operations(plan);
+    let operation = &operations.as_slice()[position];
     Ok(Lowered {
-        operation: operations
-            .iter()
-            .nth(position)
-            .expect("a position of this plan")
-            .id(),
-        statements: dialect.emit_ordered(plan, position)?,
+        operation: operation.id(),
+        origin: operation.origin().clone(),
+        statements: emitter.emit_position(plan, position)?,
     })
 }
 
-/// The whole certified sequence, in its execution mode. The generic input
-/// brand prevents a mock dialect's local fixture view reaching a real engine.
+/// The whole associated input lowered in order. Every operation, including a
+/// zero-statement operation, retains its group and original source mapping.
 /// A caller cannot replace the mode bound to that input:
 ///
 /// ```compile_fail
-/// fn override_mode<D: pbps_dialect::PlanDialect + ?Sized>(plan: &D::Plan, dialect: &D)
-/// where D::Plan: pbps_dialect::PlanPayload {
-///     let _ = pbps_dialect::lower::lower_plan(
-///         plan, dialect, pbps_model::PlanMode::Staged,
+/// fn override_mode<E: pbps_dialect::lower::Lowering>(plan: &E::Input, emitter: &E) {
+///     let _ = pbps_dialect::lower::lower_all(
+///         plan, emitter, pbps_model::PlanMode::Staged,
 ///     );
 /// }
 /// ```
-pub fn lower_plan<D: PlanDialect + ?Sized>(
-    plan: &D::Plan,
-    dialect: &D,
-) -> Result<LoweredPlan<D::Plan>, DialectError>
-where
-    D::Plan: crate::PlanPayload,
-{
+pub fn lower_all<E: Lowering>(
+    plan: &E::Input,
+    emitter: &E,
+) -> Result<LoweredPlan<E>, DialectError> {
+    let operations = crate::PlanPayload::operations(plan);
+    let mut groups = Vec::with_capacity(operations.len());
     let mut statements = Vec::new();
-    for position in 0..crate::PlanPayload::changes(plan).changes.len() {
-        statements.extend(match crate::PlanPayload::mode(plan) {
-            pbps_model::PlanMode::Transactional => dialect.emit_ordered(plan, position)?,
-            pbps_model::PlanMode::Staged => dialect.emit_staged_ordered(plan, position)?,
-        });
+    for (position, operation) in operations.iter().enumerate() {
+        let group = Lowered {
+            operation: operation.id(),
+            origin: operation.origin().clone(),
+            statements: emitter.emit_position(plan, position)?,
+        };
+        statements.extend(group.statements.iter().cloned());
+        groups.push(group);
     }
     Ok(LoweredPlan {
+        groups,
         statements,
-        input: std::marker::PhantomData,
+        emitter: std::marker::PhantomData,
     })
 }
 
@@ -260,7 +326,7 @@ mod tests {
         // A fixture: every change it has no shape for writes one plain
         // statement, which is all these tests read.
         #[allow(clippy::wildcard_enum_match_arm)]
-        fn emit(
+        fn legacy_emit(
             &self,
             change: &Change,
             strategy: Strategy,
@@ -341,7 +407,7 @@ mod tests {
             &[rename("app.a", "dst.b"), rename("app.c", "app.d")],
             ModuleEdits::InPlace,
         );
-        let lowered = lower_all(&ops, &Parking).unwrap();
+        let lowered = legacy_lower_all(&ops, &Parking).unwrap();
         assert_eq!(lowered[0].intermediate_tables(), [&t("dst.a")]);
         // The renames' endpoints are not intermediate: the source and the
         // target are the baseline's and the plan's.
@@ -357,7 +423,7 @@ mod tests {
             })],
             ModuleEdits::InPlace,
         );
-        let role = lower_all(&role, &Parking).unwrap();
+        let role = legacy_lower_all(&role, &Parking).unwrap();
         assert_eq!(
             role[0].intermediate_roles(),
             [&pbps_model::RoleName::from("parked")]
@@ -388,7 +454,7 @@ mod tests {
             ],
             ModuleEdits::InPlace,
         );
-        let lowered = lower_all(&ops, &Parking).unwrap();
+        let lowered = legacy_lower_all(&ops, &Parking).unwrap();
         let steps: Vec<(String, Execution)> = lowered
             .iter()
             .flat_map(Lowered::steps)
@@ -418,7 +484,7 @@ mod tests {
             [(0, &Released::Module(id))]
         );
         assert_eq!(
-            lower(&ops.as_slice()[2], Strategy::default(), &Parking)
+            legacy_lower(&ops.as_slice()[2], Strategy::default(), &Parking)
                 .unwrap()
                 .steps()
                 .map(|s| s.execution)

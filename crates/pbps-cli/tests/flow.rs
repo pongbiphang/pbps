@@ -14138,7 +14138,11 @@ fn roles_holding_each_other_are_dropped_parent_first_through_a_connected_plan() 
         changes
             .changes
             .iter()
-            .flat_map(|p| pbps_mssql::Mssql.emit(&p.change, p.strategy).unwrap())
+            .flat_map(|p| {
+                pbps_mssql::Mssql
+                    .legacy_emit(&p.change, p.strategy)
+                    .unwrap()
+            })
             .map(|statement| statement.sql)
             .collect::<Vec<_>>()
     };

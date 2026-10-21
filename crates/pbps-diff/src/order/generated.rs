@@ -444,30 +444,6 @@ pub fn risks(
         .collect()
 }
 
-/// Transitional scratch draft adapter, removed when PR5b migrates the
-/// source-mapped blueprint. It grants no plan/emission certificate.
-#[doc(hidden)]
-pub fn legacy_expand(
-    cs: &mut ChangeSet,
-    ids: &IdsFile,
-    deps: &ModuleDeps,
-    dialect: &(impl Dialect + ?Sized),
-) -> Result<usize, String> {
-    let mut expanded = Vec::new();
-    let mut added = 0;
-    for p in &cs.changes {
-        match parts(p, ids, &cs.changes, deps, dialect)? {
-            Some(parts) => {
-                added += parts.len() - 1;
-                expanded.extend(parts);
-            }
-            None => expanded.push(p.clone()),
-        }
-    }
-    cs.changes = expanded;
-    Ok(added)
-}
-
 /// The same generated-part expansion, retaining each part's logical source.
 pub fn expand(
     plan: &mut super::PlanningPlan,
@@ -795,29 +771,6 @@ pub fn constraints(
         edge(&mut out, provider, consumer);
     }
     out.constraints().iter().cloned().collect()
-}
-
-/// Transitional counterpart of legacy_expand for the existing scratch route.
-#[doc(hidden)]
-pub fn legacy_settle(
-    cs: &mut ChangeSet,
-    declared: &Schema,
-    deps: &ModuleDeps,
-    dialect: &(impl Dialect + ?Sized),
-) -> Result<(), String> {
-    let edges = constraints(cs, declared, deps, dialect);
-    if edges.is_empty() {
-        return Ok(());
-    }
-    let mut schedule = Schedule::new(cs.changes.len());
-    for c in edges {
-        schedule.edge(c.before, c.after, c.source, c.reason);
-    }
-    let settled = schedule
-        .settle_raw(cs.clone())
-        .map_err(|r| r.describe(cs))?;
-    *cs = settled.changes;
-    Ok(())
 }
 
 /// The generated schedule consumes and returns only an owned intermediate.

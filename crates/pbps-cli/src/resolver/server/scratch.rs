@@ -555,7 +555,7 @@ mod tests {
         let provenance = Provenance::server();
         for disagrees in [false, true] {
             let binding = BindingRequest {
-                bootstrap: &[],
+                bootstrap: &pbps_diff::order::propose(pbps_model::ChangeSet::default()),
                 base: if disagrees { &different } else { &schema },
                 desired: &schema,
             };

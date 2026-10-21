@@ -12,8 +12,8 @@ use super::super::BindingRequest;
 use pbps_db::fingerprint::FingerprintKey;
 use pbps_model::resolver::Surface;
 use pbps_model::{
-    Change, CheckConstraint, Column, Hints, IdsFile, Index, IndexColumn, IndexKey, Module,
-    ModuleKind, Schema, Table,
+    CheckConstraint, Column, Hints, IdsFile, Index, IndexColumn, IndexKey, Module, ModuleKind,
+    Schema, Table,
 };
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -197,7 +197,7 @@ pub(crate) struct Inputs {
     desired: Schema,
     base_ids: IdsFile,
     desired_ids: IdsFile,
-    bootstrap: Vec<Change>,
+    bootstrap: pbps_diff::order::PlanningPlan,
     pub(crate) hints: Hints,
 }
 
@@ -223,12 +223,7 @@ impl Inputs {
             &dialect,
             &Hints::default(),
         )
-        .unwrap()
-        .changes
-        .clone()
-        .into_iter()
-        .map(|planned| planned.change)
-        .collect();
+        .unwrap();
         Self {
             base,
             desired,

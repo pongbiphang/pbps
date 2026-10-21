@@ -1,5 +1,6 @@
 use pbps_db::{Conn, Driver};
 use pbps_dialect::Dialect;
+use pbps_dialect::PlanDialect;
 use pbps_model::{
     Change, ChangeSet, ColumnRef, ForeignKey, IdsFile, PlannedChange, TableName, Uid, UidKind,
 };
@@ -608,7 +609,14 @@ async fn policy_owner_drop_releases_column(conn: &mut Conn) {
         .unwrap();
     for step in &changes.changes {
         for statement in pbps_pg::Postgres::new()
-            .emit(&step.change, Default::default())
+            .emit(
+                &pbps_diff::order::singleton(
+                    step.clone(),
+                    pbps_model::PlanMode::Transactional,
+                    &pbps_pg::Postgres::new(),
+                ),
+                0,
+            )
             .unwrap()
         {
             conn.execute(&statement.sql).await.unwrap();
@@ -776,7 +784,14 @@ async fn policy_owner_teardowns(conn: &mut Conn) {
             );
             assert!(matches!(&plan.changes[0].change, Change::DropTable { .. }));
             for step in &plan.changes {
-                for statement in pbps_pg::Postgres::new().emit(&step.change, Default::default())? {
+                for statement in pbps_pg::Postgres::new().emit(
+                    &pbps_diff::order::singleton(
+                        step.clone(),
+                        pbps_model::PlanMode::Transactional,
+                        &pbps_pg::Postgres::new(),
+                    ),
+                    0,
+                )? {
                     conn.execute(&statement.sql).await?;
                 }
             }

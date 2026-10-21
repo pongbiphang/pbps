@@ -27,7 +27,7 @@ async fn rolled_back(conn: &mut Conn, cs: &ChangeSet) -> Result<(), String> {
         .unwrap();
     let mut result = Ok(());
     'plan: for p in &cs.changes {
-        for statement in Mssql.emit(&p.change, p.strategy).unwrap() {
+        for statement in Mssql.legacy_emit(&p.change, p.strategy).unwrap() {
             if let Err(error) = conn.execute(&statement.sql).await {
                 result = Err(format!("{}\n{error}", statement.sql));
                 break 'plan;

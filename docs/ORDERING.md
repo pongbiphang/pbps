@@ -23,9 +23,15 @@ each existing settlement records its own edges, without a constraint union.
 `OrderedPlan` has a private constructor and no public downgrade or generic
 empty-schedule finalizer (DEC-1959.5).
 
-S7 PR5a establishes this producer boundary. The existing scratch/lowering route
-moves in PR5b; artifact/apply migration and deletion of transitional raw consumer
-entries follow in PR5c. Only the completed family establishes end-to-end compiler
+S7 PR5a establishes this producer boundary. PR5b settles an engine-owned,
+SQL-free scratch blueprint before lowering. Function/phase compatibility and
+generated constraints retain their separate settlements. The real engine's
+opaque associated input prevents a caller-defined engine from manufacturing
+its scratch result. LoweredPlan keeps immutable operation groups, source IDs
+and statements and is branded by the emitter, so a mock emitter cannot supply
+a real engine's executable collection. Planning probes return metadata only.
+Artifact/apply migration and deletion of named legacy raw consumer entries
+follow in PR5c. Only the completed family establishes end-to-end compiler
 enforcement. Loaded artifacts use the separate checked `AdmittedPlan` trust
 contract, never a claim that admission ordered them. The release verifier stays
 off, and no rank, tie-break or ordering pass is added.

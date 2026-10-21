@@ -1476,7 +1476,7 @@ mod tests {
             use pbps_dialect::Dialect;
             plan.changes
                 .iter()
-                .flat_map(|p| sql_server.emit(&p.change, p.strategy).unwrap())
+                .flat_map(|p| sql_server.legacy_emit(&p.change, p.strategy).unwrap())
                 .map(|s| s.sql)
                 .collect::<Vec<_>>()
         };
@@ -1569,7 +1569,11 @@ mod tests {
                     changes
                         .changes
                         .iter()
-                        .flat_map(|p| pbps_mssql::Mssql.emit(&p.change, p.strategy).unwrap())
+                        .flat_map(|p| {
+                            pbps_mssql::Mssql
+                                .legacy_emit(&p.change, p.strategy)
+                                .unwrap()
+                        })
                         .map(|s| s.sql)
                         .collect::<Vec<_>>()
                 };

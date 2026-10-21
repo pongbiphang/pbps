@@ -250,7 +250,7 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
                 assert_owner(&cs, transition.is_none() || if rebuild_first { detach } else { !detach });
                 crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.unwrap();
                 for p in &cs.changes {
-                    for statement in pg.emit(&p.change, p.strategy).unwrap() {
+                    for statement in pg.legacy_emit(&p.change, p.strategy).unwrap() {
                         conn.execute(&statement.sql).await.unwrap();
                     }
                 }
@@ -281,7 +281,7 @@ fn connected_weaving_executes_defaults_around_both_sides_of_each_ownership_trans
         assert_parent_release(&cs);
         crate::engine::check_module_dependents(&mut conn, &cs, &before, &after_ids, &before_ids).await.unwrap();
         for p in &cs.changes {
-            for statement in pg.emit(&p.change, p.strategy).unwrap() {
+            for statement in pg.legacy_emit(&p.change, p.strategy).unwrap() {
                 conn.execute(&statement.sql).await.unwrap();
             }
         }
@@ -509,7 +509,7 @@ async fn inherited_scope_case(rebuild_first: bool, conflicting_function: bool) {
         .await
         .unwrap();
     for p in &cs.changes {
-        for statement in pg.emit(&p.change, p.strategy).unwrap() {
+        for statement in pg.legacy_emit(&p.change, p.strategy).unwrap() {
             conn.execute(&statement.sql)
                 .await
                 .unwrap_or_else(|e| panic!("{e}\n{:?}\n{}", p.change, statement.sql));

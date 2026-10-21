@@ -58,6 +58,7 @@ pub(crate) mod roles;
 pub mod row_security;
 mod saved;
 pub mod schedule;
+pub mod scratch;
 pub mod shadow;
 pub mod slots;
 pub mod verify;
