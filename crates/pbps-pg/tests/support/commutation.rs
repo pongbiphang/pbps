@@ -1377,7 +1377,7 @@ impl Engine for Pg {
         "pg"
     }
 
-    fn dialect(&self) -> &dyn Dialect {
+    fn dialect(&self) -> &dyn Dialect<Plan = dyn pbps_diff::order::PlanView> {
         &self.0
     }
 

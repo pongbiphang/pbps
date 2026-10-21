@@ -33,7 +33,7 @@ pub fn case<'a>(
     base: pbps_diff::Side<'_>,
     desired: pbps_diff::Side<'_>,
     ordinary: &pbps_model::ChangeSet,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> Case<'a> {
     let Some(selection) = selection else {
         return Case::Fallback;

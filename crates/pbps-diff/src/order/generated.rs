@@ -164,7 +164,7 @@ fn modules(changes: &[PlannedChange]) -> Vec<ModuleStep<'_>> {
 fn module_dependencies(
     modules: &[ModuleStep<'_>],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Vec<(usize, usize)> {
     let mut edges = Vec::new();
     for (i, id, module) in modules {
@@ -193,7 +193,7 @@ pub fn parts(
     ids: &IdsFile,
     changes: &[PlannedChange],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Option<Vec<PlannedChange>>, String> {
     let functions = functions(changes);
     // A reader can be behind any number of callees. Walk the very edges
@@ -267,7 +267,11 @@ pub fn parts(
 /// Derive creation-part risks from typed ownership, never diagnostic provenance.
 /// Generated-column installations identify this family after serialization;
 /// an earlier CREATE of that identity proves its context (DEC-1503.3).
-pub fn risks(cs: &ChangeSet, ids: &IdsFile, dialect: &dyn Dialect) -> Vec<BTreeSet<RiskClass>> {
+pub fn risks(
+    cs: &ChangeSet,
+    ids: &IdsFile,
+    dialect: &(impl Dialect + ?Sized),
+) -> Vec<BTreeSet<RiskClass>> {
     use pbps_model::plan_names::{At, Holder, PlanNames};
 
     let names = cs
@@ -396,7 +400,7 @@ pub fn expand(
     cs: &mut ChangeSet,
     ids: &IdsFile,
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<usize, String> {
     let mut expanded = Vec::new();
     let mut added = 0;
@@ -533,7 +537,7 @@ pub fn constraints(
     cs: &ChangeSet,
     declared: &Schema,
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Vec<Constraint> {
     let mut out = Schedule::new(cs.changes.len());
     let edge = |out: &mut Schedule, a, b| {
@@ -710,7 +714,7 @@ pub fn settle(
     cs: &mut ChangeSet,
     declared: &Schema,
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<(), String> {
     let edges = constraints(cs, declared, deps, dialect);
     if edges.is_empty() {

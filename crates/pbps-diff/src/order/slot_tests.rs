@@ -25,6 +25,7 @@ struct Slotted {
 }
 
 impl Dialect for Slotted {
+    type Plan = ();
     fn declares_a_constraint(&self, module: &pbps_model::Module) -> bool {
         module.kind == pbps_model::ModuleKind::Trigger && module.definition == "CONSTRAINT"
     }
@@ -194,7 +195,7 @@ impl Plan {
     fn run(
         &self,
         order: &[usize],
-        dialect: &dyn Dialect,
+        dialect: &(impl Dialect + ?Sized),
         facts: Option<&CatalogFacts>,
     ) -> (Vec<SlotViolation>, Vec<Skipped>, usize) {
         let logical = Operations::of_plan(&self.logical, ModuleEdits::InPlace);
@@ -230,7 +231,7 @@ impl Plan {
 impl Plan {
     /// The handover edges over the plan in its own order, the catalog's
     /// occupants included as holders (#1957).
-    fn handovers(&self, dialect: &dyn Dialect, facts: &CatalogFacts) -> Vec<SlotEdge> {
+    fn handovers(&self, dialect: &(impl Dialect + ?Sized), facts: &CatalogFacts) -> Vec<SlotEdge> {
         let logical = Operations::of_plan(&self.logical, ModuleEdits::InPlace);
         let names = PlanNames::of(&self.logical, &self.after_ids).unwrap();
         let owners = PlanOwners::new(names, &self.before_ids, &self.after_ids);

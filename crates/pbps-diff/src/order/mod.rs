@@ -28,6 +28,7 @@ pub mod expand;
 pub mod generated;
 pub mod new_tables;
 pub mod parent_defaults;
+mod plan;
 mod rewrites;
 pub(crate) mod roles;
 pub mod row_security;
@@ -37,6 +38,7 @@ pub mod slots;
 pub mod verify;
 
 pub use edges::{Baseline, Because, Checks, Edge, Graph, Source, Unmet, graph};
+pub use plan::{OrderedPlan, PlanView};
 pub use rewrites::before_rewrites;
 pub use roles::role_drops;
 pub use schedule::{Constraint, Refusal, Schedule, Settled};

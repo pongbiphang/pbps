@@ -287,7 +287,12 @@ fn read_plan(path: &std::path::Path) -> anyhow::Result<SavedPlan> {
 /// A plan names its own engine (`SavedPlan::dialect`) precisely so a plan
 /// computed for one and applied to another is nonsense the file can catch;
 /// reading it here is the same check, made earlier and without a connection.
-fn dialect_of(plan: &SavedPlan) -> anyhow::Result<(pbps_db::Driver, Box<dyn Dialect>)> {
+fn dialect_of(
+    plan: &SavedPlan,
+) -> anyhow::Result<(
+    pbps_db::Driver,
+    Box<dyn Dialect<Plan = dyn pbps_diff::order::PlanView>>,
+)> {
     // Deserialize the shared name, so another configured dialect must receive
     // an answer in both exhaustive selectors (DECISIONS 417), including here.
     let name: pbps_config::DialectName =
@@ -302,7 +307,7 @@ fn dialect_of(plan: &SavedPlan) -> anyhow::Result<(pbps_db::Driver, Box<dyn Dial
 
 fn explain(
     plan: &SavedPlan,
-    dialect: &dyn Dialect,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
     path: &std::path::Path,
     target: &Resolved,
     env: Option<&str>,

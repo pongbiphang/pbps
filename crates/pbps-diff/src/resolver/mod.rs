@@ -88,7 +88,7 @@ pub struct Ordered {
 pub fn ordinary(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &pbps_model::Hints,
 ) -> Result<ChangeSet, Vec<crate::DiffError>> {
     crate::schema_diff::rebuilding_by(
@@ -115,7 +115,7 @@ pub fn plan(
     desired: crate::Side<'_>,
     hints: &pbps_model::Hints,
     resolution: &[SurfaceResolution],
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Ordered, Error> {
     plan_operations(base, desired, hints, resolution, dialect).map(|planned| planned.ordered)
 }
@@ -140,7 +140,7 @@ pub fn plan_operations(
     desired: crate::Side<'_>,
     hints: &pbps_model::Hints,
     resolution: &[SurfaceResolution],
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Planned, Error> {
     let (logical, prepared) = prepare(base, desired, hints, resolution, dialect)?;
     let module_edits = if dialect.rebuilds_modules() {
@@ -232,7 +232,7 @@ fn scheduled(
     declared: &pbps_model::ModuleDeps,
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Schedule {
     let (before, after) = (
         Snapshot {
@@ -299,7 +299,7 @@ fn order_logical(
     declared: &pbps_model::ModuleDeps,
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Ordered, Error> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, desired.ids)
         .map_err(|e| Error::Names(e.to_string()))?;
@@ -338,7 +338,7 @@ fn prepare(
     desired: crate::Side<'_>,
     hints: &pbps_model::Hints,
     resolution: &[SurfaceResolution],
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<(ChangeSet, prepare::Prepared), Error> {
     prepare::coverage(base, desired, resolution)?;
     let ordinary = ordinary(base, desired, dialect, hints)

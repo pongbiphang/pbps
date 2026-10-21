@@ -14,7 +14,10 @@ mod declaration_file;
 const NAME: &str = "name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 const SHOWN: &str = r"name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 
-fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnapshot) {
+fn artifacts(
+    text: &str,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+) -> (Schema, SavedPlan, StateSnapshot) {
     let view = ModuleId::Named(TableName::new("app", format!("view{text}")));
     let name = TableName::new("app", format!("routine{text}"));
     let (routine, definition) = if dialect.name() == "postgres" {
@@ -93,7 +96,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
 #[test]
 fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
     for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect,
+        &pbps_pg::Postgres::new() as &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
         &pbps_mssql::Mssql,
     ] {
         let (schema, mut plan, mut state) = artifacts(NAME, dialect);

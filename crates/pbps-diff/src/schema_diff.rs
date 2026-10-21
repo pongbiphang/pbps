@@ -402,7 +402,7 @@ struct Indexes<'a> {
 pub fn diff(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
 ) -> Result<ChangeSet, Vec<DiffError>> {
     diff_rebuilding(base, declared, dialect, hints, &BTreeSet::new())
@@ -425,7 +425,7 @@ pub fn diff(
 pub fn diff_rebuilding(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
 ) -> Result<ChangeSet, Vec<DiffError>> {
@@ -477,7 +477,7 @@ pub enum Screen {
 pub fn diff_read_back(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
     screen: Screen,
@@ -500,7 +500,7 @@ pub fn diff_read_back(
 pub fn diff_connected(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
 ) -> Result<ChangeSet, Vec<DiffError>> {
@@ -520,7 +520,7 @@ pub fn diff_connected(
 pub(crate) fn rebuilding_by(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
     rebinding: Rebinding,
@@ -559,7 +559,7 @@ pub(crate) fn rebuilding_by(
 pub fn diff_partial(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
 ) -> Diffed {
     diff_partial_rebuilding(
@@ -618,7 +618,7 @@ fn standing_default(
 pub(crate) fn diff_partial_rebuilding(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     also: &BTreeSet<ModuleId>,
     rebinding: Rebinding,
@@ -2086,7 +2086,7 @@ fn diff_columns(
     declared_table_name: &TableName,
     base_table: &Table,
     declared_table: &Table,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
     errs: &mut Vec<DiffError>,
 ) {
@@ -2941,7 +2941,7 @@ fn recreate_retyped_dependents(
     base: Side<'_>,
     declared: Side<'_>,
     renames: &Renames,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
 ) {
     let also = |dependents: &mut pbps_dialect::RetypeDependents,
@@ -3370,7 +3370,7 @@ fn detached_names(
     parent: &Table,
     partition: &Table,
     declared: &Table,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Vec<DetachedName>, Vec<String>> {
     let mut names = Vec::new();
     let mut what = Vec::new();
@@ -3591,7 +3591,7 @@ fn attached(
     table: &Table,
     declared: &Table,
     of: &pbps_model::PartitionOf,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     read_back: Option<&Schema>,
 ) -> Result<Attached, Vec<String>> {
     let mut what = Vec::new();
@@ -4799,7 +4799,7 @@ fn diff_partition_columns(
     base: Side<'_>,
     declared: Side<'_>,
     index: &Indexes<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
     errors: &mut Vec<DiffError>,
 ) {
@@ -4917,7 +4917,7 @@ fn diff_partition_columns(
 /// Keep the serial expression in the dialect, while the saved change keeps
 /// the same concrete fallback text as a plain default (DEC-2218.1).
 fn partition_default(
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     parent: &TableName,
     column: &ColumnName,
     declared: Option<&pbps_model::Column>,
@@ -4974,7 +4974,7 @@ fn change_in_words(change: &Change) -> String {
 fn refuse_computed_dependencies(
     base: &Schema,
     declared: &Schema,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     screen: Screen,
     changes: &[Change],
     errs: &mut Vec<DiffError>,
@@ -6281,7 +6281,7 @@ fn dependency_rank(
 fn diff_roles(
     base: Side<'_>,
     declared: Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
 ) {
     // Whether the *principal* is this tool's at all (ADR-0010 §3,
@@ -6650,7 +6650,7 @@ fn diff_roles(
 /// everything else.
 fn revoke_public_execution(
     base: &Schema,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     hints: &Hints,
     changes: &mut Vec<Change>,
 ) {
@@ -6736,7 +6736,7 @@ fn diff_modules(
     base: &Schema,
     declared: &Schema,
     changing_hands: &BTreeSet<TableName>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     changes: &mut Vec<Change>,
 ) {
     for (id, module) in &declared.modules {
@@ -7431,7 +7431,7 @@ mod tests {
     /// schema's relation namespace with tables at all
     /// (`Dialect::indexes_share_namespace_with_tables`, issue #176).
     fn run_with(
-        dialect: &dyn Dialect,
+        dialect: &(impl Dialect + ?Sized),
         base: &Schema,
         declared: &Schema,
         intents: &[Intent],
@@ -7462,6 +7462,7 @@ mod tests {
     struct Aliases;
 
     impl Dialect for Aliases {
+        type Plan = ();
         fn name(&self) -> &'static str {
             "aliases"
         }
@@ -7524,6 +7525,7 @@ mod tests {
     struct Recollates;
 
     impl Dialect for Recollates {
+        type Plan = ();
         fn name(&self) -> &'static str {
             "recollates"
         }
@@ -11974,26 +11976,27 @@ mod tests {
             declared.tables.insert("app.ev_1".parse().unwrap(), t);
             declared
         };
-        let outcome_in = |declared: &Schema, intents: &[Intent], dialect: &dyn Dialect| {
-            let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
-                .unwrap()
-                .ids;
-            let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
-                .unwrap()
-                .ids;
-            diff(
-                Side {
-                    schema: &tree,
-                    ids: &base_ids,
-                },
-                Side {
-                    schema: declared,
-                    ids: &declared_ids,
-                },
-                dialect,
-                &Hints::default(),
-            )
-        };
+        let outcome_in =
+            |declared: &Schema, intents: &[Intent], dialect: &dyn Dialect<Plan = ()>| {
+                let base_ids = crate::resolve(&tree, &IdsFile::default(), &[], &ctx())
+                    .unwrap()
+                    .ids;
+                let declared_ids = crate::resolve(declared, &base_ids, intents, &ctx())
+                    .unwrap()
+                    .ids;
+                diff(
+                    Side {
+                        schema: &tree,
+                        ids: &base_ids,
+                    },
+                    Side {
+                        schema: declared,
+                        ids: &declared_ids,
+                    },
+                    dialect,
+                    &Hints::default(),
+                )
+            };
         let outcome =
             |declared: &Schema, intents: &[Intent]| outcome_in(declared, intents, &MinimalDialect);
         let planned = outcome(&shape(&|_| {}), &[]).expect("a detach is planned");
@@ -12563,6 +12566,7 @@ mod tests {
     struct SerialDefaults;
 
     impl Dialect for SerialDefaults {
+        type Plan = ();
         fn name(&self) -> &'static str {
             "serial-defaults"
         }
@@ -16226,7 +16230,7 @@ mod tests {
     /// renaming `app.old` into its name, then diffed from the undeployed
     /// baseline as a plan that carries both (#536).
     fn a_dropped_tables_name_reused_by_a_later_rename(
-        dialect: &dyn Dialect,
+        dialect: &(impl Dialect + ?Sized),
         base: &Schema,
         intermediate: &Schema,
         declared: &Schema,
@@ -16269,7 +16273,11 @@ mod tests {
         )
     }
 
-    fn diff_with(base: Side<'_>, declared: Side<'_>, dialect: &dyn Dialect) -> ChangeSet {
+    fn diff_with(
+        base: Side<'_>,
+        declared: Side<'_>,
+        dialect: &(impl Dialect + ?Sized),
+    ) -> ChangeSet {
         diff(base, declared, dialect, &Hints::default()).unwrap()
     }
 
@@ -16769,7 +16777,10 @@ mod tests {
         let base = two_tables(("app.old", old_t.clone()), ("app.target", target_t));
         let intermediate = schema_of("app.old", old_t.clone());
         let declared = schema_of("app.target", old_t);
-        for dialect in [&MinimalDialect as &dyn Dialect, &SharesIndexNamespace] {
+        for dialect in [
+            &MinimalDialect as &dyn Dialect<Plan = ()>,
+            &SharesIndexNamespace,
+        ] {
             let cs = a_dropped_tables_name_reused_by_a_later_rename(
                 dialect,
                 &base,
@@ -17351,7 +17362,7 @@ mod tests {
 
     /// [`across_revisions`], against a caller-chosen dialect.
     fn across_revisions_with(
-        dialect: &dyn Dialect,
+        dialect: &(impl Dialect + ?Sized),
         base: &Schema,
         revisions: &[(Schema, Vec<Intent>)],
     ) -> ChangeSet {
@@ -19508,6 +19519,7 @@ mod tests {
     struct SharesIndexNamespace;
 
     impl Dialect for SharesIndexNamespace {
+        type Plan = ();
         fn name(&self) -> &'static str {
             "shares-index-namespace"
         }
@@ -19572,6 +19584,7 @@ mod tests {
     struct NamesItsDefaults;
 
     impl Dialect for NamesItsDefaults {
+        type Plan = ();
         fn name(&self) -> &'static str {
             "names-its-defaults"
         }
@@ -22103,6 +22116,7 @@ mod tests {
         struct ClusterRoles;
 
         impl pbps_dialect::Dialect for ClusterRoles {
+            type Plan = ();
             fn name(&self) -> &'static str {
                 "cluster-roles"
             }
@@ -22160,7 +22174,7 @@ mod tests {
         }
 
         fn kinds_on(
-            dialect: &dyn pbps_dialect::Dialect,
+            dialect: &(impl pbps_dialect::Dialect + ?Sized),
             base: &(Schema, IdsFile),
             declared: &(Schema, IdsFile),
         ) -> Vec<String> {
@@ -22625,6 +22639,7 @@ mod tests {
         struct Rebuilds;
 
         impl pbps_dialect::Dialect for Rebuilds {
+            type Plan = ();
             fn name(&self) -> &'static str {
                 "rebuilds-modules"
             }
@@ -22749,7 +22764,7 @@ mod tests {
                 a_module(pbps_model::ModuleKind::View, "SELECT a, b FROM app.t"),
             );
 
-            let run = |dialect: &dyn pbps_dialect::Dialect| {
+            let run = |dialect: &dyn pbps_dialect::Dialect<Plan = ()>| {
                 diff(
                     Side {
                         schema: &base.0,
@@ -22902,6 +22917,7 @@ mod tests {
         struct PublicExecutes;
 
         impl pbps_dialect::Dialect for PublicExecutes {
+            type Plan = ();
             fn name(&self) -> &'static str {
                 "public-executes"
             }
@@ -22974,7 +22990,7 @@ mod tests {
         }
 
         fn run(
-            dialect: &dyn Dialect,
+            dialect: &(impl Dialect + ?Sized),
             base: &Schema,
             declared: &Schema,
             hints: &Hints,

@@ -11,7 +11,7 @@ pub fn before_rewrites(
     changes: ChangeSet,
     before: crate::Side<'_>,
     after: crate::Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     declared: &ModuleDeps,
 ) -> Result<ChangeSet, String> {
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, after.ids)

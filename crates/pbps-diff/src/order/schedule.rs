@@ -161,11 +161,18 @@ fn reason_word(reason: OrderReason) -> &'static str {
 /// A settled plan.
 #[derive(Debug, Clone)]
 pub struct Settled {
+    ordered: super::OrderedPlan,
     pub changes: ChangeSet,
     /// The edges that ordered it, over its own positions.
     pub proof: OrderingProof,
     /// For each position of `changes`, the position it came from.
     pub sequence: Vec<usize>,
+}
+
+impl Settled {
+    pub fn into_ordered(self) -> super::OrderedPlan {
+        self.ordered
+    }
 }
 
 /// Which of two ready steps goes first (DEC-1956.2).
@@ -292,6 +299,7 @@ impl Schedule {
         let proof = OrderingProof::new(&ordered, edges)
             .expect("a Kahn order runs every edge it kept forward");
         Ok(Settled {
+            ordered: super::OrderedPlan::new(ordered.clone(), proof.clone()),
             changes: ordered,
             proof,
             sequence,

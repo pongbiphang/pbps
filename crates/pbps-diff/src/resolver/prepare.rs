@@ -201,7 +201,7 @@ pub(super) fn changes(
     before_ids: &IdsFile,
     rebuilds: &BTreeSet<Surface>,
     hints: &pbps_model::Hints,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Result<Prepared, Error> {
     let names = ids.index();
     let mut changes: Vec<(Origin, PlannedChange)> = Vec::new();

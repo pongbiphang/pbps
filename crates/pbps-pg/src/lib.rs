@@ -772,6 +772,25 @@ fn default_problems(
 }
 
 impl Dialect for Postgres {
+    type Plan = dyn pbps_diff::order::PlanView;
+    fn emit_ordered(
+        &self,
+        plan: &Self::Plan,
+        position: usize,
+    ) -> Result<Vec<Statement>, DialectError> {
+        let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
+        self.emit(&planned.change, planned.strategy)
+    }
+
+    fn emit_staged_ordered(
+        &self,
+        plan: &Self::Plan,
+        position: usize,
+    ) -> Result<Vec<Statement>, DialectError> {
+        let planned = &pbps_dialect::PlanPayload::changes(plan).changes[position];
+        self.emit_staged(&planned.change, planned.strategy)
+    }
+
     fn name(&self) -> &'static str {
         "postgres"
     }
@@ -6979,5 +6998,40 @@ mod tests {
                 .is_empty(),
             "a check and an ordinary index may share a name"
         );
+    }
+}
+
+#[cfg(test)]
+mod certified_emission_tests {
+    use super::*;
+    use pbps_model::{Change, ChangeSet, PlanMode, PlannedChange};
+
+    #[test]
+    fn certified_lowering_preserves_statement_bytes_and_mode() {
+        let dialect = Postgres::new();
+        let changes = ChangeSet {
+            changes: vec![PlannedChange::new(Change::RenameTable {
+                uid: "t_aaaaaa".parse().unwrap(),
+                from: "dbo.old_name".parse().unwrap(),
+                to: "dbo.new_name".parse().unwrap(),
+                defaults: Vec::new(),
+            })],
+        };
+        let expected = dialect
+            .emit(&changes.changes[0].change, changes.changes[0].strategy)
+            .unwrap();
+        let ordered = pbps_diff::order::Schedule::new(1)
+            .settle(changes)
+            .unwrap()
+            .into_ordered();
+        for mode in [PlanMode::Transactional, PlanMode::Staged] {
+            let emitted = pbps_dialect::lower::lower_plan(
+                &ordered as &dyn pbps_diff::order::PlanView,
+                &dialect,
+                mode,
+            )
+            .unwrap();
+            assert_eq!(emitted.statements(), expected);
+        }
     }
 }

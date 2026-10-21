@@ -64,7 +64,7 @@ pub struct Baseline {
 pub fn load(
     project: &Project,
     source: &Source,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> anyhow::Result<Baseline> {
     match source {
         Source::File(path) => {
@@ -261,7 +261,7 @@ fn under(prefix: &str, path: &Path) -> anyhow::Result<String> {
 fn load_from_git(
     project: &Project,
     rev: &str,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> anyhow::Result<Baseline> {
     let root = &project.root;
     git(root, &["rev-parse", "--show-toplevel"]).map_err(|e| {
@@ -469,7 +469,7 @@ pub fn changed_subjects(
 pub fn schema_at(
     project: &Project,
     rev: &str,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> anyhow::Result<pbps_model::Schema> {
     let root = &project.root;
     // A revision that does not exist yet is the empty schema, the same answer

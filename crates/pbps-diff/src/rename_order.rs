@@ -30,7 +30,7 @@ pub(crate) fn order(
     planned: &mut Vec<PlannedChange>,
     base: Side<'_>,
     renames: &Renames,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
 ) -> Vec<Vec<(TableName, TableName)>> {
     let indexes = dialect.indexes_share_namespace_with_tables();
     let constraints = dialect.constraints_share_namespace_with_tables();
@@ -667,7 +667,7 @@ fn carried_names(
 /// share the namespace. Each is one of the alternatives the table may hold,
 /// so an edge through one is weak (review of #1346).
 fn generated_names(
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     name: &TableName,
     table: &pbps_model::schema::Table,
     constraints: bool,

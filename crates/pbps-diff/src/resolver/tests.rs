@@ -4338,6 +4338,7 @@ mod generated_surface_coverage {
 struct Candidates;
 
 impl pbps_dialect::Dialect for Candidates {
+    type Plan = ();
     fn name(&self) -> &'static str {
         "candidates"
     }
@@ -4775,7 +4776,7 @@ mod operations {
         base: &Schema,
         desired: &Schema,
         observations: &[SurfaceResolution],
-        dialect: &dyn pbps_dialect::Dialect,
+        dialect: &(impl pbps_dialect::Dialect + ?Sized),
     ) -> (Planned, IdsFile, IdsFile) {
         let old_ids = ids(base, &IdsFile::default());
         let new_ids = ids(desired, &old_ids);

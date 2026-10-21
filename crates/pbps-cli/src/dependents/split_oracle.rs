@@ -7,7 +7,7 @@ pub(super) fn split_new_tables(
     cs: &mut ChangeSet,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> Result<usize, String> {
     let empty = IdsFile::default();
     let generated = pbps_diff::order::generated::expand(
@@ -106,7 +106,11 @@ pub(super) fn split_new_tables(
     Ok(added)
 }
 
-pub(super) fn same_plan(actual: &ChangeSet, expected: &ChangeSet, dialect: &dyn Dialect) {
+pub(super) fn same_plan(
+    actual: &ChangeSet,
+    expected: &ChangeSet,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+) {
     assert_eq!(actual, expected);
     assert_eq!(
         serde_json::to_vec(actual).unwrap(),
@@ -162,7 +166,7 @@ pub(super) fn same_plan(actual: &ChangeSet, expected: &ChangeSet, dialect: &dyn 
 pub(super) fn same_expansion(
     actual: &Result<expand::Expanded, String>,
     expected: &Result<expand::Expanded, String>,
-    dialect: &dyn Dialect,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) {
     match (actual, expected) {
         (Ok(now), Ok(old)) => {

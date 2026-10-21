@@ -180,7 +180,10 @@ pub(crate) async fn hand_over_external_partitions(
 /// ones — two names that collide, a dependency on a missing module — have no
 /// single object to blame, so they stay with [`check_staged`], which refuses
 /// the write instead.
-pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn Dialect) {
+pub(crate) fn leave_out_what_validate_refuses(
+    pulled: &mut Pulled,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+) {
     let schema = &mut pulled.schema;
 
     let refused: Vec<_> = schema
@@ -368,7 +371,10 @@ pub(crate) fn leave_out_what_validate_refuses(pulled: &mut Pulled, dialect: &dyn
 /// declaration can still take it over deliberately (DECISIONS 377, 421). Run
 /// after [`leave_out_what_validate_refuses`], so a role whose every grant was
 /// left out as unexpressible goes too.
-pub(crate) fn leave_out_cluster_roles_without_grants(pulled: &mut Pulled, dialect: &dyn Dialect) {
+pub(crate) fn leave_out_cluster_roles_without_grants(
+    pulled: &mut Pulled,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+) {
     if dialect.manages_roles() {
         return;
     }
@@ -400,7 +406,7 @@ fn narrow_role(
     name: &pbps_model::RoleName,
     role: &mut Role,
     probe: &mut Schema,
-    dialect: &dyn Dialect,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> (Vec<Unexpressible>, Option<String>) {
     let mut left_out = Vec::new();
     let mut problems = role_problems(name, role, probe, dialect);
@@ -482,7 +488,7 @@ fn role_problems(
     name: &pbps_model::RoleName,
     role: &Role,
     probe: &mut Schema,
-    dialect: &dyn Dialect,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> Vec<String> {
     let mut out = rendered(dialect.validate_role(name, role, probe));
     probe.roles.insert(name.to_owned(), role.clone());
@@ -566,7 +572,10 @@ pub(crate) fn write_declarations(
 /// function does not ask. Either way the project the command would leave
 /// behind is one its next command refuses, and writing nothing is the honest
 /// outcome.
-pub(crate) fn check_staged(dir: &Path, dialect: &dyn Dialect) -> anyhow::Result<pbps_load::Loaded> {
+pub(crate) fn check_staged(
+    dir: &Path,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
+) -> anyhow::Result<pbps_load::Loaded> {
     let loaded = pbps_load::load_schema_dir(dir).map_err(|errors| {
         anyhow::anyhow!(
             "the staged declarations have {} problem(s):\n  {}",
@@ -619,7 +628,7 @@ pub(crate) fn check_staged(dir: &Path, dialect: &dyn Dialect) -> anyhow::Result<
 pub(crate) fn refuse_policy_errors(
     project: &pbps_config::Project,
     loaded: &pbps_load::Loaded,
-    dialect: &dyn Dialect,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> anyhow::Result<Vec<crate::output::Finding>> {
     crate::refuse_invalid_policies(project, "the declarations about to be written")?;
     let (errors, rest): (Vec<_>, Vec<_>) = crate::declaration_policy_findings(
@@ -710,7 +719,7 @@ mod tests {
         r
     }
 
-    fn pg() -> Box<dyn Dialect> {
+    fn pg() -> Box<dyn Dialect<Plan = dyn pbps_diff::order::PlanView>> {
         Box::new(pbps_pg::Postgres::new())
     }
 

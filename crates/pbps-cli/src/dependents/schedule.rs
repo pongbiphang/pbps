@@ -184,7 +184,7 @@ pub(crate) fn schedule(
     mut cs: ChangeSet,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
-    dialect: &dyn Dialect,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> Result<Scheduled, Refusal> {
     let (mut added, mut split, mut moved) = (0, 0, 0);
     let mut skipped = Vec::new();
@@ -431,7 +431,7 @@ pub(crate) fn schedule(
 fn keep_handover_dependents(
     cs: &ChangeSet,
     declared: &Declarations<'_>,
-    dialect: &dyn Dialect,
+    dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
     handovers: &mut pbps_diff::order::Schedule,
 ) -> Result<(), Refusal> {
     use pbps_diff::order::{Schedule, edges, shadow};
@@ -1305,7 +1305,7 @@ mod tests {
             released: &BTreeSet<super::ColumnRef>,
             deps: &ModuleDeps,
             schema: &Schema,
-            dialect: &dyn Dialect,
+            dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
         ) -> Result<usize, String> {
             let order = pbps_diff::order::Schedule::new(cs.changes.len());
             crate::dependents::after_the_rebuilds(cs, released, deps, schema, order, dialect)

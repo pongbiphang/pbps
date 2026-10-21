@@ -286,7 +286,7 @@ pub(crate) fn system_time(
 /// **text** is the engine's (`0` comes back `((0))`), so only its presence is
 /// comparable (DECISIONS 185, 186).
 pub(crate) fn declared_column(
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
     declared: &pbps_model::Column,
     now: &pbps_model::Column,
 ) -> bool {
@@ -325,7 +325,7 @@ pub(crate) fn declared_column(
 }
 
 pub(crate) fn columns_after(
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
     expected: &super::expect::ColumnChanges<'_>,
     after: &Schema,
     moved: &mut Vec<String>,

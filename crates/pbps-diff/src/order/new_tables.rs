@@ -8,14 +8,14 @@ use pbps_model::{Change, ColumnRef, IdsFile, ModuleKind, PlannedChange, ValueSou
 
 use super::expand::{Expansion, Order, Rewrite};
 
-pub struct NewTables<'a> {
+pub struct NewTables<'a, D: Dialect + ?Sized> {
     pub ids: &'a [&'a IdsFile],
     pub functions: &'a [(String, usize)],
     pub taken: &'a BTreeSet<ColumnRef>,
-    pub dialect: &'a dyn Dialect,
+    pub dialect: &'a D,
 }
 
-impl NewTables<'_> {
+impl<D: Dialect + ?Sized> NewTables<'_, D> {
     fn calls(&self, text: &str) -> bool {
         self.functions
             .iter()
@@ -92,7 +92,7 @@ impl NewTables<'_> {
     }
 }
 
-impl Expansion for NewTables<'_> {
+impl<D: Dialect + ?Sized> Expansion for NewTables<'_, D> {
     type Obligation = usize;
 
     fn rule(&self) -> &'static str {

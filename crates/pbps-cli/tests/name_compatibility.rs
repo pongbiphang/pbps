@@ -84,7 +84,7 @@ fn artifacts(text: &str) -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
     (schema, ids, plan, state)
 }
 
-fn sql(plan: &SavedPlan, dialect: &dyn Dialect) -> String {
+fn sql(plan: &SavedPlan, dialect: &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>) -> String {
     plan.changes
         .changes
         .iter()
@@ -188,7 +188,7 @@ fn explain_shows_hostile_names_exactly_once_and_keeps_master_json() {
 #[test]
 fn a_dialect_refusal_escapes_a_table_name_exactly_once() {
     for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect,
+        &pbps_pg::Postgres::new() as &dyn Dialect<Plan = dyn pbps_diff::order::PlanView>,
         &pbps_mssql::Mssql,
     ] {
         for (part, shown) in [(NAME, SHOWN), ("名前_ünï", "名前_ünï")] {

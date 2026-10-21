@@ -588,7 +588,7 @@ pub async fn refuse_unknown_collations(conn: &mut Conn, schema: &Schema) -> anyh
 pub async fn refuse_history_references_alike(
     conn: &mut Conn,
     schema: &Schema,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> anyhow::Result<()> {
     if conn.driver() != Driver::Mssql {
         return Ok(());
@@ -860,7 +860,7 @@ pub struct NameFacts {
 pub struct Planned<'a> {
     pub base: pbps_diff::Side<'a>,
     pub desired: pbps_diff::Side<'a>,
-    pub dialect: &'a dyn pbps_dialect::Dialect,
+    pub dialect: &'a dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
 }
 
 impl NameFacts {
@@ -3515,7 +3515,7 @@ pub async fn account_for_module_dependents(
     sources: crate::dependents::Sources<'_>,
     deps: &pbps_model::ModuleDeps,
     role_members: Option<&crate::dependents::schedule::RoleMembers>,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<ChangeSet>,
 ) -> anyhow::Result<ConnectedCheck> {
     let declarations = crate::dependents::schedule::Declarations {
@@ -3549,7 +3549,7 @@ pub async fn account_for_module_dependents(
     // planning has no extra write-path schemas (DEC-1503.1).
     let pg = pbps_pg::Postgres::new()
         .with_server_version(pbps_pg::roles::server_version_num(conn).await?);
-    let dialect: &dyn pbps_dialect::Dialect = &pg;
+    let dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView> = &pg;
     let mut found = module_dependents(conn, changes).await?;
     let untouched = crate::dependents::untouched_module_dependents(changes, &found, declared);
     if !untouched.is_empty() {
@@ -3620,7 +3620,9 @@ pub async fn account_for_module_dependents(
 
 /// The connection's immutable planning capability, before any expansion.
 /// Offline callers retain their ordinary unknown-capability dialect.
-pub async fn planning_dialect(conn: &mut Conn) -> anyhow::Result<Box<dyn pbps_dialect::Dialect>> {
+pub async fn planning_dialect(
+    conn: &mut Conn,
+) -> anyhow::Result<Box<dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>>> {
     Ok(match conn.driver() {
         Driver::Postgres => Box::new(
             pbps_pg::Postgres::new()

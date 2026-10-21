@@ -36,7 +36,7 @@ pub struct Read {
 pub fn read(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
-    dialect: &dyn Dialect,
+    dialect: &(impl Dialect + ?Sized),
     declared: &ModuleDeps,
     changes: &ChangeSet,
     sequence: Option<&[usize]>,

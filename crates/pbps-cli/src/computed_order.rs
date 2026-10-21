@@ -341,7 +341,7 @@ fn method_receivers(table: &pbps_model::Table) -> Vec<pbps_model::ColumnName> {
 fn added_calls(
     cs: &ChangeSet,
     declared: &pbps_model::Schema,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> Vec<AddedCall> {
     let receivers_of = |table: &TableName| {
         declared
@@ -385,7 +385,7 @@ fn added_calls(
 pub(crate) fn added_call_spellings(
     cs: &ChangeSet,
     declared: &pbps_model::Schema,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
 ) -> BTreeSet<String> {
     let functions = functions_changed(cs);
     let calls = added_calls(cs, declared, dialect);
@@ -433,7 +433,7 @@ pub(crate) fn added_call_spellings(
 pub(crate) fn refuse_added_calls(
     cs: &ChangeSet,
     declared: &pbps_model::Schema,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &dyn pbps_dialect::Dialect<Plan = dyn pbps_diff::order::PlanView>,
     alike: &Alike,
 ) -> Result<(), String> {
     let functions = functions_changed(cs);

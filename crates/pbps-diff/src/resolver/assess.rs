@@ -64,7 +64,7 @@ pub fn assess(
     base: crate::Side<'_>,
     desired: crate::Side<'_>,
     ordinary: &ChangeSet,
-    dialect: &dyn pbps_dialect::Dialect,
+    dialect: &(impl pbps_dialect::Dialect + ?Sized),
 ) -> Assessment {
     assessed_with(
         base,
