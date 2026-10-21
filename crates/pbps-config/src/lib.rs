@@ -299,7 +299,7 @@ pub struct Config {
 
     /// Roles the organization trusts to change evaluated user-type code (#2046).
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
-    pub trusted_roles: std::collections::BTreeSet<String>,
+    pub trusted_roles: std::collections::BTreeSet<pbps_model::RoleName>,
 
     /// Review and pin user-written routines on referenced type input paths (DEC-2181.2).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -992,7 +992,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             config.trusted_roles,
-            std::collections::BTreeSet::from(["data_team".to_owned(), "platform".to_owned()])
+            std::collections::BTreeSet::from(["data_team".into(), "platform".into()])
         );
         assert!(
             Config::parse(

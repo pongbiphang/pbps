@@ -1249,6 +1249,11 @@ fn empty_array_defaults_evaluate_no_element_domain_check() {
         }
         let d = Demo::new("refs-empty-array");
         d.keyed(db);
+        // Potential-path admission still needs owner trust, even though
+        // these measured empty fills execute no element code (DEC-2181.3).
+        let config = d.dir.join("pbps.yml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{text}trusted_roles: [{}]\n", role.name)).unwrap();
         let table = |extra: &str, overrides: &str| {
             format!(
                 "{}partition_by: [id]\npartitions:\n  low:\n    from: ['0']\n    to: ['100']\n{overrides}",
@@ -1388,6 +1393,9 @@ fn stored_generated_empty_arrays_evaluate_no_element_domain_check() {
         on_server(db, &setup(&role.name));
         let d = Demo::new("refs-generated-empty");
         d.keyed(db);
+        let config = d.dir.join("pbps.yml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{text}trusted_roles: [{}]\n", role.name)).unwrap();
         d.table(&declarations(""));
         succeeds(d.run(&["plan"]));
         d.commit();
@@ -1847,6 +1855,117 @@ fn any_language_roots_require_source_review_and_the_saved_opt_in() {
 #[ignore = "needs live PostgreSQL 18"]
 fn io_coercion_roots_require_source_review_on_postgres_18() {
     io_coercion_roots_require_source_review(&server());
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 16"]
+fn pinned_type_routines_require_owner_and_actor_trust_on_postgres_16() {
+    pinned_type_routine_owners(&std::env::var("PBPS_TEST_PG_OLD_DB").expect("PG 16 fixture"));
+}
+
+#[test]
+#[ignore = "needs live PostgreSQL 18"]
+fn pinned_type_routines_require_owner_and_actor_trust_on_postgres_18() {
+    pinned_type_routine_owners(&server());
+}
+
+fn pinned_type_routine_owners(server: &str) {
+    for operator in [false, true] {
+        let owner = UntrustedRole::new(server, "routine_owner");
+        let actor = UntrustedRole::new(server, "routine_actor");
+        let own = OwnDatabase::new(server, "routine_owners");
+        let db = own.connection();
+        let d = root_demo(
+            db,
+            "routine-owners",
+            "CREATE FUNCTION app.root(varchar) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('app.calls'); RETURN true; END $$",
+        );
+        if operator {
+            // The operator remains superuser-owned. Its implementation's
+            // owner is the one that can replace the code the executor runs.
+            on_server(
+                db,
+                "CREATE OPERATOR app.! (RIGHTARG = varchar, FUNCTION = app.root);
+                 ALTER DOMAIN app.checked DROP CONSTRAINT checked_check;
+                 ALTER DOMAIN app.checked ADD CONSTRAINT checked_check CHECK (OPERATOR(app.!) VALUE)",
+            );
+        }
+        on_server(
+            db,
+            &format!(
+                "GRANT USAGE ON SCHEMA app TO {owner}; ALTER FUNCTION app.root(varchar) OWNER TO {owner}",
+                owner = owner.name
+            ),
+        );
+        opt_in(&d, db, true);
+        let refused = d.dir.join("untrusted.json");
+        let out = d.run(&["plan", "--db", db, "--out", refused.to_str().unwrap()]);
+        assert_ne!(code(&out), 0, "{}", stdout(&out));
+        for message in ["app.root", &owner.name, "trusted_roles"] {
+            assert!(stderr(&out).contains(message), "{}", stderr(&out));
+        }
+        assert!(!refused.exists());
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            0
+        );
+
+        let config = d.dir.join("pbps.yml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{text}trusted_roles: [{}]\n", owner.name)).unwrap();
+        let path = plan(&d, db);
+        let saved: pbps_model::SavedPlan =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.type_routines.len(), 1);
+        assert!(saved.type_routine_pins.is_some());
+
+        // ADMIN alone can obtain SET later, so trusting the direct owner
+        // cannot admit code an untrusted actor can still replace.
+        on_server(
+            db,
+            &format!(
+                "GRANT {} TO {} WITH INHERIT FALSE, SET FALSE, ADMIN TRUE",
+                owner.name, actor.name
+            ),
+        );
+        for out in [
+            d.run(&["plan", "--db", db]),
+            apply_plan(&d, db, &path, false),
+        ] {
+            assert_ne!(code(&out), 0, "{}", stdout(&out));
+            for message in ["app.root", &owner.name, &actor.name, "trusted_roles"] {
+                assert!(stderr(&out).contains(message), "{}", stderr(&out));
+            }
+        }
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            0
+        );
+        assert_eq!(
+            scalar(
+                db,
+                "SELECT count(*)::bigint FROM pg_attribute WHERE attrelid='app.t'::regclass AND attname='n' AND NOT attisdropped"
+            ),
+            0
+        );
+
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            text.replace(
+                &format!("trusted_roles: [{}]", owner.name),
+                &format!("trusted_roles: [{}, {}]", owner.name, actor.name),
+            ),
+        )
+        .unwrap();
+        let admitted = plan(&d, db);
+        succeeds(apply_plan(&d, db, &admitted, false));
+        assert_eq!(
+            scalar(db, "SELECT is_called::int::bigint FROM app.calls"),
+            1
+        );
+        succeeds(d.run(&["verify", "--db", db]));
+    }
 }
 
 #[test]

@@ -1702,7 +1702,7 @@ mod tests {
             routines: Vec::new(),
             types: vec![owned(40002, "app.checked", "owner_role")],
         };
-        let actors = BTreeMap::from([(40002, vec!["member".to_owned()])]);
+        let actors = BTreeMap::from([(40002, vec!["member".into()])]);
         let InputPath::Refused(reasons) = verdict(facts.clone(), &actors, true) else {
             panic!("an empty array still requires a trusted target owner");
         };

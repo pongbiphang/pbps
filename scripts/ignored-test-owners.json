@@ -501,6 +501,8 @@
         "type_refs::polymorphic_index_defaults_survive_multiple_domain_layers",
         "type_refs::potential_type_paths_are_checked_even_without_an_added_column",
         "type_refs::any_language_roots_require_source_review_and_the_saved_opt_in",
+        "type_refs::pinned_type_routines_require_owner_and_actor_trust_on_postgres_16",
+        "type_refs::pinned_type_routines_require_owner_and_actor_trust_on_postgres_18",
         "type_refs::io_coercion_roots_require_source_review_on_postgres_16",
         "type_refs::io_coercion_roots_require_source_review_on_postgres_18",
         "type_refs::superuser_owned_root_replacements_are_pinned_separately_from_replaceable_callees",

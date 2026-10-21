@@ -9818,7 +9818,7 @@ async fn execute_transaction_body(
     statements: &[pbps_dialect::Statement],
     type_pins: &[pbps_model::TypePin],
     changes: &pbps_model::ChangeSet,
-    trusted: &BTreeSet<String>,
+    trusted: &BTreeSet<pbps_model::RoleName>,
 ) -> anyhow::Result<()> {
     conn.begin(&dialect.transaction_framing(&pin_zone(conn)))
         .await

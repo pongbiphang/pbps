@@ -450,7 +450,7 @@ pub struct SavedPlan {
 
     /// The project roles trusted when the input-path gate admitted this plan.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
-    pub trusted_roles: std::collections::BTreeSet<String>,
+    pub trusted_roles: std::collections::BTreeSet<crate::RoleName>,
 }
 
 /// Complete catalog source of a reviewed input-path root (DEC-2181.2).

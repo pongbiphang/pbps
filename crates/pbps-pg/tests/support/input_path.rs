@@ -1597,7 +1597,7 @@ async fn constructing_two_composite_levels_evaluates_and_refuses_the_nested_untr
             routines(refused(&answer[0], server.label))
                 .iter()
                 .any(|r| r.identity == "app.seen(integer)"
-                    && r.owner == stranger
+                    && r.owner.raw() == stranger.as_str()
                     && r.why == Why::NotBuiltin)
         );
         assert_eq!(
@@ -1776,7 +1776,7 @@ async fn io_coercions_execute_nested_checks(major: &str) {
     ))
     .await;
     let path = gate(&mut me, &[], "io_builtin").await;
-    if !matches!(&path, InputPath::Refused(reasons) if owner_reasons(reasons).iter().any(|r| r.owner == stranger))
+    if !matches!(&path, InputPath::Refused(reasons) if owner_reasons(reasons).iter().any(|r| r.owner.raw() == stranger.as_str()))
     {
         errors.push(format!("nested I/O target owner not checked: {path:?}"));
     }

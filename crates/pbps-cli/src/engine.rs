@@ -5474,7 +5474,7 @@ pub async fn seal_type_pins(
     conn: &mut Conn,
     schemas: &[&Schema],
     changes: &ChangeSet,
-    trusted: &BTreeSet<String>,
+    trusted: &BTreeSet<pbps_model::RoleName>,
     pin_routines: bool,
 ) -> anyhow::Result<Vec<pbps_model::TypePin>> {
     match conn.driver() {
@@ -5492,7 +5492,7 @@ pub async fn seal_type_pins(
 pub async fn check_type_pins(
     conn: &mut Conn,
     plan: &pbps_model::SavedPlan,
-    trusted: &BTreeSet<String>,
+    trusted: &BTreeSet<pbps_model::RoleName>,
     required: &BTreeSet<pbps_model::TypeRef>,
     within_transaction: bool,
 ) -> anyhow::Result<()> {
@@ -5532,7 +5532,7 @@ pub async fn check_type_pins(
 pub async fn type_input_routines(
     conn: &mut Conn,
     pins: &[pbps_model::TypePin],
-    trusted: &BTreeSet<String>,
+    trusted: &BTreeSet<pbps_model::RoleName>,
     pin_routines: bool,
     inside: bool,
 ) -> anyhow::Result<BTreeSet<i64>> {
@@ -5567,7 +5567,7 @@ pub async fn type_input_routines(
 pub fn bootstrap_type_guard(
     dialect: &str,
     schema: &Schema,
-    trusted: &BTreeSet<String>,
+    trusted: &BTreeSet<pbps_model::RoleName>,
 ) -> anyhow::Result<Option<pbps_dialect::Statement>> {
     match dialect {
         "postgres" => {
@@ -5584,7 +5584,7 @@ pub async fn recheck_type_prerequisites(
     conn: &mut Conn,
     expected: &[pbps_model::TypePin],
     changes: &ChangeSet,
-    trusted: &BTreeSet<String>,
+    trusted: &BTreeSet<pbps_model::RoleName>,
     inside: bool,
 ) -> anyhow::Result<()> {
     match conn.driver() {

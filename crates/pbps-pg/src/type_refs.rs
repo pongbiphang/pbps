@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use pbps_db::{Conn, DbError};
+use pbps_db::{Conn, DbError, Param};
 use pbps_model::{
     Change, ChangeSet, Column, ColumnName, ColumnType, ModuleKind, Schema, TypePin, TypeRef,
     ValueSource,
@@ -126,14 +126,21 @@ fn pin(ty: &UserType) -> TypePin {
     }
 }
 
-pub async fn trusted_roles(conn: &mut Conn, trusted: &BTreeSet<String>) -> Result<(), DbError> {
+pub async fn trusted_roles(
+    conn: &mut Conn,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+) -> Result<(), DbError> {
     let missing =
         crate::input_path::missing_roles(conn, &trusted.iter().cloned().collect::<Vec<_>>())
             .await?;
     if !missing.is_empty() {
         return Err(failed(format!(
             "trusted_roles names roles that do not exist: {}",
-            missing.join(", ")
+            missing
+                .iter()
+                .map(|role| role.shown().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
     Ok(())
@@ -143,7 +150,7 @@ pub async fn seal(
     conn: &mut Conn,
     schemas: &[&Schema],
     changes: &ChangeSet,
-    trusted: &BTreeSet<String>,
+    trusted: &BTreeSet<pbps_model::RoleName>,
 ) -> Result<Vec<TypePin>, DbError> {
     trusted_roles(conn, trusted).await?;
     let references: Vec<_> = references(schemas, changes).into_iter().collect();
@@ -315,7 +322,7 @@ pub async fn input_routines(
     conn: &mut Conn,
     within: Within,
     references: &[TypeRef],
-    trusted: &BTreeSet<String>,
+    trusted: &BTreeSet<pbps_model::RoleName>,
     pin_routines: bool,
 ) -> Result<BTreeSet<i64>, DbError> {
     use crate::input_path::{Added, InputPath, Reason, Why};
@@ -350,13 +357,74 @@ pub async fn input_routines(
             return Err(failed(why));
         }
     }
+    check_routine_owners(conn, trusted, &roots).await?;
     Ok(roots)
+}
+
+/// A pin detects replacement; only owner/actor trust admits running the code.
+async fn check_routine_owners(
+    conn: &mut Conn,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+    routines: &BTreeSet<i64>,
+) -> Result<(), DbError> {
+    use crate::user_types::need;
+    if routines.is_empty() {
+        return Ok(());
+    }
+    let declared = serde_json::to_string(trusted).map_err(|e| failed(e.to_string()))?;
+    let rows = conn
+        .query_with(
+            &format!(
+                "WITH RECURSIVE {walk}
+                 SELECT p.oid::pg_catalog.int8 AS oid,
+                        pg_catalog.format('%I.%I(%s)', n.nspname, p.proname,
+                            pg_catalog.pg_get_function_identity_arguments(p.oid)) AS routine,
+                        ow.rolname::pg_catalog.text AS owner,
+                        a.rolname::pg_catalog.text AS actor
+                   FROM pg_catalog.pg_proc p
+                   JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace
+                   JOIN pg_catalog.pg_roles ow ON ow.oid OPERATOR(pg_catalog.=) p.proowner
+                   LEFT JOIN reach r ON r.oid OPERATOR(pg_catalog.=) p.proowner
+                   LEFT JOIN others a ON a.oid OPERATOR(pg_catalog.=) r.origin
+                  WHERE p.oid OPERATOR(pg_catalog.=) ANY({routines})
+                  ORDER BY p.oid, a.rolname",
+                walk = crate::catalog::untrusted_role_walk(
+                    "ARRAY(SELECT pg_catalog.jsonb_array_elements_text(\
+                     $1::pg_catalog.text::pg_catalog.jsonb))"
+                ),
+                routines = user_types::oid_array(&routines.iter().copied().collect::<Vec<_>>()),
+            ),
+            &[Param::Str(&declared)],
+        )
+        .await?;
+    let mut seen = BTreeSet::new();
+    for row in &rows {
+        seen.insert(need::<i64>(row, "oid")?);
+        let routine = need::<&str>(row, "routine")?;
+        let owner = pbps_model::RoleName::from(need::<&str>(row, "owner")?);
+        if let Some(actor) = row.try_get::<&str>("actor")? {
+            let actor = pbps_model::RoleName::from(actor);
+            return Err(failed(format!(
+                "type input function `{routine}` is owned by `{owner}`, and untrusted role \
+                 `{actor}` can act as that owner; pinning does not replace owner trust. \
+                 Declare the role in `trusted_roles` in `pbps.yml` only if it is trusted",
+                owner = owner.shown(),
+                actor = actor.shown()
+            )));
+        }
+    }
+    if &seen != routines {
+        return Err(failed(
+            "an input routine disappeared while checking its owner",
+        ));
+    }
+    Ok(())
 }
 
 /// Offline reconstruction asserts prerequisites before it creates any object.
 pub fn bootstrap_guard(
     schema: &Schema,
-    trusted: &BTreeSet<String>,
+    trusted: &BTreeSet<pbps_model::RoleName>,
 ) -> Result<Option<String>, pbps_dialect::DialectError> {
     let refs = references(&[schema], &ChangeSet::default());
     if refs.is_empty() && trusted.is_empty() {
@@ -372,7 +440,12 @@ pub fn bootstrap_guard(
         sql.push_str(&format!("IF NOT EXISTS (SELECT FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace LEFT JOIN pg_catalog.pg_class c ON c.oid=t.typrelid WHERE n.nspname={schema} AND t.typname={name} AND t.typisdefined AND (t.typtype IN ('e','d') OR (t.typtype='c' AND c.relkind='c')) AND pg_catalog.has_schema_privilege(n.oid,'USAGE') AND pg_catalog.has_type_privilege(t.oid,'USAGE')) THEN RAISE EXCEPTION '%', {message}; END IF;\n"));
     }
     for role in trusted {
-        sql.push_str(&format!("IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname={}) THEN RAISE EXCEPTION '%', {}; END IF;\n", crate::emit::literal(role), crate::emit::literal(&format!("trusted role `{role}` does not exist"))));
+        let name = crate::emit::literal(role.raw());
+        let message = crate::emit::literal(&format!(
+            "trusted role `{role}` does not exist",
+            role = role.shown()
+        ));
+        sql.push_str(&format!("IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname={name}) THEN RAISE EXCEPTION '%', {message}; END IF;\n"));
     }
     sql.push_str("END");
     let tag = crate::emit::dollar_tag(&sql);
