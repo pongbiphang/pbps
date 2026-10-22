@@ -464,8 +464,7 @@ pub fn bootstrap_guard(
         let name = crate::emit::literal(reference.name());
         let message = crate::emit::literal(&format!(
             "required type `{reference}` is missing, unusable or not an enum, domain or standalone composite",
-            // Raw SQL message literal; preserve its bytes until #2084 step 5.
-            reference = reference.raw(),
+            reference = reference.shown(),
         ));
         sql.push_str(&format!("IF NOT EXISTS (SELECT FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace LEFT JOIN pg_catalog.pg_class c ON c.oid=t.typrelid WHERE n.nspname={schema} AND t.typname={name} AND t.typisdefined AND (t.typtype IN ('e','d') OR (t.typtype='c' AND c.relkind='c')) AND pg_catalog.has_schema_privilege(n.oid,'USAGE') AND pg_catalog.has_type_privilege(t.oid,'USAGE')) THEN RAISE EXCEPTION '%', {message}; END IF;\n"));
     }

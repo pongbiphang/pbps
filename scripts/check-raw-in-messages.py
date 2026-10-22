@@ -20,11 +20,9 @@ a SQL bind, a map key, a comparison, a hash - is not this check's business.
 
 SQL builders accept `format!` outside diagnostic sinks: `invalid`, `Err` and
 `DbError`/`DialectError`/`RowsError` constructors. Their message macros and error
-attributes are checked too. An existing whole-message escaping boundary needs
-a comment containing `#2084 step 5` on the raw reference's line or the line
-above it. SQL-generated RAISE/THROW messages and shared probe/offline descriptions
-are outside this bounded check (#2123); this does not trace text through locals
-or unlisted helpers.
+attributes are checked too. SQL-generated RAISE/THROW messages and shared
+probe/offline descriptions are outside this bounded check (#2123); this does
+not trace text through locals or unlisted helpers.
 
 The other exemptions remain by path and, for known holes, count. Each entry
 says why, and an entry whose file is gone, or whose count is no longer needed,
@@ -76,80 +74,91 @@ SQL_BUILDERS = {
 ALLOWED = {
     "crates/pbps-model/src/types.rs": (
         4,
-        "three shown adapters escape canonical raw spelling and the column type's "
-        "canonical formatter renders its argument raw; these remain after #2084 step 5",
-    ),
-    "crates/pbps-mssql/src/types.rs": (
-        2,
-        "type-reference and array refusals feed whole-escaped DialectError fields "
-        "until #2084 step 5",
-    ),
-    "crates/pbps-pg/src/types.rs": (
-        2,
-        "serial and overlong-reference refusals feed whole-escaped DialectError fields "
-        "until #2084 step 5",
+        "Three shown adapters escape canonical raw spellings; the canonical formatter preserves "
+        "its argument bytes.",
     ),
     "crates/pbps-pg/src/type_refs.rs": (
-        2,
-        "one type name in a SQL RAISE literal retained until #2084 step 5 "
-        "and one test cast expression that keeps raw SQL bytes",
+        1,
+        "A test constructs a cast expression as SQL.",
     ),
     "crates/pbps-cli/src/baseline.rs": (
         2,
-        "role subjects are raw grouping keys, which remain raw after #2084 step 5",
+        "role subjects are raw grouping keys, which remain raw",
     ),
     "crates/pbps-cli/src/declaration_file.rs": (
         1,
-        "builds encoded role filenames from original bytes; the key remains raw after #2084 step 5",
+        "builds encoded role filenames from original bytes; the key remains raw",
     ),
     "crates/pbps-model/src/change.rs": (
         2,
-        "role subjects are raw grouping and policy keys, which remain raw after #2084 step 5",
+        "role subjects are raw grouping and policy keys, which remain raw",
     ),
     "crates/pbps-cli/src/resolver/scope.rs": (
         1,
-        "quotes a raw role into scratch SET ROLE SQL; SQL remains raw after #2084 step 5",
+        "quotes a raw role into scratch SET ROLE SQL; SQL remains raw",
     ),
     "crates/pbps-mssql/src/resolver/authorization.rs": (
         22,
-        "nineteen raw SQL operands and three raw test replay-row operands; "
-        "both retain their original spelling after #2084 step 5",
+        "nineteen raw SQL operands and three raw test replay-row operands; both retain their "
+        "original spelling",
     ),
     "crates/pbps-pg/src/resolver/authorization.rs": (
         5,
-        "quotes raw role names into reconstruction SQL; SQL remains raw after #2084 step 5",
+        "quotes raw role names into reconstruction SQL; SQL remains raw",
     ),
     "crates/pbps-pg/src/resolver/externals.rs": (
         1,
-        "quotes a raw role into externals USAGE SQL; SQL remains raw after #2084 step 5",
+        "quotes a raw role into externals USAGE SQL; SQL remains raw",
     ),
     "crates/pbps-pg/src/resolver.rs": (
         1,
-        "quotes raw role names into cleanup SQL; SQL remains raw after #2084 step 5",
+        "quotes raw role names into cleanup SQL; SQL remains raw",
     ),
-    "crates/pbps-pg/src/roles.rs": (
-        9,
-        "role refusals feed whole-escaped DialectError fields until #2084 step 5",
+    "crates/pbps-pg/src/emit.rs": (
+        None,
+        "builds PostgreSQL statements from raw names",
     ),
-    # The SQL builders. A name or a text is quoted through the dialect into a
-    # statement, a probe or a row bind, and a `format!` is how the statement
-    # is put together. Only formatting outside the bounded diagnostic sinks
-    # is exempt; an error's raw operands need a per-site step-5 comment.
-    "crates/pbps-pg/src/emit.rs": (None, "builds PostgreSQL statements from raw names"),
-    "crates/pbps-pg/src/preflight.rs": (None, "builds PostgreSQL probe SQL from raw names"),
-    "crates/pbps-pg/src/rows.rs": (None, "builds PostgreSQL row reads and writes from raw names"),
-    "crates/pbps-pg/src/catalog.rs": (None, "the PostgreSQL catalog reader's SQL"),
-    "crates/pbps-mssql/src/emit.rs": (None, "builds SQL Server statements from raw names"),
-    "crates/pbps-mssql/src/preflight.rs": (None, "builds SQL Server probe SQL from raw names"),
-    "crates/pbps-mssql/src/rows.rs": (None, "builds SQL Server row reads and writes from raw names"),
-    "crates/pbps-mssql/src/catalog.rs": (None, "the SQL Server catalog reader's SQL"),
-    "crates/pbps-mssql/src/resolver/externals.rs": (None, "executes bounded externals batches and reads their complete catalog inventory"),
-    "crates/pbps-mssql/src/resolver/externals/render.rs": (None, "quotes catalog structure into SQL Server externals templates"),
+    "crates/pbps-pg/src/preflight.rs": (
+        None,
+        "builds PostgreSQL probe SQL from raw names",
+    ),
+    "crates/pbps-pg/src/rows.rs": (
+        None,
+        "builds PostgreSQL row reads and writes from raw names",
+    ),
+    "crates/pbps-pg/src/catalog.rs": (
+        None,
+        "the PostgreSQL catalog reader's SQL",
+    ),
+    "crates/pbps-mssql/src/emit.rs": (
+        None,
+        "builds SQL Server statements from raw names",
+    ),
+    "crates/pbps-mssql/src/preflight.rs": (
+        None,
+        "builds SQL Server probe SQL from raw names",
+    ),
+    "crates/pbps-mssql/src/rows.rs": (
+        None,
+        "builds SQL Server row reads and writes from raw names",
+    ),
+    "crates/pbps-mssql/src/catalog.rs": (
+        None,
+        "the SQL Server catalog reader's SQL",
+    ),
+    "crates/pbps-mssql/src/resolver/externals.rs": (
+        None, "executes bounded externals batches and reads their complete catalog inventory",
+    ),
+    "crates/pbps-mssql/src/resolver/externals/render.rs": (
+        None, "quotes catalog structure into SQL Server externals templates",
+    ),
     "crates/pbps-mssql/src/resolver/authorization/sandbox.rs": (
-        None, "quotes raw principal names into irreversible SQL Server deployer entry SQL",
+        None,
+        "quotes raw principal names into irreversible SQL Server deployer entry SQL",
     ),
     "crates/pbps-mssql/src/resolver/authorization/staged.rs": (
-        None, "quotes raw owner, grantor and grantee names into SQL Server ownership and ACL replay SQL",
+        None,
+        "quotes raw owner, grantor and grantee names into SQL Server ownership and ACL replay SQL",
     ),
     "crates/pbps-mssql/src/resolver/capture/object_properties.rs": (
         None, "builds OBJECTPROPERTYEX queries from a fixed property manifest and catalog IDs",
@@ -175,191 +184,101 @@ ALLOWED = {
         None,
         "writes the Markdown document, which is a file, not a terminal message",
     ),
-    # Counted exceptions: shared sentences await #2084 step 5. Stable raw keys,
-    # adapters and fixture builders are counted too, so a new raw message in
-    # those files cannot hide behind their non-message uses.
     "crates/pbps-cli/src/report.rs": (
-        74,
-        "Canonical shell arguments and describe() names stay raw: the latter is "
-        "the JSON `risks[].changes` text too and the report escapes it whole; "
-        "#2084 step 5 removes that cover",
-    ),
-    "crates/pbps-cli/src/explain/resolver.rs": (
-        8,
-        "surface() becomes shared JSON/Text and is escaped once when rendered; "
-        "#2084 step 5 removes the shared-sentence boundary",
-    ),
-    "crates/pbps-dialect/src/lib.rs": (
-        28,
-        "Unchecked::for_change labels are shared JSON/explain prose, and column "
-        "validation feeds whole-escaped DialectError fields until #2084 step 5",
-    ),
-    "crates/pbps-mssql/src/lib.rs": (
-        3,
-        "reserved-table refusals feed whole-escaped DialectError::Invalid "
-        "until #2084 step 5",
-    ),
-    "crates/pbps-mssql/src/validate.rs": (
-        74,
-        "validation sentences, including the #2084 routine-argument and #2232 "
-        "role-character refusals, "
-        "feed whole-escaped DialectError fields; the #1450 declaration note "
-        "feeds the whole-escaped `dialect.not-checked` note "
-        "until #2084 step 5",
-    ),
-    "crates/pbps-pg/src/lib.rs": (
-        38,
-        "schema/table/column validation feeds whole-escaped DialectError::Invalid "
-        "and cycling-expression declaration notes feed whole-escaped dialect.not-checked "
-        "until #2084 step 5",
-    ),
-    "crates/pbps-pg/src/validate.rs": (
-        28,
-        "structural and target-kind refusals feed whole-escaped DialectError::Invalid "
-        "until #2084 step 5",
-    ),
-    "crates/pbps-pg/src/partition_series.rs": (
-        25,
-        "series refusals and frontier descriptions feed whole-escaped "
-        "DialectError::Invalid until #2084 step 5",
-    ),
-    "crates/pbps-policy/src/evaluate.rs": (
-        15,
-        "policy sentences are shared JSON and findings that report::changes "
-        "escapes whole until #2084 step 5; subjects remain raw identity keys",
+        9,
+        "Canonical command arguments are passed to shell_arg, which quotes them or substitutes "
+        "a non-executable placeholder.",
     ),
     "crates/pbps-model/src/name.rs": (
         2,
-        "the canonical ColumnRef adapter writes raw TableName and ColumnName; "
-        "serialization remains raw after #2084 step 5",
-    ),
-    "crates/pbps-model/src/schema.rs": (
-        12,
-        "schema/storage/selector validation feeds whole-escaped DialectError::Invalid "
-        "until #2084 step 5",
+        "The canonical ColumnRef adapter writes raw TableName and ColumnName for serialization.",
     ),
     "crates/pbps-model/src/module.rs": (
         2,
-        "raw routine/trigger adapters for canonical serialization; "
-        "#2084 step 5 must retain their canonical serialized spelling",
+        "Raw routine/trigger adapters preserve canonical serialization bytes.",
     ),
     "crates/pbps-pg/src/resolver/reconstruct.rs": (
         1,
-        "builds a dropped routine signature as SQL; its names and arguments "
-        "remain raw after #2084 step 5",
+        "builds a dropped routine signature as SQL; its names and arguments remain raw",
     ),
     "crates/pbps-diff/src/schema_diff.rs": (
         26,
-        "a baseline-key refusal projects ColumnName to str before Rust Debug, "
-        "preserving the prior escaped string-list diagnostic without a type wrapper; "
-        "Rust Debug remains the escaping boundary after #2084 step 5; "
-        "twenty-five role/target/local-name/replica-identity operands build raw test comparison labels",
+        "One Rust Debug projection escapes a baseline-key list; twenty-five raw labels are test "
+        "comparison data.",
     ),
     "crates/pbps-diff/src/identity.rs": (
         1,
-        "matches a raw column target against its raw table-address prefix; "
-        "this identity key remains raw after #2084 step 5",
+        "matches a raw column target against its raw table-address prefix; this identity key "
+        "remains raw",
     ),
     "crates/pbps-dialect/tests/support/positional_preflight.rs": (
         6,
-        "builds fixture SQL, whose identifiers remain raw after #2084 step 5",
+        "builds fixture SQL, whose identifiers remain raw",
     ),
     "crates/pbps-pg/tests/live.rs": (
         5,
-        "builds a routine's fixture SQL; SQL remains raw after #2084 step 5",
+        "builds a routine's fixture SQL; SQL remains raw",
     ),
     "crates/pbps-cli/tests/flow_pg.rs": (
         1,
-        "writes a trigger's fixture YAML; serialization remains raw after #2084 step 5",
-    ),
-    "crates/pbps-diff/src/order/deployment.rs": (
-        3,
-        "Relocated Provenance.reason stays shared plan JSON and is escaped whole "
-        "by report::changes until #2084 step 5; the CLI copy is cfg(test) only "
-        "(DEC-1959.5)",
+        "writes a trigger's fixture YAML; serialization remains raw",
     ),
     "crates/pbps-cli/src/dependents.rs": (
-        9,
-        "three Provenance.reason operands are shared plan JSON escaped whole by "
-        "report::changes until #2084 step 5; six role/local-name operands are raw test ordering labels",
+        6,
+        "Frozen test ordering labels preserve raw role and local-name identities.",
     ),
     "crates/pbps-cli/src/dependents/split_oracle.rs": (
         1,
-        "builds raw index-name suffix keys in the frozen split fixture; identity remains raw after #2084 step 5",
+        "builds raw index-name suffix keys in the frozen split fixture; identity remains raw",
     ),
     "crates/pbps-cli/src/dependents/schedule.rs": (
         1,
-        "a raw role-drop label is test comparison data, retained after #2084 step 5",
+        "a raw role-drop label is test comparison data, retained",
     ),
     "crates/pbps-mssql/tests/support/resolver.rs": (
         3,
-        "two raw grant-row test labels and one raw DENY fixture SQL operand, "
-        "all retained after #2084 step 5",
+        "two raw grant-row test labels and one raw DENY fixture SQL operand, all retained",
     ),
     "crates/pbps-pg/tests/support/resolver.rs": (
         11,
-        "ten raw role fixture SQL operands and one raw role:extra comparison key, "
-        "all retained after #2084 step 5",
-    ),
-    "crates/pbps-cli/src/adopt.rs": (
-        3,
-        'raw onboarding notices are escaped at their boundary until #2084 step 5 (DEC-2084.1)',
-    ),
-    "crates/pbps-cli/src/deploy.rs": (
-        2,
-        'data.adoption messages are shared finding JSON; text output escapes once until #2084 step 5',
-    ),
-    "crates/pbps-cli/src/engine.rs": (
-        8,
-        'removal descriptions are recorded state and logical-slot/numbered-column labels are connected-check JSON; text boundaries escape once until #2084 step 5',
-    ),
-    "crates/pbps-mssql/src/estimate.rs": (
-        4,
-        'Estimate.about feeds cost JSON; cost::render escapes the shared description until #2084 step 5',
-    ),
-    "crates/pbps-mssql/src/introspect.rs": (
-        2,
-        'raw onboarding notices are escaped at their boundary until #2084 step 5 (DEC-2084.1)',
-    ),
-    "crates/pbps-pg/src/estimate.rs": (
-        36,
-        'Estimate.about feeds cost JSON; cost::render escapes the shared description until #2084 step 5',
-    ),
-    "crates/pbps-pg/src/impact.rs": (
-        4,
-        'DialectError::Invalid escapes the complete refusal once until #2084 step 5',
+        "ten raw role fixture SQL operands and one raw role:extra comparison key, all retained",
     ),
     "crates/pbps-cli/src/status.rs": (
         2,
-        "the failed-attempt `detail` prints the recorded reason raw, as the "
-        "JSON `detail` does, until #2084 step 5 gives it a type of its own; "
-        "and the 8-character sha prefix is cut raw and shown through "
-        "`Text::shown`, so an escape is never cut in half",
+        "A raw SHA is shortened before Text::shown escapes it. The existing ledger reason can "
+        "already be rendered failure prose; distinguishing legacy free text requires provenance "
+        "and is retained.",
     ),
     "crates/pbps-cli/src/object_order.rs": (
         27,
-        "raw index and constraint labels are test comparison data, retained after #2084 step 5",
+        "raw index and constraint labels are test comparison data, retained",
     ),
     "crates/pbps-cli/tests/flow.rs": (
         1,
-        "quotes a generated default-constraint name into fixture SQL; SQL remains raw after #2084 step 5",
+        "quotes a generated default-constraint name into fixture SQL; SQL remains raw",
     ),
     "crates/pbps-mssql/tests/live.rs": (
         2,
-        "quotes constraint-name and overlength role-name targets into fixture SQL; SQL remains raw after #2084 step 5",
+        "quotes constraint-name and overlength role-name targets into fixture SQL; SQL remains raw",
     ),
     "crates/pbps-pg/src/data_triggers.rs": (
         1,
-        "quotes a raw foreign-key name into catalog probe SQL; SQL remains raw after #2084 step 5",
+        "quotes a raw foreign-key name into catalog probe SQL; SQL remains raw",
     ),
     "crates/pbps-docs/src/erd.rs": (
         2,
-        "writes a Mermaid document label through its own quoted() escaping; document bytes remain raw after #2084 step 5",
+        "writes a Mermaid document label through its own quoted() escaping; document bytes "
+        "remain raw",
+    ),
+    "crates/pbps-policy/src/evaluate.rs": (
+        1,
+        "A role subject is a canonical grouping and policy key; human consumers escape that "
+        "single value.",
     ),
 }
 
 
-def mask(src, markers=None):
+def mask(src):
     """`src` with comments, strings and character literals blanked.
 
     Newlines stay, so offsets and line numbers still point into `src`. What a
@@ -374,23 +293,13 @@ def mask(src, markers=None):
             if out[k] != "\n":
                 out[k] = " "
 
-    def comment(start, end):
-        # Read markers only from comments, never from a quoted example. A
-        # file-level note must not authorize a distant diagnostic.
-        if markers is not None:
-            first = src.count("\n", 0, start) + 1
-            for offset, text in enumerate(src[start:end].split("\n")):
-                if "#2084 step 5" in text:
-                    markers.add(first + offset)
-        blank(start, end)
-
     i = 0
     while i < n:
         c = src[i]
         if src.startswith("//", i):
             j = src.find("\n", i)
             j = n if j < 0 else j
-            comment(i, j)
+            blank(i, j)
             i = j
         elif src.startswith("/*", i):
             depth, j = 1, i + 2
@@ -401,7 +310,7 @@ def mask(src, markers=None):
                     depth, j = depth - 1, j + 2
                 else:
                     j += 1
-            comment(i, j)
+            blank(i, j)
             i = j
         elif c in "rbc" and not (i and (src[i - 1].isalnum() or src[i - 1] == "_")) and (
             opening := RAW_STRING.match(src, i)
@@ -572,8 +481,7 @@ def error_ranges(code, opened, end, name):
 def hits(src, builder=False):
     """([(line, macro)] for each `.raw()` in a message, [line] for each call
     this could not find the end of)."""
-    markers = set() if builder else None
-    code = mask(src, markers)
+    code = mask(src)
     line = lambda at: code.count("\n", 0, at) + 1
     calls = [(m.end() - 1, m[1] + "!", False) for m in MACRO_CALL.finditer(code)]
     calls += [(m.end() - 1, "#[error]", False) for m in ERROR_ATTR.finditer(code)]
@@ -596,8 +504,6 @@ def hits(src, builder=False):
         for start, stop in ranges:
             for raw in RAW.finditer(code, start, stop):
                 n = line(raw.start())
-                if builder and (n in markers or n - 1 in markers):
-                    continue
                 found.setdefault(raw.start(), name)
     return [(line(at), name) for at, name in sorted(found.items())], lost
 

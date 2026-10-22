@@ -26,7 +26,7 @@
         "class": "data-update",
         "why": "a reference row's current values are overwritten, and the plan does not record what they were",
         "changes": [
-          "app.child  ~ row 1: col\nline\r\u001b[31m\\‮名前payload 1 -> 2"
+          "app.child  ~ row 1: col\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前payload 1 -> 2"
         ]
       }
     ],

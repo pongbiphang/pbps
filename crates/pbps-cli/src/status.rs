@@ -290,9 +290,8 @@ async fn one(
     if entry.snapshot.kind == pbps_model::StateKind::Failed {
         row.state = "failed";
         row.detail = Some(match &entry.snapshot.reason {
-            // This pre-existing free-text reason is outside the 1a name types.
-            // Its prose boundary remains for #2084 step 5 (DEC-2084.1), when
-            // recorded reasons and already rendered error sentences separate.
+            // Preserve the existing opaque ledger-text contract, pinned against
+            // b711ed34. Distinguishing it from rendered failures needs provenance.
             Some(reason) => format!("the last deployment attempt failed: {}", reason.raw()),
             None => "the last deployment attempt failed".to_owned(),
         });

@@ -1,5 +1,3 @@
-// Shared check descriptions and recorded removal notes remain raw until #2084 step 5 (DEC-2084.1); text output escapes them.
-
 //! The connected seam: one function per question a command asks a database,
 //! answered by whichever engine the connection is to.
 //!
@@ -122,7 +120,6 @@ pub async fn operational_cost(
                 changes.push(ChangeCost::Available {
                     change_index,
                     about: e.about,
-                    // Raw JSON field; #2084 step 5 (DEC-2084.1) owns its presentation boundary.
                     table: e.table.raw().to_string(),
                     rewrite: e.rewrite.into(),
                     reads: e.reads.into(),
@@ -170,7 +167,6 @@ pub async fn operational_cost(
                 changes.push(ChangeCost::Available {
                     change_index,
                     about: e.about,
-                    // Raw JSON field; #2084 step 5 (DEC-2084.1) owns its presentation boundary.
                     table: e.table.raw().to_string(),
                     rewrite: e.rewrite.into(),
                     reads: e.reads.into(),
@@ -246,9 +242,8 @@ pub async fn drop_scan_checks(
         .map(|check| {
             format!(
                 "the staged attach's temporary CHECK `{}` on `{}`",
-                // Shared recorded-removal text is escaped on output until #2084 step 5.
-                check.name.raw(),
-                check.table.raw()
+                check.name.shown(),
+                check.table.shown()
             )
         })
         .collect())
@@ -2355,14 +2350,23 @@ pub(crate) fn order_after_releases<S: Clone>(
                     let first = waiting[0];
                     let column = changed_column(&names, &changes.changes[first].change)
                         .map_or_else(
-                            || changes.changes[first].change.subject(),
+                            || {
+                                pbps_model::escape::Escaped(
+                                    &changes.changes[first].change.subject(),
+                                )
+                                .to_string()
+                            },
                             |c| c.2.shown().to_string(),
                         );
                     let waiting: Vec<String> = waiting
                         .iter()
                         .map(|&h| {
                             let change = &changes.changes[h].change;
-                            format!("`{}` {}", change.subject(), crate::report::describe(change))
+                            format!(
+                                "`{}` {}",
+                                pbps_model::escape::Escaped(&change.subject()),
+                                crate::report::describe(change)
+                            )
                         })
                         .collect();
                     format!(
@@ -2454,7 +2458,7 @@ fn keep_ahead(
                 "{column} is released from its generated column by an expression change in \
                  this plan, and `{}` takes its name before that change runs. Apply the \
                  expression change in a plan of its own first, then this one.",
-                taker.subject(),
+                pbps_model::escape::Escaped(&taker.subject()),
                 column = column.shown()
             ),
         );
@@ -2476,7 +2480,7 @@ fn keep_ahead(
                 "{column} is retyped after the expression change that releases it, which \
                  follows `{}`: that change may need the new type. Apply the expression \
                  change in a plan of its own first, then this one.",
-                past.subject(),
+                pbps_model::escape::Escaped(&past.subject()),
                 column = column.shown()
             ),
         );
@@ -2617,8 +2621,8 @@ pub async fn logical_slots(conn: &mut Conn, changes: &ChangeSet) -> anyhow::Resu
             {
                 Some(format!(
                     "{default} into {name}",
-                    default = default.raw(),
-                    name = name.raw()
+                    default = default.shown(),
+                    name = name.shown()
                 ))
             } else {
                 None
@@ -2653,7 +2657,11 @@ fn slots_listed(moving: &[String], slots: &[(String, String)]) -> ConnectedCheck
              as a delete and an insert",
             slots
                 .iter()
-                .map(|(slot, plugin)| format!("{slot} ({plugin})"))
+                .map(|(slot, plugin)| format!(
+                    "{} ({})",
+                    pbps_model::escape::Escaped(slot),
+                    pbps_model::escape::Escaped(plugin)
+                ))
                 .collect::<Vec<_>>()
                 .join(", "),
             moving.join(", ")
@@ -2746,13 +2754,7 @@ fn fills_listed(
 ) -> ConnectedCheck {
     let columns = fills
         .iter()
-        .map(|(table, column)| {
-            format!(
-                "{}.{}",
-                table.raw(), // #2084 step 5: connected-check JSON stays raw; the human writer escapes once.
-                column.raw()  // #2084 step 5: the shared message is escaped at the human writer.
-            )
-        })
+        .map(|(table, column)| format!("{}.{}", table.shown(), column.shown()))
         .collect::<Vec<_>>()
         .join(", ");
     let mut streams = Vec::new();
@@ -2762,19 +2764,20 @@ fn fills_listed(
         for (name, lists_columns) in found {
             if *lists_columns {
                 clauses.push(format!(
-                    "publication {name} over {} lists its columns, so it publishes none of the \
+                    "publication {} over {} lists its columns, so it publishes none of the \
                      added column(s) until they are added to its list",
-                    table.raw() // #2084 step 5: connected-check JSON stays raw until the human writer.
+                    pbps_model::escape::Escaped(name),
+                    table.shown()
                 ));
             } else {
-                whole.push(name.as_str());
+                whole.push(pbps_model::escape::Escaped(name).to_string());
             }
         }
         if !whole.is_empty() {
             streams.push(format!(
                 "publication(s) {} over {}",
                 whole.join(", "),
-                table.raw() // #2084 step 5: connected-check JSON stays raw until the human writer.
+                table.shown()
             ));
         }
     }
@@ -2783,7 +2786,11 @@ fn fills_listed(
             "logical replication slot(s) {} on this database",
             slots
                 .iter()
-                .map(|(slot, plugin)| format!("{slot} ({plugin})"))
+                .map(|(slot, plugin)| format!(
+                    "{} ({})",
+                    pbps_model::escape::Escaped(slot),
+                    pbps_model::escape::Escaped(plugin)
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -5646,7 +5653,7 @@ mod tests {
     }
 
     #[test]
-    fn numbered_column_fill_messages_keep_raw_names_until_the_human_writer() {
+    fn numbered_column_fill_messages_are_shown_once_in_every_format() {
         const RAW: &str = "name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
         const SHOWN: &str = r"name\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
         let table = TableName::new("app", RAW);
@@ -5679,13 +5686,9 @@ mod tests {
                     )
                 }
             };
-            assert_eq!(check.message, expected(RAW));
+            assert_eq!(check.message, expected(SHOWN));
             assert_eq!(
                 serde_json::to_value(&check).unwrap()["message"],
-                expected(RAW)
-            );
-            assert_eq!(
-                pbps_model::escape::Escaped(&check.message).to_string(),
                 expected(SHOWN)
             );
             // An escaped-looking identifier is a different column, not an alias.

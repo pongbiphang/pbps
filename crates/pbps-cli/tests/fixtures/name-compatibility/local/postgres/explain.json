@@ -31,8 +31,8 @@
         "class": "destructive",
         "why": "data can be lost or a uniqueness guarantee removed",
         "changes": [
-          "app.child  - unique constraint local\nline\r\u001b[31m\\‮名前uq",
-          "app.child  - index local\nline\r\u001b[31m\\‮名前ix",
+          "app.child  - unique constraint local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前uq",
+          "app.child  - index local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前ix",
           "app.child  ~ detach table app.child from app.parent, keeping its rows, with 5 name(s) of its own"
         ]
       },
@@ -41,25 +41,25 @@
         "why": "existing rows may not satisfy the new constraint and the statement fails",
         "changes": [
           "app.child  ~ primary key -> (id)",
-          "app.child  + unique constraint local\nline\r\u001b[31m\\‮名前uq",
-          "app.child  + foreign key local\nline\r\u001b[31m\\‮名前fk",
-          "app.child  + check constraint local\nline\r\u001b[31m\\‮名前ck"
+          "app.child  + unique constraint local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前uq",
+          "app.child  + foreign key local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前fk",
+          "app.child  + check constraint local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前ck"
         ]
       }
     ],
     "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum aaa33a866e3e7c332d64f226bcc9107b94c627027a1a03428ed74dfb72d7067b --allow destructive,constraint",
     "probes": [
-      "foreign keys with incompatible collations for app.child.local\nline\r\u001b[31m\\‮名前fk",
+      "foreign keys with incompatible collations for app.child.local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前fk",
       "existing NULLs in app.child.id, which NOT NULL would reject",
       "rows that would collide under the new primary key",
-      "rows that would collide under the new unique constraint local\nline\r\u001b[31m\\‮名前uq",
-      "rows with no matching parent for the new foreign key local\nline\r\u001b[31m\\‮名前fk",
-      "foreign keys with incompatible collations for app.child.local\nline\r\u001b[31m\\‮名前fk",
+      "rows that would collide under the new unique constraint local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前uq",
+      "rows with no matching parent for the new foreign key local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前fk",
+      "foreign keys with incompatible collations for app.child.local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前fk",
       "rows that reference app.child through a foreign key to app.parent: the engine will not detach it, and so not drop it, while any remain; delete or repoint them first, then plan again"
     ],
     "unchecked": [
       {
-        "check": "new check local\nline\r\u001b[31m\\‮名前ck on app.child",
+        "check": "new check local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前ck on app.child",
         "reason": "the table does not exist before apply"
       }
     ],

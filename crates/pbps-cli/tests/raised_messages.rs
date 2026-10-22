@@ -224,18 +224,15 @@ fn explain_shows_the_shared_movement_description_exactly_once() {
             .unwrap();
         let text = explain("text");
         std::fs::remove_dir_all(&dir).unwrap();
-        // Negative: the shared JSON description retains raw names for its reader.
+        // The JSON field is prose too; the terminal must not escape it a second time.
         assert!(
-            description.starts_with(&format!("rows of {name}.rest are ")),
+            description.starts_with(&format!(
+                "rows of {}.rest are ",
+                pbps_model::escape::Escaped(name)
+            )),
             "{description:?}"
         );
-        assert!(
-            text.contains(&format!(
-                "  - {}\n",
-                pbps_model::escape::Escaped(description)
-            )),
-            "{text:?}"
-        );
+        assert!(text.contains(&format!("  - {}\n", description)), "{text:?}");
     }
 }
 

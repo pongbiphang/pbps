@@ -339,13 +339,13 @@ class BuilderMessages(unittest.TestCase):
         self.assertTrue(errors[0].startswith(f'{BUILDER}:3:'), errors)
         self.assertTrue(errors[1].startswith(f'{BUILDER}:4:'), errors)
 
-    def test_a_comment_at_the_raw_site_preserves_whole_message_escaping(self):
+    def test_legacy_step_five_comments_cannot_authorize_raw_prose(self):
         for text in [
             'invalid(format!("{}", n.raw())) // raw: whole-message escaped until #2084 step 5',
             'invalid(format!("{}",\n    // raw: whole-message escaped until #2084 step 5\n    n.raw(),\n))',
             'invalid(format!("{}", /* raw until #2084 step 5 */ n.raw()))',
         ]:
-            self.assertEqual(run(text, path=BUILDER), [], text)
+            self.assertEqual(len(run(text, path=BUILDER)), 1, text)
             self.assertEqual(len(run(text.replace('#2084 step 5', 'no exception'), path=BUILDER)), 1)
 
     def test_a_marker_is_local_to_its_reference(self):
@@ -356,8 +356,10 @@ class BuilderMessages(unittest.TestCase):
             '    b.raw(),\n'
             '))'
         )
-        (error,) = run(text, path=BUILDER)
-        self.assertTrue(error.startswith(f'{BUILDER}:4:'), error)
+        errors = run(text, path=BUILDER)
+        self.assertEqual(len(errors), 2)
+        self.assertTrue(errors[0].startswith(f'{BUILDER}:2:'), errors)
+        self.assertTrue(errors[1].startswith(f'{BUILDER}:4:'), errors)
 
     def test_a_file_note_or_quoted_marker_does_not_authorize_a_diagnostic(self):
         for text in [
@@ -458,64 +460,44 @@ class TheAllowlist(unittest.TestCase):
             self.assertTrue(path.startswith(guard.SCANNED) and path.endswith(".rs"), path)
             self.assertTrue(count is None or count >= 1, path)
 
-    def test_counted_exceptions_cite_the_step_that_revisits_them(self):
+    def test_counted_exceptions_are_only_reviewed_data_or_value_adapters(self):
         holes = {p: v for p, v in guard.ALLOWED.items() if v[0] is not None}
-        self.assertEqual(
-            sorted(holes), [
-                'crates/pbps-cli/src/adopt.rs',
-                'crates/pbps-cli/src/baseline.rs',
-                'crates/pbps-cli/src/declaration_file.rs',
-                'crates/pbps-cli/src/dependents.rs',
-                'crates/pbps-cli/src/dependents/schedule.rs',
-                'crates/pbps-cli/src/dependents/split_oracle.rs',
-                'crates/pbps-cli/src/deploy.rs',
-                'crates/pbps-cli/src/engine.rs',
-                'crates/pbps-cli/src/explain/resolver.rs',
-                'crates/pbps-cli/src/object_order.rs',
-                'crates/pbps-cli/src/report.rs',
-                'crates/pbps-cli/src/resolver/scope.rs',
-                'crates/pbps-cli/src/status.rs',
-                'crates/pbps-cli/tests/flow.rs',
-                'crates/pbps-cli/tests/flow_pg.rs',
-                'crates/pbps-dialect/src/lib.rs',
-                'crates/pbps-dialect/tests/support/positional_preflight.rs',
-                'crates/pbps-diff/src/identity.rs',
-                'crates/pbps-diff/src/order/deployment.rs',
-                'crates/pbps-diff/src/schema_diff.rs',
-                'crates/pbps-docs/src/erd.rs',
-                'crates/pbps-model/src/change.rs',
-                'crates/pbps-model/src/module.rs',
-                'crates/pbps-model/src/name.rs',
-                'crates/pbps-model/src/schema.rs',
-                'crates/pbps-model/src/types.rs',
-                'crates/pbps-mssql/src/estimate.rs',
-                'crates/pbps-mssql/src/introspect.rs',
-                'crates/pbps-mssql/src/lib.rs',
-                'crates/pbps-mssql/src/resolver/authorization.rs',
-                'crates/pbps-mssql/src/types.rs',
-                'crates/pbps-mssql/src/validate.rs',
-                'crates/pbps-mssql/tests/live.rs',
-                'crates/pbps-mssql/tests/support/resolver.rs',
-                'crates/pbps-pg/src/data_triggers.rs',
-                'crates/pbps-pg/src/estimate.rs',
-                'crates/pbps-pg/src/impact.rs',
-                'crates/pbps-pg/src/lib.rs',
-                'crates/pbps-pg/src/partition_series.rs',
-                'crates/pbps-pg/src/resolver.rs',
-                'crates/pbps-pg/src/resolver/authorization.rs',
-                'crates/pbps-pg/src/resolver/externals.rs',
-                'crates/pbps-pg/src/resolver/reconstruct.rs',
-                'crates/pbps-pg/src/roles.rs',
-                'crates/pbps-pg/src/type_refs.rs',
-                'crates/pbps-pg/src/types.rs',
-                'crates/pbps-pg/src/validate.rs',
-                'crates/pbps-pg/tests/live.rs',
-                'crates/pbps-pg/tests/support/resolver.rs',
-                'crates/pbps-policy/src/evaluate.rs',
-            ]
-        )
+        self.assertEqual(sorted(holes), [
+            'crates/pbps-cli/src/baseline.rs',
+            'crates/pbps-cli/src/declaration_file.rs',
+            'crates/pbps-cli/src/dependents.rs',
+            'crates/pbps-cli/src/dependents/schedule.rs',
+            'crates/pbps-cli/src/dependents/split_oracle.rs',
+            'crates/pbps-cli/src/object_order.rs',
+            'crates/pbps-cli/src/report.rs',
+            'crates/pbps-cli/src/resolver/scope.rs',
+            'crates/pbps-cli/src/status.rs',
+            'crates/pbps-cli/tests/flow.rs',
+            'crates/pbps-cli/tests/flow_pg.rs',
+            'crates/pbps-dialect/tests/support/positional_preflight.rs',
+            'crates/pbps-diff/src/identity.rs',
+            'crates/pbps-diff/src/schema_diff.rs',
+            'crates/pbps-docs/src/erd.rs',
+            'crates/pbps-model/src/change.rs',
+            'crates/pbps-model/src/module.rs',
+            'crates/pbps-model/src/name.rs',
+            'crates/pbps-model/src/types.rs',
+            'crates/pbps-mssql/src/resolver/authorization.rs',
+            'crates/pbps-mssql/tests/live.rs',
+            'crates/pbps-mssql/tests/support/resolver.rs',
+            'crates/pbps-pg/src/data_triggers.rs',
+            'crates/pbps-pg/src/resolver.rs',
+            'crates/pbps-pg/src/resolver/authorization.rs',
+            'crates/pbps-pg/src/resolver/externals.rs',
+            'crates/pbps-pg/src/resolver/reconstruct.rs',
+            'crates/pbps-pg/src/type_refs.rs',
+            'crates/pbps-pg/tests/live.rs',
+            'crates/pbps-pg/tests/support/resolver.rs',
+            'crates/pbps-policy/src/evaluate.rs',
+        ])
         for path, (_, why) in holes.items():
-            self.assertIn("#2084 step 5", why, path)
+            self.assertNotIn("#2084 step 5", why, path)
+            self.assertNotIn("whole-escaped", why, path)
 
 
 if __name__ == "__main__":

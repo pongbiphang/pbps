@@ -1256,7 +1256,10 @@ pub fn spelling_queries(
             .get(column)
             .ok_or_else(|| RowsError::Unreadable {
                 table: name.clone(),
-                why: format!("`{column}` is not among its columns"),
+                why: format!(
+                    "`{column}` is not among its columns",
+                    column = pbps_model::escape::Escaped(column),
+                ),
             })?;
         let ty = crate::types::normalize(&spec.ty).map_err(|e| RowsError::Unreadable {
             table: name.clone(),
@@ -1709,10 +1712,9 @@ pub(crate) fn data_problems(
              past any lock, a sequence cannot be locked, and an advance survives the rollback of \
              a failed apply (ADR-0013 section 2). Declare the rows by a natural key, or place them \
              outside pbps and adopt them with `pbps baseline`.",
-            name.schema,
-            name.name,
-            // raw: whole-message escaped until #2084 step 5.
-            key = key.raw(),
+            pbps_model::escape::Escaped(&name.schema),
+            pbps_model::escape::Escaped(&name.name),
+            key = key.shown(),
         )));
     }
     // A `serial` key is the same construct with the same sequence left behind
@@ -1723,6 +1725,7 @@ pub(crate) fn data_problems(
         && let Some(spec) = table.columns.get(key)
         && let ValueSource::Sequence(sequence) = &spec.value_source
     {
+        let sequence_name = crate::emit::owned_sequence(name, key.raw(), sequence);
         errs.push(invalid(format!(
             "a `data:` block cannot key its rows by `{key}`, a `serial` column. A pinned key is \
              inserted as written and leaves the sequence `{}` behind, so the next ordinary insert \
@@ -1730,10 +1733,8 @@ pub(crate) fn data_problems(
              deployment succeeds and the application breaks afterwards. There is nothing pbps \
              can safely do to the sequence (ADR-0013 section 2). Declare the rows by a natural \
              key, or place them outside pbps and adopt them with `pbps baseline`.",
-            // raw: whole-message escaped until #2084 step 5
-            crate::emit::owned_sequence(name, key.raw(), sequence).raw(),
-            // raw: whole-message escaped until #2084 step 5.
-            key = key.raw(),
+            sequence_name.shown(),
+            key = key.shown(),
         )));
     }
 
@@ -1769,8 +1770,8 @@ pub(crate) fn data_problems(
                         ValueKind::Int => "a bare integer",
                         ValueKind::Text => "a quoted string",
                     },
-                    // raw: whole-message escaped until #2084 step 5.
-                    column = column.raw(),
+                    column = column.shown(),
+                    key = pbps_model::escape::Escaped(&key.to_string()),
                 )));
                 continue;
             }
@@ -1786,8 +1787,8 @@ pub(crate) fn data_problems(
                      would refuse the insert",
                     range.start(),
                     range.end(),
-                    // raw: whole-message escaped until #2084 step 5.
-                    column = column.raw(),
+                    column = column.shown(),
+                    key = pbps_model::escape::Escaped(&key.to_string()),
                 )));
             }
             if let (Value::Text(t), "bytea") = (value, base.as_str())
@@ -1871,7 +1872,6 @@ fn not_a_bytea(text: &str) -> Option<&'static str> {
 /// A note rather than silence, because a command that reports clean about a
 /// question it never asked is the shape this project's own rule is about:
 /// absent, empty and unreadable are three different answers (DECISIONS 327).
-// Shared finding JSON stays raw until #2084 step 5 (DEC-2084.1); text escapes it once.
 pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
     let mut out = Vec::new();
     for (name, table) in &schema.tables {
@@ -1898,10 +1898,9 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
                  fails on the primary key. `pbps plan --db` asks the engine; this run did not \
                  (ADR-0013 section 5).",
                 data.rows.len(),
-                name = name.raw(),
+                name = name.shown(),
 
-                // raw: whole-message escaped until #2084 step 5.
-                key = key.raw(),
+                key = key.shown(),
             ));
         }
         let Some(column) = table.columns.get(&key) else {
@@ -1935,11 +1934,9 @@ pub fn not_checked_offline(schema: &pbps_model::Schema) -> Vec<String> {
              `{ty}`, the type of `{key}`, and reads back with the same spelling. Even one \
              key can be refused or respelled by the engine. `pbps plan --db` checks the \
              key conversion and spelling against the live column.",
-            name = name.raw(),
-            // raw: whole-message escaped until #2084 step 5.
-            key = key.raw(),
-            // Raw data, escaped by the diagnostic writer until #2084 step 5.
-            ty = ty.raw(),
+            name = name.shown(),
+            key = key.shown(),
+            ty = ty.shown(),
         ));
     }
     out

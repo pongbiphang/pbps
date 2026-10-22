@@ -1,5 +1,3 @@
-// Shared Pulled warnings remain raw until #2084 step 5 (DEC-2084.1); terminal warning boundaries escape them.
-
 //! `pbps` — declarative database schema version control.
 
 use crate::emission::Engine as _;
@@ -1657,7 +1655,7 @@ fn cmd_pull(
     })?;
 
     for notice in &pulled.onboarding_notices {
-        eprintln!("warning: {}", pbps_model::escape::Escaped(notice));
+        eprintln!("warning: {}", notice);
     }
     for warning in &pulled.warnings {
         eprintln!("warning: {warning}");
@@ -2143,8 +2141,6 @@ pub(crate) fn declaration_problems(
     declaration_problems_with_sources(loaded, dialect, &Default::default())
 }
 
-// Diagnostic prose combines shown names with escaped DialectError displays;
-// never escape these sentences whole until #2084 step 5 (DEC-2084.1).
 fn declaration_problems_with_sources(
     loaded: &pbps_load::Loaded,
     dialect: &dyn Dialect,
@@ -2491,14 +2487,7 @@ fn validate_inspected(
             dialect
                 .declaration_notes(&l.schema)
                 .into_iter()
-                .map(|note| {
-                    // Raw probe data becomes finding prose here until #2084 step 5
-                    // (DEC-2084.1); it contains no rendered error.
-                    output::Finding::note(
-                        "dialect.not-checked",
-                        pbps_model::escape::Escaped(&note).to_string(),
-                    )
-                }),
+                .map(|note| output::Finding::note("dialect.not-checked", note)),
         );
 
         // The project's own rules (ADR-0008): the declaration point. The block

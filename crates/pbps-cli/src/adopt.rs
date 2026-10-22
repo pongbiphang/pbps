@@ -1,6 +1,3 @@
-// Catalog descriptions feed JSON as well as text. Keep operands raw until
-// #2084 step 5 (DEC-2084.1). Warnings are prose beside validation error displays.
-
 //! What an adoption writes, and what it leaves out because `validate` would
 //! refuse it (#902).
 //!
@@ -86,8 +83,8 @@ pub(crate) async fn hand_over_external_partitions(
             {
                 pulled.onboarding_notices.push(format!(
                     "table `{template}` was left out: it is pg_partman's template for `{}`",
-                    m.parent.raw(),
-                    template = template.raw()
+                    m.parent.shown(),
+                    template = template.shown()
                 ));
             }
             if parent(&pulled.schema, &m.parent) {
@@ -152,7 +149,7 @@ pub(crate) async fn hand_over_external_partitions(
             "table `{name}`: its partitions are external ({why}), so its {} partition(s) are not \
              declared",
             partitions.len(),
-            name = name.raw()
+            name = name.shown()
         ));
     }
     if !refused.is_empty() {

@@ -1,5 +1,3 @@
-// Shared catalog, check and unmanaged inventories stay raw for JSON until #2084 step 5 (DEC-2084.1); text boundaries escape them.
-
 //! The commands that need a database: recording state, adopting a database, and
 //! building one from the declarations (SPEC §8, §9.2).
 //!
@@ -328,7 +326,8 @@ fn refuse_occupied_names(
          `pbps baseline --reason ...`, after which the declaration is compared with it rather \
          than created.",
         taken.len(),
-        taken.join("\n  ")
+        taken.join("\n  "),
+        label = pbps_model::escape::Escaped(label),
     );
 }
 
@@ -543,7 +542,8 @@ pub(crate) fn refuse_uninventoried_occupants(
         "`{label}` already uses {} name(s) this plan would create or move an object onto, for \
          objects that share PostgreSQL's relation namespace with tables and views:\n  {}\n{remedy}",
         taken.len(),
-        taken.join("\n  ")
+        taken.join("\n  "),
+        label = pbps_model::escape::Escaped(label),
     );
 }
 
@@ -2424,7 +2424,7 @@ impl<'f> Walk<'f> {
                     format!(
                         "{}, which a later change frees: `{}` {}",
                         t.line,
-                        change.subject(),
+                        pbps_model::escape::Escaped(&change.subject()),
                         crate::report::describe(change)
                     )
                 }
@@ -2438,7 +2438,8 @@ impl<'f> Walk<'f> {
              rename the object in the database, or — for a table or module pbps can read — \
              adopt it as it stands with `pbps baseline --reason ...`.",
             self.taken.len(),
-            lines.join("\n  ")
+            lines.join("\n  "),
+            label = pbps_model::escape::Escaped(label),
         );
         if later {
             message.push_str(
@@ -2739,7 +2740,8 @@ async fn refuse_moved_database_collation(
             "`{label}` has default collation {} now, and this plan was computed against `{planned}`.\n\
              A column it creates or alters without a collation would take the new default, \
              which is not what was approved. Recompute the plan with `pbps plan --db`.",
-            now.map_or_else(|| "none readable".to_owned(), |n| format!("`{n}`"))
+            now.map_or_else(|| "none readable".to_owned(), |n| format!("`{n}`")),
+            label = pbps_model::escape::Escaped(label),
         );
     }
     Ok(())
@@ -2784,15 +2786,18 @@ fn moved_time_zone(
             "`{label}` reads offset-less date/time values in `{now}` now, and this plan \
              was computed in `{planned}`.\nEvery `timestamptz` and `timetz` it writes \
              without an offset would be stored at another instant than the one approved. \
-             {remedy}"
+             {remedy}",
+            label = pbps_model::escape::Escaped(label),
         )),
         (Some(planned), None) => Some(format!(
             "`{label}` reports no session time zone, and this plan was computed in \
-             `{planned}`. {remedy}"
+             `{planned}`. {remedy}",
+            label = pbps_model::escape::Escaped(label),
         )),
         (None, Some(now)) => Some(format!(
             "`{label}` reads offset-less date/time values in `{now}`, and this plan records \
-             no time zone, so what it writes was not read in one. {remedy}"
+             no time zone, so what it writes was not read in one. {remedy}",
+            label = pbps_model::escape::Escaped(label),
         )),
     }
 }
@@ -2993,7 +2998,8 @@ async fn refuse_taken_history_names(
          SQL Server would take an existing table whose columns match as the history, with its \
          rows, rather than refuse. Drop or rename that object, or name another history table.",
         taken.len(),
-        taken.join("\n  ")
+        taken.join("\n  "),
+        label = pbps_model::escape::Escaped(label),
     );
 }
 
@@ -3185,9 +3191,8 @@ pub(crate) fn catalogued_as(
 /// Prints what [`refuse_misspelt`] could not ask, for a command whose
 /// warnings go to stderr.
 pub(crate) fn warn_unasked(unasked: &[String]) {
-    // Shared warnings keep the plan's whole-message boundary until #2084 step 5.
     for w in unasked {
-        eprintln!("warning: {}", pbps_model::escape::Escaped(w));
+        eprintln!("warning: {}", w);
     }
 }
 
@@ -3787,8 +3792,6 @@ pub(crate) fn managed_limitations(
     modules: &std::collections::BTreeSet<ModuleId>,
     external: &BTreeSet<TableName>,
 ) -> Vec<String> {
-    // Catalog refusal/detail prose already contains shown names beside rendered
-    // errors; preserve that single pass until #2084 step 5 (DEC-2084.1).
     let mut managed_tables: std::collections::BTreeSet<_> = ids.tables.values().collect();
     // A partition of a managed parent whose partitions are external (#1533)
     // is held only as its parent makes it: what the catalog read could not
@@ -4075,7 +4078,8 @@ fn warn_unreleased(label: &str, released: &Result<bool, pbps_db::DbError>) {
     if let Err(e) = released {
         eprintln!(
             "warning: the deployment lock on `{label}` was not released: {e}\n\
-             Release it with `pbps unlock` before the next attempt."
+             Release it with `pbps unlock` before the next attempt.",
+            label = pbps_model::escape::Escaped(label),
         );
     }
 }
@@ -4146,9 +4150,6 @@ pub(crate) fn unmanaged_objects(
     ids: &IdsFile,
     managed_modules: &std::collections::BTreeSet<ModuleId>,
 ) -> Vec<String> {
-    // Operator-facing labels only: the machine inventory remains typed and raw
-    // in Scoped/DriftReport.unmanaged. Show its names before combining them with
-    // unreadable-module prose until #2084 step 5 (DEC-2084.1).
     let managed_tables = ids.tables.values().collect();
     scoped
         .unmanaged
@@ -4218,8 +4219,6 @@ fn apply_unmanaged_policy(names: &[String], policy: pbps_config::Unmanaged) -> a
     if names.is_empty() {
         return Ok(());
     }
-    // Labels already contain shown names beside rendered refusal prose.
-    // Preserve that single pass until #2084 step 5 (DEC-2084.1).
     let names_shown = names.join(", ");
     match policy {
         pbps_config::Unmanaged::Ignore => {}
@@ -4305,7 +4304,8 @@ fn refuse_unexpressible(scoped: &pbps_diff::Scoped, label: &str, then: &str) -> 
     bail!(
         "`{label}` holds what the declarations cannot express:\n  {}\n\
          Resolve it by hand, then {then}.",
-        scoped.unexpressible.join("\n  ")
+        scoped.unexpressible.join("\n  "),
+        label = pbps_model::escape::Escaped(label),
     );
 }
 
@@ -5392,7 +5392,8 @@ fn refuse_pinned_movement(
          The state `apply` records is the database read back, so another session's change \
          committed during the run would have been written down as this plan's own result, \
          and every later `verify` would call it clean.",
-        moved.join("\n  ")
+        moved.join("\n  "),
+        label = pbps_model::escape::Escaped(label),
     );
 }
 
@@ -5476,7 +5477,8 @@ fn recorded_verify_state(
             "state.no-entries",
             anyhow::anyhow!(
                 "`{label}` has a ledger but no entries; there is nothing to compare against.\n\
-                 Record one with `pbps snapshot` or `pbps baseline --reason ...`."
+                 Record one with `pbps snapshot` or `pbps baseline --reason ...`.",
+                label = pbps_model::escape::Escaped(label),
             ),
         )),
         Err(error) => {
@@ -5646,7 +5648,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
                     "verify",
                     vec![crate::output::Finding::error(
                         id,
-                        format!("{}: {error:#}", target.label),
+                        format!("{}: {error:#}", pbps_model::escape::Escaped(&target.label)),
                     )],
                 );
             }
@@ -5671,7 +5673,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
                     // drift verdict reads as a bug in the tool rather than a
                     // fact about the database.
                     "`{}` no longer matches its recorded state ({} difference(s))",
-                    target.label,
+                    pbps_model::escape::Escaped(&target.label),
                     report.changes.changes.len() + report.unexpressible.len()
                 ),
             )
@@ -5683,7 +5685,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
     for e in &report.unexpressible {
         findings.push(crate::output::Finding::error(
             "state.drift-unexpressible",
-            format!("{}: {e}", target.label),
+            format!("{}: {e}", pbps_model::escape::Escaped(&target.label)),
         ));
     }
     // The typed report predates managed modules and carries tables only. JSON
@@ -5699,7 +5701,7 @@ pub fn cmd_verify(project: &Project, target: &Target, json: bool) -> anyhow::Res
         findings.push(
             crate::output::Finding::error(
                 "state.unmanaged-refused",
-                format!("{}: {refusal}", target.label),
+                format!("{}: {refusal}", pbps_model::escape::Escaped(&target.label)),
             )
             .remedy("pbps pull, or relax `unmanaged:` in pbps.yml"),
         );
@@ -5789,7 +5791,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                          `pbps verify` shows what changed. Then either put the database back and \
                          re-run, or accept it with `pbps baseline --reason ...`.\n\
                          `--force` records it anyway.",
-                        target.label,
+                        pbps_model::escape::Escaped(&target.label),
                         previous.applied_at,
                         previous.id
                     );
@@ -5802,7 +5804,7 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
                     "pbps has never recorded a state for `{}`.\n\
                      Adopt it deliberately with `pbps baseline --reason ...`, or `--force` to \
                      record it as it stands.",
-                    target.label
+                    pbps_model::escape::Escaped(&target.label)
                 ),
                 Ok(None) => {}
                 Err(e) => return Err(e.into()),
@@ -5838,7 +5840,8 @@ pub fn cmd_snapshot(project: &Project, target: &Target, force: bool) -> anyhow::
         };
         println!(
             "Recorded the state of `{}` as entry #{id} ({} table(s)).",
-            target.label, tables
+            pbps_model::escape::Escaped(&target.label),
+            tables
         );
         // The ledger row is durable even when deleting the lock row fails.
         // Report that before surfacing cleanup so retrying cannot look safe.
@@ -5979,7 +5982,8 @@ fn refuse_handing_over_held_partitions(
          revert the drop intent with `git revert <drop-intent-commit>` so the baseline records \
          it missing (DEC-1852.1).",
         lines.len(),
-        lines.join("\n  ")
+        lines.join("\n  "),
+        label = pbps_model::escape::Escaped(label),
     );
 }
 
@@ -6088,7 +6092,7 @@ pub fn cmd_baseline(
                 finish_transaction(&mut conn, dialect.as_ref(), body).await
             }?;
             for said in &removed {
-                println!("Removed {}.", pbps_model::escape::Escaped(said));
+                println!("Removed {}.", said);
             }
             Ok::<_, anyhow::Error>((id, tables))
         }
@@ -6103,7 +6107,8 @@ pub fn cmd_baseline(
         };
         println!(
             "Baselined `{}` as entry #{id}: {} table(s) are now the starting point.",
-            target.label, tables
+            pbps_model::escape::Escaped(&target.label),
+            tables
         );
         println!("Reason recorded: {reason}");
         // The baseline was recorded even if cleanup now reports an error.
@@ -6273,7 +6278,8 @@ fn refuse_nonempty_bootstrap(
              Bootstrap builds into an empty database; use `pbps plan --db` and `pbps \
              apply` to migrate it instead.",
             names.len(),
-            names.join(", ")
+            names.join(", "),
+            label = pbps_model::escape::Escaped(label),
         );
     }
     Ok(())
@@ -6701,7 +6707,7 @@ pub fn cmd_bootstrap(
             };
             println!(
                 "Bootstrapped `{}`: {} table(s) created, recorded as entry #{id}.",
-                target.label,
+                pbps_model::escape::Escaped(&target.label),
                 snapshot.schema.tables.len()
             );
             // Both the DDL and ledger row committed before lock cleanup began.
@@ -6755,7 +6761,7 @@ pub fn cmd_prune(target: &Target, keep: u32) -> anyhow::Result<()> {
         let kept = keep.max(1);
         println!(
             "Pruned {removed} old snapshot(s) from `{}`; the {kept} newest remain.",
-            target.label
+            pbps_model::escape::Escaped(&target.label)
         );
         if keep == 0 {
             println!(
@@ -6777,7 +6783,10 @@ pub fn cmd_unlock(target: &Target) -> anyhow::Result<()> {
                     .as_ref()
                     .map(|h| format!("`{}` since {}", h.locked_by, h.locked_at))
                     .unwrap_or_else(|| "an unnamed holder".to_owned());
-                println!("Released the lock on `{}`, held by {who}.", target.label);
+                println!(
+                    "Released the lock on `{}`, held by {who}.",
+                    pbps_model::escape::Escaped(&target.label)
+                );
                 // Printed after the release as well as in every "locked by"
                 // refusal before it: if the holder is in fact alive, this is
                 // how to find it and stop it before it records over whatever
@@ -6790,7 +6799,10 @@ pub fn cmd_unlock(target: &Target) -> anyhow::Result<()> {
                 // detection is for.
                 println!("Run `pbps verify` before applying anything else.");
             }
-            false => println!("`{}` was not locked.", target.label),
+            false => println!(
+                "`{}` was not locked.",
+                pbps_model::escape::Escaped(&target.label)
+            ),
         }
         Ok(())
     })
@@ -6887,7 +6899,7 @@ pub fn cmd_plan_db(
             bail!(
                 "`{}` has a ledger but no entries; there is nothing to plan against.\n\
                  Record one with `pbps baseline --reason ...`.",
-                target.label
+                pbps_model::escape::Escaped(&target.label)
             );
         };
         refuse_mid_deployment(&entry, &target.label)?;
@@ -6943,7 +6955,7 @@ pub fn cmd_plan_db(
         // read-only command stays in its one JSON report (SPEC §9.8; #1660).
         for w in unasked {
             if !json {
-                eprintln!("warning: {}", pbps_model::escape::Escaped(&w));
+                eprintln!("warning: {}", w);
             }
             findings.push(crate::output::Finding::warning(
                 "plan.partition-default-unasked",
@@ -7027,7 +7039,7 @@ pub fn cmd_plan_db(
                  Planning would propose creating them, and `CREATE OR ALTER` would replace what \
                  is there. Remove the declaration, or recreate the object in a form pbps can \
                  express.",
-                target.label,
+                pbps_model::escape::Escaped(&target.label),
                 colliding.len(),
                 colliding.join(", ")
             );
@@ -7082,7 +7094,7 @@ pub fn cmd_plan_db(
             bail!(
                 "`{}` has drifted from the state recorded at {} (entry #{}).\n\
                  Run `pbps verify --env/--db ...` to see how, and resolve it before planning.",
-                target.label,
+                pbps_model::escape::Escaped(&target.label),
                 entry.applied_at,
                 entry.id
             );
@@ -7103,15 +7115,15 @@ pub fn cmd_plan_db(
                      {} row(s) now.",
                     scope.mode,
                     observed.rows.len(),
-                    name = name.raw()
+                    name = name.shown()
                 ),
                 None => format!(
                     "Reference data: {name} does not exist yet; its declared rows go in with it.",
-                    name = name.raw()
+                    name = name.shown()
                 ),
             };
             if !json {
-                println!("{}", pbps_model::escape::Escaped(&message));
+                println!("{}", message);
             }
             findings.push(crate::output::Finding::note("data.adoption", message));
         }
@@ -7593,7 +7605,7 @@ pub fn cmd_plan_db(
                          Move the ownership first (`ALTER AUTHORIZATION ON {} TO dbo;`, \
                          by hand, since pbps does not decide who owns a securable), or keep \
                          the role.",
-                        target.label,
+                        pbps_model::escape::Escaped(&target.label),
                         securables.join(", "),
                         securables[0],
                         name = name.shown(),
@@ -7670,8 +7682,8 @@ pub fn cmd_plan_db(
                  index operations.\n\
                  The statement would fail partway through the apply. Remove the hint, or deploy \
                  this change to an edition that supports it.",
-                verdict.refused_online.join(", "),
-                target.label,
+                verdict.refused_online.iter().map(|subject| pbps_model::escape::Escaped(subject).to_string()).collect::<Vec<_>>().join(", "),
+                pbps_model::escape::Escaped(&target.label),
                 verdict.runs
             );
             if json {
@@ -7742,7 +7754,7 @@ pub fn cmd_plan_db(
                 // recheck must see and refuse (DEC-1685.1).
                 let mut fresh = pbps_db::Conn::connect(conn.driver(), target.connection())
                     .await
-                    .with_context(|| format!("cannot reach `{}` for the recheck", target.label))?;
+                    .with_context(|| format!("cannot reach `{}` for the recheck", pbps_model::escape::Escaped(&target.label)))?;
                 let rechecked = match unsealed.recheck(&mut fresh).await {
                     Ok(rechecked) => rechecked,
                     Err(refused) => {
@@ -7782,7 +7794,7 @@ pub fn cmd_plan_db(
                 managed.database_collation.clone(),
                 conn.session_zone().cloned(),
             ),
-            format!("{} as queried (entry #{})", target.label, entry.id),
+            format!("{} as queried (entry #{})", pbps_model::escape::Escaped(&target.label), entry.id),
             vec![
                 permission_support,
                 generation_support,
@@ -7919,11 +7931,7 @@ pub fn cmd_plan_db(
             }
             print!("{}", crate::report::plan(&cs, &names));
             for check in &data.connected_checks {
-                println!(
-                    "{}: {}",
-                    check.name,
-                    pbps_model::escape::Escaped(&check.message)
-                );
+                println!("{}: {}", check.name, check.message);
             }
             if let Some(cost) = &data.cost {
                 print!("{}", crate::cost::render(cost));
@@ -8123,7 +8131,7 @@ pub fn cmd_apply(
             println!(
                 "Applied {} change(s) to `{}`{}; recorded as entry #{entry}.",
                 plan.changes.changes.len(),
-                target.label,
+                pbps_model::escape::Escaped(&target.label),
                 if request.staged { " (staged)" } else { "" }
             );
             // Preserve the original public hook contract: successful applies
@@ -8452,7 +8460,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
     let Some(mut entry) = crate::engine::latest(conn).await? else {
         bail!(
             "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",
-            target.label
+            pbps_model::escape::Escaped(&target.label)
         );
     };
     // First, before anything is read: in another zone every offset-less
@@ -8521,7 +8529,7 @@ async fn apply_under_lock<D: crate::emission::Engine>(
              database now:  {live}\n\
              Something changed since the plan was approved. `pbps verify` shows what; \
              then recompute the plan with `pbps plan --db`.",
-            target.label,
+            pbps_model::escape::Escaped(&target.label),
             plan.baseline.checksum
         );
     }
@@ -8894,7 +8902,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
     let Some(mut entry) = crate::engine::latest(conn).await? else {
         bail!(
             "`{}` has a ledger but no entries; a plan cannot be pinned to a state that was never recorded.",
-            target.label
+            pbps_model::escape::Escaped(&target.label)
         );
     };
 
@@ -8926,7 +8934,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 "`{}` has no staged apply in progress: its newest entry (#{}) is an ordinary \
                  {} state.\n\
                  Run `pbps apply --staged` without `--resume` to start this plan.",
-                target.label,
+                pbps_model::escape::Escaped(&target.label),
                 entry.id,
                 entry.snapshot.kind
             ),
@@ -8977,7 +8985,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                  already done. Resuming cannot decide that for you — the remaining statements \
                  must not run against a database nobody planned for — so take the database as \
                  it stands with `pbps baseline --reason ...` and plan the rest from there.",
-                target.label,
+                pbps_model::escape::Escaped(&target.label),
                 entry.id
             );
         }
@@ -9038,7 +9046,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                 "`{}` is mid-deployment: entry #{} is a staged checkpoint ({} of {} statements).\n\
                  Finish it with `pbps apply --staged --resume --plan ...`, or take the database \
                  as it stands with `pbps baseline --reason ...`.",
-                target.label,
+                pbps_model::escape::Escaped(&target.label),
                 entry.id,
                 entry.snapshot.staged.as_ref().map_or(0, |p| p.completed),
                 entry.snapshot.staged.as_ref().map_or(0, |p| p.total)
@@ -9075,7 +9083,7 @@ async fn apply_staged_under_lock<D: crate::emission::Engine>(
                  database now:  {live}\n\
                  Something changed since the plan was approved. `pbps verify` shows what; \
                  then recompute the plan with `pbps plan --db --staged`.",
-                target.label,
+                pbps_model::escape::Escaped(&target.label),
                 plan.baseline.checksum
             );
         }
@@ -9699,7 +9707,8 @@ fn refuse_unmet_public_execution(
     if !unmet.is_empty() {
         bail!(
             "{label} does not hold what this plan settled about PUBLIC execution:\n  {}",
-            unmet.join("\n  ")
+            unmet.join("\n  "),
+            label = pbps_model::escape::Escaped(label),
         );
     }
     Ok(())
@@ -9764,7 +9773,8 @@ fn refuse_mid_deployment(entry: &pbps_db::LedgerEntry, label: &str) -> anyhow::R
          stands with `pbps baseline --reason ...`.",
         entry.id,
         progress.completed,
-        progress.total
+        progress.total,
+        label = pbps_model::escape::Escaped(label),
     )
 }
 
@@ -9965,7 +9975,12 @@ async fn preflight<D: crate::emission::Engine>(
              online index operations.\n\
              The plan was approved against an edition that supports it. Recompute it against \
              this environment with `pbps plan --db`.",
-            verdict.refused_online.join(", "),
+            verdict
+                .refused_online
+                .iter()
+                .map(|subject| pbps_model::escape::Escaped(subject).to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
             verdict.runs
         );
     }

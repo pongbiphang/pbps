@@ -332,7 +332,13 @@ fn explain(
                 .changes
                 .iter()
                 .filter(|p| p.risks.contains(&class))
-                .map(|p| format!("{}  {}", p.change.subject(), report::describe(&p.change)))
+                .map(|p| {
+                    format!(
+                        "{}  {}",
+                        Escaped(&p.change.subject()),
+                        report::describe(&p.change)
+                    )
+                })
                 .collect(),
         })
         .collect();
@@ -616,13 +622,8 @@ fn findings(plan: &SavedPlan, e: &Explanation) -> Vec<output::Finding> {
 
 /// The reviewer's text report.
 ///
-/// Every string out of the plan goes through [`Escaped`] here, at the one place
-/// the report is put into words, and not in [`Explanation`], which is also the
-/// JSON a machine reads and which JSON already escapes (DEC-2032.1, #2035). A
-/// name, a description or a time in a hand-made plan may hold a line break or a
-/// terminal sequence, and printed as it is it would forge a line of the report
-/// the reviewer approves from, or erase one. The report's own line breaks are
-/// the literals below; none comes from a value.
+/// Prose is rendered at its producer (DEC-2084.1). Structured identity values
+/// are escaped here, once, when placed beside that prose.
 fn render(plan: &SavedPlan, e: &Explanation) -> String {
     let mut out = String::from("Plan\n");
     out.push_str(&crate::pins::reviewed_sources(&plan.type_routines));
@@ -690,7 +691,7 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         for r in &e.risks {
             out.push_str(&format!("  {:<12} {}\n", r.class, r.why));
             for c in &r.changes {
-                out.push_str(&format!("               {}\n", Escaped(c)));
+                out.push_str(&format!("               {}\n", c));
             }
         }
     }
@@ -705,7 +706,7 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         out.push_str("  None can run: each check this plan implies is listed below.\n");
     } else {
         for p in &e.probes {
-            out.push_str(&format!("  - {}\n", Escaped(p)));
+            out.push_str(&format!("  - {}\n", p));
         }
         out.push_str(
             "  Each counts the rows that would break. A non-zero count stops the apply before\n  \
@@ -718,11 +719,7 @@ fn render(plan: &SavedPlan, e: &Explanation) -> String {
         // in apply's warnings approved without seeing them (#478).
         out.push_str("\nChecks that cannot run before the plan\n");
         for u in &e.unchecked {
-            out.push_str(&format!(
-                "  - {}: {}\n",
-                Escaped(&u.check),
-                Escaped(&u.reason)
-            ));
+            out.push_str(&format!("  - {}: {}\n", u.check, u.reason));
         }
         out.push_str(
             "  Nothing counts these rows beforehand. The engine enforces each one when the\n  \

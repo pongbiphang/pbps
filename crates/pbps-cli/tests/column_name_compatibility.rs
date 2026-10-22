@@ -310,7 +310,7 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
 }
 
 #[test]
-fn column_validation_preserves_the_whole_message_escape_boundary() {
+fn column_validation_shows_each_name_once() {
     for dialect in [
         &pbps_pg::Postgres::new() as &dyn FixtureEmission,
         &pbps_mssql::Mssql,
@@ -462,7 +462,7 @@ fn row_read_refusals_escape_column_names_once() {
 }
 
 #[test]
-fn cycling_expression_notes_keep_raw_column_identities_until_the_writer() {
+fn cycling_expression_notes_show_column_identities_once_in_every_format() {
     let mut column = Column::new("integer".parse().unwrap()).not_null();
     column.value_source = ValueSource::Identity(Identity {
         seed: 1,
@@ -502,9 +502,9 @@ fn cycling_expression_notes_keep_raw_column_identities_until_the_writer() {
     let dialect = pbps_pg::Postgres::new();
     let notes = dialect.declaration_notes(&schema);
     let reason = "has `cycle: true` and unique index `expr` has an expression over it: whether a number the sequence hands out again collides there depends on what the expression gives back, which is not checked";
-    assert_eq!(notes, [format!("app.{NAME}.{NAME} {reason}")]);
+    assert_eq!(notes, [format!("app.{SHOWN}.{SHOWN} {reason}")]);
     assert_eq!(
-        pbps_model::escape::Escaped(&notes[0]).to_string(),
+        serde_json::to_value(&notes).unwrap()[0],
         format!("app.{SHOWN}.{SHOWN} {reason}")
     );
     let index = schema

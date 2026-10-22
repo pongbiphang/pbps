@@ -427,11 +427,7 @@ pub fn changed_subjects(
     }
     for (uid, role) in before.roles.iter().chain(&now.roles) {
         if before.roles.get(uid) != now.roles.get(uid) {
-            out.insert(format!(
-                "role {role}",
-                // Canonical grouping key; it remains raw after #2084 step 5.
-                role = role.raw(),
-            ));
+            out.insert(format!("role {role}", role = role.raw(),));
         }
     }
     for (uid, name) in before.types.iter().chain(&now.types) {
@@ -475,11 +471,7 @@ pub fn changed_subjects(
             .and_then(|uid| before.roles.get(uid))
             .and_then(|old_name| before_schema.roles.get(old_name));
         if was != Some(role) {
-            out.insert(format!(
-                "role {name}",
-                // Canonical grouping key; it remains raw after #2084 step 5.
-                name = name.raw(),
-            ));
+            out.insert(format!("role {name}", name = name.raw(),));
         }
     }
     out

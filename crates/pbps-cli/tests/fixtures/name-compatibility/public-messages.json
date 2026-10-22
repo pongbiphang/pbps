@@ -1,0 +1,41 @@
+{
+  "hostile": {
+    "missing_role": "postgres: role `type\\nline\\r\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前` is declared here and the cluster does not have it. A PostgreSQL role is a cluster object, so pbps manages what a role is granted in this database and not whether the role exists (ADR-0010 section 3). Statement preview only (not pasteable: the identifier contains controls or invisible characters):\n\n    CREATE ROLE \"type\\nline\\r\"\"'\\u{1b}[31m\\u{9b}\\\\u{202e}名前\";\n\nRecreate the original identifier with your SQL client, then plan again.",
+    "rename_role": "postgres: `type\\nline\\r\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前` is still in the cluster and `type\\nline\\r\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前next` is not: the rename this revision declares has not been run. A PostgreSQL role is a cluster object and pbps does not own it (ADR-0010 section 3); the grants follow the role's oid, so nothing has to be re-granted afterwards. Statement preview only (not pasteable: the identifier contains controls or invisible characters):\n\n    ALTER ROLE \"type\\nline\\r\"\"'\\u{1b}[31m\\u{9b}\\\\u{202e}名前\" RENAME TO \"type\\nline\\r\"\"'\\u{1b}[31m\\u{9b}\\\\u{202e}名前next\";\n\nRecreate the original identifier with your SQL client, then plan again.",
+    "rename_collision": "postgres: both `type\\nline\\r\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前` and `type\\nline\\r\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前next` exist in the cluster, so `type\\nline\\r\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前next` is a different principal and not `type\\nline\\r\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前` under a new name. pbps does not own the principal (ADR-0010 section 3), and it cannot tell which of the two its declarations mean: renaming the role would move the grants, while granting to `type\\nline\\r\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前next` would leave `type\\nline\\r\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前` holding everything it holds now. Resolve the name collision by hand, preserving the intended principal and its grants, then plan again.",
+    "postgres_validation": [
+      "postgres: primary key references `absent`, which is not a column of this table"
+    ],
+    "mssql_validation": [
+      "mssql: `app.\"type\\nline\\r\"\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前\"` names a user-defined type, and references to user-defined types are not supported; declare a built-in type",
+      "mssql: primary key references `absent`, which is not a column of this table"
+    ],
+    "unsupported_type": "mssql: `app.\"type\\nline\\r\"\"'\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前\"` names a user-defined type, and references to user-defined types are not supported; declare a built-in type"
+  },
+  "unicode": {
+    "missing_role": "postgres: role `名前_ünï` is declared here and the cluster does not have it. A PostgreSQL role is a cluster object, so pbps manages what a role is granted in this database and not whether the role exists (ADR-0010 section 3). Run it by hand, then plan again:\n\n    CREATE ROLE \"名前_ünï\";",
+    "rename_role": "postgres: `名前_ünï` is still in the cluster and `名前_ünïnext` is not: the rename this revision declares has not been run. A PostgreSQL role is a cluster object and pbps does not own it (ADR-0010 section 3); the grants follow the role's oid, so nothing has to be re-granted afterwards. Run it by hand, then plan again:\n\n    ALTER ROLE \"名前_ünï\" RENAME TO \"名前_ünïnext\";",
+    "rename_collision": "postgres: both `名前_ünï` and `名前_ünïnext` exist in the cluster, so `名前_ünïnext` is a different principal and not `名前_ünï` under a new name. pbps does not own the principal (ADR-0010 section 3), and it cannot tell which of the two its declarations mean: renaming the role would move the grants, while granting to `名前_ünïnext` would leave `名前_ünï` holding everything it holds now. Resolve the name collision by hand, preserving the intended principal and its grants, then plan again.",
+    "postgres_validation": [
+      "postgres: primary key references `absent`, which is not a column of this table"
+    ],
+    "mssql_validation": [
+      "mssql: `app.\"名前_ünï\"` names a user-defined type, and references to user-defined types are not supported; declare a built-in type",
+      "mssql: primary key references `absent`, which is not a column of this table"
+    ],
+    "unsupported_type": "mssql: `app.\"名前_ünï\"` names a user-defined type, and references to user-defined types are not supported; declare a built-in type"
+  },
+  "backslash": {
+    "missing_role": "postgres: role `one\\\\backslash` is declared here and the cluster does not have it. A PostgreSQL role is a cluster object, so pbps manages what a role is granted in this database and not whether the role exists (ADR-0010 section 3). Run it by hand, then plan again:\n\n    CREATE ROLE \"one\\backslash\";",
+    "rename_role": "postgres: `one\\\\backslash` is still in the cluster and `one\\\\backslashnext` is not: the rename this revision declares has not been run. A PostgreSQL role is a cluster object and pbps does not own it (ADR-0010 section 3); the grants follow the role's oid, so nothing has to be re-granted afterwards. Run it by hand, then plan again:\n\n    ALTER ROLE \"one\\backslash\" RENAME TO \"one\\backslashnext\";",
+    "rename_collision": "postgres: both `one\\\\backslash` and `one\\\\backslashnext` exist in the cluster, so `one\\\\backslashnext` is a different principal and not `one\\\\backslash` under a new name. pbps does not own the principal (ADR-0010 section 3), and it cannot tell which of the two its declarations mean: renaming the role would move the grants, while granting to `one\\\\backslashnext` would leave `one\\\\backslash` holding everything it holds now. Resolve the name collision by hand, preserving the intended principal and its grants, then plan again.",
+    "postgres_validation": [
+      "postgres: primary key references `absent`, which is not a column of this table"
+    ],
+    "mssql_validation": [
+      "mssql: `app.\"one\\\\backslash\"` names a user-defined type, and references to user-defined types are not supported; declare a built-in type",
+      "mssql: primary key references `absent`, which is not a column of this table"
+    ],
+    "unsupported_type": "mssql: `app.\"one\\\\backslash\"` names a user-defined type, and references to user-defined types are not supported; declare a built-in type"
+  }
+}

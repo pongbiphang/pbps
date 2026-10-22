@@ -1343,18 +1343,16 @@ impl Expansion for Weave<'_> {
                     at,
                     parts: Box::new([planned(removal, dialect), planned(restoration, dialect)]),
                     tail: Vec::new(),
-                    // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
-                    reason: format!("{} depends on `{root}`", d.described, root = root.raw()),
+                    reason: format!("{} depends on `{root}`", d.described, root = root.shown()),
                 })
             }
             Need::Removed { root, k } => {
                 let d = self.dependent(root, *k)?;
                 let at = span(changes, root).ok_or_else(|| format!("{named}: no drop"))?;
-                // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
                 let reason = format!(
                     "{} depends on `{root}`, which this plan drops",
                     d.described,
-                    root = root.raw()
+                    root = root.shown()
                 );
                 match find(&view, &parts, &d.holds, partitions, removes) {
                     // Moved to the module's drop, ahead of everything from
@@ -1449,11 +1447,10 @@ impl Expansion for Weave<'_> {
                                 of: after,
                                 change: added,
                                 anchor: Anchor::After(after),
-                                // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
                                 reason: format!(
                                     "{} depends on `{root}`, which this plan rebuilds",
                                     d.described,
-                                    root = root.raw()
+                                    root = root.shown()
                                 ),
                             })],
                             respelled: Vec::new(),
@@ -1940,7 +1937,10 @@ fn oracle_before_its_partitions_indexes(
                 if let Change::AddIndex { table, name, .. } = &cs.changes[i].change {
                     (name.shown().to_string(), table.shown().to_string())
                 } else {
-                    (cs.changes[i].change.subject(), String::new())
+                    (
+                        pbps_model::escape::Escaped(&cs.changes[i].change.subject()).to_string(),
+                        String::new(),
+                    )
                 }
             };
             let refused = |k: usize, why: String| {
@@ -1960,7 +1960,7 @@ fn oracle_before_its_partitions_indexes(
                     k,
                     format!(
                         "it would pass a change to {}",
-                        cs.changes[c].change.subject()
+                        pbps_model::escape::Escaped(&cs.changes[c].change.subject())
                     ),
                 ));
             }
@@ -1980,7 +1980,7 @@ fn oracle_before_its_partitions_indexes(
                             k,
                             format!(
                                 "it rests on {}, which it could take",
-                                cs.changes[j].change.subject()
+                                pbps_model::escape::Escaped(&cs.changes[j].change.subject())
                             ),
                         )
                     },
@@ -8130,7 +8130,7 @@ mod tests {
     }
 
     #[test]
-    fn dependency_provenance_keeps_raw_json_and_is_shown_once_by_the_report() {
+    fn dependency_provenance_keeps_raw_sources_and_shown_reasons() {
         let part = "x\n\\\u{200b}";
         let raw = format!("app.{part}");
         let shown = r"app.x\n\\\u{200b}";
@@ -8156,7 +8156,7 @@ mod tests {
             };
             assert_eq!(
                 origin.reason,
-                format!("view app.child depends on `{raw}`, which this plan {suffix}")
+                format!("view app.child depends on `{shown}`, which this plan {suffix}")
             );
             let report = crate::report::changes(&cs);
             let expected =
@@ -8168,8 +8168,8 @@ mod tests {
         }
         let json = serde_json::to_value(&origins).unwrap();
         assert_eq!(json[0]["source"], raw);
-        assert!(json[0]["reason"].as_str().unwrap().contains(&raw));
-        assert!(!json[0]["reason"].as_str().unwrap().contains(shown));
+        assert!(json[0]["reason"].as_str().unwrap().contains(shown));
+        assert!(!json[0]["reason"].as_str().unwrap().contains(&raw));
     }
 
     /// A chain of views over a rebuilt view: dropped deepest first, created

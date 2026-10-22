@@ -31,8 +31,8 @@
         "class": "destructive",
         "why": "data can be lost or a uniqueness guarantee removed",
         "changes": [
-          "app.child  - unique constraint local\nline\r\u001b[31m\\‮名前uq",
-          "app.child  - index local\nline\r\u001b[31m\\‮名前ix"
+          "app.child  - unique constraint local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前uq",
+          "app.child  - index local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前ix"
         ]
       },
       {
@@ -40,9 +40,9 @@
         "why": "existing rows may not satisfy the new constraint and the statement fails",
         "changes": [
           "app.child  ~ primary key -> (id)",
-          "app.child  + unique constraint local\nline\r\u001b[31m\\‮名前uq",
-          "app.child  + foreign key local\nline\r\u001b[31m\\‮名前fk",
-          "app.child  + check constraint local\nline\r\u001b[31m\\‮名前ck"
+          "app.child  + unique constraint local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前uq",
+          "app.child  + foreign key local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前fk",
+          "app.child  + check constraint local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前ck"
         ]
       }
     ],
@@ -50,12 +50,12 @@
     "probes": [
       "existing NULLs in app.child.id, which NOT NULL would reject",
       "rows that would collide under the new primary key",
-      "rows that would collide under the new unique constraint local\nline\r\u001b[31m\\‮名前uq",
-      "rows with no matching parent for the new foreign key local\nline\r\u001b[31m\\‮名前fk"
+      "rows that would collide under the new unique constraint local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前uq",
+      "rows with no matching parent for the new foreign key local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前fk"
     ],
     "unchecked": [
       {
-        "check": "new check local\nline\r\u001b[31m\\‮名前ck on app.child",
+        "check": "new check local\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前ck on app.child",
         "reason": "the table does not exist before apply"
       }
     ],

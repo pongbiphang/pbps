@@ -1,6 +1,3 @@
-// Names in whole-escaped DialectError fields and shared probe text stay raw
-// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
-
 //! What one change looks like on PostgreSQL.
 //!
 //! The counterpart of `pbps-mssql/src/emit.rs`'s structural half, and the only
@@ -791,8 +788,9 @@ pub(crate) fn refuse_an_unresolved_default(
          either way -- so this column would default to February in one environment and January in \
          another. Write it the way the engine renders it, with the cast it welds on and a \
          spelling that cannot be read two ways: `'2026-01-02'::date` (ADR-0013 section 3, section 4).",
-        // Raw data, escaped by the diagnostic writer until #2084 step 5.
-        ty = ty.raw(),
+        ty = ty.shown(),
+        column = pbps_model::escape::Escaped(column),
+        default = pbps_model::escape::Escaped(default),
     )))
 }
 
@@ -1005,8 +1003,7 @@ fn numbering(
         if let ValueSource::Generated(_) = source {
             return Err(invalid(format!(
                 "{column}: a generated column has no numbering source to change",
-                // raw: whole-message escaped until #2084 step 5
-                column = column.raw()
+                column = column.shown()
             )));
         }
     }
@@ -1239,7 +1236,10 @@ fn column_definition(
     column: &Column,
 ) -> Result<String, DialectError> {
     if let Some(collation) = &column.collation {
-        return Err(no_column_collation(name, collation));
+        return Err(no_column_collation(
+            pbps_model::escape::Escaped(name),
+            collation,
+        ));
     }
     let mut s = format!("{} {}", quote(name)?, sql_type(&column.ty)?);
     let default = match &column.value_source {
@@ -1260,7 +1260,8 @@ fn column_definition(
                 return Err(DialectError::Invalid {
                     dialect: DIALECT,
                     message: format!(
-                        "column `{name}` is a virtual generated column, which this model does not hold"
+                        "column `{name}` is a virtual generated column, which this model does not hold",
+                        name = pbps_model::escape::Escaped(name),
                     ),
                 });
             }
@@ -1840,7 +1841,8 @@ pub(crate) fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectE
                  its own function under `SET search_path = \"shad\", \"pg_catalog\"`, with no \
                  error either way -- so listing it would let a project object shadow a built-in \
                  in a check, a filter or a default (ADR-0013 section 3). Leave it out; it is already \
-                 first."
+                 first.",
+                part = pbps_model::escape::Escaped(part),
             )));
         }
         if part == NOT_A_SCHEMA_A_PATH_CAN_NAME {
@@ -1850,7 +1852,8 @@ pub(crate) fn write_path(pg: &Postgres, schema: &str) -> Result<String, DialectE
                  quoting it does not help -- measured, `SET search_path = \"$user\"` binds an \
                  unqualified name through the deployment role's schema even where a schema \
                  called `$user` exists. A statement scoped that way would resolve a name in a \
-                 check, a filter or a default against whatever that role owns (ADR-0013 section 3)."
+                 check, a filter or a default against whatever that role owns (ADR-0013 section 3).",
+                part = pbps_model::escape::Escaped(part),
             )));
         }
         // An omitted temporary schema is implicitly searched first. Keeping
@@ -2158,8 +2161,7 @@ fn signature(id: &ModuleId) -> Result<String, DialectError> {
             "`{id}` is a routine without an argument list, and this engine identifies a routine by \
              its arguments: two overloads share the name, so `DROP FUNCTION` needs the signature \
              to say which one (ADR-0009 section 1)",
-            // raw: whole-message escaped until #2084 step 5.
-            id = id.raw()
+            id = id.shown()
         ))
     })?;
     Ok(args
@@ -2174,8 +2176,7 @@ fn attached_to(id: &ModuleId) -> Result<&TableName, DialectError> {
         invalid(format!(
             "trigger `{id}` does not say which table it is on, and on this engine a trigger's \
              name is scoped to its table rather than to a schema (ADR-0009 section 1)",
-            // raw: whole-message escaped until #2084 step 5.
-            id = id.raw()
+            id = id.shown()
         ))
     })
 }
@@ -2267,8 +2268,7 @@ fn permission_list(
         return Err(invalid(format!(
             "a grant on `{target}` names no permission, and `GRANT ON {target}` with nothing to \
              grant is a syntax error",
-            // Whole-message escaping remains until #2084 step 5.
-            target = target.raw(),
+            target = target.shown(),
         )));
     }
     Ok(permissions
@@ -2952,10 +2952,8 @@ fn the_body_declares_the_identity(
              engine the emitter writes `CREATE FUNCTION {}` and the declaration writes everything \
              after the name, so the list is the body's -- and **measured**, the engine requires \
              one: `CREATE FUNCTION f RETURNS int ...` is a syntax error",
-            // raw: whole-message escaped until #2084 step 5
-            id.object_name().raw(),
-            // raw: whole-message escaped until #2084 step 5.
-            id = id.raw()
+            id.object_name().shown(),
+            id = id.shown()
         ))];
     };
     let carried: Vec<&str> = parameters(list)
@@ -2970,8 +2968,7 @@ fn the_body_declares_the_identity(
              name -- and accept it without a word",
             args.len(),
             carried.len(),
-            // raw: whole-message escaped until #2084 step 5.
-            id = id.raw()
+            id = id.shown()
         ))];
     }
     carried
@@ -2986,10 +2983,9 @@ fn the_body_declares_the_identity(
                  definition holds, so the engine would create a different routine under this key \
                  and the next plan would not find the one named here",
                 at + 1,
-                // raw: whole-message escaped until #2084 step 5.
-                id = id.raw(),
-                // raw: whole-message escaped until #2084 step 5.
-                arg = arg.raw()
+                id = id.shown(),
+                arg = arg.shown(),
+                parameter = pbps_model::escape::Escaped(parameter),
             ))
         })
         .collect()
@@ -2998,8 +2994,7 @@ fn the_body_declares_the_identity(
 fn empty_definition(id: &ModuleId) -> DialectError {
     invalid(format!(
         "module `{id}` has an empty definition",
-        // raw: whole-message escaped until #2084 step 5.
-        id = id.raw()
+        id = id.shown()
     ))
 }
 
@@ -3030,9 +3025,9 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
     if !crate::catalog::a_projects_schema(schema) {
         found.push(invalid(format!(
             "module `{id}` is declared in `{schema}`, which this dialect's pull never reads:              `pg_catalog`, `information_schema` and every schema whose name begins with `pg_`              are excluded from the managed set. The engine would create the module and no plan              could ever see it again -- and `pg_temp` is worse than invisible, because it is              this engine's alias for the session's temporary schema: measured, `CREATE VIEW              \"pg_temp\".\"v\"` leaves a `pg_temp_4.v` that disappears with the connection.              Declare the module in a schema of the project's own",
-            // raw: whole-message escaped until #2084 step 5.
-            id = id.raw()
-        )));
+            id = id.shown()
+        ,
+schema = pbps_model::escape::Escaped(schema),)));
     }
     // The rule a table and a grant already have, for the same reason: every
     // module statement is emitted through `scoped`, whose `write_path` refuses
@@ -3045,8 +3040,8 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
              the current role's own schema wherever a `search_path` names it -- quoting does not \
              make it literal. Every statement this dialect emits for a module sets the path \
              first, so no plan can carry this one. Declare it under a name the path can carry",
-            // raw: whole-message escaped until #2084 step 5.
-            id = id.raw()
+            id = id.shown(),
+            schema = pbps_model::escape::Escaped(schema),
         )));
     }
     match module.kind {
@@ -3062,9 +3057,9 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                     invalid(format!(
                         "module `{id}` names `{name}` in an argument type, and that name is                          over {} bytes. The engine truncates a longer identifier with a NOTICE                          nothing reads and creates the routine under the truncated identity,                          which is not this key: the next plan cannot find it, and the `CREATE`                          it emits again is refused as already existing",
                         crate::MAX_IDENT_BYTES,
-                        // raw: whole-message escaped until #2084 step 5.
-                        id = id.raw()
-                    ))
+                        id = id.shown()
+                    ,
+name = pbps_model::escape::Escaped(&name),))
                 }));
                 // An empty definition is already refused above; running the
                 // parameter scan on it would say the same thing twice, in
@@ -3092,11 +3087,10 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                          declaration holds -- `CREATE TRIGGER {} AFTER INSERT ON {on} ...` -- so a \
                          definition naming another table creates the trigger there, under this \
                          key, and the next plan cannot find it",
-                        id.name(),
-                        // raw: whole-message escaped until #2084 step 5
-                        on = on.raw(),
-                        // raw: whole-message escaped until #2084 step 5.
-                        id = id.raw()
+                        pbps_model::escape::Escaped(id.name()),
+                        on = on.shown(),
+                        id = id.shown(),
+                        named = pbps_model::escape::Escaped(named),
                     ))),
                     None => found.push(invalid(format!(
                         "trigger `{id}` has a definition this dialect cannot find an `ON \
@@ -3104,10 +3098,8 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
                          created on, and it has to be the `{on}` this identity names -- so a \
                          definition whose target cannot be read is refused rather than created \
                          somewhere this key does not point",
-                        // raw: whole-message escaped until #2084 step 5
-                        on = on.raw(),
-                        // raw: whole-message escaped until #2084 step 5.
-                        id = id.raw()
+                        on = on.shown(),
+                        id = id.shown()
                     ))),
                 }
             }
@@ -3170,23 +3162,58 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         Change::CreatePolicy { table, name, policy, .. } => {
             let targets = match &policy.to {
                 pbps_model::PolicyRoles::Public => "PUBLIC".to_owned(),
-                pbps_model::PolicyRoles::Roles(roles) => roles.iter().map(|r| quote(r.raw())).collect::<Result<Vec<_>, _>>()?.join(", "),
+                pbps_model::PolicyRoles::Roles(roles) => roles
+                    .iter()
+                    .map(|r| quote(r.raw()))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(", "),
             };
-            let mut sql = format!("CREATE POLICY {} ON {} AS {} FOR {} TO {}",
-                quote(name)?, qualified(table)?, if policy.restrictive { "RESTRICTIVE" } else { "PERMISSIVE" },
-                policy.command.as_str().to_ascii_uppercase(), targets);
-            if let Some(text) = &policy.using { sql.push_str(&format!(" USING ({})", verbatim(text.raw()))); }
-            if let Some(text) = &policy.with_check { sql.push_str(&format!(" WITH CHECK ({})", verbatim(text.raw()))); }
+            let mut sql = format!(
+                "CREATE POLICY {} ON {} AS {} FOR {} TO {}",
+                quote(name)?,
+                qualified(table)?,
+                if policy.restrictive {
+                    "RESTRICTIVE"
+                } else {
+                    "PERMISSIVE"
+                },
+                policy.command.as_str().to_ascii_uppercase(),
+                targets
+            );
+            if let Some(text) = &policy.using {
+                sql.push_str(&format!(" USING ({})", verbatim(text.raw())));
+            }
+            if let Some(text) = &policy.with_check {
+                sql.push_str(&format!(" WITH CHECK ({})", verbatim(text.raw())));
+            }
             sql.push(';');
             one(pg, table, sql)
         }
-        Change::SetRowSecurity { table, from, to, .. } => {
+        Change::SetRowSecurity {
+            table, from, to, ..
+        } => {
             let mut statements = Vec::new();
             if from.enabled != to.enabled {
-                statements.extend(one(pg, table, format!("ALTER TABLE {} {} ROW LEVEL SECURITY;", qualified(table)?, if to.enabled { "ENABLE" } else { "DISABLE" }))?);
+                statements.extend(one(
+                    pg,
+                    table,
+                    format!(
+                        "ALTER TABLE {} {} ROW LEVEL SECURITY;",
+                        qualified(table)?,
+                        if to.enabled { "ENABLE" } else { "DISABLE" }
+                    ),
+                )?);
             }
             if from.forced != to.forced {
-                statements.extend(one(pg, table, format!("ALTER TABLE {} {} ROW LEVEL SECURITY;", qualified(table)?, if to.forced { "FORCE" } else { "NO FORCE" }))?);
+                statements.extend(one(
+                    pg,
+                    table,
+                    format!(
+                        "ALTER TABLE {} {} ROW LEVEL SECURITY;",
+                        qualified(table)?,
+                        if to.forced { "FORCE" } else { "NO FORCE" }
+                    ),
+                )?);
             }
             Ok(statements)
         }
@@ -3338,8 +3365,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             column,
             collation: Some(collation),
             ..
-            // raw: whole-message escaped until #2084 step 5
-        } => Err(no_column_collation(&column.raw().to_string(), collation)),
+        } => Err(no_column_collation(column.shown(), collation)),
 
         Change::AlterColumnType {
             column,
@@ -3389,13 +3415,9 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                      element type is changed only where every element keeps its value, and \
                      this change narrows or converts them. Add the new column, fill it in a \
                      declared step, and drop the old one.",
-
-                    // raw: whole-message escaped until #2084 step 5.
-                    column.name.raw(),
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    was = was.raw(),
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    normalized = normalized.raw(),
+                    column.name.shown(),
+                    was = was.shown(),
+                    normalized = normalized.shown(),
                 )));
             }
             if types::change_risk(&was, &normalized) == pbps_dialect::TypeChangeRisk::Incompatible {
@@ -3407,16 +3429,10 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                      transformation to declare and review, not one for a tool to choose \
                      (ADR-0012 section 5). Add the new column, fill it in a declared step, and drop the \
                      old one.",
-
-                    // raw: whole-message escaped until #2084 step 5.
-                    column.name.raw(),
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    types::normalize(from)?.raw(),
-
-                    // raw: whole-message escaped until #2084 step 5.
-                    column.name.raw(),
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    normalized = normalized.raw(),
+                    column.name.shown(),
+                    types::normalize(from)?.shown(),
+                    column.name.shown(),
+                    normalized = normalized.shown(),
                 )));
             }
             // The same refusal, for the same reason, on a change the risk
@@ -3443,13 +3459,9 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
                      the zone the applying session happens to hold. Say what the values mean \
                      instead: add the new column, fill it in a declared step with the zone \
                      written out (`AT TIME ZONE \'...\'`), and drop the old one.",
-
-                    // raw: whole-message escaped until #2084 step 5.
-                    column.name.raw(),
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    was = was.raw(),
-                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                    normalized = normalized.raw(),
+                    column.name.shown(),
+                    was = was.shown(),
+                    normalized = normalized.shown(),
                 )));
             }
             // One `ALTER TABLE` takes both subcommands (ADR-0011, Amendment 1),
@@ -3620,8 +3632,7 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
             dialect: crate::types::DIALECT,
             message: format!(
                 "{} is a computed column, which this model holds for SQL Server only",
-                // raw: whole-message escaped until #2084 step 5
-                table.column(name).raw()
+                table.column(name).shown()
             ),
         }),
         Change::AlterColumnExpression { column, to, .. } => one(
@@ -3848,7 +3859,11 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         Change::DropIndex { table, name } => one(
             pg,
             table,
-            format!("DROP INDEX {}.{};", quote(&table.schema)?, quote(name.raw())?),
+            format!(
+                "DROP INDEX {}.{};",
+                quote(&table.schema)?,
+                quote(name.raw())?
+            ),
         ),
 
         // The mode is a property of the declaration, not of the database: it
@@ -3887,36 +3902,40 @@ pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
         // arrived some other way names the statement a human has to run,
         // rather than becoming SQL that widens or narrows the whole cluster's
         // idea of who a principal is.
-        Change::CreateRole { name, .. } => Err(by_hand(
-            format!(
-                "`{name}` is a role, which on this engine lives in `pg_authid` and is shared by                  every database in the cluster; pbps manages what a role is granted here and not                  whether it exists (ADR-0010 section 3)",
-                // Whole-message escaping remains until #2084 step 5.
-                name = name.raw(),
-            ),
-            // ByHand escapes this SQL statement whole until #2084 step 5.
-            format!("CREATE ROLE {};", quote(name.raw())?),
-        )),
-        Change::DropRole { name, .. } => Err(by_hand(
-            format!(
-                "`{name}` is a role, and dropping one is a cluster-wide act this database's                  catalog cannot even see the reasons for: measured, with every grant *this*                  database holds revoked, the engine still refuses with `1 object in database                  otherdb`. pbps revokes what the role was granted here and leaves the role                  (ADR-0010 section 3, section 4)",
-                // Whole-message escaping remains until #2084 step 5.
-                name = name.raw(),
-            ),
-            // ByHand escapes this SQL statement whole until #2084 step 5.
-            format!("DROP ROLE {};", quote(name.raw())?),
-        )),
-        Change::RenameRole { from, to, .. } => Err(by_hand(
-            format!(
-                "`{from}` is a role, and renaming one renames it in every database of the                  cluster; pbps does not own the principal (ADR-0010 section 3). The grants follow the                  role's oid rather than its name, so nothing here has to be re-granted afterwards",
-                // Whole-message escaping remains until #2084 step 5.
-                from = from.raw(),
-            ),
-            format!("ALTER ROLE {} RENAME TO {};",
-                // ByHand escapes this SQL statement whole until #2084 step 5.
+        Change::CreateRole { name, .. } => {
+            let statement = format!("CREATE ROLE {};", quote(name.raw())?);
+            Err(by_hand(
+                format!(
+                    "`{name}` is a role, which on this engine lives in `pg_authid` and is shared by                  every database in the cluster; pbps manages what a role is granted here and not                  whether it exists (ADR-0010 section 3)",
+                    name = name.shown(),
+                ),
+                statement,
+            ))
+        }
+        Change::DropRole { name, .. } => {
+            let statement = format!("DROP ROLE {};", quote(name.raw())?);
+            Err(by_hand(
+                format!(
+                    "`{name}` is a role, and dropping one is a cluster-wide act this database's                  catalog cannot even see the reasons for: measured, with every grant *this*                  database holds revoked, the engine still refuses with `1 object in database                  otherdb`. pbps revokes what the role was granted here and leaves the role                  (ADR-0010 section 3, section 4)",
+                    name = name.shown(),
+                ),
+                statement,
+            ))
+        }
+        Change::RenameRole { from, to, .. } => {
+            let statement = format!(
+                "ALTER ROLE {} RENAME TO {};",
                 quote(from.raw())?,
-                // ByHand escapes this SQL statement whole until #2084 step 5.
-                quote(to.raw())?),
-        )),
+                quote(to.raw())?
+            );
+            Err(by_hand(
+                format!(
+                    "`{from}` is a role, and renaming one renames it in every database of the                  cluster; pbps does not own the principal (ADR-0010 section 3). The grants follow the                  role's oid rather than its name, so nothing here has to be re-granted afterwards",
+                    from = from.shown(),
+                ),
+                statement,
+            ))
+        }
         Change::Grant {
             role,
             target,
@@ -4113,23 +4132,26 @@ fn change_is_clustered(change: &Change) -> bool {
     )
 }
 
-/// The refusal for a SQL Server table layout reaching this emitter (#1178).
 /// The refusal for a column collation reaching this emitter (#1175): the
 /// model's collation is SQL Server's, `validate` refuses it here, and a
 /// statement without it would build the column under another collation.
-fn no_column_collation(column: &str, collation: &pbps_model::Collation) -> DialectError {
+fn no_column_collation(
+    column: impl std::fmt::Display,
+    collation: &pbps_model::Collation,
+) -> DialectError {
     invalid(format!(
         "column `{column}` names collation `{collation}`; column collations are modelled for \
-         SQL Server only"
+         SQL Server only",
+        collation = pbps_model::escape::Escaped(collation.as_str()),
     ))
 }
 
+/// The refusal for a SQL Server table layout reaching this emitter (#1178).
 fn no_clustered_layout(table: &TableName) -> DialectError {
     invalid(format!(
         "`{table}`: a clustered or nonclustered layout is SQL Server's; PostgreSQL has no \
          clustered index to create",
-        // raw: whole-message escaped until #2084 step 5
-        table = table.raw()
+        table = table.shown()
     ))
 }
 
@@ -4161,6 +4183,7 @@ pub(crate) fn moving_beyond_its_intent(
          <every column but the generated ones>) INSERT INTO {q} <the same columns> SELECT * \
          FROM moved; ALTER TABLE {p} ATTACH PARTITION {q} {bound};"
     );
+    let by_hand = pbps_model::escape::Escaped(&by_hand);
     Ok(match moves_at_most {
         None => format!(
             "rows of {default} are {inside} {partition}, its parent {parent}'s new \
@@ -4168,9 +4191,9 @@ pub(crate) fn moving_beyond_its_intent(
              whatever reads the database's changes; nothing was moved. Allow it with \
              `pbps move-rows {partition} --max-rows <N> --reason <why>` and plan again, or \
              move them by hand, in one transaction: {by_hand}",
-            default = default.raw(),
-            partition = partition.raw(),
-            parent = parent.raw()
+            default = default.shown(),
+            partition = partition.shown(),
+            parent = parent.shown()
         ),
         Some(most) => format!(
             "rows of {default} are {inside} {partition}, more than the {most} its \
@@ -4178,8 +4201,8 @@ pub(crate) fn moving_beyond_its_intent(
              move the rows a batch at a time, then run the last batch and the attach in one \
              transaction with the DEFAULT locked, as in: {by_hand} Or allow more with \
              `pbps move-rows {partition} --max-rows <N> --reason <why>` and plan again.",
-            default = default.raw(),
-            partition = partition.raw()
+            default = default.shown(),
+            partition = partition.shown()
         ),
     })
 }
@@ -4662,15 +4685,7 @@ fn beside_its_default(
         allowed = moves_at_most.unwrap_or(0),
         beyond = literal(&format!(
             " {}",
-            // The shared probe description stays raw for explain; the raised text
-            // has no whole-message escaping boundary after the driver (#2161).
-            Escaped(&moving_beyond_its_intent(
-                name,
-                parent,
-                default,
-                bound,
-                moves_at_most
-            )?)
+            moving_beyond_its_intent(name, parent, default, bound, moves_at_most)?
         )),
         delete = literal(&format!("WITH moved AS (DELETE FROM {d} AS r WHERE ")),
         insert = literal(&format!(") INSERT INTO {q} (")),
@@ -4801,8 +4816,7 @@ fn create_table(
     if table.columns.is_empty() {
         return Err(invalid(format!(
             "table `{name}` has no columns",
-            // raw: whole-message escaped until #2084 step 5
-            name = name.raw()
+            name = name.shown()
         )));
     }
     if table.clustered.is_some() {
@@ -4956,7 +4970,8 @@ fn listed(
         .map(|(name, value)| {
             if !allowed(name) {
                 return Err(invalid(format!(
-                    "`{name}` is not a storage parameter this model declares here"
+                    "`{name}` is not a storage parameter this model declares here",
+                    name = pbps_model::escape::Escaped(name),
                 )));
             }
             Ok(format!("{name} = {}", literal(value)))
@@ -4982,7 +4997,8 @@ fn storage_actions(
             .map(|name| {
                 if !allowed(name) {
                     return Err(invalid(format!(
-                        "`{name}` is not a storage parameter this model declares here"
+                        "`{name}` is not a storage parameter this model declares here",
+                        name = pbps_model::escape::Escaped(name),
                     )));
                 }
                 Ok(name.as_str())
@@ -5388,7 +5404,8 @@ fn wrote_the_row(
              trigger on the table, another writer inside it, or a value the engine stores \
              differently from the way it is declared. Nothing was applied; `pbps plan --db` \
              says which.",
-            table = table.shown()
+            table = table.shown(),
+            key = pbps_model::escape::Escaped(&key.to_string()),
         ))
     ))
 }
@@ -5444,7 +5461,8 @@ fn gone_row(
         refuse(&format!(
             "{table} row `{key}` is back after this plan deleted it -- a trigger on the table, \
              or another writer inside it. Nothing was applied.",
-            table = table.shown()
+            table = table.shown(),
+            key = pbps_model::escape::Escaped(&key.to_string()),
         ))
     ))
 }
@@ -5460,7 +5478,8 @@ fn exactly_one_row(table: &TableName, key: &RowKey) -> String {
         refuse(&format!(
             "{table} row `{key}` is not as the plan recorded it: changed or deleted since the \
              plan was made. Plan again.",
-            table = table.shown()
+            table = table.shown(),
+            key = pbps_model::escape::Escaped(&key.to_string()),
         ))
     )
 }
@@ -5494,8 +5513,7 @@ fn insert_row(
              the apply succeeds, the plan verifies clean, and the next insert from anywhere else \
              fails on the primary key (ADR-0013 section 2). Declare the rows by a natural key, or place \
              them outside pbps and adopt them with `pbps baseline`.",
-            // raw: whole-message escaped until #2084 step 5
-            table = table.raw()
+            table = table.shown()
         )));
     }
     let mut columns = vec![quote(key_column)?];
@@ -5612,8 +5630,7 @@ fn update_row(
     if sets.is_empty() {
         return Err(invalid(format!(
             "{table}: a row update with no changed column",
-            // raw: whole-message escaped until #2084 step 5
-            table = table.raw()
+            table = table.shown()
         )));
     }
     let mut sql = format!(

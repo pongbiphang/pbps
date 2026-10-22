@@ -1356,8 +1356,8 @@ impl Change {
     // later is handled there, not here.
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn subject(&self) -> String {
-        // This is a grouping/policy key and shared JSON text. Reports escape
-        // it when rendering; #2084 step 5 (DEC-2084.1) removes that interim boundary.
+        // Canonical grouping and policy key. Human consumers escape this value;
+        // rendering it here would change identity comparisons (DEC-2084.1).
         match self {
             Change::CreateType { name, .. } | Change::DropType { name, .. } => {
                 name.raw().to_string()
@@ -1367,11 +1367,9 @@ impl Change {
             | Change::DropRole { name, .. }
             | Change::Grant { role: name, .. }
             | Change::Revoke { role: name, .. } => {
-                // Canonical grouping key; it remains raw after #2084 step 5.
                 format!("role {}", name.raw())
             }
             Change::RenameRole { from, .. } => {
-                // Canonical grouping key; it remains raw after #2084 step 5.
                 format!("role {}", from.raw())
             }
             // The routine, not the grantee. `PUBLIC` is every principal at

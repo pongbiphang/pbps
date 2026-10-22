@@ -31,16 +31,16 @@
         "class": "revoke",
         "why": "access is taken away: an application still relying on it fails from the moment the plan commits",
         "changes": [
-          "role role\nline\r\u001b[31m\\‮名前  - revoke update on app.role\nline\r\u001b[31m\\‮名前"
+          "role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前  - revoke update on app.role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前"
         ]
       },
       {
         "class": "grant-widen",
         "why": "access widens: a role can do more than before, which the merge request should have reviewed",
         "changes": [
-          "role role\nline\r\u001b[31m\\‮名前  + grant select on app.role\nline\r\u001b[31m\\‮名前",
-          "role role\nline\r\u001b[31m\\‮名前  + grant execute on app.role\nline\r\u001b[31m\\‮名前(integer)",
-          "role role\nline\r\u001b[31m\\‮名前  + grant execute on schema::role\nline\r\u001b[31m\\‮名前"
+          "role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前  + grant select on app.role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前",
+          "role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前  + grant execute on app.role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前(integer)",
+          "role role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前  + grant execute on schema::role\\nline\\r\\u{1b}[31m\\u{9b}\\\\\\u{202e}名前"
         ]
       }
     ],

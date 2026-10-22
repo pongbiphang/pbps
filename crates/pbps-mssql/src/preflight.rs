@@ -1,6 +1,3 @@
-// Names in whole-escaped DialectError fields and shared probe text stay raw
-// until #2084 step 5 (DEC-2084.1) makes those messages escape their individual values.
-
 //! Probes derived from the plan itself (SPEC §7.5).
 //!
 //! Each risky change knows how it can fail, so each one can be turned into a
@@ -504,7 +501,7 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             Ok(vec![Probe::new(
                 format!(
                     "rows that have no value for the new NOT NULL column {}",
-                    table.column(name).raw()
+                    table.column(name).shown()
                 ),
                 format!("SELECT COUNT(*) AS n FROM {};", qualified(&stored)?),
             )])
@@ -635,8 +632,7 @@ Change::RebuildPartitionedTable(_) | Change::CopyTableRows(_) | Change::AnalyzeT
             sql.push(';');
             Ok(vec![Probe::new(
                 format!("rows that violate the new check {name}",
-// Shared probe label is escaped by the report until #2084 step 5.
-name = name.raw(),
+name = name.shown(),
 ),
                 sql,
             )])
@@ -662,8 +658,7 @@ name = name.raw(),
                 &format!("(\n{rows}\n) AS r"),
                 &collated_keys(names, table, &constraint.columns)?,
                 &format!("rows that would collide under the new unique constraint {name}",
-// Shared probe label is escaped by the report until #2084 step 5.
-name = name.raw(),
+name = name.shown(),
 ),
             )?])
         }
@@ -748,8 +743,7 @@ name = name.raw(),
                 &format!("(\n{rows}\n) AS r"),
                 &collated_keys(names, table, &columns)?,
                 &format!("rows that would collide under the new unique index {name}",
-// Shared probe label is escaped by the report until #2084 step 5.
-name = name.raw(),
+name = name.shown(),
 ),
             )?])
         }
@@ -824,8 +818,7 @@ name = name.raw(),
 
             Ok(vec![Probe::new(
                 format!("rows with no matching parent for the new foreign key {name}",
-// Shared probe label is escaped by the report until #2084 step 5.
-name = name.raw(),
+name = name.shown(),
 ),
                 format!(
                     "SELECT COUNT(*) AS n FROM (\n{child}\n) AS r\n WHERE {}\n   AND NOT EXISTS (SELECT 1 FROM (\n{parent}\n) AS q WHERE {});",
@@ -1184,7 +1177,8 @@ fn delete_probe(
         format!(
             "rows in other tables that still reference {table} row `{key}`, which its delete \
              would orphan or cascade into",
-            table = table.raw()
+            table = table.shown(),
+            key = pbps_model::escape::Escaped(&key.to_string()),
         ),
         format!(
             "{}\nSELECT @n AS n;",
@@ -1340,7 +1334,8 @@ pub(crate) fn still_referenced(
             "{table} row `{key}` is referenced by row(s) that arrived after this plan was \
              checked; the delete would orphan or cascade into them. Nothing was applied. \
              Plan again.",
-            table = table.shown()
+            table = table.shown(),
+            key = pbps_model::escape::Escaped(&key.to_string()),
         ))
     ))
 }
@@ -1488,13 +1483,15 @@ fn unprobeable_probe(
         for key in keys {
             rows.entry(key).or_default().insert(name.clone());
         }
-        let listed: Vec<String> = keys.iter().map(|r| format!("`{r}`")).collect();
+        let listed: Vec<String> = keys
+            .iter()
+            .map(|r| format!("`{r}`", r = pbps_model::escape::Escaped(&r.to_string()),))
+            .collect();
         described.push(format!(
             "{column} (row{} {})",
             if listed.len() == 1 { "" } else { "s" },
             listed.join(", "),
-            // raw: whole-message escaped until #2084 step 5.
-            column = column.raw(),
+            column = column.shown(),
         ));
     }
     if rows.is_empty() {
@@ -1526,8 +1523,8 @@ fn unprobeable_probe(
              a default the probe cannot evaluate, which may be row `{key}` being deleted: {}; \
              spell the value",
             described.join(", "),
-            child = child.raw(),
-            table = table.raw()
+            child = child.shown(),
+            table = table.shown()
         ),
         format!(
             "SELECT COUNT(*) AS n\n  \
@@ -1962,8 +1959,8 @@ fn schema_probe(role: &pbps_model::RoleName, schema: &str) -> Probe {
             "`{schema}`, the schema this plan grants `{role}` permissions on, is not a schema \
              this database has by that spelling — create it, or write the target the way the \
              database spells it",
-            // Probe descriptions are escaped whole until #2084 step 5.
-            role = role.raw(),
+            role = role.shown(),
+            schema = pbps_model::escape::Escaped(schema),
         ),
         // Two failures, one count. Absent is the obvious one; spelt otherwise
         // is the one a case-insensitive database hides, where the GRANT
@@ -1991,7 +1988,7 @@ fn null_probe(column: &ColumnRef, from: &str, reads: &str) -> Result<Probe, Dial
     Ok(Probe::new(
         format!(
             "existing NULLs in {column}, which NOT NULL would reject",
-            column = column.raw()
+            column = column.shown()
         ),
         format!("SELECT COUNT(*) AS n FROM {from} WHERE {reads} IS NULL;"),
     ))
@@ -2064,9 +2061,8 @@ fn conversion_probe(
         Probe::new(
             format!(
                 "values in {column} changed when converted to {to}",
-                column = column.raw(),
-                // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                to = to.raw(),
+                column = column.shown(),
+                to = to.shown(),
             ),
             format!(
                 "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {target_input})) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), {col}) COLLATE Latin1_General_BIN2;",
@@ -2113,9 +2109,8 @@ fn conversion_probe(
                 return Ok(vec![Probe::new(
                     format!(
                         "values in {column} too long for {to} or that cannot become {to}",
-                        column = column.raw(),
-                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                        to = to.raw(),
+                        column = column.shown(),
+                        to = to.shown(),
                     ),
                     format!(
                         "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND \
@@ -2134,9 +2129,8 @@ fn conversion_probe(
                 let mut probes = vec![Probe::new(
                     format!(
                         "values in {column} too long for {to}",
-                        column = column.raw(),
-                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                        to = to.raw(),
+                        column = column.shown(),
+                        to = to.shown(),
                     ),
                     format!(
                         "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND {len} > {n};"
@@ -2158,9 +2152,8 @@ fn conversion_probe(
                 return Ok(vec![Probe::new(
                     format!(
                         "values in {column} too long for {to}",
-                        column = column.raw(),
-                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
-                        to = to.raw(),
+                        column = column.shown(),
+                        to = to.shown(),
                     ),
                     format!(
                         "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND DATALENGTH({col}) > {n};"
@@ -2188,9 +2181,8 @@ fn conversion_probe(
     Ok(vec![Probe::new(
         format!(
             "values in {column} that cannot become {to}",
-            column = column.raw(),
-            // Raw data, escaped by the diagnostic writer until #2084 step 5.
-            to = to.raw(),
+            column = column.shown(),
+            to = to.shown(),
         ),
         format!(
             "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND TRY_CONVERT({to}, {col}) IS NULL;",

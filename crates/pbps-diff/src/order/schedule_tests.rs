@@ -484,3 +484,31 @@ fn ordinary_graphs_keep_masters_orders_proofs_and_refusals_exhaustively() {
         }
     }
 }
+
+#[test]
+fn ordering_refusals_show_raw_subject_keys_once_without_changing_the_keys() {
+    for (name, shown) in [
+        ("r\n\u{1b}[31m\\\u{202e}", r"r\n\u{1b}[31m\\\u{202e}"),
+        ("名前_ünï❤️", "名前_ünï❤️"),
+    ] {
+        let change = pbps_model::Change::CreateRole {
+            uid: "r_aaaaaa".parse().unwrap(),
+            name: name.into(),
+        };
+        let raw = change.subject();
+        let changes = pbps_model::ChangeSet {
+            changes: vec![pbps_model::PlannedChange::new(change)],
+        };
+        let refusal = super::Refusal::Cycle {
+            members: vec![0],
+            edges: vec![],
+            waiting: vec![0],
+            remedy: None,
+        };
+        assert_eq!(
+            refusal.describe(&changes),
+            format!("these steps wait on one another: `role {shown}`; because ")
+        );
+        assert_eq!(raw, format!("role {name}"));
+    }
+}

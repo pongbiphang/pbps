@@ -1,5 +1,3 @@
-// Shared Pulled warnings remain raw until #2084 step 5 (DEC-2084.1); terminal warning boundaries escape them.
-
 //! First-run project creation (SPEC §14.2).
 //!
 //! `init` is deliberately separate from ordinary project discovery: it creates
@@ -243,7 +241,7 @@ pub fn cmd_init(root: &Path, args: &InitArgs) -> anyhow::Result<()> {
         unexpressible,
     };
     for notice in &onboarding_notices {
-        eprintln!("warning: {}", pbps_model::escape::Escaped(notice));
+        eprintln!("warning: {}", notice);
     }
     for warning in &prepared.warnings {
         eprintln!("warning: {warning}");

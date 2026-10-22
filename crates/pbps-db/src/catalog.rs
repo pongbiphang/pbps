@@ -40,8 +40,6 @@ pub struct Pulled {
     /// order a reader should see them. Never empty silence: the caller must
     /// show these, because each one is a difference that would otherwise
     /// surface as phantom drift or a destructive plan later.
-    // Prose beside validation error displays until #2084 step 5 (DEC-2084.1).
-    // Refusal/detail prose is copied as is, with no whole-message escape pass.
     pub warnings: Vec<String>,
     /// Permissions the model cannot hold and a drift check must not call
     /// clean. A grant `WITH GRANT OPTION`, a DENY, a column-level grant, a
@@ -139,6 +137,7 @@ pub struct Unrevocable {
     pub role: pbps_model::RoleName,
     pub target: pbps_model::GrantTarget,
     pub permission: pbps_model::Permission,
+    /// Why it is not managed, in the operator's words.
     pub why: String,
 }
 
@@ -165,7 +164,6 @@ pub struct Unexpressible {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Limitation {
     pub target: LimitationTarget,
-    // Prose beside rendered errors, printed as is until #2084 step 5 (DEC-2084.1).
     pub detail: String,
 }
 
@@ -218,7 +216,6 @@ impl LimitationTarget {
     }
 }
 
-// Raw shared inventory spelling until #2084 step 5 (DEC-2084.1) separates its text renderer.
 impl std::fmt::Display for LimitationTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -226,7 +223,6 @@ impl std::fmt::Display for LimitationTarget {
             | Self::Type(name)
             | Self::SharedModule(name)
             | Self::UnnameableModule(name) => name.raw().fmt(f),
-            // Raw inventory text is escaped by its human writer until #2084 step 5 (DEC-2084.1).
             Self::Module(id) => id.raw().fmt(f),
         }
     }
@@ -240,8 +236,6 @@ pub struct UnmanagedModule {
     /// same-name object cannot hide this entry from the unmanaged policy.
     /// SQL Server modules use `SharedModule` for its shared object namespace.
     pub target: LimitationTarget,
-    /// Why it is not managed, in the operator's words.
-    // Prose beside validation errors, printed as is until #2084 step 5 (DEC-2084.1).
     pub why: String,
 }
 

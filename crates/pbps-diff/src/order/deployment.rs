@@ -1349,18 +1349,16 @@ impl Expansion for Weave<'_> {
                     at,
                     parts: Box::new([planned(removal, dialect), planned(restoration, dialect)]),
                     tail: Vec::new(),
-                    // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
-                    reason: format!("{} depends on `{root}`", d.described, root = root.raw()),
+                    reason: format!("{} depends on `{root}`", d.described, root = root.shown()),
                 })
             }
             Need::Removed { root, k } => {
                 let d = self.dependent(root, *k)?;
                 let at = span(changes, root).ok_or_else(|| format!("{named}: no drop"))?;
-                // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
                 let reason = format!(
                     "{} depends on `{root}`, which this plan drops",
                     d.described,
-                    root = root.raw()
+                    root = root.shown()
                 );
                 match find(&view, &parts, &d.holds, partitions, removes) {
                     // Moved to the module's drop, ahead of everything from
@@ -1455,11 +1453,10 @@ impl Expansion for Weave<'_> {
                                 of: after,
                                 change: added,
                                 anchor: Anchor::After(after),
-                                // Raw provenance is shared JSON and escaped by report::changes until #2084 step 5.
                                 reason: format!(
                                     "{} depends on `{root}`, which this plan rebuilds",
                                     d.described,
-                                    root = root.raw()
+                                    root = root.shown()
                                 ),
                             })],
                             respelled: Vec::new(),
@@ -1911,7 +1908,10 @@ pub fn before_its_partitions_indexes(
                 if let Change::AddIndex { table, name, .. } = &cs.changes[i].change {
                     (name.shown().to_string(), table.shown().to_string())
                 } else {
-                    (cs.changes[i].change.subject(), String::new())
+                    (
+                        pbps_model::escape::Escaped(&cs.changes[i].change.subject()).to_string(),
+                        String::new(),
+                    )
                 }
             };
             let refused = |k: usize, why: String| {
@@ -1931,7 +1931,7 @@ pub fn before_its_partitions_indexes(
                     k,
                     format!(
                         "it would pass a change to {}",
-                        cs.changes[c].change.subject()
+                        pbps_model::escape::Escaped(&cs.changes[c].change.subject())
                     ),
                 ));
             }
@@ -1951,7 +1951,7 @@ pub fn before_its_partitions_indexes(
                             k,
                             format!(
                                 "it rests on {}, which it could take",
-                                cs.changes[j].change.subject()
+                                pbps_model::escape::Escaped(&cs.changes[j].change.subject())
                             ),
                         )
                     },
