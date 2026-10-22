@@ -167,7 +167,7 @@ mod tests {
         });
         let mut after = crate::order::writebacks::ScopeInput::new(vec![scope])
             .unwrap()
-            .append_to(before.clone());
+            .append_to(before.clone(), &pbps_dialect::MinimalDialect);
         after.payload.changes.insert(0, default("2"));
         after.origins.insert(0, origin.clone());
         after.invalidate();

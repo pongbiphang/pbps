@@ -185,6 +185,15 @@ pub fn statement_count(
 }
 
 /// Only certified lowered output or its fixed bootstrap prelude can be rendered.
+///
+/// ```compile_fail
+/// struct Raw;
+/// impl pbps_cli::emission::Script for Raw {
+///     fn render(&self, _: &pbps_model::SessionZone) -> String {
+///         "SELECT 1;".to_owned()
+///     }
+/// }
+/// ```
 pub trait Script: sealed::Script {
     fn render(&self, zone: &SessionZone) -> String;
 }

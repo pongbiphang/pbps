@@ -131,6 +131,14 @@ impl PlanningInput {
 
 /// Only the existing zero-SQL scope transitions may retain producer provenance.
 /// Arbitrary logical additions restart an unqualified draft through PlanningInput.
+/// Scope additions still need the shared stages; they cannot directly finalize.
+/// ```compile_fail
+/// fn skip_stages(plan: pbps_diff::order::CanonicalPlan<pbps_dialect::MinimalDialect>) {
+///     let scope = pbps_diff::order::writebacks::ScopeInput::new(vec![]).unwrap();
+///     let pending = scope.append_to(plan, &pbps_dialect::MinimalDialect);
+///     let _ = pending.ordered(pbps_model::PlanMode::Transactional, &pbps_dialect::MinimalDialect);
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct ScopeInput {
     changes: Vec<PlannedChange>,
@@ -147,9 +155,10 @@ impl ScopeInput {
             })
             .then_some(Self { changes })
     }
-    pub fn append_to<S: super::RouteState>(
+    pub fn append_to<S: super::RouteState<D>, D: Dialect + ?Sized>(
         &self,
         plan: super::PlanningPlan<S>,
+        _dialect: &D,
     ) -> super::PlanningPlan<S::Input> {
         let input = PlanningInput::new(self.changes.clone()).append_to(plan);
         super::plan::state(input)

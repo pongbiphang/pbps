@@ -729,6 +729,11 @@ decision or the issue named in its row.
   content-dependent first.
 
 The completed canonical result retains its planner's invariant type brand.
+The sealed route-state/dialect pair permits re-scheduling only with that same
+engine, including semantic fixture observation. Zero-SQL scope additions carry
+the brand in a non-executable Continuing state until shared scheduling finishes;
+scratch preparation also requires the input's original engine. These compile-time
+restrictions add no pass, constraints, rank or runtime refusal.
 `OrderedPlan<D>`, `AdmittedPlan<D>` and `SealedPlan<D>` implement only
 `PlanView<D>`; `PlanDialect` fixes each real engine's input to its own view.
 CLI dispatch preserves the concrete engine before certification, and

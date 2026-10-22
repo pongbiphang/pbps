@@ -204,7 +204,7 @@ impl Reconstruction {
     ///     pbps_pg::resolver::reconstruct::Reconstruction::new(pg, changes, ids);
     /// }
     /// ```
-    pub fn new<S: Clone>(
+    pub fn new<S: pbps_diff::order::RouteState<crate::Postgres>>(
         dialect: &crate::Postgres,
         bootstrap: &pbps_diff::order::PlanningPlan<S>,
         ids: &pbps_model::IdsFile,
@@ -213,7 +213,7 @@ impl Reconstruction {
     }
 
     #[allow(clippy::wildcard_enum_match_arm)]
-    pub fn with_dependencies<S: Clone>(
+    pub fn with_dependencies<S: pbps_diff::order::RouteState<crate::Postgres>>(
         dialect: &crate::Postgres,
         bootstrap: &pbps_diff::order::PlanningPlan<S>,
         ids: &pbps_model::IdsFile,

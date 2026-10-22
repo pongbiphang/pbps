@@ -6993,7 +6993,7 @@ pub fn cmd_plan_db(
             .map(|changes| {
                 // Re-derivations and resolver planning must retain the same
                 // zero-SQL changes as the initial connected plan.
-                zero_sql.append_to(changes)
+                zero_sql.append_to(changes, dialect.as_ref())
             })
         };
         let mut cs = diff_here(&std::collections::BTreeSet::new()).map_err(crate::Unexpressible)?;
@@ -7078,7 +7078,9 @@ pub fn cmd_plan_db(
                         // The resolver's order, with the connected plan's
                         // zero-SQL changes after it, where `diff_here`
                         // keeps them.
-                        cs = zero_sql.append_to(unsealed.changes().clone());
+                        cs = crate::resolution::Continuation::with_scope(
+                            dialect.as_ref(), &zero_sql, &unsealed,
+                        );
                         resolution = Some((selection.name.clone(), unsealed, asked));
                     }
                     Err(crate::resolution::Refused::Finding(finding)) => {

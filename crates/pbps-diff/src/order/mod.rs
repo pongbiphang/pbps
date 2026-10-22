@@ -70,8 +70,8 @@ pub use edges::{Baseline, Because, Checks, Edge, Graph, Source, Unmet, graph};
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use plan::singleton;
 pub use plan::{
-    Canonical, CanonicalPlan, DiffPlan, Differ, Draft, OrderedPlan, PlanView, PlanningPlan,
-    RouteState, propose, take,
+    Canonical, CanonicalPlan, Continuing, DiffPlan, Differ, Draft, OrderedPlan, PlanView,
+    PlanningPlan, RouteState, propose, take,
 };
 pub use rewrites::before_rewrites;
 pub use roles::role_drops;

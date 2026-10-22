@@ -8018,6 +8018,13 @@ and read by lowering rather than supplied by its caller.
 OrderedPlan, AdmittedPlan and SealedPlan carry the concrete planning or checking
 dialect's invariant type brand through PlanView and PlanDialect, so real engines
 cannot lower another engine's certificate and sealing cannot relabel its dialect.
+Canonical continuations likewise implement the sealed route-state/dialect pair
+only for their original engine. Re-scheduling, including the semantic fixture
+adapter, cannot assign a new brand. Zero-SQL scope additions retain that brand
+in a non-executable Continuing state until the shared stages finish again;
+an empty scope list cannot erase it to an engine-free differ result. Scratch
+preparation also requires the input's original engine. These are type checks,
+not new ordering stages, constraints or runtime refusals.
 Lowering an OrderedPlan uses its retained logical origins and operation IDs;
 a newly SealedPlan delegates to that same ordered collection. Admission is the
 saved-artifact exception: DEC-1958.3 omits origins from serialized changes, so
@@ -8165,7 +8172,7 @@ refusals and report bytes unchanged without weakening admission.
 Bootstrap's fixed type/trusted-role script guard is prepared alongside a
 certified lowered plan and retains its engine brand. The prepared script has
 no raw SQL constructor and cannot become an executable plan. Guard generation
-still precedes connection/locking, while rendering still waits for the target
-zone; the guard, session pins and DDL keep their existing bytes. Per-statement
+stays before the execution connection and lock, while rendering still waits
+for the target zone; the guard, session pins and DDL keep their existing bytes. Per-statement
 bootstrap prerequisite checks select a position from the certified collection,
 never an arbitrary statement slice (DEC-2181.1, DEC-2181.2).

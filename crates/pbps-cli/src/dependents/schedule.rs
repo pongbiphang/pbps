@@ -149,7 +149,7 @@ impl std::error::Error for Refusal {}
 ///
 /// The plan is taken and returned rather than edited, so a refusal leaves no
 /// half-ordered plan behind.
-pub(crate) fn schedule<S: pbps_diff::order::RouteState, D: crate::emission::Engine>(
+pub(crate) fn schedule<S: pbps_diff::order::RouteState<D>, D: crate::emission::Engine>(
     cs: PlanningPlan<S>,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
@@ -211,7 +211,7 @@ pub(crate) fn schedule<S: pbps_diff::order::RouteState, D: crate::emission::Engi
 }
 
 #[cfg(test)]
-pub(crate) fn schedule_fixture<S: pbps_diff::order::RouteState>(
+pub(crate) fn schedule_fixture<S: pbps_diff::order::RouteState<dyn Dialect>>(
     cs: PlanningPlan<S>,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
@@ -675,7 +675,7 @@ mod tests {
         .unwrap()
     }
 
-    fn scheduled<S: pbps_diff::order::RouteState>(
+    fn scheduled<S: pbps_diff::order::RouteState<dyn Dialect>>(
         cs: PlanningPlan<S>,
         schema: &Schema,
         ids: &IdsFile,

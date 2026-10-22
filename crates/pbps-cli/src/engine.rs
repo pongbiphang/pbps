@@ -3535,7 +3535,7 @@ async fn module_dependents(
 // takes every fact in one call (#1955).
 #[allow(clippy::too_many_arguments)]
 pub async fn account_for_module_dependents<
-    S: pbps_diff::order::RouteState,
+    S: pbps_diff::order::RouteState<D>,
     D: crate::emission::Engine,
 >(
     conn: &mut Conn,
@@ -3546,7 +3546,7 @@ pub async fn account_for_module_dependents<
     role_members: Option<&crate::dependents::schedule::RoleMembers>,
     dialect: &D,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
-) -> anyhow::Result<(PlanningPlan<S::Output<D>>, ConnectedCheck)> {
+) -> anyhow::Result<(PlanningPlan<S::Output>, ConnectedCheck)> {
     let declarations = crate::dependents::schedule::Declarations {
         schema: declared,
         sources,

@@ -35,29 +35,51 @@ pub struct Differ;
 pub type DiffPlan = PlanningPlan<Differ>;
 
 mod route_state {
-    pub trait Sealed {}
+    pub trait Sealed<D: ?Sized> {}
 }
-/// Which immutable inputs may complete the shared route. A raw proposal stays
-/// non-executable even after the shared stages, so a copied/reversed payload
-/// cannot impersonate the differ's completed stages.
-pub trait RouteState: route_state::Sealed + Clone + std::fmt::Debug {
-    type Output<D: pbps_dialect::Dialect + ?Sized>: Clone + std::fmt::Debug;
+/// Which immutable inputs may complete the shared route for `D`. A raw
+/// proposal stays non-executable; a canonical continuation retains its engine.
+/// The sealed state/dialect pair prevents external implementations from
+/// assigning a different engine to an existing producer's provenance.
+pub trait RouteState<D: pbps_dialect::Dialect + ?Sized>:
+    route_state::Sealed<D> + Clone + std::fmt::Debug
+{
+    type Output: Clone + std::fmt::Debug;
     type Input: Clone + std::fmt::Debug;
 }
-impl route_state::Sealed for Draft {}
-impl RouteState for Draft {
-    type Output<D: pbps_dialect::Dialect + ?Sized> = Draft;
+impl<D: ?Sized> route_state::Sealed<D> for Draft {}
+impl<D: pbps_dialect::Dialect + ?Sized> RouteState<D> for Draft {
+    type Output = Draft;
     type Input = Draft;
 }
-impl route_state::Sealed for Differ {}
-impl RouteState for Differ {
-    type Output<D: pbps_dialect::Dialect + ?Sized> = Canonical<D>;
-    type Input = Differ;
+impl<D: ?Sized> route_state::Sealed<D> for Differ {}
+impl<D: pbps_dialect::Dialect + ?Sized> RouteState<D> for Differ {
+    type Output = Canonical<D>;
+    type Input = Continuing<D>;
 }
-impl<D: ?Sized> route_state::Sealed for Canonical<D> {}
-impl<E: ?Sized> RouteState for Canonical<E> {
-    type Output<D: pbps_dialect::Dialect + ?Sized> = Canonical<D>;
-    type Input = Differ;
+impl<D: ?Sized> route_state::Sealed<D> for Canonical<D> {}
+impl<D: pbps_dialect::Dialect + ?Sized> RouteState<D> for Canonical<D> {
+    type Output = Canonical<D>;
+    type Input = Continuing<D>;
+}
+
+/// A scope-annotated producer must finish the shared stages again, retaining
+/// its engine while it has no direct execution authority (DEC-1959.5).
+pub struct Continuing<D: ?Sized>(std::marker::PhantomData<fn(&D) -> &D>);
+impl<D: ?Sized> Clone for Continuing<D> {
+    fn clone(&self) -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+impl<D: ?Sized> std::fmt::Debug for Continuing<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Continuing")
+    }
+}
+impl<D: ?Sized> route_state::Sealed<D> for Continuing<D> {}
+impl<D: pbps_dialect::Dialect + ?Sized> RouteState<D> for Continuing<D> {
+    type Output = Canonical<D>;
+    type Input = Continuing<D>;
 }
 
 pub(crate) fn differ(plan: PlanningPlan) -> DiffPlan {

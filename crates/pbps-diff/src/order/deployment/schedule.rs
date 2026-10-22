@@ -141,10 +141,10 @@ impl fmt::Display for Skipped {
 
 /// The plan in its final order, and what it took to get there.
 pub struct Scheduled<
-    S: crate::order::RouteState = crate::order::Draft,
+    S: crate::order::RouteState<D> = crate::order::Draft,
     D: Dialect + ?Sized = dyn Dialect,
 > {
-    pub changes: PlanningPlan<S::Output<D>>,
+    pub changes: PlanningPlan<S::Output>,
     /// Changes the passes added: a dependent put back around a module, a
     /// partition's own default set again.
     pub added: usize,
@@ -156,7 +156,7 @@ pub struct Scheduled<
     pub skipped: Vec<Skipped>,
 }
 
-impl<S: crate::order::RouteState, D: Dialect + ?Sized> fmt::Debug for Scheduled<S, D> {
+impl<S: crate::order::RouteState<D>, D: Dialect + ?Sized> fmt::Debug for Scheduled<S, D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Scheduled")
             .field("changes", &self.changes)
@@ -195,7 +195,7 @@ impl std::error::Error for Refusal {}
 ///
 /// The plan is taken and returned rather than edited, so a refusal leaves no
 /// half-ordered plan behind.
-pub fn schedule<S: crate::order::RouteState, D: Dialect>(
+pub fn schedule<S: crate::order::RouteState<D>, D: Dialect>(
     cs: PlanningPlan<S>,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
@@ -206,7 +206,7 @@ pub fn schedule<S: crate::order::RouteState, D: Dialect>(
 
 /// Semantic observation cannot produce a real engine's certificate.
 #[cfg(any(test, feature = "test-fixtures"))]
-pub fn schedule_semantic<S: crate::order::RouteState>(
+pub fn schedule_semantic<S: crate::order::RouteState<dyn Dialect>>(
     cs: PlanningPlan<S>,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
@@ -215,7 +215,7 @@ pub fn schedule_semantic<S: crate::order::RouteState>(
     scheduled::<S, dyn Dialect>(cs, declared, facts, dialect)
 }
 
-fn scheduled<S: crate::order::RouteState, D: Dialect + ?Sized>(
+fn scheduled<S: crate::order::RouteState<D>, D: Dialect + ?Sized>(
     cs: PlanningPlan<S>,
     declared: &Declarations<'_>,
     facts: &Facts<'_>,
@@ -409,7 +409,7 @@ fn scheduled<S: crate::order::RouteState, D: Dialect + ?Sized>(
         None,
     );
     Ok(Scheduled {
-        changes: crate::order::plan::state::<_, S::Output<D>>(cs),
+        changes: crate::order::plan::state::<_, S::Output>(cs),
         added,
         split,
         moved,
