@@ -221,7 +221,7 @@ fn admission_validates_healthy_foreign_records_without_granting_cleanup_authorit
     let f = Fixture::new("prior-record-foreign");
     // The first acquisition also proves the empty-store positive case.
     let own = spent(&f);
-    let linked = f.repo.root.with_extension("linked");
+    let linked = sibling(&f.repo.root, "linked");
     git(
         &f.repo.root,
         &[

@@ -128,7 +128,7 @@ fn discovery_and_admission_have_bounded_passes_and_linear_record_reads() {
     let spent = store.preview(request(), SystemTime::now()).unwrap();
     f.publisher().discard_preview(&spent.operation_id).unwrap();
     drop(store);
-    let linked = f.repo.root.with_extension("linked");
+    let linked = sibling(&f.repo.root, "linked");
     git(
         &f.repo.root,
         &[
@@ -298,7 +298,7 @@ fn discovery_refuses_incomplete_or_changing_batches_without_consuming_evidence()
                     return false;
                 }
                 if mode == "changed-directory" && !at.after && !flag.swap(true, Ordering::SeqCst) {
-                    fs::rename(&dir, dir.with_extension("moved")).unwrap();
+                    fs::rename(&dir, sibling(&dir, "moved")).unwrap();
                     fs::create_dir(&dir).unwrap();
                 }
                 if mode.starts_with("late-") && at.after && !flag.swap(true, Ordering::SeqCst) {
@@ -352,9 +352,7 @@ fn discovery_refuses_incomplete_or_changing_batches_without_consuming_evidence()
                 assert!(injected.load(Ordering::SeqCst), "{receipts}/{mode}");
             }
             let evidence = if mode == "changed-directory" {
-                directory
-                    .with_extension("moved")
-                    .join(target.file_name().unwrap())
+                sibling(&directory, "moved").join(target.file_name().unwrap())
             } else {
                 target.clone()
             };

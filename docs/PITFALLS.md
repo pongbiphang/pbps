@@ -2085,6 +2085,10 @@ serialise, two of them destroyed the third's schema mid-read. The failure was
 loud, so this cost minutes rather than a release; the lesson is that **the local
 command and the CI command are two different tests**, and only one of them
 counts. A fixture name must be unique per test, not per process.
+Use the test support's `sibling` helper to append suffixes to the complete
+temporary path: replacing an extension in a dotted fixture name can discard
+its PID, letting another process replace a frozen compose destination and
+correctly trigger `DestinationChanged` (#2077).
 
 **And a test that could not tell whether the fix was there.** The spelling
 checks guard a cast with `pg_input_is_valid` inside a `CASE`, and that guard

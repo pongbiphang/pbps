@@ -146,7 +146,7 @@ fn refused_everywhere(label: &str, f: &Fixture, id: &str, witness: &Fixture) {
 fn capturing_evidence_with_a_retired_base_pin_is_refused_in_either_worktree() {
     for foreign in [false, true] {
         let f = Fixture::new(&format!("lifecycle-retired-base-{foreign}"));
-        let linked = f.repo.root.with_extension("linked");
+        let linked = sibling(&f.repo.root, "linked");
         let owner = if foreign {
             git(
                 &f.repo.root,

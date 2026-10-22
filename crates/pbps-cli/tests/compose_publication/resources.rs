@@ -83,7 +83,7 @@ fn external_object_fixture(name: &str, promised: bool) -> (Fixture, Fixture) {
     fs::remove_file(donor.repo.root.join("historical-payload")).unwrap();
     donor.repo.commit();
     git(&donor.repo.root, &["push", "-q", "origin", "master"]);
-    let shared = donor.repo.root.with_extension("borrower");
+    let shared = sibling(&donor.repo.root, "borrower");
     let _ = fs::remove_dir_all(&shared);
     if promised {
         git(
@@ -1675,8 +1675,8 @@ fn linked_worktrees_list_only_their_own_valid_receipts_and_resources() {
     let source = f.repo.preserved();
     drop(publisher);
     let linked = Repository {
-        root: f.repo.root.with_extension("linked"),
-        project: f.repo.root.with_extension("linked").join("project"),
+        root: sibling(&f.repo.root, "linked"),
+        project: sibling(&f.repo.root, "linked").join("project"),
     };
     git(
         &f.repo.root,
