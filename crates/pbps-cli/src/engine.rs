@@ -3642,6 +3642,40 @@ pub async fn account_for_module_dependents<
     Ok((changes, check))
 }
 
+/// A staged plan's table-local name facts, read beside its schema facts.
+/// Identities map a renamed attaching table back to its current catalog name.
+/// Preserve the project's dialect and ordinary planning's unknown server version.
+pub async fn staged_attach_dialect<D: crate::emission::Engine>(
+    conn: &mut Conn,
+    dialect: &D,
+    before: pbps_diff::Side<'_>,
+    after: pbps_diff::Side<'_>,
+) -> anyhow::Result<D> {
+    Ok(match conn.driver() {
+        Driver::Postgres => {
+            let attaching = after
+                .ids
+                .tables
+                .iter()
+                .filter_map(|(uid, name)| {
+                    let table = after.schema.tables.get(name)?;
+                    table.partition_of.as_ref()?;
+                    let live = before.ids.tables.get(uid)?;
+                    let standing = before.schema.tables.get(live)?;
+                    standing
+                        .partition_of
+                        .is_none()
+                        .then(|| (uid.clone(), live.clone()))
+                })
+                .collect();
+            dialect.with_attach_constraint_names(
+                pbps_pg::staged::attach_constraint_names(conn, &attaching).await?,
+            )
+        }
+        Driver::Mssql => dialect.clone(),
+    })
+}
+
 /// The connection's immutable planning capability, before any expansion.
 /// Offline callers retain their ordinary unknown-capability dialect.
 #[cfg(test)]

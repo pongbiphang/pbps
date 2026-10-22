@@ -46,6 +46,14 @@ pub trait Engine:
     /// The connected seam asks at the old refusal point. PostgreSQL's module
     /// expansion has always used the empty write path and observed version.
     fn with_planning_version(&self, version: i64) -> Self;
+    /// Keep observed attach names on the selected concrete planning engine.
+    fn with_attach_constraint_names(
+        &self,
+        names: std::collections::BTreeMap<
+            pbps_model::Uid,
+            std::collections::BTreeSet<pbps_model::ObjectLocalName>,
+        >,
+    ) -> Self;
 }
 impl Engine for pbps_pg::Postgres {
     fn lower(&self, plan: &Self::Plan) -> Result<LoweredPlan, pbps_dialect::DialectError> {
@@ -59,6 +67,15 @@ impl Engine for pbps_pg::Postgres {
     fn with_planning_version(&self, version: i64) -> Self {
         Self::new().with_server_version(version)
     }
+    fn with_attach_constraint_names(
+        &self,
+        names: std::collections::BTreeMap<
+            pbps_model::Uid,
+            std::collections::BTreeSet<pbps_model::ObjectLocalName>,
+        >,
+    ) -> Self {
+        self.clone().with_attach_constraint_names(names)
+    }
 }
 impl Engine for pbps_mssql::Mssql {
     fn lower(&self, plan: &Self::Plan) -> Result<LoweredPlan, pbps_dialect::DialectError> {
@@ -70,6 +87,15 @@ impl Engine for pbps_mssql::Mssql {
         })
     }
     fn with_planning_version(&self, _version: i64) -> Self {
+        *self
+    }
+    fn with_attach_constraint_names(
+        &self,
+        _names: std::collections::BTreeMap<
+            pbps_model::Uid,
+            std::collections::BTreeSet<pbps_model::ObjectLocalName>,
+        >,
+    ) -> Self {
         *self
     }
 }

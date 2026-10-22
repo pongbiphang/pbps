@@ -13206,6 +13206,161 @@ fn a_table_is_attached_as_the_default_partition_through_the_cli() {
     );
 }
 
+#[test]
+#[ignore = "needs a live PostgreSQL; set PBPS_TEST_PG_DB"]
+fn a_staged_attach_uses_a_plain_attach_only_for_its_own_occupied_constraint_name() {
+    for case in [
+        "p",
+        "u",
+        "f",
+        "different",
+        "other_constraint",
+        "table",
+        "index",
+        "sequence",
+        "own_index",
+    ] {
+        let own = OwnDatabase::new(&server(), &format!("attach2126_{case}"));
+        let connection = own.connection();
+        on_server(connection, "CREATE SCHEMA app");
+        let d = Demo::new(&format!("attach2126-{case}"));
+        let columns = "columns:\n  id: {type: integer, nullable: false}\n  v: {type: integer, nullable: false}\n";
+        std::fs::write(
+            d.dir.join("schema/app.ref.yml"),
+            "table: app.ref\ncolumns:\n  v: {type: integer, nullable: false}\nprimary_key: [v]\n",
+        )
+        .unwrap();
+        let constraints = |prefix: &str| {
+            format!(
+                "primary_key: {{name: {prefix}_pk, columns: [id]}}\nunique:\n  {prefix}_uq: [id, v]\n\
+             foreign_keys:\n  {prefix}_fk:\n    columns: [v]\n    references: app.ref(v)\n"
+            )
+        };
+        let parent = format!(
+            "table: app.ev\n{columns}{}partition_by: [id]\n",
+            constraints("ev")
+        );
+        std::fs::write(d.dir.join("schema/app.ev.yml"), &parent).unwrap();
+        d.table(&format!("table: app.t\n{columns}{}", constraints("t")));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        succeeds(d.run(&["bootstrap", "--db", connection]));
+        let ids: pbps_model::IdsFile =
+            serde_json::from_slice(&std::fs::read(d.dir.join("schema.ids.json")).unwrap()).unwrap();
+        let uid = ids
+            .tables
+            .iter()
+            .find(|(_, name)| name.schema.as_str() == "app" && name.name.as_str() == "t")
+            .unwrap()
+            .0;
+        let scratch = format!("pbps_attach_{uid}");
+        let occupied = matches!(case, "p" | "u" | "f");
+        let setup = match case {
+            "p" => format!("ALTER TABLE app.t RENAME CONSTRAINT t_pk TO {scratch}"),
+            "u" => format!("ALTER TABLE app.t RENAME CONSTRAINT t_uq TO {scratch}"),
+            "f" => format!("ALTER TABLE app.t RENAME CONSTRAINT t_fk TO {scratch}"),
+            "different" => format!("ALTER TABLE app.t RENAME CONSTRAINT t_pk TO {scratch}_other"),
+            "other_constraint" => {
+                format!("CREATE TABLE app.other (v int CONSTRAINT {scratch} PRIMARY KEY)")
+            }
+            "table" => format!("CREATE TABLE app.{scratch} (v int)"),
+            "index" => {
+                format!("CREATE TABLE app.other (v int); CREATE INDEX {scratch} ON app.other(v)")
+            }
+            "sequence" => format!("CREATE SEQUENCE app.{scratch}"),
+            "own_index" => format!("CREATE INDEX {scratch} ON app.t(v)"),
+            _ => unreachable!(),
+        };
+        on_server(connection, &setup);
+        if case == "own_index" {
+            // Keep this independent index across the attach, rather than
+            // planning its removal as a second logical change.
+            d.table(&format!(
+                "table: app.t\n{columns}{}indexes:\n  {scratch}: {{columns: [v]}}\n",
+                constraints("t")
+            ));
+            succeeds(d.run(&["plan"]));
+            d.commit();
+        }
+        succeeds(d.run(&[
+            "baseline",
+            "--db",
+            connection,
+            "--reason",
+            "adopt live constraint names",
+        ]));
+        on_server(
+            connection,
+            "INSERT INTO app.ref VALUES (1); INSERT INTO app.t VALUES (1, 1)",
+        );
+        std::fs::remove_file(d.dir.join("schema/app.t.yml")).unwrap();
+        let own_index = if case == "own_index" {
+            format!("    indexes:\n      {scratch}: {{columns: [v]}}\n")
+        } else {
+            String::new()
+        };
+        std::fs::write(
+            d.dir.join("schema/app.ev.yml"),
+            format!("{parent}partitions:\n  t:\n    from: [0]\n    to: [10]\n{own_index}"),
+        )
+        .unwrap();
+        let path = connected_artifact(&d, connection, true);
+        let plan: pbps_model::SavedPlan =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(plan.changes.changes.len(), 1, "{case}");
+        let change = &plan.changes.changes[0];
+        let sql = pbps_pg::Postgres::new()
+            .fixture_emit_staged(&change.change, change.strategy)
+            .unwrap();
+        assert_eq!(sql.len(), if occupied { 1 } else { 4 }, "{case}: {sql:?}");
+        assert_eq!(
+            sql.iter()
+                .filter(|s| s.sql.contains("ATTACH PARTITION"))
+                .count(),
+            1
+        );
+        if occupied {
+            assert!(
+                sql.iter().all(|s| s.scan_check.is_none()),
+                "{case}: {sql:?}"
+            );
+        }
+        succeeds(approved_apply(
+            &d,
+            connection,
+            &path,
+            &["--staged", "--allow", "constraint"],
+        ));
+        assert_eq!(
+            scalar(
+                connection,
+                "SELECT count(*) FROM app.ev WHERE tableoid = 'app.t'::regclass"
+            ),
+            1,
+            "{case}"
+        );
+        if occupied {
+            assert_eq!(
+                scalar(
+                    connection,
+                    &format!(
+                        "SELECT count(*) FROM pg_constraint WHERE conrelid = 'app.t'::regclass AND conname = '{scratch}'"
+                    )
+                ),
+                1,
+                "{case}"
+            );
+        }
+        succeeds(d.run(&["verify", "--db", connection]));
+        let next = succeeds(d.run(&["plan", "--db", connection]));
+        assert!(
+            stdout(&next).contains("No changes"),
+            "{case}: {}",
+            stdout(&next)
+        );
+    }
+}
+
 /// A staged attach skips its scan through a CHECK it validates first, and
 /// what a stopped run leaves of that CHECK is pbps's to take out (#1638,
 /// DEC-1638.1). A `VALIDATE` that fails takes it out itself, with no

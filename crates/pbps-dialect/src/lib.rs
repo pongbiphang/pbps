@@ -3048,6 +3048,18 @@ pub trait Dialect {
         found
     }
 
+    /// The key carried as proof that an attach can use its staged scan CHECK.
+    /// An empty key keeps the ordinary ATTACH, including when observed names
+    /// prevent that optimization (DEC-2126.1). The choice travels in the plan,
+    /// so apply and resume never choose another statement sequence.
+    fn attach_scan_key(
+        &self,
+        _uid: &pbps_model::Uid,
+        key: &[pbps_model::ColumnName],
+    ) -> Vec<pbps_model::ColumnName> {
+        key.to_vec()
+    }
+
     /// Checks what a partition declares of its own against its parent's
     /// columns, which it has and does not declare (#1577): an index or a check
     /// on a partition names the parent's columns. [`validate_table`] sees the
