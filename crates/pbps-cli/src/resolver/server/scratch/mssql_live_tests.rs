@@ -519,6 +519,124 @@ async fn mssql_supplied_acquisition_refuses_target_and_cleans_after_the_external
 
 #[tokio::test]
 #[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn instance_wide_ownership_chaining_refuses_the_scratch_sandbox_and_cleans_setup() {
+    let primary = server("PBPS_TEST_DB");
+    let scratch = server("PBPS_TEST_MSSQL_SCRATCH_DB");
+    let (name, supplied) = create_database(&scratch).await;
+    let mut admin = connection(&scratch).await;
+    let option =
+        |value| format!("EXEC sp_configure 'cross db ownership chaining', {value}; RECONFIGURE;");
+    // This group runs serially on its dedicated instances. Joining a task
+    // catches a panic in acquisition too, so restoration precedes assertions.
+    let measured = tokio::spawn(async move {
+        let inventory = async || {
+            connection(&scratch)
+                .await
+                .query(
+                    "SELECT N'database:' + name AS name FROM sys.databases UNION ALL \
+                     SELECT N'login:' + name FROM sys.server_principals ORDER BY name;",
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.try_get::<&str>("name").unwrap().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let before = inventory().await;
+        connection(&scratch)
+            .await
+            .execute(&option(1))
+            .await
+            .unwrap();
+        // A separate target chooses run-owned provisioning; a target on the
+        // scratch instance forces the supplied database path, even as sa.
+        let mut refused = Vec::new();
+        for (target, source) in [(&primary, &scratch), (&scratch, &supplied)] {
+            refused.push(refusal(target, source).await);
+        }
+        let after_refusal = inventory().await;
+        let supplied_after_refusal = sql::inventory::read(&mut connection(&supplied).await, None)
+            .await
+            .unwrap();
+        connection(&scratch)
+            .await
+            .execute(&option(0))
+            .await
+            .unwrap();
+        let mut allowed = Vec::new();
+        for (target, source) in [(&primary, &scratch), (&scratch, &supplied)] {
+            allowed.push(refusal(target, source).await);
+        }
+        let after_control = inventory().await;
+        let supplied_after_control = sql::inventory::read(&mut connection(&supplied).await, None)
+            .await
+            .unwrap();
+        (
+            before,
+            after_refusal,
+            after_control,
+            supplied_after_refusal,
+            supplied_after_control,
+            refused,
+            allowed,
+        )
+    })
+    .await;
+    let restored = admin.execute(&option(0)).await;
+    let setting = admin
+        .query(
+            "SELECT CONVERT(int,value_in_use) AS value_in_use FROM sys.configurations \
+             WHERE name=N'cross db ownership chaining';",
+        )
+        .await;
+    drop_database(&server("PBPS_TEST_MSSQL_SCRATCH_DB"), &name).await;
+    restored.unwrap();
+    assert_eq!(
+        setting.unwrap()[0].try_get::<i32>("value_in_use").unwrap(),
+        Some(0)
+    );
+    let (
+        before,
+        after_refusal,
+        after_control,
+        supplied_refused,
+        supplied_control,
+        refused,
+        allowed,
+    ) = measured.unwrap();
+    assert_eq!(
+        after_refusal, before,
+        "refused setup left a database or login"
+    );
+    assert_eq!(
+        after_control, before,
+        "control setup left a database or login"
+    );
+    for inventory in [supplied_refused, supplied_control] {
+        assert!(inventory.is_empty(), "{:?}", inventory.names());
+    }
+    for outcome in refused {
+        assert!(
+            matches!(outcome, ProduceError::Run(Error::Read(_))),
+            "{outcome}"
+        );
+        let message = outcome.to_string();
+        assert!(message.contains("cross db ownership chaining"), "{message}");
+        assert!(
+            message.contains("EXEC sp_configure 'cross db ownership chaining', 0; RECONFIGURE;"),
+            "{message}"
+        );
+    }
+    for outcome in allowed {
+        assert!(
+            matches!(outcome, ProduceError::Run(Error::Binding(ref reason)) if reason.contains("#2237")),
+            "{outcome}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_run_owned_acquisition_removes_its_login_database_and_reference_on_refusal() {
     let primary = server("PBPS_TEST_DB");
     let scratch = server("PBPS_TEST_MSSQL_SCRATCH_DB");

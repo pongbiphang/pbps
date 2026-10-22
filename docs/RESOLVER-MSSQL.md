@@ -247,6 +247,14 @@ for a moment keeps that type.
     outside the sandbox, whatever they are.
   - **What still reaches out**, read before the first plan statement. Each is a
     property of the instance or of the scratch database, not of an account:
+    - **Instance-wide ownership chaining must be off.** The sandbox reads
+      `sys.configurations.value_in_use` for `cross db ownership chaining`.
+      This option overrides the scratch database's own `DB_CHAINING` flag
+      and allows same-owner chains into other databases, including `msdb`.
+      An enabled or unreadable setting refuses by name. Disable it with
+      `EXEC sp_configure 'cross db ownership chaining', 0; RECONFIGURE;`
+      or use a scratch instance with it disabled
+      [`instance_wide_ownership_chaining_refuses_the_scratch_sandbox_and_cleans_setup`].
     - **A database whose `guest` admits the sandbox.** The sandbox entered,
       and wrote, a target with `guest` enabled.
       - The supplied session lists every database in `sys.databases`. The

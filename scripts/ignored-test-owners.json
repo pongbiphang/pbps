@@ -1965,6 +1965,7 @@
         "resolver::server::scratch::mssql_live_tests::mssql_supplied_acquisition_refuses_target_and_cleans_after_the_externals_refusal",
         "resolver::server::scratch::mssql_live_tests::mssql_supplied_cleanup_names_the_retained_sandbox_after_failure",
         "resolver::server::scratch::mssql_live_tests::mssql_run_owned_acquisition_removes_its_login_database_and_reference_on_refusal",
+        "resolver::server::scratch::mssql_live_tests::instance_wide_ownership_chaining_refuses_the_scratch_sandbox_and_cleans_setup",
         "resolver::server::scratch::mssql_live_tests::mssql_supplied_guest_admission_dirty_inventory_and_persistent_options_refuse_by_name",
         "resolver::server::scratch::mssql_live_tests::mssql_docker_removes_the_container_on_success_failure_and_cancellation",
         "resolver::server::scratch::mssql_live_tests::mssql_supplied_independent_catalogs_refuse_untouched_and_cleanup_restores_fresh",
