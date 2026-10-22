@@ -97,9 +97,13 @@ in [ORDERING](ORDERING.md#adding-an-engine) (DEC-1959.6).
 - `Dialect::engine_effects` adds pure, operation-local effects to the portable
   effects. Baseline/desired snapshots establish ownership and the change's
   other end, not substitute payloads.
-- `slots::slot`/`slots::slots` maps addresses into the engine's namespaces.
-  Slot equality is a catalog fact under its identifier/collation rules.
-  Unknown equality is reported/skipped, never interpreted as inequality.
+- The shared [`pbps_dialect::slots::slots`](../crates/pbps-dialect/src/slots.rs#L366)
+  mapper uses the engine's `Dialect::shares_namespace_with_tables`,
+  `Dialect::indexes_share_namespace_with_tables`,
+  `Dialect::constraints_share_namespace_with_tables` and `Dialect::overloads`
+  hooks to map addresses into namespaces. Slot equality is a catalog fact
+  under its identifier/collation rules. Unknown equality is reported/skipped,
+  never interpreted as inequality.
 - Engine catalog I/O supplies holders, bindings, dependencies, releases and
   capabilities as neutral facts. Unread and read-empty remain distinct;
   `pbps-diff::order` owns their pure constraints and structural application.
@@ -112,11 +116,17 @@ in [ORDERING](ORDERING.md#adding-an-engine) (DEC-1959.6).
   scratch blueprints and connected continuations finish inside order; only
   certified input reaches rendering, sealing and execution.
 
-Ordinary plans retain one transaction and refuse non-transactional statements.
-A plan of several non-transactional statements is refused until a separate
-multi-transaction design exists. Batch boundaries do not authorize commits;
-the existing one-logical-change staged protocol keeps its designed
-checkpoints/resume contract (ADR-0003). No new engine silently widens it.
+Ordinary transactional plans refuse non-transactional statements
+([`reject_non_transactional`](../crates/pbps-cli/src/deploy.rs#L9907)).
+A staged plan contains exactly one logical change
+([planning limit](../crates/pbps-cli/src/deploy.rs#L7600)); its lowered
+statements run in order, each committed, under the existing checkpoint and
+resume protocol ([staged executor](../crates/pbps-cli/src/deploy.rs#L8908),
+ADR-0003). A new engine whose single change lowers to several non-transactional
+statements uses this staged route and must make each statement resumable or
+idempotent under that protocol. Several logical changes needing
+non-transactional execution remain refused until a separate multi-transaction
+design exists. Batch boundaries do not authorize commits.
 The release verifier remains off; tests/debug replay and live commutation
 checks remain complementary guards, with mutation audits exposing missing
 effects. This contract adds no dependency, rank, tie-break, settlement stage,

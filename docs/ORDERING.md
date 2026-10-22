@@ -114,7 +114,8 @@ the existing settlements or change their order (DEC-1959.5, DEC-1959.6).
    route for a reviewed saved artifact and preserves its order. Neither adds
    proof/origins to checksum bytes (DEC-1959.5).
 
-The canonical declaration/catalog route is `order::deployment::schedule`.
+The canonical declaration/catalog entry point is
+`order::deployment::schedule::schedule`.
 CLI adapters supply observed facts and preserve re-diff/probe timing. A fact
 not read is distinct from a fact read and empty: unavailable stages report
 their skip. Resolver, connected catalog continuations and the shared route
@@ -189,7 +190,7 @@ reorder pass or manufacture an executable plan (DEC-1959.6).
 | Input | Engine responsibility | Shared consumer |
 | --- | --- | --- |
 | `Dialect::engine_effects` | Pure effects specific to the engine, reading each operation's own payload and supplied snapshots; include lexer/binding semantics that portable effects cannot state | Resource-indexed edges and operation replay |
-| `slots::slot` / `slots::slots` | Namespace scope, overlapping namespaces and routine signatures from the dialect's answers | Slot claims, releases and intermediate-name checks |
+| Shared [`pbps_dialect::slots::slots`](../crates/pbps-dialect/src/slots.rs#L366) mapper | Supply namespace sharing and overload policy through the `Dialect::shares_namespace_with_tables`, `Dialect::indexes_share_namespace_with_tables`, `Dialect::constraints_share_namespace_with_tables` and `Dialect::overloads` hooks; the mapper uses an address's supplied signature for overloaded routines | Slot claims, releases and intermediate-name checks |
 | Slot equality | A catalog fact under the target's comparison/collation rules; exact comparison only where the engine contract establishes it | `CatalogFacts` / `Same`; unknown equality is skipped and reported, never assumed unequal |
 | Catalog facts | Actual occupants, releases, module/column/role bindings and dependencies, plus capabilities needed by an expansion; distinguish unread from read-empty | Pure order proposals and connected canonical continuations; I/O stays in the engine/CLI seam |
 | Statement lowering metadata | Transaction and batch requirements, intermediate `renames`/`role_renames`, `creates` and `releases`, plus execution guards such as row writes or index builds | Immutable lowering groups, rendering, checkpointing and statement-level verification |
@@ -202,12 +203,20 @@ not imply a commit; `transactional` is a separate requirement. Intermediate name
 the emitter, never reconstructed by parsing SQL. Engines preserve their
 concrete type through certified lowering, rendering, sealing and apply.
 
-An ordinary plan remains one transaction and refuses a non-transactional
-statement. A plan of several non-transactional statements is refused until a
-multi-transaction design exists; metadata does not authorize automatic commit
-boundaries. The existing staged protocol remains restricted to one logical
-change, with its designed checkpoints and resume checks (ADR-0003). Adding an
-engine does not generalize that protocol or split an ordinary plan.
+An ordinary plan remains one transaction and refuses non-transactional
+statements ([`reject_non_transactional`](../crates/pbps-cli/src/deploy.rs#L9907)).
+A staged plan contains exactly one logical change: planning refuses both
+multiple logical changes and an empty plan, and skips that transactional
+statement check ([planning limit](../crates/pbps-cli/src/deploy.rs#L7600)).
+Its lowered statements run in order, each committed, with the existing
+checkpoints and resume checks
+([staged executor](../crates/pbps-cli/src/deploy.rs#L8908), ADR-0003).
+A new engine whose single change lowers to several non-transactional
+statements must use this staged route and make each statement resumable or
+idempotent under the existing protocol. Several logical changes needing
+non-transactional execution remain refused until a multi-transaction design
+exists. Statement metadata and batch boundaries do not authorize additional
+commits in an ordinary plan.
 
 ## Method
 
@@ -272,8 +281,9 @@ Names are stated the same way, apart from the effects, because a name is an
 address and not an identity. `pbps_model::operation::names` reports, for each
 operation, the names it claims and releases. `pbps_dialect::slots::names`
 adds a constraint trigger's companion names and its clones' names from the
-dialect's existing answers (DEC-2100.1). The dialect's `slots::slot`
-says which namespace holds each one. Whether two spellings are one name is the
+dialect's existing answers (DEC-2100.1). The shared
+`pbps_dialect::slots::slots` mapper uses the dialect's namespace hooks to
+identify every slot each name holds. Whether two spellings are one name is the
 engine's rule, or the catalog's answer under a collation (DEC-1964.1).
 `pbps_diff::order::slots` then does three things beside every order
 (DEC-1964.2):
