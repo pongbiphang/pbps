@@ -202,7 +202,7 @@ fn declared_literals(schema: &Schema) -> Result<Vec<Literal>, DbError> {
             let ty = crate::types::normalize(ty).map_err(|e| DbError::BadRow(e.to_string()))?;
             Ok(SETTING_SENSITIVE
                 .contains(&ty.base.as_str())
-                .then(|| (ty.base.clone(), ty.to_string(), ty.is_array())))
+                .then(|| (ty.base.clone(), ty.raw().to_string(), ty.is_array())))
         };
     for (name, table) in &schema.tables {
         // A partition's columns are its parent's; its own defaults are read

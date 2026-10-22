@@ -1,0 +1,14 @@
+table: app.typed
+
+columns:
+  id:
+    type: int
+    nullable: false
+  amount:
+    type: "decimal(18, 4)"
+  body:
+    type: nvarchar(max)
+  at:
+    type: datetime2(3)
+  added:
+    type: nvarchar(max)

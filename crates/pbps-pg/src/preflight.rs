@@ -1355,7 +1355,9 @@ impl AsStored<'_, '_> {
         match self.final_type(column) {
             Some(ty) => format!(
                 "CAST({literal} AS {})",
-                crate::types::normalize(&ty).unwrap_or_else(|_| ty.clone())
+                crate::types::normalize(&ty)
+                    .unwrap_or_else(|_| ty.clone())
+                    .raw()
             ),
             None => literal,
         }
@@ -1381,7 +1383,7 @@ impl AsStored<'_, '_> {
         match self.retyped.get(column) {
             Some(to) => {
                 let to = crate::types::normalize(to).unwrap_or_else(|_| to.clone());
-                format!("CAST({expr} AS {to})")
+                format!("CAST({expr} AS {to})", to = to.raw())
             }
             None => expr,
         }
@@ -1935,6 +1937,7 @@ fn planned_key_probes(
                             value_literal(
                                 &crate::types::normalize(to)
                                     .unwrap_or_else(|_| to.clone())
+                                    .raw()
                                     .to_string()
                             )
                         ),
@@ -2592,7 +2595,7 @@ fn rows_after(
                 let to = crate::types::normalize(to).ok()?;
                 // Exclusion belongs to the raw stored row, not to its value:
                 // manufacturing NULL would change what a key means (449).
-                Some(format!("CAST({sql} AS {to}) AS k{i}"))
+                Some(format!("CAST({sql} AS {to}) AS k{i}", to = to.raw()))
             }
             _ => Some(format!("{sql} AS k{i}")),
         }
@@ -2855,7 +2858,7 @@ fn rows_after(
         };
         empty.push(format!(
             "CAST(NULL AS {}) AS k{i}",
-            crate::types::normalize(&ty).unwrap_or(ty)
+            crate::types::normalize(&ty).unwrap_or(ty).raw()
         ));
     }
     Ok(Some(format!("SELECT {} WHERE false", empty.join(", "))))
@@ -2881,7 +2884,9 @@ fn backfill_of(added: &AddedColumn) -> Option<String> {
             }
             Some(format!(
                 "CAST(({literal}) AS {})",
-                crate::types::normalize(&added.ty).unwrap_or_else(|_| added.ty.clone())
+                crate::types::normalize(&added.ty)
+                    .unwrap_or_else(|_| added.ty.clone())
+                    .raw()
             ))
         }
         // A scalar reference may be a domain whose own DEFAULT fills the row.
@@ -3192,7 +3197,12 @@ fn build<'v, 'p: 'v>(
             };
             if let Some(fails) = crate::types::cannot_become(&from, &to, &quoted) {
                 out.push(Probe::new(
-                    format!("values in {column} that cannot become {to}", column = column.raw()),
+                    format!(
+                        "values in {column} that cannot become {to}",
+                        column = column.raw(),
+                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                        to = to.raw(),
+                    ),
                     // The NULLs are excluded here and counted by the probe
                     // above where there is one: a NULL converts to a NULL
                     // whatever the target, and counting it under "cannot
@@ -3758,7 +3768,7 @@ fn planned_collation(names: &AsStored, column: &ColumnRef) -> Result<String, Dia
         return Ok(format!(
             "(SELECT t.typcollation FROM pg_catalog.pg_type t \
              WHERE t.oid = pg_catalog.to_regtype({}))",
-            value_literal(&crate::types::normalize(ty)?.to_string())
+            value_literal(&crate::types::normalize(ty)?.raw().to_string())
         ));
     }
     let Some(stored) = names.column(column) else {

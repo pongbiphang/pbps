@@ -1,0 +1,33 @@
+Plan
+  origin      computed against the target environment — applyable
+  dialect     mssql
+  created     2026-10-22T00:00:00Z
+  baseline    type-name master fixture
+  execution   one transaction, all or nothing: a failure rolls the whole plan back
+  checksum    ea97f3880b619ef5e0e6237971fe41420ac042314213c63a5c73881a3363f772
+
+What it changes
+  3 change(s) across 1 table(s), 3 statement(s).
+
+  app.typed
+    + create table app.typed (4 columns)
+    + add column added nvarchar(max)
+    ~ id type int -> bigint
+
+Why it needs approval
+  No risk class applies; this plan needs no --allow.
+
+Checks that run before the first statement
+  None can run: each check this plan implies is listed below.
+
+Checks that cannot run before the plan
+  - type conversion of app.typed.id: the column does not exist before apply
+  Nothing counts these rows beforehand. The engine enforces each one when the
+  apply reaches it, and a violation fails the apply at that statement.
+
+The environment
+  Not checked: no --db or --env was given. Whether the target is mid-deployment is
+  the one question this file cannot answer; `pbps status` answers it.
+
+To approve and run it:
+  pbps apply --env "<environment>" --plan plan.json --checksum ea97f3880b619ef5e0e6237971fe41420ac042314213c63a5c73881a3363f772

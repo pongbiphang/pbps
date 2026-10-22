@@ -56,8 +56,21 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
             CREATE TYPE app.pair AS (n integer, s text);
             CREATE TYPE \"App\".\"Mood\" AS ENUM ('ok');",
         );
+        // Both names exist, so escaping a type identity cannot accidentally
+        // pass by resolving to the only type the database holds (#2084 step 1c).
+        let hostile_names = ["type\n\"\\\u{1b}名", r#"type\n"\\\u{1b}名"#];
+        let mut extra = String::new();
+        for (i, name) in hostile_names.iter().enumerate() {
+            let reference = pbps_model::TypeRef::new("app", *name).unwrap();
+            let canonical = reference.raw().to_string();
+            on_server(db, &format!("CREATE TYPE {canonical} AS ENUM ('ok')"));
+            extra.push_str(&format!(
+                "  hostile_{i}: {{type: {}}}\n",
+                serde_json::to_string(&canonical).unwrap()
+            ));
+        }
         let d = Demo::new("refs-roundtrip");
-        d.table(&declarations("  mood: {type: app.mood, default: \"'happy'::app.mood\"}\n  moods: {type: 'app.mood[]', default: \"'{}'::app.mood[]\"}\n  n: {type: app.positive}\n  ns: {type: 'app.positive[]'}\n  pair: {type: app.pair}\n  pairs: {type: 'app.pair[]'}\n  quoted: {type: '\"App\".\"Mood\"'}\n"));
+        d.table(&declarations(&("  mood: {type: app.mood, default: \"'happy'::app.mood\"}\n  moods: {type: 'app.mood[]', default: \"'{}'::app.mood[]\"}\n  n: {type: app.positive}\n  ns: {type: 'app.positive[]'}\n  pair: {type: app.pair}\n  pairs: {type: 'app.pair[]'}\n  quoted: {type: '\"App\".\"Mood\"'}\n" .to_owned() + &extra)));
         succeeds(d.run(&["plan"]));
         d.commit();
         succeeds(d.run(&["bootstrap", "--db", db]));
@@ -66,7 +79,15 @@ fn existing_enum_domain_and_composite_columns_round_trip_as_scalars_and_arrays()
         let saved: pbps_model::SavedPlan =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert!(saved.changes.is_empty(), "{:?}", saved.changes);
-        assert_eq!(saved.type_pins.len(), 4);
+        assert_eq!(saved.type_pins.len(), 6);
+        for name in hostile_names {
+            assert!(
+                saved
+                    .type_pins
+                    .iter()
+                    .any(|pin| pin.schema == "app" && pin.name == name)
+            );
+        }
         succeeds(d.run(&["pull", "--db", db, "--force"]));
         succeeds(d.run(&["validate"]));
         let next = plan(&d, db);

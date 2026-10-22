@@ -230,7 +230,7 @@ fn assigned_default(
         ),
         None => format!("({default})"),
     };
-    Some(format!("CONVERT({ty}, {input})"))
+    Some(format!("CONVERT({ty}, {input})", ty = ty.raw()))
 }
 
 /// `NULL` under any number of parentheses and comments: a default that
@@ -1698,7 +1698,7 @@ fn rows_after(
         let value = match ty {
             Some(ty) => format!(
                 "TRY_CONVERT({}, {sql})",
-                types::normalize(ty).unwrap_or_else(|_| ty.clone())
+                types::normalize(ty).unwrap_or_else(|_| ty.clone()).raw()
             ),
             None => sql,
         };
@@ -1901,7 +1901,7 @@ fn rows_after(
         };
         empty.push(format!(
             "TRY_CONVERT({}, NULL) AS k{i}",
-            types::normalize(ty).unwrap_or_else(|_| ty.clone())
+            types::normalize(ty).unwrap_or_else(|_| ty.clone()).raw()
         ));
     }
     Ok(Some(format!("SELECT {} WHERE 1 = 0", empty.join(", "))))
@@ -2060,10 +2060,13 @@ fn conversion_probe(
         Probe::new(
             format!(
                 "values in {column} changed when converted to {to}",
-                column = column.raw()
+                column = column.raw(),
+                // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                to = to.raw(),
             ),
             format!(
-                "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {target_input})) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), {col}) COLLATE Latin1_General_BIN2;"
+                "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND CONVERT(nvarchar(max), CONVERT({to}, {target_input})) COLLATE Latin1_General_BIN2 <> CONVERT(nvarchar(max), {col}) COLLATE Latin1_General_BIN2;",
+                to = to.raw(),
             ),
         )
     };
@@ -2106,11 +2109,14 @@ fn conversion_probe(
                 return Ok(vec![Probe::new(
                     format!(
                         "values in {column} too long for {to} or that cannot become {to}",
-                        column = column.raw()
+                        column = column.raw(),
+                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                        to = to.raw(),
                     ),
                     format!(
                         "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND \
-                         (TRY_CONVERT({to}, {col}) IS NULL OR {over_capacity});"
+                         (TRY_CONVERT({to}, {col}) IS NULL OR {over_capacity});",
+                        to = to.raw(),
                     ),
                 )]);
             }
@@ -2124,7 +2130,9 @@ fn conversion_probe(
                 let mut probes = vec![Probe::new(
                     format!(
                         "values in {column} too long for {to}",
-                        column = column.raw()
+                        column = column.raw(),
+                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                        to = to.raw(),
                     ),
                     format!(
                         "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND {len} > {n};"
@@ -2146,7 +2154,9 @@ fn conversion_probe(
                 return Ok(vec![Probe::new(
                     format!(
                         "values in {column} too long for {to}",
-                        column = column.raw()
+                        column = column.raw(),
+                        // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                        to = to.raw(),
                     ),
                     format!(
                         "SELECT COUNT(*) AS n FROM {table} WHERE {col} IS NOT NULL AND DATALENGTH({col}) > {n};"
@@ -2174,10 +2184,13 @@ fn conversion_probe(
     Ok(vec![Probe::new(
         format!(
             "values in {column} that cannot become {to}",
-            column = column.raw()
+            column = column.raw(),
+            // Raw data, escaped by the diagnostic writer until #2084 step 5.
+            to = to.raw(),
         ),
         format!(
-            "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND TRY_CONVERT({to}, {col}) IS NULL;"
+            "SELECT COUNT(*) AS n FROM {table}\n WHERE {col} IS NOT NULL AND TRY_CONVERT({to}, {col}) IS NULL;",
+            to = to.raw(),
         ),
     )])
 }

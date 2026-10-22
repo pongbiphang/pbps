@@ -154,7 +154,7 @@ pub fn render(schema: &Schema) -> String {
             let _ = writeln!(
                 s,
                 "        {} {token}{key}{comment}",
-                attr_type(&col.ty.to_string()),
+                attr_type(&col.ty.raw().to_string()),
             );
         }
         // A SQL Server computed column has no type in the model: the engine

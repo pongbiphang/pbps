@@ -2872,12 +2872,12 @@ mod tests {
     fn nvarchar_lengths_are_bytes_and_come_back_as_characters() {
         let mut c = raw_column(1, "x", "nvarchar");
         c.max_length = 200;
-        assert_eq!(column_type(&c).unwrap().to_string(), "nvarchar(100)");
+        assert_eq!(column_type(&c).unwrap().raw().to_string(), "nvarchar(100)");
         c.max_length = -1;
-        assert_eq!(column_type(&c).unwrap().to_string(), "nvarchar(max)");
+        assert_eq!(column_type(&c).unwrap().raw().to_string(), "nvarchar(max)");
         let mut v = raw_column(1, "x", "varchar");
         v.max_length = 200;
-        assert_eq!(column_type(&v).unwrap().to_string(), "varchar(200)");
+        assert_eq!(column_type(&v).unwrap().raw().to_string(), "varchar(200)");
     }
 
     #[test]
@@ -2885,10 +2885,10 @@ mod tests {
         let mut c = raw_column(1, "x", "numeric");
         (c.precision, c.scale) = (12, 4);
         // numeric normalizes to decimal, same as on the declared side.
-        assert_eq!(column_type(&c).unwrap().to_string(), "decimal(12, 4)");
+        assert_eq!(column_type(&c).unwrap().raw().to_string(), "decimal(12, 4)");
         let mut t = raw_column(1, "x", "datetime2");
         t.scale = 3;
-        assert_eq!(column_type(&t).unwrap().to_string(), "datetime2(3)");
+        assert_eq!(column_type(&t).unwrap().raw().to_string(), "datetime2(3)");
     }
 
     #[test]
@@ -3500,7 +3500,7 @@ mod tests {
                 options: Default::default(),
             })
         );
-        assert_eq!(t.columns["email"].ty.to_string(), "nvarchar(255)");
+        assert_eq!(t.columns["email"].ty.raw().to_string(), "nvarchar(255)");
         assert_eq!(
             t.columns["status"].value_source,
             pbps_model::ValueSource::Default("0".into())

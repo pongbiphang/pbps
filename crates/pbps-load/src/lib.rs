@@ -566,7 +566,7 @@ indexes:
                 "table: app.t\ncolumns:\n  id: {{type: {spelled}}}\n"
             ));
             let id = &t.table.columns["id"];
-            assert_eq!(id.ty.to_string(), integer, "{spelled}");
+            assert_eq!(id.ty.raw().to_string(), integer, "{spelled}");
             assert_eq!(
                 id.value_source,
                 pbps_model::ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
@@ -605,7 +605,7 @@ indexes:
             array.table.columns["ids"].value_source,
             pbps_model::ValueSource::None
         );
-        assert_eq!(array.table.columns["ids"].ty.to_string(), "serial[]");
+        assert_eq!(array.table.columns["ids"].ty.raw().to_string(), "serial[]");
         // The negative case: an ordinary integer is not given a sequence.
         let plain = load("table: app.t\ncolumns:\n  id: {type: integer}\n");
         assert_eq!(
@@ -630,7 +630,7 @@ indexes:
         let ty = &t.table.columns["full_name"].ty;
         assert_eq!(ty.base, "nvarchar");
         assert_eq!(ty.args, vec![TypeArg::Int(100)]);
-        assert_eq!(ty.to_string(), "nvarchar(100)");
+        assert_eq!(ty.raw().to_string(), "nvarchar(100)");
     }
 
     #[test]

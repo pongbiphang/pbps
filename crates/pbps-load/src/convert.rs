@@ -308,6 +308,7 @@ pub(crate) fn convert_for_diagnostics(
                             "column `{col_name}` has a `sequence:` on `{ty}`, which is not a \
                              serial type",
                             col_name = col_name.shown(),
+                            ty = ty.shown(),
                         ),
                         "`sequence:` beside a type that is not serial".to_owned(),
                     )

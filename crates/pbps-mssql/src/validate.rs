@@ -745,7 +745,8 @@ pub(crate) fn table_sources(
                 errs.push(invalid(format!(
                     "column `{col_name}` is `{}`, which takes no collation; only character \
                      types do",
-                    col.ty,
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    col.ty.raw(),
                     // raw: whole-message escaped until #2084 step 5.
                     col_name = col_name.raw(),
                 )));
@@ -766,8 +767,8 @@ pub(crate) fn table_sources(
             if !types::can_be_identity(&col.ty) {
                 errs.push(invalid(format!(
                     "column `{col_name}` is IDENTITY, which needs an integer type or a decimal with scale 0, not `{}`",
-                    col.ty
-                ,
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    col.ty.raw(),
                     // raw: whole-message escaped until #2084 step 5.
                     col_name = col_name.raw(),
                 )));
@@ -1277,7 +1278,8 @@ fn system_time(
             errs.push(invalid(format!(
                 "column `{column}` is the period's {role}, which SQL Server requires to be \
                  `datetime2`, not `{}`",
-                col.ty,
+                // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                col.ty.raw(),
                 // raw: whole-message escaped until #2084 step 5.
                 column = column.raw(),
             )));
@@ -1418,7 +1420,8 @@ fn key_columns(
             ))),
             Some(col) if !types::is_indexable(&col.ty) => errs.push(invalid(format!(
                 "{what} uses `{c}`, whose type `{}` cannot be part of a key",
-                col.ty,
+                // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                col.ty.raw(),
                 // raw: whole-message escaped until #2084 step 5.
                 c = c.raw(),
             ))),

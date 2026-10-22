@@ -3657,7 +3657,9 @@ fn key_type_changes_over_aliases(
                  them: {}",
                 column.table.shown(),
                 column.name.shown(),
-                aliased.join(", ")
+                aliased.join(", "),
+                from = from.shown(),
+                to = to.shown(),
             ));
         }
     }

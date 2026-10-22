@@ -1364,7 +1364,8 @@ pub fn describe(c: &Change) -> String {
         Change::AddColumn { name, column, .. } => {
             format!(
                 "+ add column {name} {}",
-                column.ty,
+                // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                column.ty.raw(),
                 // Shared JSON/prose, escaped whole until #2084 step 5.
                 name = name.raw(),
             )
@@ -1387,7 +1388,11 @@ pub fn describe(c: &Change) -> String {
             format!(
                 "~ {} type {from} -> {to}",
                 // Shared JSON/prose, escaped whole until #2084 step 5.
-                column.name.raw()
+                column.name.raw(),
+                // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                from = from.raw(),
+                // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                to = to.raw(),
             )
         }
         Change::AlterColumnNullability {
@@ -2683,5 +2688,30 @@ mod tests {
         // The general "schema, table and column" explanation of the
         // separator is fine here; claiming *this* name is a column is not.
         assert!(!text.contains("mint an identity for this column"), "{text}");
+    }
+
+    #[test]
+    fn type_descriptions_keep_raw_explain_data_until_the_human_boundary() {
+        use pbps_model::{ColumnType, TypeRef};
+        let raw = ColumnType::reference(TypeRef::new("app", "type\n\\\u{1b}\"名前").unwrap());
+        let visible = ColumnType::reference(TypeRef::new("app", r#"type\n\\\u{1b}"名前"#).unwrap());
+        let raw_text = "app.\"type\n\\\u{1b}\"\"名前\"";
+        let visible_text = r#"app."type\n\\\u{1b}""名前""#;
+        let change = Change::AlterColumnType {
+            uid: "c_aaaaaa".parse().unwrap(),
+            column: TableName::new("app", "t").column("v"),
+            from: raw,
+            to: visible,
+            from_nullable: true,
+            to_nullable: true,
+            from_collation: None,
+            to_collation: None,
+            through_external_partitions: false,
+        };
+        assert_eq!(
+            describe(&change),
+            format!("~ v type {raw_text} -> {visible_text}")
+        );
+        assert_ne!(describe(&change), Escaped(&describe(&change)).to_string());
     }
 }

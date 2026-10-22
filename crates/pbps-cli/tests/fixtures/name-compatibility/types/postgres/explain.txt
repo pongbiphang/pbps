@@ -1,0 +1,36 @@
+Plan
+Approving this plan approves the shown routines, whatever they call as those routines stand at plan time, and any SQL they build from data that pbps cannot show.
+Plan-time probes requiring these routines are unchecked until source review; apply checks them.
+CREATE FUNCTION app.checked(integer) RETURNS boolean LANGUAGE sql RETURN $1 > 0; -- type\nline\r"'\u{1b}[31m\u{9b}\\\u{202e}名前domain
+  origin      computed against the target environment — applyable
+  dialect     postgres
+  created     2026-10-22T00:00:00Z
+  baseline    type-name master fixture
+  execution   one transaction, all or nothing: a failure rolls the whole plan back
+  checksum    365c38329dac9e406cdac8f5cdf71b67cbab531ceb2a9e2406f33e69577a54c5
+
+What it changes
+  3 change(s) across 1 table(s), 3 statement(s).
+
+  app.typed
+    + create table app.typed (7 columns)
+    + add column added app."type\nline\r""'\u{1b}[31m\u{9b}\\\u{202e}名前domain"
+    ~ id type int -> bigint
+
+Why it needs approval
+  No risk class applies; this plan needs no --allow.
+
+Checks that run before the first statement
+  None can run: each check this plan implies is listed below.
+
+Checks that cannot run before the plan
+  - type conversion of app.typed.id: the column does not exist before apply
+  Nothing counts these rows beforehand. The engine enforces each one when the
+  apply reaches it, and a violation fails the apply at that statement.
+
+The environment
+  Not checked: no --db or --env was given. Whether the target is mid-deployment is
+  the one question this file cannot answer; `pbps status` answers it.
+
+To approve and run it:
+  pbps apply --env "<environment>" --plan plan.json --checksum 365c38329dac9e406cdac8f5cdf71b67cbab531ceb2a9e2406f33e69577a54c5

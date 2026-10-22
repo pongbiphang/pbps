@@ -480,7 +480,12 @@ pub(crate) fn estimate(change: &Change, strategy: Strategy) -> Option<Estimate> 
                 }
             };
             e(
-                format!("changing {column} to {to}", column = column.raw()),
+                format!(
+                    "changing {column} to {to}",
+                    column = column.raw(),
+                    // Raw data, escaped by the diagnostic writer until #2084 step 5.
+                    to = to.raw(),
+                ),
                 &column.table,
                 rewrite,
                 reads,

@@ -851,16 +851,19 @@ async fn every_spelling_the_catalogue_admits_reads_back_as_the_dialect_says() {
             .normalize_type(&spelling.parse().expect("a type parses"))
             .unwrap_or_else(|e| panic!("`{spelling}` should normalize: {e}"));
         assert_eq!(
-            normalized, engine,
+            normalized,
+            engine,
             "declared `{spelling}`: the dialect says `{normalized}` and the engine says \
-             `{read_back}`, so every run would report a change that is not there"
+             `{read_back}`, so every run would report a change that is not there",
+            normalized = normalized.shown(),
         );
         // And the contract's other half, against the engine's own spelling
         // rather than against this crate's idea of it.
         let again = Postgres::new().normalize_type(&engine).expect("idempotent");
         assert_eq!(again, engine, "normalizing the read-back form moved it");
         conn.execute(&format!(
-            "ALTER TABLE {table} ALTER COLUMN c{i} TYPE {normalized}"
+            "ALTER TABLE {table} ALTER COLUMN c{i} TYPE {normalized}",
+            normalized = normalized.raw(),
         ))
         .await
         .expect("the normalized spelling is executable SQL");
@@ -1084,7 +1087,7 @@ async fn temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calend
         let from = Postgres::new()
             .normalize_type(&ty(&format!("{base}(6)")))
             .unwrap();
-        assert_eq!(read, from.to_string());
+        assert_eq!(read, from.raw().to_string());
         assert!(
             Postgres::new()
                 .normalize_type(&ty(&format!("{base}(7)")))
@@ -1113,9 +1116,12 @@ async fn temporal_modifiers_keep_the_engine_bounds_and_do_not_shorten_the_calend
                 .probes
                 .is_empty()
         );
-        conn.execute(&format!("ALTER TABLE {table} ALTER COLUMN c TYPE {to}"))
-            .await
-            .unwrap();
+        conn.execute(&format!(
+            "ALTER TABLE {table} ALTER COLUMN c TYPE {to}",
+            to = to.raw()
+        ))
+        .await
+        .unwrap();
         assert!(
             text(&mut conn, &format!("SELECT c::text FROM {table}"))
                 .await
@@ -1797,7 +1803,7 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
     // The respelling ADR-0009 §2 is about: `varchar(10)` comes back as the
     // engine's own name for it, and the catalogue of step 2 agrees.
     assert_eq!(
-        parent.columns["code"].ty.to_string(),
+        parent.columns["code"].ty.raw().to_string(),
         "character varying(10)"
     );
     assert_eq!(
@@ -2603,13 +2609,14 @@ async fn what_the_model_cannot_hold_is_named_and_never_silently_dropped() {
     assert_eq!(
         pulled.schema.tables[&pbps_model::TableName::new(&s, "collated")].columns["b"]
             .ty
+            .raw()
             .to_string(),
         "text"
     );
     // That column is carried — an `integer` with a `nextval` default, which
     // is exactly what the model says — and the sequence beside it named.
     let serialised = &pulled.schema.tables[&pbps_model::TableName::new(&s, "serialised")];
-    assert_eq!(serialised.columns["id"].ty.to_string(), "integer");
+    assert_eq!(serialised.columns["id"].ty.raw().to_string(), "integer");
     assert!(
         matches!(&serialised.columns["id"].value_source, pbps_model::ValueSource::Default(default) if default.starts_with("nextval(")),
         "{:?}",
@@ -3304,7 +3311,7 @@ async fn inet_cidr_macaddr_tsvector_and_xml_columns_pull_recreate_and_repull_to_
         ("d_tsv", "tsvector"),
         ("d_doc", "xml"),
     ] {
-        assert_eq!(columns[name].ty.to_string(), spelled, "{name}");
+        assert_eq!(columns[name].ty.raw().to_string(), spelled, "{name}");
     }
     let pbps_model::ValueSource::Generated(fts) = columns["fts"].value_source.clone() else {
         panic!("fts is generated")
@@ -3523,7 +3530,7 @@ async fn inet_into_cidr_is_a_narrowing_whose_probe_counts_the_rows_with_host_bit
             matches!(
                 step.changes.as_slice(),
                 [p] if matches!(&p.change, Change::AlterColumnType { from: f, to: t, .. }
-                    if f.to_string() == from && t.to_string() == to)
+                    if f.raw().to_string() == from && t.raw().to_string() == to)
             ),
             "{from} -> {to}: {step:#?}"
         );
@@ -4484,7 +4491,7 @@ async fn a_serial_round_trips_and_numbers_the_rows_it_is_added_to() {
 
     let columns = &pulled.tables[&t].columns;
     for (column, integer) in [("id", "integer"), ("big", "bigint"), ("small", "smallint")] {
-        assert_eq!(columns[column].ty.to_string(), integer, "{column}");
+        assert_eq!(columns[column].ty.raw().to_string(), integer, "{column}");
         assert_eq!(
             columns[column].value_source,
             pbps_model::ValueSource::Sequence(OwnedSequence::serial()),
@@ -5171,7 +5178,7 @@ async fn array_columns_round_trip_and_widen_their_elements() {
     let before = values(&mut target, &s).await;
     let pulled = ours_only(&pull(&mut target).await, &s);
     let t = &pulled.tables[&TableName::new(&s, "t")];
-    let types: Vec<String> = t.columns.values().map(|c| c.ty.to_string()).collect();
+    let types: Vec<String> = t.columns.values().map(|c| c.ty.raw().to_string()).collect();
     assert_eq!(
         types,
         [
@@ -5195,7 +5202,7 @@ async fn array_columns_round_trip_and_widen_their_elements() {
     // A GIN index over `jsonb[]` is not one over `jsonb` (#1525 review): left
     // out, while its table and column are held.
     let g = &pulled.tables[&TableName::new(&s, "g")];
-    assert_eq!(g.columns["docs"].ty.to_string(), "jsonb[]");
+    assert_eq!(g.columns["docs"].ty.raw().to_string(), "jsonb[]");
     assert!(g.indexes.is_empty(), "{:?}", g.indexes);
     let ids = mint_ids(&pulled, &IdsFile::default(), &[]);
 
@@ -5230,6 +5237,7 @@ async fn array_columns_round_trip_and_widen_their_elements() {
     assert_eq!(
         after.tables[&TableName::new(&s, "t")].columns["a"]
             .ty
+            .raw()
             .to_string(),
         "bigint[]"
     );

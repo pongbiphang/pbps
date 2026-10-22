@@ -1,0 +1,20 @@
+table: app.typed
+
+columns:
+  id:
+    type: int
+    nullable: false
+  amount:
+    type: "decimal(18, 4)"
+  domain:
+    type: "app.\"type\nline\r\"\"'\e[31m\x9B\\‮名前domain\""
+  domains:
+    type: "app.\"type\nline\r\"\"'\e[31m\x9B\\‮名前domain\"[]"
+  enumeration:
+    type: "app.\"type\nline\r\"\"'\e[31m\x9B\\‮名前enum\""
+  enumerations:
+    type: "app.\"type\nline\r\"\"'\e[31m\x9B\\‮名前enum\"[]"
+  at:
+    type: timestamp(3) with time zone
+  added:
+    type: "app.\"type\nline\r\"\"'\e[31m\x9B\\‮名前domain\""

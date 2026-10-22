@@ -231,7 +231,7 @@ pub async fn seal(
         }) {
             return Err(failed(format!(
                 "type `{}` depends on managed {} `{}`; a referenced type cannot depend on an object pbps changes",
-                ty.reference(),
+                ty.reference().shown(),
                 reached.kind,
                 reached.identity
             )));
@@ -253,7 +253,8 @@ pub async fn check(
     for reference in self::references(&[], changes) {
         if !references.contains(&reference) {
             return Err(failed(format!(
-                "plan has no type pin for `{reference}`; plan again against the database"
+                "plan has no type pin for `{reference}`; plan again against the database",
+                reference = reference.shown(),
             )));
         }
     }
@@ -377,7 +378,9 @@ pub fn bootstrap_guard(
         let schema = crate::emit::literal(reference.schema());
         let name = crate::emit::literal(reference.name());
         let message = crate::emit::literal(&format!(
-            "required type `{reference}` is missing, unusable or not an enum, domain or standalone composite"
+            "required type `{reference}` is missing, unusable or not an enum, domain or standalone composite",
+            // Raw SQL message literal; preserve its bytes until #2084 step 5.
+            reference = reference.raw(),
         ));
         sql.push_str(&format!("IF NOT EXISTS (SELECT FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid=t.typnamespace LEFT JOIN pg_catalog.pg_class c ON c.oid=t.typrelid WHERE n.nspname={schema} AND t.typname={name} AND t.typisdefined AND (t.typtype IN ('e','d') OR (t.typtype='c' AND c.relkind='c')) AND pg_catalog.has_schema_privilege(n.oid,'USAGE') AND pg_catalog.has_type_privilege(t.oid,'USAGE')) THEN RAISE EXCEPTION '%', {message}; END IF;\n"));
     }
@@ -558,5 +561,48 @@ mod tests {
                 && sql.contains("c.relkind='c'")
         );
         assert_eq!(references(&[&schema], &ChangeSet::default()).len(), 1);
+    }
+
+    #[test]
+    fn referenced_type_keys_and_cast_fallback_keep_raw_names_distinct() {
+        let raw = TypeRef::new("app", "type\n\\\u{1b}\"名前").unwrap();
+        let visible = TypeRef::new("app", r#"type\n\\\u{1b}"名前"#).unwrap();
+        let ty = ColumnType::reference(raw.clone());
+        let other = ColumnType::reference(visible.clone());
+        let table = pbps_model::Table {
+            columns: [
+                ("raw".into(), Column::new(ty.clone())),
+                ("shown".into(), Column::new(other.clone().into_array())),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let schema = Schema {
+            tables: [(pbps_model::TableName::new("app", "t"), table)].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            references(&[&schema], &ChangeSet::default()),
+            BTreeSet::from([raw.clone(), visible])
+        );
+        let canonical = "app.\"type\n\\\u{1b}\"\"名前\"";
+        let mut column = Column::new(ty);
+        column.value_source = ValueSource::Default(format!("NULL::{canonical}"));
+        // The existing cast recognizer conservatively leaves quoted control
+        // characters to the full input-path check; changing that parser is
+        // outside the mechanical name migration (#2084 step 1c).
+        assert_eq!(fill(&column), Fill::Constructs);
+        column.value_source = ValueSource::Default(format!("NULL::{}", other.raw()));
+        assert_eq!(fill(&column), Fill::Constructs);
+        let pins = [pbps_model::TypePin {
+            schema: raw.schema().into(),
+            name: raw.name().into(),
+            oid: 1,
+            kind: "enum".into(),
+            digest: "ab".repeat(32),
+        }];
+        let from_pin = TypeRef::new(&pins[0].schema, &pins[0].name).unwrap();
+        assert_eq!(from_pin, raw);
+        assert!(references(&[&schema], &ChangeSet::default()).contains(&from_pin));
     }
 }

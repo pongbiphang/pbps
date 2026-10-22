@@ -188,7 +188,7 @@ fn one_table(s: &mut String, name: &TableName, table: &Table) {
         let _ = writeln!(
             s,
             "<tr><td>{label}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            code(&c.ty.to_string()),
+            code(&c.ty.raw().to_string()),
             if c.nullable { "yes" } else { "no" },
             match &c.value_source {
                 pbps_model::ValueSource::Default(text) => code(text),
