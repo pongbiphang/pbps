@@ -352,6 +352,125 @@ async fn mssql_run_owned_acquisition_needs_only_login_and_database_creation_priv
 
 #[tokio::test]
 #[ignore = "needs the owned SQL Server resolver fixtures"]
+async fn mssql_supplied_cleanup_names_the_retained_sandbox_after_failure() {
+    let primary = server("PBPS_TEST_DB");
+    let schema = Schema::default();
+    let ids = IdsFile::default();
+    let side = pbps_diff::Side {
+        schema: &schema,
+        ids: &ids,
+    };
+    let request =
+        super::super::producer::request(Driver::Mssql, side, side, &Hints::default(), &[]).unwrap();
+    for missing_marker in [false, true] {
+        let (database, on) = create_database(&primary).await;
+        let outcome: Result<_, pbps_db::DbError> = async {
+            let mut target = Conn::connect(Driver::Mssql, &primary).await?;
+            let mut admin = Conn::connect(Driver::Mssql, &on).await?;
+            let identity = sql::cluster_identity(&mut target).await?;
+            let tokens = super::Tokens::generate();
+            let provenance = Provenance::server();
+            let (provisioning, mut state) = super::engine::scratch(
+                Driver::Mssql,
+                &mut target,
+                &mut admin,
+                &tokens,
+                &identity,
+                &on,
+                &request,
+                &Standard::Mssql,
+                None,
+                &provenance,
+            )
+            .await
+            .map_err(|error| pbps_db::DbError::Refused(error.to_string()))?;
+            let (catalog, authorization) =
+                crate::resolver::scope::read_target(&mut target, Driver::Mssql, &[], &[], &[], &[])
+                    .await?;
+            let prepared = state
+                .prepare(
+                    provisioning,
+                    &mut admin,
+                    &mut target,
+                    &catalog,
+                    &authorization,
+                    &[],
+                    &BindingRequest {
+                        bootstrap: &[],
+                        base: &schema,
+                        desired: &schema,
+                    },
+                    &[],
+                )
+                .await
+                .err();
+            let rows = admin
+                .query(
+                    "SELECT name FROM sys.database_principals \
+                     WHERE name LIKE N'pbps[_]sandbox[_]%';",
+                )
+                .await?;
+            let sandbox = rows
+                .first()
+                .ok_or_else(|| pbps_db::DbError::BadRow("no sandbox was created".into()))?
+                .try_get::<&str>("name")?
+                .ok_or_else(|| pbps_db::DbError::BadRow("sandbox name is NULL".into()))?
+                .to_owned();
+            if missing_marker {
+                admin
+                    .execute(&format!("DROP TABLE [##pbps_{}];", tokens.scratch))
+                    .await?;
+            } else {
+                // An index property has no cleanup rule. The privileged final
+                // drop must be skipped, and its retained user must be named.
+                admin
+                    .execute(
+                        "CREATE TABLE dbo.cleanup_refusal(i int); \
+                         CREATE INDEX ix ON dbo.cleanup_refusal(i); \
+                         EXEC sys.sp_addextendedproperty @name=N'cleanup_property',@value=N'held',\
+                         @level0type=N'SCHEMA',@level0name=N'dbo',@level1type=N'TABLE',\
+                         @level1name=N'cleanup_refusal',@level2type=N'INDEX',@level2name=N'ix';",
+                    )
+                    .await?;
+            }
+            let cleanup = state.release(&mut admin).await;
+            let retained = admin
+                .query(&format!(
+                    "SELECT IS_ROLEMEMBER(N'db_owner',name) AS membership \
+                     FROM sys.database_principals WHERE name=N'{sandbox}';"
+                ))
+                .await?;
+            Ok((prepared, cleanup, sandbox, retained))
+        }
+        .await;
+        // Restore before assertions, including when the regression is tested
+        // with the reporting fix reverted.
+        drop_database(&primary, &database).await;
+        let (prepared, cleanup, sandbox, retained) = outcome.unwrap();
+        assert!(matches!(prepared, Some(Error::Binding(reason)) if reason.contains("#2237")));
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].try_get::<i32>("membership").unwrap(), Some(1));
+        let failed = cleanup.unwrap_err();
+        let expected = format!("sandbox user {sandbox} (db_owner) in database {database}");
+        assert_eq!(
+            failed.iter().filter(|name| **name == expected).count(),
+            1,
+            "{failed:?}"
+        );
+        let original = if missing_marker {
+            "no longer reaches the marked database"
+        } else {
+            "extended property class 7 cleanup_property"
+        };
+        assert!(
+            failed.iter().any(|name| name.contains(original)),
+            "{failed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the owned SQL Server resolver fixtures"]
 async fn mssql_supplied_acquisition_refuses_target_and_cleans_after_the_externals_refusal() {
     let primary = server("PBPS_TEST_DB");
     let (name, on) = create_database(&primary).await;

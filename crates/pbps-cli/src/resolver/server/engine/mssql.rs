@@ -254,48 +254,59 @@ impl Scratch<'_> {
                 }
             }
             Created::Supplied { database, sandbox } => {
-                let mut cleanup = Conn::connect(Driver::Mssql, self.connection)
-                    .await
-                    .map_err(|error| {
-                        vec![format!(
-                            "database {} cleanup session ({error})",
-                            database.name
-                        )]
-                    })?;
-                let verified = async {
-                    if !sql::marked(&mut cleanup, &self.mark).await?
-                        || sql::database(&mut cleanup).await? != database
-                    {
-                        return Err(pbps_db::DbError::Refused(
-                            "the supplied cleanup connection no longer reaches the marked database"
-                                .into(),
-                        ));
-                    }
-                    Ok(())
-                }
-                .await;
-                verified.map_err(|error| vec![error.to_string()])?;
-                if entered {
-                    let result = async {
-                        let mut bounded = Conn::connect(Driver::Mssql, self.connection).await?;
-                        if !sql::marked(&mut bounded, &self.mark).await?
-                            || sql::database(&mut bounded).await? != database
+                let result = async {
+                    let mut cleanup = Conn::connect(Driver::Mssql, self.connection)
+                        .await
+                        .map_err(|error| {
+                            vec![format!(
+                                "database {} cleanup session ({error})",
+                                database.name
+                            )]
+                        })?;
+                    let verified = async {
+                        if !sql::marked(&mut cleanup, &self.mark).await?
+                            || sql::database(&mut cleanup).await? != database
                         {
                             return Err(pbps_db::DbError::Refused(
-                                "the sandbox cleanup connection no longer reaches \
+                                "the supplied cleanup connection no longer reaches \
                                  the marked database"
                                     .into(),
                             ));
                         }
-                        sql::enter_sandbox(&mut bounded, &sandbox).await?;
-                        Ok(bounded)
+                        Ok(())
                     }
                     .await;
-                    let mut bounded = result.map_err(|error| vec![error.to_string()])?;
-                    sql::inventory::cleanup(&mut bounded, Some(&sandbox)).await?;
-                    drop(bounded);
+                    verified.map_err(|error| vec![error.to_string()])?;
+                    if entered {
+                        let result = async {
+                            let mut bounded = Conn::connect(Driver::Mssql, self.connection).await?;
+                            if !sql::marked(&mut bounded, &self.mark).await?
+                                || sql::database(&mut bounded).await? != database
+                            {
+                                return Err(pbps_db::DbError::Refused(
+                                    "the sandbox cleanup connection no longer reaches \
+                                     the marked database"
+                                        .into(),
+                                ));
+                            }
+                            sql::enter_sandbox(&mut bounded, &sandbox).await?;
+                            Ok(bounded)
+                        }
+                        .await;
+                        let mut bounded = result.map_err(|error| vec![error.to_string()])?;
+                        sql::inventory::cleanup(&mut bounded, Some(&sandbox)).await?;
+                        drop(bounded);
+                    }
+                    sql::inventory::drop_sandbox(&mut cleanup, &sandbox).await
                 }
-                sql::inventory::drop_sandbox(&mut cleanup, &sandbox).await
+                .await;
+                result.map_err(|mut failed| {
+                    failed.push(format!(
+                        "sandbox user {sandbox} (db_owner) in database {}",
+                        database.name
+                    ));
+                    failed
+                })
             }
         }
     }
