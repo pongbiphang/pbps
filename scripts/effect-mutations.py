@@ -20,12 +20,14 @@ engine holds the dependency each effect states.
 The --s7 mode repeats the original M01–M20 sample and command matrix from
 #1965 (including the five initially caught effects), with per-command logs,
 source backup/checksums and shadow observations under target/s7-closure.
+A failure counts only after its exact tests pass on the restored source;
+confirmation commands, logs and results are recorded per mutation.
 
 It first runs the same commands unmutated, and stops if they fail: a test
 that fails for another reason would read as every mutation caught.
 
-Exits 0 when every mutation fails a test (under `--audit`, every one but
-those `UNSHOWABLE` lists, and none of those), 1 otherwise, and 2 when an
+Exits 0 when every mutation has a confirmed test failure (under `--audit`,
+every one but those `UNSHOWABLE` lists, and none of those), 1 otherwise, and 2 when an
 anchor is missing or the mutated crate does not compile: a patch that matches
 nothing, or code that no longer builds, proves nothing about the tests.
 S7 (#1959) re-runs it; an anchor that moved is updated here, never dropped.
@@ -182,11 +184,15 @@ def legacy_main(args):
                     for c in commands]
             log = "".join(o.stdout + o.stderr for o in outs)
             expected = commands is AUDIT and name in UNSHOWABLE
-            statuses = [test_status(o.returncode, o.stdout + o.stderr) for o in outs]
-            if "invalid" in statuses:
-                print(f"no build/empty run  {name}")
+            runs = [{"command": command, "status": test_status(o.returncode, o.stdout + o.stderr),
+                     "failed_tests": failed_tests(o.stdout + o.stderr)}
+                    for command, o in zip(commands, outs)]
+            EFFECTS.write_text(original)
+            status, _ = mutation_result(runs, env)
+            if status == "invalid":
+                print(f"invalid evidence  {name}")
                 broken.append(name)
-            elif "failed" in statuses:
+            elif status == "killed":
                 print(f"caught    {name}")
                 if expected:
                     print(f"          (listed as unshowable: update UNSHOWABLE)")
@@ -247,7 +253,7 @@ S7_COMMANDS = [
 
 
 def test_status(code, log):
-    """A compiler/endpoint/empty run must not masquerade as a killed mutation."""
+    """Classify a harness run; a failure still needs restored-source confirmation."""
     totals = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed", log)
     if not totals or not any(int(a) + int(b) for a, b in totals):
         return "invalid"
@@ -256,6 +262,44 @@ def test_status(code, log):
     if code != 0 and any(int(b) for _, b in totals):
         return "failed"
     return "invalid"
+
+
+def failed_tests(log):
+    return re.findall(r"^test (.+) \.{3} FAILED$", log, re.M)
+
+
+def mutation_result(runs, env):
+    """The caller must restore the source before confirming every named failure."""
+    if any(r["status"] == "invalid" for r in runs):
+        return "invalid", {"status": "invalid", "reason": "invalid mutated run", "runs": []}
+    failed = [r for r in runs if r["status"] == "failed"]
+    if not failed:
+        return "survived", {"status": "not_needed", "runs": []}
+    if any(not r["failed_tests"] for r in failed):
+        return "invalid", {"status": "invalid", "reason": "empty failed-test list", "runs": []}
+    confirmations = []
+    for run in failed:
+        command = run["command"]
+        split = command.index("--") if "--" in command else len(command)
+        # Replace the suite filter, retaining the ignored/live harness mode.
+        flags = [arg for arg in command[split + 1:]
+                 if arg in ("--ignored", "--include-ignored", "--nocapture", "--show-output")]
+        for name in run["failed_tests"]:
+            exact = command[:split] + ["--", "--exact", name] + flags
+            started = time.monotonic()
+            output = subprocess.run(exact, capture_output=True, text=True, env=env)
+            log = output.stdout + output.stderr
+            status = test_status(output.returncode, log)
+            # An exact rerun must execute the named test, not pass by selecting zero.
+            totals = re.findall(r"test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed", log)
+            if status == "passed" and totals != [("1", "0")]:
+                status = "invalid"
+            confirmations.append({"test": name, "command": exact, "returncode": output.returncode,
+                                  "status": status, "log": log,
+                                  "seconds": time.monotonic() - started})
+    confirmed = all(r["status"] == "passed" for r in confirmations)
+    return ("killed" if confirmed else "invalid",
+            {"status": "passed" if confirmed else "invalid", "runs": confirmations})
 
 
 def run_case(directory, commands, env):
@@ -269,7 +313,7 @@ def run_case(directory, commands, env):
         records.append({"command": command, "returncode": output.returncode,
                         "status": test_status(output.returncode, log),
                         "seconds": time.monotonic() - started,
-                        "failed_tests": re.findall(r"^test (.+) \.{3} FAILED$", log, re.M)})
+                        "failed_tests": failed_tests(log)})
     return records
 
 
@@ -315,10 +359,13 @@ def s7_main(args):
             EFFECTS.write_text(text.replace(anchor, replacement))
             env["PBPS_ORDER_SHADOW"] = str((out / f"{identity}-shadow.log").resolve())
             runs = run_case(out / identity, S7_COMMANDS, env)
-            status = ("invalid" if any(r["status"] == "invalid" for r in runs) else
-                      "killed" if any(r["status"] == "failed" for r in runs) else "survived")
+            EFFECTS.write_bytes(original)
+            confirmation_env = dict(env, PBPS_ORDER_SHADOW=str(
+                (out / f"{identity}-confirmation-shadow.log").resolve()))
+            status, confirmation = mutation_result(runs, confirmation_env)
             report["mutations"].append({"id": identity, "effect": name, "status": status,
-                                        "live_unshowable": name in UNSHOWABLE, "runs": runs})
+                                        "live_unshowable": name in UNSHOWABLE, "runs": runs,
+                                        "confirmation": confirmation})
             persist()
             print(identity, status, name, flush=True)
             EFFECTS.write_bytes(original)

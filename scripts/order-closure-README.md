@@ -48,6 +48,12 @@ including the previously caught effects. It uses the capped commutation
 suites, clears inherited `PBPS_COMMUTE_ALL`, and records shadow findings
 separately from independent failures. Its JSON report includes commands,
 per-command logs, failed tests and an exact source backup/restoration digest.
+After each mutation the exact source is restored before every named failure
+is re-run individually with `--exact`, retaining ignored/live harness flags.
+A kill requires all those tests to execute and pass; an empty failed-test list,
+a persistent failure or an empty/invalid confirmation makes the mutation
+invalid. Each mutation's `confirmation` records the command, captured log,
+return code, status and duration of every rerun directly in `report.json`.
 Choose a fresh `--output DIR` for a repeat; it refuses overwriting evidence.
 The unit-only default and `--audit` retain #2091's former-miss sample. The
 latter swaps all effect-independent pairs, and distinguishes effects the
