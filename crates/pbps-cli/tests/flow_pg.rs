@@ -22188,7 +22188,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                 },
             };
             let key = Dropped {
-                foreign_keys: [(child.clone(), "fk_c".to_owned())].into(),
+                foreign_keys: [(child.clone(), "fk_c".into())].into(),
                 ..Default::default()
             };
             let table = Dropped {
@@ -22258,7 +22258,7 @@ fn an_action_that_cannot_write_is_not_in_the_closure() {
                     Dropped {
                         foreign_keys: [(
                             pbps_model::TableName::new("app", "parted"),
-                            "fk_parted".to_owned(),
+                            "fk_parted".into(),
                         )]
                         .into(),
                         ..Default::default()
@@ -22772,10 +22772,10 @@ fn a_referenced_key_replacement_applies_and_the_next_plan_is_empty() {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved.changes.changes.len(), 4, "{:?}", saved.changes);
             assert!(
-                matches!(&saved.changes.changes[0].change, pbps_model::Change::DropForeignKey {name, ..} if name == "fk_child")
+                matches!(&saved.changes.changes[0].change, pbps_model::Change::DropForeignKey {name, ..} if name.raw() == "fk_child")
             );
             assert!(
-                matches!(&saved.changes.changes[3].change, pbps_model::Change::AddForeignKey {name, ..} if name == "fk_child")
+                matches!(&saved.changes.changes[3].change, pbps_model::Change::AddForeignKey {name, ..} if name.raw() == "fk_child")
             );
             let checksum = plan_checksum(&path);
             let mut args = vec![

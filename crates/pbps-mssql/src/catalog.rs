@@ -562,7 +562,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             identity: seed.zip(increment),
             default: opt::<&str>(&row, "default_definition")?.map(str::to_owned),
             default_constraint: opt::<i32>(&row, "default_constraint_object_id")?
-                .zip(opt::<&str>(&row, "default_constraint_name")?.map(str::to_owned)),
+                .zip(opt::<&str>(&row, "default_constraint_name")?.map(Into::into)),
             collation: opt::<&str>(&row, "collation_name")?.map(str::to_owned),
             computed_definition: opt::<&str>(&row, "computed_definition")?.map(str::to_owned),
             computed_persisted: get(&row, "computed_persisted")?,
@@ -579,7 +579,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             rows_partitioned: get(&row, "rows_partitioned")?,
 
             object_id: get(&row, "object_id")?,
-            constraint_name: get::<&str>(&row, "name")?.to_owned(),
+            constraint_name: get::<&str>(&row, "name")?.to_owned().into(),
             is_primary: get(&row, "is_primary")?,
             column: get::<&str>(&row, "column_name")?.to_owned(),
         });
@@ -588,11 +588,11 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
     for row in conn.query(FOREIGN_KEY_COLUMNS).await? {
         raw.foreign_key_columns.push(RawForeignKeyColumn {
             object_id: get(&row, "object_id")?,
-            constraint_name: get::<&str>(&row, "name")?.to_owned(),
+            constraint_name: get::<&str>(&row, "name")?.to_owned().into(),
             ref_schema: get::<&str>(&row, "ref_schema")?.to_owned(),
             ref_table: get::<&str>(&row, "ref_table")?.to_owned(),
             ref_object_id: get(&row, "ref_object_id")?,
-            ref_key: opt::<&str>(&row, "ref_key_name")?.map(str::to_owned),
+            ref_key: opt::<&str>(&row, "ref_key_name")?.map(Into::into),
             column: get::<&str>(&row, "column_name")?.to_owned(),
             ref_column: get::<&str>(&row, "ref_column_name")?.to_owned(),
             on_delete: get(&row, "delete_referential_action")?,
@@ -611,7 +611,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
 
             object_id: get(&row, "object_id")?,
             constraint_object_id: get(&row, "constraint_object_id")?,
-            name: get::<&str>(&row, "name")?.to_owned(),
+            name: get::<&str>(&row, "name")?.to_owned().into(),
             definition: get::<&str>(&row, "definition")?.to_owned(),
         });
     }
@@ -646,7 +646,7 @@ pub async fn introspect(conn: &mut Conn) -> Result<Pulled, DbError> {
             ignore_dup_key: get(&row, "ignore_dup_key")?,
 
             object_id: get(&row, "object_id")?,
-            index_name: get::<&str>(&row, "name")?.to_owned(),
+            index_name: get::<&str>(&row, "name")?.to_owned().into(),
             is_unique: get(&row, "is_unique")?,
             kind: IndexKind::from_type_code(get::<u8>(&row, "index_type")?),
             filter: opt::<&str>(&row, "filter_definition")?.map(str::to_owned),

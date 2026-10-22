@@ -191,7 +191,7 @@ pub fn render(schema: &Schema) -> String {
                 "    {} {left}--|| {} : \"{}\"",
                 entity(name),
                 entity(&fk.references_table),
-                quoted(fk_name)
+                quoted(fk_name.raw())
             );
         }
     }
@@ -320,7 +320,7 @@ mod tests {
                 storage_parameters: Default::default(),
             });
             table.foreign_keys.insert(
-                format!("fk_{i}"),
+                format!("fk_{i}").into(),
                 ForeignKey {
                     columns: vec![format!("column_{i}").into()],
                     references_table: TableName::new(names[next].0, names[next].1),

@@ -46,15 +46,15 @@ pub struct DeclaredExpressions {
     pub computed: BTreeMap<TableName, BTreeMap<ColumnName, String>>,
     /// `CheckConstraint::expression`, by table and constraint name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub checks: BTreeMap<TableName, BTreeMap<String, String>>,
+    pub checks: BTreeMap<TableName, BTreeMap<crate::ObjectLocalName, String>>,
     /// `Index::filter`, by table and index name; only filtered indexes appear.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub filters: BTreeMap<TableName, BTreeMap<String, String>>,
+    pub filters: BTreeMap<TableName, BTreeMap<crate::ObjectLocalName, String>>,
     /// An index's keys, by table and index name, one entry per key: the
     /// declared text of an expression key and `None` for a column key. Only
     /// indexes with an expression key appear (DEC-1169.2).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub keys: BTreeMap<TableName, BTreeMap<String, Vec<Option<String>>>>,
+    pub keys: BTreeMap<TableName, BTreeMap<crate::ObjectLocalName, Vec<Option<String>>>>,
     /// Both predicates independently, without manufacturing omitted clauses.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub policies: BTreeMap<TableName, BTreeMap<String, DeclaredPolicyExpressions>>,
@@ -134,9 +134,9 @@ pub struct Bindings {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<TableName, BTreeMap<ColumnName, Binding>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub checks: BTreeMap<TableName, BTreeMap<String, Binding>>,
+    pub checks: BTreeMap<TableName, BTreeMap<crate::ObjectLocalName, Binding>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub filters: BTreeMap<TableName, BTreeMap<String, Binding>>,
+    pub filters: BTreeMap<TableName, BTreeMap<crate::ObjectLocalName, Binding>>,
 }
 
 impl Bindings {
@@ -391,7 +391,7 @@ impl Declared {
                     self.expressions.filters.extend(fresh.expressions.filters);
                     self.expressions.keys.extend(fresh.expressions.keys);
                     self.expressions.policies.extend(fresh.expressions.policies);
-                    let renamed = |kind: crate::DetachedKind, of: &String| {
+                    let renamed = |kind: crate::DetachedKind, of: &crate::ObjectLocalName| {
                         names
                             .iter()
                             .find(|n| n.kind == kind && &n.parent == of)
@@ -427,10 +427,11 @@ impl Declared {
                     let mut checks = self.bindings.checks.remove(table).unwrap_or_default();
                     let mut filters = self.bindings.filters.remove(table).unwrap_or_default();
                     self.forget_table(table);
-                    let held = |map: &BTreeMap<TableName, BTreeMap<String, String>>,
-                                key: &String| {
-                        map.get(table).is_some_and(|m| m.contains_key(key))
-                    };
+                    let held =
+                        |map: &BTreeMap<TableName, BTreeMap<crate::ObjectLocalName, String>>,
+                         key: &crate::ObjectLocalName| {
+                            map.get(table).is_some_and(|m| m.contains_key(key))
+                        };
                     defaults.retain(|column, _| {
                         fresh
                             .expressions
@@ -855,13 +856,13 @@ mod tests {
             .columns
             .insert("m".into(), Column::new("int".parse().unwrap()));
         table.checks.insert(
-            "ck_n".to_owned(),
+            "ck_n".into(),
             CheckConstraint {
                 expression: "n > 0".to_owned(),
             },
         );
         table.indexes.insert(
-            "ix_n".to_owned(),
+            "ix_n".into(),
             Index {
                 columns: vec![IndexColumn {
                     key: crate::IndexKey::Column("n".into()),
@@ -876,7 +877,7 @@ mod tests {
             },
         );
         table.indexes.insert(
-            "ix_m".to_owned(),
+            "ix_m".into(),
             Index {
                 columns: vec![IndexColumn {
                     key: crate::IndexKey::Column("m".into()),
@@ -945,7 +946,7 @@ mod tests {
             .get_mut(&t())
             .unwrap()
             .indexes
-            .insert("ix_expr".to_owned(), expression_index("n+m"));
+            .insert("ix_expr".into(), expression_index("n+m"));
         let d = Declared::from_schema(&declared);
         assert_eq!(
             d.expressions.keys[&t()]["ix_expr"],
@@ -960,7 +961,7 @@ mod tests {
             .get_mut(&t())
             .unwrap()
             .indexes
-            .insert("ix_expr".to_owned(), expression_index("(n + m)"));
+            .insert("ix_expr".into(), expression_index("(n + m)"));
         let base = d.overlay(&read);
         assert_eq!(
             base.tables[&t()].indexes["ix_expr"].columns[0].key,
@@ -969,7 +970,7 @@ mod tests {
         // ...and not where a key changed kind: that is a difference to plan.
         let mut changed = read.clone();
         changed.tables.get_mut(&t()).unwrap().indexes.insert(
-            "ix_expr".to_owned(),
+            "ix_expr".into(),
             Index {
                 columns: vec![
                     key(IndexKey::Column("m".into())),
@@ -988,7 +989,7 @@ mod tests {
         let mut advanced = Declared::default();
         advanced.advance(&changes(vec![Change::AddIndex {
             table: t(),
-            name: "ix_expr".to_owned(),
+            name: "ix_expr".into(),
             index: Box::new(expression_index("lower(x)")),
             clustered: false,
         }]));
@@ -1006,7 +1007,7 @@ mod tests {
         assert!(advanced.expressions.keys[&u].contains_key("ix_expr"));
         advanced.advance(&changes(vec![Change::DropIndex {
             table: u.clone(),
-            name: "ix_expr".to_owned(),
+            name: "ix_expr".into(),
         }]));
         assert!(
             advanced
@@ -1043,7 +1044,7 @@ mod tests {
             .get_mut(&t())
             .unwrap()
             .indexes
-            .insert("ix_expr".to_owned(), expression_index.clone());
+            .insert("ix_expr".into(), expression_index.clone());
         let mut d = Declared::from_schema(&ordinary);
         let bound = || Binding {
             candidates: [("f".to_owned(), ["dbo.f".to_owned()].into_iter().collect())]
@@ -1055,10 +1056,10 @@ mod tests {
             .insert(t(), [("n".into(), bound())].into_iter().collect());
         d.bindings
             .checks
-            .insert(t(), [("ck_n".to_owned(), bound())].into_iter().collect());
+            .insert(t(), [("ck_n".into(), bound())].into_iter().collect());
         d.bindings
             .filters
-            .insert(t(), [("ix_n".to_owned(), bound())].into_iter().collect());
+            .insert(t(), [("ix_n".into(), bound())].into_iter().collect());
         let shape = Table {
             checks: table().checks,
             indexes: [("ix_expr".into(), expression_index)].into_iter().collect(),
@@ -1230,7 +1231,7 @@ mod tests {
     fn a_plan_advances_the_record_by_what_it_writes_drops_and_renames() {
         let mut d = Declared::from_schema(&schema());
         d.bindings.checks.entry(t()).or_default().insert(
-            "ck_n".to_owned(),
+            "ck_n".into(),
             Binding {
                 candidates: [("n".to_owned(), BTreeSet::from(["dbo.t.n".to_owned()]))]
                     .into_iter()
@@ -1257,11 +1258,11 @@ mod tests {
             },
             Change::DropCheck {
                 table: t(),
-                name: "ck_n".to_owned(),
+                name: "ck_n".into(),
             },
             Change::AddCheck {
                 table: t(),
-                name: "ck_n".to_owned(),
+                name: "ck_n".into(),
                 constraint: CheckConstraint {
                     expression: "n > 1".to_owned(),
                 },

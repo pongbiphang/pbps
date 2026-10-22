@@ -786,13 +786,16 @@ mod tests {
             .checks
             .entry(t.clone())
             .or_default()
-            .insert("ck".to_owned(), "n > 0".to_owned());
+            .insert("ck".to_owned().into(), "n > 0".to_owned());
         snap.declared
             .expressions
             .filters
             .entry(t.clone())
             .or_default()
-            .insert("ix".to_owned(), "n > 0 AND label <> 'none'".to_owned());
+            .insert(
+                "ix".to_owned().into(),
+                "n > 0 AND label <> 'none'".to_owned(),
+            );
         snap.declared.bindings.modules.insert(
             "dbo.v".parse().unwrap(),
             crate::declared::Binding {

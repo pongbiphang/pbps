@@ -20153,10 +20153,10 @@ fn a_referenced_key_replacement_applies_and_the_next_plan_is_empty() {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(saved.changes.changes.len(), 4, "{:?}", saved.changes);
             assert!(
-                matches!(&saved.changes.changes[0].change, pbps_model::Change::DropForeignKey {name, ..} if name == "fk_child")
+                matches!(&saved.changes.changes[0].change, pbps_model::Change::DropForeignKey {name, ..} if name.raw() == "fk_child")
             );
             assert!(
-                matches!(&saved.changes.changes[3].change, pbps_model::Change::AddForeignKey {name, ..} if name == "fk_child")
+                matches!(&saved.changes.changes[3].change, pbps_model::Change::AddForeignKey {name, ..} if name.raw() == "fk_child")
             );
             let checksum = plan_checksum(&path);
             let mut args = vec![
@@ -22285,7 +22285,11 @@ fn renames_only_the_catalog_can_order_apply_or_are_refused_at_plan() {
             pbps_mssql::emit::fallback_default_constraint_name(&"z.old".parse().unwrap(), "x");
         on_server(
             own.connection(),
-            &format!("EXEC sp_rename N'z.DF_pbps_old_x', N'{fallback}', N'OBJECT';"),
+            &format!(
+                "EXEC sp_rename N'z.DF_pbps_old_x', N'{fallback}', N'OBJECT';",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                fallback = fallback.raw(),
+            ),
         );
         write(&d, "z.old", None);
         write(&d, "a.other", None);

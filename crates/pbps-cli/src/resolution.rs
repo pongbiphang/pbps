@@ -109,8 +109,16 @@ fn describe(surface: &pbps_model::resolver::Surface) -> String {
     match surface {
         Surface::Module(id) => id.shown().to_string(),
         Surface::Default(column) => format!("the default of {column}", column = column.shown()),
-        Surface::Check { table, name } => format!("check {name} on {table}", table = table.shown()),
-        Surface::Index { table, name } => format!("index {name} on {table}", table = table.shown()),
+        Surface::Check { table, name } => format!(
+            "check {name} on {table}",
+            table = table.shown(),
+            name = name.shown(),
+        ),
+        Surface::Index { table, name } => format!(
+            "index {name} on {table}",
+            table = table.shown(),
+            name = name.shown(),
+        ),
         Surface::Namespace(schema) => format!("schema {schema}"),
         Surface::Table(table) => table.shown().to_string(),
         Surface::Column(column) => column.shown().to_string(),

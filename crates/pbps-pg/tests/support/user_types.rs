@@ -330,7 +330,7 @@ async fn an_enum_a_domain_and_a_composite_are_read_with_their_kind_and_their_pin
         let constraints: Vec<(&str, bool, &str)> = d
             .constraints
             .iter()
-            .map(|c| (c.name.as_str(), c.validated, c.definition.as_str()))
+            .map(|c| (c.name.raw(), c.validated, c.definition.as_str()))
             .collect();
         assert_eq!(
             constraints,

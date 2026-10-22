@@ -73,7 +73,9 @@ pub use module::{
     Hints, Module, ModuleDeps, ModuleId, ModuleIdError, ModuleKind, ObjectName, PublicExecute,
     RoutineArg, RoutineArgError, RoutineId,
 };
-pub use name::{ColumnName, ColumnRef, NameError, RoleName, TableName, check_segment};
+pub use name::{
+    ColumnName, ColumnRef, NameError, ObjectLocalName, RoleName, TableName, check_segment,
+};
 pub use partitions::Partitions;
 pub use plan::{
     PlanBaseline, PlanMode, PlanOrigin, RoutinePins, SavedPlan, SchemaPin, TypePin, TypeRoutine,

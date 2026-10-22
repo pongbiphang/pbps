@@ -2188,7 +2188,7 @@ fn a_row_update_waits_for_a_check_replaced_under_its_name_and_not_for_one_kept()
                     ..
                 },
                 ..
-            } if n == "ck"
+            } if n.raw() == "ck"
         )),
         "{early:?}"
     );
@@ -4412,7 +4412,7 @@ fn one_index(name: &str, column: &str) -> (String, pbps_model::Index) {
 fn add_index(table: &str, index: (String, pbps_model::Index)) -> PlannedChange {
     p(Change::AddIndex {
         table: t(table),
-        name: index.0,
+        name: index.0.into(),
         index: Box::new(index.1),
         clustered: false,
     })
@@ -4549,7 +4549,7 @@ fn a_check_follows_a_new_column_that_fills_the_rows_it_validates() {
 fn an_index_over_a_new_column_follows_the_column() {
     let mut will = table_with(&["id", "c"]);
     let (name, index) = one_index("ix", "c");
-    will.indexes.insert(name, index);
+    will.indexes.insert(name.into(), index);
     let mut plan = on_one_table(
         vec![
             p(Change::AddColumn {
@@ -4573,7 +4573,7 @@ fn an_index_over_a_new_column_follows_the_column() {
 fn a_column_s_drop_follows_the_drop_of_an_index_over_it() {
     let mut was = table_with(&["id", "c"]);
     let (name, index) = one_index("ix", "c");
-    was.indexes.insert(name, index);
+    was.indexes.insert(name.into(), index);
     let mut plan = on_one_table(
         vec![
             p(Change::DropIndex {
@@ -4599,7 +4599,7 @@ fn a_column_s_drop_follows_the_drop_of_an_index_over_it() {
 fn an_index_spelling_a_renamed_column_s_new_name_follows_the_rename() {
     let mut will = table_with(&["id", "d"]);
     let (name, index) = one_index("ix", "d");
-    will.indexes.insert(name, index);
+    will.indexes.insert(name.into(), index);
     let (mut before, mut after) = (Schema::default(), Schema::default());
     before.tables.insert(t("t"), table_with(&["id", "c"]));
     after.tables.insert(t("t"), will);
@@ -4866,7 +4866,7 @@ fn a_computed_column_s_drop_follows_the_drop_of_an_index_over_it() {
     let mut was = table_with(&["id"]);
     was.computed.insert("cc".into(), computed.clone());
     let (name, index) = one_index("ix", "cc");
-    was.indexes.insert(name, index);
+    was.indexes.insert(name.into(), index);
     refused_backwards(&on_one_table(
         vec![
             p(Change::DropIndex {

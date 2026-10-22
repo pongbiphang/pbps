@@ -253,9 +253,9 @@ impl Reconstruction {
                     steps.push(step(
                         dialect,
                         Phase::Modules,
-                        &format!("index {name} on {}", table.shown()),
+                        &format!("index {name} on {}", table.shown(), name = name.shown(),),
                         change,
-                        vec![(Nameable::Index, table.schema.clone(), name.clone())],
+                        vec![(Nameable::Index, table.schema.clone(), name.raw().to_owned())],
                         None,
                     )?);
                 }
@@ -403,7 +403,11 @@ impl Reconstruction {
                         steps.push(step(
                             dialect,
                             Phase::Expressions,
-                            &format!("check {check} on {name}", name = name.shown()),
+                            &format!(
+                                "check {check} on {name}",
+                                name = name.shown(),
+                                check = check.shown(),
+                            ),
                             &Change::AddCheck {
                                 table: name.clone(),
                                 name: check,
@@ -431,14 +435,18 @@ impl Reconstruction {
                         steps.push(step(
                             dialect,
                             phase,
-                            &format!("index {index} on {name}", name = name.shown()),
+                            &format!(
+                                "index {index} on {name}",
+                                name = name.shown(),
+                                index = index.shown(),
+                            ),
                             &Change::AddIndex {
                                 table: name.clone(),
                                 name: index.clone(),
                                 index: Box::new(spec),
                                 clustered: false,
                             },
-                            vec![(Nameable::Index, name.schema.clone(), index)],
+                            vec![(Nameable::Index, name.schema.clone(), index.into_raw())],
                             None,
                         )?);
                     }

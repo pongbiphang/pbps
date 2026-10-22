@@ -740,13 +740,13 @@ mod tests {
         let old = name("z.old");
         let other = name("a.other");
         let parked = held(
-            &format!("z.{}", fallback_default_constraint_name(&old, "x")),
+            &format!("z.{}", fallback_default_constraint_name(&old, "x").raw()),
             "default constraint",
             Some("z.old"),
             Some("x"),
         );
         let others = held(
-            &format!("a.{}", default_constraint_name(&other, "y")),
+            &format!("a.{}", default_constraint_name(&other, "y").raw()),
             "default constraint",
             Some("a.other"),
             Some("y"),
@@ -767,7 +767,7 @@ mod tests {
         );
 
         let generated = held(
-            &format!("z.{}", default_constraint_name(&old, "x")),
+            &format!("z.{}", default_constraint_name(&old, "x").raw()),
             "default constraint",
             Some("z.old"),
             Some("x"),
@@ -851,7 +851,7 @@ mod tests {
         let old = name("s1.old");
         let new = name("s2.new");
         let default = held(
-            &format!("s1.{}", default_constraint_name(&old, "x")),
+            &format!("s1.{}", default_constraint_name(&old, "x").raw()),
             "default constraint",
             Some("s1.old"),
             Some("x"),
@@ -868,7 +868,9 @@ mod tests {
             [pair("s1.old", "s2.new"), pair("s2.a", "s2.DF_pbps_old_x")]
         );
 
-        let taken = |n: String| held(&format!("s2.{n}"), "sequence object", None, None);
+        let taken = |n: pbps_model::ObjectLocalName| {
+            held(&format!("s2.{}", n.raw()), "sequence object", None, None)
+        };
         let e = order(
             plan(),
             &[
@@ -894,7 +896,15 @@ mod tests {
         let generated = default_constraint_name(&t, "old");
         let e = order(
             vec![
-                rename("dbo.a", &format!("dbo.{generated}"), &[]),
+                rename(
+                    "dbo.a",
+                    &format!(
+                        "dbo.{generated}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        generated = generated.raw(),
+                    ),
+                    &[],
+                ),
                 PlannedChange::new(Change::RenameColumn {
                     uid: pbps_model::Uid::derived(pbps_model::UidKind::Column, "dbo.t.old", 0),
                     table: t.clone(),
@@ -904,7 +914,11 @@ mod tests {
                 }),
             ],
             &[held(
-                &format!("dbo.{generated}"),
+                &format!(
+                    "dbo.{generated}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    generated = generated.raw(),
+                ),
                 "default constraint",
                 Some("dbo.t"),
                 Some("old"),
@@ -955,17 +969,42 @@ mod tests {
         let cs = order(
             vec![
                 rename("dbo.A", "dbo.z", &["v"]),
-                rename("dbo.B", &format!("dbo.{fallback}"), &[]),
-                rename(&format!("dbo.{preferred}"), "dbo.other", &[]),
+                rename(
+                    "dbo.B",
+                    &format!(
+                        "dbo.{fallback}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        fallback = fallback.raw(),
+                    ),
+                    &[],
+                ),
+                rename(
+                    &format!(
+                        "dbo.{preferred}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        preferred = preferred.raw(),
+                    ),
+                    "dbo.other",
+                    &[],
+                ),
             ],
             &[
                 held(
-                    &format!("dbo.{}", default_constraint_name(&a, "v")),
+                    &format!("dbo.{}", default_constraint_name(&a, "v").raw()),
                     "default constraint",
                     Some("dbo.A"),
                     Some("v"),
                 ),
-                held(&format!("dbo.{preferred}"), "user table", None, None),
+                held(
+                    &format!(
+                        "dbo.{preferred}",
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        preferred = preferred.raw(),
+                    ),
+                    "user table",
+                    None,
+                    None,
+                ),
             ],
             &[],
         )
@@ -1225,7 +1264,11 @@ mod tests {
         let new = name("dbo.new");
         let generated = default_constraint_name(&new, "x");
         let function = PlannedChange::new(Change::DropModule {
-            id: pbps_model::ModuleId::Named(name(&format!("dbo.{generated}"))),
+            id: pbps_model::ModuleId::Named(name(&format!(
+                "dbo.{generated}",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                generated = generated.raw(),
+            ))),
             kind: pbps_model::ModuleKind::Function,
         });
         let check = PlannedChange::new(Change::AddCheck {
@@ -1247,7 +1290,10 @@ mod tests {
         };
         let occupants = [
             held(
-                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                &format!(
+                    "dbo.{}",
+                    default_constraint_name(&name("dbo.old"), "x").raw()
+                ),
                 "default constraint",
                 Some("dbo.old"),
                 Some("x"),
@@ -1255,7 +1301,11 @@ mod tests {
             // An adopted default on `z` under the name `old` moves to.
             held("dbo.new", "default constraint", Some("dbo.z"), Some("y")),
             held(
-                &format!("dbo.{generated}"),
+                &format!(
+                    "dbo.{generated}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    generated = generated.raw(),
+                ),
                 "sql scalar function",
                 None,
                 None,
@@ -1368,13 +1418,20 @@ mod tests {
         }));
         let occupants = [
             held(
-                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                &format!(
+                    "dbo.{}",
+                    default_constraint_name(&name("dbo.old"), "x").raw()
+                ),
                 "default constraint",
                 Some("dbo.old"),
                 Some("x"),
             ),
             held(
-                &format!("dbo.{generated}"),
+                &format!(
+                    "dbo.{generated}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    generated = generated.raw(),
+                ),
                 "check constraint",
                 Some("dbo.z"),
                 None,
@@ -1432,17 +1489,24 @@ mod tests {
         let mut changes = vec![z.clone()];
         changes.extend(functions.iter().cloned());
         changes.push(rename("dbo.old", "dbo.new", &["x"]));
-        changes.push(check(&generated));
+        changes.push(check(generated.raw()));
         changes.extend((0..11).map(|k| check(&format!("g{k}"))));
         let mut occupants = vec![
             held(
-                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                &format!(
+                    "dbo.{}",
+                    default_constraint_name(&name("dbo.old"), "x").raw()
+                ),
                 "default constraint",
                 Some("dbo.old"),
                 Some("x"),
             ),
             held(
-                &format!("dbo.{generated}"),
+                &format!(
+                    "dbo.{generated}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    generated = generated.raw(),
+                ),
                 "check constraint",
                 Some("dbo.z"),
                 None,
@@ -1513,7 +1577,11 @@ mod tests {
                 kind: pbps_model::ModuleKind::Function,
             })
         };
-        let f = drop_function(&format!("dbo.{generated}"));
+        let f = drop_function(&format!(
+            "dbo.{generated}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            generated = generated.raw(),
+        ));
         let g = drop_function("dbo.g");
         let changes = vec![
             drop_table("dbo.u"),
@@ -1531,14 +1599,21 @@ mod tests {
         ];
         let occupants = [
             held(
-                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                &format!(
+                    "dbo.{}",
+                    default_constraint_name(&name("dbo.old"), "x").raw()
+                ),
                 "default constraint",
                 Some("dbo.old"),
                 Some("x"),
             ),
             held("dbo.new", "default constraint", Some("dbo.z"), Some("y")),
             held(
-                &format!("dbo.{generated}"),
+                &format!(
+                    "dbo.{generated}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    generated = generated.raw(),
+                ),
                 "sql scalar function",
                 None,
                 None,
@@ -1582,7 +1657,11 @@ mod tests {
                 kind: pbps_model::ModuleKind::Function,
             })
         };
-        let f = drop_function(&format!("dbo.{generated}"));
+        let f = drop_function(&format!(
+            "dbo.{generated}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            generated = generated.raw(),
+        ));
         let view = drop_function("dbo.v");
         let lookup = PlannedChange::new(Change::DropTable {
             uid: pbps_model::Uid::derived(pbps_model::UidKind::Table, "dbo.lookup", 0),
@@ -1606,13 +1685,20 @@ mod tests {
         };
         let occupants = [
             held(
-                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                &format!(
+                    "dbo.{}",
+                    default_constraint_name(&name("dbo.old"), "x").raw()
+                ),
                 "default constraint",
                 Some("dbo.old"),
                 Some("x"),
             ),
             held(
-                &format!("dbo.{generated}"),
+                &format!(
+                    "dbo.{generated}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    generated = generated.raw(),
+                ),
                 "sql scalar function",
                 None,
                 None,
@@ -1659,7 +1745,11 @@ mod tests {
                 kind: pbps_model::ModuleKind::Function,
             })
         };
-        let f = drop_function(&format!("dbo.{generated}"));
+        let f = drop_function(&format!(
+            "dbo.{generated}",
+            // Preserve raw comparison-label or fixture SQL bytes in test data.
+            generated = generated.raw(),
+        ));
         let followers: Vec<PlannedChange> = (0..11)
             .map(|k| drop_function(&format!("dbo.g{k}")))
             .collect();
@@ -1675,13 +1765,20 @@ mod tests {
         }));
         let occupants = [
             held(
-                &format!("dbo.{}", default_constraint_name(&name("dbo.old"), "x")),
+                &format!(
+                    "dbo.{}",
+                    default_constraint_name(&name("dbo.old"), "x").raw()
+                ),
                 "default constraint",
                 Some("dbo.old"),
                 Some("x"),
             ),
             held(
-                &format!("dbo.{generated}"),
+                &format!(
+                    "dbo.{generated}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    generated = generated.raw(),
+                ),
                 "sql scalar function",
                 None,
                 None,

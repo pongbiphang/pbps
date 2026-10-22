@@ -633,7 +633,10 @@ fn build<'v, 'p: 'v>(
             }
             sql.push(';');
             Ok(vec![Probe::new(
-                format!("rows that violate the new check {name}"),
+                format!("rows that violate the new check {name}",
+// Shared probe label is escaped by the report until #2084 step 5.
+name = name.raw(),
+),
                 sql,
             )])
         }
@@ -657,7 +660,10 @@ fn build<'v, 'p: 'v>(
             Ok(vec![duplicate_probe(
                 &format!("(\n{rows}\n) AS r"),
                 &collated_keys(names, table, &constraint.columns)?,
-                &format!("rows that would collide under the new unique constraint {name}"),
+                &format!("rows that would collide under the new unique constraint {name}",
+// Shared probe label is escaped by the report until #2084 step 5.
+name = name.raw(),
+),
             )?])
         }
 
@@ -740,7 +746,10 @@ fn build<'v, 'p: 'v>(
             Ok(vec![duplicate_probe(
                 &format!("(\n{rows}\n) AS r"),
                 &collated_keys(names, table, &columns)?,
-                &format!("rows that would collide under the new unique index {name}"),
+                &format!("rows that would collide under the new unique index {name}",
+// Shared probe label is escaped by the report until #2084 step 5.
+name = name.raw(),
+),
             )?])
         }
 
@@ -813,7 +822,10 @@ fn build<'v, 'p: 'v>(
                 .collect::<Result<_, DialectError>>()?;
 
             Ok(vec![Probe::new(
-                format!("rows with no matching parent for the new foreign key {name}"),
+                format!("rows with no matching parent for the new foreign key {name}",
+// Shared probe label is escaped by the report until #2084 step 5.
+name = name.raw(),
+),
                 format!(
                     "SELECT COUNT(*) AS n FROM (\n{child}\n) AS r\n WHERE {}\n   AND NOT EXISTS (SELECT 1 FROM (\n{parent}\n) AS q WHERE {});",
                     not_null.join("\n   AND "),
@@ -1153,7 +1165,10 @@ fn delete_probe(
         );
         gone.push(match &removed.constraint {
             Some(constraint) => {
-                format!("AND NOT ({of_table} AND fk.name = {})", literal(constraint))
+                format!(
+                    "AND NOT ({of_table} AND fk.name = {})",
+                    literal(constraint.raw())
+                )
             }
             None => format!("AND NOT ({of_table})"),
         });
@@ -1528,7 +1543,7 @@ fn unprobeable_probe(
                     "\n     AND fk.name NOT IN ({})",
                     removed
                         .iter()
-                        .map(|k| literal(k))
+                        .map(|k| literal(k.raw()))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )

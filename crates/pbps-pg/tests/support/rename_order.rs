@@ -137,7 +137,12 @@ fn fixture(case: &str) -> (Schema, Schema, Vec<Intent>) {
         table.indexes.remove("target");
         table.unique.remove("target");
         table.foreign_keys.remove("fk_child");
-        if table.primary_key.as_ref().and_then(|pk| pk.name.as_deref()) == Some("target") {
+        if table
+            .primary_key
+            .as_ref()
+            .and_then(|pk| pk.name.as_ref().map(pbps_model::ObjectLocalName::raw))
+            == Some("target")
+        {
             table.primary_key = None;
         }
     }

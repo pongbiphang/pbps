@@ -242,7 +242,9 @@ pub enum Why {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Part {
     /// A CHECK constraint of a domain, by name.
-    Check { constraint: String },
+    Check {
+        constraint: pbps_model::ObjectLocalName,
+    },
     /// The declared domain's own DEFAULT.
     Default,
 }
@@ -259,7 +261,12 @@ impl fmt::Display for Use {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.part {
             Part::Check { constraint } => {
-                write!(f, "the CHECK `{constraint}` of `{}`", self.ty)
+                write!(
+                    f,
+                    "the CHECK `{constraint}` of `{}`",
+                    self.ty,
+                    constraint = constraint.shown()
+                )
             }
             Part::Default => write!(f, "the DEFAULT of `{}`", self.ty),
         }
@@ -1193,7 +1200,10 @@ async fn reach(conn: &mut Conn, roots: &[Oid], constructs: bool) -> Result<Vec<T
 /// other kind of constraint is a failed read: `NOT NULL` (which 18 also keeps
 /// as a row) runs nothing and is left out, and a kind this release does not
 /// know could.
-async fn checks(conn: &mut Conn, domains: &[Oid]) -> Result<Vec<(Oid, String, String)>, Failure> {
+async fn checks(
+    conn: &mut Conn,
+    domains: &[Oid],
+) -> Result<Vec<(Oid, pbps_model::ObjectLocalName, String)>, Failure> {
     let rows = conn
         .query(&format!(
             "SELECT c.contypid::pg_catalog.int8 AS dom,
@@ -1215,7 +1225,7 @@ async fn checks(conn: &mut Conn, domains: &[Oid]) -> Result<Vec<(Oid, String, St
             row.try_get::<&str>("expr")?,
         )
         .map_err(Failure::Uncertified)?;
-        out.push((need(row, "dom")?, name.to_owned(), text));
+        out.push((need(row, "dom")?, name.into(), text));
     }
     Ok(out)
 }
@@ -1577,6 +1587,28 @@ async fn untrusted_actors(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_domain_check_use_escapes_its_local_name_once() {
+        let used = super::Use {
+            ty: "app.positive".into(),
+            part: super::Part::Check {
+                constraint: "ck\nline\\slash".into(),
+            },
+        };
+        assert_eq!(
+            used.to_string(),
+            r"the CHECK `ck\nline\\slash` of `app.positive`"
+        );
+        assert_ne!(
+            used,
+            super::Use {
+                ty: "app.positive".into(),
+                part: super::Part::Check {
+                    constraint: r"ck\nline\\slash".into()
+                }
+            }
+        );
+    }
 
     #[test]
     fn owner_actor_and_missing_trust_diagnostics_show_role_names_once() {
@@ -1627,7 +1659,7 @@ mod tests {
         Use {
             ty: ty.to_owned(),
             part: Part::Check {
-                constraint: format!("{ty}_check"),
+                constraint: format!("{ty}_check").into(),
             },
         }
     }

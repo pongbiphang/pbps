@@ -519,6 +519,8 @@ pub(crate) fn checks_over_computed_columns(schema: &pbps_model::Schema) -> Vec<S
                         name = name.raw(),
                         // raw: whole-message escaped until #2084 step 5.
                         column = column.raw(),
+                        // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                        check = check.raw(),
                     ));
                 }
             }
@@ -572,18 +574,26 @@ pub(crate) fn table_sources(
         .primary_key
         .iter()
         .map(|pk| ("the primary key".to_owned(), &pk.storage_parameters))
-        .chain(
-            table
-                .unique
-                .iter()
-                .map(|(n, u)| (format!("unique constraint `{n}`"), &u.storage_parameters)),
-        )
-        .chain(
-            table
-                .indexes
-                .iter()
-                .map(|(n, ix)| (format!("index `{n}`"), &ix.storage_parameters)),
-        );
+        .chain(table.unique.iter().map(|(n, u)| {
+            (
+                format!(
+                    "unique constraint `{n}`",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
+                ),
+                &u.storage_parameters,
+            )
+        }))
+        .chain(table.indexes.iter().map(|(n, ix)| {
+            (
+                format!(
+                    "index `{n}`",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
+                ),
+                &ix.storage_parameters,
+            )
+        }));
     for (what, parameters) in keyed {
         if !parameters.is_empty() {
             errs.push(invalid(format!(
@@ -929,7 +939,7 @@ pub(crate) fn table_sources(
 
     if let Some(pk) = &table.primary_key {
         if let Some(n) = &pk.name
-            && let Err(e) = ident::quote(n)
+            && let Err(e) = ident::quote(n.raw())
         {
             errs.push(e);
         }
@@ -951,11 +961,15 @@ pub(crate) fn table_sources(
     }
 
     for (n, u) in &table.unique {
-        if let Err(e) = ident::quote(n) {
+        if let Err(e) = ident::quote(n.raw()) {
             errs.push(e);
         }
         errs.extend(key_columns(
-            &format!("unique constraint `{n}`"),
+            &format!(
+                "unique constraint `{n}`",
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
+            ),
             &u.columns,
             table,
             Computed::Allowed,
@@ -963,11 +977,15 @@ pub(crate) fn table_sources(
     }
 
     for (n, fk) in &table.foreign_keys {
-        if let Err(e) = ident::quote(n) {
+        if let Err(e) = ident::quote(n.raw()) {
             errs.push(e);
         }
         errs.extend(key_columns(
-            &format!("foreign key `{n}`"),
+            &format!(
+                "foreign key `{n}`",
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
+            ),
             &fk.columns,
             table,
             Computed::Refused,
@@ -976,12 +994,16 @@ pub(crate) fn table_sources(
             errs.push(invalid(format!(
                 "foreign key `{n}` has {} column(s) but references {}; the two sides must line up",
                 fk.columns.len(),
-                fk.references_columns.len()
+                fk.references_columns.len(),
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
             )));
         }
         if fk.references_columns.is_empty() {
             errs.push(invalid(format!(
-                "foreign key `{n}` names no columns on the referenced table"
+                "foreign key `{n}` names no columns on the referenced table",
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
             )));
         }
         // PostgreSQL's action: SQL Server has no `RESTRICT`, and `no_action`
@@ -991,25 +1013,29 @@ pub(crate) fn table_sources(
                 errs.push(invalid(format!(
                     "foreign key `{n}` is `{side}: restrict`, a PostgreSQL action; SQL Server \
                      has no RESTRICT, so declare `no_action`, which it checks at the end of the \
-                     statement instead"
+                     statement instead",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
                 )));
             }
         }
     }
 
     for (n, c) in &table.checks {
-        if let Err(e) = ident::quote(n) {
+        if let Err(e) = ident::quote(n.raw()) {
             errs.push(e);
         }
         if c.expression.trim().is_empty() {
             errs.push(invalid(format!(
-                "check constraint `{n}` has an empty expression"
+                "check constraint `{n}` has an empty expression",
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
             )));
         }
     }
 
     for (n, idx) in &table.indexes {
-        if let Err(e) = ident::quote(n) {
+        if let Err(e) = ident::quote(n.raw()) {
             errs.push(e);
         }
         // An expression key is PostgreSQL's (DEC-1169.2): SQL Server indexes a
@@ -1018,7 +1044,9 @@ pub(crate) fn table_sources(
             if let Some(expression) = key.key.expression() {
                 errs.push(invalid(format!(
                     "index `{n}` has the expression key `{expression}`, and SQL Server indexes \
-                     only columns"
+                     only columns",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
                 )));
             }
         }
@@ -1028,7 +1056,11 @@ pub(crate) fn table_sources(
             .filter_map(|c| c.key.column().cloned())
             .collect();
         errs.extend(key_columns(
-            &format!("index `{n}`"),
+            &format!(
+                "index `{n}`",
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
+            ),
             &keys,
             table,
             Computed::Allowed,
@@ -1036,7 +1068,9 @@ pub(crate) fn table_sources(
         if keys.len() > MAX_INDEX_KEY_COLUMNS {
             errs.push(invalid(format!(
                 "index `{n}` has {} key columns; SQL Server allows at most {MAX_INDEX_KEY_COLUMNS}",
-                keys.len()
+                keys.len(),
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
             )));
         }
         for inc in &idx.include {
@@ -1045,6 +1079,8 @@ pub(crate) fn table_sources(
                     "index `{n}` includes `{inc}`, which is not a column of this table",
                     // raw: whole-message escaped until #2084 step 5.
                     inc = inc.raw(),
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
                 )));
             }
             if keys.contains(inc) {
@@ -1052,12 +1088,16 @@ pub(crate) fn table_sources(
                     "index `{n}` has `{inc}` both as a key column and as an included column",
                     // raw: whole-message escaped until #2084 step 5.
                     inc = inc.raw(),
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
                 )));
             }
         }
         if idx.filter.as_ref().is_some_and(|f| f.trim().is_empty()) {
             errs.push(invalid(format!(
-                "index `{n}` has an empty filter expression"
+                "index `{n}` has an empty filter expression",
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
             )));
         }
         // PostgreSQL's words (DEC-1169.1): SQL Server builds every index this model
@@ -1065,7 +1105,9 @@ pub(crate) fn table_sources(
         if !idx.method.is_btree() {
             errs.push(invalid(format!(
                 "index `{n}` uses the `{}` method, which SQL Server does not have",
-                idx.method.as_str()
+                idx.method.as_str(),
+                // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                n = n.raw(),
             )));
         }
         for key in &idx.columns {
@@ -1073,7 +1115,9 @@ pub(crate) fn table_sources(
                 errs.push(invalid(format!(
                     "index `{n}` indexes `{}` with `{class}`, and SQL Server has no operator \
                      classes (if `{class}` was meant as a direction, it is `asc` or `desc`)",
-                    key.key.text()
+                    key.key.text(),
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
                 )));
             }
         }
@@ -1081,17 +1125,21 @@ pub(crate) fn table_sources(
         // rows rather than a copy of some of them — so every column is in it
         // already and it covers every row. Measured on 17.0: `INCLUDE` is
         // refused (10601) and a `WHERE` is a syntax error.
-        if table.index_is_clustered(n) {
+        if table.index_is_clustered(n.raw()) {
             if !idx.include.is_empty() {
                 errs.push(invalid(format!(
                     "index `{n}` is the clustered index, which cannot have INCLUDE columns: it \
-                     holds every column already"
+                     holds every column already",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
                 )));
             }
             if idx.filter.is_some() {
                 errs.push(invalid(format!(
                     "index `{n}` is the clustered index, which cannot be filtered: it holds \
-                     every row"
+                     every row",
+                    // Validation text feeds a whole-escaped dialect error until #2084 step 5.
+                    n = n.raw(),
                 )));
             }
         }

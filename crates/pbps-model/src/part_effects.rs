@@ -52,6 +52,8 @@ pub enum Part<'a> {
     Named {
         table: &'a TableName,
         kind: crate::Part,
+        // Policy names share this borrowed dependency carrier; keep the
+        // generic view raw without widening the index/constraint type scope.
         name: &'a str,
     },
     PrimaryKey(&'a TableName),
@@ -192,28 +194,28 @@ impl Change {
                 named(table, crate::Part::Policy, name, Effect::Created)
             }
             Change::AddCheck { table, name, .. } => {
-                named(table, crate::Part::Check, name, Effect::Created)
+                named(table, crate::Part::Check, name.raw(), Effect::Created)
             }
             Change::DropCheck { table, name } => {
-                named(table, crate::Part::Check, name, Effect::Removed)
+                named(table, crate::Part::Check, name.raw(), Effect::Removed)
             }
             Change::AddIndex { table, name, .. } => {
-                named(table, crate::Part::Index, name, Effect::Created)
+                named(table, crate::Part::Index, name.raw(), Effect::Created)
             }
             Change::DropIndex { table, name } => {
-                named(table, crate::Part::Index, name, Effect::Removed)
+                named(table, crate::Part::Index, name.raw(), Effect::Removed)
             }
             Change::AddUnique { table, name, .. } => {
-                named(table, crate::Part::Unique, name, Effect::Created)
+                named(table, crate::Part::Unique, name.raw(), Effect::Created)
             }
             Change::DropUnique { table, name } => {
-                named(table, crate::Part::Unique, name, Effect::Removed)
+                named(table, crate::Part::Unique, name.raw(), Effect::Removed)
             }
             Change::AddForeignKey { table, name, .. } => {
-                named(table, crate::Part::ForeignKey, name, Effect::Created)
+                named(table, crate::Part::ForeignKey, name.raw(), Effect::Created)
             }
             Change::DropForeignKey { table, name } => {
-                named(table, crate::Part::ForeignKey, name, Effect::Removed)
+                named(table, crate::Part::ForeignKey, name.raw(), Effect::Removed)
             }
             Change::SetPrimaryKey {
                 table, from, to, ..

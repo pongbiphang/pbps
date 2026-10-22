@@ -883,7 +883,7 @@ mod tests {
             };
             partition
                 .indexes
-                .insert(format!("{name}_ix"), index(column));
+                .insert(format!("{name}_ix").into(), index(column));
             s.tables.insert(TableName::new("app", name), partition);
         }
 

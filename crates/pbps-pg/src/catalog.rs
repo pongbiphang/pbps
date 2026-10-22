@@ -1563,7 +1563,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         };
         raw.constraints.push(RawConstraint {
             table_oid: number(row, "table_oid")?,
-            name,
+            name: name.into(),
             kind,
             columns: numbers(&optional_text(row, "conkey")?.unwrap_or_default()),
             ref_columns: numbers(&optional_text(row, "confkey")?.unwrap_or_default()),
@@ -1595,7 +1595,7 @@ fn decode_batch(batch: &CatalogBatch) -> Result<CatalogRead, DbError> {
         raw.indexes.push(RawIndex {
             oid: number(row, "oid")?,
             table_oid: number(row, "table_oid")?,
-            name: text(row, "name")?,
+            name: text(row, "name")?.into(),
             unique: flag(row, "is_unique")?,
             primary: flag(row, "is_primary")?,
             exclusion: flag(row, "is_exclusion")?,
@@ -3574,7 +3574,7 @@ pub struct NameOccupant {
 #[derive(Debug, Clone)]
 pub struct DetachClone {
     pub kind: pbps_model::DetachedKind,
-    pub parent: String,
+    pub parent: pbps_model::ObjectLocalName,
     pub name: TableName,
 }
 
@@ -3632,7 +3632,7 @@ pub async fn detach_clone_names(
         };
         clones.push(DetachClone {
             kind,
-            parent: text("parent_name")?,
+            parent: text("parent_name")?.into(),
             name: TableName::new(&table.schema, text("clone_name")?),
         });
     }

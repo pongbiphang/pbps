@@ -137,7 +137,7 @@ enum Work {
     /// catalog does, so this is settled in [`against`]. Measured on 17.0 as
     /// the mirror of the build: new partition ids for the heap and each
     /// nonclustered index, under Sch-M.
-    MaybeClusteredDrop(Option<String>),
+    MaybeClusteredDrop(Option<pbps_model::ObjectLocalName>),
 }
 
 impl Estimate {
@@ -183,7 +183,11 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 } => (
                     table,
                     Work::ClusteredBuild,
-                    format!("building `{name}` as the clustered index"),
+                    format!(
+                        "building `{name}` as the clustered index",
+                        // Shared estimate description is escaped by the report until #2084 step 5.
+                        name = name.raw(),
+                    ),
                 ),
                 Change::SetPrimaryKey {
                     table,
@@ -198,7 +202,11 @@ pub fn planned_estimates(names: &PlanNames<'_>) -> Vec<(usize, Estimate)> {
                 Change::DropUnique { table, name } | Change::DropIndex { table, name } => (
                     table,
                     Work::MaybeClusteredDrop(Some(name.clone())),
-                    format!("dropping `{name}`"),
+                    format!(
+                        "dropping `{name}`",
+                        // Shared estimate description is escaped by the report until #2084 step 5.
+                        name = name.raw(),
+                    ),
                 ),
                 Change::CreateTable { .. }
                 | Change::DropTable { .. }
@@ -559,7 +567,13 @@ async fn against_layout(conn: &mut Conn, estimate: &mut Estimate) -> Result<(), 
     let rows = conn
         .query_with(
             LAYOUT,
-            &[relation.as_str().into(), dropped.as_deref().into()],
+            &[
+                relation.as_str().into(),
+                dropped
+                    .as_ref()
+                    .map(pbps_model::ObjectLocalName::raw)
+                    .into(),
+            ],
         )
         .await?;
     let Some(row) = rows.first() else {

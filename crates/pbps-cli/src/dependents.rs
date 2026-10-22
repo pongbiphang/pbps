@@ -251,7 +251,7 @@ fn exact_dependent(part: &DependencyPart<'_>, holds: &Holds) -> bool {
                 table: target,
                 part: Part::Index(target_name),
             },
-        ) => *table == target && *name == target_name,
+        ) => *table == target && *name == target_name.raw(),
         (
             DependencyPart::Default { column, .. },
             Holds::TablePart {
@@ -1836,7 +1836,7 @@ fn before_its_partitions_indexes(
             // `k` is a parent's `AddIndex`, as every adoption's first end is.
             let named = |i: usize| {
                 if let Change::AddIndex { table, name, .. } = &cs.changes[i].change {
-                    (name.clone(), table.shown().to_string())
+                    (name.shown().to_string(), table.shown().to_string())
                 } else {
                     (cs.changes[i].change.subject(), String::new())
                 }
@@ -3112,13 +3112,13 @@ fn replay(present: &mut Vec<KeyNameHolder>, change: &Change) {
         }
         // A unique constraint is its index and itself.
         Change::DropUnique { table, name } => {
-            present.retain(|h| !(owned(h, table) && h.name.name == *name));
+            present.retain(|h| !(owned(h, table) && h.name.name == name.raw()));
         }
         Change::DropIndex { table, name } => {
-            present.retain(|h| !(!h.constraint && owned(h, table) && h.name.name == *name));
+            present.retain(|h| !(!h.constraint && owned(h, table) && h.name.name == name.raw()));
         }
         Change::DropCheck { table, name } | Change::DropForeignKey { table, name } => {
-            present.retain(|h| !(h.constraint && owned(h, table) && h.name.name == *name));
+            present.retain(|h| !(h.constraint && owned(h, table) && h.name.name == name.raw()));
         }
         Change::SetPrimaryKey {
             table,
@@ -3153,13 +3153,13 @@ fn constraints_added(change: &Change, dialect: &dyn Dialect) -> Vec<TableName> {
             module,
         } if dialect.declares_a_constraint(module) => vec![in_schema(on, name)],
         Change::AddCheck { table, name, .. } | Change::AddForeignKey { table, name, .. } => {
-            vec![in_schema(table, name)]
+            vec![in_schema(table, name.raw())]
         }
         Change::CreateTable { name, table, .. } => table
             .checks
             .keys()
             .chain(table.foreign_keys.keys())
-            .map(|n| in_schema(name, n))
+            .map(|n| in_schema(name, n.raw()))
             .collect(),
         _ => Vec::new(),
     }
@@ -3192,7 +3192,7 @@ fn relations_brought(change: &Change) -> Vec<(Step, Brought)> {
     };
     // A key's index: its name, or the one the engine generates (#1619).
     let key = |table: &TableName, pk: &pbps_model::PrimaryKey| match &pk.name {
-        Some(n) => index(table, n),
+        Some(n) => index(table, n.raw()),
         None => Brought::Key(table.clone()),
     };
     let one = match change {
@@ -3203,15 +3203,15 @@ fn relations_brought(change: &Change) -> Vec<(Step, Brought)> {
                     .indexes
                     .keys()
                     .enumerate()
-                    .map(|(k, n)| (index_step(k) + 1, index(name, n))),
+                    .map(|(k, n)| (index_step(k) + 1, index(name, n.raw()))),
             );
-            out.extend(table.unique.keys().map(|n| (KEYS, index(name, n))));
+            out.extend(table.unique.keys().map(|n| (KEYS, index(name, n.raw()))));
             out.extend(table.primary_key.as_ref().map(|pk| (KEYS, key(name, pk))));
             return out;
         }
         Change::RenameTable { to, .. } => vec![Brought::Named(to.clone())],
         Change::AddIndex { table, name, .. } | Change::AddUnique { table, name, .. } => {
-            vec![index(table, name)]
+            vec![index(table, name.raw())]
         }
         Change::SetPrimaryKey {
             table,
@@ -3304,7 +3304,7 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
                 .iter()
                 .map(|(n, c)| {
                     (
-                        format!("check {n} on {name}", name = name.shown()),
+                        format!("check {n} on {name}", name = name.shown(), n = n.shown(),),
                         c.expression.clone(),
                     )
                 })
@@ -3320,7 +3320,7 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
                 .map(|(k, (n, ix))| {
                     (
                         index_step(k),
-                        format!("index {n} on {name}", name = name.shown()),
+                        format!("index {n} on {name}", name = name.shown(), n = n.shown(),),
                         index_text(ix),
                     )
                 }),
@@ -3370,13 +3370,21 @@ fn expressions_set(change: &Change) -> Vec<(Step, String, String)> {
             name,
             constraint,
         } => vec![(
-            format!("check {name} on {table}", table = table.shown()),
+            format!(
+                "check {name} on {table}",
+                table = table.shown(),
+                name = name.shown(),
+            ),
             constraint.expression.clone(),
         )],
         Change::AddIndex {
             table, name, index, ..
         } => vec![(
-            format!("index {name} on {table}", table = table.shown()),
+            format!(
+                "index {name} on {table}",
+                table = table.shown(),
+                name = name.shown(),
+            ),
             index_text(index),
         )],
         Change::CreateModule { id, module } | Change::AlterModule { id, module } => {
@@ -4313,8 +4321,16 @@ mod tests {
                 Change::DropModule { id, .. } => format!("drop {id}", id = id.shown()),
                 Change::CreateModule { id, .. } => format!("create {id}", id = id.shown()),
                 Change::AlterModule { id, .. } => format!("alter {id}", id = id.shown()),
-                Change::DropCheck { name, .. } => format!("drop check {name}"),
-                Change::AddCheck { name, .. } => format!("add check {name}"),
+                Change::DropCheck { name, .. } => format!(
+                    "drop check {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
+                Change::AddCheck { name, .. } => format!(
+                    "add check {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
                 Change::AlterColumnDefault { column, to, .. } => {
                     format!("default {} -> {to:?}", column.name.shown())
                 }
@@ -4428,7 +4444,11 @@ mod tests {
         cs.changes
             .iter()
             .map(|p| match &p.change {
-                Change::AddIndex { name, .. } => format!("add index {name}"),
+                Change::AddIndex { name, .. } => format!(
+                    "add index {name}",
+                    // Preserve raw comparison-label or fixture SQL bytes in test data.
+                    name = name.raw(),
+                ),
                 Change::InsertRow { .. } => "insert".to_owned(),
                 _ => rendered(&ChangeSet {
                     changes: vec![p.clone()],
@@ -4544,7 +4564,7 @@ mod tests {
         };
         let unique = |column: &str| Change::AddUnique {
             table: t.clone(),
-            name: format!("uq_{column}"),
+            name: format!("uq_{column}").into(),
             constraint: pbps_model::UniqueConstraint {
                 columns: vec![column.into()],
                 storage_parameters: Default::default(),
@@ -4590,7 +4610,9 @@ mod tests {
         assert!(expression < tightened("n"), "{:?}", names(&cs));
         assert!(tightened("other") < rebuilt, "{:?}", names(&cs));
         let keyed = |name: &str| {
-            at(&|c| matches!(c, Change::AddUnique { name: n, .. } if n == &format!("uq_{name}")))
+            at(
+                &|c| matches!(c, Change::AddUnique { name: n, .. } if n.raw() == format!("uq_{name}")),
+            )
         };
         assert!(expression < keyed("n"), "{:?}", names(&cs));
         assert!(keyed("other") < rebuilt, "{:?}", names(&cs));
@@ -4777,7 +4799,13 @@ mod tests {
         assert_eq!(split_new_tables(&mut cs, &[&ids], pg().as_ref()), Ok(3));
         let left = table_of(&cs);
         assert!(left.checks.is_empty());
-        assert_eq!(left.indexes.keys().collect::<Vec<_>>(), ["ix_u"]);
+        assert_eq!(
+            left.indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ix_u"]
+        );
         assert_eq!(
             left.columns["v"].value_source,
             pbps_model::ValueSource::None
@@ -5037,7 +5065,14 @@ mod tests {
         #[allow(clippy::wildcard_enum_match_arm)]
         match &cs.changes[0].change {
             Change::CreateTable { table, .. } => {
-                assert_eq!(table.checks.keys().collect::<Vec<_>>(), ["ck_plain"]);
+                assert_eq!(
+                    table
+                        .checks
+                        .keys()
+                        .map(pbps_model::ObjectLocalName::raw)
+                        .collect::<Vec<_>>(),
+                    ["ck_plain"]
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -6597,7 +6632,7 @@ mod tests {
         // Declared as the partition it becomes: `ck` is its parent's, and
         // `own`, which calls the same function, its own.
         let partition = Table {
-            checks: [("own".to_owned(), check())].into(),
+            checks: [("own".into(), check())].into(),
             partition_of: Some(pbps_model::PartitionOf {
                 parent: TableName::new("app", "p"),
                 bound: bound.clone(),
@@ -6635,9 +6670,19 @@ mod tests {
             .iter()
             .filter_map(|p| {
                 if let Change::DropCheck { table, name } = &p.change {
-                    Some(format!("drop {table} {name}", table = table.shown()))
+                    Some(format!(
+                        "drop {table} {name}",
+                        table = table.shown(),
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    ))
                 } else if let Change::AddCheck { table, name, .. } = &p.change {
-                    Some(format!("add {table} {name}", table = table.shown()))
+                    Some(format!(
+                        "add {table} {name}",
+                        table = table.shown(),
+                        // Preserve raw comparison-label or fixture SQL bytes in test data.
+                        name = name.raw(),
+                    ))
                 } else if let Change::AttachPartition { .. } = &p.change {
                     Some("attach".to_owned())
                 } else if let Change::AlterModule { .. } = &p.change {
@@ -6761,7 +6806,7 @@ mod tests {
                 cs.changes
                     .iter()
                     .any(|p| matches!(&p.change, Change::AddCheck { table, name, .. }
-                        if *table == ev && name == "ev_ck")),
+                        if *table == ev && name.raw() == "ev_ck")),
                 "{:?}",
                 cs.changes
             );
@@ -6788,7 +6833,7 @@ mod tests {
                 .iter()
                 .map(|p| {
                     if let Change::AddCheck { name, .. } = &p.change {
-                        name.clone()
+                        name.raw().to_owned()
                     } else {
                         p.change.subject()
                     }
@@ -7019,7 +7064,7 @@ mod tests {
                 .iter()
                 .map(|p| {
                     if let Change::AddIndex { name, .. } = &p.change {
-                        name.clone()
+                        name.raw().to_owned()
                     } else {
                         p.change.subject()
                     }
@@ -8162,7 +8207,7 @@ mod tests {
         match &cs.changes[0].change {
             Change::DropCheck { table, name } => {
                 assert_eq!(table.raw().to_string(), "app.t");
-                assert_eq!(name, "ck");
+                assert_eq!(name.raw(), "ck");
             }
             other => panic!("expected the moved removal first, got {other:?}"),
         }

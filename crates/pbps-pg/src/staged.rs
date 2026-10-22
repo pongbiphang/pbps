@@ -36,12 +36,12 @@ pub async fn execute(conn: &mut Conn, statement: &Statement) -> Result<(), DbErr
          EXISTS (SELECT 1 FROM pg_catalog.pg_class c WHERE c.relnamespace=n.oid AND c.relname=$3) AS existed \
          FROM pg_catalog.pg_class t JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace \
          WHERE n.nspname=$1 AND t.relname=$2",
-        &[build.table.schema.as_str().into(), build.table.name.as_str().into(), build.name.as_str().into()],
+        &[build.table.schema.as_str().into(), build.table.name.as_str().into(), build.name.raw().into()],
     ).await?;
     let row = rows.first().ok_or_else(|| {
         DbError::Refused(format!(
             "cannot prepare index build `{}`: table `{}` is absent",
-            build.name,
+            build.name.shown(),
             build.table.shown()
         ))
     })?;
@@ -57,7 +57,8 @@ pub async fn execute(conn: &mut Conn, statement: &Statement) -> Result<(), DbErr
     let outcome = if existed {
         format!(
             "Index recovery preserved `{}.{}`: that name existed before the statement.",
-            build.table.schema, build.name
+            build.table.schema,
+            build.name.shown()
         )
     } else {
         match recover(conn, build, table_oid).await {
@@ -66,7 +67,8 @@ pub async fn execute(conn: &mut Conn, statement: &Statement) -> Result<(), DbErr
             // context: it can name undeclared data (DECISIONS 455/456).
             Err(_) => format!(
                 "Recovery of index `{}.{}` failed; the artifact may remain. Inspect it before retrying; the original build error follows.",
-                build.table.schema, build.name
+                build.table.schema,
+                build.name.shown()
             ),
         }
     };
@@ -84,24 +86,21 @@ pub async fn recover_failed_validation(conn: &mut Conn, check: &ScanCheck) -> St
             "Removing the temporary CHECK `{}` on `{}` failed; it may remain `NOT VALID`, \
              which every read of the table refuses. `pbps baseline --reason ...` removes it \
              by name before it records; the original error follows.",
-            check.name,
+            check.name.shown(),
             check.table.shown()
         ),
     }
 }
 
 async fn recover(conn: &mut Conn, build: &IndexBuild, table_oid: i64) -> Result<String, DbError> {
-    let name = format!("{}.{}", build.table.schema, build.name);
+    let name = format!("{}.{}", build.table.schema, build.name.shown());
     let rows = conn
         .query_with(
             "SELECT i.indrelid::bigint AS table_oid, i.indisvalid AS valid \
          FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace \
          LEFT JOIN pg_catalog.pg_index i ON i.indexrelid=c.oid \
          WHERE n.nspname=$1 AND c.relname=$2",
-            &[
-                build.table.schema.as_str().into(),
-                build.name.as_str().into(),
-            ],
+            &[build.table.schema.as_str().into(), build.name.raw().into()],
         )
         .await?;
     let Some(row) = rows.first() else {
@@ -139,14 +138,14 @@ async fn remove_unvalidated(conn: &mut Conn, check: &ScanCheck) -> Result<String
             &[
                 check.table.schema.as_str().into(),
                 check.table.name.as_str().into(),
-                check.name.as_str().into(),
+                check.name.raw().into(),
             ],
         )
         .await?;
     let Some(row) = rows.first() else {
         return Ok(format!(
             "The temporary CHECK `{}` is not on `{}`; nothing was removed.",
-            check.name,
+            check.name.shown(),
             check.table.shown()
         ));
     };
@@ -154,7 +153,7 @@ async fn remove_unvalidated(conn: &mut Conn, check: &ScanCheck) -> Result<String
     {
         return Ok(format!(
             "`{}` on `{}` is not a `NOT VALID` CHECK, so it was left as it is.",
-            check.name,
+            check.name.shown(),
             check.table.shown()
         ));
     }
@@ -164,7 +163,7 @@ async fn remove_unvalidated(conn: &mut Conn, check: &ScanCheck) -> Result<String
     Ok(format!(
         "The temporary CHECK `{}` on `{}` was removed; the database is as the last \
          checkpoint recorded it.",
-        check.name,
+        check.name.shown(),
         check.table.shown()
     ))
 }
@@ -201,7 +200,11 @@ pub async fn standing_scan_checks<'a>(
                 .map(str::to_owned)
                 .ok_or_else(|| missing(column))
         };
-        standing.insert((field("nspname")?, field("relname")?, field("conname")?));
+        standing.insert((
+            field("nspname")?,
+            field("relname")?,
+            field("conname")?.into(),
+        ));
     }
     Ok(tables
         .into_iter()

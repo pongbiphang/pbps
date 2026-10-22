@@ -300,7 +300,11 @@ impl Dialect for Mssql {
 
     /// Both spellings of each column default's generated name: which one a
     /// database holds is the catalog's to say, and the plan is ordered offline.
-    fn generated_constraint_names(&self, name: &TableName, table: &Table) -> Vec<String> {
+    fn generated_constraint_names(
+        &self,
+        name: &TableName,
+        table: &Table,
+    ) -> Vec<pbps_model::ObjectLocalName> {
         table
             .columns
             .iter()
@@ -693,7 +697,7 @@ mod tests {
                     end: "vt".into(),
                     hidden: false,
                     versioning: Some(pbps_model::SystemVersioning {
-                        history: pbps_model::TableName::new("dbo", &history),
+                        history: pbps_model::TableName::new("dbo", history.raw()),
                         retention: None,
                     }),
                 }),
@@ -703,7 +707,12 @@ mod tests {
             schema.tables.insert(name.clone(), t.clone());
             schema.tables.insert("dbo.v".parse().unwrap(), versioned);
             let problems = pbps_dialect::check_history_names(&schema, &Mssql);
-            assert!(problems.is_empty(), "{history}: {problems:?}");
+            assert!(
+                problems.is_empty(),
+                "{history}: {problems:?}",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                history = history.raw(),
+            );
         }
     }
 

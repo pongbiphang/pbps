@@ -18,8 +18,14 @@ pub enum Surface {
     Table(TableName),
     Column(ColumnRef),
     Default(ColumnRef),
-    Check { table: TableName, name: String },
-    Index { table: TableName, name: String },
+    Check {
+        table: TableName,
+        name: crate::ObjectLocalName,
+    },
+    Index {
+        table: TableName,
+        name: crate::ObjectLocalName,
+    },
     Module(ModuleId),
 }
 

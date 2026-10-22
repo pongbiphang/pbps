@@ -221,12 +221,16 @@ fn partition_problems(table: &pbps_model::Table) -> Vec<DialectError> {
             .primary_key
             .iter()
             .map(|k| ("the primary key".to_owned(), &k.columns))
-            .chain(
-                table
-                    .unique
-                    .iter()
-                    .map(|(n, u)| (format!("unique constraint `{n}`"), &u.columns)),
-            );
+            .chain(table.unique.iter().map(|(n, u)| {
+                (
+                    format!(
+                        "unique constraint `{n}`",
+                        // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
+                        n = n.raw(),
+                    ),
+                    &u.columns,
+                )
+            }));
         for (what, columns) in keys {
             for key in &by.columns {
                 if !columns.contains(key) {
@@ -519,13 +523,21 @@ fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
         && pk.columns.iter().any(|c| c.raw() == column)
     {
         keys.push(match &pk.name {
-            Some(name) => format!("primary key `{name}`"),
+            Some(name) => format!(
+                "primary key `{name}`",
+                // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
+                name = name.raw(),
+            ),
             None => "the primary key".to_owned(),
         });
     }
     for (name, unique) in &table.unique {
         if unique.columns.iter().any(|c| c.raw() == column) {
-            keys.push(format!("unique constraint `{name}`"));
+            keys.push(format!(
+                "unique constraint `{name}`",
+                // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
+                name = name.raw(),
+            ));
         }
     }
     for (name, index) in &table.indexes {
@@ -535,7 +547,11 @@ fn cycle_problems(table: &Table, column: &str) -> Vec<DialectError> {
                 .iter()
                 .any(|c| c.key.column().is_some_and(|c| c.raw() == column))
         {
-            keys.push(format!("unique index `{name}`"));
+            keys.push(format!(
+                "unique index `{name}`",
+                // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
+                name = name.raw(),
+            ));
         }
     }
     keys.into_iter()
@@ -590,6 +606,8 @@ fn cycle_expression_notes(schema: &Schema) -> Vec<String> {
                         table_name.raw(),
                         // raw: declaration notes are escaped whole until #2084 step 5.
                         column = column.raw(),
+                        // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
+                        name = name.raw(),
                     ));
                 }
             }
@@ -1240,7 +1258,9 @@ impl Dialect for Postgres {
                 dialect: crate::types::DIALECT,
                 message: format!(
                     "{own} `{name}` is named as its parent's {kind}, which the partition already \
-                     has under that name; name it otherwise"
+                     has under that name; name it otherwise",
+                    // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
+                    name = name.raw(),
                 ),
             });
         }
@@ -1257,7 +1277,11 @@ impl Dialect for Postgres {
                     message: format!(
                         "foreign key `{name}` is its parent's `{parents}` again, which the \
                          partition already has as a clone, and which the engine may take it \
-                         for; declare it on the parent only"
+                         for; declare it on the parent only",
+                        // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
+                        name = name.raw(),
+                        // Validation text feeds a whole-escaped dialect error/note until #2084 step 5.
+                        parents = parents.raw(),
                     ),
                 });
             }
@@ -1547,12 +1571,17 @@ impl Dialect for Postgres {
         let owned = table
             .primary_key
             .as_ref()
-            .and_then(|pk| pk.name.as_deref())
+            .and_then(|pk| pk.name.as_ref().map(pbps_model::ObjectLocalName::raw))
             .into_iter()
-            .chain(table.unique.keys().map(String::as_str))
-            .chain(table.foreign_keys.keys().map(String::as_str))
-            .chain(table.checks.keys().map(String::as_str))
-            .chain(table.indexes.keys().map(String::as_str));
+            .chain(table.unique.keys().map(pbps_model::ObjectLocalName::raw))
+            .chain(
+                table
+                    .foreign_keys
+                    .keys()
+                    .map(pbps_model::ObjectLocalName::raw),
+            )
+            .chain(table.checks.keys().map(pbps_model::ObjectLocalName::raw))
+            .chain(table.indexes.keys().map(pbps_model::ObjectLocalName::raw));
         for object in owned {
             if let Err(e) = self.quote_ident(object) {
                 found.push(e);
@@ -2575,7 +2604,7 @@ mod tests {
             };
             if let Some(name) = check {
                 partition.checks.insert(
-                    name.to_owned(),
+                    name.into(),
                     pbps_model::CheckConstraint {
                         expression: "k > 0".into(),
                     },
@@ -3518,7 +3547,7 @@ mod tests {
         };
         let index = |name: &str| {
             (
-                name.to_owned(),
+                name.into(),
                 Index {
                     columns: vec![IndexColumn {
                         key: pbps_model::IndexKey::Column("id".into()),
@@ -3670,7 +3699,7 @@ mod tests {
             }
             t.columns.insert("id".into(), id);
             t.primary_key = Some(PrimaryKey {
-                name: pk_name.map(str::to_owned),
+                name: pk_name.map(Into::into),
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
             });
@@ -6026,19 +6055,19 @@ mod tests {
             pbps_model::Column::new(ty("integer")).not_null(),
         );
         table.primary_key = Some(pbps_model::PrimaryKey {
-            name: Some(long.clone()),
+            name: Some(long.clone().into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
         table.unique.insert(
-            format!("uq_{long}"),
+            format!("uq_{long}").into(),
             pbps_model::UniqueConstraint {
                 columns: vec!["id".into()],
                 storage_parameters: Default::default(),
             },
         );
         table.checks.insert(
-            format!("ck_{long}"),
+            format!("ck_{long}").into(),
             pbps_model::CheckConstraint {
                 expression: "id > 0".to_owned(),
             },

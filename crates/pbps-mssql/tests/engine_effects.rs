@@ -445,15 +445,15 @@ fn a_storage_type_change_waits_for_every_key_and_index_over_its_column() {
     let retype = plan.at(|c| matches!(c, Change::AlterColumnType { column, .. } if column.table == t() && column.name == "a".into()));
     for (drop, part) in [
         (
-            plan.at(|c| matches!(c, Change::DropIndex { name, .. } if name == "ix_a")),
+            plan.at(|c| matches!(c, Change::DropIndex { name, .. } if name.raw() == "ix_a")),
             PartKey::Index("ix_a".into()),
         ),
         (
-            plan.at(|c| matches!(c, Change::DropUnique { name, .. } if name == "uq_a")),
+            plan.at(|c| matches!(c, Change::DropUnique { name, .. } if name.raw() == "uq_a")),
             PartKey::Unique("uq_a".into()),
         ),
         (
-            plan.at(|c| matches!(c, Change::DropForeignKey { name, .. } if name == "fk_x")),
+            plan.at(|c| matches!(c, Change::DropForeignKey { name, .. } if name.raw() == "fk_x")),
             PartKey::ForeignKey("fk_x".into()),
         ),
     ] {
@@ -480,7 +480,7 @@ fn a_varchar_widening_requires_no_check_gone_and_a_base_type_change_does() {
                 pbps_model::operation::Requirement::Absent(ObjectKey::Part {
                     part: PartKey::Check(n),
                     ..
-                }) if n == "ck_b"
+                }) if n.raw() == "ck_b"
             )
         })
     };

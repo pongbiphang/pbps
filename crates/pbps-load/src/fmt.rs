@@ -197,7 +197,7 @@ pub fn render_partitioned(
             } => {
                 let _ = writeln!(s, "primary_key:");
                 if let Some(n) = name {
-                    let _ = writeln!(s, "  name: {}", scalar(n));
+                    let _ = writeln!(s, "  name: {}", scalar(n.raw()));
                 }
                 let _ = writeln!(s, "  columns: {}", seq(columns));
                 if !storage_parameters.is_empty() {
@@ -211,12 +211,12 @@ pub fn render_partitioned(
         s.push_str("\nunique:\n");
         for (n, u) in &table.unique {
             if u.storage_parameters.is_empty() {
-                let _ = writeln!(s, "  {}: {}", scalar(n), seq(&u.columns));
+                let _ = writeln!(s, "  {}: {}", scalar(n.raw()), seq(&u.columns));
             } else {
                 let _ = writeln!(
                     s,
                     "  {}: {{columns: {}, storage_parameters: {}}}",
-                    scalar(n),
+                    scalar(n.raw()),
                     seq(&u.columns),
                     flow(&u.storage_parameters)
                 );
@@ -233,10 +233,10 @@ pub fn render_partitioned(
         None => {}
         Some(Clustered::Heap) => s.push_str("\nclustered: heap\n"),
         Some(Clustered::Unique(n)) => {
-            let _ = writeln!(s, "\nclustered: {{unique: {}}}", scalar(n));
+            let _ = writeln!(s, "\nclustered: {{unique: {}}}", scalar(n.raw()));
         }
         Some(Clustered::Index(n)) => {
-            let _ = writeln!(s, "\nclustered: {{index: {}}}", scalar(n));
+            let _ = writeln!(s, "\nclustered: {{index: {}}}", scalar(n.raw()));
         }
     }
     // The same, for the same reason.
@@ -246,10 +246,10 @@ pub fn render_partitioned(
         Some(ReplicaIdentity::Nothing) => s.push_str("\nreplica_identity: nothing\n"),
         Some(ReplicaIdentity::PrimaryKey) => s.push_str("\nreplica_identity: primary_key\n"),
         Some(ReplicaIdentity::Unique(n)) => {
-            let _ = writeln!(s, "\nreplica_identity: {{unique: {}}}", scalar(n));
+            let _ = writeln!(s, "\nreplica_identity: {{unique: {}}}", scalar(n.raw()));
         }
         Some(ReplicaIdentity::Index(n)) => {
-            let _ = writeln!(s, "\nreplica_identity: {{index: {}}}", scalar(n));
+            let _ = writeln!(s, "\nreplica_identity: {{index: {}}}", scalar(n.raw()));
         }
     }
     // Only where it is not the default (#1443).
@@ -755,7 +755,7 @@ fn render_foreign_keys(s: &mut String, table: &Table, pad: &str, lead: &str) {
     }
     let _ = writeln!(s, "{lead}{pad}foreign_keys:");
     for (n, fk) in &table.foreign_keys {
-        let _ = writeln!(s, "{pad}  {}:", scalar(n));
+        let _ = writeln!(s, "{pad}  {}:", scalar(n.raw()));
         let _ = writeln!(s, "{pad}    columns: {}", seq(&fk.columns));
         let _ = writeln!(
             s,
@@ -783,14 +783,14 @@ fn render_checks_and_indexes(s: &mut String, table: &Table, pad: &str, lead: &st
     if !table.checks.is_empty() {
         let _ = writeln!(s, "{lead}{pad}checks:");
         for (n, c) in &table.checks {
-            let _ = writeln!(s, "{pad}  {}: {}", scalar(n), scalar(&c.expression));
+            let _ = writeln!(s, "{pad}  {}: {}", scalar(n.raw()), scalar(&c.expression));
         }
     }
 
     if !table.indexes.is_empty() {
         let _ = writeln!(s, "{lead}{pad}indexes:");
         for (n, ix) in &table.indexes {
-            let _ = writeln!(s, "{pad}  {}:", scalar(n));
+            let _ = writeln!(s, "{pad}  {}:", scalar(n.raw()));
             if !ix.method.is_btree() {
                 let _ = writeln!(s, "{pad}    method: {}", ix.method.as_str());
             }
@@ -1105,10 +1105,10 @@ mod tests {
                     .insert(format!("+{i}").into(), generated);
                 let mut check = base.table.checks["ck"].clone();
                 check.expression = text(4).clone();
-                expected.table.checks.insert(key.clone(), check);
+                expected.table.checks.insert(key.clone().into(), check);
                 let mut index = base.table.indexes["ix"].clone();
                 index.filter = Some(text(5).clone());
-                expected.table.indexes.insert(key, index);
+                expected.table.indexes.insert(key.into(), index);
                 let mut computed = base.table.computed["c"].clone();
                 computed.expression = text(6).clone();
                 expected
@@ -1190,14 +1190,14 @@ mod tests {
                 text(3)
             );
             assert_eq!(
-                expected.table.checks.get(&key),
-                back.table.checks.get(&key),
+                expected.table.checks.get(key.as_str()),
+                back.table.checks.get(key.as_str()),
                 "check: {:?}",
                 text(4)
             );
             assert_eq!(
-                expected.table.indexes.get(&key),
-                back.table.indexes.get(&key),
+                expected.table.indexes.get(key.as_str()),
+                back.table.indexes.get(key.as_str()),
                 "filter: {:?}",
                 text(5)
             );
@@ -2248,8 +2248,22 @@ indexes:
                 .unwrap_or_else(|| panic!("{n}"))
                 .1
         };
-        assert_eq!(own("ev_old").checks.keys().collect::<Vec<_>>(), ["old_ck"]);
-        assert_eq!(own("ev_old").indexes.keys().collect::<Vec<_>>(), ["old_v"]);
+        assert_eq!(
+            own("ev_old")
+                .checks
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["old_ck"]
+        );
+        assert_eq!(
+            own("ev_old")
+                .indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["old_v"]
+        );
         assert!(own("ev_plain").checks.is_empty() && own("ev_plain").indexes.is_empty());
         assert_eq!(
             own("ev_rest").partition_of.as_ref().map(|p| &p.bound),
@@ -2257,8 +2271,22 @@ indexes:
         );
         assert!(own("ev_rest").indexes["rest_id"].unique);
         // The parent's stay on the parent.
-        assert_eq!(t.table.checks.keys().collect::<Vec<_>>(), ["ev_ck"]);
-        assert_eq!(t.table.indexes.keys().collect::<Vec<_>>(), ["ev_v"]);
+        assert_eq!(
+            t.table
+                .checks
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev_ck"]
+        );
+        assert_eq!(
+            t.table
+                .indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev_v"]
+        );
         // A partition with nothing of its own stays on one line.
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
         let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
@@ -2293,7 +2321,14 @@ indexes:
         assert_eq!(fk.references_table.raw().to_string(), "app.archive");
         assert_eq!(fk.on_delete, pbps_model::ReferentialAction::Cascade);
         assert!(own("ev_plain").foreign_keys.is_empty());
-        assert_eq!(t.table.foreign_keys.keys().collect::<Vec<_>>(), ["ev_u_fk"]);
+        assert_eq!(
+            t.table
+                .foreign_keys
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev_u_fk"]
+        );
         let partitions: Vec<_> = t.partitions.iter().map(|(n, p)| (n, p)).collect();
         let out = render_partitioned(&t.name, &t.table, &partitions, &[], None);
         assert!(
@@ -2962,7 +2997,13 @@ indexes:
         let named = "table: public.t\ncolumns:\n  n: {type: int, nullable: false}\nprimary_key: {name: t_pkey, columns: [n]}\n";
         let t = crate::load_table_str(Path::new("t.yml"), named).unwrap();
         assert_eq!(
-            t.table.primary_key.as_ref().unwrap().name.as_deref(),
+            t.table
+                .primary_key
+                .as_ref()
+                .unwrap()
+                .name
+                .as_ref()
+                .map(pbps_model::ObjectLocalName::raw),
             Some("t_pkey")
         );
         // Negative: neither a list nor a mapping.

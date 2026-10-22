@@ -207,12 +207,17 @@ pub async fn drop_blockers(
                 index,
                 format!(
                     "unique constraint `{name}` on {table}",
-                    table = table.shown()
+                    table = table.shown(),
+                    name = name.shown(),
                 ),
             )),
             Change::DropIndex { table, name } => Some((
                 index,
-                format!("index `{name}` on {table}", table = table.shown()),
+                format!(
+                    "index `{name}` on {table}",
+                    table = table.shown(),
+                    name = name.shown(),
+                ),
             )),
             Change::AlterColumnNumbering {
                 column, from, to, ..

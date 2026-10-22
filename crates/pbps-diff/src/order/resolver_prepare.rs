@@ -177,7 +177,7 @@ pub(crate) fn invalidates(parts: &[PartEffect<'_>], surface: &Surface) -> bool {
         (DependencyPart::Default { column, change: DefaultChange::Column { from: Some(_), .. } | DefaultChange::Partition { .. } }, _, Surface::Default(target))
         | (DependencyPart::Generated(column), Effect::Rewritten, Surface::Default(target)) => column == target,
         (DependencyPart::Named { table, kind: pbps_model::Part::Check, name }, Effect::Removed, Surface::Check { table: target, name: target_name })
-        | (DependencyPart::Named { table, kind: pbps_model::Part::Index, name }, Effect::Removed, Surface::Index { table: target, name: target_name }) => *table == target && *name == target_name,
+        | (DependencyPart::Named { table, kind: pbps_model::Part::Index, name }, Effect::Removed, Surface::Index { table: target, name: target_name }) => *table == target && *name == target_name.raw(),
         _ => false,
     })
 }
@@ -295,7 +295,7 @@ pub(crate) fn changes(
                 );
                 parts.extend(indexes.into_iter().map(|(index, spec)| Change::AddIndex {
                     table: name.clone(),
-                    clustered: table.index_is_clustered(&index),
+                    clustered: table.index_is_clustered(index.raw()),
                     name: index,
                     index: Box::new(spec),
                 }));
@@ -534,7 +534,7 @@ pub(crate) fn changes(
                         table: table.clone(),
                         name: name.clone(),
                         index: Box::new(index),
-                        clustered: definition.index_is_clustered(name),
+                        clustered: definition.index_is_clustered(name.raw()),
                     },
                 ]
             }

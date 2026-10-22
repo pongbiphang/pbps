@@ -1,0 +1,42 @@
+table: app.child
+
+columns:
+  id:
+    type: int
+    nullable: false
+  code:
+    type: int
+    nullable: false
+
+primary_key:
+  name: "local\nline\r\e[31m\x9B\\‮名前pk"
+  columns: [id]
+
+unique:
+  "local\nline\r\e[31m\x9B\\‮名前uq": [code]
+
+foreign_keys:
+  "local\nline\r\e[31m\x9B\\‮名前fk":
+    columns: [code]
+    references: app.parent(id)
+
+checks:
+  "local\nline\r\e[31m\x9B\\‮名前ck": code > 0
+
+indexes:
+  "local\nline\r\e[31m\x9B\\‮名前ix":
+    columns: [code]
+    include: [id]
+    where: code > 0
+
+clustered: {unique: "local\nline\r\e[31m\x9B\\‮名前uq"}
+
+---
+table: app.parent
+
+columns:
+  id:
+    type: int
+    nullable: false
+
+primary_key: [id]

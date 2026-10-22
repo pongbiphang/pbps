@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "tool_version": "0.0.0",
+  "command": "explain",
+  "result": "ok",
+  "findings": [
+    {
+      "id": "plan.risk",
+      "severity": "warning",
+      "message": "destructive: data can be lost or a uniqueness guarantee removed (2 change(s))"
+    },
+    {
+      "id": "plan.risk",
+      "severity": "warning",
+      "message": "constraint: existing rows may not satisfy the new constraint and the statement fails (4 change(s))"
+    }
+  ],
+  "data": {
+    "applyable": true,
+    "dialect": "mssql",
+    "created_at": "2026-10-22T00:00:00Z",
+    "baseline": "local-name master fixture",
+    "mode": "transactional",
+    "checksum": "46d9749cce6d553e9b8317f2907ce4673d01e6ea7cb6a795297cdd58bf64b03e",
+    "change_count": 10,
+    "table_count": 1,
+    "module_count": 0,
+    "role_count": 0,
+    "risks": [
+      {
+        "class": "destructive",
+        "why": "data can be lost or a uniqueness guarantee removed",
+        "changes": [
+          "app.child  - unique constraint local\nline\r\u001b[31m\\‮名前uq",
+          "app.child  - index local\nline\r\u001b[31m\\‮名前ix"
+        ]
+      },
+      {
+        "class": "constraint",
+        "why": "existing rows may not satisfy the new constraint and the statement fails",
+        "changes": [
+          "app.child  ~ primary key -> (id)",
+          "app.child  + unique constraint local\nline\r\u001b[31m\\‮名前uq",
+          "app.child  + foreign key local\nline\r\u001b[31m\\‮名前fk",
+          "app.child  + check constraint local\nline\r\u001b[31m\\‮名前ck"
+        ]
+      }
+    ],
+    "approve_with": "pbps apply --env \"<environment>\" --plan plan.json --checksum 46d9749cce6d553e9b8317f2907ce4673d01e6ea7cb6a795297cdd58bf64b03e --allow destructive,constraint",
+    "probes": [
+      "existing NULLs in app.child.id, which NOT NULL would reject",
+      "rows that would collide under the new primary key",
+      "rows that would collide under the new unique constraint local\nline\r\u001b[31m\\‮名前uq",
+      "rows with no matching parent for the new foreign key local\nline\r\u001b[31m\\‮名前fk"
+    ],
+    "unchecked": [
+      {
+        "check": "new check local\nline\r\u001b[31m\\‮名前ck on app.child",
+        "reason": "the table does not exist before apply"
+      }
+    ],
+    "statement_count": 14
+  }
+}

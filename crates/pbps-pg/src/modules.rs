@@ -1622,9 +1622,9 @@ pub enum Holds {
 /// Which part of a table a dependent is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Part {
-    Check(String),
+    Check(pbps_model::ObjectLocalName),
     Default(pbps_model::ColumnName),
-    Index(String),
+    Index(pbps_model::ObjectLocalName),
     /// A generated column's expression. Never restorable: no statement takes
     /// the expression off and puts it back. A plan that changes the
     /// expression releases the dependency instead, when that change runs
@@ -1958,7 +1958,7 @@ async fn direct_dependents(
                 },
                 "check" => Holds::TablePart {
                     table: TableName::new(&dep_schema, &dep_name),
-                    part: Part::Check(part.clone()),
+                    part: Part::Check(part.clone().into()),
                 },
                 "default" => Holds::TablePart {
                     table: TableName::new(&dep_schema, &dep_name),
@@ -1970,7 +1970,7 @@ async fn direct_dependents(
                 },
                 "index" => Holds::TablePart {
                     table: TableName::new(&dep_schema, &dep_name),
-                    part: Part::Index(part.clone()),
+                    part: Part::Index(part.clone().into()),
                 },
                 // `other` is the fallback arm, which already carries its own
                 // sentence in `unrepresentable` and never reaches here; a

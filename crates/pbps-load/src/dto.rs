@@ -346,17 +346,17 @@ pub struct TableDto {
     pub primary_key: Option<PrimaryKeyDto>,
 
     #[serde(default)]
-    pub unique: BTreeMap<String, UniqueDto>,
+    pub unique: BTreeMap<pbps_model::ObjectLocalName, UniqueDto>,
 
     #[serde(default)]
-    pub foreign_keys: BTreeMap<String, ForeignKeyDto>,
+    pub foreign_keys: BTreeMap<pbps_model::ObjectLocalName, ForeignKeyDto>,
 
     /// Constraint name to check expression.
     #[serde(default)]
-    pub checks: BTreeMap<String, String>,
+    pub checks: BTreeMap<pbps_model::ObjectLocalName, String>,
 
     #[serde(default)]
-    pub indexes: BTreeMap<String, IndexDto>,
+    pub indexes: BTreeMap<pbps_model::ObjectLocalName, IndexDto>,
 
     /// Which index holds the table's rows, on SQL Server: `heap`, `{unique:
     /// <constraint>}` or `{index: <index>}`. Absent means the primary key is
@@ -655,7 +655,7 @@ pub enum PrimaryKeyDto {
 #[serde(deny_unknown_fields)]
 pub struct PrimaryKeySpecDto {
     #[serde(default)]
-    pub name: Option<String>,
+    pub name: Option<pbps_model::ObjectLocalName>,
     pub columns: Vec<ColumnName>,
     #[serde(default)]
     #[schemars(with = "BTreeMap<String, StorageValueDto>")]
@@ -793,16 +793,16 @@ pub struct PartitionEntryDto {
     pub default: bool,
     /// Constraint name to check expression, the partition's own.
     #[serde(default)]
-    pub checks: BTreeMap<String, String>,
+    pub checks: BTreeMap<pbps_model::ObjectLocalName, String>,
     /// The partition's own indexes; the parent's reach it without being
     /// written here.
     #[serde(default)]
-    pub indexes: BTreeMap<String, IndexDto>,
+    pub indexes: BTreeMap<pbps_model::ObjectLocalName, IndexDto>,
     /// The partition's own foreign keys (#1632); the parent's reach it as
     /// clones without being written here, and one equal to a parent's is
     /// refused, since the engine may take it for the parent's clone.
     #[serde(default)]
-    pub foreign_keys: BTreeMap<String, ForeignKeyDto>,
+    pub foreign_keys: BTreeMap<pbps_model::ObjectLocalName, ForeignKeyDto>,
     /// What the partition holds of its parent's columns otherwise than its
     /// parent: a default, a NOT NULL (#1578). Never a type, which is the
     /// parent's.
@@ -1094,8 +1094,8 @@ pub struct UniqueSpecDto {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClusteredDto {
     Heap,
-    Unique(String),
-    Index(String),
+    Unique(pbps_model::ObjectLocalName),
+    Index(pbps_model::ObjectLocalName),
 }
 
 /// A storage parameter's value as written. Any of the four, since the
@@ -1124,8 +1124,8 @@ pub enum ReplicaIdentityDto {
     Full,
     Nothing,
     PrimaryKey,
-    Unique(String),
-    Index(String),
+    Unique(pbps_model::ObjectLocalName),
+    Index(pbps_model::ObjectLocalName),
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

@@ -88,7 +88,7 @@ pub(super) struct Whole<'a> {
     column_names: BTreeMap<(i64, i64), &'a str>,
     /// An index's name, `None` for a heap, which has none: any text could
     /// also be an index's name, so a heap gets no stand-in.
-    index_names: BTreeMap<(i64, i64), Option<String>>,
+    index_names: BTreeMap<(i64, i64), Option<pbps_model::ObjectLocalName>>,
     /// A table type's own table object, by its id: the type's `user_type_id`.
     table_objects: BTreeMap<i64, i64>,
 }
@@ -143,7 +143,7 @@ impl<'a> Whole<'a> {
             if let (Some(object), Some(index)) = (number(row, "object_id"), number(row, "index_id"))
             {
                 whole.indexes.entry(object).or_default().push(row);
-                let name = row.get("name").cloned().flatten();
+                let name = row.get("name").cloned().flatten().map(Into::into);
                 whole.index_names.insert((object, index), name);
             }
         }

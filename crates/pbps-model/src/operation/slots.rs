@@ -175,14 +175,18 @@ fn whole_table(name: &TableName, owner: &Recorded, table: &Table, policies: bool
         },
         holder: ObjectKey::Table(owner.clone()),
     }];
-    if let Some(pk_name) = table.primary_key.as_ref().and_then(|pk| pk.name.as_deref()) {
+    if let Some(pk_name) = table
+        .primary_key
+        .as_ref()
+        .and_then(|pk| pk.name.as_ref().map(crate::ObjectLocalName::raw))
+    {
         out.push(part(NameKind::Key, PartKey::PrimaryKey, pk_name));
     }
     for n in table.unique.keys() {
-        out.push(part(NameKind::Key, PartKey::Unique(n.clone()), n));
+        out.push(part(NameKind::Key, PartKey::Unique(n.clone()), n.raw()));
     }
     for n in table.indexes.keys() {
-        out.push(part(NameKind::Index, PartKey::Index(n.clone()), n));
+        out.push(part(NameKind::Index, PartKey::Index(n.clone()), n.raw()));
     }
     if policies {
         for n in table.row_policies.keys() {
@@ -190,13 +194,17 @@ fn whole_table(name: &TableName, owner: &Recorded, table: &Table, policies: bool
         }
     }
     for n in table.checks.keys() {
-        out.push(part(NameKind::Constraint, PartKey::Check(n.clone()), n));
+        out.push(part(
+            NameKind::Constraint,
+            PartKey::Check(n.clone()),
+            n.raw(),
+        ));
     }
     for n in table.foreign_keys.keys() {
         out.push(part(
             NameKind::Constraint,
             PartKey::ForeignKey(n.clone()),
-            n,
+            n.raw(),
         ));
     }
     for n in table.computed.keys() {
@@ -323,7 +331,7 @@ pub fn names(
                     DetachedKind::Check => (NameKind::Constraint, PartKey::Check(name.clone())),
                     DetachedKind::Index => (NameKind::Index, PartKey::Index(name.clone())),
                 };
-                nx.part(true, table, kind, key, name)?;
+                nx.part(true, table, kind, key, name.raw())?;
             }
         }
         Change::RenameTable { uid, from, to, .. } => {
@@ -393,10 +401,16 @@ pub fn names(
         Change::SetPrimaryKey {
             table, from, to, ..
         } => {
-            if let Some(name) = from.as_ref().and_then(|pk| pk.name.as_deref()) {
+            if let Some(name) = from
+                .as_ref()
+                .and_then(|pk| pk.name.as_ref().map(crate::ObjectLocalName::raw))
+            {
                 nx.part(false, table, NameKind::Key, PartKey::PrimaryKey, name)?;
             }
-            if let Some(name) = to.as_ref().and_then(|pk| pk.name.as_deref()) {
+            if let Some(name) = to
+                .as_ref()
+                .and_then(|pk| pk.name.as_ref().map(crate::ObjectLocalName::raw))
+            {
                 nx.part(true, table, NameKind::Key, PartKey::PrimaryKey, name)?;
             }
         }
@@ -406,7 +420,7 @@ pub fn names(
                 table,
                 NameKind::Key,
                 PartKey::Unique(name.clone()),
-                name,
+                name.raw(),
             )?;
         }
         Change::DropUnique { table, name } => {
@@ -415,7 +429,7 @@ pub fn names(
                 table,
                 NameKind::Key,
                 PartKey::Unique(name.clone()),
-                name,
+                name.raw(),
             )?;
         }
         Change::AddForeignKey { table, name, .. } => {
@@ -424,7 +438,7 @@ pub fn names(
                 table,
                 NameKind::Constraint,
                 PartKey::ForeignKey(name.clone()),
-                name,
+                name.raw(),
             )?;
         }
         Change::DropForeignKey { table, name } => {
@@ -433,7 +447,7 @@ pub fn names(
                 table,
                 NameKind::Constraint,
                 PartKey::ForeignKey(name.clone()),
-                name,
+                name.raw(),
             )?;
         }
         Change::CreatePolicy { table, name, .. } => {
@@ -451,7 +465,7 @@ pub fn names(
                 table,
                 NameKind::Constraint,
                 PartKey::Check(name.clone()),
-                name,
+                name.raw(),
             )?;
         }
         Change::DropCheck { table, name } => {
@@ -460,7 +474,7 @@ pub fn names(
                 table,
                 NameKind::Constraint,
                 PartKey::Check(name.clone()),
-                name,
+                name.raw(),
             )?;
         }
         Change::AddIndex { table, name, .. } => {
@@ -469,7 +483,7 @@ pub fn names(
                 table,
                 NameKind::Index,
                 PartKey::Index(name.clone()),
-                name,
+                name.raw(),
             )?;
         }
         Change::DropIndex { table, name } => {
@@ -478,7 +492,7 @@ pub fn names(
                 table,
                 NameKind::Index,
                 PartKey::Index(name.clone()),
-                name,
+                name.raw(),
             )?;
         }
         Change::CreateModule { id, module } => {

@@ -496,17 +496,21 @@ impl AddedColumn {
 #[derive(Debug)]
 struct Added {
     child: TableName,
-    name: String,
+    name: pbps_model::ObjectLocalName,
     columns: Vec<ColumnName>,
     parent: TableName,
     referenced: Vec<ColumnName>,
 }
 
 impl Added {
-    fn of(table: &TableName, name: &str, constraint: &pbps_model::ForeignKey) -> Self {
+    fn of(
+        table: &TableName,
+        name: &pbps_model::ObjectLocalName,
+        constraint: &pbps_model::ForeignKey,
+    ) -> Self {
         Self {
             child: table.clone(),
-            name: name.to_owned(),
+            name: name.clone(),
             columns: constraint.columns.clone(),
             parent: constraint.references_table.clone(),
             referenced: constraint.references_columns.clone(),
@@ -895,7 +899,7 @@ fn gone_keys(names: &AsStored) -> String {
         gone.push(match &removed.constraint {
             Some(constraint) => format!(
                 "AND NOT ({of_table} AND con.conname = {})",
-                value_literal(constraint)
+                value_literal(constraint.raw())
             ),
             None => format!("AND NOT ({of_table})"),
         });
@@ -1707,7 +1711,7 @@ fn unprobeable_probe(
             "\n   AND con.conname NOT IN ({})",
             removed
                 .iter()
-                .map(|c| value_literal(c))
+                .map(|c| value_literal(c.raw()))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -3290,7 +3294,10 @@ fn build<'v, 'p: 'v>(
             }
             sql.push(';');
             Ok(vec![Probe::new(
-                format!("rows that violate the new check {name}"),
+                format!("rows that violate the new check {name}",
+// Shared probe label is escaped by the report until #2084 step 5.
+name = name.raw(),
+),
                 sql,
             )])
         }
@@ -3307,7 +3314,10 @@ fn build<'v, 'p: 'v>(
             Ok(vec![duplicate_probe(
                 &format!("(\n{rows}\n) AS r"),
                 &keys(constraint.columns.len()),
-                &format!("rows that would collide under the new unique constraint {name}"),
+                &format!("rows that would collide under the new unique constraint {name}",
+// Shared probe label is escaped by the report until #2084 step 5.
+name = name.raw(),
+),
             )])
         }
 
@@ -3337,7 +3347,10 @@ fn build<'v, 'p: 'v>(
             Ok(vec![duplicate_probe(
                 &format!("(\n{rows}\n) AS r"),
                 &keys(columns.len()),
-                &format!("rows that would collide under the new unique index {name}"),
+                &format!("rows that would collide under the new unique index {name}",
+// Shared probe label is escaped by the report until #2084 step 5.
+name = name.raw(),
+),
             )])
         }
 
@@ -3657,7 +3670,7 @@ fn build<'v, 'p: 'v>(
 fn orphan_probe(
     names: &AsStored,
     table: &TableName,
-    name: &str,
+    name: &pbps_model::ObjectLocalName,
     constraint: &pbps_model::ForeignKey,
 ) -> Result<Vec<Probe>, DialectError> {
     let Some(child) = rows_after(names, table, &constraint.columns, "c", &Applies::AllRows)? else {
@@ -3712,7 +3725,11 @@ fn orphan_probe(
         join.join(" AND ")
     );
     Ok(vec![Probe::new(
-        format!("rows with no matching parent for the new foreign key {name}"),
+        format!(
+            "rows with no matching parent for the new foreign key {name}",
+            // Shared probe label is escaped by the report until #2084 step 5.
+            name = name.raw(),
+        ),
         format!(
             "SELECT {} AS n;",
             saturated_count(&assembled_count(&term, &clauses))
@@ -3761,7 +3778,7 @@ fn planned_collation(names: &AsStored, column: &ColumnRef) -> Result<String, Dia
 fn key_collation_probe(
     names: &AsStored,
     table: &TableName,
-    name: &str,
+    name: &pbps_model::ObjectLocalName,
     constraint: &pbps_model::ForeignKey,
 ) -> Result<Probe, DialectError> {
     let mut pairs = Vec::new();
@@ -3784,7 +3801,10 @@ fn key_collation_probe(
     Ok(Probe::new(
         format!(
             "foreign keys with incompatible collations for {table}.{name}",
-            table = table.raw()
+            // Shared probe label is escaped by the report until #2084 step 5.
+            table = table.raw(),
+            // Shared probe label is escaped by the report until #2084 step 5.
+            name = name.raw(),
         ),
         format!(
             "SELECT CASE \
@@ -5517,7 +5537,7 @@ mod tests {
         };
         let unique = |column: &str| Change::AddUnique {
             table: table.clone(),
-            name: format!("uq_{column}"),
+            name: format!("uq_{column}").into(),
             constraint: pbps_model::UniqueConstraint {
                 columns: vec![column.into()],
                 storage_parameters: Default::default(),
@@ -6385,7 +6405,7 @@ mod tests {
         let table: TableName = "app.t".parse().expect("a table name");
         let check = |t: &TableName| Change::AddCheck {
             table: t.clone(),
-            name: "t_rounded".to_owned(),
+            name: "t_rounded".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "v = round(v)".to_owned(),
             },
@@ -6451,7 +6471,7 @@ mod tests {
         let partitions = pbps_model::Partitions::of(&stored);
         let check = Change::AddCheck {
             table: partition.clone(),
-            name: "p_1_rounded".to_owned(),
+            name: "p_1_rounded".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "v = round(v)".to_owned(),
             },
@@ -6488,7 +6508,7 @@ mod tests {
         );
         let elsewhere = Change::AddCheck {
             table: "app.t".parse().expect("a table name"),
-            name: "t_rounded".to_owned(),
+            name: "t_rounded".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "v = round(v)".to_owned(),
             },
@@ -6512,7 +6532,7 @@ mod tests {
         };
         let unique = Change::AddIndex {
             table: partition.clone(),
-            name: "p_1_label".to_owned(),
+            name: "p_1_label".into(),
             index: Box::new(pbps_model::Index {
                 columns: vec![pbps_model::IndexColumn::column("label")],
                 include: Vec::new(),
@@ -6541,7 +6561,7 @@ mod tests {
         let t: TableName = "app.t".parse().expect("a table name");
         let check = Change::AddCheck {
             table: t.clone(),
-            name: "t_n".to_owned(),
+            name: "t_n".into(),
             constraint: pbps_model::CheckConstraint {
                 expression: "n > 0".to_owned(),
             },
@@ -6680,7 +6700,7 @@ mod tests {
                 },
                 Change::AddForeignKey {
                     table: child.clone(),
-                    name: "child_status_fkey".to_owned(),
+                    name: "child_status_fkey".into(),
                     constraint: Box::new(key.clone()),
                 },
             ])
@@ -6753,7 +6773,7 @@ mod tests {
                 },
                 Change::AddForeignKey {
                     table: child.clone(),
-                    name: "child_status_fkey".to_owned(),
+                    name: "child_status_fkey".into(),
                     constraint: Box::new(key.clone()),
                 },
                 deleting("app.status", "old"),
@@ -6890,7 +6910,7 @@ mod tests {
                 retype_change,
                 Change::AddForeignKey {
                     table: child.clone(),
-                    name: "child_status_fkey".to_owned(),
+                    name: "child_status_fkey".into(),
                     constraint: Box::new(key.clone()),
                 },
                 deleting("app.status", "old"),
@@ -7038,7 +7058,7 @@ mod tests {
             },
             Change::AddForeignKey {
                 table: child.clone(),
-                name: "child_status_fkey".to_owned(),
+                name: "child_status_fkey".into(),
                 constraint: Box::new(key),
             },
             deleting("app.status", "old"),
@@ -7105,7 +7125,7 @@ mod tests {
             },
             Change::AddForeignKey {
                 table: child.clone(),
-                name: "child_status_fkey".to_owned(),
+                name: "child_status_fkey".into(),
                 constraint: Box::new(widening_key),
             },
             deleting("app.status", "old"),
@@ -7181,7 +7201,7 @@ mod tests {
         let probes = probes(&set(vec![
             Change::DropForeignKey {
                 table: "app.child".parse().expect("a table name"),
-                name: "fk_child".to_owned(),
+                name: "fk_child".into(),
             },
             Change::DropTable {
                 uid: pbps_model::Uid::generate(pbps_model::UidKind::Table),

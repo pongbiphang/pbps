@@ -1798,7 +1798,13 @@ async fn a_table_built_by_hand_reads_back_field_by_field() {
         "character varying(10)"
     );
     assert_eq!(
-        parent.primary_key.as_ref().unwrap().name.as_deref(),
+        parent
+            .primary_key
+            .as_ref()
+            .unwrap()
+            .name
+            .as_ref()
+            .map(pbps_model::ObjectLocalName::raw),
         Some("parent_pkey"),
         "an unnamed primary key comes back under the name the engine gave it"
     );
@@ -2852,9 +2858,9 @@ async fn a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan() {
         .iter()
         .filter_map(|p| {
             if let Change::DropIndex { name, .. } = &p.change {
-                Some(("drop", name.as_str()))
+                Some(("drop", name.raw()))
             } else if let Change::AddIndex { name, .. } = &p.change {
-                Some(("add", name.as_str()))
+                Some(("add", name.raw()))
             } else {
                 None
             }
@@ -2900,7 +2906,7 @@ async fn a_gin_index_over_jsonb_round_trips_and_changes_as_a_typed_plan() {
     assert!(
         replaced.changes.iter().any(|p| matches!(
             &p.change,
-            Change::AddIndex { name, index, .. } if name == "ix_body" && index.method.is_btree()
+            Change::AddIndex { name, index, .. } if name.raw() == "ix_body" && index.method.is_btree()
         )),
         "{replaced:#?}"
     );
@@ -2981,7 +2987,7 @@ async fn a_btree_expression_index_round_trips_and_changes_as_a_typed_plan() {
         .iter()
         .filter_map(|p| {
             if let Change::DropIndex { name, .. } | Change::AddIndex { name, .. } = &p.change {
-                Some(name.as_str())
+                Some(name.raw())
             } else {
                 None
             }
@@ -3015,7 +3021,7 @@ async fn a_btree_expression_index_round_trips_and_changes_as_a_typed_plan() {
         replaced.changes.iter().any(|p| matches!(
             &p.change,
             Change::AddIndex { name, index, .. }
-                if name == "ix_lower" && index.columns[0].key == IndexKey::Column("email".into())
+                if name.raw() == "ix_lower" && index.columns[0].key == IndexKey::Column("email".into())
         )),
         "{replaced:#?}"
     );
@@ -4676,17 +4682,17 @@ async fn every_replica_identity_round_trips_and_moves_as_a_typed_plan() {
         .rposition(|p| identity_of("indexed")(&p.change))
         .unwrap();
     assert!(
-        at(&|c| matches!(c, Change::AddIndex { name, .. } if name == "indexed_id")) < last,
+        at(&|c| matches!(c, Change::AddIndex { name, .. } if name.raw() == "indexed_id")) < last,
         "{step:#?}"
     );
     assert!(
         at(&identity_of("indexed"))
-            < at(&|c| matches!(c, Change::DropIndex { name, .. } if name == "indexed_code")),
+            < at(&|c| matches!(c, Change::DropIndex { name, .. } if name.raw() == "indexed_code")),
         "{step:#?}"
     );
     assert!(
         at(&identity_of("coded"))
-            < at(&|c| matches!(c, Change::DropUnique { name, .. } if name == "coded_code")),
+            < at(&|c| matches!(c, Change::DropUnique { name, .. } if name.raw() == "coded_code")),
         "{step:#?}"
     );
     apply(&mut target, &Postgres::new(), &step).await;
@@ -5407,19 +5413,44 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
             .into()
         );
         let ev_2025 = &held.tables[&t(&s, "ev_2025")];
-        assert_eq!(ev_2025.checks.keys().collect::<Vec<_>>(), ["ev_2025_id_ck"]);
-        assert_eq!(ev_2025.indexes.keys().collect::<Vec<_>>(), ["ev_2025_id"]);
+        assert_eq!(
+            ev_2025
+                .checks
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev_2025_id_ck"]
+        );
+        assert_eq!(
+            ev_2025
+                .indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev_2025_id"]
+        );
         let own_index = &ev_2025.indexes["ev_2025_id"];
         assert!(own_index.columns[0].descending && own_index.filter.is_some());
         let ev_rest = &held.tables[&t(&s, "ev_rest")];
         assert!(ev_rest.checks.is_empty());
-        assert_eq!(ev_rest.indexes.keys().collect::<Vec<_>>(), ["ev_rest_id"]);
+        assert_eq!(
+            ev_rest
+                .indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev_rest_id"]
+        );
         assert!(ev_rest.indexes["ev_rest_id"].unique);
         // A GIN over `jsonb` is judged by the column the partition has from
         // its parent, under both classes the model holds.
         let doc_1 = &held.tables[&t(&s, "doc_1")];
         assert_eq!(
-            doc_1.indexes.keys().collect::<Vec<_>>(),
+            doc_1
+                .indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
             ["doc_1_d", "doc_1_p"]
         );
         assert_eq!(
@@ -5535,7 +5566,13 @@ async fn range_partition_trees_round_trip_whole_or_not_at_all() {
         }
         // The foreign key, once: its clones to each partition are the engine's.
         let r = &held.tables[&t(&s, "r")];
-        assert_eq!(r.foreign_keys.keys().collect::<Vec<_>>(), ["r_ev"]);
+        assert_eq!(
+            r.foreign_keys
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["r_ev"]
+        );
         // A grant on a partition is its own, as on any table (#1579): the
         // tree is held, and PUBLIC's is reported as it is on a table. A
         // column grant, held for no table, still leaves its tree out.
@@ -7753,9 +7790,13 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
             ..parent.clone()
         };
         archived.primary_key.as_mut().unwrap().name = Some("arch_pk".into());
-        fn rename<V>(map: &mut std::collections::BTreeMap<String, V>, from: &str, to: &str) {
+        fn rename<V>(
+            map: &mut std::collections::BTreeMap<pbps_model::ObjectLocalName, V>,
+            from: &str,
+            to: &str,
+        ) {
             let v = map.remove(from).expect(from);
-            map.insert(to.to_owned(), v);
+            map.insert(to.into(), v);
         }
         rename(&mut archived.unique, "ev_vt", "arch_vt");
         rename(&mut archived.foreign_keys, "ev_rid_fk", "arch_rid_fk");
@@ -7764,8 +7805,22 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
         // And its own, under their own names, which the detach leaves alone
         // (#1577).
         let ev_2025 = &base.tables[&t("ev_2025")];
-        assert_eq!(ev_2025.checks.keys().collect::<Vec<_>>(), ["ev25_own_ck"]);
-        assert_eq!(ev_2025.indexes.keys().collect::<Vec<_>>(), ["ev25_own"]);
+        assert_eq!(
+            ev_2025
+                .checks
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev25_own_ck"]
+        );
+        assert_eq!(
+            ev_2025
+                .indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ev25_own"]
+        );
         archived.checks.extend(ev_2025.checks.clone());
         archived.indexes.extend(ev_2025.indexes.clone());
         // And its own default and NOT NULL, which are its columns' once it is
@@ -7875,7 +7930,7 @@ async fn a_partition_is_detached_and_kept_under_its_declared_names() {
                 .primary_key
                 .as_ref()
                 .and_then(|k| k.name.clone()),
-            Some("ev_2027_pkey1".to_owned())
+            Some("ev_2027_pkey1".into())
         );
         assert!(plan(&last, &second_ids, &second, &second_ids).is_empty());
 
@@ -9537,7 +9592,7 @@ async fn an_online_index_is_built_concurrently_and_says_it_leaves_the_transactio
     let online = Strategy { online: true };
     let add = |name: &str, index: &Index| pbps_model::Change::AddIndex {
         table: table.clone(),
-        name: name.to_owned(),
+        name: name.into(),
         index: Box::new(index.clone()),
         clustered: false,
     };
@@ -11420,7 +11475,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
             );
         }
         t.primary_key = Some(PrimaryKey {
-            name: Some("pk_s".to_owned()),
+            name: Some("pk_s".into()),
             columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });
@@ -21442,7 +21497,7 @@ async fn a_write_to_a_default_no_probe_can_evaluate_is_refused_where_a_key_spans
         });
         if keyed {
             t.foreign_keys.insert(
-                format!("{name}_parent_fkey"),
+                format!("{name}_parent_fkey").into(),
                 ForeignKey {
                     columns: vec!["parent".into()],
                     references_table: parent_name.clone(),
@@ -33013,7 +33068,7 @@ async fn a_check_probe_over_values_a_conversion_replaces_would_refuse_a_valid_pl
     let table = TableName::new(&s, "t");
     let check = Change::AddCheck {
         table: table.clone(),
-        name: "t_rounded".to_owned(),
+        name: "t_rounded".into(),
         constraint: CheckConstraint {
             expression: "v = round(v)".to_owned(),
         },
@@ -34048,7 +34103,7 @@ fn schema_103(tables: usize, modules: usize) -> Schema {
             Column::new("bigint".parse().unwrap()).not_null(),
         );
         t.primary_key = Some(PrimaryKey {
-            name: Some(format!("pk_t{i}")),
+            name: Some(format!("pk_t{i}").into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
@@ -36473,7 +36528,7 @@ async fn doctor_reports_an_absent_recorded_managed_table() {
         .unwrap()
         .foreign_keys
         .insert(
-            "fk_keyed".to_owned(),
+            "fk_keyed".into(),
             pbps_model::ForeignKey {
                 columns: vec!["id".into()],
                 references_table: "public.kept".parse().unwrap(),

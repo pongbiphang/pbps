@@ -949,7 +949,7 @@ async fn signed_default_arrivals_compare_the_assigned_foreign_key() {
                     }),
                     PlannedChange::new(Change::AddForeignKey {
                         table: TableName::new("dbo", format!("b{i}")),
-                        name: format!("fk_b{i}"),
+                        name: format!("fk_b{i}").into(),
                         constraint: Box::new(ForeignKey {
                             columns: vec!["k".into()],
                             references_table: parent.clone(),
@@ -1731,8 +1731,20 @@ async fn an_object_over_a_left_out_column_is_left_out_with_it() {
         [pbps_model::ColumnName::from("id")]
     );
     assert!(t.unique.is_empty(), "{:?}", t.unique);
-    assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_a"]);
-    assert_eq!(t.checks.keys().collect::<Vec<_>>(), ["ck_a"]);
+    assert_eq!(
+        t.indexes
+            .keys()
+            .map(pbps_model::ObjectLocalName::raw)
+            .collect::<Vec<_>>(),
+        ["ix_a"]
+    );
+    assert_eq!(
+        t.checks
+            .keys()
+            .map(pbps_model::ObjectLocalName::raw)
+            .collect::<Vec<_>>(),
+        ["ck_a"]
+    );
     assert!(t.foreign_keys.is_empty(), "{:?}", t.foreign_keys);
     let u = table("u");
     assert!(u.primary_key.is_none() && u.unique.is_empty(), "{u:?}");
@@ -1840,7 +1852,13 @@ async fn a_computed_column_or_filter_reading_a_left_out_column_goes_with_it() {
         t.computed.keys().cloned().collect::<Vec<_>>(),
         [pbps_model::ColumnName::from("e")]
     );
-    assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_g"]);
+    assert_eq!(
+        t.indexes
+            .keys()
+            .map(pbps_model::ObjectLocalName::raw)
+            .collect::<Vec<_>>(),
+        ["ix_g"]
+    );
     for detail in [
         "t.c: the computed column reads column `m`, which was left out",
         "index `ix_c` is over column `c`, which was left out",
@@ -2175,7 +2193,12 @@ async fn a_foreign_key_into_a_left_out_unique_index_is_left_out_too() {
     db.drop().await;
 
     let ch = &pulled.schema.tables[&TableName::new("dbo", "ch")].foreign_keys;
-    assert_eq!(ch.keys().collect::<Vec<_>>(), ["fk_ch_p", "fk_ch_r"]);
+    assert_eq!(
+        ch.keys()
+            .map(pbps_model::ObjectLocalName::raw)
+            .collect::<Vec<_>>(),
+        ["fk_ch_p", "fk_ch_r"]
+    );
     assert_eq!(
         pulled.schema.tables[&TableName::new("dbo", "p")].clustered,
         Some(Clustered::Index("ux_p_code".into()))
@@ -2659,7 +2682,11 @@ async fn every_rowstore_layout_round_trips_through_an_empty_database() {
     assert_eq!(table("c").clustered, None);
     assert_eq!(table("child").clustered, None);
     assert_eq!(
-        table("child").foreign_keys.keys().collect::<Vec<_>>(),
+        table("child")
+            .foreign_keys
+            .keys()
+            .map(pbps_model::ObjectLocalName::raw)
+            .collect::<Vec<_>>(),
         ["fk_child_c", "fk_child_h", "fk_child_u", "fk_child_u_code"]
     );
 
@@ -4130,7 +4157,7 @@ async fn an_index_whose_physical_kind_the_model_cannot_hold_is_never_adopted_as_
         pulled.schema.tables[&TableName::new(schema, table)]
             .indexes
             .keys()
-            .cloned()
+            .map(|name| name.raw().to_owned())
             .collect::<Vec<_>>()
     };
     // The negative case: the one kind the model does hold is still adopted.
@@ -5120,7 +5147,11 @@ async fn a_default_whose_new_name_is_taken_frees_its_old_one() {
         // The name the renamed column's default would take is held.
         let target = pbps_mssql::emit::default_constraint_name(&name, "d");
         db.conn
-            .execute(&format!("CREATE TABLE dbo.[{target}] (id int);"))
+            .execute(&format!(
+                "CREATE TABLE dbo.[{target}] (id int);",
+                // Preserve raw comparison-label or fixture SQL bytes in test data.
+                target = target.raw(),
+            ))
             .await
             .unwrap();
         apply(
@@ -5167,11 +5198,11 @@ async fn a_default_whose_new_name_is_taken_frees_its_old_one() {
             [
                 (
                     "c".to_owned(),
-                    pbps_mssql::emit::default_constraint_name(&name, "c")
+                    pbps_mssql::emit::default_constraint_name(&name, "c").into_raw()
                 ),
                 (
                     "d".to_owned(),
-                    pbps_mssql::emit::fallback_default_constraint_name(&name, "d")
+                    pbps_mssql::emit::fallback_default_constraint_name(&name, "d").into_raw()
                 ),
             ],
             "{table}"
@@ -9763,7 +9794,7 @@ async fn referenced_column_subsets_match_the_foreign_key_and_its_probe() {
             .map(|column| {
                 PlannedChange::new(Change::AddForeignKey {
                     table: "app.child".parse().unwrap(),
-                    name: format!("fk_{column}"),
+                    name: format!("fk_{column}").into(),
                     constraint: Box::new(ForeignKey {
                         columns: vec![column.into()],
                         references_table: target.clone(),
@@ -10582,7 +10613,7 @@ async fn reference_data_reaches_the_engine_in_an_order_it_accepts() {
         storage_parameters: Default::default(),
     });
     kind.foreign_keys.insert(
-        "fk_kind_status".to_owned(),
+        "fk_kind_status".into(),
         pbps_model::ForeignKey {
             columns: vec!["status_code".into()],
             references_table: TableName::new("dbo", "status"),
@@ -10794,7 +10825,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
     // Named, so the whole table compares equal below: the engine invents a
     // name for an unnamed key and the read-back reports it.
     status.primary_key = Some(PrimaryKey {
-        name: Some("pk_status".to_owned()),
+        name: Some("pk_status".into()),
         columns: vec!["code".into()],
         storage_parameters: Default::default(),
     });
@@ -10833,7 +10864,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         storage_parameters: Default::default(),
     });
     kind.foreign_keys.insert(
-        "fk_kind_status".to_owned(),
+        "fk_kind_status".into(),
         ForeignKey {
             columns: vec!["status_code".into()],
             references_table: TableName::new("dbo", "status"),
@@ -11018,7 +11049,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         (
             pbps_model::Change::DropForeignKey {
                 table: TableName::new("dbo", "kind"),
-                name: "fk_kind_status".to_owned(),
+                name: "fk_kind_status".into(),
             },
             "the constraint this plan drops first counts nothing",
         ),
@@ -11051,7 +11082,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         changes: vec![
             pbps_model::PlannedChange::new(pbps_model::Change::DropForeignKey {
                 table: TableName::new("other", "kind"),
-                name: "fk_kind_status".to_owned(),
+                name: "fk_kind_status".into(),
             }),
             delete.clone(),
         ],
@@ -11313,7 +11344,7 @@ async fn declared_rows_read_back_as_declared_and_hand_edits_are_seen() {
         0,
         pbps_model::PlannedChange::new(pbps_model::Change::DropForeignKey {
             table: TableName::new("dbo", "kind"),
-            name: "fk_kind_status".to_owned(),
+            name: "fk_kind_status".into(),
         }),
     );
     let probe = refusal_for(&without_the_key).expect("the probe is still built");
@@ -12935,7 +12966,7 @@ async fn an_explicit_default_stays_explicit_and_a_volatile_default_is_never_run(
     stamp.value_source = pbps_model::ValueSource::Default("sysutcdatetime()".to_owned());
     t.columns.insert("stamp".into(), stamp);
     t.primary_key = Some(PrimaryKey {
-        name: Some("pk_t".to_owned()),
+        name: Some("pk_t".into()),
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
     });
@@ -13066,7 +13097,7 @@ async fn a_declared_key_keeps_its_spelling_when_the_engine_spells_it_differently
         t.columns
             .insert("label".into(), Column::new(ty("nvarchar(50)")).not_null());
         t.primary_key = Some(PrimaryKey {
-            name: Some("pk_k".to_owned()),
+            name: Some("pk_k".into()),
             columns: vec!["id".into()],
             storage_parameters: Default::default(),
         });
@@ -13318,7 +13349,7 @@ async fn roles_and_grants_round_trip_and_a_rename_keeps_the_members() {
         .columns
         .insert("id".into(), Column::new(ty("int")).not_null());
     customer.primary_key = Some(PrimaryKey {
-        name: Some("pk_customer".to_owned()),
+        name: Some("pk_customer".into()),
         columns: vec!["id".into()],
         storage_parameters: Default::default(),
     });
@@ -16576,7 +16607,7 @@ async fn an_undeclared_key_on_a_retyped_column_is_named_before_the_widening() {
             &plan(vec![
                 Change::DropForeignKey {
                     table: TableName::new("ext", format!("c_{family}")),
-                    name: format!("fk_{family}"),
+                    name: format!("fk_{family}").into(),
                 },
                 widen(&format!("dbo.p_{family}"), "code", spelling, wider),
             ]),
@@ -16809,12 +16840,9 @@ async fn retyped_keys_checks_indexes_and_foreign_keys_converge_and_still_enforce
         .ty = ty("bigint");
     let ids = mint_ids(&before, &IdsFile::default(), &[]);
     let changes = plan(&before, &ids, &after, &ids);
-    assert!(
-        !changes
-            .changes
-            .iter()
-            .any(|p| matches!(&p.change, Change::DropIndex { name, .. } if name == "ix_unrelated"))
-    );
+    assert!(!changes.changes.iter().any(
+        |p| matches!(&p.change, Change::DropIndex { name, .. } if name.raw() == "ix_unrelated")
+    ));
     assert_eq!(
         changes
             .changes
@@ -16871,7 +16899,7 @@ async fn widening_a_referenced_string_keeps_its_key_but_rebuilds_the_fk_and_filt
     assert!(!changes.changes.iter().any(|p| matches!(
         &p.change,
         Change::SetPrimaryKey { .. } | Change::DropCheck { .. }
-    ) || matches!(&p.change, Change::DropIndex { name, .. } if name == "ix_n")));
+    ) || matches!(&p.change, Change::DropIndex { name, .. } if name.raw() == "ix_n")));
     let result = try_apply(&mut db.conn, &changes).await;
     let observed = pbps_mssql::catalog::introspect(&mut db.conn)
         .await
@@ -17372,7 +17400,7 @@ async fn a_dropped_columns_name_is_free_before_the_rename_that_reuses_it() {
         // one: an unnamed key comes back wearing the engine's own
         // `PK__s__357D4CF8…`.
         t.primary_key = Some(PrimaryKey {
-            name: Some("pk_s".to_owned()),
+            name: Some("pk_s".into()),
             columns: vec!["code".into()],
             storage_parameters: Default::default(),
         });

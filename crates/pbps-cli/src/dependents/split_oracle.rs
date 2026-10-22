@@ -29,7 +29,7 @@ pub(super) fn split_new_tables(
         };
         let name = name.clone();
         let mut parts: Vec<Change> = Vec::new();
-        let calling: Vec<String> = table
+        let calling: Vec<pbps_model::ObjectLocalName> = table
             .checks
             .iter()
             .filter(|(_, check)| calls(&check.expression))
@@ -44,7 +44,7 @@ pub(super) fn split_new_tables(
                 });
             }
         }
-        let filtered: Vec<String> = table
+        let filtered: Vec<pbps_model::ObjectLocalName> = table
             .indexes
             .iter()
             .filter(|(_, index)| index.holds_expression() && calls(&index_text(index)))
@@ -54,7 +54,7 @@ pub(super) fn split_new_tables(
             if let Some(spec) = table.indexes.remove(&index) {
                 // Never the clustered index, which cannot be filtered; asked
                 // of the table anyway, so the split cannot say otherwise.
-                let clustered = table.index_is_clustered(&index);
+                let clustered = table.index_is_clustered(index.raw());
                 parts.push(Change::AddIndex {
                     table: name.clone(),
                     name: index,
@@ -228,7 +228,10 @@ fn schema() -> Schema {
     other.indexes = other
         .indexes
         .into_iter()
-        .map(|(name, index)| (format!("{name}_b"), index))
+        .map(|(name, index)| {
+            // Fixture identity retains the original index bytes.
+            (format!("{name}_b", name = name.raw()).into(), index)
+        })
         .collect();
     Schema {
         tables: [
@@ -376,6 +379,79 @@ fn split_parts_match_the_frozen_plan_sql_and_checksum_for_32_uid_seeds() {
             same_plan(&no_functions, &given, &dialect);
         }
     }
+}
+
+#[test]
+fn split_parts_keep_raw_local_names_distinct_from_their_shown_lookalikes() {
+    use pbps_model::*;
+    const RAW: &str = "part\nline\\slash\u{200b}";
+    const SHOWN: &str = r"part\nline\\slash\u{200b}";
+    let mut schema = schema();
+    schema.tables.retain(|name, _| name.name == "a");
+    let table_name = TableName::new("app", "a");
+    let table = schema.tables.get_mut(&table_name).unwrap();
+    let check = table.checks.remove("ck_call").unwrap();
+    table.checks.insert(RAW.into(), check);
+    table.checks.insert(
+        SHOWN.into(),
+        CheckConstraint {
+            expression: "id > 0".into(),
+        },
+    );
+    let index = table.indexes.remove("ix_filter").unwrap();
+    table.indexes.insert(RAW.into(), index);
+    table
+        .indexes
+        .insert(SHOWN.into(), table.indexes["ix_plain"].clone());
+    let ids = super::generated_tests::identities(&schema);
+    let dialect = pbps_pg::Postgres::new();
+    let mut changes = pbps_diff::diff(
+        pbps_diff::Side {
+            schema: &Schema::default(),
+            ids: &IdsFile::default(),
+        },
+        pbps_diff::Side {
+            schema: &schema,
+            ids: &ids,
+        },
+        &dialect,
+        &Hints::default(),
+    )
+    .unwrap();
+    let mut expected = changes.changes().clone();
+    let count = split_new_tables(&mut expected, &[&ids], &ModuleDeps::new(), &dialect).unwrap();
+    assert_eq!(
+        super::split_new_tables(&mut changes, &[&ids], &ModuleDeps::new(), &dialect),
+        Ok(count)
+    );
+    same_plan(&changes, &expected, &dialect);
+    assert!(
+        changes
+            .changes
+            .iter()
+            .any(|p| matches!(&p.change, Change::AddCheck { name, .. } if name.raw() == RAW))
+    );
+    assert!(
+        changes
+            .changes
+            .iter()
+            .any(|p| matches!(&p.change, Change::AddIndex { name, .. } if name.raw() == RAW))
+    );
+    let bare = changes
+        .changes
+        .iter()
+        .find_map(|p| {
+            if let Change::CreateTable { table, .. } = &p.change {
+                Some(table)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!(bare.checks.contains_key(SHOWN));
+    assert!(bare.indexes.contains_key(SHOWN));
+    assert!(!bare.checks.contains_key(RAW));
+    assert!(!bare.indexes.contains_key(RAW));
 }
 
 #[tokio::test]

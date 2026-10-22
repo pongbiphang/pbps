@@ -73,8 +73,8 @@ pub async fn key_drop_blockers(
                     from: Some(_),
                     ..
                 } => (table, "PK", ""),
-                Change::DropUnique { table, name } => (table, "UQ", name.as_str()),
-                Change::DropIndex { table, name } => (table, "IX", name.as_str()),
+                Change::DropUnique { table, name } => (table, "UQ", name.raw()),
+                Change::DropIndex { table, name } => (table, "IX", name.raw()),
                 Change::CreateTable { .. }
                 | Change::DropTable { .. }
                 | Change::RenameTable { .. }
@@ -294,7 +294,7 @@ pub async fn key_drop_blockers(
         };
         let qualified = qualified(&table)?;
         let rows = if let Some(name) = fk {
-            conn.query_with("SELECT fk.object_id AS oid, fk.parent_object_id AS parent FROM sys.foreign_keys fk WHERE fk.parent_object_id=OBJECT_ID(@P1, N'U') AND fk.name=@P2", &[Param::Str(&qualified), Param::Str(name)]).await?
+            conn.query_with("SELECT fk.object_id AS oid, fk.parent_object_id AS parent FROM sys.foreign_keys fk WHERE fk.parent_object_id=OBJECT_ID(@P1, N'U') AND fk.name=@P2", &[Param::Str(&qualified), Param::Str(name.raw())]).await?
         } else {
             conn.query_with("SELECT t.object_id AS oid, t.object_id AS parent FROM sys.tables t WHERE t.object_id=OBJECT_ID(@P1, N'U')", &[Param::Str(&qualified)]).await?
         };

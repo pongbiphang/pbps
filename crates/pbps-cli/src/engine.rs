@@ -246,7 +246,8 @@ pub async fn drop_scan_checks(
         .map(|check| {
             format!(
                 "the staged attach's temporary CHECK `{}` on `{}`",
-                check.name,
+                // Shared recorded-removal text is escaped on output until #2084 step 5.
+                check.name.raw(),
                 check.table.raw()
             )
         })

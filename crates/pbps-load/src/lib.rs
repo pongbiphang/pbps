@@ -696,7 +696,13 @@ indexes:
             "table: dbo.t\ncolumns:\n  a: {type: int}\nprimary_key:\n  name: pk_t\n  columns: [a]\n",
         );
         assert_eq!(
-            named.table.primary_key.unwrap().name.as_deref(),
+            named
+                .table
+                .primary_key
+                .unwrap()
+                .name
+                .as_ref()
+                .map(pbps_model::ObjectLocalName::raw),
             Some("pk_t")
         );
     }

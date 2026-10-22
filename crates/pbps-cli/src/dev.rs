@@ -417,11 +417,13 @@ fn classify(remaining: &ChangeSet, engine: &Schema) -> (Vec<String>, Vec<String>
                     Some(stored) => spelling.push(format!(
                         "check {name} on {table}: declared `{}`, the engine stores `{stored}`",
                         constraint.expression,
-                        table = table.shown()
+                        table = table.shown(),
+                        name = name.shown(),
                     )),
                     None => structural.push(format!(
                         "check {name} on {table} is declared but the plan did not create it",
-                        table = table.shown()
+                        table = table.shown(),
+                        name = name.shown(),
                     )),
                 }
             }

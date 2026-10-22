@@ -267,9 +267,12 @@ fn versioning(
         .iter()
         .filter(|i| i.object_id == h.object_id)
         .collect();
-    let expected = format!("ix_{}", h.name);
+    let expected: pbps_model::ObjectLocalName = format!("ix_{}", h.name).into();
     if index.iter().any(|i| i.index_name != expected) {
-        return layout(&format!("has an index other than `{expected}`"));
+        return layout(&format!(
+            "has an index other than `{expected}`",
+            expected = expected.shown(),
+        ));
     }
     let keys: Vec<(&str, bool, bool)> = index
         .iter()
@@ -277,7 +280,8 @@ fn versioning(
         .collect();
     if keys != [(end, false, false), (start, false, false)] {
         return layout(&format!(
-            "has no clustered index `{expected}` on ({end}, {start}) alone"
+            "has no clustered index `{expected}` on ({end}, {start}) alone",
+            expected = expected.shown(),
         ));
     }
     if index.iter().any(|i| {
@@ -288,7 +292,10 @@ fn versioning(
             || i.ignore_dup_key
             || i.rows_partitioned
     }) {
-        return layout(&format!("has `{expected}` with options of its own"));
+        return layout(&format!(
+            "has `{expected}` with options of its own",
+            expected = expected.shown(),
+        ));
     }
     // The engine compresses a new history PAGE where the edition does so by
     // itself and leaves it NONE elsewhere (Express, measured on 17.0), and an
@@ -334,7 +341,7 @@ pub struct RawColumn {
     /// The default definition as stored, wrapped in parentheses.
     pub default: Option<String>,
     /// The backing `sys.default_constraints` row, when a default exists.
-    pub default_constraint: Option<(i32, String)>,
+    pub default_constraint: Option<(i32, pbps_model::ObjectLocalName)>,
     /// `sys.columns.collation_name`: `None` for a type with no collation at
     /// all (everything but the character types); `Some` names the collation a
     /// character column actually has, whether that is the database's default
@@ -366,7 +373,7 @@ pub struct RawKeyColumn {
     /// index does), which no declaration can say.
     pub rows_partitioned: bool,
     pub object_id: i32,
-    pub constraint_name: String,
+    pub constraint_name: pbps_model::ObjectLocalName,
     pub is_primary: bool,
     pub column: String,
 }
@@ -375,13 +382,13 @@ pub struct RawKeyColumn {
 #[derive(Debug, Clone)]
 pub struct RawForeignKeyColumn {
     pub object_id: i32,
-    pub constraint_name: String,
+    pub constraint_name: pbps_model::ObjectLocalName,
     pub ref_schema: String,
     pub ref_table: String,
     pub ref_object_id: i32,
     /// The name of the referenced key or unique index, as `key_index_id`
     /// resolves it.
-    pub ref_key: Option<String>,
+    pub ref_key: Option<pbps_model::ObjectLocalName>,
     pub column: String,
     pub ref_column: String,
     /// `sys.foreign_keys.delete_referential_action`: 0..=3.
@@ -401,7 +408,7 @@ pub struct RawCheck {
     pub is_not_for_replication: bool,
     pub object_id: i32,
     pub constraint_object_id: i32,
-    pub name: String,
+    pub name: pbps_model::ObjectLocalName,
     pub definition: String,
 }
 
@@ -516,7 +523,7 @@ pub struct RawIndexColumn {
     pub is_disabled: bool,
     pub ignore_dup_key: bool,
     pub object_id: i32,
-    pub index_name: String,
+    pub index_name: pbps_model::ObjectLocalName,
     pub is_unique: bool,
     pub kind: IndexKind,
     pub filter: Option<String>,
@@ -1365,7 +1372,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 names.get(&c.object_id),
                 format!(
                     "{table_name}.{}: default constraint `{constraint_name}` depends on an omitted temporal or ledger object or module; the default was left out too",
-                    c.name
+                    c.name,
+                    constraint_name = constraint_name.shown(),
                 ),
             );
         }
@@ -1438,7 +1446,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .get(&object_id)
             .is_some_and(|columns| columns.contains(column))
     };
-    let mut keys_over_left_out: BTreeMap<(i32, String), BTreeSet<&str>> = BTreeMap::new();
+    let mut keys_over_left_out: BTreeMap<(i32, pbps_model::ObjectLocalName), BTreeSet<&str>> =
+        BTreeMap::new();
     for k in raw
         .key_columns
         .iter()
@@ -1449,7 +1458,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
             .or_default()
             .insert(&k.column);
     }
-    let mut indexes_over_left_out: BTreeMap<(i32, String), BTreeSet<&str>> = BTreeMap::new();
+    let mut indexes_over_left_out: BTreeMap<(i32, pbps_model::ObjectLocalName), BTreeSet<&str>> =
+        BTreeMap::new();
     for i in raw
         .index_columns
         .iter()
@@ -1468,11 +1478,14 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
         .filter(|r| r.reader == ColumnReader::Filter && over_left_out(r.object_id, &r.column))
     {
         indexes_over_left_out
-            .entry((r.object_id, r.name.clone()))
+            .entry((r.object_id, r.name.clone().into()))
             .or_default()
             .insert(&r.column);
     }
-    let mut foreign_keys_over_left_out: BTreeMap<(i32, String), BTreeSet<&str>> = BTreeMap::new();
+    let mut foreign_keys_over_left_out: BTreeMap<
+        (i32, pbps_model::ObjectLocalName),
+        BTreeSet<&str>,
+    > = BTreeMap::new();
     for f in raw
         .foreign_key_columns
         .iter()
@@ -1507,7 +1520,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
     // no clustered index at all — both are a different table on bootstrap.
     // Asked before the keys, because a key left out takes the foreign keys
     // that reference it with it (#1178).
-    let lost_clustered: BTreeMap<i32, String> = raw
+    let lost_clustered: BTreeMap<i32, pbps_model::ObjectLocalName> = raw
         .key_columns
         .iter()
         .filter(|k| {
@@ -1560,7 +1573,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     format!(
                         "{}: {kind} `{}` is over {}, which was left out of the declarations; the {kind} was left out too",
                         name_of(k.object_id, &names),
-                        k.constraint_name,
+                        k.constraint_name.shown(),
                         left_out_columns_phrase(columns),
                     ),
                 );
@@ -1576,7 +1589,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     format!(
                         "{}: key constraint `{}` has unmodelled write behavior (disabled={}, IGNORE_DUP_KEY={}); it was left out of the declarations",
                         name_of(k.object_id, &names),
-                        k.constraint_name,
+                        k.constraint_name.shown(),
                         k.is_disabled,
                         k.ignore_dup_key
                     ),
@@ -1602,7 +1615,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     format!(
                         "{}: {kind} `{}` is backed by an index that is {}; a declaration cannot spell that layout, so it was left out of the declarations",
                         name_of(k.object_id, &names),
-                        k.constraint_name,
+                        k.constraint_name.shown(),
                         index_type_name(k.index_type),
                     ),
                 );
@@ -1625,7 +1638,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     format!(
                         "{}: {kind} `{}`: {PARTITIONED}, so it was left out of the declarations",
                         name_of(k.object_id, &names),
-                        k.constraint_name,
+                        k.constraint_name.shown(),
                     ),
                 );
             }
@@ -1643,7 +1656,8 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     format!(
                         "{}: primary key `{}` is nonclustered beside the clustered index `{clustered}`, which was left out of the declarations; without it the key's layout cannot be declared, so the key was left out too",
                         name_of(k.object_id, &names),
-                        k.constraint_name,
+                        k.constraint_name.shown(),
+                        clustered = clustered.shown(),
                     ),
                 );
             }
@@ -1699,7 +1713,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     format!(
                         "{}: {kind} `{}` is over {}, which was left out of the declarations; the index was left out too",
                         name_of(i.object_id, &names),
-                        i.index_name,
+                        i.index_name.shown(),
                         left_out_columns_phrase(columns),
                     ),
                 );
@@ -1718,7 +1732,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     format!(
                         "{}: unique index `{}` has unmodelled write behavior (disabled={}, IGNORE_DUP_KEY={}); it was left out of the declarations",
                         name_of(i.object_id, &names),
-                        i.index_name,
+                        i.index_name.shown(),
                         i.is_disabled,
                         i.ignore_dup_key
                     ),
@@ -1736,13 +1750,13 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                         format!(
                             "{}: clustered index `{}`: {PARTITIONED}, so it was left out of the declarations",
                             name_of(i.object_id, &names),
-                            i.index_name,
+                            i.index_name.shown(),
                         )
                     } else {
                         format!(
                             "{}: clustered index `{}` is disabled, which leaves the table's rows unreadable until it is rebuilt; a declaration cannot say so, and bootstrap would create it enabled, so it was left out of the declarations",
                             name_of(i.object_id, &names),
-                            i.index_name,
+                            i.index_name.shown(),
                         )
                     },
                 );
@@ -1766,7 +1780,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     names.get(&i.object_id),
                     format!(
                         "{table_name}: index `{}` is {}, which is not modelled yet; it was left out of the declarations",
-                        i.index_name,
+                        i.index_name.shown(),
                         index_type_name(code)
                     ),
                 );
@@ -1818,7 +1832,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     format!(
                         "{}: foreign key `{}` is over {}, which was left out of the declarations; the foreign key was left out too",
                         name_of(f.object_id, &names),
-                        f.constraint_name,
+                        f.constraint_name.shown(),
                         left_out_columns_phrase(columns),
                     ),
                 );
@@ -1845,7 +1859,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     names.get(&f.object_id),
                     format!(
                         "{table_name}: foreign key `{}` is {}; these enforcement states are outside the declarations, so the foreign key was left out instead of recreated with different semantics",
-                        f.constraint_name,
+                        f.constraint_name.shown(),
                         states.join(", ")
                     ),
                 );
@@ -1871,8 +1885,9 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     names.get(&f.object_id),
                     format!(
                         "{table_name}: foreign key `{}` references {kind} `{key}` of {referenced}, which was left out of the declarations; the foreign key was left out too",
-                        f.constraint_name,
-                        referenced = referenced.shown()
+                        f.constraint_name.shown(),
+                        referenced = referenced.shown(),
+                        key = key.shown(),
                     ),
                 );
             }
@@ -1887,7 +1902,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                     names.get(&f.object_id),
                     format!(
                         "{table_name}: foreign key `{}` references {kind} {referenced}, which is outside the declarations; the foreign key was left out too",
-                        f.constraint_name,
+                        f.constraint_name.shown(),
                         referenced = referenced.shown()
                     ),
                 );
@@ -1921,7 +1936,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 format!(
                     "{}: check constraint `{}` is over {}, which was left out of the declarations; the check constraint was left out too",
                     name_of(c.object_id, &names),
-                    c.name,
+                    c.name.shown(),
                     left_out_columns_phrase(columns),
                 ),
             );
@@ -1935,7 +1950,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 format!(
                     "{}: check constraint `{}` has unmodelled enforcement (disabled={}, not_trusted={}, NOT FOR REPLICATION={}); it was left out of the declarations",
                     name_of(c.object_id, &names),
-                    c.name,
+                    c.name.shown(),
                     c.is_disabled,
                     c.is_not_trusted,
                     c.is_not_for_replication
@@ -1954,7 +1969,7 @@ pub fn assemble(raw: &RawCatalog) -> Pulled {
                 names.get(&c.object_id),
                 format!(
                     "{table_name}: check constraint `{}` depends on an omitted temporal or ledger object or module; the check constraint was left out too",
-                    c.name
+                    c.name.shown()
                 ),
             );
             continue;
@@ -3802,7 +3817,12 @@ mod tests {
         let pulled = assemble(&raw);
 
         let ch = &pulled.schema.tables[&TableName::new("dbo", "ch")].foreign_keys;
-        assert_eq!(ch.keys().collect::<Vec<_>>(), ["fk_ch_r", "fk_ch_s"]);
+        assert_eq!(
+            ch.keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["fk_ch_r", "fk_ch_s"]
+        );
         for (fk, index, table) in [("fk_ch_p", "ux_p_code", "p"), ("fk_ch_q", "ux_q_code", "q")] {
             assert!(
                 pulled.limitations.iter().any(|l| {
@@ -3952,8 +3972,20 @@ mod tests {
             [pbps_model::ColumnName::from("id")]
         );
         assert!(t.unique.is_empty(), "{:?}", t.unique);
-        assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_a"]);
-        assert_eq!(t.checks.keys().collect::<Vec<_>>(), ["ck_a"]);
+        assert_eq!(
+            t.indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ix_a"]
+        );
+        assert_eq!(
+            t.checks
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ck_a"]
+        );
         assert!(t.foreign_keys.is_empty(), "{:?}", t.foreign_keys);
         let u = table("u");
         assert!(u.primary_key.is_none() && u.unique.is_empty(), "{u:?}");
@@ -4083,7 +4115,13 @@ mod tests {
             t.computed.keys().cloned().collect::<Vec<_>>(),
             [pbps_model::ColumnName::from("e")]
         );
-        assert_eq!(t.indexes.keys().collect::<Vec<_>>(), ["ix_g"]);
+        assert_eq!(
+            t.indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ix_g"]
+        );
         for detail in [
             "t.c: the computed column reads column `m`, which was left out",
             "index `ix_c` is over column `c`, which was left out",
@@ -4213,7 +4251,10 @@ mod tests {
         assert!(table("l").indexes.is_empty());
         let child = &table("child").foreign_keys;
         assert_eq!(
-            child.keys().collect::<Vec<_>>(),
+            child
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
             ["fk_child_c", "fk_child_h", "fk_child_u_code"]
         );
         for (name, detail) in [
@@ -4477,7 +4518,7 @@ mod tests {
             is_disabled: false,
             ignore_dup_key: false,
             object_id: 10,
-            index_name: name.to_owned(),
+            index_name: name.into(),
             is_unique: false,
             kind: IndexKind::from_type_code(type_code),
             filter: None,
@@ -4497,7 +4538,13 @@ mod tests {
 
         let p = assemble(&raw);
         let indexes = &p.schema.tables[&TableName::new("dbo", "customer")].indexes;
-        assert_eq!(indexes.keys().collect::<Vec<_>>(), ["ix_email"]);
+        assert_eq!(
+            indexes
+                .keys()
+                .map(pbps_model::ObjectLocalName::raw)
+                .collect::<Vec<_>>(),
+            ["ix_email"]
+        );
         assert_eq!(p.limitations.len(), 3, "{:?}", p.limitations);
         let said = p
             .limitations
@@ -4544,6 +4591,122 @@ mod tests {
         });
         let p = assemble(&raw);
         assert_eq!(p.schema.tables.len(), 1);
+    }
+
+    #[test]
+    fn catalog_local_keys_keep_raw_names_and_do_not_omit_their_shown_lookalikes() {
+        const RAW: &str = "part\nline\\slash\u{200b}";
+        const SHOWN: &str = r"part\nline\\slash\u{200b}";
+        let mut raw = RawCatalog {
+            tables: vec![raw_table(1, "dbo", "child"), raw_table(2, "dbo", "parent")],
+            columns: vec![
+                raw_column(1, "id", "int"),
+                raw_column(1, "extra", "int"),
+                raw_column(2, "id", "int"),
+            ],
+            key_columns: vec![
+                key(1, &format!("pk{RAW}"), true, 1, "id"),
+                key(2, "pk_parent", true, 1, "id"),
+            ],
+            ..Default::default()
+        };
+        for (i, text) in [RAW, SHOWN].into_iter().enumerate() {
+            let column = if text == RAW { "extra" } else { "id" };
+            raw.key_columns
+                .push(key(1, &format!("uq{text}"), false, 2, column));
+            raw.foreign_key_columns.push(RawForeignKeyColumn {
+                object_id: 1,
+                constraint_name: format!("fk{text}").into(),
+                ref_schema: "dbo".into(),
+                ref_table: "parent".into(),
+                ref_object_id: 2,
+                ref_key: Some("pk_parent".into()),
+                column: column.into(),
+                ref_column: "id".into(),
+                on_delete: 0,
+                on_update: 0,
+                is_disabled: false,
+                is_not_trusted: false,
+                is_not_for_replication: false,
+            });
+            raw.checks.push(RawCheck {
+                object_id: 1,
+                constraint_object_id: 100 + i as i32,
+                name: format!("ck{text}").into(),
+                definition: format!("[{column}] > 0"),
+                is_disabled: false,
+                is_not_trusted: false,
+                is_not_for_replication: false,
+            });
+            raw.check_columns.push(RawCheckColumn {
+                constraint_object_id: 100 + i as i32,
+                column: column.into(),
+            });
+            raw.index_columns.push(RawIndexColumn {
+                object_id: 1,
+                index_name: format!("ix{text}").into(),
+                is_unique: false,
+                kind: IndexKind::Nonclustered,
+                filter: Some(format!("[{column}] > 0")),
+                column: column.into(),
+                is_included: false,
+                is_descending: false,
+                is_disabled: false,
+                ignore_dup_key: false,
+                rows_partitioned: false,
+            });
+            raw.read_columns.push(RawReadColumn {
+                object_id: 1,
+                reader: ColumnReader::Filter,
+                name: format!("ix{text}"),
+                column: column.into(),
+            });
+        }
+        let child = TableName::new("dbo", "child");
+        let pulled = assemble(&raw);
+        let table = &pulled.schema.tables[&child];
+        assert_eq!(
+            table
+                .primary_key
+                .as_ref()
+                .unwrap()
+                .name
+                .as_ref()
+                .unwrap()
+                .raw(),
+            format!("pk{RAW}")
+        );
+        for text in [RAW, SHOWN] {
+            assert!(table.unique.contains_key(format!("uq{text}").as_str()));
+            assert!(
+                table
+                    .foreign_keys
+                    .contains_key(format!("fk{text}").as_str())
+            );
+            assert!(table.checks.contains_key(format!("ck{text}").as_str()));
+            assert!(table.indexes.contains_key(format!("ix{text}").as_str()));
+        }
+        // One omitted input removes only its own named readers, never an
+        // unrelated object whose literal name resembles its display spelling.
+        raw.columns[1].type_name = "not_a_modelled_type".into();
+        let pulled = assemble(&raw);
+        let table = &pulled.schema.tables[&child];
+        for (prefix, keys) in [
+            ("uq", table.unique.keys().collect::<Vec<_>>()),
+            ("fk", table.foreign_keys.keys().collect()),
+            ("ck", table.checks.keys().collect()),
+            ("ix", table.indexes.keys().collect()),
+        ] {
+            assert_eq!(
+                keys.iter().map(|n| n.raw()).collect::<Vec<_>>(),
+                vec![format!("{prefix}{SHOWN}")]
+            );
+        }
+        assert!(
+            pulled.warnings.iter().all(|message| !message.contains(RAW)),
+            "{:?}",
+            pulled.warnings
+        );
     }
 }
 

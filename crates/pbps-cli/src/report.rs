@@ -1512,8 +1512,16 @@ pub fn describe(c: &Change) -> String {
             parts.extend(reset.iter().map(|k| format!("{k} reset")));
             let of = match target {
                 pbps_model::IndexPart::PrimaryKey => "primary key".to_owned(),
-                pbps_model::IndexPart::Unique(n) => format!("unique constraint {n}"),
-                pbps_model::IndexPart::Index(n) => format!("index {n}"),
+                pbps_model::IndexPart::Unique(n) => format!(
+                    "unique constraint {n}",
+                    // Shared JSON/report description is escaped once until #2084 step 5.
+                    n = n.raw(),
+                ),
+                pbps_model::IndexPart::Index(n) => format!(
+                    "index {n}",
+                    // Shared JSON/report description is escaped once until #2084 step 5.
+                    n = n.raw(),
+                ),
             };
             format!("~ storage parameters of {of}: {}", parts.join(", "))
         }
@@ -1536,17 +1544,53 @@ pub fn describe(c: &Change) -> String {
             to.enabled, to.forced
         ),
         Change::SetReplicaIdentity { to, .. } => match to {
-            Some(identity) => format!("~ replica identity -> {identity}"),
+            Some(identity) => format!(
+                "~ replica identity -> {identity}",
+                // Shared JSON/report description is escaped once until #2084 step 5.
+                identity = identity.raw(),
+            ),
             None => "~ replica identity -> default".to_owned(),
         },
-        Change::AddUnique { name, .. } => format!("+ unique constraint {name}"),
-        Change::DropUnique { name, .. } => format!("- unique constraint {name}"),
-        Change::AddForeignKey { name, .. } => format!("+ foreign key {name}"),
-        Change::DropForeignKey { name, .. } => format!("- foreign key {name}"),
-        Change::AddCheck { name, .. } => format!("+ check constraint {name}"),
-        Change::DropCheck { name, .. } => format!("- check constraint {name}"),
-        Change::AddIndex { name, .. } => format!("+ index {name}"),
-        Change::DropIndex { name, .. } => format!("- index {name}"),
+        Change::AddUnique { name, .. } => format!(
+            "+ unique constraint {name}",
+            // Shared JSON/report description is escaped once until #2084 step 5.
+            name = name.raw(),
+        ),
+        Change::DropUnique { name, .. } => format!(
+            "- unique constraint {name}",
+            // Shared JSON/report description is escaped once until #2084 step 5.
+            name = name.raw(),
+        ),
+        Change::AddForeignKey { name, .. } => format!(
+            "+ foreign key {name}",
+            // Shared JSON/report description is escaped once until #2084 step 5.
+            name = name.raw(),
+        ),
+        Change::DropForeignKey { name, .. } => format!(
+            "- foreign key {name}",
+            // Shared JSON/report description is escaped once until #2084 step 5.
+            name = name.raw(),
+        ),
+        Change::AddCheck { name, .. } => format!(
+            "+ check constraint {name}",
+            // Shared JSON/report description is escaped once until #2084 step 5.
+            name = name.raw(),
+        ),
+        Change::DropCheck { name, .. } => format!(
+            "- check constraint {name}",
+            // Shared JSON/report description is escaped once until #2084 step 5.
+            name = name.raw(),
+        ),
+        Change::AddIndex { name, .. } => format!(
+            "+ index {name}",
+            // Shared JSON/report description is escaped once until #2084 step 5.
+            name = name.raw(),
+        ),
+        Change::DropIndex { name, .. } => format!(
+            "- index {name}",
+            // Shared JSON/report description is escaped once until #2084 step 5.
+            name = name.raw(),
+        ),
         Change::CreateModule { module, .. } => format!("+ create {}", module.kind),
         // "restate", not "alter": the whole definition is sent, which is what
         // `CREATE OR ALTER` does and what the reviewer is approving.

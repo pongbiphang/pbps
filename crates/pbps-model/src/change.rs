@@ -15,6 +15,7 @@
 //! hold a `Dialect`, and attached to [`PlannedChange`] as data.
 
 use crate::ColumnName;
+use crate::ObjectLocalName;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -188,11 +189,11 @@ pub struct DetachedName {
     pub kind: DetachedKind,
     /// The parent's object. A key is found as the table's only one, so its
     /// parent's name is carried for the record only.
-    pub parent: String,
+    pub parent: ObjectLocalName,
     /// The name the declaration gives the detached table's. `None` only for
     /// a key the declaration leaves unnamed, which keeps whatever name the
     /// engine gave its clone: an unnamed key matches any name.
-    pub name: Option<String>,
+    pub name: Option<ObjectLocalName>,
 }
 
 /// The kinds of object a partition holds a clone of. A key, a unique
@@ -545,7 +546,7 @@ pub enum Change {
     },
     AddUnique {
         table: TableName,
-        name: String,
+        name: ObjectLocalName,
         constraint: UniqueConstraint,
         /// This constraint's index is the table's clustered one
         /// ([`Table::clustered`]).
@@ -554,29 +555,29 @@ pub enum Change {
     },
     DropUnique {
         table: TableName,
-        name: String,
+        name: ObjectLocalName,
     },
     AddForeignKey {
         table: TableName,
-        name: String,
+        name: ObjectLocalName,
         constraint: Box<ForeignKey>,
     },
     DropForeignKey {
         table: TableName,
-        name: String,
+        name: ObjectLocalName,
     },
     AddCheck {
         table: TableName,
-        name: String,
+        name: ObjectLocalName,
         constraint: CheckConstraint,
     },
     DropCheck {
         table: TableName,
-        name: String,
+        name: ObjectLocalName,
     },
     AddIndex {
         table: TableName,
-        name: String,
+        name: ObjectLocalName,
         index: Box<Index>,
         /// This index is the table's clustered one ([`Table::clustered`]).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -584,7 +585,7 @@ pub enum Change {
     },
     DropIndex {
         table: TableName,
-        name: String,
+        name: ObjectLocalName,
     },
 
     // Reference data (ADR-0004). No uid, and no rename intent: a row's entire
@@ -1065,8 +1066,8 @@ pub fn drop_parameter_changes_of_rebuilt_indexes<T>(
 #[serde(rename_all = "snake_case")]
 pub enum IndexPart {
     PrimaryKey,
-    Unique(String),
-    Index(String),
+    Unique(ObjectLocalName),
+    Index(ObjectLocalName),
 }
 
 /// One named part of a table, and what this plan leaves there.
@@ -2298,11 +2299,11 @@ impl Change {
                 clustered,
             } => it(
                 table,
-                Some(name),
+                Some(name.raw()),
                 standing(PartDefinition::Unique(constraint, *clustered)),
             ),
             Change::DropUnique { table, name, .. } => {
-                it(table, Some(name), PartAfter::Gone(Part::Unique))
+                it(table, Some(name.raw()), PartAfter::Gone(Part::Unique))
             }
             Change::AddForeignKey {
                 table,
@@ -2310,11 +2311,11 @@ impl Change {
                 constraint,
             } => it(
                 table,
-                Some(name),
+                Some(name.raw()),
                 standing(PartDefinition::ForeignKey(constraint)),
             ),
             Change::DropForeignKey { table, name, .. } => {
-                it(table, Some(name), PartAfter::Gone(Part::ForeignKey))
+                it(table, Some(name.raw()), PartAfter::Gone(Part::ForeignKey))
             }
             Change::AddCheck {
                 table,
@@ -2322,11 +2323,11 @@ impl Change {
                 constraint,
             } => it(
                 table,
-                Some(name),
+                Some(name.raw()),
                 standing(PartDefinition::Check(constraint)),
             ),
             Change::DropCheck { table, name, .. } => {
-                it(table, Some(name), PartAfter::Gone(Part::Check))
+                it(table, Some(name.raw()), PartAfter::Gone(Part::Check))
             }
             Change::AddIndex {
                 table,
@@ -2335,11 +2336,11 @@ impl Change {
                 clustered,
             } => it(
                 table,
-                Some(name),
+                Some(name.raw()),
                 standing(PartDefinition::Index(index, *clustered)),
             ),
             Change::DropIndex { table, name, .. } => {
-                it(table, Some(name), PartAfter::Gone(Part::Index))
+                it(table, Some(name.raw()), PartAfter::Gone(Part::Index))
             }
             Change::AddComputedColumn {
                 table,
