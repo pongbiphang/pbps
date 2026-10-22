@@ -1047,7 +1047,8 @@ exactly one logical change (DEC-1950.1).
 <a id="dec-1892-1"></a>
 
 **DEC-1892.1. A declared PostgreSQL INSERT implies USAGE on every sequence
-the table's serial columns own.** Option A, chosen by the maintainer on
+the table's serial columns own, following a partition to its root.**
+The partition extension is DEC-2202.1. Option A, chosen by the maintainer on
 2026-10-19. Measured on PostgreSQL 18: INSERT on the table alone fails with
 `permission denied for sequence t_id_seq`; granting USAGE on its sequence
 makes the insert succeed. USAGE permits `nextval` and `currval`, but `setval`
@@ -1070,7 +1071,8 @@ revocability retain their existing meaning. Pull and documentation omit the
 marker; the ledger retains the access read back from the database.
 
 The existing Grant and Revoke changes carry the marker. Their statements
-find auto-dependent sequences through the table at execution time, so
+find auto-dependent sequences through the table (a partition's root,
+DEC-2202.1) at execution time, so
 renames and generated names require no guess. Being pbps's own catalog read, the
 block runs on the empty `search_path` with every operator qualified, so an
 operator a schema user created cannot be chosen over the built-in one
@@ -1135,3 +1137,64 @@ doctor sequence authority and documentation rendering. The CLI live flow on
 16 and 18 exercises independent USAGE, SELECT and UPDATE, custom sequence
 names, both union transitions, creation and conversion, table/column renames,
 empty subsequent plans, clean verify, pull and a standalone-sequence limitation.
+
+<a id="dec-2202-1"></a>
+
+**DEC-2202.1. INSERT on a partition implies USAGE on its root parent's
+serial sequences, including through multiple partition levels.** Measured
+on PostgreSQL 16 and 18: direct INSERT into a partition, leaving out the
+serial column, fails without USAGE on the root's sequence; with USAGE,
+inserts into both a partition and a sub-partition are numbered. A partition
+owns no sequence: its auto-dependent sequence set is empty and
+`pg_get_serial_sequence` returns NULL. The root owns the serial's sequence.
+Partitions themselves are also auto-dependent on their parent, so a
+dependency lookup must select only `pg_class.relkind = 'S'`; the existing
+marker block already did so and retains that filter.
+
+Declaration derivation and effective grant comparison follow `partition_of`
+to the root's serial columns. Plain and identity parents imply no access.
+Explicit `sequence::` targets still name only an owning serial column;
+naming a partition's inherited column is refused by name. The marker's
+statement resolves `pg_partition_root` from the granted relation's OID when
+it runs, so the root's earlier rename in the same plan needs no name map.
+It keeps the empty search path and qualified operators of DEC-1564.1.
+An ordinary table's `pg_partition_root` is NULL on both supported servers,
+so the lookup falls back to the granted relation's own OID. Doctor asks for
+grant authority on those same root sequences.
+
+One root USAGE ACL can satisfy INSERT on several partitions and on the
+parent. The live fold records every satisfied marker, independently of ACL
+row order, and keeps revocability on the exact root sequence column.
+Incomplete USAGE sets retain DEC-1892.1's limitation; USAGE without any
+INSERT implying it stays explicit under DEC-2199.1. Explicit access and all
+markers compare as one effective union, so retaining any source prevents a
+revoke. New root serials re-grant existing partition markers after creation.
+The existing Grant/Revoke ordering handles attached tables as well, with no
+new Change kind, sort class or reordering pass.
+
+Detach removes the inherited implication without revoking the still-standing
+root sequence's USAGE through a partition that has left the tree. The live
+read now carries that access explicitly under DEC-2199.1, and the deploy
+guard compares the same effective privilege before and after. Subsequent
+explicit grant changes use the ordinary union comparison. This does not
+broaden the existing detach shape admission or the reader's serial-sharing
+rules: a detached table's own default must still be representable.
+
+Tests: model derivation through one and two levels, explicit/implied union,
+plain and identity negatives, missing parents and cycles, and named refusal
+of explicit partition sequence targets; emitter root resolution and sequence
+filtering; live-read folding for multiple INSERT targets, partial access and
+explicit-only access; diff re-grants, root renames, source removal, union
+transitions, attach and detach; deploy read-back acceptance and missing or
+unplanned privilege refusals; doctor root lookup and documentation hiding the
+marker. Live on 16 and 18,
+`partition_insert_uses_root_serial_sequences_and_round_trips_on_both_servers`
+applies the grants to single-level partitions, inserts directly without the
+serial, checks an empty next plan, clean verify and doctor, pulls the same
+role declarations with no explicit sequence target, and checks a plain
+parent's partition gets no sequence access. It separately executes the
+emitted marker on a SQL-created sub-partition after renaming the root,
+checking that INSERT alone fails and the marker makes the direct insert
+succeed. Full nested-tree adoption, apply, verify and pull remain a
+prerequisite outside this issue: DEC-1170.1 holds only a single-level tree,
+and this grant change does not broaden that boundary.

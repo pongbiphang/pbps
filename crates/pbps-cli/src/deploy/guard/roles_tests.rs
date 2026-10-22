@@ -267,68 +267,205 @@ fn hostile_role_handoffs_keep_raw_grant_holders_distinct() {
 #[test]
 fn serial_usage_readback_tracks_the_union_and_refuses_missing_or_unplanned_access() {
     use pbps_model::{Column, OwnedSequence, Table, ValueSource};
+    for target in ["dbo.t", "dbo.p1", "dbo.p2a"] {
+        let mut before = Schema::default();
+        let mut table = Table::default();
+        let mut column = Column::new("integer".parse().unwrap());
+        column.value_source = ValueSource::Sequence(OwnedSequence::serial());
+        table.columns.insert("id".into(), column);
+        before.tables.insert("dbo.t".parse().unwrap(), table);
+        for (name, parent) in [("dbo.p1", "dbo.t"), ("dbo.p2a", "dbo.p1")] {
+            before.tables.insert(
+                name.parse().unwrap(),
+                Table {
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: parent.parse().unwrap(),
+                        bound: pbps_model::PartitionBound::Default,
+                        columns: Default::default(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        before.roles.insert(
+            "writer".into(),
+            Role {
+                grants: [(
+                    target.parse().unwrap(),
+                    [Permission::Insert, Permission::SerialSequences].into(),
+                )]
+                .into(),
+                ..Default::default()
+            },
+        );
+        let cs = changes(vec![Change::Revoke {
+            role: "writer".into(),
+            target: target.parse().unwrap(),
+            permissions: [Permission::Insert].into(),
+        }]);
+        let mut ids = ids(&[("r_aaaaaa", "writer")]);
+        ids.tables
+            .insert("t_aaaaaa".parse().unwrap(), "dbo.t".parse().unwrap());
+        ids.columns
+            .insert("c_aaaaaa".parse().unwrap(), "dbo.t.id".parse().unwrap());
+        for (uid, name) in [("t_bbbbbb", "dbo.p1"), ("t_cccccc", "dbo.p2a")] {
+            ids.tables
+                .insert(uid.parse().unwrap(), name.parse().unwrap());
+        }
+        let mut after = before.clone();
+        after.roles.get_mut("writer").unwrap().grants = [(
+            "sequence::dbo.t.id".parse().unwrap(),
+            [Permission::Usage].into(),
+        )]
+        .into();
+        compare(&cs, &ids, &before, &after).unwrap();
+        let preserved = after.clone();
+        after.roles.get_mut("writer").unwrap().grants.clear();
+        assert!(
+            compare(&cs, &ids, &before, &after)
+                .unwrap_err()
+                .contains("usage")
+        );
+        after = preserved.clone();
+        after
+            .roles
+            .get_mut("writer")
+            .unwrap()
+            .grants
+            .get_mut(&"sequence::dbo.t.id".parse().unwrap())
+            .unwrap()
+            .insert(Permission::Update);
+        assert!(
+            compare(&cs, &ids, &before, &after)
+                .unwrap_err()
+                .contains("update")
+        );
+        // Adding INSERT folds the same physical entry into the marker.
+        let cs = changes(vec![Change::Grant {
+            role: "writer".into(),
+            target: target.parse().unwrap(),
+            permissions: [Permission::Insert, Permission::SerialSequences].into(),
+        }]);
+        compare(&cs, &ids, &preserved, &before).unwrap();
+    }
+}
+
+#[test]
+fn a_detach_preserves_the_roots_usage_and_an_attach_checks_its_new_marker() {
+    use pbps_model::{
+        Column, OwnedSequence, PartitionBound, PartitionColumn, PartitionOf, Table, ValueSource,
+    };
     let mut before = Schema::default();
-    let mut table = Table::default();
-    let mut column = Column::new("integer".parse().unwrap());
-    column.value_source = ValueSource::Sequence(OwnedSequence::serial());
-    table.columns.insert("id".into(), column);
-    before.tables.insert("dbo.t".parse().unwrap(), table);
+    let mut serial = Column::new("integer".parse().unwrap());
+    serial.value_source = ValueSource::Sequence(OwnedSequence::serial());
+    before.tables.insert(
+        "dbo.t".parse().unwrap(),
+        Table {
+            columns: [("id".into(), serial)].into(),
+            ..Default::default()
+        },
+    );
+    before.tables.insert(
+        "dbo.p1".parse().unwrap(),
+        Table {
+            partition_of: Some(PartitionOf {
+                parent: "dbo.t".parse().unwrap(),
+                bound: PartitionBound::Default,
+                columns: [(
+                    "id".into(),
+                    PartitionColumn {
+                        default: Some("0".into()),
+                        not_null: false,
+                    },
+                )]
+                .into(),
+            }),
+            ..Default::default()
+        },
+    );
     before.roles.insert(
         "writer".into(),
         Role {
             grants: [(
-                "dbo.t".parse().unwrap(),
+                "dbo.p1".parse().unwrap(),
                 [Permission::Insert, Permission::SerialSequences].into(),
             )]
             .into(),
             ..Default::default()
         },
     );
-    let cs = changes(vec![Change::Revoke {
-        role: "writer".into(),
-        target: "dbo.t".parse().unwrap(),
-        permissions: [Permission::Insert].into(),
-    }]);
     let mut ids = ids(&[("r_aaaaaa", "writer")]);
-    ids.tables
-        .insert("t_aaaaaa".parse().unwrap(), "dbo.t".parse().unwrap());
-    ids.columns
-        .insert("c_aaaaaa".parse().unwrap(), "dbo.t.id".parse().unwrap());
-    let mut after = before.clone();
-    after.roles.get_mut("writer").unwrap().grants = [(
-        "sequence::dbo.t.id".parse().unwrap(),
-        [Permission::Usage].into(),
-    )]
+    ids.tables = [
+        ("t_aaaaaa".parse().unwrap(), "dbo.t".parse().unwrap()),
+        ("t_bbbbbb".parse().unwrap(), "dbo.p1".parse().unwrap()),
+    ]
     .into();
-    compare(&cs, &ids, &before, &after).unwrap();
-    let preserved = after.clone();
-    after.roles.get_mut("writer").unwrap().grants.clear();
-    assert!(
-        compare(&cs, &ids, &before, &after)
-            .unwrap_err()
-            .contains("usage")
+    ids.columns = [
+        ("c_aaaaaa".parse().unwrap(), "dbo.t.id".parse().unwrap()),
+        ("c_bbbbbb".parse().unwrap(), "dbo.p1.id".parse().unwrap()),
+    ]
+    .into();
+    let mut detached = before.clone();
+    let mut plain = Column::new("integer".parse().unwrap());
+    plain.value_source = ValueSource::Default("0".into());
+    detached.tables.insert(
+        "dbo.p1".parse().unwrap(),
+        Table {
+            columns: [("id".into(), plain)].into(),
+            ..Default::default()
+        },
     );
-    after = preserved.clone();
-    after
+    detached.roles.get_mut("writer").unwrap().grants = [
+        ("dbo.p1".parse().unwrap(), [Permission::Insert].into()),
+        (
+            "sequence::dbo.t.id".parse().unwrap(),
+            [Permission::Usage].into(),
+        ),
+    ]
+    .into();
+    let cs = changes(vec![Change::DetachPartition {
+        uid: "t_bbbbbb".parse().unwrap(),
+        table: "dbo.p1".parse().unwrap(),
+        parent: "dbo.t".parse().unwrap(),
+        names: vec![],
+        shape: Box::new(detached.tables[&"dbo.p1".parse().unwrap()].clone()),
+    }]);
+    compare(&cs, &ids, &before, &detached).unwrap();
+    let mut missing = detached.clone();
+    missing
         .roles
         .get_mut("writer")
         .unwrap()
         .grants
-        .get_mut(&"sequence::dbo.t.id".parse().unwrap())
+        .remove(&"sequence::dbo.t.id".parse().unwrap());
+    assert!(compare(&cs, &ids, &before, &missing).is_err());
+    let cs = changes(vec![
+        Change::AttachPartition {
+            uid: "t_bbbbbb".parse().unwrap(),
+            table: "dbo.p1".parse().unwrap(),
+            parent: "dbo.t".parse().unwrap(),
+            bound: PartitionBound::Default,
+            key: vec![],
+            shape: Box::new(before.tables[&"dbo.p1".parse().unwrap()].clone()),
+        },
+        Change::Grant {
+            role: "writer".into(),
+            target: "dbo.p1".parse().unwrap(),
+            permissions: [Permission::SerialSequences].into(),
+        },
+    ]);
+    ids.columns.remove(&"c_bbbbbb".parse().unwrap());
+    compare(&cs, &ids, &missing, &before).unwrap();
+    let mut ungranted = before.clone();
+    ungranted
+        .roles
+        .get_mut("writer")
         .unwrap()
-        .insert(Permission::Update);
-    assert!(
-        compare(&cs, &ids, &before, &after)
-            .unwrap_err()
-            .contains("update")
-    );
-    // Adding INSERT folds the same physical entry into the marker.
-    let cs = changes(vec![Change::Grant {
-        role: "writer".into(),
-        target: "dbo.t".parse().unwrap(),
-        permissions: [Permission::Insert, Permission::SerialSequences].into(),
-    }]);
-    compare(&cs, &ids, &preserved, &before).unwrap();
+        .grants
+        .get_mut(&"dbo.p1".parse().unwrap())
+        .unwrap()
+        .remove(&Permission::SerialSequences);
+    assert!(compare(&cs, &ids, &missing, &ungranted).is_err());
 }
 
 #[test]
