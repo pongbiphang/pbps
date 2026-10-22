@@ -126,30 +126,32 @@ pub struct Request<'a> {
     pub base: pbps_diff::Side<'a>,
     pub desired: pbps_diff::Side<'a>,
     pub hints: &'a pbps_model::Hints,
-    /// The `system_identifier` of the cluster the planning read reached, for
-    /// a PostgreSQL target. The resolver's own target connection must reach
-    /// the same one: a target name can reach several (#1685).
+    /// The planning read's engine lineage identity: PostgreSQL's cluster
+    /// `system_identifier` or SQL Server master's `family_guid`. The resolver
+    /// must reach the same one: a target name can reach several (#1685).
     pub target_identity: Option<&'a str>,
 }
 
-/// The `system_identifier` of the cluster `conn` reached, for a PostgreSQL
-/// target: the planning read's, which the resolver's own target connection
-/// must match, since a target name can reach several clusters (#1685).
-/// Only PostgreSQL is resolved, and resolution refuses the other engines by
-/// name, so they record none. Both kinds of resolver are bound by it: a
+/// The engine lineage identity the planning read reached, which the
+/// resolver's own target connection must match, since a target name can
+/// reach several clusters or instances (#1685).
+/// Both kinds of resolver are bound by the engine's lineage identity: a
 /// Docker scratch, like a supplied server, answers for the cluster the plan
 /// was read from (#1674), so neither plans for a role refused the read.
 pub async fn planning_identity(
     conn: &mut pbps_db::Conn,
     _selection: &ResolverSelection,
 ) -> Result<Option<String>, Refused> {
-    if conn.driver() != pbps_db::Driver::Postgres {
-        return Ok(None);
-    }
-    pbps_pg::resolver::scratch::cluster_identity(conn)
+    let driver = conn.driver();
+    pbps_cli::resolver::server::target_identity(conn)
         .await
         .map(Some)
-        .map_err(identity_unread)
+        .map_err(|error| match driver {
+            pbps_db::Driver::Postgres => identity_unread(error),
+            pbps_db::Driver::Mssql => Refused::Unanswerable(anyhow::anyhow!(
+                "the target's master family_guid could not be read: {error}"
+            )),
+        })
 }
 
 /// A refused read of the cluster's identity is the deployment role's to
@@ -241,16 +243,6 @@ pub async fn resolve(
     request: &Request<'_>,
 ) -> Result<pbps_cli::resolver::server::Unsealed, Refused> {
     let driver = request.target.driver();
-    if driver != pbps_db::Driver::Postgres {
-        return Err(Refused::Finding(gated(
-            request.selection,
-            request.assessment,
-            "the resolver answers for PostgreSQL only; SQL Server resolution is not built yet \
-             (#619, #620)",
-            "Select no resolver for this environment: without one, the existing protection \
-             keeps deciding (DEC-1515.1).",
-        )));
-    }
     if let Err(missing) =
         pbps_cli::resolver::sealing::environment_key(request.project, request.target.environment())
     {
@@ -829,11 +821,9 @@ mod tests {
         assert!(unbound.contains("no cluster identity"), "{unbound}");
     }
 
-    /// SQL Server resolution is a gate that refuses by name before the
-    /// resolver runs (#1517). Negative: a PostgreSQL target passes it, and
-    /// stops at the next step, the missing fingerprint key.
+    /// Both engines require the fingerprint key before acquiring scratch.
     #[test]
-    fn sql_server_resolution_is_refused_by_name() {
+    fn both_engines_require_the_key_before_acquiring_scratch() {
         let selection = selection();
         let (base, desired) = arrival();
         let Case::Required { assessment, .. } = decide(Some(&selection), &base, &desired) else {
@@ -882,23 +872,7 @@ mod tests {
             "sqlserver://127.0.0.1:1;database=pbps",
             pbps_db::Driver::Mssql,
         );
-        assert_eq!(mssql.id, "resolver.unresolved");
-        assert_eq!(
-            mssql.message,
-            format!(
-                "the selected resolver `local` cannot answer the binding questions of {}: \
-                 the resolver answers for PostgreSQL only; SQL Server resolution is not built yet \
-                 (#619, #620).",
-                named(&assessment),
-            ),
-        );
-        assert_eq!(
-            mssql.remedy.as_deref(),
-            Some(
-                "Select no resolver for this environment: without one, the existing protection \
-                  keeps deciding (DEC-1515.1)."
-            ),
-        );
+        assert_eq!(mssql.id, "resolver.key");
         let postgres = refusal(
             "postgres://pbps@127.0.0.1:1/pbps",
             pbps_db::Driver::Postgres,

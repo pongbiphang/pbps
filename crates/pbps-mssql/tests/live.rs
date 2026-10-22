@@ -35,6 +35,9 @@ use pbps_mssql::Mssql;
 #[path = "live/binding_releases.rs"]
 mod binding_releases;
 
+#[path = "live/scratch2236.rs"]
+mod scratch2236;
+
 #[path = "support/commutation.rs"]
 mod commutation;
 

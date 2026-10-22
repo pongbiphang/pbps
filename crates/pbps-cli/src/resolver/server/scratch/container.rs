@@ -476,12 +476,37 @@ mod tests {
             engine.connection(41417, "secret").unwrap(),
             "host=127.0.0.1 port=41417 user=postgres password=secret dbname=postgres sslmode=disable"
         );
-        let Err(super::ProduceError::Run(super::Error::Binding(reason))) =
-            super::engine::docker(Driver::Mssql, "secret")
-        else {
-            panic!("SQL Server has no Docker scratch adapter");
-        };
-        assert_eq!(reason, "the resolver is implemented for PostgreSQL only");
+        let mssql =
+            super::engine::docker(Driver::Mssql, "0123456789abcdef0123456789abcdef").unwrap();
+        let password = pbps_mssql::resolver::scratch::password("0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            mssql.environment,
+            [
+                "ACCEPT_EULA=Y".to_owned(),
+                format!("MSSQL_SA_PASSWORD={password}")
+            ]
+        );
+        assert_eq!(mssql.readiness_query, "SELECT 1 AS ok");
+        assert_eq!(
+            mssql
+                .connection(41417, "0123456789abcdef0123456789abcdef")
+                .unwrap(),
+            format!(
+                "Server=127.0.0.1,41417;Database=master;User \
+                 Id=sa;Password={password};TrustServerCertificate=true"
+            )
+        );
+        let mssql_args = run_args("pbps-scratch-1", &mssql, "sql-server-image");
+        assert!(
+            mssql_args
+                .windows(2)
+                .any(|pair| pair == ["--publish", "127.0.0.1::1433"])
+        );
+        assert!(
+            mssql_args
+                .windows(2)
+                .any(|pair| pair == ["--pull", "never"])
+        );
         assert_eq!(after("--publish"), "127.0.0.1::5432");
         assert_eq!(after("--name"), "pbps-scratch-0");
         let labels: Vec<&str> = args

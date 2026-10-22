@@ -77,6 +77,12 @@ pub struct ResolvedPlan {
     pub evidence: pbps_model::resolver::ResolverEvidence,
 }
 
+/// The selected resolver binds its target before acquiring scratch. The
+/// engine adapter supplies the lineage read; this acquires no resource.
+pub async fn target_identity(target: &mut pbps_db::Conn) -> Result<String, pbps_db::DbError> {
+    engine::target_identity(target.driver(), target).await
+}
+
 struct ProducerOutcome {
     compiled: engine::CompiledCapture,
     opening_build: String,

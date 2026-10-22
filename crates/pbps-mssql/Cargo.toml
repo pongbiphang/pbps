@@ -15,7 +15,8 @@ pbps-db.workspace = true
 # The authorization context is serialised into its canonical form for the
 # fingerprint (#611), the same way the PostgreSQL one is.
 serde.workspace = true
-serde_json.workspace = true
+# Scratch comparisons keep numeric JSON tokens without rounding future columns.
+serde_json = { workspace = true, features = ["raw_value"] }
 # The generated default-constraint name is cut to fit and carries a digest of
 # the qualified column so two cuts stay distinct. The same checksum the plan
 # pinning already uses, rather than a second hash in the tree.

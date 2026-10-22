@@ -245,7 +245,7 @@ for a moment keeps that type.
     `db_owner` of its scratch database, to create and impersonate the
     sandbox. Its server permissions, roles, ownership and mappings stay
     outside the sandbox, whatever they are.
-  - **What still reaches out**, read before the first write. Each is a
+  - **What still reaches out**, read before the first plan statement. Each is a
     property of the instance or of the scratch database, not of an account:
     - **A database whose `guest` admits the sandbox.** The sandbox entered,
       and wrote, a target with `guest` enabled.
@@ -264,12 +264,30 @@ for a moment keeps that type.
     - **The scratch database's options, compared whole.** Its
       `sys.databases` row is compared with a fresh database's, every column
       by default [`a_scratch_databases_options_are_compared_whole_with_a_fresh_databases`].
-      - Only identity is skipped: `name`, `database_id`, `create_date`,
+      - Identity is skipped: `name`, `database_id`, `create_date`,
         `physical_database_name`, `service_broker_guid` and `owner_sid`.
-        Two fresh databases differ in exactly those, and so does one that
-        has been used.
-      - The collation and compatibility level are compared with the target
-        instead, as reported facts.
+        `log_reuse_wait` and `log_reuse_wait_desc` are statuses too: a
+        FULL-recovery database waiting for `LOG_BACKUP` remains usable.
+      - The collation, compatibility level, containment and ANSI settings
+        are compared with the target instead, by §9's reported-facts rule.
+        The fresh-row exclusions and that rule's database facts must name
+        exactly the same set (DEC-2236.1).
+      - In the run-owned layout the administrator creates a reference
+        database beside scratch, reads its row, and immediately drops it,
+        including after a failed read. It inherits that instance's `model`.
+      - A supplied account need not be able to create a database. Its
+        reference is `model`'s row, with the creation-decided bits replaced
+        by measured values: broker, full-text and data retention start
+        enabled; mixed-page allocation, read-only, clean shutdown, trust,
+        chaining, broker priority, accelerated recovery and optimized
+        locking start disabled. Every other column is compared by default.
+      - A supplied scratch refuses when `model` is `READ_ONLY`, naming
+        `ALTER DATABASE model SET READ_WRITE` as the remedy. On that model,
+        snapshot isolation reports ON even when its persisted setting is
+        OFF; two identical reported rows can produce different newborn
+        rows. A constant cannot recover the hidden setting. The live test
+        enumerates every database column and restores and verifies `model`
+        after every option measurement.
       - The sandbox cannot change an option. An option set before it
         arrives is caught without a rule naming it. A `TRUSTWORTHY` scratch
         owned by an administrator lends an `EXECUTE AS OWNER` module the
@@ -278,16 +296,32 @@ for a moment keeps that type.
         not restore the inventory.
     - **What `guest` and `public` hold in `master`, `tempdb` and `msdb`.**
       The sandbox enters them as `guest`. Its token there must be `guest`
-      and `public` only, holding exactly the grants and ownership of the
-      fresh-install inventory, measured as §7's inventory is.
-      - On the pinned build that inventory is identical on Developer and
-        Express. At database scope it is `CONNECT` to `guest` and the two
-        `VIEW ANY COLUMN … KEY DEFINITION` permissions to `public`. The rest
-        are object grants on system objects, and `guest` owns the `guest`
-        schema.
-      - A grant to `guest` or `public` there, a role `guest` joins, or a
-        schema `guest` owns would be the sandbox's
-        [`a_guest_login_reads_what_guest_and_public_hold_in_a_system_database`].
+      and `public` only. Fixed rules apply on every build, without a
+      permission-list snapshot (DEC-2236.1):
+      - At database scope, exactly three GRANTs qualify: `CONNECT` to
+        `guest`, and `VIEW ANY COLUMN MASTER KEY DEFINITION` and
+        `VIEW ANY COLUMN ENCRYPTION KEY DEFINITION` to `public`.
+      - An object permission must resolve as ms-shipped through
+        `OBJECTPROPERTYEX(major_id, 'IsMSShipped')`, evaluated inside that
+        database. Hidden system views can be absent from `sys.all_objects`.
+        NULL refuses as unresolvable; `OBJECT_SCHEMA_NAME` and `OBJECT_NAME`
+        name the object under the same rule.
+      - A GRANT must be object-level (`minor_id = 0`), to `public`, and
+        SELECT or EXECUTE. A DENY on an ms-shipped object qualifies because
+        it only narrows reach. If it prevents a required catalog read, that
+        read refuses by database and catalog name. No other permission
+        class or permission on a non-ms-shipped object qualifies: an
+        administrator's `EXECUTE AS OWNER` procedure is one such path.
+      - `guest` must belong to no role and own only the `guest` schema;
+        `public` owns nothing. Violations name the database, grantee,
+        permission and affected object or role.
+      - **Accepted residual.** An administrator's added GRANT to `public`
+        on an ms-shipped object cannot be distinguished from a shipped
+        grant. Measured `sys.xp_cmdshell` and `sys.sp_helptext` EXECUTE
+        grants differ only in `major_id` in `sys.database_permissions`.
+        Every login already holds that shared reach, the supplied account
+        included, so the sandbox gains nothing from it. The check accepts
+        it rather than pinning a build's system-object list.
   - **Why not a confined login.** The design first checked the supplied
     login's own reach against an allowlist, in PostgreSQL's form (#2085).
     Review kept finding reaches a SQL Server login carries that no read of
@@ -364,13 +398,24 @@ fresh-install inventory
 - the 14 principals: `public`, `dbo`, `guest`, `INFORMATION_SCHEMA`, `sys`
   and the nine fixed roles;
 - one role membership, `db_owner` ← `dbo`;
-- permissions: `public`'s 2 database grants and 232 grants on system objects,
-  and `dbo`'s one database grant;
+- permissions: `public`'s 2 database grants and `dbo`'s one database grant;
 - no user type, assembly, synonym, XML schema collection, full-text catalog
   or database DDL trigger, and no database-scoped configuration away from its
   default.
 
-**How the inventory is read.** Not from a hand-written list of catalogs. A
+The empty check has no build-keyed snapshot baseline. Outside the accepted
+residuals below, it requires no user-created catalog row and requires the
+fixed schema, principal, membership and database-grant lists above.
+SELECT on an ms-shipped catalog view is the
+measured exception: a fresh database's 232 system-object grants are all
+such SELECTs, including hidden views `sys.all_objects` does not list.
+They cannot be schema-bound, creation does not execute their reads, and
+the loginless `db_owner` sandbox can grant, deny and revoke them itself.
+Every other permission on a system object must be absent. A denied catalog
+read refuses by catalog name; it never certifies emptiness (DEC-2236.1).
+
+**How the inventory is read.** Securable classes and an explicit sweep of
+non-securable catalogs supply the inventory. A
 database holds things `sys.objects` never lists: a master key, a
 certificate, an asymmetric key, and a partition function and scheme each
 live only in their own catalog [`a_database_holds_securables_no_object_catalog_lists`].
@@ -384,19 +429,63 @@ live only in their own catalog [`a_database_holds_securables_no_object_catalog_l
   rows, and the system broker objects a new database carries are among
   them. A class with no known catalog refuses by name, so a class a later
   build adds is refused until it is read.
-- **Objects that are no securable.** These are read from their catalogs
-  too:
-  - partition functions and schemes;
-  - plan guides;
-  - event notifications;
-  - database audit specifications;
-  - the database's filegroups and files.
+- **Objects that are no securable.** The inventory was swept against
+  `sys.all_views` on the pinned 17.0.4075.5 build. Beyond the securable
+  classes it reads:
+  - partition functions and schemes, plan guides and event notifications;
+  - database audit specifications, filegroups and files;
+  - Always Encrypted master keys, encryption keys and their values;
+  - extended properties, every class;
+  - broker priorities and conversation endpoints, plus conversation groups
+    and queued transmissions without an endpoint;
+  - external data sources, file formats and libraries;
+  - database and table change tracking;
+  - FILESTREAM non-transacted access and directory settings;
+  - automatic tuning mode and explicitly selected tuning options;
+  - user Query Store hints, forced plans and per-query tuning settings;
+  - ledger digest locations, including historical locations, which refuse
+    by name because there is no safe cleanup rule.
 
-  The engine names no list of these, so this is the one part written by
-  hand.
+  A populated ledger digest location could not be tested because it needs
+  external storage; the guard refuses any returned row.
+
+  Fresh FILESTREAM settings are OFF with no directory. Fresh automatic
+  tuning uses AUTO mode and DEFAULT options; its runtime actual state is
+  not a baseline. Database-ID catalogs are filtered to the current database.
+  Query Store execution statistics alone are runtime history; recorded
+  hints, forced plans and tuning overrides are persistent intent.
+
+  Parent cleanup was measured for search properties, sensitivity labels,
+  security predicates, selective XML paths and namespaces, JSON and spatial
+  indexes, columnstore metadata, table change tracking, ordinary columns,
+  constraints, statistics, parameters and dependencies. Dropping their
+  inventoried parent removes the corresponding user rows. External library
+  files disappear with their library. Full-text catalogs can be created and
+  dropped, but stoplist and index creation fail on this image (7609), so
+  empty full-text child catalogs are not evidence of parent cleanup. Ledger deletion retains named, soft-deleted table/view
+  objects and history; it must refuse rather than report a fresh database.
+
+  There is no engine-provided enumeration of non-securable kinds. The
+  explicit list remains necessary even though every securable class is
+  checked against the engine's list.
+- **Accepted residual: database encryption key with encryption OFF.** The
+  whole `sys.databases` row is unchanged; reading the key needs server-level
+  `VIEW SERVER SECURITY STATE` (15562 as the loginless `db_owner`). No object
+  creation, binding or compilation depends on it. Encryption ON changes
+  `is_encrypted`, so the whole-row comparison refuses. pbps never creates
+  a database encryption key, so cleanup cannot leave one behind; run-owned
+  and Docker databases start new.
+- **Accepted residual: granular Query Store options.** `db_owner` can change
+  `QUERY_CAPTURE_MODE`, `MAX_STORAGE_SIZE_MB` and similar options without
+  changing `sys.databases`. Fresh defaults vary by version with no
+  `is_default`, so a baseline would be build-keyed. They govern plan
+  collection, never object creation, binding or compilation. Hints, forced
+  plans and per-query tuning that affect execution remain inventoried and
+  cleaned. Neither residual adds a read, permission or baseline.
 
 #723's check compares the newborn database with this inventory, read so,
-before any scratch write. A table or user added to `model` appears in the next
+before sandbox setup or plan DDL. The live marker necessarily precedes it.
+A table or user added to `model` appears in the next
 `CREATE DATABASE`, measured on #619.
 
 The check reads as the database's `db_owner`. Metadata visibility hides what
@@ -405,21 +494,45 @@ exists [`an_account_that_is_not_db_owner_cannot_see_what_its_database_holds`].
 So the supplied layout's account must be `db_owner` of its database, and a
 check that cannot read as one refuses.
 
-The supplied layout is emptied after a run, and before one, as `db_owner`.
+An initially dirty supplied database refuses without dropping its contents,
+as PostgreSQL's does. After acquisition, the supplied layout is emptied
+after a run, including a refusal, as `db_owner`.
 SQL Server has no `DROP OWNED`. So cleanup drops exactly what the
 inventory read finds beyond the fresh-install inventory, the same read #723's
 check makes, rather than a list of kinds. A kind no rule here knows to drop
 refuses by name, rather than being left behind:
 
-- **Order.** Cleanup works in reverse dependency order: schema-bound
+- **Order.** Extended properties precede grants and memberships. Cleanup
+  then works in reverse dependency order: schema-bound
   dependents, then modules, tables, types, synonyms and other
   schema-contained objects, then schemas, then database roles and users.
+  Conversations end before services and priorities are dropped. External
+  tables use `DROP EXTERNAL TABLE` before data sources, file formats and
+  credentials. Security policies precede tables and functions. Table change
+  tracking is disabled before primary keys are dropped (3735), and database
+  tracking is disabled after the tables. Automatic tuning returns to AUTO
+  before options return to DEFAULT (15715). Query Store hints and forced
+  plans are cleared before their query is removed (12456).
+  Partition schemes precede their functions, and encryption keys precede
+  their master keys. A role owned by another role or user goes before its
+  owner; that ownership chain is a dependency too (15421).
+  Catalog-ID edges also order references within a rank: symmetric-key
+  encryptors, assembly references and table types using alias types.
+  Certificate/key-mapped users precede their matching key by SID (15559);
+  signatures and counter-signatures precede their signer. Keys precede
+  their owners and master-key protectors, and external models precede
+  their credentials. Bound types or columns precede standalone defaults
+  and rules; standalone defaults use `DROP DEFAULT`. A dependency cycle
+  refuses with the retained names. Cleanup does not acquire passwords or
+  alter encryption to break a cycle.
 - **Roles.** A role sheds its members first. Its schemas go before it,
   since `DROP ROLE` refuses a role that has a member (15144) or owns a
   schema (15138)
   [`a_role_drops_only_after_its_members_and_the_schemas_it_owns`].
 - **The sandbox user** is dropped last, by a fresh session of the supplied
-  account.
+  account. Other cleanup statements stay in the irreversible sandbox:
+  database DDL triggers are user code too. The final privileged drop checks
+  that the complete inventory contains no other remaining object first.
 - **Afterwards.** A database that does not read as the inventory refuses
   the next run.
 

@@ -17,6 +17,11 @@
       "fixture": "Pinned SQL Server; PBPS_TEST_DB.",
       "job": "live"
     },
+    "resolver-mssql": {
+      "platform": "linux",
+      "fixture": "Two pinned SQL Server instances with one build and collation; the configured resolver Docker image.",
+      "job": "resolver-mssql"
+    },
     "editions": {
       "platform": "linux",
       "fixture": "Pinned SQL Server Developer and case-sensitive Express instances.",
@@ -1907,6 +1912,60 @@
       "ignored_on": ["linux", "win32", "darwin"],
       "cases": [
         "a_table_swap_is_refused_at_diff_time_on_every_path"
+      ]
+    },
+    {
+      "target": [
+        "pbps-mssql",
+        "test",
+        "live"
+      ],
+      "owner": "resolver-mssql",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "scratch2236::model_inheritance_is_measured_and_read_only_model_refuses_with_its_remedy",
+        "scratch2236::scratch_inventory_reads_every_catalog_and_cleans_contained_dependencies",
+        "scratch2236::supplied_options_compare_every_column_and_allow_log_backup_status",
+        "scratch2236::sandbox_checks_all_database_names_and_the_complete_system_contract",
+        "scratch2236::system_catalog_selects_are_creation_independent_and_other_system_permissions_refuse",
+        "scratch2236::a_live_marker_distinguishes_instances_and_pins_the_backend_before_any_setup",
+        "scratch2236::inherited_model_objects_refuse_and_the_model_is_restored_before_assertions",
+        "scratch2236::failed_database_creation_and_failed_reference_reads_release_every_recorded_resource",
+        "scratch2236::system_database_permissions_follow_fixed_rules_and_restore_each_change",
+        "scratch2236::independent_database_catalogs_are_dirty_and_cleanup_restores_fresh_as_owner",
+        "scratch2236::ledger_soft_deletion_refuses_with_the_retained_object_names",
+        "scratch2236::assembly_references_drop_dependents_before_providers_as_owner",
+        "scratch2236::cyclic_symmetric_key_protection_refuses_by_name_and_preserves_the_keys"
+      ]
+    },
+    {
+      "target": [
+        "pbps-cli",
+        "lib",
+        "pbps_cli"
+      ],
+      "owner": "resolver-mssql",
+      "validate_on": "linux",
+      "ignored_on": [
+        "linux",
+        "win32",
+        "darwin"
+      ],
+      "cases": [
+        "resolver::server::scratch::mssql_live_tests::mssql_supplied_owner_needs_no_creation_and_changed_visibility_or_system_context_refuses",
+        "resolver::server::scratch::mssql_live_tests::mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract",
+        "resolver::server::scratch::mssql_live_tests::mssql_run_owned_acquisition_needs_only_login_and_database_creation_privileges",
+        "resolver::server::scratch::mssql_live_tests::mssql_supplied_acquisition_refuses_target_and_cleans_after_the_externals_refusal",
+        "resolver::server::scratch::mssql_live_tests::mssql_supplied_cleanup_names_the_retained_sandbox_after_failure",
+        "resolver::server::scratch::mssql_live_tests::mssql_run_owned_acquisition_removes_its_login_database_and_reference_on_refusal",
+        "resolver::server::scratch::mssql_live_tests::mssql_supplied_guest_admission_dirty_inventory_and_persistent_options_refuse_by_name",
+        "resolver::server::scratch::mssql_live_tests::mssql_docker_removes_the_container_on_success_failure_and_cancellation",
+        "resolver::server::scratch::mssql_live_tests::mssql_supplied_independent_catalogs_refuse_untouched_and_cleanup_restores_fresh"
       ]
     }
   ]

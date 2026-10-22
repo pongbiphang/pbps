@@ -1,0 +1,174 @@
+[
+  [
+    "BROKER PRIORITY",
+    "CREATE BROKER PRIORITY bp FOR CONVERSATION SET(CONTRACT_NAME=ANY,LOCAL_SERVICE_NAME=ANY,REMOTE_SERVICE_NAME=ANY,PRIORITY_LEVEL=10);"
+  ],
+  [
+    "EXTERNAL DATA SOURCE",
+    "CREATE EXTERNAL DATA SOURCE ds WITH(TYPE=BLOB_STORAGE,LOCATION='https://example.invalid/container');"
+  ],
+  [
+    "EXTERNAL FILE FORMAT",
+    "CREATE EXTERNAL FILE FORMAT fmt WITH(FORMAT_TYPE=DELIMITEDTEXT,FORMAT_OPTIONS(FIELD_TERMINATOR=','));"
+  ],
+  [
+    "EXTERNAL LIBRARY",
+    "CREATE EXTERNAL LIBRARY library FROM(CONTENT=0x504b03041400000008007a50565d919d6d2753000000660000000800000073657475702e70794b2bcacf55284e2d292d28c9cfcf2956c8cc2dc82f2a81887081498dbcc4dc545bf582a48262232363b382a2fca454759db2d4a2e2ccfc3c5b75033d033d43759d82caf8dcfc94d29cd462db6834b5b19a5c00504b03041400000008007a50565def3f1b6a0a0000000800000010000000706270733232333670726f62652e70792b4bcc294db535e40200504b010214031400000008007a50565d919d6d27530000006600000008000000000000000000000080010000000073657475702e7079504b010214031400000008007a50565def3f1b6a0a00000008000000100000000000000000000000800179000000706270733232333670726f62652e7079504b0506000000000200020074000000b10000000000) WITH(LANGUAGE='Python');"
+  ],
+  [
+    "database change tracking",
+    "ALTER DATABASE CURRENT SET CHANGE_TRACKING=ON(CHANGE_RETENTION=2 DAYS,AUTO_CLEANUP=ON); CREATE TABLE dbo.t(i int PRIMARY KEY); ALTER TABLE dbo.t ENABLE CHANGE_TRACKING WITH(TRACK_COLUMNS_UPDATED=ON);"
+  ],
+  [
+    "database FILESTREAM options",
+    "ALTER DATABASE CURRENT SET FILESTREAM(NON_TRANSACTED_ACCESS=READ_ONLY,DIRECTORY_NAME=N'pbps2236_directory');"
+  ],
+  [
+    "automatic tuning option FORCE_LAST_GOOD_PLAN",
+    "ALTER DATABASE CURRENT SET AUTOMATIC_TUNING(FORCE_LAST_GOOD_PLAN=ON);"
+  ],
+  [
+    "database automatic tuning mode",
+    "ALTER DATABASE CURRENT SET AUTOMATIC_TUNING=CUSTOM;"
+  ],
+  [
+    "conversation endpoint",
+    "CREATE MESSAGE TYPE message VALIDATION=NONE; CREATE CONTRACT contract(message SENT BY ANY); CREATE QUEUE dbo.queue; CREATE SERVICE service ON QUEUE dbo.queue(contract); DECLARE @h uniqueidentifier; BEGIN DIALOG CONVERSATION @h FROM SERVICE service TO SERVICE N'service' ON CONTRACT contract WITH ENCRYPTION=OFF; SEND ON CONVERSATION @h MESSAGE TYPE message(N'hello'); CREATE BROKER PRIORITY bound_priority FOR CONVERSATION SET(CONTRACT_NAME=contract,LOCAL_SERVICE_NAME=service,REMOTE_SERVICE_NAME=ANY,PRIORITY_LEVEL=10);"
+  ],
+  [
+    "EXTERNAL DATA SOURCE",
+    "CREATE EXTERNAL DATA SOURCE ds WITH(LOCATION='abs://container@example.invalid'); CREATE EXTERNAL FILE FORMAT fmt WITH(FORMAT_TYPE=DELIMITEDTEXT); EXEC(N'CREATE EXTERNAL TABLE dbo.t(i int) WITH(LOCATION=''probe.csv'',DATA_SOURCE=ds,FILE_FORMAT=fmt);');"
+  ],
+  [
+    "OBJECT SP",
+    "CREATE TABLE dbo.t(i int); EXEC(N'CREATE FUNCTION dbo.predicate(@i int) RETURNS TABLE WITH SCHEMABINDING AS RETURN SELECT 1 AS allowed WHERE @i=1;'); EXEC(N'CREATE SECURITY POLICY dbo.policy ADD FILTER PREDICATE dbo.predicate(i) ON dbo.t WITH(STATE=ON);');"
+  ],
+  [
+    "Query Store intent query",
+    "ALTER DATABASE CURRENT SET QUERY_STORE(QUERY_CAPTURE_MODE=ALL); CREATE TABLE dbo.q(i int); INSERT dbo.q VALUES(1),(2); EXEC sys.sp_executesql N'SELECT SUM(i)+@i AS pbps2236_query_intent FROM dbo.q OPTION(MAXDOP 1);',N'@i int',@i=42; EXEC sys.sp_query_store_flush_db; DECLARE @q bigint,@p bigint; SELECT TOP(1) @q=q.query_id,@p=p.plan_id FROM sys.query_store_query q JOIN sys.query_store_query_text t ON q.query_text_id=t.query_text_id JOIN sys.query_store_plan p ON p.query_id=q.query_id WHERE t.query_sql_text LIKE N'(@i int)SELECT SUM(i)+@i%'; IF @q IS NULL THROW 50000,'the owned query was not captured',1; EXEC sys.sp_query_store_set_hints @query_id=@q,@query_hints=N'OPTION(MAXDOP 2)'; ALTER DATABASE CURRENT SET QUERY_STORE(QUERY_CAPTURE_MODE=AUTO);"
+  ],
+  [
+    "Query Store intent query",
+    "ALTER DATABASE CURRENT SET QUERY_STORE(QUERY_CAPTURE_MODE=ALL); CREATE TABLE dbo.q(i int); INSERT dbo.q VALUES(1),(2); EXEC sys.sp_executesql N'SELECT SUM(i)+@i AS pbps2236_query_intent FROM dbo.q OPTION(MAXDOP 1);',N'@i int',@i=42; EXEC sys.sp_query_store_flush_db; DECLARE @q bigint,@p bigint; SELECT TOP(1) @q=q.query_id,@p=p.plan_id FROM sys.query_store_query q JOIN sys.query_store_query_text t ON q.query_text_id=t.query_text_id JOIN sys.query_store_plan p ON p.query_id=q.query_id WHERE t.query_sql_text LIKE N'(@i int)SELECT SUM(i)+@i%'; IF @q IS NULL THROW 50000,'the owned query was not captured',1; EXEC sys.sp_query_store_force_plan @query_id=@q,@plan_id=@p; ALTER DATABASE CURRENT SET QUERY_STORE(QUERY_CAPTURE_MODE=AUTO);"
+  ],
+  [
+    "Query Store intent query",
+    "ALTER DATABASE CURRENT SET QUERY_STORE(QUERY_CAPTURE_MODE=ALL); CREATE TABLE dbo.q(i int); INSERT dbo.q VALUES(1),(2); EXEC sys.sp_executesql N'SELECT SUM(i)+@i AS pbps2236_query_intent FROM dbo.q OPTION(MAXDOP 1);',N'@i int',@i=42; EXEC sys.sp_query_store_flush_db; DECLARE @q bigint,@p bigint; SELECT TOP(1) @q=q.query_id,@p=p.plan_id FROM sys.query_store_query q JOIN sys.query_store_query_text t ON q.query_text_id=t.query_text_id JOIN sys.query_store_plan p ON p.query_id=q.query_id WHERE t.query_sql_text LIKE N'(@i int)SELECT SUM(i)+@i%'; IF @q IS NULL THROW 50000,'the owned query was not captured',1; EXEC sys.sp_configure_automatic_tuning 'FORCE_LAST_GOOD_PLAN','QUERY',@q,'OFF'; ALTER DATABASE CURRENT SET QUERY_STORE(QUERY_CAPTURE_MODE=AUTO);"
+  ],
+  [
+    "USER cert_user",
+    "EXEC(N'CREATE CERTIFICATE c ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'' WITH SUBJECT=''probe'';'); EXEC(N'CREATE USER cert_user FOR CERTIFICATE c;');"
+  ],
+  [
+    "USER key_user",
+    "EXEC(N'CREATE ASYMMETRIC KEY a WITH ALGORITHM=RSA_2048 ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE USER key_user FOR ASYMMETRIC KEY a;');"
+  ],
+  [
+    "CERTIFICATE",
+    "EXEC(N'CREATE CERTIFICATE c ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'' WITH SUBJECT=''probe'';'); EXEC(N'CREATE PROCEDURE dbo.p AS SELECT 1;'); EXEC(N'ADD SIGNATURE TO dbo.p BY CERTIFICATE c WITH PASSWORD=''Pbps!Probe2236Secret'';');"
+  ],
+  [
+    "CERTIFICATE",
+    "EXEC(N'CREATE CERTIFICATE c ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'' WITH SUBJECT=''probe'';'); EXEC(N'CREATE PROCEDURE dbo.p AS SELECT 1;'); EXEC(N'ADD COUNTER SIGNATURE TO dbo.p BY CERTIFICATE c WITH PASSWORD=''Pbps!Probe2236Secret'';');"
+  ],
+  [
+    "CERTIFICATE",
+    "EXEC(N'CREATE CERTIFICATE c ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'' WITH SUBJECT=''probe'';'); EXEC(N'CREATE SYMMETRIC KEY child WITH ALGORITHM=AES_256 ENCRYPTION BY CERTIFICATE c;');"
+  ],
+  [
+    "ASYMMETRIC KEY",
+    "EXEC(N'CREATE ASYMMETRIC KEY a WITH ALGORITHM=RSA_2048 ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE PROCEDURE dbo.p AS SELECT 1;'); EXEC(N'ADD SIGNATURE TO dbo.p BY ASYMMETRIC KEY a WITH PASSWORD=''Pbps!Probe2236Secret'';');"
+  ],
+  [
+    "ASYMMETRIC KEY",
+    "EXEC(N'CREATE ASYMMETRIC KEY a WITH ALGORITHM=RSA_2048 ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE PROCEDURE dbo.p AS SELECT 1;'); EXEC(N'ADD COUNTER SIGNATURE TO dbo.p BY ASYMMETRIC KEY a WITH PASSWORD=''Pbps!Probe2236Secret'';');"
+  ],
+  [
+    "ASYMMETRIC KEY",
+    "EXEC(N'CREATE ASYMMETRIC KEY a WITH ALGORITHM=RSA_2048 ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE SYMMETRIC KEY child WITH ALGORITHM=AES_256 ENCRYPTION BY ASYMMETRIC KEY a;');"
+  ],
+  [
+    "SYMMETRIC KEY",
+    "EXEC(N'CREATE SYMMETRIC KEY z_provider WITH ALGORITHM=AES_256 ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'OPEN SYMMETRIC KEY z_provider DECRYPTION BY PASSWORD=''Pbps!Probe2236Secret''; CREATE SYMMETRIC KEY m_child WITH ALGORITHM=AES_256 ENCRYPTION BY SYMMETRIC KEY z_provider; OPEN SYMMETRIC KEY m_child DECRYPTION BY SYMMETRIC KEY z_provider; CREATE SYMMETRIC KEY a_leaf WITH ALGORITHM=AES_256 ENCRYPTION BY SYMMETRIC KEY m_child; CLOSE ALL SYMMETRIC KEYS;');"
+  ],
+  [
+    "SYMMETRIC KEY",
+    "EXEC(N'CREATE SYMMETRIC KEY password_key WITH ALGORITHM=AES_256 ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';');"
+  ],
+  [
+    "CERTIFICATE",
+    "EXEC(N'CREATE MASTER KEY ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE CERTIFICATE c WITH SUBJECT=''probe'';');"
+  ],
+  [
+    "ASYMMETRIC KEY",
+    "EXEC(N'CREATE MASTER KEY ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE ASYMMETRIC KEY a WITH ALGORITHM=RSA_2048;');"
+  ],
+  [
+    "USER cert_user",
+    "EXEC(N'CREATE CERTIFICATE c ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'' WITH SUBJECT=''probe'';'); EXEC(N'CREATE USER cert_user FOR CERTIFICATE c;'); EXEC(N'CREATE SCHEMA held AUTHORIZATION cert_user;'); EXEC(N'CREATE ROLE held_role AUTHORIZATION cert_user;'); EXEC(N'CREATE TABLE held.t(i int);');"
+  ],
+  [
+    "APPLICATION ROLE app",
+    "EXEC(N'CREATE APPLICATION ROLE app WITH PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE SCHEMA held AUTHORIZATION app;'); EXEC(N'CREATE TABLE held.t(i int);');"
+  ],
+  [
+    "FULLTEXT CATALOG",
+    "EXEC(N'CREATE USER ft_owner WITHOUT LOGIN;'); EXEC(N'CREATE FULLTEXT CATALOG ft AUTHORIZATION ft_owner;');"
+  ],
+  [
+    "TYPE",
+    "EXEC(N'CREATE TYPE dbo.z_alias FROM int;'); EXEC(N'CREATE TYPE dbo.a_table AS TABLE(i dbo.z_alias);');"
+  ],
+  [
+    "OBJECT R",
+    "EXEC(N'CREATE RULE dbo.r AS @value>0;'); EXEC(N'CREATE TYPE dbo.t FROM int;'); EXEC(N'EXEC sys.sp_bindrule N''dbo.r'',N''dbo.t'';');"
+  ],
+  [
+    "OBJECT D",
+    "EXEC(N'CREATE DEFAULT dbo.d AS 1;'); EXEC(N'CREATE TYPE dbo.t FROM int;'); EXEC(N'EXEC sys.sp_bindefault N''dbo.d'',N''dbo.t'';');"
+  ],
+  [
+    "OBJECT D",
+    "EXEC(N'CREATE DEFAULT dbo.d AS 1;'); EXEC(N'CREATE TABLE dbo.t(i int);'); EXEC(N'EXEC sys.sp_bindefault N''dbo.d'',N''dbo.t.i'';');"
+  ],
+  [
+    "TYPE",
+    "EXEC(N'CREATE TYPE dbo.t AS TABLE(i int PRIMARY KEY,j int DEFAULT(1),CHECK(j>0));');"
+  ],
+  [
+    "USER later_user",
+    "EXEC(N'CREATE USER first_owner WITHOUT LOGIN;'); EXEC(N'CREATE CERTIFICATE c AUTHORIZATION first_owner ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'' WITH SUBJECT=''probe'';'); EXEC(N'CREATE USER later_user FOR CERTIFICATE c;');"
+  ],
+  [
+    "USER later_user",
+    "EXEC(N'CREATE USER first_owner WITHOUT LOGIN;'); EXEC(N'CREATE ASYMMETRIC KEY a AUTHORIZATION first_owner WITH ALGORITHM=RSA_2048 ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE USER later_user FOR ASYMMETRIC KEY a;');"
+  ],
+  [
+    "REMOTE SERVICE BINDING",
+    "EXEC(N'CREATE USER remote_user WITHOUT LOGIN;'); EXEC(N'CREATE CERTIFICATE c AUTHORIZATION remote_user ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'' WITH SUBJECT=''probe'';'); EXEC(N'CREATE REMOTE SERVICE BINDING binding TO SERVICE N''remote'' WITH USER=remote_user,ANONYMOUS=OFF;'); EXEC(N'CREATE ROUTE route WITH SERVICE_NAME=N''remote'',ADDRESS=N''LOCAL'';');"
+  ],
+  [
+    "EXTERNAL MODEL",
+    "EXEC(N'CREATE MASTER KEY ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE DATABASE SCOPED CREDENTIAL [https://example.invalid/] WITH IDENTITY=''HTTPEndpointHeaders'',SECRET=''{\"key\":\"unused\"}'';'); EXEC(N'CREATE EXTERNAL MODEL m WITH(LOCATION=''https://example.invalid/v1/embeddings'',API_FORMAT=''OpenAI'',MODEL_TYPE=EMBEDDINGS,MODEL=''probe'',CREDENTIAL=[https://example.invalid/]);');"
+  ],
+  [
+    "EXTERNAL DATA SOURCE",
+    "EXEC(N'CREATE MASTER KEY ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE DATABASE SCOPED CREDENTIAL cred WITH IDENTITY=''SHARED ACCESS SIGNATURE'',SECRET=''unused'';'); EXEC(N'CREATE EXTERNAL DATA SOURCE ds WITH(TYPE=BLOB_STORAGE,LOCATION=''https://example.invalid/container'',CREDENTIAL=cred);');"
+  ],
+  [
+    "USER cert_user",
+    "EXEC(N'CREATE MASTER KEY ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE CERTIFICATE c WITH SUBJECT=''probe'';'); EXEC(N'CREATE USER cert_user FOR CERTIFICATE c;');"
+  ],
+  [
+    "USER key_user",
+    "EXEC(N'CREATE MASTER KEY ENCRYPTION BY PASSWORD=''Pbps!Probe2236Secret'';'); EXEC(N'CREATE ASYMMETRIC KEY a WITH ALGORITHM=RSA_2048;'); EXEC(N'CREATE USER key_user FOR ASYMMETRIC KEY a;');"
+  ],
+  [
+    "TYPE",
+    "EXEC(N'CREATE TYPE dbo.a_alias FROM int;'); EXEC(N'CREATE TYPE dbo.z_table AS TABLE(i dbo.a_alias);');"
+  ],
+  [
+    "OBJECT R",
+    "EXEC(N'CREATE RULE dbo.r AS @v>0;'); EXEC(N'CREATE TABLE dbo.t(i int);'); EXEC(N'EXEC sys.sp_bindrule N''dbo.r'',N''dbo.t.i'';');"
+  ]
+]

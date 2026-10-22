@@ -3770,3 +3770,214 @@ live; and
 of the rule removed. The rebuilt-alike case of
 `mssql_an_identitys_seed_and_not_for_replication_are_differences` fails if
 the dates are compared.
+
+<a id="dec-2236-1"></a>
+
+**DEC-2236.1. SQL Server scratch mirrors the PostgreSQL lifecycle, with a
+live instance marker, a loginless sandbox, a catalog-driven empty check
+without a build-keyed baseline, and one inventory for
+reverse-dependency cleanup (#2236).**
+
+- **Separation precedes setup.** The scratch session creates a generated
+  global temporary marker, proves it can see the marker itself, and asks
+  the target to look for it. Visibility proves the same instance; equal
+  database IDs there refuse the target itself. The target is bound to the
+  planning read by `master`'s `family_guid`, which is a lineage identity,
+  never proof of separate instances. Backend checks keep the original
+  marker session pinned, and a new setup or cleanup connection must see
+  that live marker and the recorded database identity.
+- **The layout follows the measured boundary.** A capable account on
+  another instance creates the run's login and database. The CLI records
+  their cleanup obligation before the first creation, including partial
+  failure. On the target's instance only a supplied database qualifies.
+  Its initial inventory must already be clean; existing contents refuse
+  without being dropped. After acquisition a refusal still cleans setup.
+  Unlike PostgreSQL, SQL Server keeps the run-owned database with its
+  creator: the sandbox executes setup, not the generated login. Measured
+  with `ALTER ANY LOGIN` and `CREATE ANY DATABASE`, transferring ownership
+  to the new login fails with 15151 without `IMPERSONATE`. That extra
+  permission is unnecessary and is not added to the acquisition contract.
+- **Two fresh-option sources, no permission invented.** The run-owned
+  administrator creates a generated reference database beside scratch,
+  reads its whole `sys.databases` row and drops it immediately, on read
+  failure too. Both databases inherit that instance's `model`.
+  A supplied owner need not be able to create a database: it uses `model`'s
+  row with only the measured creation-decided bits replaced. Broker,
+  full-text and data retention start enabled; mixed-page allocation,
+  read-only, clean shutdown, trust, chaining, broker priority, accelerated
+  recovery and optimized locking start disabled. The live measurement
+  enumerates every reported column, toggles model options where accepted,
+  creates a database, and restores and verifies `model` after every case.
+- **READ_ONLY model is a named refusal.** Measured on 17.0.4075.5:
+  `ALLOW_SNAPSHOT_ISOLATION OFF` on a read-only `model` reports ON, but its
+  newborn reports OFF. Explicit ON produces an identical model row and
+  a newborn reporting ON. The visible row cannot recover the persisted
+  bit, so supplied scratch names the state and the remedy
+  `ALTER DATABASE model SET READ_WRITE`. It never guesses an inherited
+  option. This is the rare, detectable-state refusal authorized by the
+  maintainer's standing rule.
+- **Every unnamed database column is compared.** Values retain SQL types,
+  booleans, numbers and NULL; no string sentinel stands in for absence.
+  Identity excludes only `name`, `database_id`, `create_date`,
+  `physical_database_name`, `service_broker_guid` and `owner_sid`.
+  `log_reuse_wait` and `log_reuse_wait_desc` are statuses: FULL recovery
+  waiting for `LOG_BACKUP` qualifies. Collation, compatibility level,
+  containment and ANSI settings are compared with the target instead.
+  A test holds those exclusions exactly to §9's reported database facts,
+  so the two comparisons cannot contradict one another.
+- **Option C for emptiness.** Each database-scoped securable class
+  reported by `sys.fn_builtin_permissions` must have a known catalog.
+  A sweep of `sys.all_views` on pinned 17.0.4075.5 also covers partition
+  functions and schemes, plan guides, event notifications, audit
+  specifications, filegroups and files, Always Encrypted keys and values,
+  every extended-property class, broker priorities, conversation endpoints
+  and orphan groups/transmissions, external data sources/file
+  formats/libraries, database and table change tracking, FILESTREAM
+  settings, automatic tuning mode/options, Query Store hints/forced
+  plans/per-query tuning, and ledger digest locations. Historical digest
+  locations have no safe cleanup rule and refuse by name. A populated ledger
+  digest location could not be tested because it needs external storage;
+  the guard refuses any returned row. Parent removal was measured for search
+  properties, sensitivity classifications,
+  security predicates, XML/JSON/spatial/columnstore indexes, ordinary
+  columns/constraints/statistics/parameters/dependencies and external
+  library files. Full-text catalogs can be created and dropped, but stoplist
+  and index creation fail (7609); empty child catalogs are not a
+  parent-removal measurement. Ledger history retains
+  soft-deleted objects, so their names still refuse. Outside the accepted
+  residuals below, no user-created row qualifies. The fixed schemas,
+  principals, membership and database grants must be present; engine-created
+  broker objects and the system-owned R/Python languages
+  are the measured built-ins. A denied or unreadable catalog refuses by
+  name, never as an empty inventory.
+- **Accepted residual: database encryption key with encryption OFF.** The
+  whole `sys.databases` row is unchanged; reading the key needs server-level
+  `VIEW SERVER SECURITY STATE` (15562 as the loginless `db_owner`). No object
+  creation, binding or compilation depends on it. Encryption ON changes
+  `is_encrypted`, so the whole-row comparison refuses. pbps never creates
+  a database encryption key, so cleanup cannot leave one behind; run-owned
+  and Docker databases start new.
+- **Accepted residual: granular Query Store options.** `db_owner` can change
+  `QUERY_CAPTURE_MODE`, `MAX_STORAGE_SIZE_MB` and similar options without
+  changing `sys.databases`. Fresh defaults vary by version with no
+  `is_default`, so a baseline would be build-keyed. They govern plan
+  collection, never object creation, binding or compilation. Hints, forced
+  plans and per-query tuning that affect execution remain inventoried and
+  cleaned. Neither residual adds a read, permission or baseline.
+- **System-view SELECTs have a measured reason.** A fresh user database's
+  232 system-object grants are all SELECT on catalog views; 24 are hidden
+  from `sys.all_objects` but report `IsMSShipped` and `IsView` through
+  `OBJECTPROPERTYEX`. A system object cannot be schema-bound (2720), and
+  DENY SELECT on `sys.objects` still permits creation of a view, inline
+  function, procedure and computed column. The loginless `db_owner` user
+  can grant, deny and revoke those SELECTs itself. They are skipped;
+  every other system-object permission must be absent. Procedures,
+  functions and DMVs refuse grants in a user database (4629), CONTROL or
+  ALTER on a catalog view refuse (4606), and a system-type grant refuses
+  (15151). A catalog read under DENY still errors and refuses by name.
+- **The sandbox is the execution boundary.** An owner creates a user
+  without a login, adds only its `db_owner` membership, and enters it
+  `WITH NO REVERT` on a dedicated connection. The setup CONNECT grant
+  SQL Server gives the new user and that membership are the only added
+  baseline entries. Before plan DDL, the source account must prove
+  `VIEW ANY DATABASE` and list every database. The sandbox reads
+  `HAS_DBACCESS` for each; NULL is unreadable, and admission anywhere but
+  scratch, `master`, `tempdb` and `msdb` refuses by name. In each system
+  database its token must be exactly guest/public. The system-database
+  grant-equality choice in DEC-619.3 is superseded by the fixed rules below.
+- **System-database permissions follow rules, not a build's list.** In
+  `master`, `tempdb` and `msdb`, database permissions must be exactly the
+  CONNECT GRANT to guest and the two VIEW ANY COLUMN MASTER/ENCRYPTION KEY
+  DEFINITION GRANTs to public. Every object permission must resolve as
+  ms-shipped; a GRANT must be public's object-level SELECT or EXECUTE.
+  A DENY qualifies because it only narrows reach; a denied required read
+  still errors by database and catalog name. No other permission class,
+  permission on a non-ms-shipped object or guest role membership qualifies.
+  In particular, public must not execute an administrator's own
+  `EXECUTE AS OWNER` procedure. Guest owns only its schema, public owns
+  nothing, and every violation names its database, grantee, permission and
+  object or role.
+  - `sys.all_objects` omits hidden system views even for an administrator.
+    `OBJECTPROPERTYEX(major_id, 'IsMSShipped')` resolves them inside each
+    database; NULL refuses as unresolvable, never absent. Object names come
+    from `OBJECT_SCHEMA_NAME` and `OBJECT_NAME` in that same context. The
+    live test requires a nonempty set of grants resolved only this way.
+  - **Accepted residual:** an administrator's added public GRANT on an
+    ms-shipped object is indistinguishable from a shipped one. Measured
+    EXECUTE grants on `sys.xp_cmdshell` and `sys.sp_helptext` differ in no
+    `sys.database_permissions` column except `major_id`. Every login on the
+    instance already holds this public reach, including the supplied
+    account, so the sandbox gains nothing. This residual is accepted;
+    there is no build-keyed system-database permission list.
+- **Cleanup shares the inventory.** Extended properties precede grants
+  and memberships; schema-bound dependents precede their dependencies;
+  foreign keys precede the keys they reference. Owned roles precede their
+  owning roles or users (dropping an owner first is engine error 15421).
+  Catalog-ID dependency edges, without changing ranks, put mapped users
+  before their certificate or asymmetric key by SID (15559), signatures
+  and counter-signatures before their signer, and keys before their owners
+  and master-key protectors. They also order symmetric-key encryption
+  chains, assembly references, table types using alias types and external
+  models using credentials. Bound types/columns precede standalone rules
+  and defaults; standalone defaults use `DROP DEFAULT`. Dependency cycles
+  retain their named refusal; cleanup gains no password or encryption
+  change to break them.
+  Modules, tables and types
+  precede schemas, which precede owning roles/users. Partition schemes
+  precede functions, and encryption keys precede master keys. Conversations
+  end before broker parents are dropped; external tables use their own DROP
+  syntax before data sources/formats/credentials. Security policies precede
+  their tables and functions. Table change tracking is disabled before
+  primary keys (3735), and database tracking after tables. Tuning mode
+  returns to AUTO before options return to DEFAULT (15715); runtime actual
+  state is not a baseline. Hints and forced plans are cleared before Query
+  Store query removal (12456). Unknown
+  cleanup kinds refuse with their names. A fresh administrator session
+  drops the sandbox last and re-reads the full inventory. All other cleanup
+  DDL stays in a `NO REVERT` sandbox, guarded on each statement: database
+  DDL triggers must not gain the supplied account's server authority.
+  The final privileged drop first verifies that no other object remains.
+  A failed
+  cleanup takes precedence over the run's refusal and names what may
+  remain.
+- **No binding answer is fabricated.** Acquisition and checks now reach
+  the CLI path, then return `Error::Binding` naming the unimplemented
+  SQL Server externals step (#2237). PostgreSQL retains fill before
+  preparation; its orchestration moves inside its engine arm so MSSQL
+  can acquire before refusing. Ordinary planning without a required
+  resolver gains no new read or connection. Full reconstruction,
+  compatibility qualification and assessment remain #2238.
+- **Docker and fixtures keep the existing runner.** SQL Server supplies
+  EULA acceptance, generated policy-compliant credentials, loopback 1433
+  publication and login plus `SELECT 1 AS ok` readiness. LOGIN, Docker
+  environment and connection use the same fixed-prefix derivation from
+  generated entropy, without logging it. A second fixture uses the same
+  immutable image and server collation as the primary. `resolver-mssql`
+  owns these live tests in CI, joins `ci-gate`, and is omitted on PR runs
+  under DEC-1835.1. Every ignored test has an execution owner.
+
+**Pinned by**
+`model_inheritance_is_measured_and_read_only_model_refuses_with_its_remedy`,
+`fresh_row_exclusions_are_exactly_the_database_facts_compared_with_the_target`,
+`unknown_columns_nulls_and_sql_types_remain_part_of_the_comparison`,
+`numeric_tokens_and_a_textual_null_do_not_lose_their_distinctions`,
+`supplied_options_compare_every_column_and_allow_log_backup_status`,
+`inherited_model_objects_refuse_and_the_model_is_restored_before_assertions`,
+`scratch_inventory_reads_every_catalog_and_cleans_contained_dependencies`,
+`assembly_references_drop_dependents_before_providers_as_owner`,
+`cyclic_symmetric_key_protection_refuses_by_name_and_preserves_the_keys`,
+`system_catalog_selects_are_creation_independent_and_other_system_permissions_refuse`,
+`sandbox_checks_all_database_names_and_the_complete_system_contract`,
+`system_database_permissions_follow_fixed_rules_and_restore_each_change`,
+`only_shared_shipped_grants_or_narrowing_denials_qualify`,
+`unresolved_or_non_system_objects_refuse_even_when_denied`,
+`a_live_marker_distinguishes_instances_and_pins_the_backend_before_any_setup`,
+`mssql_supplied_acquisition_refuses_target_and_cleans_after_the_externals_refusal`,
+`mssql_run_owned_acquisition_removes_its_login_database_and_reference_on_refusal`,
+`mssql_run_owned_acquisition_needs_only_login_and_database_creation_privileges`,
+`failed_database_creation_and_failed_reference_reads_release_every_recorded_resource`,
+`mssql_supplied_guest_admission_dirty_inventory_and_persistent_options_refuse_by_name`,
+`mssql_supplied_owner_needs_no_creation_and_changed_visibility_or_system_context_refuses`,
+`mssql_docker_supplied_inventory_and_sandbox_use_the_same_contract`
+and `mssql_docker_removes_the_container_on_success_failure_and_cancellation`,
+with negative cases and live engine measurements.

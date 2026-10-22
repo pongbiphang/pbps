@@ -1,0 +1,197 @@
+[
+  [
+    "user_access",
+    "ALTER DATABASE model SET SINGLE_USER;",
+    "ALTER DATABASE model SET MULTI_USER;"
+  ],
+  [
+    "is_read_only",
+    "ALTER DATABASE model SET READ_ONLY;",
+    "ALTER DATABASE model SET READ_WRITE;"
+  ],
+  [
+    "is_auto_close_on",
+    "ALTER DATABASE model SET AUTO_CLOSE ON;",
+    "ALTER DATABASE model SET AUTO_CLOSE OFF;"
+  ],
+  [
+    "is_auto_shrink_on",
+    "ALTER DATABASE model SET AUTO_SHRINK ON;",
+    "ALTER DATABASE model SET AUTO_SHRINK OFF;"
+  ],
+  [
+    "snapshot_isolation_state",
+    "ALTER DATABASE model SET ALLOW_SNAPSHOT_ISOLATION ON;",
+    "ALTER DATABASE model SET ALLOW_SNAPSHOT_ISOLATION OFF;"
+  ],
+  [
+    "is_read_committed_snapshot_on",
+    "ALTER DATABASE model SET READ_COMMITTED_SNAPSHOT ON;",
+    "ALTER DATABASE model SET READ_COMMITTED_SNAPSHOT OFF;"
+  ],
+  [
+    "recovery_model",
+    "ALTER DATABASE model SET RECOVERY SIMPLE;",
+    "ALTER DATABASE model SET RECOVERY FULL;"
+  ],
+  [
+    "page_verify_option",
+    "ALTER DATABASE model SET PAGE_VERIFY NONE;",
+    "ALTER DATABASE model SET PAGE_VERIFY CHECKSUM;"
+  ],
+  [
+    "is_auto_create_stats_on",
+    "ALTER DATABASE model SET AUTO_CREATE_STATISTICS OFF;",
+    "ALTER DATABASE model SET AUTO_CREATE_STATISTICS ON;"
+  ],
+  [
+    "is_auto_create_stats_incremental_on",
+    "ALTER DATABASE model SET AUTO_CREATE_STATISTICS ON (INCREMENTAL = ON);",
+    "ALTER DATABASE model SET AUTO_CREATE_STATISTICS ON (INCREMENTAL = OFF);"
+  ],
+  [
+    "is_auto_update_stats_on",
+    "ALTER DATABASE model SET AUTO_UPDATE_STATISTICS OFF;",
+    "ALTER DATABASE model SET AUTO_UPDATE_STATISTICS ON;"
+  ],
+  [
+    "is_auto_update_stats_async_on",
+    "ALTER DATABASE model SET AUTO_UPDATE_STATISTICS_ASYNC ON;",
+    "ALTER DATABASE model SET AUTO_UPDATE_STATISTICS_ASYNC OFF;"
+  ],
+  [
+    "is_ansi_null_default_on",
+    "ALTER DATABASE model SET ANSI_NULL_DEFAULT ON;",
+    "ALTER DATABASE model SET ANSI_NULL_DEFAULT OFF;"
+  ],
+  [
+    "is_ansi_nulls_on",
+    "ALTER DATABASE model SET ANSI_NULLS ON;",
+    "ALTER DATABASE model SET ANSI_NULLS OFF;"
+  ],
+  [
+    "is_ansi_padding_on",
+    "ALTER DATABASE model SET ANSI_PADDING ON;",
+    "ALTER DATABASE model SET ANSI_PADDING OFF;"
+  ],
+  [
+    "is_ansi_warnings_on",
+    "ALTER DATABASE model SET ANSI_WARNINGS ON;",
+    "ALTER DATABASE model SET ANSI_WARNINGS OFF;"
+  ],
+  [
+    "is_arithabort_on",
+    "ALTER DATABASE model SET ARITHABORT ON;",
+    "ALTER DATABASE model SET ARITHABORT OFF;"
+  ],
+  [
+    "is_concat_null_yields_null_on",
+    "ALTER DATABASE model SET CONCAT_NULL_YIELDS_NULL ON;",
+    "ALTER DATABASE model SET CONCAT_NULL_YIELDS_NULL OFF;"
+  ],
+  [
+    "is_numeric_roundabort_on",
+    "ALTER DATABASE model SET NUMERIC_ROUNDABORT ON;",
+    "ALTER DATABASE model SET NUMERIC_ROUNDABORT OFF;"
+  ],
+  [
+    "is_quoted_identifier_on",
+    "ALTER DATABASE model SET QUOTED_IDENTIFIER ON;",
+    "ALTER DATABASE model SET QUOTED_IDENTIFIER OFF;"
+  ],
+  [
+    "is_recursive_triggers_on",
+    "ALTER DATABASE model SET RECURSIVE_TRIGGERS ON;",
+    "ALTER DATABASE model SET RECURSIVE_TRIGGERS OFF;"
+  ],
+  [
+    "is_cursor_close_on_commit_on",
+    "ALTER DATABASE model SET CURSOR_CLOSE_ON_COMMIT ON;",
+    "ALTER DATABASE model SET CURSOR_CLOSE_ON_COMMIT OFF;"
+  ],
+  [
+    "is_local_cursor_default",
+    "ALTER DATABASE model SET CURSOR_DEFAULT LOCAL;",
+    "ALTER DATABASE model SET CURSOR_DEFAULT GLOBAL;"
+  ],
+  [
+    "is_trustworthy_on",
+    "ALTER DATABASE model SET TRUSTWORTHY ON;",
+    "ALTER DATABASE model SET TRUSTWORTHY OFF;"
+  ],
+  [
+    "is_db_chaining_on",
+    "ALTER DATABASE model SET DB_CHAINING ON;",
+    "ALTER DATABASE model SET DB_CHAINING OFF;"
+  ],
+  [
+    "is_parameterization_forced",
+    "ALTER DATABASE model SET PARAMETERIZATION FORCED;",
+    "ALTER DATABASE model SET PARAMETERIZATION SIMPLE;"
+  ],
+  [
+    "is_query_store_on",
+    "ALTER DATABASE model SET QUERY_STORE = OFF;",
+    "ALTER DATABASE model SET QUERY_STORE = ON;"
+  ],
+  [
+    "is_broker_enabled",
+    "ALTER DATABASE model SET ENABLE_BROKER;",
+    "ALTER DATABASE model SET DISABLE_BROKER;"
+  ],
+  [
+    "is_date_correlation_on",
+    "ALTER DATABASE model SET DATE_CORRELATION_OPTIMIZATION ON;",
+    "ALTER DATABASE model SET DATE_CORRELATION_OPTIMIZATION OFF;"
+  ],
+  [
+    "is_honor_broker_priority_on",
+    "ALTER DATABASE model SET HONOR_BROKER_PRIORITY ON;",
+    "ALTER DATABASE model SET HONOR_BROKER_PRIORITY OFF;"
+  ],
+  [
+    "target_recovery_time_in_seconds",
+    "ALTER DATABASE model SET TARGET_RECOVERY_TIME = 120 SECONDS;",
+    "ALTER DATABASE model SET TARGET_RECOVERY_TIME = 60 SECONDS;"
+  ],
+  [
+    "delayed_durability",
+    "ALTER DATABASE model SET DELAYED_DURABILITY = FORCED;",
+    "ALTER DATABASE model SET DELAYED_DURABILITY = DISABLED;"
+  ],
+  [
+    "is_memory_optimized_elevate_to_snapshot_on",
+    "ALTER DATABASE model SET MEMORY_OPTIMIZED_ELEVATE_TO_SNAPSHOT = ON;",
+    "ALTER DATABASE model SET MEMORY_OPTIMIZED_ELEVATE_TO_SNAPSHOT = OFF;"
+  ],
+  [
+    "is_mixed_page_allocation_on",
+    "ALTER DATABASE model SET MIXED_PAGE_ALLOCATION OFF;",
+    "ALTER DATABASE model SET MIXED_PAGE_ALLOCATION ON;"
+  ],
+  [
+    "is_temporal_history_retention_enabled",
+    "ALTER DATABASE model SET TEMPORAL_HISTORY_RETENTION OFF;",
+    "ALTER DATABASE model SET TEMPORAL_HISTORY_RETENTION ON;"
+  ],
+  [
+    "is_accelerated_database_recovery_on",
+    "ALTER DATABASE model SET ACCELERATED_DATABASE_RECOVERY = ON;",
+    "ALTER DATABASE model SET ACCELERATED_DATABASE_RECOVERY = OFF;"
+  ],
+  [
+    "is_optimized_locking_on",
+    "ALTER DATABASE model SET OPTIMIZED_LOCKING = ON;",
+    "ALTER DATABASE model SET OPTIMIZED_LOCKING = OFF;"
+  ],
+  [
+    "is_data_retention_enabled",
+    "ALTER DATABASE model SET DATA_RETENTION = ON;",
+    "ALTER DATABASE model SET DATA_RETENTION = OFF;"
+  ],
+  [
+    "is_fulltext_enabled",
+    "EXEC(N'USE model; EXEC sys.sp_fulltext_database N''enable'';');",
+    "EXEC(N'USE model; EXEC sys.sp_fulltext_database N''disable'';');"
+  ]
+]
