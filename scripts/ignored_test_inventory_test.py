@@ -424,6 +424,19 @@ class WorkflowKeySpellings(unittest.TestCase):
             with self.subTest(source=source), self.assertRaisesRegex(audit.InventoryError, "alternate spelling"):
                 list(audit.workflow_runs(source, "live"))
 
+    def test_a_hash_inside_a_scalar_is_text_and_only_a_separated_hash_comments(self):
+        # YAML starts a comment only at a `#` after whitespace or a line start.
+        for source in ("    env: { URL: https://example.test/#fragment }\n",
+                       "    steps:\n      - { name: build#1, run: echo }\n",
+                       "    steps: [{ name: a#b, run: echo }]\n",
+                       "    strategy: { matrix: { cell: [a#1, b#2] } }\n",
+                       "    env: { A: x # a comment\n      }\n"):
+            with self.subTest(source=source):
+                audit.check_workflow_key_spellings(source, "live")
+        # A separated comment still hides nothing: the key after it is read.
+        with self.assertRaisesRegex(audit.InventoryError, "alternate spelling"):
+            audit.check_workflow_key_spellings("    steps:\n      - { name: a # note\n          , 'if': false }\n", "live")
+
     def test_canonical_and_distinct_quoted_keys_pass_the_spelling_guard(self):
         for position, template in self.positions.items():
             for key in (*SCHEDULING_KEYS, "'i''f'", '"i\'f"', "'timeout-minutes' "):
