@@ -8002,8 +8002,9 @@ its existing ranks and Sink tie-break. Compatibility chains exist only for
 byte-identical output, as in DEC-1959.1, DEC-1959.3 and DEC-1959.4.
 
 A loaded SavedPlan is the untrusted wire DTO, not evidence that ordering ran.
-Checked admission constructs `AdmittedPlan`, never OrderedPlan. Both executable
-types implement diff's sealed PlanView; caller-defined views do not. Admission
+Checked admission constructs `AdmittedPlan`, never OrderedPlan. OrderedPlan,
+metadata-bound SealedPlan and AdmittedPlan implement diff's sealed PlanView;
+caller-defined views do not. Admission
 trusts the reviewed, checksum-pinned wire order as-is under SPEC's saved-plan
 contract, without reordering or enabling the release verifier. Version,
 checksum, origin, identity, analysis, risk and mode checks retain their existing
@@ -8027,8 +8028,8 @@ SQL, saved-plan bytes, checksums and versions remain unchanged.
 RLS policy setup and catalog-owner releases use the same immutable planning
 boundary: order owns their final settlement, generated-table and name-slot
 constraints, and creation-risk write-back, while callers supply catalog facts.
-The create-only RLS validator is shared by saved admission and transitional CLI
-consumers; the frozen master RLS settlement pins operations, SQL, checksums and
+The create-only RLS validator is shared by saved admission and test
+observations; the frozen master RLS settlement pins operations, SQL, checksums and
 refusals without enabling a raw production write-back.
 The canonical deployment route consumes policy-dependent facts at that same
 final RLS stage before granting execution authority. Pure policy facts and
@@ -8036,6 +8037,14 @@ owner-release selection live in order beside module facts; PostgreSQL retains
 the catalog reads and re-exports their shared value types. The original
 policy-owner teardown, paired routine drop/create and combined release graph
 keep their existing order and refusal priority, without a new stage or crate edge.
+Apply's policy/module dependency guards require PlanView after saved admission;
+fresh policy facts only validate the approved order and cannot reschedule it.
+Planning uses the same read-only release validator on its immutable intermediate.
+Adverse catalog-guard fixtures remain non-executable PlanningPlan snapshots:
+a cfg(test) observation seam runs the shared fact checks and returns no execution
+authority. Admitting or completing those partial snapshots would require adding
+routine execution decisions and change the SQL sequence the fixture measures.
+Their emission observations still use the real singleton producer.
 
 PlanDialect's associated plan input avoids a dependency cycle: concrete engines
 bind it to the sealed diff view, while pure semantic consumers remain generic.
@@ -8087,9 +8096,9 @@ Operation groups retain source IDs and origins, including zero-statement
 operations. Only the associated input can reach lower/lower_all and script
 rendering. Scratch executes these immutable groups directly. Planning-time
 intermediate-name probes return only metadata at their previous refusal point.
-Raw emit/render entries remain explicitly named legacy compatibility entries
-for PR5c; obsolete raw scratch and raw lowering entries are removed. Frozen
-reference code stays cfg(test) only. PG and MSSQL emission fixtures compare
+PR5b retained raw emit/render entries as explicitly named compatibility
+entries for PR5c; obsolete raw scratch and raw lowering entries were removed.
+Frozen reference code stays cfg(test) only. PG and MSSQL emission fixtures compare
 all Statement fields, both modes, SQL rendering, deterministic artifact bytes
 and checksums through real singleton routes; the non-default singleton
 fixture feature remains restricted to dev-dependencies.
@@ -8097,5 +8106,66 @@ fixture feature remains restricted to dev-dependencies.
 The completed canonical intermediate also retains the invariant planner type.
 Its final constructor binds that same concrete dialect; selecting a different
 engine there must not relabel an already completed route. Semantic observations
-carry an erased brand that neither real emitter accepts. The transitional CLI
-adapter remains private to PR5c's first commit and is removed with its consumers.
+carry an erased brand that neither real emitter accepts. PR5c removes its transitional CLI adapter with its consumers.
+
+PR5c completes the boundary. `DiffPlan` retains the successful differ's
+sort/rename provenance, while a raw `propose` stays non-executable after
+empty settlement or the complete shared stage sequence. Only the complete
+resolver/declaration/catalog routes produce the canonical continuation type
+that order can finish as OrderedPlan. Public annotations, spelling/slot
+write-backs and existing connected settlements apply inside order and keep
+that provenance; arbitrary logical additions restart an unqualified draft.
+Only the two existing zero-SQL scope transitions may retain producer input
+provenance at their old tail position. This adds no ordering pass or release
+verifier. Every existing component pin and the full shared route compare the
+relocated policy with its frozen cfg(test) CLI reference, including refusals,
+counts, complete operations, SQL and fixed-metadata artifact fingerprints.
+
+Resolver completion stores the original expansion identities. Subsequent
+settlements and slot applications permute those identities with their payload;
+final publication keeps its run-bound recheck, equal-change ordinal remap,
+evidence projection and fingerprint checks. Later restorations reserve the
+existing part numbers, and scope tails take unused source numbers after
+already allocated rebindings; neither can alias an original operation ID.
+Only that final order's sources, proof and payload reach lowering. No
+constraints are unioned.
+
+New artifact sealing requires OrderedPlan and rejects metadata containing any
+changed operation, strategy, risk or finding. Loaded artifacts enter the
+separate checked AdmittedPlan at the original validation location. Admission
+owns apply's version/checksum/origin/dialect refusals in that order, followed
+by payload validation; the consumer does not repeat them. Request-mode,
+resume and risk gates retain their following positions. Its reviewed order
+is trusted as-is. The model DTO's hash is named `wire_fingerprint`, solely for unchecked
+wire/attempt identity; the sealed ArtifactView owns executable checksums and
+writing. The digest algorithm, domain, fields/default omissions, pretty JSON,
+trailing LF, saved version and all checksum bytes stay unchanged. Error
+Display/source chains and refusal priorities are pinned by the old validator.
+
+CLI keeps actual PostgreSQL and SQL Server variants through lowering, rather
+than erasing their emitter brand behind a borrowed trait object. Its opaque
+LoweredPlan retains the engine and immutable groups through script rendering,
+bootstrap/rehearsal and transactional, staged and resume execution. No raw
+statement vector, draft, deserialized DTO or caller-defined emitter constructs
+that collection. Transitional emit/render entries are removed; only private
+metadata probes and frozen test references accept raw observation data.
+Fixtures use genuine production producers, checked wire admission, or the real
+singleton route for individual emitter observations. There is no shipping
+fixture feature or unchecked execution factory. CI's explicit model, diff,
+dialect, PG, MSSQL and CLI doctests include the compiler-negative fixtures.
+
+Explain remains a descriptive wire review, including for previews that
+execution admission must refuse. It retains its original version, dialect
+selection and payload-validation order. Engines answer statement-count
+metadata through their private emitters with the artifact's mode; no SQL or
+lowered collection escapes that observation. The reported wire fingerprint
+is review identity, not an execution capability. This keeps preview counts,
+refusals and report bytes unchanged without weakening admission.
+
+Bootstrap's fixed type/trusted-role script guard is prepared alongside a
+certified lowered plan and retains its engine brand. The prepared script has
+no raw SQL constructor and cannot become an executable plan. Guard generation
+still precedes connection/locking, while rendering still waits for the target
+zone; the guard, session pins and DDL keep their existing bytes. Per-statement
+bootstrap prerequisite checks select a position from the certified collection,
+never an arbitrary statement slice (DEC-2181.1, DEC-2181.2).

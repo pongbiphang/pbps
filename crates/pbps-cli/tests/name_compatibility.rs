@@ -1,6 +1,9 @@
 //! Captured on master 1c3db445 before #2084 step 1a changed name formatting.
 //! Byte comparisons pin field order as well as values and approved checksums.
 
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission;
+
 use pbps_dialect::Dialect;
 use pbps_model::{
     Change, ChangeSet, Column, Declared, IdsFile, PlanBaseline, PlanOrigin, PlannedChange,
@@ -80,15 +83,15 @@ fn artifacts(text: &str) -> (Schema, IdsFile, SavedPlan, StateSnapshot) {
     );
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids.clone(), "fixture");
     state.declared = Declared::from_schema(&schema);
-    state.plan_checksum = Some(plan.checksum());
+    state.plan_checksum = Some(plan.wire_fingerprint());
     (schema, ids, plan, state)
 }
 
-fn sql(plan: &SavedPlan, dialect: &dyn Dialect) -> String {
+fn sql(plan: &SavedPlan, dialect: &dyn FixtureEmission) -> String {
     plan.changes
         .changes
         .iter()
-        .flat_map(|p| dialect.legacy_emit(&p.change, Default::default()).unwrap())
+        .flat_map(|p| dialect.fixture_emit(&p.change, Default::default()).unwrap())
         .map(|s| s.sql)
         .collect::<Vec<_>>()
         .join("\n")
@@ -101,14 +104,14 @@ fn hostile_names_keep_master_artifact_bytes_checksums_and_sql() {
     // deliberately advanced version (#1172).
     plan.version = 42;
     state.version = 25;
-    state.plan_checksum = Some(plan.checksum());
+    state.plan_checksum = Some(plan.wire_fingerprint());
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),
         ("ids.json", serde_json::to_string(&ids).unwrap()),
         ("plan.json", serde_json::to_string(&plan).unwrap()),
         ("state.json", serde_json::to_string(&state).unwrap()),
         ("state.sha256", state_checksum(&schema, &ids)),
-        ("plan.sha256", plan.checksum()),
+        ("plan.sha256", plan.wire_fingerprint()),
         ("postgres.sql", sql(&plan, &pbps_pg::Postgres::new())),
         ("mssql.sql", sql(&plan, &pbps_mssql::Mssql)),
     ];
@@ -136,7 +139,7 @@ fn hostile_names_keep_master_artifact_bytes_checksums_and_sql() {
     // Negative: changing the actual name still changes the approved bytes.
     let (_, _, mut ordinary, _) = artifacts("ordinary");
     ordinary.version = plan.version;
-    assert_ne!(ordinary.checksum(), plan.checksum());
+    assert_ne!(ordinary.wire_fingerprint(), plan.wire_fingerprint());
 }
 
 #[test]
@@ -181,14 +184,14 @@ fn explain_shows_hostile_names_exactly_once_and_keeps_master_json() {
     // changes when its version advances; all names and JSON stay pinned.
     let expected = std::fs::read_to_string(root.join("explain.json"))
         .unwrap()
-        .replace(&historical.checksum(), &plan.checksum());
+        .replace(&historical.wire_fingerprint(), &plan.wire_fingerprint());
     assert_eq!(outputs[1], expected);
 }
 
 #[test]
 fn a_dialect_refusal_escapes_a_table_name_exactly_once() {
     for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect,
+        &pbps_pg::Postgres::new() as &dyn FixtureEmission,
         &pbps_mssql::Mssql,
     ] {
         for (part, shown) in [(NAME, SHOWN), ("名前_ünï", "名前_ünï")] {
@@ -200,7 +203,7 @@ fn a_dialect_refusal_escapes_a_table_name_exactly_once() {
                 moves_at_most: None,
             };
             let error = dialect
-                .legacy_emit(&change, Default::default())
+                .fixture_emit(&change, Default::default())
                 .unwrap_err();
             let pbps_dialect::DialectError::Invalid { dialect, .. } = &error else {
                 panic!("the empty table must be refused: {error:?}");
@@ -298,4 +301,12 @@ fn table_change_descriptions_keep_raw_json_and_are_shown_once_under_approval() {
         json["data"]["risks"][0]["changes"][0],
         format!("app.{NAME}  - drop table app.{NAME}")
     );
+}
+
+#[cfg(test)]
+mod certified_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-diff/tests/support/emission.rs"
+    ));
 }

@@ -1,5 +1,8 @@
 #![cfg(test)]
 //! Frozen 557d4984 function hold, retained only for equivalence checks.
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission as _;
+
 use super::*;
 use pbps_model::Module;
 
@@ -324,7 +327,7 @@ async fn callable_columns_precede_their_readers_and_real_cycles_are_refused_on_b
             assert_eq!(super::test_adapters::after_their_functions(&mut cs, &ModuleDeps::new(), &Partitions::default()), Ok(1));
             let pg = pbps_pg::Postgres::new();
             for p in &cs.changes {
-                for sql in pg.legacy_emit(&p.change, p.strategy)? { conn.execute(&sql.sql).await?; }
+                for sql in pg.fixture_emit(&p.change, p.strategy)? { conn.execute(&sql.sql).await?; }
             }
             let rows = conn.query("SELECT g FROM app.consumer").await?;
             assert_eq!(rows[0].try_get::<i32>("g")?, Some(7));

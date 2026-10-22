@@ -1,4 +1,4 @@
-use super::{PlanView, admit, seal, singleton};
+use super::{ArtifactView, PlanView, admit, seal, singleton};
 use pbps_dialect::MinimalDialect;
 use pbps_model::{
     Change, ChangeSet, IdsFile, PlanBaseline, PlanMode, PlanOrigin, PlannedChange, SavedPlan,
@@ -37,7 +37,7 @@ fn admission_accepts_a_matching_plan_without_changing_its_order_or_checksum() {
     for mode in [PlanMode::Transactional, PlanMode::Staged] {
         let mut plan = wire();
         plan.mode = mode;
-        let checksum = plan.checksum();
+        let checksum = plan.wire_fingerprint();
         let admitted = admit(
             plan.clone(),
             &MinimalDialect,
@@ -55,13 +55,13 @@ fn admission_accepts_a_matching_plan_without_changing_its_order_or_checksum() {
 #[test]
 fn admission_refuses_an_unapproved_checksum_before_preview_or_dialect_checks() {
     let mut plan = wire();
-    let checksum = plan.checksum();
+    let checksum = plan.wire_fingerprint();
     let error = refusal(plan.clone(), "approved");
     assert!(error.contains("approved checksum: approved"));
     assert!(error.contains(&format!("plan checksum now: {checksum}")));
     plan.origin = PlanOrigin::Preview;
     plan.dialect = "another".into();
-    let checksum = plan.checksum();
+    let checksum = plan.wire_fingerprint();
     assert_eq!(
         refusal(plan, "approved"),
         format!(
@@ -80,11 +80,11 @@ fn admission_refuses_a_preview_before_dialect_or_payload_checks() {
     plan.origin = PlanOrigin::Preview;
     let expected = "`plan.json` is an offline preview, not an applyable plan.\n\
                     Recompute it against the target with `pbps plan --db ... --out plan.json`.";
-    assert_eq!(refusal(plan.clone(), &plan.checksum()), expected);
+    assert_eq!(refusal(plan.clone(), &plan.wire_fingerprint()), expected);
     plan.dialect = "another".into();
     plan.mode = PlanMode::Staged;
     plan.changes.changes.clear();
-    let checksum = plan.checksum();
+    let checksum = plan.wire_fingerprint();
     assert_eq!(refusal(plan, &checksum), expected);
 }
 
@@ -93,10 +93,10 @@ fn admission_refuses_another_dialect_before_payload_checks_and_escapes_its_name(
     let mut plan = wire();
     plan.dialect = "another\nengine".into();
     let expected = "`plan.json` was computed for another\\nengine and this project is minimal";
-    assert_eq!(refusal(plan.clone(), &plan.checksum()), expected);
+    assert_eq!(refusal(plan.clone(), &plan.wire_fingerprint()), expected);
     plan.mode = PlanMode::Staged;
     plan.changes.changes.clear();
-    let checksum = plan.checksum();
+    let checksum = plan.wire_fingerprint();
     assert_eq!(refusal(plan, &checksum), expected);
 }
 
@@ -118,7 +118,7 @@ fn admission_refuses_an_old_version_before_checksum_checks() {
 fn admission_still_refuses_invalid_payloads_after_the_outer_checks_pass() {
     let mut plan = wire().staged();
     plan.changes.changes.clear();
-    let checksum = plan.checksum();
+    let checksum = plan.wire_fingerprint();
     assert!(
         refusal(plan, &checksum)
             .contains("a staged plan must contain exactly one logical change; this artifact has 0")

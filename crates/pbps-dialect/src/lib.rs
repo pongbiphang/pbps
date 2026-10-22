@@ -23,7 +23,7 @@
 //! | Difference | PostgreSQL | SQL Server | How the interface accommodates it |
 //! |---|---|---|---|
 //! | Unquoted identifiers | folded to lowercase | kept as written | [`Dialect::fold_ident`] |
-//! | One change, several statements | a view rebuild is `DROP`, `CREATE` and a `GRANT` per permission | a cross-schema table rename is `sp_rename` plus `ALTER SCHEMA TRANSFER` | [`Dialect::legacy_emit`] returns a `Vec` |
+//! | One change, several statements | a view rebuild is `DROP`, `CREATE` and a `GRANT` per permission | a cross-schema table rename is `sp_rename` plus `ALTER SCHEMA TRANSFER` | [`Dialect::emit`] returns a `Vec` |
 //! | Effect of a rename on views | updated automatically | definition text goes stale | left to Phase 3's `DialectDb` |
 //! | Batch separation | not needed | some DDL needs its own batch | [`Statement::own_batch`] |
 //!
@@ -2272,6 +2272,16 @@ pub trait PlanPayload {
 pub trait PlanDialect: Dialect {
     type Plan: ?Sized;
 
+    /// Bootstrap's fixed prerequisite guard, derived from declarations and
+    /// trust settings rather than caller-supplied SQL (DEC-2181.1).
+    fn bootstrap_guard(
+        &self,
+        _schema: &Schema,
+        _trusted: &BTreeSet<pbps_model::RoleName>,
+    ) -> Result<Option<Statement>, DialectError> {
+        Ok(None)
+    }
+
     /// Emits one position of the engine's certified input. The associated type
     /// avoids a dialect -> diff dependency; concrete engines cannot substitute
     /// an unsealed user-defined view (DEC-1959.5).
@@ -3100,49 +3110,7 @@ pub trait Dialect {
         &self,
         change: &Change,
         strategy: Strategy,
-    ) -> Result<Vec<TableName>, DialectError> {
-        let statements = self.legacy_emit(change, strategy)?;
-        Ok(lower::intermediate_tables(&statements))
-    }
-
-    /// Transitional raw input for PR5c consumers; it grants no certificate.
-    /// Renders one change as statements.
-    ///
-    /// Returning a `Vec` is necessary because one change is not always one
-    /// statement: SQL Server's `RenameTable` across schemas is `sp_rename` plus
-    /// `ALTER SCHEMA TRANSFER` (see [`Statement::renames`]), and PostgreSQL's
-    /// `AlterModule` on a view is `DROP VIEW`, `CREATE VIEW` and a `GRANT` per
-    /// declared permission (ADR-0009 §3). An earlier version of this comment
-    /// gave a different reason — that PostgreSQL splits a type change and a
-    /// nullability change into two `ALTER COLUMN`s — and it is false: measured,
-    /// one `ALTER TABLE` takes both subcommands (ADR-0011, Amendment 1).
-    ///
-    /// `strategy` says *how* to get there (ADR-0003) and never *where* to go: a
-    /// dialect that cannot honour a hint on this statement emits the statement
-    /// without it rather than failing, because the desired state is the same
-    /// either way and refusing would turn a performance hint into an outage.
-    fn legacy_emit(
-        &self,
-        change: &Change,
-        strategy: Strategy,
-    ) -> Result<Vec<Statement>, DialectError>;
-
-    /// The statements for `change` in a staged plan, which commits each one
-    /// on its own (SPEC §7.5).
-    ///
-    /// The same as [`Dialect::legacy_emit`] but where a sequence of statements is
-    /// worth something only when each commits before the next: a
-    /// PostgreSQL attach then validates a CHECK that implies its bound
-    /// before it attaches, so the attach skips its scan (#1638,
-    /// DEC-1638.1). Inside one transaction the CHECK's lock is held to the
-    /// commit, so a transactional plan keeps [`Dialect::legacy_emit`]'s form.
-    fn legacy_emit_staged(
-        &self,
-        change: &Change,
-        strategy: Strategy,
-    ) -> Result<Vec<Statement>, DialectError> {
-        self.legacy_emit(change, strategy)
-    }
+    ) -> Result<Vec<TableName>, DialectError>;
 
     /// Questions to ask the data before this **plan** runs (SPEC §7.5).
     ///
@@ -4458,17 +4426,57 @@ pub fn check_constraint_names(schema: &Schema, dialect: &(impl Dialect + ?Sized)
 /// Taking the dialect, rather than just its separator, keeps a new script
 /// caller from omitting settings the deployment connection already establishes.
 /// `zone` is the target's session time zone, pinned with the rest (DEC-1916.1).
-/// Render only this engine's immutable lowered sequence. Raw statement
-/// rendering remains a named PR5c compatibility entry.
+/// Render only this engine's immutable lowered sequence. The renderer cannot accept a replaceable raw statement vector.
 pub fn render_script<D: Dialect + ?Sized>(
     plan: &lower::LoweredPlan<D>,
     dialect: &D,
     zone: &SessionZone,
 ) -> String {
-    legacy_render_script(plan.statements(), dialect, zone)
+    render_statements(plan.statements(), dialect, zone)
 }
 
-pub fn legacy_render_script(
+/// A certified script with bootstrap's fixed prerequisite guard. Preparing
+/// it preserves the old early refusal; rendering later uses the target zone.
+/// Neither a raw statement nor a different engine can replace its contents.
+///
+/// ```compile_fail
+/// fn forge(plan: pbps_dialect::lower::LoweredPlan<pbps_dialect::MinimalDialect>) {
+///     let _ = pbps_dialect::BootstrapScript { plan, guard: None };
+/// }
+/// ```
+pub struct BootstrapScript<D: ?Sized> {
+    plan: lower::LoweredPlan<D>,
+    guard: Option<Statement>,
+}
+
+/// Keeps bootstrap's existing prelude outside operation groups. The only
+/// added SQL is the engine's declaration-derived guard; there is no raw SQL
+/// parameter or way to turn this script into an executable lowered plan.
+pub fn prepare_bootstrap_script<D: PlanDialect>(
+    plan: &lower::LoweredPlan<D>,
+    dialect: &D,
+    schema: &Schema,
+    trusted: &BTreeSet<pbps_model::RoleName>,
+) -> Result<BootstrapScript<D>, DialectError> {
+    Ok(BootstrapScript {
+        plan: plan.clone(),
+        guard: dialect.bootstrap_guard(schema, trusted)?,
+    })
+}
+
+impl<D: Dialect + ?Sized> BootstrapScript<D> {
+    pub fn render(&self, dialect: &D, zone: &SessionZone) -> String {
+        let statements: Vec<_> = self
+            .guard
+            .iter()
+            .cloned()
+            .chain(self.plan.statements().iter().cloned())
+            .collect();
+        render_statements(&statements, dialect, zone)
+    }
+}
+
+fn render_statements(
     statements: &[Statement],
     dialect: &(impl Dialect + ?Sized),
     zone: &SessionZone,
@@ -4740,11 +4748,11 @@ mod tests {
         assert_eq!(render_batches(&stmts, None), "A;\n\nB;\n\nC;\n\nD;\n");
         assert_eq!(render_batches(&[], Some("GO")), "");
         assert_eq!(
-            legacy_render_script(&stmts, &MinimalDialect, &SessionZone::utc()),
+            render_statements(&stmts, &MinimalDialect, &SessionZone::utc()),
             render_batches(&stmts, None)
         );
         assert_eq!(
-            legacy_render_script(&[], &MinimalDialect, &SessionZone::utc()),
+            render_statements(&[], &MinimalDialect, &SessionZone::utc()),
             ""
         );
     }
@@ -5201,7 +5209,11 @@ mod tests {
         fn validate_table(&self, _n: &TableName, _t: &Table) -> Vec<DialectError> {
             Vec::new()
         }
-        fn legacy_emit(&self, _c: &Change, _s: Strategy) -> Result<Vec<Statement>, DialectError> {
+        fn intermediate_tables(
+            &self,
+            _c: &Change,
+            _s: Strategy,
+        ) -> Result<Vec<TableName>, DialectError> {
             Ok(Vec::new())
         }
         fn shares_namespace_with_tables(&self, kind: ModuleKind) -> bool {
@@ -6420,11 +6432,11 @@ impl Dialect for MinimalDialect {
         Vec::new()
     }
 
-    fn legacy_emit(
+    fn intermediate_tables(
         &self,
         _change: &Change,
         _strategy: Strategy,
-    ) -> Result<Vec<Statement>, DialectError> {
+    ) -> Result<Vec<TableName>, DialectError> {
         Err(DialectError::Unsupported {
             dialect: "minimal",
             feature: "SQL generation (the real emitter arrives in Phase 2)".to_owned(),

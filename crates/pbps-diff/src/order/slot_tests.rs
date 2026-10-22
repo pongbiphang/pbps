@@ -37,23 +37,28 @@ impl Dialect for Slotted {
     fn quote_ident(&self, ident: &str) -> Result<String, DialectError> {
         MinimalDialect.quote_ident(ident)
     }
-    fn legacy_emit(
+    fn intermediate_tables(
         &self,
         change: &Change,
         strategy: Strategy,
-    ) -> Result<Vec<Statement>, DialectError> {
-        if let Change::RenameTable { from, to, .. } = change
-            && from.schema != to.schema
-        {
-            let stop = TableName::new(to.schema.clone(), from.name.clone());
-            return Ok(vec![
-                Statement::new(format!("move {from}", from = from.shown()))
-                    .renaming(from.clone(), stop.clone()),
-                Statement::new(format!("rename {stop}", stop = stop.shown()))
-                    .renaming(stop, to.clone()),
-            ]);
-        }
-        MinimalDialect.legacy_emit(change, strategy)
+    ) -> Result<Vec<TableName>, DialectError> {
+        let statements = (|| -> Result<Vec<Statement>, DialectError> {
+            if let Change::RenameTable { from, to, .. } = change
+                && from.schema != to.schema
+            {
+                let stop = TableName::new(to.schema.clone(), from.name.clone());
+                return Ok(vec![
+                    Statement::new(format!("move {from}", from = from.shown()))
+                        .renaming(from.clone(), stop.clone()),
+                    Statement::new(format!("rename {stop}", stop = stop.shown()))
+                        .renaming(stop, to.clone()),
+                ]);
+            }
+            MinimalDialect
+                .intermediate_tables(change, strategy)
+                .map(|_| Vec::new())
+        })()?;
+        Ok(pbps_dialect::lower::intermediate_tables(&statements))
     }
     fn normalize_type(&self, ty: &ColumnType) -> Result<ColumnType, DialectError> {
         MinimalDialect.normalize_type(ty)

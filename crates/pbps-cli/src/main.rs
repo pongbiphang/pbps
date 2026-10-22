@@ -2,6 +2,7 @@
 
 //! `pbps` — declarative database schema version control.
 
+use crate::emission::Engine as _;
 use pbps_diff::order::PlanningPlan;
 mod adopt;
 mod artifact;
@@ -14,7 +15,7 @@ mod dependents;
 mod deploy;
 mod dev;
 mod doctor;
-mod emission;
+use pbps_cli::emission;
 mod engine;
 mod explain;
 mod externals_draft;
@@ -42,10 +43,10 @@ mod test_pg;
 mod test_plan_ids;
 
 #[cfg(test)]
-fn fixture_ordered(
+fn fixture_ordered<D: Dialect + ?Sized>(
     cs: pbps_model::ChangeSet,
-    dialect: &(dyn Dialect + 'static),
-) -> pbps_diff::order::AdmittedPlan<dyn pbps_dialect::Dialect> {
+    dialect: &D,
+) -> pbps_diff::order::AdmittedPlan<D> {
     let wire = pbps_model::SavedPlan::new(
         pbps_model::PlanOrigin::Database,
         dialect.name(),
@@ -59,7 +60,7 @@ fn fixture_ordered(
         cs,
         IdsFile::default(),
     );
-    let approved = wire.checksum();
+    let approved = wire.wire_fingerprint();
     pbps_diff::order::admit(
         wire,
         dialect,
@@ -1784,17 +1785,17 @@ pub fn policy_finding(f: &pbps_model::Finding) -> output::Finding {
 /// Still a `Result`, though nothing refuses today: every caller threads it
 /// through `or_unanswerable` under `project.unsupported-dialect`, and that is
 /// the finding a third dialect gets while its crate is being built.
-fn dialect(project: &Project) -> anyhow::Result<Box<dyn Dialect>> {
+fn dialect(project: &Project) -> anyhow::Result<emission::SelectedDialect> {
     Ok(dialect_for(project.config.dialect))
 }
 
 /// The dialect implementation for a configured name. One of two places in
 /// this crate that names an engine to choose it; `db::driver_for` is the
 /// other, and `engine` routes by what the connection turned out to be.
-pub(crate) fn dialect_for(name: DialectName) -> Box<dyn Dialect> {
+pub(crate) fn dialect_for(name: DialectName) -> emission::SelectedDialect {
     match name {
-        DialectName::Mssql => Box::new(pbps_mssql::Mssql),
-        DialectName::Postgres => Box::new(pbps_pg::Postgres::new()),
+        DialectName::Mssql => emission::SelectedDialect::Mssql(pbps_mssql::Mssql),
+        DialectName::Postgres => emission::SelectedDialect::Postgres(pbps_pg::Postgres::new()),
     }
 }
 
@@ -3212,433 +3213,432 @@ fn cmd_plan(
         "project.unsupported-dialect",
         dialect(project),
     )?;
-    // The declarations were loaded before the dialect was known, so the
-    // routine-identity pass `load` runs comes here instead — on this side now,
-    // and on the baseline inside `baseline::load`. Skipped on either side, a
-    // routine written `f(int)` at the baseline and `f(integer)` now would be
-    // two keys, and the plan a drop and a create of an unchanged object.
-    let mut collisions = routine_ids_as_the_dialect_spells_them(
-        &mut loaded.schema,
-        &mut loaded.hints,
-        dialect.as_ref(),
-    );
-    // Offline previews must refuse fixed sequence-name collisions before
-    // resolving ids or writing artifacts, just as connected plans do (DEC-1898.1).
-    collisions.extend(pbps_dialect::check_fixed_sequence_names(
-        &loaded.schema,
-        dialect.as_ref(),
-    ));
-    if !collisions.is_empty() {
-        if json {
-            output::unanswerable(
-                "plan",
-                collisions
-                    .iter()
-                    .map(|c| output::Finding::error("schema.name-collision", c.clone()))
-                    .collect(),
-            );
-        } else {
-            for c in &collisions {
-                eprintln!("error: {c}");
-            }
-        }
-        bail!("the declarations have {} problem(s)", collisions.len());
-    }
-
-    let mut findings: Vec<output::Finding> = Vec::new();
-    for notice in crate::row_security::binding_notices(&loaded.schema) {
-        if !json {
-            eprintln!("warning: {notice}");
-        }
-        findings.push(output::Finding::warning(
-            "plan.policy-bindings-unchecked",
-            notice,
+    pbps_cli::with_plan_dialect!(dialect, |dialect| {
+        // The declarations were loaded before the dialect was known, so the
+        // routine-identity pass `load` runs comes here instead — on this side now,
+        // and on the baseline inside `baseline::load`. Skipped on either side, a
+        // routine written `f(int)` at the baseline and `f(integer)` now would be
+        // two keys, and the plan a drop and a create of an unchanged object.
+        let mut collisions = routine_ids_as_the_dialect_spells_them(
+            &mut loaded.schema,
+            &mut loaded.hints,
+            dialect.as_ref(),
+        );
+        // Offline previews must refuse fixed sequence-name collisions before
+        // resolving ids or writing artifacts, just as connected plans do (DEC-1898.1).
+        collisions.extend(pbps_dialect::check_fixed_sequence_names(
+            &loaded.schema,
+            dialect.as_ref(),
         ));
-    }
+        if !collisions.is_empty() {
+            if json {
+                output::unanswerable(
+                    "plan",
+                    collisions
+                        .iter()
+                        .map(|c| output::Finding::error("schema.name-collision", c.clone()))
+                        .collect(),
+                );
+            } else {
+                for c in &collisions {
+                    eprintln!("error: {c}");
+                }
+            }
+            bail!("the declarations have {} problem(s)", collisions.len());
+        }
 
-    let res = match resolve_with_intent(project, &loaded, &ids, may_prompt, json)? {
-        Ok(r) => r,
-        Err(blockers) => {
-            // A finding, not a tool failure: pbps did its job and is asking a
-            // question only a human can answer (SPEC §6.1). CI must be able to
-            // tell that apart from "the tool broke".
+        let mut findings: Vec<output::Finding> = Vec::new();
+        for notice in crate::row_security::binding_notices(&loaded.schema) {
+            if !json {
+                eprintln!("warning: {notice}");
+            }
+            findings.push(output::Finding::warning(
+                "plan.policy-bindings-unchecked",
+                notice,
+            ));
+        }
+
+        let res = match resolve_with_intent(project, &loaded, &ids, may_prompt, json)? {
+            Ok(r) => r,
+            Err(blockers) => {
+                // A finding, not a tool failure: pbps did its job and is asking a
+                // question only a human can answer (SPEC §6.1). CI must be able to
+                // tell that apart from "the tool broke".
+                if json {
+                    let report = output::Report::new(
+                        "plan",
+                        report::blocker_findings(&blockers),
+                        None::<PlanData>,
+                    );
+                    return report.emit_json();
+                }
+                return Err(Found::new(
+                "some changes could not be decided automatically; express the intent with the commands above and retry",
+            )
+            .into());
+            }
+        };
+
+        if res.ids != ids && check {
+            let message = format!(
+                "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
+                project.ids_file().display()
+            );
             if json {
                 let report = output::Report::new(
                     "plan",
-                    report::blocker_findings(&blockers),
+                    vec![
+                        output::Finding::error("identity.stale", message)
+                            .at(project.ids_file(), None)
+                            .remedy("pbps plan"),
+                    ],
                     None::<PlanData>,
                 );
                 return report.emit_json();
             }
-            return Err(Found::new(
-                "some changes could not be decided automatically; express the intent with the commands above and retry",
-            )
-            .into());
+            return Err(Found::new(message).into());
         }
-    };
+        // The write itself waits for the policy gate below. `error` refuses the
+        // plan "before any file is written" (ADR-0008), and the identity file is a
+        // file: minting a uid and then refusing left `pbps.ids.json` changed for a
+        // plan that does not exist, so the next run compared against identities no
+        // reviewed plan ever used (DECISIONS 154).
+        let ids_to_write = (res.ids != ids).then(|| res.ids.clone());
 
-    if res.ids != ids && check {
-        let message = format!(
-            "the identity file is out of date; run `pbps plan` locally and commit `{}` along with your changes",
-            project.ids_file().display()
-        );
-        if json {
-            let report = output::Report::new(
-                "plan",
-                vec![
-                    output::Finding::error("identity.stale", message)
-                        .at(project.ids_file(), None)
-                        .remedy("pbps plan"),
-                ],
-                None::<PlanData>,
-            );
-            return report.emit_json();
-        }
-        return Err(Found::new(message).into());
-    }
-    // The write itself waits for the policy gate below. `error` refuses the
-    // plan "before any file is written" (ADR-0008), and the identity file is a
-    // file: minting a uid and then refusing left `pbps.ids.json` changed for a
-    // plan that does not exist, so the next run compared against identities no
-    // reviewed plan ever used (DECISIONS 154).
-    let ids_to_write = (res.ids != ids).then(|| res.ids.clone());
-
-    // plan never rewrites the user's YAML (SPEC §6.2), so without this line
-    // nothing tells the author that the annotations they just had absorbed are now
-    // redundant — and CI's `pbps fmt --check` fails on exactly that, with no local
-    // signal that anything was left undone.
-    if loaded
-        .intents
-        .iter()
-        .any(|i| pbps_diff::intent_is_absorbed(i, &res.ids, RenameSource::of(i, &loaded.schema)))
-    {
-        findings.push(
+        // plan never rewrites the user's YAML (SPEC §6.2), so without this line
+        // nothing tells the author that the annotations they just had absorbed are now
+        // redundant — and CI's `pbps fmt --check` fails on exactly that, with no local
+        // signal that anything was left undone.
+        if loaded.intents.iter().any(|i| {
+            pbps_diff::intent_is_absorbed(i, &res.ids, RenameSource::of(i, &loaded.schema))
+        }) {
+            findings.push(
             output::Finding::note(
                 "fmt.redundant-annotation",
                 "the `renamed_from` annotation(s) just absorbed into the identity file are now redundant",
             )
             .remedy("pbps fmt"),
         );
-        if !json {
-            println!("run `pbps fmt` to strip the now-redundant `renamed_from` annotation(s)");
+            if !json {
+                println!("run `pbps fmt` to strip the now-redundant `renamed_from` annotation(s)");
+            }
         }
-    }
 
-    // A `--base` that is missing, malformed or of an unsupported version is a
-    // failure of the *input*, not of the plan: the command never got as far as
-    // comparing anything, so it is unanswerable rather than a finding.
-    let base = output::or_unanswerable(
-        "plan",
-        json,
-        "baseline.unreadable",
-        baseline::load(project, source, dialect.as_ref()),
-    )?;
-    if base.is_empty_fallback {
-        let message = format!(
-            "the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",
-            base.description
-        );
-        if json {
-            findings.push(output::Finding::warning("baseline.empty", message));
-        } else {
-            eprintln!("warning: {message}");
-        }
-    }
-
-    // Drop ordering is computed over the *baseline's* modules, so it needs the
-    // annotations that travelled with that revision. A module this revision
-    // removes declares no `depends_on:` any more, and the edge it recorded is
-    // one the identifier scan could not find — so without this the drops fall
-    // back to name order and can remove a dependency before its dependent.
-    // Only a removed module's: a module still declared owns its current
-    // `depends_on:`, and one that dropped an edge has dropped it. Carried
-    // across, the old edge beside a reversed new one made a cycle the
-    // declarations do not hold, which is refused (#2083 review). `plan --db`
-    // carries the snapshot's the same way.
-    let mut hints = loaded.hints.clone();
-    for (name, deps) in &base.hints.module_deps {
-        if !loaded.schema.modules.contains_key(name) {
-            hints.module_deps.insert(name.clone(), deps.clone());
-        }
-    }
-
-    // A snapshot baseline is a read-back, and the engine respells what it
-    // stores; where the snapshot recorded what was declared, that is what the
-    // declarations are compared against (ADR-0013 §4). A git baseline records
-    // nothing and the overlay leaves it as it is.
-    let mut base_schema = base.declared.overlay(&base.schema);
-    // A snapshot is a read, which knows the sequence names it leaves out; a
-    // git baseline is declarations, which do not (#1631).
-    if let baseline::Source::File(_) = source {
-        pbps_dialect::name_read_sequences(&mut base_schema, dialect.as_ref());
-    }
-    let cs = pbps_diff::diff(
-        Side {
-            schema: &base_schema,
-            ids: &base.ids,
-        },
-        Side {
-            schema: &loaded.schema,
-            ids: &res.ids,
-        },
-        dialect.as_ref(),
-        &hints,
-    )
-    .map_err(|errors| {
-        // Structured, not wrapped through `or_unanswerable`: the differ hands
-        // back one error per change it cannot express, and collapsing them into
-        // a single message would throw away the column name that is the whole
-        // remedy. Each becomes its own finding, carrying the id a future
-        // `policies:` block can re-weight.
-        let errors = Unexpressible(errors);
-        if json {
-            output::unanswerable("plan", errors.findings());
-        } else {
-            errors.print_human();
-        }
-        errors
-    })?;
-
-    // The order `plan --db` would give these declarations with no catalog to
-    // read (#1598): what a new table calls goes ahead of it. The passes that
-    // need the target's catalog stay `plan --db`'s, and are named when they
-    // matter. A refusal is the one `plan --db` gives, before any file is
-    // written.
-    let scheduled = output::or_unanswerable(
-        "plan",
-        json,
-        "plan.unorderable",
-        dependents::schedule::schedule(
-            cs,
-            &dependents::schedule::Declarations {
-                schema: &loaded.schema,
-                sources: dependents::Sources {
-                    before: Side {
-                        schema: &base_schema,
-                        ids: &base.ids,
-                    },
-                    after: &res.ids,
-                },
-                module_deps: &hints.module_deps,
-            },
-            &dependents::schedule::Facts::default(),
-            dialect.as_ref(),
-        )
-        .map_err(anyhow::Error::from),
-    )?;
-    let skipped = scheduled.skipped;
-    let mut cs = scheduled.changes;
-
-    // The plan rules (ADR-0008): attached to the changes they are about, so
-    // the plan file carries them to `explain`, and reported here at the
-    // severity the project chose. An `error` refuses to produce the plan —
-    // nothing below writes a file for it — and never reaches `apply`.
-    let policy = attach_policy_findings(&mut cs, project, dialect.as_ref(), false);
-    let refused = policy.iter().any(|f| f.severity == output::Severity::Error);
-    findings.extend(policy);
-
-    // Now that the plan is known to be one this project allows. The identity
-    // file is the artifact `plan` exists to maintain — it is what the MR
-    // reviews and what every later comparison matches by uid — so failing to
-    // write it is as much a failure of the command as failing to write
-    // `--out`.
-    if let Some(minted) = ids_to_write.filter(|_| !refused) {
-        output::or_unanswerable(
+        // A `--base` that is missing, malformed or of an unsupported version is a
+        // failure of the *input*, not of the plan: the command never got as far as
+        // comparing anything, so it is unanswerable rather than a finding.
+        let base = output::or_unanswerable(
             "plan",
             json,
-            "identity.unwritable",
-            write_ids(project, &minted),
+            "baseline.unreadable",
+            baseline::load(project, source, dialect.as_ref()),
         )?;
-        if !json {
-            println!("updated {}", project.ids_file().display());
+        if base.is_empty_fallback {
+            let message = format!(
+                "the baseline is empty ({}). Everything will be listed as newly created, which is not a real plan against an existing database.",
+                base.description
+            );
+            if json {
+                findings.push(output::Finding::warning("baseline.empty", message));
+            } else {
+                eprintln!("warning: {message}");
+            }
         }
-    }
 
-    if !json {
-        println!("Baseline: {}", base.description);
-        print!(
-            "{}",
-            report::plan(
-                &cs,
-                &pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?
+        // Drop ordering is computed over the *baseline's* modules, so it needs the
+        // annotations that travelled with that revision. A module this revision
+        // removes declares no `depends_on:` any more, and the edge it recorded is
+        // one the identifier scan could not find — so without this the drops fall
+        // back to name order and can remove a dependency before its dependent.
+        // Only a removed module's: a module still declared owns its current
+        // `depends_on:`, and one that dropped an edge has dropped it. Carried
+        // across, the old edge beside a reversed new one made a cycle the
+        // declarations do not hold, which is refused (#2083 review). `plan --db`
+        // carries the snapshot's the same way.
+        let mut hints = loaded.hints.clone();
+        for (name, deps) in &base.hints.module_deps {
+            if !loaded.schema.modules.contains_key(name) {
+                hints.module_deps.insert(name.clone(), deps.clone());
+            }
+        }
+
+        // A snapshot baseline is a read-back, and the engine respells what it
+        // stores; where the snapshot recorded what was declared, that is what the
+        // declarations are compared against (ADR-0013 §4). A git baseline records
+        // nothing and the overlay leaves it as it is.
+        let mut base_schema = base.declared.overlay(&base.schema);
+        // A snapshot is a read, which knows the sequence names it leaves out; a
+        // git baseline is declarations, which do not (#1631).
+        if let baseline::Source::File(_) = source {
+            pbps_dialect::name_read_sequences(&mut base_schema, dialect.as_ref());
+        }
+        let cs = pbps_diff::diff(
+            Side {
+                schema: &base_schema,
+                ids: &base.ids,
+            },
+            Side {
+                schema: &loaded.schema,
+                ids: &res.ids,
+            },
+            dialect.as_ref(),
+            &hints,
+        )
+        .map_err(|errors| {
+            // Structured, not wrapped through `or_unanswerable`: the differ hands
+            // back one error per change it cannot express, and collapsing them into
+            // a single message would throw away the column name that is the whole
+            // remedy. Each becomes its own finding, carrying the id a future
+            // `policies:` block can re-weight.
+            let errors = Unexpressible(errors);
+            if json {
+                output::unanswerable("plan", errors.findings());
+            } else {
+                errors.print_human();
+            }
+            errors
+        })?;
+
+        // The order `plan --db` would give these declarations with no catalog to
+        // read (#1598): what a new table calls goes ahead of it. The passes that
+        // need the target's catalog stay `plan --db`'s, and are named when they
+        // matter. A refusal is the one `plan --db` gives, before any file is
+        // written.
+        let scheduled = output::or_unanswerable(
+            "plan",
+            json,
+            "plan.unorderable",
+            dependents::schedule::schedule(
+                cs,
+                &dependents::schedule::Declarations {
+                    schema: &loaded.schema,
+                    sources: dependents::Sources {
+                        before: Side {
+                            schema: &base_schema,
+                            ids: &base.ids,
+                        },
+                        after: &res.ids,
+                    },
+                    module_deps: &hints.module_deps,
+                },
+                &dependents::schedule::Facts::default(),
+                dialect.as_ref(),
             )
-        );
-        // What the target's catalog would add to the order, and an offline
-        // plan cannot: who a dropped role is taken from, what depends on a
-        // dropped module. Saying so keeps "none listed" from reading as
-        // "none".
-        for skip in &skipped {
-            println!("\n  {skip}");
-        }
-    }
-    // And in JSON, as a note a consumer can key on: the same evidence in both
-    // reports (SPEC §9.8), so a preview's silence about a catalog fact is
-    // never read as "nothing there".
-    if json {
-        findings.extend(
-            skipped
-                .iter()
-                .map(|skip| output::Finding::note(skip.id(), skip.to_string())),
-        );
-    }
+            .map_err(anyhow::Error::from),
+        )?;
+        let skipped = scheduled.skipped;
+        let mut cs = scheduled.changes;
 
-    // ADR-0003 decision 3: whether ONLINE exists is an edition question, and an
-    // offline plan has no edition to ask. Saying so is the honest form of a
-    // preview — the alternative is a plan.sql that reads as verified and turns
-    // out to be Enterprise-only at the deployment gate. Only where the engine
-    // has that question (#1614).
-    let online_unverified =
-        crate::engine::online_depends_on_the_edition(crate::db::driver_for(project.config.dialect))
-            && cs.changes.iter().any(|c| c.strategy.online);
-    if online_unverified && json {
-        findings.push(output::Finding::note(
+        // The plan rules (ADR-0008): attached to the changes they are about, so
+        // the plan file carries them to `explain`, and reported here at the
+        // severity the project chose. An `error` refuses to produce the plan —
+        // nothing below writes a file for it — and never reaches `apply`.
+        let policy = attach_policy_findings(&mut cs, project, dialect.as_ref(), false);
+        let refused = policy.iter().any(|f| f.severity == output::Severity::Error);
+        findings.extend(policy);
+
+        // Now that the plan is known to be one this project allows. The identity
+        // file is the artifact `plan` exists to maintain — it is what the MR
+        // reviews and what every later comparison matches by uid — so failing to
+        // write it is as much a failure of the command as failing to write
+        // `--out`.
+        if let Some(minted) = ids_to_write.filter(|_| !refused) {
+            output::or_unanswerable(
+                "plan",
+                json,
+                "identity.unwritable",
+                write_ids(project, &minted),
+            )?;
+            if !json {
+                println!("updated {}", project.ids_file().display());
+            }
+        }
+
+        if !json {
+            println!("Baseline: {}", base.description);
+            print!(
+                "{}",
+                report::plan(
+                    &cs,
+                    &pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?
+                )
+            );
+            // What the target's catalog would add to the order, and an offline
+            // plan cannot: who a dropped role is taken from, what depends on a
+            // dropped module. Saying so keeps "none listed" from reading as
+            // "none".
+            for skip in &skipped {
+                println!("\n  {skip}");
+            }
+        }
+        // And in JSON, as a note a consumer can key on: the same evidence in both
+        // reports (SPEC §9.8), so a preview's silence about a catalog fact is
+        // never read as "nothing there".
+        if json {
+            findings.extend(
+                skipped
+                    .iter()
+                    .map(|skip| output::Finding::note(skip.id(), skip.to_string())),
+            );
+        }
+
+        // ADR-0003 decision 3: whether ONLINE exists is an edition question, and an
+        // offline plan has no edition to ask. Saying so is the honest form of a
+        // preview — the alternative is a plan.sql that reads as verified and turns
+        // out to be Enterprise-only at the deployment gate. Only where the engine
+        // has that question (#1614).
+        let online_unverified = crate::engine::online_depends_on_the_edition(
+            crate::db::driver_for(project.config.dialect),
+        ) && cs.changes.iter().any(|c| c.strategy.online);
+        if online_unverified && json {
+            findings.push(output::Finding::note(
             "strategy.online-unverified",
             "`strategy: online` is emitted unverified: online index operations are Enterprise-only, \
              and only `pbps plan --db` can read the target's edition",
         ));
-    }
-    if online_unverified && !json {
-        println!(
-            "\n  `strategy: online` is emitted here unverified: online index operations are \n  \
-             Enterprise-only, and only `pbps plan --db` can read the target's edition."
-        );
-    }
-
-    if refused {
-        if json {
-            let report = output::Report::new("plan", findings, None::<PlanData>);
-            return report.emit_json();
         }
-        return Err(Found::new(
-            "a policy set to `error` refuses this plan; fix the declarations, or suppress the \
-             rule in pbps.yml with a reason",
-        )
-        .into());
-    }
-
-    let ordered = cs
-        .clone()
-        .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref());
-
-    if let Some(path) = out {
-        // Written as a `SavedPlan` marked `Preview`, not as a bare change set:
-        // §7.3's "a plan computed offline is never accepted by apply" has to be
-        // a property of the artifact. A file that merely lacked a checksum
-        // would invite someone to add one.
-        let mut plan = pbps_model::SavedPlan::new(
-            pbps_model::PlanOrigin::Preview,
-            dialect.name(),
-            now(),
-            pbps_model::PlanBaseline {
-                time_zone: None,
-                description: base.description.as_str().into(),
-                checksum: pbps_model::state_checksum(&base.schema, &base.ids),
-                database_collation: None,
-            },
-            cs.changes().clone(),
-            res.ids.clone(),
-        );
-        plan.module_deps = loaded.hints.module_deps.clone();
-        plan.trusted_roles = project.config.trusted_roles.clone();
-        plan.git_sha = db::git_sha(project.root());
-        let plan = pbps_diff::order::seal(ordered.clone(), plan)?;
-        // The artifact is the deliverable, so failing to write it is a failure
-        // of the whole command — but it is still the *command* that could not
-        // finish, not a finding about the declarations. A read-only or missing
-        // parent directory is the ordinary way this happens in CI.
-        output::or_unanswerable("plan", json, "plan.unwritable", write_plan(path, &plan))?;
-        if !json {
+        if online_unverified && !json {
             println!(
-                "\nwrote {} (a preview; `apply` will refuse it)",
-                path.display()
+                "\n  `strategy: online` is emitted here unverified: online index operations are \n  \
+             Enterprise-only, and only `pbps plan --db` can read the target's edition."
             );
         }
-    }
 
-    if let Some(path) = sql {
-        // Rendering can fail for the same reason `explain` can — a typed change
-        // the emitter refuses — and writing for the same reason `--out` can.
-        // Both leave the command unable to produce what it was asked for.
-        let script = output::or_unanswerable(
-            "plan",
-            json,
-            "plan.unwritable",
-            render_sql(&ordered, dialect.as_ref(), &base.description),
-        )?;
-        output::or_unanswerable(
-            "plan",
-            json,
-            "plan.unwritable",
-            std::fs::write(path, script)
-                .with_context(|| format!("cannot write `{}`", path.display())),
-        )?;
-        if !json {
-            println!("wrote {}", path.display());
-        }
-    }
-
-    // The dev database is optional and is asked last: everything above is what
-    // a plan produces with no engine in the room, and it must be identical
-    // whether or not one is available (SPEC §9.3).
-    // `--check --dev` is refused at the flag site, through the envelope. The
-    // `dev:` block in pbps.yml is a different question and has to be *skipped*
-    // rather than refused, or a project that configures one could never run
-    // `plan --check` at all. Either way --check must not start a container or
-    // open a connection: it is the read-only file check CI runs.
-    // A rehearsal that could not be *set up* — no docker, a dev database that
-    // does not answer — is unanswerable, distinct from one that ran and found
-    // the plan does not converge (a finding, below). Confusing the two would
-    // tell CI the plan is wrong when the rehearsal never happened.
-    let dev_spec = if check || no_dev {
-        None
-    } else {
-        output::or_unanswerable(
-            "plan",
-            json,
-            "rehearsal.unavailable",
-            dev::spec(project, dev),
-        )?
-    };
-    if let Some(spec) = dev_spec {
-        // Rendered first, and wrapped in its own right. As an argument it was
-        // evaluated *before* the wrapper was entered, so an emitter refusal
-        // here escaped exactly the envelope the call around it was added to
-        // guarantee. A `?` inside an argument list is invisible at a glance,
-        // which is why this is a separate statement now.
-        let statements = output::or_unanswerable(
-            "plan",
-            json,
-            "plan.unrenderable",
-            statements(&ordered, dialect.as_ref()),
-        )?;
-        let rehearsal = output::or_unanswerable(
-            "plan",
-            json,
-            "rehearsal.unavailable",
-            dev::rehearse(
-                &spec,
-                &base.schema,
-                &base.ids,
-                &base.hints,
-                &loaded.schema,
-                &res.ids,
-                &statements,
-                dialect.as_ref(),
-                &loaded.hints,
-            ),
-        )?;
-        // Run in both formats. Skipping it in JSON mode made an output-format
-        // choice silently disable a validation the project had asked for — a
-        // plan that does not converge would have come back `result: "ok"`.
-        if json {
-            for d in &rehearsal.structural {
-                findings.push(output::Finding::error(
-                    "rehearsal.does-not-converge",
-                    format!("after applying the plan, the database still differs: {d}"),
-                ));
+        if refused {
+            if json {
+                let report = output::Report::new("plan", findings, None::<PlanData>);
+                return report.emit_json();
             }
-            for d in &rehearsal.spelling {
-                findings.push(
+            return Err(Found::new(
+                "a policy set to `error` refuses this plan; fix the declarations, or suppress the \
+             rule in pbps.yml with a reason",
+            )
+            .into());
+        }
+
+        let ordered = cs
+            .clone()
+            .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref());
+
+        if let Some(path) = out {
+            // Written as a `SavedPlan` marked `Preview`, not as a bare change set:
+            // §7.3's "a plan computed offline is never accepted by apply" has to be
+            // a property of the artifact. A file that merely lacked a checksum
+            // would invite someone to add one.
+            let mut plan = pbps_model::SavedPlan::new(
+                pbps_model::PlanOrigin::Preview,
+                dialect.name(),
+                now(),
+                pbps_model::PlanBaseline {
+                    time_zone: None,
+                    description: base.description.as_str().into(),
+                    checksum: pbps_model::state_checksum(&base.schema, &base.ids),
+                    database_collation: None,
+                },
+                cs.changes().clone(),
+                res.ids.clone(),
+            );
+            plan.module_deps = loaded.hints.module_deps.clone();
+            plan.trusted_roles = project.config.trusted_roles.clone();
+            plan.git_sha = db::git_sha(project.root());
+            let plan = pbps_diff::order::seal(ordered.clone(), plan)?;
+            // The artifact is the deliverable, so failing to write it is a failure
+            // of the whole command — but it is still the *command* that could not
+            // finish, not a finding about the declarations. A read-only or missing
+            // parent directory is the ordinary way this happens in CI.
+            output::or_unanswerable("plan", json, "plan.unwritable", write_plan(path, &plan))?;
+            if !json {
+                println!(
+                    "\nwrote {} (a preview; `apply` will refuse it)",
+                    path.display()
+                );
+            }
+        }
+
+        if let Some(path) = sql {
+            // Rendering can fail for the same reason `explain` can — a typed change
+            // the emitter refuses — and writing for the same reason `--out` can.
+            // Both leave the command unable to produce what it was asked for.
+            let script = output::or_unanswerable(
+                "plan",
+                json,
+                "plan.unwritable",
+                render_sql(&ordered, &dialect, &base.description),
+            )?;
+            output::or_unanswerable(
+                "plan",
+                json,
+                "plan.unwritable",
+                std::fs::write(path, script)
+                    .with_context(|| format!("cannot write `{}`", path.display())),
+            )?;
+            if !json {
+                println!("wrote {}", path.display());
+            }
+        }
+
+        // The dev database is optional and is asked last: everything above is what
+        // a plan produces with no engine in the room, and it must be identical
+        // whether or not one is available (SPEC §9.3).
+        // `--check --dev` is refused at the flag site, through the envelope. The
+        // `dev:` block in pbps.yml is a different question and has to be *skipped*
+        // rather than refused, or a project that configures one could never run
+        // `plan --check` at all. Either way --check must not start a container or
+        // open a connection: it is the read-only file check CI runs.
+        // A rehearsal that could not be *set up* — no docker, a dev database that
+        // does not answer — is unanswerable, distinct from one that ran and found
+        // the plan does not converge (a finding, below). Confusing the two would
+        // tell CI the plan is wrong when the rehearsal never happened.
+        let dev_spec = if check || no_dev {
+            None
+        } else {
+            output::or_unanswerable(
+                "plan",
+                json,
+                "rehearsal.unavailable",
+                dev::spec(project, dev),
+            )?
+        };
+        if let Some(spec) = dev_spec {
+            // Rendered first, and wrapped in its own right. As an argument it was
+            // evaluated *before* the wrapper was entered, so an emitter refusal
+            // here escaped exactly the envelope the call around it was added to
+            // guarantee. A `?` inside an argument list is invisible at a glance,
+            // which is why this is a separate statement now.
+            let statements = output::or_unanswerable(
+                "plan",
+                json,
+                "plan.unrenderable",
+                statements(&ordered, &dialect),
+            )?;
+            let rehearsal = output::or_unanswerable(
+                "plan",
+                json,
+                "rehearsal.unavailable",
+                dev::rehearse(
+                    &spec,
+                    &base.schema,
+                    &base.ids,
+                    &base.hints,
+                    &loaded.schema,
+                    &res.ids,
+                    &statements,
+                    &dialect,
+                    &loaded.hints,
+                ),
+            )?;
+            // Run in both formats. Skipping it in JSON mode made an output-format
+            // choice silently disable a validation the project had asked for — a
+            // plan that does not converge would have come back `result: "ok"`.
+            if json {
+                for d in &rehearsal.structural {
+                    findings.push(output::Finding::error(
+                        "rehearsal.does-not-converge",
+                        format!("after applying the plan, the database still differs: {d}"),
+                    ));
+                }
+                for d in &rehearsal.spelling {
+                    findings.push(
                     output::Finding::warning(
                         "rehearsal.spelling",
                         format!(
@@ -3648,47 +3648,48 @@ fn cmd_plan(
                     )
                     .remedy("rewrite the declaration in the form shown"),
                 );
-            }
-        } else {
-            print!("{}", report::rehearsal(&rehearsal));
-            if !rehearsal.converged() {
-                return Err(Found::new(
+                }
+            } else {
+                print!("{}", report::rehearsal(&rehearsal));
+                if !rehearsal.converged() {
+                    return Err(Found::new(
                     "the plan does not converge on the declarations (SPEC §11.5 invariant 3); the \
                      differences above are what would be left behind",
                 )
                 .into());
+                }
             }
         }
-    }
 
-    if json {
-        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?;
-        let (tables, modules) = report::touched(&names);
-        let report = output::Report::new(
-            "plan",
-            findings,
-            Some(PlanData {
-                baseline: base.description.clone(),
-                time_zone: None,
-                changes: cs.changes.len(),
-                tables,
-                modules,
-                roles: report::touched_roles(&names),
-                risks: cs.risks().iter().map(|r| r.as_str()).collect(),
-                connected_checks: Vec::new(),
-                type_routines: Vec::new(),
-                type_routine_approval: None,
-                origins: report::origins(&cs),
-                cost: None,
-                resolver_selection: None,
-                resolver_assessment: None,
-            }),
-        );
-        // A non-converging rehearsal is an error finding, so `outcome` exits 2
-        // here exactly as `Found` does in the human path.
-        return report.emit_json();
-    }
-    Ok(())
+        if json {
+            let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &res.ids)?;
+            let (tables, modules) = report::touched(&names);
+            let report = output::Report::new(
+                "plan",
+                findings,
+                Some(PlanData {
+                    baseline: base.description.clone(),
+                    time_zone: None,
+                    changes: cs.changes.len(),
+                    tables,
+                    modules,
+                    roles: report::touched_roles(&names),
+                    risks: cs.risks().iter().map(|r| r.as_str()).collect(),
+                    connected_checks: Vec::new(),
+                    type_routines: Vec::new(),
+                    type_routine_approval: None,
+                    origins: report::origins(&cs),
+                    cost: None,
+                    resolver_selection: None,
+                    resolver_assessment: None,
+                }),
+            );
+            // A non-converging rehearsal is an error finding, so `outcome` exits 2
+            // here exactly as `Found` does in the human path.
+            return report.emit_json();
+        }
+        Ok(())
+    })
 }
 
 /// Writes a plan file. A trailing newline, so it never shows
@@ -3710,9 +3711,9 @@ fn rendered_plan(plan: &impl pbps_diff::order::ArtifactView) -> anyhow::Result<S
 ///
 /// An offline plan is a preview (SPEC §7.3): the header says so, so a script
 /// that escapes into a chat or a ticket still carries its own warning label.
-fn render_sql(
-    cs: &(dyn pbps_diff::order::PlanView<dyn pbps_dialect::Dialect> + 'static),
-    dialect: &dyn Dialect,
+fn render_sql<D: emission::Engine>(
+    cs: &(dyn pbps_diff::order::PlanView<D> + 'static),
+    dialect: &D,
     baseline: &str,
 ) -> anyhow::Result<String> {
     // An offline plan is never staged: `--staged` needs a target.
@@ -3721,7 +3722,6 @@ fn render_sql(
     // declared zone or a refusal (DEC-1916.1).
     Ok(sql_script(
         &statements,
-        dialect,
         baseline,
         &pbps_model::SessionZone::offline_utc(),
     ))
@@ -3732,15 +3732,14 @@ fn render_sql(
 /// Apart so a command that learns the zone only once it connects — a
 /// bootstrap with a target — emits early, where an emitter's refusal still
 /// stops it, and renders once the zone is known (DEC-1916.1).
-pub(crate) fn sql_script<'a>(
-    statements: &emission::LoweredPlan<'a>,
-    dialect: &'a dyn Dialect,
+pub(crate) fn sql_script(
+    statements: &impl emission::Script,
     baseline: &str,
     zone: &pbps_model::SessionZone,
 ) -> String {
     format!(
         "-- Generated by pbps against baseline: {baseline}\n-- A preview, not an applyable plan. Never hand-edit this file.\n\n{}",
-        pbps_dialect::render_script(statements, &emission::Emitter(dialect), zone)
+        statements.render(zone)
     )
 }
 
@@ -3750,29 +3749,31 @@ pub(crate) fn sql_script<'a>(
 /// express must stop the apply at statement zero, not halfway through — which is
 /// the same reason `plan` renders the SQL rather than the executor doing it one
 /// change at a time.
-pub(crate) fn statements<'a>(
-    plan: &(dyn pbps_diff::order::PlanView<dyn pbps_dialect::Dialect> + 'static),
-    dialect: &'a dyn Dialect,
-) -> anyhow::Result<emission::LoweredPlan<'a>> {
-    emission::lower(plan, dialect)
+pub(crate) fn statements<D: emission::Engine>(
+    plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
+    dialect: &D,
+) -> anyhow::Result<emission::LoweredPlan> {
+    dialect
+        .lower(plan)
+        .map_err(|error| anyhow::anyhow!("cannot render a change as SQL: {error}"))
 }
 
 /// One planned change's statements in a plan of `mode`. A staged plan
 /// commits each statement on its own, and the dialect may write a change
 /// otherwise for it (#1638, DEC-1638.1), so everything that counts a staged
 /// plan's statements per change counts these.
-pub(crate) fn emitted(
-    dialect: &dyn Dialect,
-    plan: &(dyn pbps_diff::order::PlanView<dyn pbps_dialect::Dialect> + 'static),
+pub(crate) fn emitted<D: emission::Engine>(
+    dialect: &D,
+    plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
     position: usize,
     mode: pbps_model::PlanMode,
 ) -> anyhow::Result<Vec<pbps_dialect::Statement>> {
     match mode {
         pbps_model::PlanMode::Transactional => {
-            pbps_dialect::PlanDialect::emit(&emission::Emitter(dialect), plan, position)
+            pbps_dialect::PlanDialect::emit(dialect, plan, position)
         }
         pbps_model::PlanMode::Staged => {
-            pbps_dialect::PlanDialect::emit_staged(&emission::Emitter(dialect), plan, position)
+            pbps_dialect::PlanDialect::emit_staged(dialect, plan, position)
         }
     }
     .map_err(|e| anyhow::anyhow!("cannot render a change as SQL: {e}"))
@@ -5089,4 +5090,12 @@ mod plan_fixture {
         };
         (changes, ids)
     }
+}
+
+#[cfg(test)]
+mod certified_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-diff/tests/support/emission.rs"
+    ));
 }

@@ -54,7 +54,7 @@ async fn respelled_key(is_update: bool, key_type: &str, append_space: bool) {
     db.conn.execute(&format!("CREATE TABLE dbo.key218 ([co'de]]x] {key_type} COLLATE SQL_Latin1_General_CP1_CI_AS PRIMARY KEY, label nvarchar(20));")).await.unwrap();
     let key = "Ne'w";
     let seed = Mssql
-        .legacy_emit(&insert("key218", key), Default::default())
+        .fixture_emit(&insert("key218", key), Default::default())
         .unwrap()
         .remove(0);
     let change = if is_update {
@@ -63,7 +63,7 @@ async fn respelled_key(is_update: bool, key_type: &str, append_space: bool) {
         insert("key218", key)
     };
     let stmt = Mssql
-        .legacy_emit(&change, Default::default())
+        .fixture_emit(&change, Default::default())
         .unwrap()
         .remove(0);
     if is_update {
@@ -179,7 +179,7 @@ async fn canonical_non_text_keys_and_padded_text_keys_still_accept_writes() {
             .unwrap();
         for change in [insert(&table, key), update(&table, key)] {
             let sql = Mssql
-                .legacy_emit(&change, Default::default())
+                .fixture_emit(&change, Default::default())
                 .unwrap()
                 .remove(0)
                 .sql;
@@ -202,7 +202,7 @@ async fn canonical_non_text_keys_and_padded_text_keys_still_accept_writes() {
     // Restore the baseline without firing the trigger before the attempt.
     db.conn.execute("DISABLE TRIGGER dbo.money218 ON dbo.key218_money; UPDATE dbo.key218_money SET [co'de]]x]=1.0001; ENABLE TRIGGER dbo.money218 ON dbo.key218_money;").await.unwrap();
     let sql = Mssql
-        .legacy_emit(&update("key218_money", "1.0001"), Default::default())
+        .fixture_emit(&update("key218_money", "1.0001"), Default::default())
         .unwrap()
         .remove(0)
         .sql;
@@ -236,7 +236,7 @@ async fn lossy_key(is_update: bool, key_type: &str, stored: &str, declared: &str
     let mut db = TestDb::create(&format!("key_lossy_{is_update}218")).await;
     db.conn.execute(&format!("CREATE TABLE dbo.key218 ([co'de]]x] {key_type} COLLATE SQL_Latin1_General_CP1_CI_AS PRIMARY KEY, label nvarchar(20));")).await.unwrap();
     let seed = Mssql
-        .legacy_emit(&insert("key218", stored), Default::default())
+        .fixture_emit(&insert("key218", stored), Default::default())
         .unwrap()
         .remove(0);
     let plain = db
@@ -255,7 +255,7 @@ async fn lossy_key(is_update: bool, key_type: &str, stored: &str, declared: &str
         insert("key218", declared)
     };
     let stmt = Mssql
-        .legacy_emit(&change, Default::default())
+        .fixture_emit(&change, Default::default())
         .unwrap()
         .remove(0);
     let attempted = db
@@ -318,7 +318,7 @@ async fn an_update_refuses_a_trigger_that_rewrites_an_existing_key_alias() {
         let table = format!("key_alias218_{tag}");
         db.conn.execute(&format!("CREATE TABLE dbo.{table} ([co'de]]x] {key_type} COLLATE SQL_Latin1_General_CP1_CI_AS PRIMARY KEY, label nvarchar(20)); INSERT dbo.{table} VALUES (N'ne''w', N'a');")).await.unwrap();
         let stmt = Mssql
-            .legacy_emit(&update(&table, "Ne'w"), Default::default())
+            .fixture_emit(&update(&table, "Ne'w"), Default::default())
             .unwrap()
             .remove(0);
         let plain = db
@@ -367,12 +367,11 @@ async fn exported_updates_keep_key_capture_variables_in_separate_batches() {
     for key in ["first", "second"] {
         statements.extend(
             Mssql
-                .legacy_emit(&update("key_batch218", key), Default::default())
+                .fixture_emit(&update("key_batch218", key), Default::default())
                 .unwrap(),
         );
     }
-    let script =
-        pbps_dialect::legacy_render_script(&statements, &Mssql, &pbps_model::SessionZone::utc());
+    let script = script_oracle::render(&statements, &Mssql, &pbps_model::SessionZone::utc());
     let mut results = Vec::new();
     for batch in script
         .split("\nGO\n")
@@ -396,4 +395,12 @@ async fn exported_updates_keep_key_capture_variables_in_separate_batches() {
         rows,
         vec![("first".into(), "b".into()), ("second".into(), "b".into())]
     );
+}
+
+#[cfg(test)]
+mod script_oracle {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-dialect/tests/support/script_oracle.rs"
+    ));
 }

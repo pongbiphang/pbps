@@ -79,7 +79,7 @@ pub use name::{
 pub use partitions::Partitions;
 pub use plan::{
     PlanBaseline, PlanMode, PlanOrigin, RoutinePins, SavedPlan, SchemaPin, TypePin, TypeRoutine,
-    plan_checksum, state_checksum,
+    state_checksum, wire_fingerprint,
 };
 pub use reason::{Reason, ReasonError};
 pub use rename::Renames;

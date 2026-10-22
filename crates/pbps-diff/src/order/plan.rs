@@ -297,8 +297,8 @@ impl<D: ?Sized> Clone for OrderedPlan<D> {
 }
 
 impl<D: ?Sized> OrderedPlan<D> {
-    // PR5a's production stages still return PlanningPlan. The complete route
-    // adds its private call here when the stacked consumer migration lands.
+    // A singleton fixture has no inter-operation permutation. Its private
+    // constructor stays under the same fixture gate as the public adapter.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub(super) fn new(plan: PlanningPlan, mode: PlanMode, dialect: &D) -> Self
     where

@@ -153,28 +153,28 @@ pub fn intermediate_tables(statements: &[Statement]) -> Vec<TableName> {
 /// The statements of one operation, as the dialect emits its change under
 /// `strategy`.
 #[cfg(test)]
-fn legacy_lower(
+fn frozen_lower(
     operation: &Operation,
     strategy: Strategy,
-    dialect: &(impl Dialect + ?Sized),
+    dialect: &tests::Parking,
 ) -> Result<Lowered, DialectError> {
     Ok(Lowered {
         operation: operation.id(),
         origin: operation.origin().clone(),
-        statements: dialect.legacy_emit(operation.change(), strategy)?,
+        statements: dialect.frozen_emit(operation.change(), strategy)?,
     })
 }
 
 /// Every operation lowered in order, each under the strategy its own planned
 /// change carries.
 #[cfg(test)]
-fn legacy_lower_all(
+fn frozen_lower_all(
     operations: &Operations,
-    dialect: &(impl Dialect + ?Sized),
+    dialect: &tests::Parking,
 ) -> Result<Vec<Lowered>, DialectError> {
     operations
         .iter()
-        .map(|op| legacy_lower(op, op.planned().strategy, dialect))
+        .map(|op| frozen_lower(op, op.planned().strategy, dialect))
         .collect()
 }
 
@@ -317,7 +317,7 @@ mod tests {
 
     /// A dialect whose renames go through a parking name, as both engines'
     /// cross-schema moves do, and whose role rename does the same.
-    struct Parking;
+    pub(super) struct Parking;
 
     impl Dialect for Parking {
         fn name(&self) -> &'static str {
@@ -326,36 +326,16 @@ mod tests {
         // A fixture: every change it has no shape for writes one plain
         // statement, which is all these tests read.
         #[allow(clippy::wildcard_enum_match_arm)]
-        fn legacy_emit(
+        fn intermediate_tables(
             &self,
             change: &Change,
             strategy: Strategy,
-        ) -> Result<Vec<Statement>, DialectError> {
-            Ok(match change {
-                Change::RenameTable { from, to, .. } => {
-                    let parked = TableName::new(&to.schema, &from.name);
-                    vec![
-                        Statement::new("MOVE").renaming(from.clone(), parked.clone()),
-                        Statement::new("RENAME")
-                            .own_batch()
-                            .renaming(parked, to.clone()),
-                    ]
-                }
-                Change::RenameRole { from, to, .. } => vec![
-                    Statement::new("PARK ROLE").renaming_role(from.clone(), "parked"),
-                    Statement::new("NAME ROLE").renaming_role("parked", to.clone()),
-                ],
-                Change::DropModule { id, .. } => vec![
-                    Statement::new("DROP")
-                        .non_transactional()
-                        .releasing(Released::Module(id.clone())),
-                ],
-                // Whatever else: run outside the transaction only when told
-                // to build online, which is the strategy's whole effect.
-                _ if strategy.online => vec![Statement::new("ONLINE").non_transactional()],
-                _ => vec![Statement::new("OTHER")],
-            })
+        ) -> Result<Vec<TableName>, DialectError> {
+            Ok(super::intermediate_tables(
+                &self.frozen_emit(change, strategy)?,
+            ))
         }
+
         fn lexicon(&self) -> crate::Lexicon {
             MinimalDialect.lexicon()
         }
@@ -389,6 +369,40 @@ mod tests {
         }
     }
 
+    impl Parking {
+        #[allow(clippy::wildcard_enum_match_arm)]
+        pub(super) fn frozen_emit(
+            &self,
+            change: &Change,
+            strategy: Strategy,
+        ) -> Result<Vec<Statement>, DialectError> {
+            Ok(match change {
+                Change::RenameTable { from, to, .. } => {
+                    let parked = TableName::new(&to.schema, &from.name);
+                    vec![
+                        Statement::new("MOVE").renaming(from.clone(), parked.clone()),
+                        Statement::new("RENAME")
+                            .own_batch()
+                            .renaming(parked, to.clone()),
+                    ]
+                }
+                Change::RenameRole { from, to, .. } => vec![
+                    Statement::new("PARK ROLE").renaming_role(from.clone(), "parked"),
+                    Statement::new("NAME ROLE").renaming_role("parked", to.clone()),
+                ],
+                Change::DropModule { id, .. } => vec![
+                    Statement::new("DROP")
+                        .non_transactional()
+                        .releasing(Released::Module(id.clone())),
+                ],
+                // Whatever else: run outside the transaction only when told
+                // to build online, which is the strategy's whole effect.
+                _ if strategy.online => vec![Statement::new("ONLINE").non_transactional()],
+                _ => vec![Statement::new("OTHER")],
+            })
+        }
+    }
+
     fn t(s: &str) -> TableName {
         s.parse().unwrap()
     }
@@ -407,7 +421,7 @@ mod tests {
             &[rename("app.a", "dst.b"), rename("app.c", "app.d")],
             ModuleEdits::InPlace,
         );
-        let lowered = legacy_lower_all(&ops, &Parking).unwrap();
+        let lowered = frozen_lower_all(&ops, &Parking).unwrap();
         assert_eq!(lowered[0].intermediate_tables(), [&t("dst.a")]);
         // The renames' endpoints are not intermediate: the source and the
         // target are the baseline's and the plan's.
@@ -423,7 +437,7 @@ mod tests {
             })],
             ModuleEdits::InPlace,
         );
-        let role = legacy_lower_all(&role, &Parking).unwrap();
+        let role = frozen_lower_all(&role, &Parking).unwrap();
         assert_eq!(
             role[0].intermediate_roles(),
             [&pbps_model::RoleName::from("parked")]
@@ -454,7 +468,7 @@ mod tests {
             ],
             ModuleEdits::InPlace,
         );
-        let lowered = legacy_lower_all(&ops, &Parking).unwrap();
+        let lowered = frozen_lower_all(&ops, &Parking).unwrap();
         let steps: Vec<(String, Execution)> = lowered
             .iter()
             .flat_map(Lowered::steps)
@@ -484,7 +498,7 @@ mod tests {
             [(0, &Released::Module(id))]
         );
         assert_eq!(
-            legacy_lower(&ops.as_slice()[2], Strategy::default(), &Parking)
+            frozen_lower(&ops.as_slice()[2], Strategy::default(), &Parking)
                 .unwrap()
                 .steps()
                 .map(|s| s.execution)

@@ -17,6 +17,7 @@
 //! this tool exists to catch. `baseline` is the deliberate override, and the
 //! reason it demands is what an audit asks for later.
 
+use crate::emission::Engine as _;
 use anyhow::{Context as _, bail};
 use pbps_diff::order::PlanningPlan;
 
@@ -3091,9 +3092,9 @@ fn plan_mode(staged: bool) -> pbps_model::PlanMode {
 /// (`DROP ROLE`, the old name of a rename): `(wanted, vacated)`. Counted per
 /// statement the way `role_drop_expectations` counts, so a staged resume
 /// asks only about the names its remaining statements touch (DECISIONS 119).
-fn role_name_expectations(
-    plan: &(dyn pbps_diff::order::PlanView<dyn pbps_dialect::Dialect> + 'static),
-    dialect: &dyn pbps_dialect::Dialect,
+fn role_name_expectations<D: crate::emission::Engine>(
+    plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
+    dialect: &D,
     mode: pbps_model::PlanMode,
     completed: usize,
 ) -> anyhow::Result<(Vec<pbps_model::RoleName>, Vec<pbps_model::RoleName>)> {
@@ -6003,500 +6004,496 @@ pub fn cmd_bootstrap(
     target: Option<&Target>,
     sql_out: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
-    let mut dialect = crate::dialect(project)?;
-    let mut loaded = crate::load(project, dialect.as_ref())?;
-    let ids = crate::read_ids(project)?;
-    refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
+    let dialect = crate::dialect(project)?;
+    pbps_cli::with_plan_dialect!(dialect, |mut dialect| {
+        let mut loaded = crate::load(project, dialect.as_ref())?;
+        let ids = crate::read_ids(project)?;
+        refuse_invalid_declarations(&loaded, dialect.as_ref(), false)?;
 
-    // A connected generation proves nothing about a later replay target.
-    // Keep the input-path proof in connected execution (DEC-2181.1).
-    if sql_out.is_some() && !crate::engine::type_references(&loaded.schema).is_empty() {
-        bail!(
-            "bootstrap --sql cannot validate referenced type input paths for its replay target; run connected bootstrap without --sql, or use plan/apply against the target (DEC-2181.1)"
-        );
-    }
-
-    // Every declared object needs its identity, not just "some": a role the
-    // ids file does not know is skipped by the differ, and a bootstrap that
-    // skipped it built less than the declarations say and recorded that as
-    // the whole state. `pbps plan` mints what is missing (DECISIONS 109).
-    let unidentified: Vec<String> = loaded
-        .schema
-        .tables
-        .keys()
-        .filter(|t| ids.table_uid(t).is_none())
-        .map(|name| name.shown().to_string())
-        .chain(
-            loaded
-                .schema
-                .roles
-                .keys()
-                .filter(|r| ids.role_uid(r).is_none())
-                .map(|r| format!("role {r}", r = r.shown(),)),
-        )
-        .collect();
-    if !unidentified.is_empty() {
-        bail!(
-            "the identity file does not know {}: {}.\n\
-             Run `pbps plan` first to mint identities for the declarations.",
-            if unidentified.len() == 1 {
-                "a declared object"
-            } else {
-                "these declared objects"
-            },
-            unidentified.join(", ")
-        );
-    }
-
-    // Every declared text, as the engine reads it, before anything is built
-    // from them: a spelling it would read back differently would be recorded
-    // as the engine spells it and drift from the declaration on the next plan
-    // (DECISIONS 101), and a date or time it reads one way only is built,
-    // scripted and recorded as that reading (DEC-1883.1) — so this is asked
-    // ahead of the diff, not inside the build where it used to be, since the
-    // statements and the `--sql` script are made from what it answers. Into
-    // an empty database, so nothing is under an older name: the declared
-    // names are the only ones the catalog could have. Not under the lock: the
-    // engine's reading of a text does not turn on what the database holds.
-    // Without a target nothing can be asked, and the script carries the
-    // declared text, as it always has.
-    if let Some(target) = target {
-        loaded.schema = db::runtime()?.block_on(async {
-            let mut conn = db::connect(target).await?;
-            dialect = crate::engine::planning_dialect(&mut conn).await?;
-            bootstrap_type_pins(&mut conn, &loaded.schema, &Default::default(), project).await?;
-            let mut unasked = Vec::new();
-            let refused = refuse_misspelt(
-                &mut conn,
-                &loaded.schema,
-                &Default::default(),
-                &mut unasked,
-                false,
-            )
-            .await;
-            // Printed before the refusal, beside it, as the plan prints them.
-            warn_unasked(&unasked);
-            refused
-        })?;
-    }
-    for notice in crate::row_security::binding_notices(&loaded.schema) {
-        eprintln!("warning: {notice}");
-    }
-    let declared_modules = managed_modules(None, Some(&loaded.schema));
-
-    // Bootstrap is the plan from nothing: every declared table is created.
-    let cs = pbps_diff::diff(
-        pbps_diff::Side {
-            schema: &Schema::default(),
-            ids: &IdsFile::default(),
-        },
-        pbps_diff::Side {
-            schema: &loaded.schema,
-            ids: &ids,
-        },
-        dialect.as_ref(),
-        // Bootstrap builds into an empty database, so there are no rows for an
-        // online operation to spare and the strategies are dropped. The module
-        // dependencies are not: `depends_on:` exists for the edges the
-        // identifier scan cannot see, and discarding them here would make
-        // bootstrap emit a dependent module first and fail on declarations that
-        // plan perfectly well.
-        &pbps_model::Hints {
-            strategies: Default::default(),
-            module_deps: loaded.hints.module_deps.clone(),
-            // Carried for the same reason, and one more: it is what decides
-            // whether the routines this bootstrap creates arrive executable
-            // by every principal in the cluster (ADR-0010 §5). Dropping it
-            // here would make the first apply into an empty database the one
-            // apply that leaves the engine default standing.
-            public_execute: loaded.hints.public_execute.clone(),
-        },
-    )
-    .map_err(|errs| {
-        let errors = crate::Unexpressible(errs);
-        errors.print_human();
-        errors
-    })?;
-    // What a new table calls goes ahead of it, by the same reordering passes
-    // `plan --db` runs (#1585, DEC-942.1, DEC-1364.1): a default or generated
-    // column calling a declared function. Into an empty database there is no
-    // catalog to read, so the facts are none: nothing is dropped or rebuilt,
-    // no column is released, and `weave` has nothing to add. The passes that
-    // read nothing run, so the `--sql` script gets them too (#1955).
-    let cs = crate::dependents::schedule::schedule(
-        cs,
-        &crate::dependents::schedule::Declarations {
-            schema: &loaded.schema,
-            sources: crate::dependents::Sources {
-                before: pbps_diff::Side {
-                    schema: &Schema::default(),
-                    ids: &IdsFile::default(),
-                },
-                after: &ids,
-            },
-            module_deps: &loaded.hints.module_deps,
-        },
-        &crate::dependents::schedule::Facts::default(),
-        dialect.as_ref(),
-    )?
-    .changes;
-    // And the check `plan --db` runs on that final order (DEC-1576.1): an
-    // expression naming, in a literal, a relation created only after it is
-    // refused with the two-plan remedy, before any script or DDL, rather
-    // than rolled back by the engine. A qualified name is refused offline.
-    // An unqualified one may be found ahead on its path, and which name an
-    // unnamed key's index takes depends on what holds its candidates now
-    // (#1619, #1645), which only the target can say: asked of it with
-    // `--db`, before any script is written, and refused without one. One
-    // refusal names them all.
-    let mut refused = Vec::new();
-    if dialect.name() == "postgres" {
-        let offline = crate::dependents::names_a_later_relation(
-            &cs,
-            dialect.as_ref(),
-            None,
-            &Schema::default(),
-        );
-        let prefixes = crate::dependents::key_name_prefixes(&cs);
-        match target {
-            Some(target)
-                if !prefixes.is_empty() || offline.iter().any(|n| !n.searched.is_empty()) =>
-            {
-                db::runtime()?.block_on(async {
-                    let mut conn = db::connect(target).await?;
-                    let holders = pbps_pg::catalog::key_name_holders(&mut conn, &prefixes)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("reading what holds key names: {e}"))?;
-                    for name in crate::dependents::names_a_later_relation(
-                        &cs,
-                        dialect.as_ref(),
-                        Some(&holders),
-                        &Schema::default(),
-                    ) {
-                        if name.searched.is_empty()
-                            || !crate::engine::resolves_now(&mut conn, &name).await?
-                        {
-                            refused.push(name);
-                        }
-                    }
-                    Ok::<_, anyhow::Error>(())
-                })?;
-            }
-            Some(_) | None => refused = offline,
-        }
-    }
-    crate::dependents::later_relation_refusal(&refused)
-        .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
-
-    // Rendered now; with a target, written as the build's last step inside
-    // its transaction, after the ledger row: a script written first
-    // overwrote the file with one the same command then refused (#1684).
-    // Refusals come before the lock, under it (two roles the collation reads
-    // as one name, DECISIONS 123) and after the build (a definer routine
-    // without a pinned path, #322), so only the end of the build is past all
-    // of them. A write that fails there rolls the build back with it.
-    //
-    // Emitted now and rendered at the write: the pins carry the zone the
-    // build ran in, which a target tells only once connected (DEC-1916.1).
-    let script = sql_out
-        .map(|_| -> anyhow::Result<_> {
-            let mut statements = crate::statements(
-                &cs.clone()
-                    .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref()),
-                dialect.as_ref(),
-            )?
-            .statements()
-            .to_vec();
-            if let Some(guard) = crate::engine::bootstrap_type_guard(
-                dialect.name(),
-                &loaded.schema,
-                &project.config.trusted_roles,
-            )? {
-                statements.insert(0, guard);
-            }
-            Ok(statements)
-        })
-        .transpose()?;
-    let write_script = |zone: &SessionZone| -> anyhow::Result<()> {
-        if let (Some(path), Some(statements)) = (sql_out, &script) {
-            let script = format!(
-                "-- Generated by pbps against baseline: an empty database\n-- A preview, not an applyable plan. Never hand-edit this file.\n\n{}",
-                pbps_dialect::legacy_render_script(statements, dialect.as_ref(), zone),
-            );
-            std::fs::write(path, script)
-                .with_context(|| format!("cannot write `{}`", path.display()))?;
-            println!("wrote {}", path.display());
-        }
-        Ok(())
-    };
-
-    let Some(target) = target else {
-        if sql_out.is_none() {
+        // A connected generation proves nothing about a later replay target.
+        // Keep the input-path proof in connected execution (DEC-2181.1).
+        if sql_out.is_some() && !crate::engine::type_references(&loaded.schema).is_empty() {
             bail!(
-                "bootstrap needs somewhere to go: pass --sql {}, --db or --env",
-                crate::report::placeholder("file")
+                "bootstrap --sql cannot validate referenced type input paths for its replay target; run connected bootstrap without --sql, or use plan/apply against the target (DEC-2181.1)"
             );
         }
-        // No target to ask: UTC until #1918 (DEC-1916.1).
-        return write_script(&SessionZone::offline_utc());
-    };
 
-    let statements = crate::statements(
-        &cs.clone()
-            .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref()),
-        dialect.as_ref(),
-    )?;
-    let operator = crate::operator(project.root());
-
-    db::runtime()?.block_on(async {
-        let mut conn = db::connect(target).await?;
-        let bootstrap_pins = bootstrap_type_pins(&mut conn, &loaded.schema, &cs, project).await?;
-        // A collation the server lacks is refused here, by name, rather than
-        // by the `CREATE TABLE` that names it after the ones before it ran
-        // (#1175).
-        crate::engine::refuse_unknown_collations(&mut conn, &loaded.schema).await?;
-        // A key to a declared history under another spelling (#1625).
-        crate::engine::refuse_history_references_alike(&mut conn, &loaded.schema, dialect.as_ref())
-            .await?;
-        // A history retention or a cascading key the server lacks (#1502).
-        crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
-        crate::engine::permission_support(&mut conn, &cs).await?;
-        crate::engine::lock(&mut conn, &operator).await?;
-        let mut transaction_attempted = false;
-        let result = async {
-            refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
-
-            // The empty-target check is protected by the same lock as the
-            // build. Checking before it would let two bootstraps both observe
-            // emptiness, then let the second continue after the first had
-            // committed and released the lock.
-            //
-            // No rows are read here: the question is whether any declared
-            // object stands, and a table that does is refused before its rows
-            // matter.
-            let existing = managed_state_full(
-                &mut conn,
-                &ids,
-                &declared_modules,
-                &pbps_diff::external_parents(&loaded.schema),
-                project.config.unmanaged,
-                &BTreeMap::new(),
-                crate::engine::Read::Snapshot,
-            )
-            .await?;
-
-            // Unsupported grants are outside role.grants, so an apparently
-            // empty role is not proof that the database is empty (110).
-            refuse_unexpressible(&existing.scoped, &target.label, "bootstrap again")?;
-            crate::engine::refuse_missing_cluster_roles(
-                conn.driver(),
-                &existing.scoped.missing_roles,
-            )?;
-            // This command builds what it grants on, so the role running it
-            // owns every object the declarations name. A grant to that role
-            // is the impossible line a connected plan is refused for, and
-            // here there is nothing downstream to catch it: the engine writes
-            // only the owner's default ACL entry, the pull reads that entry
-            // as the zero point (DECISIONS 371), and this command compares no
-            // declared grant against what it built. Unrefused it reports
-            // success and records a snapshot that does not hold the grant
-            // (#261).
-            crate::engine::owned_targets(
-                conn.driver(),
-                &cs,
-                &ids,
-                &existing.scoped.owners,
-                &existing.scoped.session_role,
-            )?;
-
-            // Only names the plan creates need to be free (DECISIONS 118).
-            // PostgreSQL grants use existing cluster roles; their existence
-            // is outside this database's ownership (DECISIONS 211).
-            let (wanted, vacated) = role_name_expectations(
-                &cs.clone()
-                    .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref()),
-                dialect.as_ref(),
-                pbps_model::PlanMode::Transactional,
-                0,
-            )?;
-            refuse_taken_role_names(&mut conn, &wanted, &vacated).await?;
-            // A history name already taken: SQL Server takes an existing
-            // table whose columns match as the history, with its rows,
-            // instead of refusing (measured on 17.0, #1176).
-            refuse_taken_history_names(&mut conn, &cs, &target.label).await?;
-
-            // A cluster role with no managed grants is not an object this
-            // bootstrap creates. Existing managed grants still make the
-            // target nonempty: bootstrap must not silently adopt them.
-            let existing_roles: Vec<_> = existing
-                .scoped
-                .schema
-                .roles
-                .iter()
-                .filter(|(_, role)| dialect.manages_roles() || !role.grants.is_empty())
-                .map(|(name, _)| format!("role {name}", name = name.shown(),))
-                .collect();
-
-            // Bootstrap means "into an empty database". Running it over an
-            // existing managed set would fail halfway through on the first
-            // CREATE and leave a partly built schema unless the transaction
-            // catches it. Modules count too: `CREATE OR ALTER` would otherwise
-            // replace one without a plan or approval. And so does a role
-            // (ADR-0005): `CREATE ROLE` fails on one already there, after
-            // everything before it in the batch has run. And so does
-            // everything in the managed set that the projection could not
-            // express — a declared module the catalog cannot read back, or a
-            // declared table whose every column is unsupported and which
-            // introspection therefore left out whole. That table is absent
-            // from the scoped schema and present in the database; counting
-            // only the scoped schema called the target empty, the CREATE
-            // failed on it, and the failure audit recorded an empty state as
-            // the newest one, which the next `verify` under `unmanaged:
-            // ignore` believed.
-            if !existing.scoped.schema.tables.is_empty()
-                || !existing.scoped.schema.modules.is_empty()
-                || !existing_roles.is_empty()
-                || !existing.limitations.is_empty()
-            {
-                let names: Vec<String> = existing
-                    .scoped
+        // Every declared object needs its identity, not just "some": a role the
+        // ids file does not know is skipped by the differ, and a bootstrap that
+        // skipped it built less than the declarations say and recorded that as
+        // the whole state. `pbps plan` mints what is missing (DECISIONS 109).
+        let unidentified: Vec<String> = loaded
+            .schema
+            .tables
+            .keys()
+            .filter(|t| ids.table_uid(t).is_none())
+            .map(|name| name.shown().to_string())
+            .chain(
+                loaded
                     .schema
-                    .tables
+                    .roles
                     .keys()
-                    .map(|name| name.shown().to_string())
-                    .chain(
-                        existing
-                            .scoped
-                            .schema
-                            .modules
-                            .keys()
-                            .map(|id| id.shown().to_string()),
-                    )
-                    .chain(existing_roles)
-                    .chain(existing.limitations.iter().cloned())
-                    .collect();
+                    .filter(|r| ids.role_uid(r).is_none())
+                    .map(|r| format!("role {r}", r = r.shown(),)),
+            )
+            .collect();
+        if !unidentified.is_empty() {
+            bail!(
+                "the identity file does not know {}: {}.\n\
+             Run `pbps plan` first to mint identities for the declarations.",
+                if unidentified.len() == 1 {
+                    "a declared object"
+                } else {
+                    "these declared objects"
+                },
+                unidentified.join(", ")
+            );
+        }
+
+        // Every declared text, as the engine reads it, before anything is built
+        // from them: a spelling it would read back differently would be recorded
+        // as the engine spells it and drift from the declaration on the next plan
+        // (DECISIONS 101), and a date or time it reads one way only is built,
+        // scripted and recorded as that reading (DEC-1883.1) — so this is asked
+        // ahead of the diff, not inside the build where it used to be, since the
+        // statements and the `--sql` script are made from what it answers. Into
+        // an empty database, so nothing is under an older name: the declared
+        // names are the only ones the catalog could have. Not under the lock: the
+        // engine's reading of a text does not turn on what the database holds.
+        // Without a target nothing can be asked, and the script carries the
+        // declared text, as it always has.
+        if let Some(target) = target {
+            loaded.schema = db::runtime()?.block_on(async {
+                let mut conn = db::connect(target).await?;
+                dialect = crate::engine::planning_dialect_for(&mut conn, &dialect).await?;
+                bootstrap_type_pins(&mut conn, &loaded.schema, &Default::default(), project)
+                    .await?;
+                let mut unasked = Vec::new();
+                let refused = refuse_misspelt(
+                    &mut conn,
+                    &loaded.schema,
+                    &Default::default(),
+                    &mut unasked,
+                    false,
+                )
+                .await;
+                // Printed before the refusal, beside it, as the plan prints them.
+                warn_unasked(&unasked);
+                refused
+            })?;
+        }
+        for notice in crate::row_security::binding_notices(&loaded.schema) {
+            eprintln!("warning: {notice}");
+        }
+        let declared_modules = managed_modules(None, Some(&loaded.schema));
+
+        // Bootstrap is the plan from nothing: every declared table is created.
+        let cs = pbps_diff::diff(
+            pbps_diff::Side {
+                schema: &Schema::default(),
+                ids: &IdsFile::default(),
+            },
+            pbps_diff::Side {
+                schema: &loaded.schema,
+                ids: &ids,
+            },
+            dialect.as_ref(),
+            // Bootstrap builds into an empty database, so there are no rows for an
+            // online operation to spare and the strategies are dropped. The module
+            // dependencies are not: `depends_on:` exists for the edges the
+            // identifier scan cannot see, and discarding them here would make
+            // bootstrap emit a dependent module first and fail on declarations that
+            // plan perfectly well.
+            &pbps_model::Hints {
+                strategies: Default::default(),
+                module_deps: loaded.hints.module_deps.clone(),
+                // Carried for the same reason, and one more: it is what decides
+                // whether the routines this bootstrap creates arrive executable
+                // by every principal in the cluster (ADR-0010 §5). Dropping it
+                // here would make the first apply into an empty database the one
+                // apply that leaves the engine default standing.
+                public_execute: loaded.hints.public_execute.clone(),
+            },
+        )
+        .map_err(|errs| {
+            let errors = crate::Unexpressible(errs);
+            errors.print_human();
+            errors
+        })?;
+        // What a new table calls goes ahead of it, by the same reordering passes
+        // `plan --db` runs (#1585, DEC-942.1, DEC-1364.1): a default or generated
+        // column calling a declared function. Into an empty database there is no
+        // catalog to read, so the facts are none: nothing is dropped or rebuilt,
+        // no column is released, and `weave` has nothing to add. The passes that
+        // read nothing run, so the `--sql` script gets them too (#1955).
+        let cs = crate::dependents::schedule::schedule(
+            cs,
+            &crate::dependents::schedule::Declarations {
+                schema: &loaded.schema,
+                sources: crate::dependents::Sources {
+                    before: pbps_diff::Side {
+                        schema: &Schema::default(),
+                        ids: &IdsFile::default(),
+                    },
+                    after: &ids,
+                },
+                module_deps: &loaded.hints.module_deps,
+            },
+            &crate::dependents::schedule::Facts::default(),
+            dialect.as_ref(),
+        )?
+        .changes;
+        // And the check `plan --db` runs on that final order (DEC-1576.1): an
+        // expression naming, in a literal, a relation created only after it is
+        // refused with the two-plan remedy, before any script or DDL, rather
+        // than rolled back by the engine. A qualified name is refused offline.
+        // An unqualified one may be found ahead on its path, and which name an
+        // unnamed key's index takes depends on what holds its candidates now
+        // (#1619, #1645), which only the target can say: asked of it with
+        // `--db`, before any script is written, and refused without one. One
+        // refusal names them all.
+        let mut refused = Vec::new();
+        if dialect.name() == "postgres" {
+            let offline = crate::dependents::names_a_later_relation(
+                &cs,
+                dialect.as_ref(),
+                None,
+                &Schema::default(),
+            );
+            let prefixes = crate::dependents::key_name_prefixes(&cs);
+            match target {
+                Some(target)
+                    if !prefixes.is_empty() || offline.iter().any(|n| !n.searched.is_empty()) =>
+                {
+                    db::runtime()?.block_on(async {
+                        let mut conn = db::connect(target).await?;
+                        let holders = pbps_pg::catalog::key_name_holders(&mut conn, &prefixes)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("reading what holds key names: {e}"))?;
+                        for name in crate::dependents::names_a_later_relation(
+                            &cs,
+                            dialect.as_ref(),
+                            Some(&holders),
+                            &Schema::default(),
+                        ) {
+                            if name.searched.is_empty()
+                                || !crate::engine::resolves_now(&mut conn, &name).await?
+                            {
+                                refused.push(name);
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })?;
+                }
+                Some(_) | None => refused = offline,
+            }
+        }
+        crate::dependents::later_relation_refusal(&refused)
+            .map_err(|why| anyhow::anyhow!("module_dependents (PostgreSQL): {why}"))?;
+
+        // Rendered now; with a target, written as the build's last step inside
+        // its transaction, after the ledger row: a script written first
+        // overwrote the file with one the same command then refused (#1684).
+        // Refusals come before the lock, under it (two roles the collation reads
+        // as one name, DECISIONS 123) and after the build (a definer routine
+        // without a pinned path, #322), so only the end of the build is past all
+        // of them. A write that fails there rolls the build back with it.
+        //
+        // Emitted now and rendered at the write: the pins carry the zone the
+        // build ran in, which a target tells only once connected (DEC-1916.1).
+        let script = sql_out
+            .map(|_| {
+                crate::statements(
+                    &cs.clone()
+                        .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref()),
+                    &dialect,
+                )?
+                .bootstrap_script(&loaded.schema, &project.config.trusted_roles)
+            })
+            .transpose()?;
+        let write_script = |zone: &SessionZone| -> anyhow::Result<()> {
+            if let (Some(path), Some(statements)) = (sql_out, &script) {
+                let script = crate::sql_script(statements, "an empty database", zone);
+                std::fs::write(path, script)
+                    .with_context(|| format!("cannot write `{}`", path.display()))?;
+                println!("wrote {}", path.display());
+            }
+            Ok(())
+        };
+
+        let Some(target) = target else {
+            if sql_out.is_none() {
                 bail!(
-                    "`{}` already has {} of the declared object(s): {}.\n\
-                     Bootstrap builds into an empty database; use `pbps plan --db` and `pbps \
-                     apply` to migrate it instead.",
-                    target.label,
-                    names.len(),
-                    names.join(", ")
+                    "bootstrap needs somewhere to go: pass --sql {}, --db or --env",
+                    crate::report::placeholder("file")
                 );
             }
+            // No target to ask: UTC until #1918 (DEC-1916.1).
+            return write_script(&SessionZone::offline_utc());
+        };
 
-            crate::engine::recheck_type_prerequisites(
-                &mut conn,
-                &bootstrap_pins,
-                &cs,
-                &project.config.trusted_roles,
-                false,
-            )
-            .await?;
-            transaction_attempted = true;
-            execute_transaction_body(
-                &mut conn,
-                dialect.as_ref(),
-                &statements,
-                &bootstrap_pins,
-                &cs,
-                &project.config.trusted_roles,
-            )
-            .await?;
-            // Bootstrap creates routines as `apply` does, so the same form is
-            // required of a definer among them (#322).
-            crate::engine::refuse_unsafe_definers(
-                &mut conn,
-                &crate::engine::written_routines(&cs),
-                crate::engine::Absent::Refused,
-            )
-            .await?;
+        let statements = crate::statements(
+            &cs.clone()
+                .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref()),
+            &dialect,
+        )?;
+        let operator = crate::operator(project.root());
 
-            // Read-back and the success ledger row are part of the same
-            // transaction as the DDL. If either fails, the database is still
-            // empty and bootstrap can be retried honestly.
-            //
-            // The state recorded is what the engine actually built, read back —
-            // not what was declared. Expressions come back in the engine's
-            // stored form, and only that form compares equal on the next drift
-            // check (SPEC §8.2). The rows too, under the declared scope:
-            // bootstrap inserted them, and the engine's spelling of each value
-            // is what the record has to hold.
-            let built = managed_state(
+        db::runtime()?.block_on(async {
+            let mut conn = db::connect(target).await?;
+            let bootstrap_pins =
+                bootstrap_type_pins(&mut conn, &loaded.schema, &cs, project).await?;
+            // A collation the server lacks is refused here, by name, rather than
+            // by the `CREATE TABLE` that names it after the ones before it ran
+            // (#1175).
+            crate::engine::refuse_unknown_collations(&mut conn, &loaded.schema).await?;
+            // A key to a declared history under another spelling (#1625).
+            crate::engine::refuse_history_references_alike(
                 &mut conn,
-                &ids,
-                &declared_modules,
-                &pbps_diff::external_parents(&loaded.schema),
-                project.config.unmanaged,
-                &loaded.schema.data_scopes(),
                 &loaded.schema,
-                crate::engine::Read::InsideOwnTransaction,
+                dialect.as_ref(),
             )
             .await?;
-            // A database-side trigger can add a privilege during the build.
-            // Never commit a snapshot that silently omits it (110, 147).
-            refuse_unexpressible(&built, &target.label, "bootstrap again")?;
-            crate::engine::refuse_missing_cluster_roles(conn.driver(), &built.missing_roles)?;
-            // And it can take one back. `ddl_command_end` fires on `GRANT`
-            // and on `REVOKE` (measured), so a trigger already in the
-            // database can reverse what this build just settled about
-            // `PUBLIC` before this read — and no other check here would see
-            // it, because what `PUBLIC` holds is in neither the schema nor
-            // the unexpressible list (DECISIONS 371, 517). The same
-            // postcondition the apply paths ask, at the read this command
-            // records.
-            refuse_unmet_public_execution(&cs, &built, &target.label)?;
-            // Only the uids of what this build made. The ids file may name
-            // tables and roles these declarations do not hold, and recording
-            // those as held would make the next plan skip them (#1600, #1606).
-            crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
-            let gone = crate::engine::absent_roles(&mut conn, &built.missing_roles).await?;
-            let held = ids.without(&built.missing).without_roles(&gone);
-            crate::engine::recheck_type_prerequisites(
-                &mut conn,
-                &bootstrap_pins,
-                &cs,
-                &project.config.trusted_roles,
-                true,
-            )
-            .await?;
-            let mut snapshot = with_provenance(
-                project.root(),
-                StateSnapshot::new(StateKind::Bootstrap, built.schema, held, &operator),
-            );
-            snapshot.module_deps = loaded.hints.module_deps.clone();
-            // Every object was created from these declarations, so what was
-            // declared is exactly what bootstrap holds (ADR-0009 §2.2).
-            snapshot.declared = pbps_model::Declared::from_schema(&loaded.schema);
-            let id = crate::engine::record(&mut conn, &snapshot).await?;
-            write_script(&pin_zone(&conn))?;
-            Ok::<_, anyhow::Error>((id, snapshot))
-        }
-        .await;
-        let result = if transaction_attempted {
-            finish_transaction(&mut conn, dialect.as_ref(), result).await
-        } else {
-            result
-        };
-        if transaction_attempted && let Err(error) = &result {
-            record_failed_bootstrap(&mut conn, project.root(), &operator, error).await;
-        }
-        let unlocked = crate::engine::unlock(&mut conn).await;
-        let (id, snapshot) = match result {
-            Ok(built) => built,
-            Err(error) => {
-                warn_unreleased(&target.label, &unlocked);
-                return Err(error);
+            // A history retention or a cascading key the server lacks (#1502).
+            crate::engine::refuse_unsupported_temporal(&mut conn, &cs).await?;
+            crate::engine::permission_support(&mut conn, &cs).await?;
+            crate::engine::lock(&mut conn, &operator).await?;
+            let mut transaction_attempted = false;
+            let result = async {
+                refuse_wrongly_spelt_schemas(&mut conn, &loaded.schema).await?;
+
+                // The empty-target check is protected by the same lock as the
+                // build. Checking before it would let two bootstraps both observe
+                // emptiness, then let the second continue after the first had
+                // committed and released the lock.
+                //
+                // No rows are read here: the question is whether any declared
+                // object stands, and a table that does is refused before its rows
+                // matter.
+                let existing = managed_state_full(
+                    &mut conn,
+                    &ids,
+                    &declared_modules,
+                    &pbps_diff::external_parents(&loaded.schema),
+                    project.config.unmanaged,
+                    &BTreeMap::new(),
+                    crate::engine::Read::Snapshot,
+                )
+                .await?;
+
+                // Unsupported grants are outside role.grants, so an apparently
+                // empty role is not proof that the database is empty (110).
+                refuse_unexpressible(&existing.scoped, &target.label, "bootstrap again")?;
+                crate::engine::refuse_missing_cluster_roles(
+                    conn.driver(),
+                    &existing.scoped.missing_roles,
+                )?;
+                // This command builds what it grants on, so the role running it
+                // owns every object the declarations name. A grant to that role
+                // is the impossible line a connected plan is refused for, and
+                // here there is nothing downstream to catch it: the engine writes
+                // only the owner's default ACL entry, the pull reads that entry
+                // as the zero point (DECISIONS 371), and this command compares no
+                // declared grant against what it built. Unrefused it reports
+                // success and records a snapshot that does not hold the grant
+                // (#261).
+                crate::engine::owned_targets(
+                    conn.driver(),
+                    &cs,
+                    &ids,
+                    &existing.scoped.owners,
+                    &existing.scoped.session_role,
+                )?;
+
+                // Only names the plan creates need to be free (DECISIONS 118).
+                // PostgreSQL grants use existing cluster roles; their existence
+                // is outside this database's ownership (DECISIONS 211).
+                let (wanted, vacated) = role_name_expectations(
+                    &cs.clone()
+                        .ordered(pbps_model::PlanMode::Transactional, dialect.as_ref()),
+                    dialect.as_ref(),
+                    pbps_model::PlanMode::Transactional,
+                    0,
+                )?;
+                refuse_taken_role_names(&mut conn, &wanted, &vacated).await?;
+                // A history name already taken: SQL Server takes an existing
+                // table whose columns match as the history, with its rows,
+                // instead of refusing (measured on 17.0, #1176).
+                refuse_taken_history_names(&mut conn, &cs, &target.label).await?;
+
+                // A cluster role with no managed grants is not an object this
+                // bootstrap creates. Existing managed grants still make the
+                // target nonempty: bootstrap must not silently adopt them.
+                let existing_roles: Vec<_> = existing
+                    .scoped
+                    .schema
+                    .roles
+                    .iter()
+                    .filter(|(_, role)| dialect.manages_roles() || !role.grants.is_empty())
+                    .map(|(name, _)| format!("role {name}", name = name.shown(),))
+                    .collect();
+
+                // Bootstrap means "into an empty database". Running it over an
+                // existing managed set would fail halfway through on the first
+                // CREATE and leave a partly built schema unless the transaction
+                // catches it. Modules count too: `CREATE OR ALTER` would otherwise
+                // replace one without a plan or approval. And so does a role
+                // (ADR-0005): `CREATE ROLE` fails on one already there, after
+                // everything before it in the batch has run. And so does
+                // everything in the managed set that the projection could not
+                // express — a declared module the catalog cannot read back, or a
+                // declared table whose every column is unsupported and which
+                // introspection therefore left out whole. That table is absent
+                // from the scoped schema and present in the database; counting
+                // only the scoped schema called the target empty, the CREATE
+                // failed on it, and the failure audit recorded an empty state as
+                // the newest one, which the next `verify` under `unmanaged:
+                // ignore` believed.
+                if !existing.scoped.schema.tables.is_empty()
+                    || !existing.scoped.schema.modules.is_empty()
+                    || !existing_roles.is_empty()
+                    || !existing.limitations.is_empty()
+                {
+                    let names: Vec<String> = existing
+                        .scoped
+                        .schema
+                        .tables
+                        .keys()
+                        .map(|name| name.shown().to_string())
+                        .chain(
+                            existing
+                                .scoped
+                                .schema
+                                .modules
+                                .keys()
+                                .map(|id| id.shown().to_string()),
+                        )
+                        .chain(existing_roles)
+                        .chain(existing.limitations.iter().cloned())
+                        .collect();
+                    bail!(
+                        "`{}` already has {} of the declared object(s): {}.\n\
+                     Bootstrap builds into an empty database; use `pbps plan --db` and `pbps \
+                     apply` to migrate it instead.",
+                        target.label,
+                        names.len(),
+                        names.join(", ")
+                    );
+                }
+
+                crate::engine::recheck_type_prerequisites(
+                    &mut conn,
+                    &bootstrap_pins,
+                    &cs,
+                    &project.config.trusted_roles,
+                    false,
+                )
+                .await?;
+                transaction_attempted = true;
+                execute_transaction_body(
+                    &mut conn,
+                    dialect.as_ref(),
+                    &statements,
+                    &bootstrap_pins,
+                    &cs,
+                    &project.config.trusted_roles,
+                )
+                .await?;
+                // Bootstrap creates routines as `apply` does, so the same form is
+                // required of a definer among them (#322).
+                crate::engine::refuse_unsafe_definers(
+                    &mut conn,
+                    &crate::engine::written_routines(&cs),
+                    crate::engine::Absent::Refused,
+                )
+                .await?;
+
+                // Read-back and the success ledger row are part of the same
+                // transaction as the DDL. If either fails, the database is still
+                // empty and bootstrap can be retried honestly.
+                //
+                // The state recorded is what the engine actually built, read back —
+                // not what was declared. Expressions come back in the engine's
+                // stored form, and only that form compares equal on the next drift
+                // check (SPEC §8.2). The rows too, under the declared scope:
+                // bootstrap inserted them, and the engine's spelling of each value
+                // is what the record has to hold.
+                let built = managed_state(
+                    &mut conn,
+                    &ids,
+                    &declared_modules,
+                    &pbps_diff::external_parents(&loaded.schema),
+                    project.config.unmanaged,
+                    &loaded.schema.data_scopes(),
+                    &loaded.schema,
+                    crate::engine::Read::InsideOwnTransaction,
+                )
+                .await?;
+                // A database-side trigger can add a privilege during the build.
+                // Never commit a snapshot that silently omits it (110, 147).
+                refuse_unexpressible(&built, &target.label, "bootstrap again")?;
+                crate::engine::refuse_missing_cluster_roles(conn.driver(), &built.missing_roles)?;
+                // And it can take one back. `ddl_command_end` fires on `GRANT`
+                // and on `REVOKE` (measured), so a trigger already in the
+                // database can reverse what this build just settled about
+                // `PUBLIC` before this read — and no other check here would see
+                // it, because what `PUBLIC` holds is in neither the schema nor
+                // the unexpressible list (DECISIONS 371, 517). The same
+                // postcondition the apply paths ask, at the read this command
+                // records.
+                refuse_unmet_public_execution(&cs, &built, &target.label)?;
+                // Only the uids of what this build made. The ids file may name
+                // tables and roles these declarations do not hold, and recording
+                // those as held would make the next plan skip them (#1600, #1606).
+                crate::engine::prove_tables_absent(&mut conn, &built.missing).await?;
+                let gone = crate::engine::absent_roles(&mut conn, &built.missing_roles).await?;
+                let held = ids.without(&built.missing).without_roles(&gone);
+                crate::engine::recheck_type_prerequisites(
+                    &mut conn,
+                    &bootstrap_pins,
+                    &cs,
+                    &project.config.trusted_roles,
+                    true,
+                )
+                .await?;
+                let mut snapshot = with_provenance(
+                    project.root(),
+                    StateSnapshot::new(StateKind::Bootstrap, built.schema, held, &operator),
+                );
+                snapshot.module_deps = loaded.hints.module_deps.clone();
+                // Every object was created from these declarations, so what was
+                // declared is exactly what bootstrap holds (ADR-0009 §2.2).
+                snapshot.declared = pbps_model::Declared::from_schema(&loaded.schema);
+                let id = crate::engine::record(&mut conn, &snapshot).await?;
+                write_script(&pin_zone(&conn))?;
+                Ok::<_, anyhow::Error>((id, snapshot))
             }
-        };
-        println!(
-            "Bootstrapped `{}`: {} table(s) created, recorded as entry #{id}.",
-            target.label,
-            snapshot.schema.tables.len()
-        );
-        // Both the DDL and ledger row committed before lock cleanup began.
-        unlocked?;
-        Ok(())
+            .await;
+            let result = if transaction_attempted {
+                finish_transaction(&mut conn, dialect.as_ref(), result).await
+            } else {
+                result
+            };
+            if transaction_attempted && let Err(error) = &result {
+                record_failed_bootstrap(&mut conn, project.root(), &operator, error).await;
+            }
+            let unlocked = crate::engine::unlock(&mut conn).await;
+            let (id, snapshot) = match result {
+                Ok(built) => built,
+                Err(error) => {
+                    warn_unreleased(&target.label, &unlocked);
+                    return Err(error);
+                }
+            };
+            println!(
+                "Bootstrapped `{}`: {} table(s) created, recorded as entry #{id}.",
+                target.label,
+                snapshot.schema.tables.len()
+            );
+            // Both the DDL and ledger row committed before lock cleanup began.
+            unlocked?;
+            Ok(())
+        })
     })
 }
 
@@ -6608,54 +6605,55 @@ pub fn cmd_plan_db(
     carried: &mut Vec<crate::output::Finding>,
 ) -> anyhow::Result<()> {
     let dialect = crate::dialect(project)?;
-    let mut loaded = crate::load(project, dialect.as_ref())?;
-    let ids = crate::read_ids(project)?;
-    refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
-    let created_at = crate::now();
+    pbps_cli::with_plan_dialect!(dialect, |dialect| {
+        let mut loaded = crate::load(project, dialect.as_ref())?;
+        let ids = crate::read_ids(project)?;
+        refuse_invalid_declarations(&loaded, dialect.as_ref(), json)?;
+        let created_at = crate::now();
 
-    let resolved = match pbps_diff::resolve_with_annotations(
-        &loaded.schema,
-        &ids,
-        &loaded.intents,
-        loaded.intents.len(),
-        &crate::context(project.root()),
-    ) {
-        Ok(r) => r,
-        Err(blockers) => {
+        let resolved = match pbps_diff::resolve_with_annotations(
+            &loaded.schema,
+            &ids,
+            &loaded.intents,
+            loaded.intents.len(),
+            &crate::context(project.root()),
+        ) {
+            Ok(r) => r,
+            Err(blockers) => {
+                if json {
+                    return crate::output::Report::plain(
+                        "plan",
+                        crate::report::blocker_findings(&blockers),
+                    )
+                    .emit_json();
+                }
+                eprintln!("{}", crate::report::blockers(&blockers));
+                bail!("some changes could not be decided automatically");
+            }
+        };
+        if resolved.ids != ids {
+            let message = format!(
+                "the identity file is out of date; run `pbps plan` locally and commit `{}`.\n\
+             A deployment plan must be computed against the identity its reviewers read.",
+                project.ids_file().display()
+            );
+            // The same finding offline `plan --check` reports, so a pipeline
+            // reads one id for one refusal whichever command met it (#573).
             if json {
                 return crate::output::Report::plain(
                     "plan",
-                    crate::report::blocker_findings(&blockers),
+                    vec![
+                        crate::output::Finding::error("identity.stale", message)
+                            .at(project.ids_file(), None)
+                            .remedy("pbps plan"),
+                    ],
                 )
                 .emit_json();
             }
-            eprintln!("{}", crate::report::blockers(&blockers));
-            bail!("some changes could not be decided automatically");
+            bail!("{message}");
         }
-    };
-    if resolved.ids != ids {
-        let message = format!(
-            "the identity file is out of date; run `pbps plan` locally and commit `{}`.\n\
-             A deployment plan must be computed against the identity its reviewers read.",
-            project.ids_file().display()
-        );
-        // The same finding offline `plan --check` reports, so a pipeline
-        // reads one id for one refusal whichever command met it (#573).
-        if json {
-            return crate::output::Report::plain(
-                "plan",
-                vec![
-                    crate::output::Finding::error("identity.stale", message)
-                        .at(project.ids_file(), None)
-                        .remedy("pbps plan"),
-                ],
-            )
-            .emit_json();
-        }
-        bail!("{message}");
-    }
 
-    let connected = db::runtime()?.block_on(async {
+        let connected = db::runtime()?.block_on(async {
         let mut conn = db::connect(target).await?;
         let initial_types = crate::engine::seal_type_pins(
             &mut conn,
@@ -7565,170 +7563,168 @@ pub fn cmd_plan_db(
             resolution,
         ))))
     })?;
-    let (
-        cs,
-        (baseline_checksum, baseline_collation, baseline_zone),
-        baseline_description,
-        connected_checks,
-        findings,
-        cost,
-        routine_pins,
-        type_pins,
-        reviewed,
-        resolver_assessment,
-        resolution,
-    ) = match connected {
-        Connected::Ordinary(planned) => *planned,
-        Connected::Refused {
-            finding,
-            mut findings,
-        } => {
-            if json {
-                findings.push(finding);
-                return crate::output::Report::plain("plan", findings).emit_json();
+        let (
+            cs,
+            (baseline_checksum, baseline_collation, baseline_zone),
+            baseline_description,
+            connected_checks,
+            findings,
+            cost,
+            routine_pins,
+            type_pins,
+            reviewed,
+            resolver_assessment,
+            resolution,
+        ) = match connected {
+            Connected::Ordinary(planned) => *planned,
+            Connected::Refused {
+                finding,
+                mut findings,
+            } => {
+                if json {
+                    findings.push(finding);
+                    return crate::output::Report::plain("plan", findings).emit_json();
+                }
+                let report = crate::output::Report::plain("plan", vec![finding]);
+                eprint!("{}", crate::output::human(&report.findings));
+                return report.outcome();
             }
-            let report = crate::output::Report::plain("plan", vec![finding]);
-            eprint!("{}", crate::output::human(&report.findings));
-            return report.outcome();
-        }
-    };
+        };
 
-    let statements = crate::statements(
-        &cs.clone().ordered(plan_mode(staged), dialect.as_ref()),
-        dialect.as_ref(),
-    )?;
-    if staged {
-        // A staged plan is one logical change isolated in a deployment of its
-        // own (ADR-0003). The limit is the whole point: what cannot be rolled
-        // back must not be able to take four unrelated changes down with it,
-        // and a resume that had to reason about which of five changes were
-        // half-done would be guessing.
-        let logical = crate::logical_changes(&cs);
-        if logical > 1 {
-            bail!(
-                "--staged applies one logical change, and this plan has {logical}.\n\
+        let statements = crate::statements(
+            &cs.clone().ordered(plan_mode(staged), dialect.as_ref()),
+            &dialect,
+        )?;
+        if staged {
+            // A staged plan is one logical change isolated in a deployment of its
+            // own (ADR-0003). The limit is the whole point: what cannot be rolled
+            // back must not be able to take four unrelated changes down with it,
+            // and a resume that had to reason about which of five changes were
+            // half-done would be guessing.
+            let logical = crate::logical_changes(&cs);
+            if logical > 1 {
+                bail!(
+                    "--staged applies one logical change, and this plan has {logical}.\n\
                  Stage the change that needs it in a revision of its own; the rest can go \
                  through an ordinary transactional apply."
-            );
+                );
+            }
+            if cs.is_empty() {
+                bail!("there is nothing to stage: this plan is empty");
+            }
+        } else {
+            // §7.5: a statement that cannot run inside a transaction fails **here**,
+            // not halfway through an apply with no way back.
+            reject_non_transactional(&statements)?;
         }
-        if cs.is_empty() {
-            bail!("there is nothing to stage: this plan is empty");
-        }
-    } else {
-        // §7.5: a statement that cannot run inside a transaction fails **here**,
-        // not halfway through an apply with no way back.
-        reject_non_transactional(&statements)?;
-    }
 
-    let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &resolved.ids)?;
-    let (tables, modules) = crate::report::touched(&names);
-    let data = crate::PlanData {
-        baseline: baseline_description.clone(),
-        time_zone: baseline_zone.as_ref().map(ToString::to_string),
-        changes: cs.changes.len(),
-        tables,
-        modules,
-        roles: crate::report::touched_roles(&names),
-        risks: cs.risks().iter().map(|risk| risk.as_str()).collect(),
-        connected_checks,
-        type_routines: reviewed.0.clone(),
-        type_routine_approval: (!reviewed.0.is_empty())
-            .then(|| crate::pins::TYPE_ROUTINE_APPROVAL.to_owned()),
-        origins: crate::report::origins(&cs),
-        cost: Some(cost),
-        resolver_selection,
-        resolver_assessment,
-    };
-    if !json {
-        println!("Baseline: {baseline_description}");
-        if let Some(zone) = &baseline_zone {
-            // Named because nothing in a statement shows it: the same
-            // `2026-02-01` is another instant in another zone (DEC-1916.1).
-            println!("Offset-less date/time values read in {zone}");
-        }
-        // Case 1 has no resolver to report and claims no verification.
-        if let Some(resolution) = &resolution {
-            println!(
-                "Resolver profile: {}; it answered the binding questions of {}, and the \
+        let names = pbps_model::plan_names::PlanNames::of(&cs.changes, &resolved.ids)?;
+        let (tables, modules) = crate::report::touched(&names);
+        let data = crate::PlanData {
+            baseline: baseline_description.clone(),
+            time_zone: baseline_zone.as_ref().map(ToString::to_string),
+            changes: cs.changes.len(),
+            tables,
+            modules,
+            roles: crate::report::touched_roles(&names),
+            risks: cs.risks().iter().map(|risk| risk.as_str()).collect(),
+            connected_checks,
+            type_routines: reviewed.0.clone(),
+            type_routine_approval: (!reviewed.0.is_empty())
+                .then(|| crate::pins::TYPE_ROUTINE_APPROVAL.to_owned()),
+            origins: crate::report::origins(&cs),
+            cost: Some(cost),
+            resolver_selection,
+            resolver_assessment,
+        };
+        if !json {
+            println!("Baseline: {baseline_description}");
+            if let Some(zone) = &baseline_zone {
+                // Named because nothing in a statement shows it: the same
+                // `2026-02-01` is another instant in another zone (DEC-1916.1).
+                println!("Offset-less date/time values read in {zone}");
+            }
+            // Case 1 has no resolver to report and claims no verification.
+            if let Some(resolution) = &resolution {
+                println!(
+                    "Resolver profile: {}; it answered the binding questions of {}, and the \
                  target was rechecked after its run.",
-                resolution.name, resolution.asked
-            );
-        } else if let (Some(selection), Some(assessment)) =
-            (&data.resolver_selection, &data.resolver_assessment)
-        {
-            println!(
-                "Resolver profile: {} ({:?}); not needed, so not acquired: this plan moves no name a kept binding could reach ({} unaffected, {} rebuilt from their declarations).",
-                selection.name, selection.source, assessment.unaffected, assessment.rebuilt,
-            );
+                    resolution.name, resolution.asked
+                );
+            } else if let (Some(selection), Some(assessment)) =
+                (&data.resolver_selection, &data.resolver_assessment)
+            {
+                println!(
+                    "Resolver profile: {} ({:?}); not needed, so not acquired: this plan moves no name a kept binding could reach ({} unaffected, {} rebuilt from their declarations).",
+                    selection.name, selection.source, assessment.unaffected, assessment.rebuilt,
+                );
+            }
+            print!("{}", crate::report::plan(&cs, &names));
+            for check in &data.connected_checks {
+                println!(
+                    "{}: {}",
+                    check.name,
+                    pbps_model::escape::Escaped(&check.message)
+                );
+            }
+            if let Some(cost) = &data.cost {
+                print!("{}", crate::cost::render(cost));
+            }
         }
-        print!("{}", crate::report::plan(&cs, &names));
-        for check in &data.connected_checks {
-            println!(
-                "{}: {}",
-                check.name,
-                pbps_model::escape::Escaped(&check.message)
-            );
-        }
-        if let Some(cost) = &data.cost {
-            print!("{}", crate::cost::render(cost));
-        }
-    }
 
-    let mut plan = pbps_model::SavedPlan::new(
-        pbps_model::PlanOrigin::Database,
-        dialect.name(),
-        created_at,
-        pbps_model::PlanBaseline {
-            description: baseline_description.as_str().into(),
-            checksum: baseline_checksum,
-            database_collation: baseline_collation,
-            time_zone: baseline_zone,
-        },
-        cs.changes().clone(),
-        resolved.ids,
-    );
-    plan.module_deps = loaded.hints.module_deps.clone();
-    plan.git_sha = db::git_sha(project.root());
-    // The rows the state recorded after the apply has to cover: the
-    // declarations' scope, carried so that `apply` needs no checkout.
-    plan.data = loaded.schema.data_scopes();
-    plan.routine_pins = routine_pins;
-    plan.type_pins = type_pins;
-    plan.pin_type_routines = project.config.pin_type_routines;
-    (plan.type_routines, plan.type_routine_pins) = reviewed;
-    if !json {
-        print!("{}", crate::pins::reviewed_sources(&plan.type_routines));
-    }
-    plan.trusted_roles = project.config.trusted_roles.clone();
-    if let Some(resolution) = resolution {
-        plan = plan.with_resolution(resolution.evidence).map_err(|e| {
+        let mut plan = pbps_model::SavedPlan::new(
+            pbps_model::PlanOrigin::Database,
+            dialect.name(),
+            created_at,
+            pbps_model::PlanBaseline {
+                description: baseline_description.as_str().into(),
+                checksum: baseline_checksum,
+                database_collation: baseline_collation,
+                time_zone: baseline_zone,
+            },
+            cs.changes().clone(),
+            resolved.ids,
+        );
+        plan.module_deps = loaded.hints.module_deps.clone();
+        plan.git_sha = db::git_sha(project.root());
+        // The rows the state recorded after the apply has to cover: the
+        // declarations' scope, carried so that `apply` needs no checkout.
+        plan.data = loaded.schema.data_scopes();
+        plan.routine_pins = routine_pins;
+        plan.type_pins = type_pins;
+        plan.pin_type_routines = project.config.pin_type_routines;
+        (plan.type_routines, plan.type_routine_pins) = reviewed;
+        if !json {
+            print!("{}", crate::pins::reviewed_sources(&plan.type_routines));
+        }
+        plan.trusted_roles = project.config.trusted_roles.clone();
+        if let Some(resolution) = resolution {
+            plan = plan.with_resolution(resolution.evidence).map_err(|e| {
             anyhow::anyhow!(
                 "the resolver's evidence does not describe this plan: {e}; this is a bug in pbps, \
                  please report it"
             )
         })?;
-    }
-    if staged {
-        plan = plan.staged();
-        if !json {
-            println!(
-                "\nThis is a staged plan: {} statement(s) will run outside a transaction, each \n\
+        }
+        if staged {
+            plan = plan.staged();
+            if !json {
+                println!(
+                    "\nThis is a staged plan: {} statement(s) will run outside a transaction, each \n\
              recorded in the ledger as it completes. Apply it with `pbps apply --staged \n\
              --checksum {}`, and continue an interrupted run with \n\
              `--staged --resume`.",
-                statements.len(),
-                crate::report::placeholder("approved-checksum")
-            );
+                    statements.len(),
+                    crate::report::placeholder("approved-checksum")
+                );
+            }
         }
-    }
 
-    let script = sql_out.map(|_| {
+        let script = sql_out.map(|_| {
         format!(
             "-- Generated by pbps against {}\n-- Applyable only through `pbps apply --plan`; never hand-edit this file.\n\n{}",
             plan.baseline.description.shown(),
-            pbps_dialect::render_script(
-                &statements,
-                &crate::emission::Emitter(dialect.as_ref()),
+            statements.render(
                 // The zone the plan recorded: the script is the plan's, and
                 // runs where the plan was computed (DEC-1916.1).
                 plan.baseline
@@ -7738,39 +7734,44 @@ pub fn cmd_plan_db(
             )
         )
     });
-    let plan = pbps_diff::order::seal(cs.ordered(plan.mode, dialect.as_ref()), plan)?;
-    let rendered = out.map(|_| crate::rendered_plan(&plan)).transpose()?;
-    // Both rendered before either is written, and the SQL written first
-    // (DEC-1516.1): a failed write never leaves a new plan beside an old
-    // script. Each is written in place, so the file keeps its owner, group
-    // and permissions, as it always has.
-    if let (Some(path), Some(script)) = (sql_out, &script) {
-        std::fs::write(path, script)
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
-    }
-    if let (Some(path), Some(rendered)) = (out, &rendered) {
-        std::fs::write(path, rendered)
-            .with_context(|| format!("cannot write `{}`", path.display()))?;
-    }
-    if let Some(path) = out
-        && !json
-    {
-        println!("\nwrote {} (checksum {})", path.display(), plan.checksum());
-    }
-    if let Some(path) = sql_out
-        && !json
-    {
-        println!("wrote {}", path.display());
-    }
-    if out.is_none() && !json {
-        println!(
-            "\nThis plan was not saved. `--out plan.json` writes the artifact `pbps apply` takes."
-        );
-    }
-    if json {
-        return crate::output::Report::new("plan", findings, Some(data)).emit_json();
-    }
-    Ok(())
+        let plan = pbps_diff::order::seal(cs.ordered(plan.mode, dialect.as_ref()), plan)?;
+        let rendered = out.map(|_| crate::rendered_plan(&plan)).transpose()?;
+        // Both rendered before either is written, and the SQL written first
+        // (DEC-1516.1): a failed write never leaves a new plan beside an old
+        // script. Each is written in place, so the file keeps its owner, group
+        // and permissions, as it always has.
+        if let (Some(path), Some(script)) = (sql_out, &script) {
+            std::fs::write(path, script)
+                .with_context(|| format!("cannot write `{}`", path.display()))?;
+        }
+        if let (Some(path), Some(rendered)) = (out, &rendered) {
+            std::fs::write(path, rendered)
+                .with_context(|| format!("cannot write `{}`", path.display()))?;
+        }
+        if let Some(path) = out
+            && !json
+        {
+            println!(
+                "\nwrote {} (checksum {})",
+                path.display(),
+                pbps_diff::order::ArtifactView::checksum(&plan)
+            );
+        }
+        if let Some(path) = sql_out
+            && !json
+        {
+            println!("wrote {}", path.display());
+        }
+        if out.is_none() && !json {
+            println!(
+                "\nThis plan was not saved. `--out plan.json` writes the artifact `pbps apply` takes."
+            );
+        }
+        if json {
+            return crate::output::Report::new("plan", findings, Some(data)).emit_json();
+        }
+        Ok(())
+    })
 }
 
 /// What the connected half of `plan` ended with (DEC-1515.1).
@@ -7846,7 +7847,7 @@ pub fn cmd_apply(
     let raw = std::fs::read_to_string(plan_path)
         .with_context(|| format!("cannot read `{}`", plan_path.display()))?;
     let plan = crate::saved_plan::decode(&raw, plan_path)?;
-    let plan_checksum = plan.checksum();
+    let plan_checksum = plan.wire_fingerprint();
 
     let attempt = apply_identified(
         project,
@@ -7854,7 +7855,7 @@ pub fn cmd_apply(
         request,
         &plan,
         &plan_checksum,
-        dialect.as_ref(),
+        &dialect,
         &operator,
     );
     let (error, released) = match attempt {
@@ -7932,142 +7933,145 @@ fn apply_identified(
     request: &ApplyRequest<'_>,
     plan: &pbps_model::SavedPlan,
     plan_checksum: &str,
-    dialect: &(dyn pbps_dialect::Dialect + 'static),
+    selected: &crate::emission::SelectedDialect,
     operator: &str,
 ) -> anyhow::Result<Attempt> {
-    let ApplyRequest {
-        plan_path,
-        approved_checksum,
-        allow,
-        staged,
-        resume,
-    } = *request;
+    pbps_cli::with_plan_dialect!(selected, |dialect| {
+        let ApplyRequest {
+            plan_path,
+            approved_checksum,
+            allow,
+            staged,
+            resume,
+        } = *request;
 
-    let admitted = pbps_diff::order::admit(plan.clone(), dialect, plan_path, approved_checksum)?;
-    let plan = &admitted;
+        let admitted =
+            pbps_diff::order::admit(plan.clone(), dialect, plan_path, approved_checksum)?;
+        let plan = &admitted;
 
-    // The mode lives in the file because that is what the gate approved; the
-    // flag exists so that the CI configuration says out loud which kind of
-    // deployment this is. A disagreement between them is somebody's mistake,
-    // and running whichever was typed would be the tool choosing the loser.
-    if plan.mode.is_staged() != staged {
-        bail!(
-            "`{}` is a {} plan and `--staged` was {}.\n\
+        // The mode lives in the file because that is what the gate approved; the
+        // flag exists so that the CI configuration says out loud which kind of
+        // deployment this is. A disagreement between them is somebody's mistake,
+        // and running whichever was typed would be the tool choosing the loser.
+        if plan.mode.is_staged() != staged {
+            bail!(
+                "`{}` is a {} plan and `--staged` was {}.\n\
              A staged plan runs outside a transaction and is applied with `--staged`; a \
              transactional one is not.",
-            plan_path.display(),
-            plan.mode,
-            if staged { "given" } else { "not given" }
-        );
-    }
-    if resume && !staged {
-        bail!("--resume continues a staged apply; pass --staged as well");
-    }
-
-    // A cluster role's rename has no SQL, but its approved identity mapping
-    // still has to be checked and recorded. Additions and removal of the last
-    // role need the same check (421). SQL Server keeps its connection-free
-    // empty path; PostgreSQL decides whether the role map moved under the lock.
-    if plan.changes.is_empty() && dialect.manages_roles() {
-        println!("The plan is empty; nothing to apply.");
-        return Ok(Attempt::Empty);
-    }
-
-    // The gate. It can be this coarse precisely because the checksum pins the
-    // plan: what `--allow destructive` approves is this plan's destruction and
-    // no other (SPEC §7.3).
-    let unapproved = plan.changes.unapproved_risks(allow);
-    if !unapproved.is_empty() {
-        let names: Vec<&str> = unapproved.iter().map(|r| r.as_str()).collect();
-        bail!(
-            "this plan carries risks that were not approved: {}.\n\
-             Read {} and, if it is what you intend, re-run with --allow {}",
-            names.join(", "),
-            plan_path.display(),
-            plan.changes
-                .gated_risks()
-                .iter()
-                .map(|r| r.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-    }
-
-    let statements = crate::statements(plan, dialect)?;
-    crate::engine::require_transactional_rebuilds(target.driver(), &plan.changes, staged)?;
-    // Only for a transactional plan. A staged one exists *because* its
-    // statement cannot run inside a transaction (ADR-0003): `plan --db
-    // --staged` accepts it deliberately, and rejecting it here would leave
-    // staged execution refusing the only kind of change it is for.
-    //
-    // Nothing the T-SQL emitter writes is marked non-transactional yet, so this
-    // is latent — which is the reason to fix it now rather than when the first
-    // such statement arrives and the guard swallows every staged apply.
-    if !staged {
-        reject_non_transactional(&statements)?;
-    }
-    let names = pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?;
-    let targets = crate::engine::rename_targets(target.driver(), &names);
-    // A resolved plan's key, before anything connects: evidence sealed under
-    // another key, or none, is no evidence here (#616, DEC-952.1).
-    let keyed = pbps_cli::resolver::apply::Keyed::check(
-        plan,
-        pbps_cli::resolver::sealing::environment_key(project, target.environment()),
-        &target.label,
-    )?;
-    let deployment = Deployment {
-        project,
-        target,
-        plan,
-        plan_checksum,
-        statements: &statements,
-        rename_targets: &targets,
-        dialect,
-        operator,
-    };
-
-    let (result, released) = db::runtime()?.block_on(async {
-        let mut conn = db::connect(target).await?;
-
-        // This capability is constant for the connection and needs no ledger
-        // lock. Check before any writes, including staged resumes.
-        crate::engine::permission_support(&mut conn, &plan.changes).await?;
-        crate::engine::generation_support(&mut conn, &plan.changes, &plan.ids).await?;
-        // A resolved plan's cluster, constant for the connection like the
-        // checks above: the evidence describes one cluster (#616, DEC-1685.1).
-        let resolved = match &keyed {
-            Some(keyed) => Some(keyed.open(&mut conn).await?),
-            None => None,
-        };
-
-        // The lock comes first, before the checks and not after them: a
-        // pre-flight that passed while another pipeline was mid-apply would
-        // have been answered about a database that is already moving.
-        crate::engine::lock(&mut conn, operator).await?;
-        let result = if staged {
-            apply_staged_under_lock(&mut conn, &deployment, resume)
-                .await
-                .map(Some)
-        } else {
-            apply_under_lock(&mut conn, &deployment, resolved.as_ref()).await
-        };
-        if let Err(error) = &result {
-            record_failed_apply(&mut conn, &deployment, error).await;
+                plan_path.display(),
+                plan.mode,
+                if staged { "given" } else { "not given" }
+            );
         }
-        // Released whatever happened. A lock left behind by a failed apply
-        // blocks the very pipeline that would fix it.
-        let released = crate::engine::unlock(&mut conn).await;
-        Ok::<_, anyhow::Error>((result, released))
-    })?;
+        if resume && !staged {
+            bail!("--resume continues a staged apply; pass --staged as well");
+        }
 
-    Ok(match result {
-        Ok(Some(entry)) => Attempt::Applied { entry, released },
-        Ok(None) => {
-            released.context("the empty plan's deployment lock could not be released")?;
+        // A cluster role's rename has no SQL, but its approved identity mapping
+        // still has to be checked and recorded. Additions and removal of the last
+        // role need the same check (421). SQL Server keeps its connection-free
+        // empty path; PostgreSQL decides whether the role map moved under the lock.
+        if plan.changes.is_empty() && dialect.manages_roles() {
             println!("The plan is empty; nothing to apply.");
-            Attempt::Empty
+            return Ok(Attempt::Empty);
         }
-        Err(error) => Attempt::Failed { error, released },
+
+        // The gate. It can be this coarse precisely because the checksum pins the
+        // plan: what `--allow destructive` approves is this plan's destruction and
+        // no other (SPEC §7.3).
+        let unapproved = plan.changes.unapproved_risks(allow);
+        if !unapproved.is_empty() {
+            let names: Vec<&str> = unapproved.iter().map(|r| r.as_str()).collect();
+            bail!(
+                "this plan carries risks that were not approved: {}.\n\
+             Read {} and, if it is what you intend, re-run with --allow {}",
+                names.join(", "),
+                plan_path.display(),
+                plan.changes
+                    .gated_risks()
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+        }
+
+        let statements = crate::statements(plan, dialect)?;
+        crate::engine::require_transactional_rebuilds(target.driver(), &plan.changes, staged)?;
+        // Only for a transactional plan. A staged one exists *because* its
+        // statement cannot run inside a transaction (ADR-0003): `plan --db
+        // --staged` accepts it deliberately, and rejecting it here would leave
+        // staged execution refusing the only kind of change it is for.
+        //
+        // Nothing the T-SQL emitter writes is marked non-transactional yet, so this
+        // is latent — which is the reason to fix it now rather than when the first
+        // such statement arrives and the guard swallows every staged apply.
+        if !staged {
+            reject_non_transactional(&statements)?;
+        }
+        let names = pbps_model::plan_names::PlanNames::of(&plan.changes.changes, &plan.ids)?;
+        let targets = crate::engine::rename_targets(target.driver(), &names);
+        // A resolved plan's key, before anything connects: evidence sealed under
+        // another key, or none, is no evidence here (#616, DEC-952.1).
+        let keyed = pbps_cli::resolver::apply::Keyed::check(
+            plan,
+            pbps_cli::resolver::sealing::environment_key(project, target.environment()),
+            &target.label,
+        )?;
+        let deployment = Deployment {
+            project,
+            target,
+            plan,
+            plan_checksum,
+            statements: &statements,
+            rename_targets: &targets,
+            dialect,
+            operator,
+        };
+
+        let (result, released) = db::runtime()?.block_on(async {
+            let mut conn = db::connect(target).await?;
+
+            // This capability is constant for the connection and needs no ledger
+            // lock. Check before any writes, including staged resumes.
+            crate::engine::permission_support(&mut conn, &plan.changes).await?;
+            crate::engine::generation_support(&mut conn, &plan.changes, &plan.ids).await?;
+            // A resolved plan's cluster, constant for the connection like the
+            // checks above: the evidence describes one cluster (#616, DEC-1685.1).
+            let resolved = match &keyed {
+                Some(keyed) => Some(keyed.open(&mut conn).await?),
+                None => None,
+            };
+
+            // The lock comes first, before the checks and not after them: a
+            // pre-flight that passed while another pipeline was mid-apply would
+            // have been answered about a database that is already moving.
+            crate::engine::lock(&mut conn, operator).await?;
+            let result = if staged {
+                apply_staged_under_lock(&mut conn, &deployment, resume)
+                    .await
+                    .map(Some)
+            } else {
+                apply_under_lock(&mut conn, &deployment, resolved.as_ref()).await
+            };
+            if let Err(error) = &result {
+                record_failed_apply(&mut conn, &deployment, error).await;
+            }
+            // Released whatever happened. A lock left behind by a failed apply
+            // blocks the very pipeline that would fix it.
+            let released = crate::engine::unlock(&mut conn).await;
+            Ok::<_, anyhow::Error>((result, released))
+        })?;
+
+        Ok(match result {
+            Ok(Some(entry)) => Attempt::Applied { entry, released },
+            Ok(None) => {
+                released.context("the empty plan's deployment lock could not be released")?;
+                println!("The plan is empty; nothing to apply.");
+                Attempt::Empty
+            }
+            Err(error) => Attempt::Failed { error, released },
+        })
     })
 }
 
@@ -8076,7 +8080,11 @@ fn apply_identified(
 /// is the unchanged pre-plan state, and for a staged apply it is the last
 /// completed statement. A failure to write the audit must never replace the
 /// original deployment error.
-async fn record_failed_apply(conn: &mut Conn, d: &Deployment<'_>, error: &anyhow::Error) {
+async fn record_failed_apply<D: crate::emission::Engine>(
+    conn: &mut Conn,
+    d: &Deployment<'_, D>,
+    error: &anyhow::Error,
+) {
     let current = match crate::engine::latest(conn).await {
         Ok(Some(entry)) => entry.snapshot,
         Ok(None) | Err(pbps_db::LedgerError::NotInitialized) => return,
@@ -8151,23 +8159,23 @@ fn failed_apply_snapshot(
 /// to be written down rather than counted to. Nine positional arguments is a
 /// place where it can be made by counting, which is what the two
 /// `#[allow(clippy::too_many_arguments)]` this replaces were saying.
-struct Deployment<'a> {
+struct Deployment<'a, D: crate::emission::Engine> {
     project: &'a Project,
     target: &'a Target,
-    plan: &'a pbps_diff::order::AdmittedPlan<dyn pbps_dialect::Dialect>,
+    plan: &'a pbps_diff::order::AdmittedPlan<D>,
     plan_checksum: &'a str,
-    statements: &'a crate::emission::LoweredPlan<'a>,
+    statements: &'a crate::emission::LoweredPlan,
     rename_targets: &'a [pbps_db::impact::RenameTarget],
-    dialect: &'a (dyn pbps_dialect::Dialect + 'static),
+    dialect: &'a D,
     operator: &'a str,
 }
 
 /// Everything between taking the lock and releasing it. Returns the ledger id.
 /// `resolved` holds a resolved plan's checks, its key and cluster already
 /// passed (#616).
-async fn apply_under_lock(
+async fn apply_under_lock<D: crate::emission::Engine>(
     conn: &mut Conn,
-    d: &Deployment<'_>,
+    d: &Deployment<'_, D>,
     resolved: Option<&pbps_cli::resolver::apply::Guard<'_>>,
 ) -> anyhow::Result<Option<i64>> {
     // Destructured straight back into the names the body below already uses:
@@ -8319,7 +8327,7 @@ async fn apply_under_lock(
         crate::engine::external_role_renames(conn, &original_ids, &plan.ids).await?;
         crate::engine::check_module_dependents(
             conn,
-            &plan.changes,
+            plan,
             &scoped.schema,
             &plan.ids,
             &recorded_ids,
@@ -8589,9 +8597,9 @@ fn retain_managed_roles(schema: &mut Schema, ids: &IdsFile, dialect: &dyn Dialec
 /// hand, so the drift discipline applies to a half-finished plan as much as to
 /// a finished one: the live state has to still equal the checkpoint, or the
 /// remaining statements are being run against something nobody planned for.
-async fn apply_staged_under_lock(
+async fn apply_staged_under_lock<D: crate::emission::Engine>(
     conn: &mut Conn,
-    d: &Deployment<'_>,
+    d: &Deployment<'_, D>,
     resume: bool,
 ) -> anyhow::Result<i64> {
     let Deployment {
@@ -9445,9 +9453,9 @@ fn refuse_mid_deployment(entry: &pbps_db::LedgerEntry, label: &str) -> anyhow::R
 /// own statements, in the emitter's order (one `DROP MEMBER` per listed
 /// member, then the `DROP ROLE`), so a resume asks about the role as the
 /// plan left it and not as the plan first saw it (DECISIONS 102).
-fn role_drop_expectations(
-    plan: &(dyn pbps_diff::order::PlanView<dyn pbps_dialect::Dialect> + 'static),
-    dialect: &dyn pbps_dialect::Dialect,
+fn role_drop_expectations<D: crate::emission::Engine>(
+    plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
+    dialect: &D,
     mode: pbps_model::PlanMode,
     completed: usize,
 ) -> anyhow::Result<Vec<(pbps_model::RoleName, Vec<pbps_model::RoleName>)>> {
@@ -9588,10 +9596,10 @@ async fn drop_preflight(
     Ok(())
 }
 
-async fn preflight(
+async fn preflight<D: crate::emission::Engine>(
     conn: &mut Conn,
-    dialect: &dyn pbps_dialect::Dialect,
-    plan: &pbps_diff::order::AdmittedPlan<dyn pbps_dialect::Dialect>,
+    dialect: &D,
+    plan: &pbps_diff::order::AdmittedPlan<D>,
     rename_targets: &[pbps_db::impact::RenameTarget],
     stored: &pbps_model::Schema,
     stored_ids: &IdsFile,
@@ -9937,7 +9945,7 @@ fn reject_non_transactional(statements: &[pbps_dialect::Statement]) -> anyhow::R
 async fn execute_transaction_body(
     conn: &mut Conn,
     dialect: &dyn Dialect,
-    statements: &crate::emission::LoweredPlan<'_>,
+    statements: &crate::emission::LoweredPlan,
     type_pins: &[pbps_model::TypePin],
     changes: &pbps_model::ChangeSet,
     trusted: &BTreeSet<pbps_model::RoleName>,
@@ -9962,7 +9970,7 @@ async fn execute_transaction_body(
 
 async fn execute_statements(
     conn: &mut Conn,
-    statements: &crate::emission::LoweredPlan<'_>,
+    statements: &crate::emission::LoweredPlan,
     data_guard: &crate::engine::DataWriteGuard,
     reviewed: Option<&crate::pins::Approved<'_>>,
 ) -> anyhow::Result<()> {
@@ -9976,7 +9984,7 @@ async fn execute_statements(
 // certified collection into a raw slice that another caller could execute.
 async fn execute_statement(
     conn: &mut Conn,
-    statements: &crate::emission::LoweredPlan<'_>,
+    statements: &crate::emission::LoweredPlan,
     position: usize,
     data_guard: &crate::engine::DataWriteGuard,
     reviewed: Option<&crate::pins::Approved<'_>>,

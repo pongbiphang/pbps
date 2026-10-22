@@ -1,8 +1,8 @@
 //! The create-only policy contract; standing mutations arrive with #1173.
 
+use pbps_model::IdsFile;
 #[cfg(test)]
-use pbps_model::{Change, Uid};
-use pbps_model::{ChangeSet, IdsFile};
+use pbps_model::{Change, ChangeSet, Uid};
 
 pub(crate) use pbps_diff::order::row_security::{PolicyDependents, column_edit, policy_target_uid};
 
@@ -17,11 +17,12 @@ pub(crate) fn policy_releases(
     )?)
 }
 
-pub(crate) fn check_policy_releases(
-    changes: &ChangeSet,
+pub(crate) fn check_policy_releases<D: ?Sized>(
+    plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
     ids: &IdsFile,
     found: &PolicyDependents,
 ) -> anyhow::Result<()> {
+    let changes = pbps_dialect::PlanPayload::changes(plan);
     Ok(pbps_diff::order::row_security::check_releases(
         changes, ids, found,
     )?)
@@ -57,6 +58,7 @@ pub(crate) fn binding_notices(schema: &pbps_model::Schema) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pbps_diff::order::row_security::check_releases as check_policy_releases;
     use pbps_model::{PlannedChange, RowPolicy, RowSecurity, RowSecurityOrigin, Table, TableName};
 
     fn fixture() -> (ChangeSet, IdsFile) {
@@ -108,7 +110,7 @@ mod tests {
 
     #[test]
     fn saved_admission_keeps_complete_rls_bytes_and_refuses_missing_policy_operations() {
-        use pbps_diff::order::admit;
+        use pbps_diff::order::{ArtifactView, admit};
         use pbps_model::{PlanBaseline, PlanOrigin, SavedPlan};
 
         let (changes, ids) = fixture();
@@ -128,7 +130,7 @@ mod tests {
         );
         let path = std::path::Path::new("plan.json");
         let bytes = serde_json::to_vec(&wire).unwrap();
-        let checksum = wire.checksum();
+        let checksum = wire.wire_fingerprint();
         let admitted = admit(
             serde_json::from_slice(&bytes).unwrap(),
             &dialect,
@@ -144,7 +146,7 @@ mod tests {
             let refused = validate(&incomplete.changes, &incomplete.ids, &dialect).unwrap_err();
             let expected = refused.to_string();
             assert_eq!(format!("{refused:#}"), expected);
-            let checksum = incomplete.checksum();
+            let checksum = incomplete.wire_fingerprint();
             let refused = admit(incomplete, &dialect, path, &checksum).unwrap_err();
             assert_eq!(
                 format!("{:#}", anyhow::Error::new(refused)),

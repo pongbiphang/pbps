@@ -1,6 +1,6 @@
 use super::*;
 
-fn positional_dialect() -> impl pbps_dialect::Dialect {
+fn positional_dialect() -> impl crate::certified_fixture::FixtureEmission {
     Postgres::new()
 }
 fn positional_schema() -> &'static str {
@@ -80,7 +80,7 @@ async fn an_attach_cannot_borrow_a_later_detachs_empty_range() {
         db.conn.begin(&frame).await.unwrap();
         let mut accepted = true;
         'apply: for p in &plan.changes {
-            for statement in dialect.legacy_emit(&p.change, p.strategy).unwrap() {
+            for statement in dialect.fixture_emit(&p.change, p.strategy).unwrap() {
                 if db.conn.execute(&statement.sql).await.is_err() {
                     accepted = false;
                     break 'apply;
@@ -205,7 +205,7 @@ async fn tightening_sees_an_attached_child_only_after_the_attach() {
         db.conn.begin(&frame).await.unwrap();
         let mut target_accepted = true;
         for p in &plan.changes {
-            for statement in dialect.legacy_emit(&p.change, p.strategy).unwrap() {
+            for statement in dialect.fixture_emit(&p.change, p.strategy).unwrap() {
                 let result = db.conn.execute(&statement.sql).await;
                 if matches!(p.change, Change::AlterColumnNullability { .. }) {
                     target_accepted &= result.is_ok();
@@ -396,7 +396,7 @@ async fn a_new_key_validates_writes_before_its_own_step_and_never_after_it() {
         db.conn.begin(&frame).await.unwrap();
         let mut accepted = true;
         'apply: for p in &plan.changes {
-            for statement in dialect.legacy_emit(&p.change, p.strategy).unwrap() {
+            for statement in dialect.fixture_emit(&p.change, p.strategy).unwrap() {
                 if db.conn.execute(&statement.sql).await.is_err() {
                     accepted = false;
                     break 'apply;

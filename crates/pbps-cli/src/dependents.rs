@@ -497,7 +497,10 @@ fn in_place_parts(change: &Change) -> Option<(Change, Change)> {
 }
 
 #[cfg(test)]
-fn planned(change: Change, dialect: &dyn Dialect) -> PlannedChange {
+fn planned(
+    change: Change,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> PlannedChange {
     let mut p = PlannedChange::new(change);
     p.risks = dialect.change_risks(&p.change);
     p
@@ -541,7 +544,11 @@ fn named_at(sources: &PhysicalSources<'_>, at: At, holds: &Holds) -> Option<Hold
 /// declared while their table follows the physical source at insertion.
 #[allow(clippy::wildcard_enum_match_arm)]
 #[cfg(test)]
-fn respell(p: &mut PlannedChange, holds: &Holds, dialect: &dyn Dialect) {
+fn respell(
+    p: &mut PlannedChange,
+    holds: &Holds,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) {
     let Holds::TablePart { table, .. } = holds else {
         return;
     };
@@ -562,7 +569,7 @@ fn respell_at(
     original: &Holds,
     sources: &PhysicalSources<'_>,
     at: At,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<(), String> {
     let here = named_at(sources, at, original).ok_or_else(|| {
         "the dependent's physical source is unavailable at its insertion boundary".to_owned()
@@ -965,7 +972,7 @@ fn oracle_weave(
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
     sources: Sources<'_>,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     let roots = dropped_modules(cs);
     let mut refused: Vec<String> = Vec::new();
@@ -1077,7 +1084,7 @@ fn module_order(
     found: &BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &Schema,
     sources: Sources<'_>,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<Vec<Order>, String> {
     Weave {
         roots: dropped_modules(cs)
@@ -1104,7 +1111,7 @@ struct Weave<'a> {
     found: &'a BTreeMap<ModuleId, Vec<Dependent>>,
     declared: &'a Schema,
     sources: Sources<'a>,
-    dialect: &'a dyn Dialect,
+    dialect: &'a dyn crate::certified_fixture::FixtureEmission,
     partitions: Partitions,
 }
 
@@ -1709,7 +1716,7 @@ fn oracle_split_new_tables(
     cs: &mut PlanningPlan,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     #[cfg(test)]
     let mut old = cs.changes().clone();
@@ -1730,7 +1737,7 @@ fn expand_new_tables(
     cs: &mut PlanningPlan,
     ids: &[&IdsFile],
     deps: &ModuleDeps,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     let empty = IdsFile::default();
     let generated = pbps_diff::order::generated::expand(
@@ -1802,7 +1809,7 @@ mod expansion_oracle;
 fn oracle_before_its_partitions_indexes(
     cs: &mut PlanningPlan,
     declared: &Schema,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<(), String> {
     let adoptable_by = |parent: &TableName, index: &pbps_model::Index, c: &Change| {
         let Change::AddIndex {
@@ -2082,7 +2089,11 @@ fn passable_by_a_leaving_partition(c: &Change, partition: &TableName, parent: &T
 /// breaks the plan. These are the edges a partition's index that sinks
 /// carries what rests on it with (DEC-1967.2).
 #[cfg(test)]
-fn rests_on(later: &Change, earlier: &Change, dialect: &dyn Dialect) -> bool {
+fn rests_on(
+    later: &Change,
+    earlier: &Change,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> bool {
     let brought = relations_brought(earlier);
     if !brought.is_empty() {
         let names: Vec<String> = expressions_set(later)
@@ -2153,7 +2164,7 @@ fn oracle_after_their_parents_defaults(
     cs: &mut PlanningPlan,
     declared: &Schema,
     ids: &[&IdsFile],
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     #[cfg(test)]
     let mut old = cs.changes().clone();
@@ -2256,7 +2267,7 @@ fn oracle_after_the_rebuilds(
     deps: &ModuleDeps,
     declared: &pbps_model::Schema,
     mut schedule: Schedule,
-    dialect: &dyn Dialect,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
 ) -> Result<usize, String> {
     let has_handovers = !schedule.constraints().is_empty();
     // A partition delayed past its trigger's release must take its readers
@@ -2450,7 +2461,11 @@ fn oracle_after_the_rebuilds(
 /// create and what is split off it carry the dialect's risks recomputed: a
 /// NOT NULL the create no longer sets is a risk of the change that does.
 #[cfg(test)]
-fn split_moving_defaults(cs: &mut PlanningPlan, declared: &Schema, dialect: &dyn Dialect) {
+fn split_moving_defaults(
+    cs: &mut PlanningPlan,
+    declared: &Schema,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) {
     let functions = function_creates(cs);
     pbps_diff::order::split_moving_defaults(cs, declared, dialect, &functions);
 }
@@ -4334,6 +4349,154 @@ pub(crate) fn unaccounted(
 }
 
 #[cfg(test)]
+fn weave(
+    cs: &mut PlanningPlan,
+    found: &BTreeMap<ModuleId, Vec<Dependent>>,
+    declared: &Schema,
+    sources: Sources<'_>,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<usize, String> {
+    let mut expected = cs.clone();
+    let old = oracle_weave(&mut expected, found, declared, sources, dialect);
+    let actual = pbps_diff::order::deployment::weave(
+        cs,
+        found,
+        declared,
+        pbps_diff::order::deployment::Sources {
+            before: sources.before,
+            after: sources.after,
+        },
+        dialect,
+    );
+    assert_eq!(actual, old, "relocated weave refusal/count");
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, dialect);
+    }
+    actual
+}
+
+#[cfg(test)]
+fn split_new_tables(
+    cs: &mut PlanningPlan,
+    ids: &[&IdsFile],
+    deps: &ModuleDeps,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<usize, String> {
+    let mut expected = cs.clone();
+    let old = oracle_split_new_tables(&mut expected, ids, deps, dialect);
+    let actual = pbps_diff::order::deployment::split_new_tables(cs, ids, deps, dialect);
+    assert_eq!(actual, old, "relocated split_new_tables refusal/count");
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, dialect);
+    }
+    actual
+}
+
+#[cfg(test)]
+fn before_its_partitions_indexes(
+    cs: &mut PlanningPlan,
+    declared: &Schema,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<(), String> {
+    let mut expected = cs.clone();
+    let old = oracle_before_its_partitions_indexes(&mut expected, declared, dialect);
+    let actual = pbps_diff::order::deployment::before_its_partitions_indexes(cs, declared, dialect);
+    assert_eq!(
+        actual, old,
+        "relocated before_its_partitions_indexes refusal/count"
+    );
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, dialect);
+    }
+    actual
+}
+
+#[cfg(test)]
+fn after_the_rows_that_leave(cs: &mut PlanningPlan, declared: &Schema) -> Result<(), String> {
+    let mut expected = cs.clone();
+    let old = oracle_after_the_rows_that_leave(&mut expected, declared);
+    let actual = pbps_diff::order::deployment::after_the_rows_that_leave(cs, declared);
+    assert_eq!(
+        actual, old,
+        "relocated after_the_rows_that_leave refusal/count"
+    );
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, &pbps_pg::Postgres::new());
+    }
+    actual
+}
+
+#[cfg(test)]
+fn after_their_parents_defaults(
+    cs: &mut PlanningPlan,
+    declared: &Schema,
+    ids: &[&IdsFile],
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<usize, String> {
+    let mut expected = cs.clone();
+    let old = oracle_after_their_parents_defaults(&mut expected, declared, ids, dialect);
+    let actual =
+        pbps_diff::order::deployment::after_their_parents_defaults(cs, declared, ids, dialect);
+    assert_eq!(
+        actual, old,
+        "relocated after_their_parents_defaults refusal/count"
+    );
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, dialect);
+    }
+    actual
+}
+
+#[cfg(test)]
+fn after_the_rebuilds(
+    cs: &mut PlanningPlan,
+    released: &BTreeSet<ColumnRef>,
+    deps: &ModuleDeps,
+    declared: &Schema,
+    schedule: Schedule,
+    dialect: &dyn crate::certified_fixture::FixtureEmission,
+) -> Result<usize, String> {
+    let mut expected = cs.clone();
+    let old = oracle_after_the_rebuilds(
+        &mut expected,
+        released,
+        deps,
+        declared,
+        schedule.clone(),
+        dialect,
+    );
+    let actual = pbps_diff::order::deployment::after_the_rebuilds(
+        cs, released, deps, declared, schedule, dialect,
+    );
+    assert_eq!(actual, old, "relocated after_the_rebuilds refusal/count");
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, dialect);
+    }
+    actual
+}
+
+#[cfg(test)]
+fn after_their_functions(
+    cs: &mut PlanningPlan,
+    deps: &ModuleDeps,
+    partitions: &Partitions,
+) -> Result<usize, String> {
+    let mut expected = cs.clone();
+    let old = oracle_after_their_functions(&mut expected, deps, partitions);
+    let actual = pbps_diff::order::deployment::after_their_functions(
+        cs,
+        deps,
+        partitions,
+        &pbps_pg::Postgres::new(),
+    );
+    assert_eq!(actual, old, "relocated after_their_functions refusal/count");
+    if actual.is_ok() {
+        split_oracle::same_plan(cs, &expected, &pbps_pg::Postgres::new());
+    }
+    actual
+}
+
+#[cfg(test)]
 mod fixture;
 #[cfg(test)]
 mod part_effect_tests;
@@ -4380,7 +4543,7 @@ mod tests {
     fn split_new_tables(
         cs: &mut ChangeSet,
         ids: &[&IdsFile],
-        dialect: &dyn Dialect,
+        dialect: &dyn crate::certified_fixture::FixtureEmission,
     ) -> Result<usize, String> {
         super::test_adapters::split_new_tables(cs, ids, &ModuleDeps::new(), dialect)
     }
@@ -4390,7 +4553,7 @@ mod tests {
         released: &BTreeSet<ColumnRef>,
         deps: &ModuleDeps,
         declared: &Schema,
-        dialect: &dyn Dialect,
+        dialect: &dyn crate::certified_fixture::FixtureEmission,
     ) -> Result<usize, String> {
         let schedule = Schedule::new(cs.changes.len());
         super::test_adapters::after_the_rebuilds(cs, released, deps, declared, schedule, dialect)
@@ -4463,7 +4626,7 @@ mod tests {
         }
     }
 
-    fn pg() -> Box<dyn Dialect> {
+    fn pg() -> Box<dyn crate::certified_fixture::FixtureEmission> {
         Box::new(pbps_pg::Postgres::new())
     }
 
@@ -8463,7 +8626,10 @@ mod tests {
     }
 
     /// The check with nothing already on the target: every candidate stands.
-    fn refusal_of(cs: &ChangeSet, dialect: &dyn Dialect) -> Result<(), String> {
+    fn refusal_of(
+        cs: &ChangeSet,
+        dialect: &dyn crate::certified_fixture::FixtureEmission,
+    ) -> Result<(), String> {
         later_relation_refusal(&names_a_later_relation(cs, dialect, None))
     }
 
@@ -10002,151 +10168,3 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod generated_tests;
-
-#[cfg(test)]
-fn weave(
-    cs: &mut PlanningPlan,
-    found: &BTreeMap<ModuleId, Vec<Dependent>>,
-    declared: &Schema,
-    sources: Sources<'_>,
-    dialect: &dyn Dialect,
-) -> Result<usize, String> {
-    let mut expected = cs.clone();
-    let old = oracle_weave(&mut expected, found, declared, sources, dialect);
-    let actual = pbps_diff::order::deployment::weave(
-        cs,
-        found,
-        declared,
-        pbps_diff::order::deployment::Sources {
-            before: sources.before,
-            after: sources.after,
-        },
-        dialect,
-    );
-    assert_eq!(actual, old, "relocated weave refusal/count");
-    if actual.is_ok() {
-        split_oracle::same_plan(cs, &expected, dialect);
-    }
-    actual
-}
-
-#[cfg(test)]
-fn split_new_tables(
-    cs: &mut PlanningPlan,
-    ids: &[&IdsFile],
-    deps: &ModuleDeps,
-    dialect: &dyn Dialect,
-) -> Result<usize, String> {
-    let mut expected = cs.clone();
-    let old = oracle_split_new_tables(&mut expected, ids, deps, dialect);
-    let actual = pbps_diff::order::deployment::split_new_tables(cs, ids, deps, dialect);
-    assert_eq!(actual, old, "relocated split_new_tables refusal/count");
-    if actual.is_ok() {
-        split_oracle::same_plan(cs, &expected, dialect);
-    }
-    actual
-}
-
-#[cfg(test)]
-fn before_its_partitions_indexes(
-    cs: &mut PlanningPlan,
-    declared: &Schema,
-    dialect: &dyn Dialect,
-) -> Result<(), String> {
-    let mut expected = cs.clone();
-    let old = oracle_before_its_partitions_indexes(&mut expected, declared, dialect);
-    let actual = pbps_diff::order::deployment::before_its_partitions_indexes(cs, declared, dialect);
-    assert_eq!(
-        actual, old,
-        "relocated before_its_partitions_indexes refusal/count"
-    );
-    if actual.is_ok() {
-        split_oracle::same_plan(cs, &expected, dialect);
-    }
-    actual
-}
-
-#[cfg(test)]
-fn after_the_rows_that_leave(cs: &mut PlanningPlan, declared: &Schema) -> Result<(), String> {
-    let mut expected = cs.clone();
-    let old = oracle_after_the_rows_that_leave(&mut expected, declared);
-    let actual = pbps_diff::order::deployment::after_the_rows_that_leave(cs, declared);
-    assert_eq!(
-        actual, old,
-        "relocated after_the_rows_that_leave refusal/count"
-    );
-    if actual.is_ok() {
-        split_oracle::same_plan(cs, &expected, &pbps_pg::Postgres::new());
-    }
-    actual
-}
-
-#[cfg(test)]
-fn after_their_parents_defaults(
-    cs: &mut PlanningPlan,
-    declared: &Schema,
-    ids: &[&IdsFile],
-    dialect: &dyn Dialect,
-) -> Result<usize, String> {
-    let mut expected = cs.clone();
-    let old = oracle_after_their_parents_defaults(&mut expected, declared, ids, dialect);
-    let actual =
-        pbps_diff::order::deployment::after_their_parents_defaults(cs, declared, ids, dialect);
-    assert_eq!(
-        actual, old,
-        "relocated after_their_parents_defaults refusal/count"
-    );
-    if actual.is_ok() {
-        split_oracle::same_plan(cs, &expected, dialect);
-    }
-    actual
-}
-
-#[cfg(test)]
-fn after_the_rebuilds(
-    cs: &mut PlanningPlan,
-    released: &BTreeSet<ColumnRef>,
-    deps: &ModuleDeps,
-    declared: &Schema,
-    schedule: Schedule,
-    dialect: &dyn Dialect,
-) -> Result<usize, String> {
-    let mut expected = cs.clone();
-    let old = oracle_after_the_rebuilds(
-        &mut expected,
-        released,
-        deps,
-        declared,
-        schedule.clone(),
-        dialect,
-    );
-    let actual = pbps_diff::order::deployment::after_the_rebuilds(
-        cs, released, deps, declared, schedule, dialect,
-    );
-    assert_eq!(actual, old, "relocated after_the_rebuilds refusal/count");
-    if actual.is_ok() {
-        split_oracle::same_plan(cs, &expected, dialect);
-    }
-    actual
-}
-
-#[cfg(test)]
-fn after_their_functions(
-    cs: &mut PlanningPlan,
-    deps: &ModuleDeps,
-    partitions: &Partitions,
-) -> Result<usize, String> {
-    let mut expected = cs.clone();
-    let old = oracle_after_their_functions(&mut expected, deps, partitions);
-    let actual = pbps_diff::order::deployment::after_their_functions(
-        cs,
-        deps,
-        partitions,
-        &pbps_pg::Postgres::new(),
-    );
-    assert_eq!(actual, old, "relocated after_their_functions refusal/count");
-    if actual.is_ok() {
-        split_oracle::same_plan(cs, &expected, &pbps_pg::Postgres::new());
-    }
-    actual
-}

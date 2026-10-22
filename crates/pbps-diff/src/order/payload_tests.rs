@@ -1,6 +1,8 @@
 //! Certified lowering observes retained sources; admission observes wire inputs.
 use super::expand::{Expansion, Order, Rewrite};
-use super::{OrderedPlan, PlanView, PlanningPlan, Schedule, Source, admit, propose, seal};
+use super::{
+    ArtifactView, OrderedPlan, PlanView, PlanningPlan, Schedule, Source, admit, propose, seal,
+};
 use pbps_dialect::lower::{Lowering, lower_all};
 use pbps_dialect::{DialectError, MinimalDialect, Statement};
 use pbps_model::operation::Origin;
@@ -181,7 +183,7 @@ fn sealed_lowering_delegates_the_ordered_sources_without_changing_wire_bytes() {
     let plan = ordered();
     let wire = wire(&plan);
     let before = serde_json::to_vec(&wire).unwrap();
-    let checksum = wire.checksum();
+    let checksum = wire.wire_fingerprint();
     let sealed = seal(plan, wire).unwrap();
     assert_retained(&sealed);
     assert_retained(&sealed.clone());
@@ -192,7 +194,7 @@ fn sealed_lowering_delegates_the_ordered_sources_without_changing_wire_bytes() {
 fn admission_uses_wire_step_ids_instead_of_guessing_lost_planning_sources() {
     let plan = ordered();
     let wire = wire(&plan);
-    let checksum = wire.checksum();
+    let checksum = wire.wire_fingerprint();
     // Admission must use the actual saved representation, not accidentally
     // recover unsealed annotations that survived an in-memory clone.
     assert!(
@@ -211,7 +213,7 @@ fn admission_uses_wire_step_ids_instead_of_guessing_lost_planning_sources() {
             .all(|part| part.provenance.is_none())
     );
     assert_eq!(serde_json::to_vec(&loaded).unwrap(), bytes);
-    assert_eq!(loaded.checksum(), checksum);
+    assert_eq!(loaded.wire_fingerprint(), checksum);
     assert_eq!(loaded, wire);
     let admitted = admit(
         loaded,

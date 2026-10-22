@@ -189,7 +189,7 @@ async fn exercise(connection: String) {
         for planned in &ordered.changes.changes {
             assert!(
                 dialect
-                    .legacy_emit(&planned.change, planned.strategy)
+                    .fixture_emit(&planned.change, planned.strategy)
                     .unwrap()
                     .is_empty()
             );

@@ -1,6 +1,9 @@
 //! Captured on master d4752d3f before #2084 step 1b changed routine/module formatting.
 //! #2186 corrects only the PostgreSQL definition's unsafe literal YAML controls.
 
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission;
+
 use pbps_dialect::Dialect;
 use pbps_model::{
     Change, ChangeSet, Declared, IdsFile, Module, ModuleId, ModuleKind, PlanBaseline, PlanOrigin,
@@ -86,23 +89,23 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "fixture");
     state.declared = Declared::from_schema(&schema);
     state.module_deps = plan.module_deps.clone();
-    state.plan_checksum = Some(plan.checksum());
+    state.plan_checksum = Some(plan.wire_fingerprint());
     (schema, plan, state)
 }
 
 #[test]
 fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
     for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect,
+        &pbps_pg::Postgres::new() as &dyn FixtureEmission,
         &pbps_mssql::Mssql,
     ] {
         let (schema, mut plan, mut state) = artifacts(NAME, dialect);
-        let current_checksum = plan.checksum();
+        let current_checksum = plan.wire_fingerprint();
         let sql = plan
             .changes
             .changes
             .iter()
-            .flat_map(|p| dialect.legacy_emit(&p.change, Default::default()).unwrap())
+            .flat_map(|p| dialect.fixture_emit(&p.change, Default::default()).unwrap())
             .map(|s| s.sql)
             .collect::<Vec<_>>()
             .join("\n");
@@ -150,13 +153,13 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
         // the CLI invocation above still exercises today's applicable plan.
         plan.version = 42;
         state.version = 25;
-        state.plan_checksum = Some(plan.checksum());
+        state.plan_checksum = Some(plan.wire_fingerprint());
         let outputs = [
             ("schema.json", serde_json::to_string(&schema).unwrap()),
             ("plan.json", serde_json::to_string(&plan).unwrap()),
             ("state.json", serde_json::to_string(&state).unwrap()),
             ("state.sha256", state_checksum(&schema, &state.ids)),
-            ("plan.sha256", plan.checksum()),
+            ("plan.sha256", plan.wire_fingerprint()),
             ("statements.sql", sql),
             ("filenames.txt", files),
             ("declarations.yml", yaml),
@@ -168,7 +171,7 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
         for (name, actual) in outputs {
             let expected = std::fs::read_to_string(root.join(name)).unwrap();
             let expected = if name == "explain.json" {
-                expected.replace(&plan.checksum(), &current_checksum)
+                expected.replace(&plan.wire_fingerprint(), &current_checksum)
             } else {
                 expected
             };
@@ -184,7 +187,7 @@ fn routine_and_module_artifacts_keep_master_bytes_and_filename_components() {
         );
         let (_, mut ordinary, _) = artifacts("ordinary", dialect);
         ordinary.version = plan.version;
-        assert_ne!(ordinary.checksum(), plan.checksum());
+        assert_ne!(ordinary.wire_fingerprint(), plan.wire_fingerprint());
     }
 }
 
@@ -232,11 +235,19 @@ fn a_routine_refusal_is_escaped_exactly_once() {
             }),
         };
         let error = pbps_pg::Postgres::new()
-            .legacy_emit(&change, Default::default())
+            .fixture_emit(&change, Default::default())
             .unwrap_err();
         assert_eq!(
             error.to_string(),
             format!("postgres: module `app.{shown}(app.\"{shown}\")` has an empty definition")
         );
     }
+}
+
+#[cfg(test)]
+mod certified_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-diff/tests/support/emission.rs"
+    ));
 }

@@ -635,14 +635,12 @@ fn cycle_expression_notes(schema: &Schema) -> Vec<String> {
 /// The middle line is the one that decides the shape. A path of the object's
 /// own schema alone is not enough — an extension installed in `public` is the
 /// ordinary case — so the extras have to come from somewhere, and the only
-/// honest somewhere is the project. They are held here rather than passed to
-/// [`Dialect::legacy_emit`] because the trait takes a change and a strategy, and a
-/// strategy says how to get there and never where (ADR-0003).
+/// honest somewhere is the project. The selected dialect retains these extras
+/// throughout certified emission; a strategy chooses how, and never the write
+/// namespace (ADR-0003).
 ///
-/// Empty is the value every caller has today: `pbps.yml` has no key for this
-/// yet, because the CLI cannot select this dialect at all (`main.rs`'s
-/// `dialect()` refuses it) and a configuration key nothing reads is worse than
-/// none. The key arrives with the step that can read it.
+/// Ordinary CLI selection has no extras. Resolver reconstruction supplies the
+/// qualified write-path extras from its captured inputs (ADR-0013 section 3).
 /// Raw changes, immutable intermediates and caller-defined views are not
 /// the real PostgreSQL emitter's associated input (DEC-1959.5).
 ///
@@ -669,6 +667,17 @@ fn cycle_expression_notes(schema: &Schema) -> Vec<String> {
 /// fn another_emitter(plan: &pbps_dialect::lower::LoweredPlan<pbps_dialect::MinimalDialect>,
 ///                    pg: &pbps_pg::Postgres) {
 ///     pbps_dialect::render_script(plan, pg, &pbps_model::SessionZone::utc());
+/// }
+/// ```
+/// A prepared bootstrap script retains the lowered engine in both directions.
+/// ```compile_fail
+/// fn pg(script: &pbps_dialect::BootstrapScript<pbps_pg::Postgres>) {
+///     script.render(&pbps_mssql::Mssql, &pbps_model::SessionZone::utc());
+/// }
+/// ```
+/// ```compile_fail
+/// fn ms(script: &pbps_dialect::BootstrapScript<pbps_mssql::Mssql>) {
+///     script.render(&pbps_pg::Postgres::new(), &pbps_model::SessionZone::utc());
 /// }
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -838,7 +847,7 @@ fn default_problems(
 ///
 /// ```compile_fail
 /// fn pg_admission_cannot_reach_mssql(wire: pbps_model::SavedPlan) {
-///     let checksum = wire.checksum();
+///     let checksum = wire.wire_fingerprint();
 ///     let plan = pbps_diff::order::admit(wire, &pbps_pg::Postgres::new(),
 ///         std::path::Path::new("plan.json"), &checksum).unwrap();
 ///     let _ = pbps_dialect::lower::lower_all::<pbps_mssql::Mssql>(&plan, &pbps_mssql::Mssql);
@@ -847,7 +856,7 @@ fn default_problems(
 ///
 /// ```compile_fail
 /// fn mssql_admission_cannot_reach_pg(wire: pbps_model::SavedPlan) {
-///     let checksum = wire.checksum();
+///     let checksum = wire.wire_fingerprint();
 ///     let plan = pbps_diff::order::admit(wire, &pbps_mssql::Mssql,
 ///         std::path::Path::new("plan.json"), &checksum).unwrap();
 ///     let _ = pbps_dialect::lower::lower_all::<pbps_pg::Postgres>(&plan, &pbps_pg::Postgres::new());
@@ -893,6 +902,14 @@ fn default_problems(
 /// }
 /// ```
 impl pbps_dialect::PlanDialect for Postgres {
+    fn bootstrap_guard(
+        &self,
+        schema: &Schema,
+        trusted: &std::collections::BTreeSet<pbps_model::RoleName>,
+    ) -> Result<Option<Statement>, DialectError> {
+        Ok(type_refs::bootstrap_guard(schema, trusted)?.map(Statement::new))
+    }
+
     type Plan = dyn pbps_diff::order::PlanView<Self>;
 
     fn emit(&self, plan: &Self::Plan, position: usize) -> Result<Vec<Statement>, DialectError> {
@@ -2263,24 +2280,6 @@ impl Dialect for Postgres {
         Ok(pbps_dialect::lower::intermediate_tables(&emit::emit(
             self, change, strategy,
         )?))
-    }
-
-    fn legacy_emit(
-        &self,
-        change: &Change,
-        strategy: Strategy,
-    ) -> Result<Vec<Statement>, DialectError> {
-        emit::emit(self, change, strategy)
-    }
-
-    /// An attach validates a CHECK that implies its bound first, so that it
-    /// skips its scan (#1638, DEC-1638.1); every other change is [`emit`]'s.
-    fn legacy_emit_staged(
-        &self,
-        change: &Change,
-        strategy: Strategy,
-    ) -> Result<Vec<Statement>, DialectError> {
-        emit::staged_attach(change).unwrap_or_else(|| emit::emit(self, change, strategy))
     }
 
     /// What this plan implies about the data, asked before its first
@@ -3834,7 +3833,7 @@ mod tests {
     #[test]
     fn an_empty_postgres_script_does_not_change_session_settings() {
         assert!(
-            pbps_dialect::legacy_render_script(
+            script_oracle::render(
                 &[],
                 &super::Postgres::new(),
                 &pbps_model::SessionZone::utc()
@@ -4588,7 +4587,7 @@ mod tests {
         let column = TableName::new("app", "t").column("id");
         let emit = |from: ValueSource, to: ValueSource| {
             super::Postgres::new()
-                .legacy_emit(
+                .fixture_emit(
                     &Change::AlterColumnNumbering {
                         uid: "c_a1b2c3".parse().unwrap(),
                         column: column.clone(),
@@ -4662,7 +4661,7 @@ mod tests {
         // Negative: generated is refused, never emitted.
         assert!(
             super::Postgres::new()
-                .legacy_emit(
+                .fixture_emit(
                     &Change::AlterColumnNumbering {
                         uid: "c_a1b2c3".parse().unwrap(),
                         column: column.clone(),
@@ -4900,7 +4899,7 @@ mod tests {
         // plans do about undeclared rows, and the row changes it implies are
         // separate entries in this same plan.
         assert!(
-            pg.legacy_emit(
+            pg.fixture_emit(
                 &Change::SetDataMode {
                     table: "app.t".parse().expect("a table name parses"),
                     from: None,
@@ -4931,7 +4930,7 @@ mod tests {
                 to: "reader".to_owned().into(),
             },
         ] {
-            pg.legacy_emit(&change, Strategy::default())
+            pg.fixture_emit(&change, Strategy::default())
                 .expect_err("the principal is the cluster's");
         }
     }
@@ -7313,7 +7312,7 @@ mod certified_emission_tests {
                 );
                 assert_eq!(
                     pbps_dialect::render_script(&lowered, dialect, &pbps_model::SessionZone::utc()),
-                    pbps_dialect::legacy_render_script(
+                    script_oracle::render(
                         reference.as_ref().unwrap(),
                         dialect,
                         &pbps_model::SessionZone::utc()
@@ -7349,19 +7348,14 @@ mod certified_emission_tests {
             bytes
         };
         assert_eq!(bytes(&before), bytes(after.wire()));
-        assert_eq!(before.checksum(), after.wire().checksum());
+        assert_eq!(
+            before.wire_fingerprint(),
+            pbps_diff::order::ArtifactView::checksum(&after)
+        );
         if let (Ok(actual), Ok(expected)) = (&actual, &expected) {
             assert_eq!(
-                pbps_dialect::legacy_render_script(
-                    actual,
-                    dialect,
-                    &pbps_model::SessionZone::utc()
-                ),
-                pbps_dialect::legacy_render_script(
-                    expected,
-                    dialect,
-                    &pbps_model::SessionZone::utc()
-                )
+                script_oracle::render(actual, dialect, &pbps_model::SessionZone::utc()),
+                script_oracle::render(expected, dialect, &pbps_model::SessionZone::utc())
             );
         }
         actual
@@ -7382,7 +7376,7 @@ mod certified_emission_tests {
             })],
         };
         let expected = dialect
-            .legacy_emit(&changes.changes[0].change, changes.changes[0].strategy)
+            .fixture_emit(&changes.changes[0].change, changes.changes[0].strategy)
             .unwrap();
         for mode in [PlanMode::Transactional, PlanMode::Staged] {
             let ordered = pbps_diff::order::singleton(changes.changes[0].clone(), mode, &dialect);
@@ -7397,7 +7391,7 @@ mod certified_emission_tests {
 
     #[test]
     fn partition_lowering_uses_each_certified_inputs_bound_mode() {
-        use pbps_diff::order::{PlanView, admit, seal, singleton};
+        use pbps_diff::order::{ArtifactView, PlanView, admit, seal, singleton};
         use pbps_model::{
             BoundDatum, IdsFile, PartitionBound, PlanBaseline, PlanOrigin, SavedPlan,
         };
@@ -7437,7 +7431,7 @@ mod certified_emission_tests {
             );
             wire.mode = mode;
             let bytes = serde_json::to_string(&wire).unwrap();
-            let checksum = wire.checksum();
+            let checksum = wire.wire_fingerprint();
             let admitted = admit(
                 serde_json::from_str(&bytes).unwrap(),
                 &dialect,
@@ -7473,7 +7467,26 @@ mod certified_emission_tests {
 // the private emitter and the engine-associated certified input.
 #[cfg(test)]
 impl Postgres {
-    pub(crate) fn legacy_emit(
+    pub(crate) fn fixture_emit_staged(
+        &self,
+        change: &Change,
+        strategy: Strategy,
+    ) -> Result<Vec<Statement>, DialectError> {
+        let mut part = pbps_model::PlannedChange::new(change.clone());
+        part.strategy = strategy;
+        let expected =
+            emit::staged_attach(change).unwrap_or_else(|| emit::emit(self, change, strategy));
+        let actual = self.emit_staged(
+            &pbps_diff::order::singleton(part, pbps_model::PlanMode::Staged, self),
+            0,
+        );
+        assert_eq!(
+            actual.as_ref().map_err(ToString::to_string),
+            expected.as_ref().map_err(ToString::to_string)
+        );
+        actual
+    }
+    pub(crate) fn fixture_emit(
         &self,
         change: &Change,
         strategy: Strategy,
@@ -7485,4 +7498,12 @@ impl Postgres {
             emit::emit(self, change, strategy),
         )
     }
+}
+
+#[cfg(test)]
+mod script_oracle {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-dialect/tests/support/script_oracle.rs"
+    ));
 }

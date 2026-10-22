@@ -109,17 +109,18 @@ impl Rehearsal {
 
 /// Builds the baseline, applies the plan, and compares against the declarations.
 #[allow(clippy::too_many_arguments)]
-pub fn rehearse(
+pub fn rehearse<D: crate::emission::Engine>(
     spec: &Spec,
     baseline: &Schema,
     baseline_ids: &IdsFile,
     baseline_hints: &pbps_model::Hints,
     declared: &Schema,
     declared_ids: &IdsFile,
-    plan: &crate::emission::LoweredPlan<'_>,
-    dialect: &(dyn Dialect + 'static),
+    plan: &crate::emission::LoweredPlan,
+    selected: &D,
     hints: &pbps_model::Hints,
 ) -> anyhow::Result<Rehearsal> {
+    let dialect = selected.as_ref();
     // The scratch-database lifecycle and container setup below are SQL
     // Server-specific (SPEC §9.3). Dispatching catalog reads by connection
     // cannot make that lifecycle safe for another dialect.
@@ -178,7 +179,7 @@ pub fn rehearse(
     .changes;
     let build = crate::statements(
         &build.ordered(pbps_model::PlanMode::Transactional, dialect),
-        dialect,
+        selected,
     )?;
 
     let container = match spec {
@@ -212,8 +213,8 @@ pub fn rehearse(
 #[allow(clippy::too_many_arguments)]
 async fn run(
     connection: &str,
-    build: &crate::emission::LoweredPlan<'_>,
-    plan: &crate::emission::LoweredPlan<'_>,
+    build: &crate::emission::LoweredPlan,
+    plan: &crate::emission::LoweredPlan,
     declared: &Schema,
     declared_ids: &IdsFile,
     baseline_ids: &IdsFile,
@@ -266,8 +267,8 @@ async fn run(
 async fn rehearse_in(
     conn: &mut Conn,
     name: &str,
-    build: &crate::emission::LoweredPlan<'_>,
-    plan: &crate::emission::LoweredPlan<'_>,
+    build: &crate::emission::LoweredPlan,
+    plan: &crate::emission::LoweredPlan,
     declared: &Schema,
     declared_ids: &IdsFile,
     baseline_ids: &IdsFile,

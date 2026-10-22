@@ -25,6 +25,7 @@
 //! and the suite holds it to still showing, so the day the effects order it
 //! the list has to change.
 
+#[cfg(test)]
 use std::path::PathBuf;
 
 use pbps_dialect::Dialect;
@@ -78,7 +79,7 @@ pub struct Pulled {
 pub trait Engine {
     type Db;
     fn name(&self) -> &'static str;
-    fn dialect(&self) -> &dyn Dialect;
+    fn dialect(&self) -> &dyn crate::certified_fixture::FixtureEmission;
     /// A new database with [`SCHEMA`] in it and nothing else.
     async fn database(&self, tag: &str) -> Self::Db;
     async fn drop(&self, db: Self::Db);
@@ -260,7 +261,7 @@ pub async fn run<E: Engine>(
         let p = &changes.changes[i];
         for stmt in engine
             .dialect()
-            .legacy_emit(&p.change, p.strategy)
+            .fixture_emit(&p.change, p.strategy)
             .map_err(|e| e.to_string())?
         {
             engine

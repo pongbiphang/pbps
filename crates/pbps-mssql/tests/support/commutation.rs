@@ -6,7 +6,6 @@
 mod core;
 
 use core::{Engine, Pulled, SCHEMA, Scenario};
-use pbps_dialect::Dialect;
 use pbps_model::{Schema, TableName};
 
 use super::TestDb;
@@ -1117,7 +1116,7 @@ impl Engine for Ms {
         "mssql"
     }
 
-    fn dialect(&self) -> &dyn Dialect {
+    fn dialect(&self) -> &dyn crate::certified_fixture::FixtureEmission {
         &pbps_mssql::Mssql
     }
 

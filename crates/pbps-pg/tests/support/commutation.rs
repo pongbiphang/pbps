@@ -6,7 +6,6 @@
 mod core;
 
 use core::{Engine, Pulled, SCHEMA, Scenario};
-use pbps_dialect::Dialect;
 use pbps_model::{Schema, TableName};
 
 use super::{TestDb, connected_base, fresh, pull};
@@ -1377,7 +1376,7 @@ impl Engine for Pg {
         "pg"
     }
 
-    fn dialect(&self) -> &dyn Dialect {
+    fn dialect(&self) -> &dyn crate::certified_fixture::FixtureEmission {
         &self.0
     }
 

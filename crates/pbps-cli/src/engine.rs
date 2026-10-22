@@ -3534,19 +3534,19 @@ async fn module_dependents(
 // The eighth argument is the role members the caller read: the schedule
 // takes every fact in one call (#1955).
 #[allow(clippy::too_many_arguments)]
-pub async fn account_for_module_dependents<S: pbps_diff::order::RouteState>(
+pub async fn account_for_module_dependents<
+    S: pbps_diff::order::RouteState,
+    D: crate::emission::Engine,
+>(
     conn: &mut Conn,
     mut changes: PlanningPlan<S>,
     declared: &pbps_model::Schema,
     sources: crate::dependents::Sources<'_>,
     deps: &pbps_model::ModuleDeps,
     role_members: Option<&crate::dependents::schedule::RoleMembers>,
-    dialect: &(dyn pbps_dialect::Dialect + 'static),
+    dialect: &D,
     rediff: &dyn Fn(&BTreeSet<pbps_model::ModuleId>) -> anyhow::Result<PlanningPlan<S>>,
-) -> anyhow::Result<(
-    PlanningPlan<S::Output<dyn pbps_dialect::Dialect + 'static>>,
-    ConnectedCheck,
-)> {
+) -> anyhow::Result<(PlanningPlan<S::Output<D>>, ConnectedCheck)> {
     let declarations = crate::dependents::schedule::Declarations {
         schema: declared,
         sources,
@@ -3571,9 +3571,8 @@ pub async fn account_for_module_dependents<S: pbps_diff::order::RouteState>(
     }
     // Version is observed once, before the pure expansion. Ordinary CLI
     // planning has no extra write-path schemas (DEC-1503.1).
-    let pg = pbps_pg::Postgres::new()
-        .with_server_version(pbps_pg::roles::server_version_num(conn).await?);
-    let dialect: &dyn pbps_dialect::Dialect = &pg;
+    let pg = dialect.with_planning_version(pbps_pg::roles::server_version_num(conn).await?);
+    let dialect = &pg;
     let mut found = module_dependents(conn, &changes).await?;
     let untouched = crate::dependents::untouched_module_dependents(&changes, &found, declared);
     if !untouched.is_empty() {
@@ -3589,7 +3588,7 @@ pub async fn account_for_module_dependents<S: pbps_diff::order::RouteState>(
         .with_policy_dependents(&policies);
     let scheduled = crate::dependents::schedule::schedule(changes, &declarations, &facts, dialect)?;
     let changes = scheduled.changes;
-    crate::row_security::check_policy_releases(&changes, sources.after, &policies)?;
+    pbps_diff::order::row_security::check_releases(&changes, sources.after, &policies)?;
     let (added, split, moved) = (scheduled.added, scheduled.split, scheduled.moved);
     let partitions = crate::dependents::standing_partitions(declared, &changes);
     // On the final order: every pass above may move what an expression
@@ -3645,13 +3644,22 @@ pub async fn account_for_module_dependents<S: pbps_diff::order::RouteState>(
 
 /// The connection's immutable planning capability, before any expansion.
 /// Offline callers retain their ordinary unknown-capability dialect.
-pub async fn planning_dialect(conn: &mut Conn) -> anyhow::Result<Box<dyn pbps_dialect::Dialect>> {
+#[cfg(test)]
+pub async fn planning_dialect(conn: &mut Conn) -> anyhow::Result<pbps_pg::Postgres> {
+    Ok(pbps_pg::Postgres::new()
+        .with_server_version(pbps_pg::roles::server_version_num(conn).await?))
+}
+
+/// Preserve the concrete selected engine while observing the same capability.
+pub async fn planning_dialect_for<D: crate::emission::Engine>(
+    conn: &mut Conn,
+    dialect: &D,
+) -> anyhow::Result<D> {
     Ok(match conn.driver() {
-        Driver::Postgres => Box::new(
-            pbps_pg::Postgres::new()
-                .with_server_version(pbps_pg::roles::server_version_num(conn).await?),
-        ),
-        Driver::Mssql => Box::new(pbps_mssql::Mssql),
+        Driver::Postgres => {
+            dialect.with_planning_version(pbps_pg::roles::server_version_num(conn).await?)
+        }
+        Driver::Mssql => dialect.clone(),
     })
 }
 
@@ -3680,15 +3688,45 @@ pub(crate) async fn resolves_now(
 ///
 /// `stored` is the database as the plan's baseline found it, which says
 /// which table is whose partition (DEC-1699.1).
-pub async fn check_module_dependents(
+pub async fn check_module_dependents<D: ?Sized>(
     conn: &mut Conn,
-    changes: &ChangeSet,
+    plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
     stored: &pbps_model::Schema,
     ids: &pbps_model::IdsFile,
     stored_ids: &pbps_model::IdsFile,
 ) -> anyhow::Result<()> {
+    let changes = pbps_dialect::PlanPayload::changes(plan);
     let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
-    refuse_policy_dependents(conn, changes, ids, stored).await?;
+    refuse_policy_dependents(conn, plan, ids, stored).await?;
+    check_module_dependency_facts(conn, changes, names, stored, stored_ids).await
+}
+
+#[cfg(test)]
+pub async fn check_module_dependents_fixture(
+    conn: &mut Conn,
+    input: &PlanningPlan,
+    stored: &pbps_model::Schema,
+    ids: &pbps_model::IdsFile,
+    stored_ids: &pbps_model::IdsFile,
+) -> anyhow::Result<()> {
+    // Adverse logical snapshots omit execution decisions deliberately. Observe
+    // the same catalog checks without certifying or repairing their payload.
+    let changes = input.changes();
+    let names = pbps_model::plan_names::PlanNames::of(&changes.changes, ids)?;
+    if conn.driver() == Driver::Postgres {
+        let found = policy_dependents(conn, changes, ids, stored).await?;
+        pbps_diff::order::row_security::check_releases(changes, ids, &found)?;
+    }
+    check_module_dependency_facts(conn, changes, names, stored, stored_ids).await
+}
+
+async fn check_module_dependency_facts(
+    conn: &mut Conn,
+    changes: &ChangeSet,
+    names: pbps_model::plan_names::PlanNames<'_>,
+    stored: &pbps_model::Schema,
+    stored_ids: &pbps_model::IdsFile,
+) -> anyhow::Result<()> {
     let found = module_dependents(conn, changes).await?;
     // Match the planner's final relation first; each dependency lookup then
     // spells both ends at the statement's boundary (DEC-1875.1).
@@ -5474,15 +5512,16 @@ async fn policy_dependents(
 
 /// Apply validates the approved order against fresh catalog bindings. It
 /// never schedules a newly discovered dependent into the saved plan.
-async fn refuse_policy_dependents(
+async fn refuse_policy_dependents<D: ?Sized>(
     conn: &mut Conn,
-    changes: &ChangeSet,
+    plan: &(dyn pbps_diff::order::PlanView<D> + 'static),
     ids: &pbps_model::IdsFile,
     managed: &pbps_model::Schema,
 ) -> anyhow::Result<()> {
     if conn.driver() == Driver::Postgres {
+        let changes = pbps_dialect::PlanPayload::changes(plan);
         let found = policy_dependents(conn, changes, ids, managed).await?;
-        crate::row_security::check_policy_releases(changes, ids, &found)?;
+        crate::row_security::check_policy_releases(plan, ids, &found)?;
     }
     Ok(())
 }
@@ -5578,22 +5617,6 @@ pub async fn type_input_routines(
         }
         Driver::Mssql if !pin_routines && pins.is_empty() => Ok(BTreeSet::new()),
         Driver::Mssql => anyhow::bail!("pin_type_routines is supported only on PostgreSQL"),
-    }
-}
-
-/// Assert offline type prerequisites before bootstrap creates any object.
-pub fn bootstrap_type_guard(
-    dialect: &str,
-    schema: &Schema,
-    trusted: &BTreeSet<pbps_model::RoleName>,
-) -> anyhow::Result<Option<pbps_dialect::Statement>> {
-    match dialect {
-        "postgres" => {
-            Ok(pbps_pg::type_refs::bootstrap_guard(schema, trusted)?
-                .map(pbps_dialect::Statement::new))
-        }
-        _ if trusted.is_empty() => Ok(None),
-        _ => anyhow::bail!("trusted_roles is supported only on PostgreSQL"),
     }
 }
 

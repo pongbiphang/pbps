@@ -187,6 +187,7 @@ jobs:
       # downstream opacity of source-bearing native capture inputs (#876).
       - run: cargo test -p pbps-pg --doc
       # And that a resolver plan is sealed only by its own recheck (#1516).
+      # Concrete CLI lowering, saved admission and serde-forgery negatives.
       - run: cargo test -p pbps-cli --doc
       # And that no operation key holds a uid a caller made up, and no
       # operation or its id can be serialized into a saved plan (#1961).
@@ -194,6 +195,8 @@ jobs:
       # Intermediate settlements and external draft copies grant no SQL
       # emission authority (DEC-1959.5).
       - run: cargo test -p pbps-diff --doc
+      # Engine dev-dependencies enable fixtures; also test the ordinary API.
+      - run: cargo test -p pbps-diff --doc --no-default-features
       # Immutable lowering and SQL Server's private emitter are compiler gates.
       - run: cargo test -p pbps-dialect --doc
       - run: cargo test -p pbps-mssql --doc

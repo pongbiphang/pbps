@@ -179,7 +179,7 @@ fn resolution(before: &CapturedInputs, after: &CapturedInputs) -> Vec<SurfaceRes
 async fn execute(conn: &mut Conn, changes: &ChangeSet) -> Result<(), pbps_db::DbError> {
     for p in &changes.changes {
         for statement in crate::Postgres::default()
-            .legacy_emit(&p.change, p.strategy)
+            .fixture_emit(&p.change, p.strategy)
             .unwrap()
         {
             conn.execute(&statement.sql).await?;
@@ -311,7 +311,7 @@ async fn exercise(target_connection: String, scratch_connection: String, worker:
     );
     let restored: pbps_model::SavedPlan =
         serde_json::from_str(&serde_json::to_string(&artifact).unwrap()).unwrap();
-    assert_eq!(restored.checksum(), artifact.checksum());
+    assert_eq!(restored.wire_fingerprint(), artifact.wire_fingerprint());
     let roundtrip = restored.changes;
     assert_eq!(roundtrip, ordered.changes);
     ordered.proof.validate(&roundtrip).unwrap();
@@ -581,7 +581,7 @@ async fn new_table_online_indexes_are_transactional(target: &mut Conn) {
     for step in &restored.changes {
         assert!(
             dialect
-                .legacy_emit(&step.change, step.strategy)
+                .fixture_emit(&step.change, step.strategy)
                 .unwrap()
                 .iter()
                 .all(|s| s.transactional)

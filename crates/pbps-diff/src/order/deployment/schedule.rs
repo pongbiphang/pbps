@@ -205,6 +205,7 @@ pub fn schedule<S: crate::order::RouteState, D: Dialect>(
 }
 
 /// Semantic observation cannot produce a real engine's certificate.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn schedule_semantic<S: crate::order::RouteState>(
     cs: PlanningPlan<S>,
     declared: &Declarations<'_>,

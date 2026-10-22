@@ -100,7 +100,7 @@ async fn filtered_children_refuse_preflight_and_delete_for_both_referential_acti
         let mut db = TestDb::create(tag).await;
         fixture(&mut db.conn, action).await;
         let sql = Mssql
-            .legacy_emit(&deletion(), Default::default())
+            .fixture_emit(&deletion(), Default::default())
             .unwrap()
             .remove(0)
             .sql;
@@ -210,7 +210,7 @@ async fn hidden_security_policy_metadata_is_not_treated_as_no_policy() {
         .await
         .unwrap();
     let sql = Mssql
-        .legacy_emit(&deletion(), Default::default())
+        .fixture_emit(&deletion(), Default::default())
         .unwrap()
         .remove(0)
         .sql;
@@ -289,7 +289,7 @@ async fn hidden_security_policy_metadata_is_not_treated_as_no_policy() {
     let removed_sql = removed
         .changes
         .iter()
-        .flat_map(|p| Mssql.legacy_emit(&p.change, p.strategy).unwrap())
+        .flat_map(|p| Mssql.fixture_emit(&p.change, p.strategy).unwrap())
         .map(|s| s.sql)
         .collect::<Vec<_>>()
         .join("\n");
@@ -339,7 +339,7 @@ async fn an_invisible_referencing_key_does_not_hide_its_row_filter_from_the_guar
     let policies = number(&mut db.conn, "SELECT COUNT(*) FROM sys.security_predicates").await;
     let counted = probe(&mut db.conn, &plan()).await;
     let sql = Mssql
-        .legacy_emit(&deletion(), Default::default())
+        .fixture_emit(&deletion(), Default::default())
         .unwrap()
         .remove(0)
         .sql;
@@ -459,7 +459,7 @@ async fn denying_the_security_definition_permission_hides_no_policy_and_refuses_
     }
 
     let sql = Mssql
-        .legacy_emit(&deletion(), Default::default())
+        .fixture_emit(&deletion(), Default::default())
         .unwrap()
         .remove(0)
         .sql;

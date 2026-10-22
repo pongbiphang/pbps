@@ -84,7 +84,7 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
     );
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "fixture");
     state.declared = Declared::from_schema(&schema);
-    state.plan_checksum = Some(plan.checksum());
+    state.plan_checksum = Some(plan.wire_fingerprint());
     (schema, plan, state)
 }
 
@@ -99,7 +99,7 @@ where
     D: pbps_dialect::PlanDialect<Plan = dyn pbps_diff::order::PlanView<D>> + 'static,
 {
     let (schema, mut plan, mut state) = artifacts(NAME, dialect);
-    let current_checksum = plan.checksum();
+    let current_checksum = plan.wire_fingerprint();
     let sql = plan
         .changes
         .changes
@@ -165,13 +165,13 @@ where
     // applicable version, with the checksum that version produces.
     plan.version = 44;
     state.version = 27;
-    state.plan_checksum = Some(plan.checksum());
+    state.plan_checksum = Some(plan.wire_fingerprint());
     let outputs = [
         ("schema.json", serde_json::to_string(&schema).unwrap()),
         ("ids.json", serde_json::to_string(&state.ids).unwrap()),
         ("plan.json", serde_json::to_string(&plan).unwrap()),
         ("state.json", serde_json::to_string(&state).unwrap()),
-        ("plan.sha256", plan.checksum()),
+        ("plan.sha256", plan.wire_fingerprint()),
         ("state.sha256", state_checksum(&schema, &state.ids)),
         ("statements.sql", sql),
         ("declarations.yml", yaml),
@@ -184,7 +184,7 @@ where
     for (name, actual) in outputs {
         let expected = std::fs::read_to_string(root.join(name)).unwrap();
         let expected = if name == "explain.json" {
-            expected.replace(&plan.checksum(), &current_checksum)
+            expected.replace(&plan.wire_fingerprint(), &current_checksum)
         } else {
             expected
         };
@@ -200,7 +200,7 @@ where
     );
     let (_, mut other, _) = artifacts(SHOWN, dialect);
     other.version = plan.version;
-    assert_ne!(plan.checksum(), other.checksum());
+    assert_ne!(plan.wire_fingerprint(), other.wire_fingerprint());
 }
 
 #[test]

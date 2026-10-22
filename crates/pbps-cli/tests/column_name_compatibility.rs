@@ -1,13 +1,16 @@
 //! Captured on unchanged master c50c0db4 before #2084 step 2's production edits.
 //! Collections exercise column identities independently of their printed spelling.
 
+#[cfg(test)]
+use crate::certified_fixture::FixtureEmission;
+
 use pbps_dialect::Dialect;
 use pbps_model::*;
 
 const NAME: &str = "col\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 const SHOWN: &str = r"col\nline\r\u{1b}[31m\u{9b}\\\u{202e}名前";
 
-fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnapshot) {
+fn artifacts(text: &str, dialect: &dyn FixtureEmission) -> (Schema, SavedPlan, StateSnapshot) {
     let parent = TableName::new("app", "parent");
     let name = TableName::new("app", "child");
     let payload = format!("{text}payload");
@@ -212,23 +215,23 @@ fn artifacts(text: &str, dialect: &dyn Dialect) -> (Schema, SavedPlan, StateSnap
     );
     let mut state = StateSnapshot::new(StateKind::Apply, schema.clone(), ids, "fixture");
     state.declared = Declared::from_schema(&schema);
-    state.plan_checksum = Some(plan.checksum());
+    state.plan_checksum = Some(plan.wire_fingerprint());
     (schema, plan, state)
 }
 
 #[test]
 fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
     for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect,
+        &pbps_pg::Postgres::new() as &dyn FixtureEmission,
         &pbps_mssql::Mssql,
     ] {
         let (schema, mut plan, mut state) = artifacts(NAME, dialect);
-        let current_checksum = plan.checksum();
+        let current_checksum = plan.wire_fingerprint();
         let sql = plan
             .changes
             .changes
             .iter()
-            .flat_map(|p| dialect.legacy_emit(&p.change, Default::default()).unwrap())
+            .flat_map(|p| dialect.fixture_emit(&p.change, Default::default()).unwrap())
             .map(|s| s.sql)
             .collect::<Vec<_>>()
             .join("\n");
@@ -268,13 +271,13 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
         // current applicable plan, whose checksum advances with its version.
         plan.version = 44;
         state.version = 27;
-        state.plan_checksum = Some(plan.checksum());
+        state.plan_checksum = Some(plan.wire_fingerprint());
         let outputs = [
             ("schema.json", serde_json::to_string(&schema).unwrap()),
             ("ids.json", serde_json::to_string(&state.ids).unwrap()),
             ("plan.json", serde_json::to_string(&plan).unwrap()),
             ("state.json", serde_json::to_string(&state).unwrap()),
-            ("plan.sha256", plan.checksum()),
+            ("plan.sha256", plan.wire_fingerprint()),
             ("state.sha256", state_checksum(&schema, &state.ids)),
             ("statements.sql", sql),
             ("declarations.yml", yaml),
@@ -286,7 +289,7 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
         for (name, actual) in outputs {
             let expected = std::fs::read_to_string(root.join(name)).unwrap();
             let expected = if name == "explain.json" {
-                expected.replace(&plan.checksum(), &current_checksum)
+                expected.replace(&plan.wire_fingerprint(), &current_checksum)
             } else {
                 expected
             };
@@ -302,14 +305,14 @@ fn column_collections_keep_master_bytes_checksums_sql_and_declarations() {
         );
         let (_, mut other, _) = artifacts(SHOWN, dialect);
         other.version = plan.version;
-        assert_ne!(plan.checksum(), other.checksum());
+        assert_ne!(plan.wire_fingerprint(), other.wire_fingerprint());
     }
 }
 
 #[test]
 fn column_validation_preserves_the_whole_message_escape_boundary() {
     for dialect in [
-        &pbps_pg::Postgres::new() as &dyn Dialect,
+        &pbps_pg::Postgres::new() as &dyn FixtureEmission,
         &pbps_mssql::Mssql,
     ] {
         let table = Table {
@@ -540,4 +543,12 @@ fn baseline_key_diagnostics_keep_the_previous_escaped_string_list() {
             [NAME, "ordinary"],
         )
     );
+}
+
+#[cfg(test)]
+mod certified_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pbps-diff/tests/support/emission.rs"
+    ));
 }

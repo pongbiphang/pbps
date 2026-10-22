@@ -169,7 +169,7 @@ fn a_resolved_plan_is_offered_the_ordinary_approval_command() {
     let artifact = Artifact::new(&serde_json::to_value(&plan).unwrap());
     let approve = format!(
         "pbps apply --env \"<environment>\" --plan plan.json --checksum {}",
-        plan.checksum()
+        plan.wire_fingerprint()
     );
     for format in ["text", "json"] {
         let out = artifact.explain(format);
@@ -183,7 +183,7 @@ fn a_resolved_plan_is_offered_the_ordinary_approval_command() {
             let value = report(&out);
             assert_eq!(value["data"]["applyable"], true, "{value}");
             assert_eq!(value["data"]["approve_with"], approve.as_str(), "{value}");
-            assert_eq!(value["data"]["checksum"], plan.checksum());
+            assert_eq!(value["data"]["checksum"], plan.wire_fingerprint());
             assert_eq!(value["findings"], serde_json::json!([]), "{value}");
             assert!(value["data"].get("target").is_none(), "{value}");
         } else {
@@ -229,7 +229,7 @@ fn ordinary_database_approval_and_preview_remedy_keep_their_meaning() {
             }
             if origin == PlanOrigin::Database {
                 assert!(text.contains("pbps apply --env"), "{text}");
-                assert!(text.contains(&plan.checksum()), "{text}");
+                assert!(text.contains(&plan.wire_fingerprint()), "{text}");
                 assert!(!text.contains("pbps plan"), "{text}");
             } else {
                 assert!(text.contains("pbps plan --env"), "{text}");
@@ -371,7 +371,7 @@ fn malformed_or_unsupported_resolver_evidence_is_refused_before_presentation() {
 fn a_plan_sealed_under_the_previous_qualification_rule_is_refused_naming_it() {
     let previous = sealed_under("pg-reported-scope-v1", Default::default());
     let current = resolved_plan();
-    assert_ne!(previous.checksum(), current.checksum());
+    assert_ne!(previous.wire_fingerprint(), current.wire_fingerprint());
     let artifact = Artifact::new(&serde_json::to_value(&previous).unwrap());
     for format in ["text", "json"] {
         let out = artifact.explain(format);
@@ -403,7 +403,7 @@ fn a_plan_sealed_under_the_previous_qualification_rule_is_refused_naming_it() {
             "--db",
             &connection,
             "--checksum",
-            &previous.checksum(),
+            &previous.wire_fingerprint(),
         ])
         .output()
         .unwrap();
@@ -535,7 +535,7 @@ fn a_refusal_shows_the_files_values_escaped_and_never_raw() {
         // The plan's own checksum where it can be read, so the checksum
         // refusal cannot be what the apply below reports.
         let checksum = serde_json::from_value::<SavedPlan>(value.clone())
-            .map(|p| p.checksum())
+            .map(|p| p.wire_fingerprint())
             .unwrap_or_else(|_| "00".repeat(32));
         let artifact = Artifact::new(&value);
         for format in ["text", "json"] {
@@ -622,7 +622,7 @@ fn a_refusal_names_a_unicode_value_as_the_file_spells_it() {
         "explain",
     );
     assert_inert(
-        &apply_refused(&artifact, &plan.checksum()),
+        &apply_refused(&artifact, &plan.wire_fingerprint()),
         &[&format!("rule `{rule}`")],
         "apply",
     );
@@ -660,8 +660,8 @@ fn current_resolver_artifacts_cannot_bypass_required_evidence_on_apply() {
         // If the wire shape is readable, supply its own checksum so a checksum
         // refusal cannot conceal a missing evidence/provenance validation.
         let checksum = serde_json::from_value::<SavedPlan>(value.clone())
-            .map(|p| p.checksum())
-            .unwrap_or_else(|_| plan.checksum());
+            .map(|p| p.wire_fingerprint())
+            .unwrap_or_else(|_| plan.wire_fingerprint());
         let artifact = Artifact::new(&value);
         std::fs::write(artifact.0.join("pbps.yml"), "dialect: postgres\n").unwrap();
         let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -720,7 +720,7 @@ fn a_resolved_plan_without_its_key_is_refused_before_contacting_the_target() {
             "--db",
             &connection,
             "--checksum",
-            &plan.checksum(),
+            &plan.wire_fingerprint(),
         ])
         .output()
         .unwrap();
@@ -1222,7 +1222,7 @@ fn named_plan(text: &str, edit: impl FnOnce(&mut SavedPlan)) -> (Artifact, Strin
         ids,
     );
     edit(&mut plan);
-    let checksum = plan.checksum();
+    let checksum = plan.wire_fingerprint();
     (
         Artifact::new(&serde_json::to_value(&plan).unwrap()),
         checksum,
