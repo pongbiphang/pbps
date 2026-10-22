@@ -370,7 +370,7 @@ fn question(target: &GrantTarget, right: Permission) -> (Securable, String, Vec<
                FROM pg_catalog.pg_class t
                JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace
                LEFT JOIN pg_catalog.pg_depend d
-                 ON d.refobjid = t.oid AND d.refobjsubid > 0 AND d.deptype = 'a'
+                 ON d.refobjid = COALESCE(pg_catalog.pg_partition_root(t.oid)::pg_catalog.oid, t.oid) AND d.refobjsubid > 0 AND d.deptype = 'a'
                 AND d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
                 AND d.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
                LEFT JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S'
@@ -484,6 +484,11 @@ mod tests {
             "{query}"
         );
         assert!(query.contains("d.deptype = 'a'"), "{query}");
+        assert!(
+            query.contains("COALESCE(pg_catalog.pg_partition_root(t.oid)::pg_catalog.oid, t.oid)"),
+            "{query}"
+        );
+        assert!(query.contains("s.relkind = 'S'"), "{query}");
         assert!(
             query.contains("d.refclassid = 'pg_catalog.pg_class'"),
             "{query}"

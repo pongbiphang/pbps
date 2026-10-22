@@ -109,6 +109,14 @@ mod tests {
                         [Permission::Insert, Permission::SerialSequences].into(),
                     ),
                     (
+                        "app.p1".parse().unwrap(),
+                        [Permission::Insert, Permission::SerialSequences].into(),
+                    ),
+                    (
+                        "app.p2a".parse().unwrap(),
+                        [Permission::Insert, Permission::SerialSequences].into(),
+                    ),
+                    (
                         "app.hidden".parse().unwrap(),
                         [Permission::SerialSequences].into(),
                     ),
@@ -131,7 +139,14 @@ mod tests {
         );
         for format in [Format::Markdown, Format::Html] {
             let out = render(&schema, &IdsFile::default(), format, "Schema");
-            for kept in ["insert", "usage", "app.t", "No grants."] {
+            for kept in [
+                "insert",
+                "usage",
+                "app.t",
+                "app.p1",
+                "app.p2a",
+                "No grants.",
+            ] {
                 assert!(out.contains(kept), "{out}");
             }
             for hidden in ["serial-sequences", "app.hidden"] {

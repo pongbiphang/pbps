@@ -6289,9 +6289,15 @@ fn diff_roles(
             Vec::new()
         })
         .collect();
-    let serial_creates: BTreeSet<_> = sequence_creates
+    let detaching: BTreeSet<_> = changes
         .iter()
-        .map(|column| &column.table)
+        .filter_map(|change| {
+            if let Change::DetachPartition { uid, .. } = change {
+                Some(uid.clone())
+            } else {
+                None
+            }
+        })
         .collect();
     let effective = |role: &pbps_model::Role, schema: &Schema| {
         let mut grants = pbps_model::role::effective_grants(role, &schema.tables);
@@ -6346,6 +6352,22 @@ fn diff_roles(
         .iter()
         .map(|(uid, name)| (name, uid))
         .collect();
+    let detached_usage = |role: &pbps_model::Role, target: &GrantTarget| {
+        let GrantTarget::Sequence(column) = target else {
+            return false;
+        };
+        role.grants.iter().any(|(target, rights)| {
+            let GrantTarget::Object(table) = target else {
+                return false;
+            };
+            rights.contains(&Permission::SerialSequences)
+                && base_uid
+                    .get(table)
+                    .is_some_and(|uid| detaching.contains(*uid))
+                && pbps_model::role::serial_grant_columns(table, &base.schema.tables)
+                    .contains(column)
+        })
+    };
     let dropped_with_its_table = |target: &GrantTarget| -> bool {
         match target {
             GrantTarget::Object(o) => base_uid
@@ -6436,6 +6458,13 @@ fn diff_roles(
             if dropped_with_its_table(target) {
                 continue;
             }
+            let mut permissions = permissions.clone();
+            // Detach removes the implication, not the root's sequence ACL.
+            // Leave that access to the live read's explicit column target
+            // (DEC-2199.1), rather than revoking through the departed partition.
+            if detached_usage(held, target) {
+                permissions.remove(&Permission::Usage);
+            }
             let target = forward(target);
             // A `REVOKE` on an object this same plan drops would fail on an
             // object that is gone — the same rule the per-target comparison
@@ -6448,7 +6477,7 @@ fn diff_roles(
             changes.push(Change::Revoke {
                 role: name.clone(),
                 target,
-                permissions: permissions.clone(),
+                permissions,
             });
         }
     }
@@ -6507,10 +6536,14 @@ fn diff_roles(
         }
         // The base grants, keyed by the name the target has after this plan.
         let mut before: BTreeMap<GrantTarget, BTreeSet<Permission>> = BTreeMap::new();
+        let mut detached = BTreeSet::new();
         if let Some(b) = base.schema.roles.get(base_name) {
             for (target, permissions) in &effective(b, base.schema) {
                 if dropped_with_its_table(target) {
                     continue;
+                }
+                if detached_usage(b, target) {
+                    detached.insert(forward(target));
                 }
                 before
                     .entry(forward(target))
@@ -6540,7 +6573,7 @@ fn diff_roles(
             let d = desired.get(target).cloned().unwrap_or_default();
             let mut added: BTreeSet<Permission> = d.difference(&b).copied().collect();
             if d.contains(&Permission::SerialSequences)
-                && matches!(target, GrantTarget::Object(table) if serial_creates.contains(table))
+                && matches!(target, GrantTarget::Object(table) if !pbps_model::role::serial_grant_columns(table, &declared.schema.tables).is_disjoint(&sequence_creates))
             {
                 added.insert(Permission::SerialSequences);
             }
@@ -6550,8 +6583,10 @@ fn diff_roles(
                 }
                 if role
                     .grants
-                    .get(&GrantTarget::Object(column.table.clone()))
-                    .is_some_and(|rights| rights.contains(&Permission::SerialSequences))
+                    .iter()
+                    .any(|(target, rights)| matches!(target, GrantTarget::Object(table)
+                        if rights.contains(&Permission::SerialSequences)
+                        && pbps_model::role::serial_grant_columns(table, &declared.schema.tables).contains(column)))
                 {
                     // The table marker grants this same ACL entry once.
                     added.remove(&Permission::Usage);
@@ -6561,6 +6596,9 @@ fn diff_roles(
             // A marker's narrowing is settled per column: retained explicit
             // USAGE must never be revoked by a table-wide statement.
             removed.remove(&Permission::SerialSequences);
+            if detached.contains(target) {
+                removed.remove(&Permission::Usage);
+            }
             if !added.is_empty() {
                 changes.push(Change::Grant {
                     role: name.clone(),
@@ -21395,7 +21433,7 @@ mod tests {
 
         #[test]
         fn converting_a_column_to_serial_regrants_only_the_declared_holders() {
-            let base = side(&[(
+            let mut base = side(&[(
                 "r_aaaaaa",
                 "writer",
                 role(&[(
@@ -21403,12 +21441,35 @@ mod tests {
                     &[Permission::Insert, Permission::SerialSequences],
                 )]),
             )]);
-            let declared = base.clone();
+            // The standing marker is backed by an existing serial; the
+            // declared side also holds the source installed by the change.
+            let mut existing = Column::new(ty("int"));
+            existing.value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+            base.0
+                .tables
+                .get_mut(&"dbo.customer".parse().unwrap())
+                .unwrap()
+                .columns
+                .insert("existing".into(), existing);
+            let mut declared = base.clone();
+            declared
+                .0
+                .tables
+                .get_mut(&"dbo.customer".parse().unwrap())
+                .unwrap()
+                .columns["id"]
+                .value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
             for from in [
                 ValueSource::None,
                 ValueSource::Identity(pbps_model::Identity::new(1, 1)),
                 ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
             ] {
+                base.0
+                    .tables
+                    .get_mut(&"dbo.customer".parse().unwrap())
+                    .unwrap()
+                    .columns["id"]
+                    .value_source = from.clone();
                 let creates = !matches!(from, ValueSource::Sequence(_));
                 let mut changes = vec![Change::AlterColumnNumbering {
                     uid: "c_aaaaaa".parse().unwrap(),
@@ -21441,6 +21502,284 @@ mod tests {
                 .columns["id"]
                 .value_source = ValueSource::Sequence(pbps_model::OwnedSequence::serial());
             s
+        }
+
+        #[test]
+        fn partition_markers_regrant_new_root_serials_and_compare_the_effective_union() {
+            let mut base = serial_side(&[]);
+            let parent: TableName = "dbo.customer".parse().unwrap();
+            base.0.tables.get_mut(&parent).unwrap().partition_by = Some(pbps_model::PartitionBy {
+                strategy: Default::default(),
+                columns: vec!["id".into()],
+                external: false,
+            });
+            for (uid, name, parent_name) in [
+                ("t_bbbbbb", "dbo.p1", "dbo.customer"),
+                ("t_cccccc", "dbo.p2", "dbo.p1"),
+            ] {
+                base.0.tables.insert(
+                    name.parse().unwrap(),
+                    Table {
+                        partition_of: Some(pbps_model::PartitionOf {
+                            parent: parent_name.parse().unwrap(),
+                            bound: pbps_model::PartitionBound::Default,
+                            columns: Default::default(),
+                        }),
+                        ..Default::default()
+                    },
+                );
+                base.1
+                    .tables
+                    .insert(uid.parse().unwrap(), name.parse().unwrap());
+            }
+            base.0
+                .roles
+                .insert("writer".into(), role(&[("dbo.p2", &[Permission::Insert])]));
+            pbps_model::role::implied_serial_grants(&mut base.0);
+            for shape in ["unchanged", "add", "convert", "drop", "rename"] {
+                let mut declared = base.clone();
+                let mut changes = Vec::new();
+                if shape == "add" {
+                    let mut column = Column::new(ty("int"));
+                    column.value_source =
+                        ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+                    declared
+                        .0
+                        .tables
+                        .get_mut(&parent)
+                        .unwrap()
+                        .columns
+                        .insert("other".into(), column.clone());
+                    changes.push(Change::AddColumn {
+                        uid: "c_bbbbbb".parse().unwrap(),
+                        table: parent.clone(),
+                        name: "other".into(),
+                        column: Box::new(column),
+                    });
+                } else if shape == "convert" {
+                    base.0.tables.get_mut(&parent).unwrap().columns["id"].value_source =
+                        ValueSource::None;
+                    changes.push(Change::AlterColumnNumbering {
+                        uid: "c_aaaaaa".parse().unwrap(),
+                        column: parent.column("id"),
+                        ty: ty("int"),
+                        from: ValueSource::None,
+                        to: ValueSource::Sequence(pbps_model::OwnedSequence::serial()),
+                    });
+                } else if shape == "drop" {
+                    declared.0.tables.get_mut(&parent).unwrap().columns.clear();
+                    declared.1.columns.clear();
+                } else if shape == "rename" {
+                    let renamed: TableName = "dbo.renamed".parse().unwrap();
+                    let table = declared.0.tables.remove(&parent).unwrap();
+                    declared.0.tables.insert(renamed.clone(), table);
+                    declared
+                        .1
+                        .tables
+                        .insert("t_aaaaaa".parse().unwrap(), renamed.clone());
+                    declared
+                        .1
+                        .columns
+                        .insert("c_aaaaaa".parse().unwrap(), renamed.column("id"));
+                    declared
+                        .0
+                        .tables
+                        .get_mut(&"dbo.p1".parse().unwrap())
+                        .unwrap()
+                        .partition_of
+                        .as_mut()
+                        .unwrap()
+                        .parent = renamed;
+                }
+                diff_roles(
+                    Side {
+                        schema: &base.0,
+                        ids: &base.1,
+                    },
+                    Side {
+                        schema: &declared.0,
+                        ids: &declared.1,
+                    },
+                    &ClusterRoles,
+                    &mut changes,
+                );
+                let grants: Vec<_> = changes
+                    .iter()
+                    .filter(|c| matches!(c, Change::Grant { .. }))
+                    .collect();
+                assert_eq!(
+                    grants.len(),
+                    usize::from(matches!(shape, "add" | "convert")),
+                    "{shape}: {changes:?}"
+                );
+                for grant in grants {
+                    assert!(
+                        matches!(grant, Change::Grant { target, permissions, .. } if *target == "dbo.p2".parse().unwrap() && *permissions == [Permission::SerialSequences].into()),
+                        "{grant:?}"
+                    );
+                }
+                assert!(
+                    !changes.iter().any(|c| matches!(c, Change::Revoke { .. })),
+                    "{shape}: {changes:?}"
+                );
+                // Restore the base changed for the conversion case.
+                base.0.tables.get_mut(&parent).unwrap().columns["id"].value_source =
+                    ValueSource::Sequence(pbps_model::OwnedSequence::serial());
+            }
+            // Explicit USAGE on the root and INSERT on a partition describe
+            // one ACL; removing either source must preserve the other.
+            for keep_insert in [false, true] {
+                let mut declared = base.clone();
+                declared.0.roles.insert(
+                    "writer".into(),
+                    if keep_insert {
+                        role(&[("dbo.p1", &[Permission::Insert])])
+                    } else {
+                        role(&[("sequence::dbo.customer.id", &[Permission::Usage])])
+                    },
+                );
+                pbps_model::role::implied_serial_grants(&mut declared.0);
+                let mut changes = Vec::new();
+                diff_roles(
+                    Side {
+                        schema: &base.0,
+                        ids: &base.1,
+                    },
+                    Side {
+                        schema: &declared.0,
+                        ids: &declared.1,
+                    },
+                    &ClusterRoles,
+                    &mut changes,
+                );
+                assert!(
+                    !changes.iter().any(|c| matches!(
+                        c,
+                        Change::Revoke {
+                            target: GrantTarget::Sequence(_),
+                            ..
+                        }
+                    )),
+                    "{changes:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn detach_leaves_inherited_sequence_usage_explicit_and_attach_gains_the_marker() {
+            let mut partition = serial_side(&[("dbo.p1", &[Permission::Insert])]);
+            let parent: TableName = "dbo.customer".parse().unwrap();
+            partition.0.tables.get_mut(&parent).unwrap().partition_by =
+                Some(pbps_model::PartitionBy {
+                    strategy: Default::default(),
+                    columns: vec!["id".into()],
+                    external: false,
+                });
+            partition.0.tables.insert(
+                "dbo.p1".parse().unwrap(),
+                Table {
+                    partition_of: Some(pbps_model::PartitionOf {
+                        parent: parent.clone(),
+                        bound: pbps_model::PartitionBound::Default,
+                        columns: [(
+                            "id".into(),
+                            pbps_model::PartitionColumn {
+                                default: Some("0".into()),
+                                not_null: false,
+                            },
+                        )]
+                        .into(),
+                    }),
+                    ..Default::default()
+                },
+            );
+            partition
+                .1
+                .tables
+                .insert("t_bbbbbb".parse().unwrap(), "dbo.p1".parse().unwrap());
+            pbps_model::role::implied_serial_grants(&mut partition.0);
+            let mut detached = partition.clone();
+            let mut column = detached.0.tables[&parent].columns["id"].clone();
+            column.value_source = ValueSource::Default("0".into());
+            detached.0.tables.insert(
+                "dbo.p1".parse().unwrap(),
+                Table {
+                    columns: [("id".into(), column)].into(),
+                    ..Default::default()
+                },
+            );
+            detached
+                .1
+                .columns
+                .insert("c_bbbbbb".parse().unwrap(), "dbo.p1.id".parse().unwrap());
+            detached
+                .0
+                .roles
+                .insert("writer".into(), role(&[("dbo.p1", &[Permission::Insert])]));
+            for removed_role in [false, true] {
+                let mut declared = detached.clone();
+                if removed_role {
+                    declared.0.roles.clear();
+                    declared.1.roles.clear();
+                }
+                let changes = diff(
+                    Side {
+                        schema: &partition.0,
+                        ids: &partition.1,
+                    },
+                    Side {
+                        schema: &declared.0,
+                        ids: &declared.1,
+                    },
+                    &ClusterRoles,
+                    &Hints::default(),
+                )
+                .unwrap();
+                assert!(
+                    changes
+                        .changes
+                        .iter()
+                        .any(|p| matches!(p.change, Change::DetachPartition { .. })),
+                    "{changes:?}"
+                );
+                assert!(
+                    !changes.changes.iter().any(|p| matches!(
+                        &p.change,
+                        Change::Revoke {
+                            target: GrantTarget::Sequence(_),
+                            ..
+                        }
+                    )),
+                    "{changes:?}"
+                );
+            }
+            let changes = diff(
+                Side {
+                    schema: &detached.0,
+                    ids: &detached.1,
+                },
+                Side {
+                    schema: &partition.0,
+                    ids: &partition.1,
+                },
+                &ClusterRoles,
+                &Hints::default(),
+            )
+            .unwrap();
+            let attach = changes
+                .changes
+                .iter()
+                .position(|p| matches!(p.change, Change::AttachPartition { .. }))
+                .unwrap();
+            let grant = changes.changes.iter().position(|p| matches!(&p.change, Change::Grant { target, permissions, .. } if *target == "dbo.p1".parse().unwrap() && *permissions == [Permission::SerialSequences].into())).unwrap();
+            assert!(attach < grant, "{changes:?}");
+            assert!(
+                !changes
+                    .changes
+                    .iter()
+                    .any(|p| matches!(p.change, Change::Revoke { .. })),
+                "{changes:?}"
+            );
         }
 
         #[test]

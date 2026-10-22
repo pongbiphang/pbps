@@ -3010,6 +3010,217 @@ fn declared_insert_grants_serial_usage_and_keeps_it_on_new_sequences() {
     assert!(stdout(&succeeds(d.run(&["plan", "--db", connection]))).contains("No changes"));
 }
 
+/// Managed single-level partitions round-trip their implied serial access.
+/// A SQL-created two-level tree separately exercises emitted SQL: adopting
+/// nested partition trees still needs DEC-1170.1's broader support.
+#[test]
+#[ignore = "needs live PostgreSQL 16 and 18; set PBPS_TEST_PG_DB and PBPS_TEST_PG_OLD_DB"]
+fn partition_insert_uses_root_serial_sequences_and_round_trips_on_both_servers() {
+    struct Roles(String, Vec<String>);
+    impl Drop for Roles {
+        fn drop(&mut self) {
+            for role in &self.1 {
+                let _ = try_on_server(&self.0, &format!("DROP ROLE IF EXISTS {role}"));
+            }
+        }
+    }
+    for (version, server) in [
+        (
+            16,
+            std::env::var("PBPS_TEST_PG_OLD_DB").expect("PBPS_TEST_PG_OLD_DB"),
+        ),
+        (18, server()),
+    ] {
+        let roles = Roles(
+            server.clone(),
+            ["serial", "plain"]
+                .map(|kind| format!("pbps_partition2202_{kind}_{version}_{}", std::process::id()))
+                .into(),
+        );
+        for role in &roles.1 {
+            on_server(&server, &format!("CREATE ROLE {role} NOSUPERUSER"));
+        }
+        let source = OwnDatabase::new(&server, "partition-serial2202-source");
+        let target = OwnDatabase::new(&server, "partition-serial2202-target");
+        let src = source.connection();
+        let conn = target.connection();
+        assert_eq!(
+            scalar(
+                conn,
+                "SELECT current_setting('server_version_num')::bigint / 10000"
+            ),
+            version
+        );
+        on_server(
+            src,
+            "CREATE SCHEMA app;
+            CREATE TABLE app.p (id bigserial, v integer) PARTITION BY RANGE (v);
+            CREATE TABLE app.p1 PARTITION OF app.p FOR VALUES FROM (0) TO (10);
+            CREATE TABLE app.p2 PARTITION OF app.p FOR VALUES FROM (10) TO (20);
+            CREATE TABLE app.plain (id bigint NOT NULL DEFAULT 0, v integer) PARTITION BY RANGE (v);
+            CREATE TABLE app.plain1 PARTITION OF app.plain FOR VALUES FROM (0) TO (10)",
+        );
+        let d = Demo::new("partition-serial2202");
+        let source_pull = succeeds(d.run(&["pull", "--db", src]));
+        assert!(
+            !stderr(&source_pull).contains("left out"),
+            "{}",
+            stderr(&source_pull)
+        );
+        std::fs::create_dir_all(d.dir.join("schema/roles")).unwrap();
+        for (i, grants) in [
+            "  app.p1: [insert]\n  app.p2: [insert]\n",
+            "  app.plain1: [insert]\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            std::fs::write(
+                d.dir.join(format!("schema/roles/{}.yml", roles.1[i])),
+                format!(
+                    "role: {}\ngrants:\n  schema::app: [usage]\n{grants}",
+                    roles.1[i]
+                ),
+            )
+            .unwrap();
+        }
+        succeeds(d.run(&["validate"]));
+        succeeds(d.run(&["plan"]));
+        d.commit();
+        on_server(conn, "CREATE SCHEMA app");
+        succeeds(d.run(&["baseline", "--db", conn, "--reason", "empty database"]));
+        let plan = d.dir.join("plan.json");
+        succeeds(d.run(&["plan", "--db", conn, "--out", plan.to_str().unwrap()]));
+        succeeds(approved_apply(&d, conn, &plan, &[]));
+        on_server(
+            conn,
+            &format!(
+                "SET ROLE {};
+            INSERT INTO app.p1 (v) VALUES (1);
+            INSERT INTO app.p2 (v) VALUES (11);
+            RESET ROLE",
+                roles.1[0]
+            ),
+        );
+        assert_eq!(scalar(conn, "SELECT id FROM app.p1 WHERE v = 1"), 1);
+        assert_eq!(scalar(conn, "SELECT id FROM app.p2 WHERE v = 11"), 2);
+        assert!(
+            try_on_server(
+                conn,
+                &format!("SET ROLE {}; INSERT INTO app.p (v) VALUES (2)", roles.1[0])
+            )
+            .unwrap_err()
+            .contains("permission denied")
+        );
+        on_server(
+            conn,
+            &format!(
+                "SET ROLE {}; INSERT INTO app.plain1 (v) VALUES (1); RESET ROLE",
+                roles.1[1]
+            ),
+        );
+        assert_eq!(scalar(conn, "SELECT id FROM app.plain1 WHERE v = 1"), 0);
+        assert_eq!(
+            scalar(
+                conn,
+                &format!(
+                    "SELECT pg_catalog.has_sequence_privilege('{}', 'app.p_id_seq', 'USAGE')::integer::bigint",
+                    roles.1[1]
+                )
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                conn,
+                "SELECT count(*) FROM pg_catalog.pg_depend d JOIN pg_catalog.pg_class s ON s.oid = d.objid AND s.relkind = 'S' WHERE d.refobjid = 'app.p1'::regclass AND d.deptype = 'a'"
+            ),
+            0
+        );
+        let next = succeeds(d.run(&["plan", "--db", conn]));
+        assert!(stdout(&next).contains("No changes"), "{}", stdout(&next));
+        succeeds(d.run(&["verify", "--db", conn]));
+        succeeds(d.run(&["doctor", "--db", conn]));
+        let pulled = Demo::new("partition-serial2202-pull");
+        let output = succeeds(pulled.run(&["pull", "--db", conn]));
+        assert!(
+            !stderr(&output).contains("on sequence"),
+            "{}",
+            stderr(&output)
+        );
+        assert!(!stderr(&output).contains("left out"), "{}", stderr(&output));
+        for role in &roles.1 {
+            let text = std::fs::read_to_string(pulled.dir.join(format!("schema/roles/{role}.yml")))
+                .unwrap();
+            assert!(
+                !text.contains("sequence::") && !text.contains("serial-sequences"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            pbps_load::load_schema_dir(&d.dir.join("schema"))
+                .unwrap()
+                .schema
+                .roles,
+            pbps_load::load_schema_dir(&pulled.dir.join("schema"))
+                .unwrap()
+                .schema
+                .roles
+        );
+        succeeds(pulled.run(&["validate"]));
+
+        // Nested partition adoption remains outside #2202. Exercise the
+        // actual emitted statements independently, including a root renamed
+        // after statement generation and before execution.
+        let nested = OwnDatabase::new(&server, "partition-serial2202-nested");
+        let conn = nested.connection();
+        on_server(conn, &format!("CREATE SCHEMA app;
+            GRANT USAGE ON SCHEMA app TO {};
+            CREATE TABLE app.p (id bigserial, v integer) PARTITION BY RANGE (v);
+            CREATE TABLE app.p2 PARTITION OF app.p FOR VALUES FROM (10) TO (20) PARTITION BY RANGE (v);
+            CREATE TABLE app.p2a PARTITION OF app.p2 FOR VALUES FROM (10) TO (20)", roles.1[0]));
+        let emit = |permissions| {
+            pbps_dialect::Dialect::emit(
+                &pbps_pg::Postgres::new(),
+                &pbps_model::Change::Grant {
+                    role: roles.1[0].clone().into(),
+                    target: "app.p2a".parse().unwrap(),
+                    permissions,
+                },
+                pbps_model::Strategy::default(),
+            )
+            .unwrap()
+        };
+        for statement in emit([pbps_model::Permission::Insert].into()) {
+            on_server(conn, &statement.sql);
+        }
+        assert!(
+            try_on_server(
+                conn,
+                &format!(
+                    "SET ROLE {}; INSERT INTO app.p2a (v) VALUES (11)",
+                    roles.1[0]
+                )
+            )
+            .unwrap_err()
+            .contains("permission denied for sequence")
+        );
+        let statements = emit([pbps_model::Permission::SerialSequences].into());
+        on_server(conn, "ALTER TABLE app.p RENAME TO renamed_root");
+        for statement in statements {
+            on_server(conn, &statement.sql);
+        }
+        on_server(
+            conn,
+            &format!(
+                "SET ROLE {}; INSERT INTO app.p2a (v) VALUES (11); RESET ROLE",
+                roles.1[0]
+            ),
+        );
+        assert_eq!(scalar(conn, "SELECT id FROM app.p2a WHERE v = 11"), 1);
+    }
+}
+
 /// A connected plan's base is a read, which knows the name the engine
 /// generated for a `serial`'s sequence: a declaration naming another one
 /// renames it, gated as `rename` (#1889). The same name a git baseline

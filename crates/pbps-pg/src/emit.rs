@@ -2192,6 +2192,8 @@ fn serial_sequence_permission(
     };
     // Names are resolved when this statement runs: a rename may have carried
     // the sequence, and a column added earlier in this plan owns a new one.
+    // Resolve a partition's root by OID here, including sub-partitions: the
+    // root may have been renamed in this plan (DEC-2202.1).
     // Identity sequences have deptype 'i' and need no such grant (DEC-1892.1).
     // pbps's own catalog read, so it runs on the empty path with every
     // operator qualified: on the table's schema's path, an exact-match
@@ -2214,7 +2216,7 @@ BEGIN
           JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) s.relnamespace
          WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid
            AND d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass::pg_catalog.oid
-           AND d.refobjid OPERATOR(pg_catalog.=) {}::pg_catalog.regclass::pg_catalog.oid
+           AND d.refobjid OPERATOR(pg_catalog.=) COALESCE(pg_catalog.pg_partition_root({table}::pg_catalog.regclass), {table}::pg_catalog.regclass)::pg_catalog.oid
            AND d.refobjsubid OPERATOR(pg_catalog.>) 0
            AND d.deptype OPERATOR(pg_catalog.=) 'a'
          ORDER BY n.nspname, s.relname
@@ -2223,8 +2225,8 @@ BEGIN
             pbps_sequence.nspname, pbps_sequence.relname, {});
     END LOOP;
 END",
-        literal(&qualified(table)?),
         literal(role.raw()),
+        table = literal(&qualified(table)?),
     );
     let tag = dollar_tag(&body);
     Ok(format!("DO {tag}\n{body}\n{tag};"))
@@ -7218,6 +7220,43 @@ mod tests {
 
     /// A derived serial marker is granted on the sequences the table owns,
     /// found when the statement runs, and never as a table word.
+    #[test]
+    fn a_partition_marker_resolves_its_root_at_execution_and_selects_only_sequences() {
+        let pg = Postgres::new();
+        for table in ["p1", "p2a"] {
+            let sql = sql_of(
+                &pg,
+                &Change::Grant {
+                    role: "writer".into(),
+                    target: GrantTarget::Object(TableName::new("app", table)),
+                    permissions: [Permission::Insert, Permission::SerialSequences].into(),
+                },
+            )
+            .join("\n");
+            assert!(sql.contains(&format!("COALESCE(pg_catalog.pg_partition_root('\"app\".\"{table}\"'::pg_catalog.regclass), '\"app\".\"{table}\"'::pg_catalog.regclass)::pg_catalog.oid")), "{sql}");
+            assert!(
+                sql.contains("s.relkind OPERATOR(pg_catalog.=) 'S'"),
+                "{sql}"
+            );
+            assert!(!sql.contains("'i'"), "{sql}");
+            let block = sql.split_once("DO ").unwrap().1;
+            assert!(!block.contains(" = ") && !block.contains(" > "), "{sql}");
+            assert!(sql.contains("SET search_path = '';\nDO "), "{sql}");
+            assert!(!sql.contains("search_path = app"), "{sql}");
+            let ordinary = sql_of(
+                &pg,
+                &Change::Grant {
+                    role: "writer".into(),
+                    target: GrantTarget::Object(TableName::new("app", table)),
+                    permissions: [Permission::Insert].into(),
+                },
+            )
+            .join("\n");
+            assert!(!ordinary.contains("pg_partition_root"), "{ordinary}");
+            assert!(!ordinary.contains("ON SEQUENCE"), "{ordinary}");
+        }
+    }
+
     #[test]
     fn serial_markers_render_owned_sequence_usage_beside_ordinary_permissions() {
         let pg = Postgres::new();

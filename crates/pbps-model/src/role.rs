@@ -310,34 +310,48 @@ impl FromStr for Permission {
     }
 }
 
-/// Adds the sequence access implied by a declared INSERT on a serial table.
+/// The serial columns whose sequences an INSERT target uses (DEC-2202.1).
+/// Partitions own no columns or sequences: even a sub-partition uses the root.
+pub fn serial_grant_columns(
+    table: &crate::TableName,
+    tables: &BTreeMap<crate::TableName, crate::Table>,
+) -> BTreeSet<crate::ColumnRef> {
+    let mut next = table;
+    // Declarations can reach this helper before partition validation. A
+    // missing parent or a cycle proves no owned sequence, rather than hanging.
+    for _ in 0..tables.len() {
+        let Some((name, table)) = tables.get_key_value(next) else {
+            return BTreeSet::new();
+        };
+        if let Some(of) = &table.partition_of {
+            next = &of.parent;
+        } else {
+            return table
+                .columns
+                .iter()
+                .filter(|(_, c)| matches!(c.value_source, crate::ValueSource::Sequence(_)))
+                .map(|(column, _)| name.column(column))
+                .collect();
+        }
+    }
+    BTreeSet::new()
+}
+
+/// Adds the sequence access implied by a declared INSERT on a serial tree.
 /// Only declarations pass here: inferring access from a live INSERT would
 /// hide the very missing sequence privilege the comparison must find.
 pub fn implied_serial_grants(schema: &mut crate::Schema) {
-    let serial_tables: BTreeSet<_> = schema
+    let serial_tables: BTreeMap<_, _> = schema
         .tables
-        .iter()
-        .filter(|(_, table)| {
-            table
-                .columns
-                .values()
-                .any(|column| matches!(column.value_source, crate::ValueSource::Sequence(_)))
-        })
-        .map(|(name, _)| name)
-        .collect();
-    let serial_columns: BTreeSet<_> = schema
-        .tables
-        .iter()
-        .flat_map(|(table, t)| {
-            t.columns
-                .iter()
-                .filter(|(_, c)| matches!(c.value_source, crate::ValueSource::Sequence(_)))
-                .map(|(name, _)| table.column(name))
+        .keys()
+        .filter_map(|name| {
+            let columns = serial_grant_columns(name, &schema.tables);
+            (!columns.is_empty()).then_some((name, columns))
         })
         .collect();
     for role in schema.roles.values_mut() {
         for (target, permissions) in &mut role.grants {
-            if matches!(target, GrantTarget::Object(table) if serial_tables.contains(table))
+            if matches!(target, GrantTarget::Object(table) if serial_tables.contains_key(table))
                 && permissions.contains(&Permission::Insert)
             {
                 permissions.insert(Permission::SerialSequences);
@@ -348,18 +362,19 @@ pub fn implied_serial_grants(schema: &mut crate::Schema) {
             .iter()
             .filter_map(|(target, rights)| match target {
                 GrantTarget::Object(table) if rights.contains(&Permission::SerialSequences) => {
-                    Some(table.clone())
+                    serial_tables.get(table)
                 }
                 GrantTarget::Object(_)
                 | GrantTarget::Sequence(_)
                 | GrantTarget::Routine(_)
                 | GrantTarget::Schema(_) => None,
             })
+            .flatten()
+            .cloned()
             .collect();
         role.grants.retain(|target, rights| {
             if let GrantTarget::Sequence(column) = target
-                && implied.contains(&column.table)
-                && serial_columns.contains(column)
+                && implied.contains(column)
             {
                 rights.remove(&Permission::Usage);
             }
@@ -379,15 +394,11 @@ pub fn effective_grants(
         if let GrantTarget::Object(table) = target
             && rights.contains(&Permission::SerialSequences)
         {
-            if let Some(t) = tables.get(table) {
-                for (name, column) in &t.columns {
-                    if matches!(column.value_source, crate::ValueSource::Sequence(_)) {
-                        grants
-                            .entry(GrantTarget::Sequence(table.column(name.clone())))
-                            .or_default()
-                            .insert(Permission::Usage);
-                    }
-                }
+            for column in serial_grant_columns(table, tables) {
+                grants
+                    .entry(GrantTarget::Sequence(column))
+                    .or_default()
+                    .insert(Permission::Usage);
             }
             if let Some(rights) = grants.get_mut(target) {
                 rights.remove(&Permission::SerialSequences);
@@ -461,6 +472,7 @@ pub fn check(schema: &crate::schema::Schema) -> Vec<String> {
                     if !schema
                         .tables
                         .get(&column.table)
+                        .filter(|table| table.partition_of.is_none())
                         .and_then(|table| table.columns.get(&column.name))
                         .is_some_and(|c| matches!(c.value_source, crate::ValueSource::Sequence(_)))
                     {
@@ -624,6 +636,154 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn partition_insert_derives_only_the_roots_serial_access_at_every_depth() {
+        use crate::{Identity, OwnedSequence, PartitionBound, PartitionOf, ValueSource};
+        for source in [
+            ValueSource::Sequence(OwnedSequence::serial()),
+            ValueSource::None,
+            ValueSource::Identity(Identity::new(1, 1)),
+        ] {
+            for permission in [Permission::Insert, Permission::Select] {
+                let expected =
+                    matches!(source, ValueSource::Sequence(_)) && permission == Permission::Insert;
+                let mut schema = schema_with_table();
+                schema
+                    .tables
+                    .get_mut(&"dbo.customer".parse().unwrap())
+                    .unwrap()
+                    .columns["id"]
+                    .value_source = source.clone();
+                for (name, parent) in [("dbo.p1", "dbo.customer"), ("dbo.p2", "dbo.p1")] {
+                    schema.tables.insert(
+                        name.parse().unwrap(),
+                        Table {
+                            partition_of: Some(PartitionOf {
+                                parent: parent.parse().unwrap(),
+                                bound: PartitionBound::Default,
+                                columns: Default::default(),
+                            }),
+                            ..Default::default()
+                        },
+                    );
+                }
+                for target in ["dbo.p1", "dbo.p2"] {
+                    schema.roles.insert(
+                        target.into(),
+                        Role {
+                            grants: [
+                                (target.parse().unwrap(), [permission].into()),
+                                (
+                                    "sequence::dbo.customer.id".parse().unwrap(),
+                                    [Permission::Usage, Permission::Select].into(),
+                                ),
+                            ]
+                            .into(),
+                            ..Default::default()
+                        },
+                    );
+                }
+                implied_serial_grants(&mut schema);
+                for target in ["dbo.p1", "dbo.p2"] {
+                    let role = &schema.roles[target];
+                    assert_eq!(
+                        role.grants[&target.parse().unwrap()]
+                            .contains(&Permission::SerialSequences),
+                        expected
+                    );
+                    assert_eq!(
+                        role.grants[&"sequence::dbo.customer.id".parse().unwrap()]
+                            .contains(&Permission::Usage),
+                        !expected
+                    );
+                    assert_eq!(
+                        effective_grants(role, &schema.tables)
+                            [&"sequence::dbo.customer.id".parse().unwrap()],
+                        [Permission::Usage, Permission::Select].into()
+                    );
+                    assert!(
+                        !effective_grants(role, &schema.tables)
+                            .contains_key(&format!("sequence::{target}.id").parse().unwrap())
+                    );
+                }
+                let once = schema.clone();
+                implied_serial_grants(&mut schema);
+                assert_eq!(schema, once);
+                // A missing parent and a cycle must prove no implication.
+                schema
+                    .tables
+                    .get_mut(&"dbo.p1".parse().unwrap())
+                    .unwrap()
+                    .partition_of
+                    .as_mut()
+                    .unwrap()
+                    .parent = "dbo.missing".parse().unwrap();
+                assert!(
+                    serial_grant_columns(&"dbo.p2".parse().unwrap(), &schema.tables).is_empty()
+                );
+                schema
+                    .tables
+                    .get_mut(&"dbo.p1".parse().unwrap())
+                    .unwrap()
+                    .partition_of
+                    .as_mut()
+                    .unwrap()
+                    .parent = "dbo.p2".parse().unwrap();
+                assert!(
+                    serial_grant_columns(&"dbo.p2".parse().unwrap(), &schema.tables).is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_explicit_sequence_target_cannot_name_a_partitions_inherited_column() {
+        let mut schema = schema_with_table();
+        schema.roles.insert(
+            "writer".into(),
+            Role {
+                grants: [(
+                    "sequence::dbo.customer.id".parse().unwrap(),
+                    [Permission::Usage].into(),
+                )]
+                .into(),
+                ..Default::default()
+            },
+        );
+        let table = schema
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap();
+        table.columns["id"].value_source =
+            crate::ValueSource::Sequence(crate::OwnedSequence::serial());
+        assert!(check(&schema).is_empty());
+        schema
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .partition_of = Some(crate::PartitionOf {
+            parent: "dbo.parent".parse().unwrap(),
+            bound: crate::PartitionBound::Default,
+            columns: Default::default(),
+        });
+        assert!(
+            check(&schema)
+                .iter()
+                .any(|p| p.contains("sequence::dbo.customer.id") && p.contains("owned sequence"))
+        );
+        schema
+            .tables
+            .get_mut(&"dbo.customer".parse().unwrap())
+            .unwrap()
+            .columns
+            .clear();
+        assert!(
+            check(&schema)
+                .iter()
+                .any(|p| p.contains("sequence::dbo.customer.id"))
+        );
     }
 
     #[test]

@@ -498,6 +498,7 @@
         "a_conversion_past_an_exhausted_counter_is_refused_before_apply",
         "a_numbered_column_added_to_rows_names_the_publications_that_miss_it",
         "declared_insert_grants_serial_usage_and_keeps_it_on_new_sequences",
+        "partition_insert_uses_root_serial_sequences_and_round_trips_on_both_servers",
         "explicit_serial_sequence_grants_preserve_the_union_and_round_trip_on_both_servers",
         "a_constraint_trigger_rebuild_frees_its_name_before_a_check_or_foreign_key",
         "a_deferred_unique_or_primary_key_keeps_its_referencing_foreign_key_after_it",

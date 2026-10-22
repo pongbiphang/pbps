@@ -740,10 +740,13 @@ grants:
 - **A grant's target must be declared** — the foreign-key-target rule applied
   to permissions — or be a `schema::` target. `validate` refuses the rest.
 - **PostgreSQL serial access**: INSERT on a declared table implies USAGE on
-  all sequences its serial columns own (DEC-1892.1). Explicit
+  all sequences its serial columns own (DEC-1892.1). A partition follows
+  `partition_of` to the root's serial columns, through every level
+  (DEC-2202.1). Explicit
   `sequence::app.orders.id: [usage, select, update]` grants accept only those
   three words and require a declared serial column (`ValueSource::Sequence`),
-  never an identity or plain column. SQL Server refuses this target by name.
+  never an identity, plain or inherited partition column. SQL Server refuses
+  this target by name.
   Explicit and implied USAGE are unioned: removing either source keeps the
   privilege while the other holds it. Pull writes only non-implied USAGE and
   all SELECT and UPDATE; implied access remains an internal table marker.
