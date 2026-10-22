@@ -1770,6 +1770,7 @@ fn before_its_partitions_indexes(
                 | Change::DropCheck { .. }
                 | Change::AddForeignKey { .. }
                 | Change::DropForeignKey { .. }
+                | Change::DropPolicy { .. }
                 | Change::CreatePolicy { .. }
                 | Change::SetRowSecurity { .. }
                 | Change::SetReplicaIdentity { .. }

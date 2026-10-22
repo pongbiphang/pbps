@@ -3034,6 +3034,18 @@ pub(crate) fn validate_module(id: &ModuleId, module: &Module) -> Vec<DialectErro
 
 pub(crate) fn emit(pg: &Postgres, change: &Change, strategy: Strategy) -> Sql {
     match change {
+        Change::DropPolicy { table, .. }
+        | Change::CreatePolicy { table, origin: pbps_model::RowSecurityOrigin::Standing, .. }
+        | Change::SetRowSecurity { table, origin: pbps_model::RowSecurityOrigin::Standing, .. } => {
+            Err(DialectError::Unsupported {
+                dialect: DIALECT,
+                feature: format!(
+                    "{}: standing-table row-security SQL delivery arrives with later PRs of #1173",
+                    // raw: Unsupported escapes its complete feature until #2084 step 5.
+                    table.raw()
+                ),
+            })
+        }
         Change::CreatePolicy { table, name, policy, .. } => {
             let targets = match &policy.to {
                 pbps_model::PolicyRoles::Public => "PUBLIC".to_owned(),

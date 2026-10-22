@@ -624,7 +624,9 @@ impl Operation {
             Change::AddForeignKey { table, name, .. } | Change::DropForeignKey { table, name } => {
                 part(table, PartKey::ForeignKey(name.clone()))?
             }
-            Change::CreatePolicy { table, name, .. } => part(table, PartKey::Policy(name.clone()))?,
+            Change::CreatePolicy { table, name, .. } | Change::DropPolicy { table, name, .. } => {
+                part(table, PartKey::Policy(name.clone()))?
+            }
             Change::SetRowSecurity { uid, .. } => ObjectKey::Part {
                 table: recorded(uid),
                 part: PartKey::RowSecurity,
@@ -773,6 +775,7 @@ impl Operation {
             | Change::DropUnique { .. }
             | Change::DropForeignKey { .. }
             | Change::DropCheck { .. }
+            | Change::DropPolicy { .. }
             | Change::DropIndex { .. }
             | Change::DeleteRow { .. }
             | Change::DropModule { .. }

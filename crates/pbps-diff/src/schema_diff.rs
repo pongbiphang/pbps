@@ -1136,6 +1136,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetStorageParameters { .. }
@@ -1190,6 +1191,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetStorageParameters { .. }
@@ -1380,6 +1382,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetStorageParameters { .. }
@@ -1436,6 +1439,7 @@ pub(crate) fn diff_partial_rebuilding(
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetStorageParameters { .. }
@@ -2526,6 +2530,7 @@ fn recreate_referenced_foreign_keys(
             | Change::SetTablePersistence { .. }
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetStorageParameters { .. }
@@ -3046,6 +3051,7 @@ fn recreate_retyped_dependents(
         | Change::SetTablePersistence { .. }
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. }
+        | Change::DropPolicy { .. }
         | Change::CreatePolicy { .. }
         | Change::SetRowSecurity { .. }
         | Change::SetStorageParameters { .. }
@@ -4351,6 +4357,7 @@ fn refuse_partition_changes(
                 | Change::DropForeignKey { .. }
                 | Change::SetPartitionDefault { .. }
                 | Change::SetPartitionNotNull { .. }
+                | Change::DropPolicy { .. }
                 | Change::CreatePolicy { .. }
                 | Change::SetRowSecurity { .. }
                 | Change::SetStorageParameters { .. }
@@ -5062,6 +5069,7 @@ fn refuse_computed_dependencies(
                     | Change::SetTablePersistence { .. }
                     | Change::SetPartitionDefault { .. }
                     | Change::SetPartitionNotNull { .. }
+                    | Change::DropPolicy { .. }
                     | Change::CreatePolicy { .. }
                     | Change::SetRowSecurity { .. }
                     | Change::SetStorageParameters { .. }
@@ -6126,6 +6134,7 @@ fn dependency_rank(
         | Change::SetColumnDeprecated { .. }
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
+        | Change::DropPolicy { .. }
         | Change::CreatePolicy { .. }
         | Change::SetRowSecurity { .. }
         | Change::SetStorageParameters { .. }
@@ -6867,6 +6876,8 @@ const ROW_DELETIONS: u8 = 12;
 
 fn order_key(c: &Change) -> u8 {
     match c {
+        // Registration only; policy teardown ranks and edges arrive in PR B.
+        Change::DropPolicy { .. } => 0,
         // Modules go first and last, and both ends are load-bearing. A
         // SCHEMABINDING view blocks a rename of the column it binds, so every
         // module that is going has to go before the table changes; and a view

@@ -602,3 +602,49 @@ saved-plan format becomes 37 for the new variant and to refuse older plans
 that can silently omit an ensure scope transition. Both live engines test
 additions, removals, empty scopes, no-ops, row writes, renames and checksum
 refusals; a stale baseline retains the failed-attempt audit per SPEC §7.5.
+
+
+<a id="dec-1173-1"></a>
+
+**DEC-1173.1. Standing-table row-security changes have explicit, gated access
+risks and UID-verified origins (#1173).** `RowSecurityOrigin::Standing` extends
+`CreatePolicy` and `SetRowSecurity`; `DropPolicy { table, name, policy }` retains
+the complete dropped definition. There is no `AlterPolicy`: every definition
+change is a drop and create. A latent policy on a disabled table is classified
+as if enabled, so a later ENABLE cannot hide the earlier access decision.
+
+ENABLE, FORCE, creating a restrictive policy and dropping a permissive policy
+carry `revoke`. DISABLE, NO FORCE, creating a permissive policy and dropping a
+restrictive policy carry the new gated `row-security` class, approved with
+`--allow row-security`. Independent flag transitions combine their labels;
+no-op flags add none. `grant-widen` retains its existing ungated permission
+semantics. Every policy replacement carries both labels, regardless of which
+field changes. The existing generated-risk calculation pairs drop and create
+by owning table UID and policy name, including across renames; it does not
+infer predicate implication. Intrinsic labels alone miss a mode flip whose
+drop and create both point in the same direction.
+
+Operations completing a newly created table remain risk-free. Shared admission
+resolves the table holder at the operation and verifies the claimed origin
+against the actual preceding creation of that UID, before applying the
+created-table payload and completeness checks. A spelling reused by another
+table cannot borrow a creation's exemption. Drops require standing owners.
+Both saved-plan consumers rederive the contextual risks and reject edited
+labels. A matching checksum authenticates bytes, not their origin claim.
+
+PR A registers the new kind and its removal effects, but leaves differ
+transitions, relative teardown ordering, staged/apply guards and actual
+standing-table SQL to the later PRs of #1173. PostgreSQL emission temporarily
+refuses all standing operations after the CLI approval gate; SQL Server
+continues to refuse PostgreSQL RLS operations. Created-table delivery remains
+available. The plan format becomes 47 for the new kind, origin and risk label, after
+#2124 took 46. State 29 and schema set 53 are inherited from master without
+an additional bump: this slice leaves declaration/state shapes unchanged,
+and published envelope risk labels are unrestricted strings.
+
+Pinned by the full flag-transition matrix, intrinsic and replacement risk
+cases including both mode flips, UID/rename/name-reuse controls, both saved
+admission paths, strict wire payloads, real policy-removal effects, and CLI
+approval before the temporary delivery refusal. Mutation checks remove the
+row-security gate and the origin comparison independently; their refusal tests
+must fail before the guards are restored.

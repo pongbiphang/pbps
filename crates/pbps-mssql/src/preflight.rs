@@ -872,6 +872,7 @@ fn build<'v, 'p: 'v>(
         | Change::SetIndexStorageParameters { .. }
         | Change::SetTablePersistence { .. }
         | Change::SetStorageParameters { .. }
+        | Change::DropPolicy { .. }
         | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }

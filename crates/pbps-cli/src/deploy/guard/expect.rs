@@ -280,6 +280,7 @@ impl<'a> TableChanges<'a> {
                 | Change::RenameRole { .. }
                 | Change::Grant { .. }
                 | Change::Revoke { .. }
+                | Change::DropPolicy { .. }
                 | Change::CreatePolicy { .. }
                 | Change::SetRowSecurity { .. }
                 | Change::PublicExecution { .. } => {}

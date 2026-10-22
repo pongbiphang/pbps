@@ -153,3 +153,53 @@ fn row_security_cases_classify_policy_parts_and_independent_flags() {
     assert_eq!(policies, 3);
     assert_eq!(flags, [(true, false), (false, true), (true, true)].into());
 }
+
+#[test]
+fn dropped_policy_corpus_cases_remove_the_named_policy_and_its_declaration() {
+    use pbps_model::{Change, Declared, PartAfter};
+    let mut seen = 0;
+    for (case, change) in corpus::cases() {
+        if let Change::DropPolicy {
+            table,
+            name,
+            policy,
+        } = &change
+        {
+            seen += 1;
+            assert!(policy.using.is_some() || policy.with_check.is_some());
+            assert_eq!(
+                change.part_effects(),
+                vec![pbps_model::part_effects::PartEffect {
+                    part: Part::Named {
+                        table,
+                        kind: pbps_model::Part::Policy,
+                        name
+                    },
+                    effect: Effect::Removed,
+                    origin: Origin::Direct
+                }],
+                "{case}"
+            );
+            assert!(matches!(
+                change.constraints().unwrap().after,
+                PartAfter::Gone(pbps_model::Part::Policy)
+            ));
+            let mut declared = Declared::default();
+            let mut changes = pbps_model::ChangeSet::default();
+            changes
+                .changes
+                .push(pbps_model::PlannedChange::new(Change::CreatePolicy {
+                    table: table.clone(),
+                    name: name.clone(),
+                    policy: policy.clone(),
+                    origin: pbps_model::RowSecurityOrigin::Standing,
+                }));
+            declared.advance(&changes);
+            assert!(!declared.is_empty());
+            changes.changes = vec![pbps_model::PlannedChange::new(change)];
+            declared.advance(&changes);
+            assert!(declared.is_empty(), "{case}");
+        }
+    }
+    assert_eq!(seen, 3);
+}

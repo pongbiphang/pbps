@@ -1,7 +1,7 @@
-//! The unchanged create-only RLS admission contract from master 34b1b1db.
+//! UID-verified policy origins and the explicit created-table RLS contract.
 use super::super::AdmissionError;
 use pbps_model::{
-    Change, ChangeSet, IdsFile, TableName, Uid,
+    Change, ChangeSet, IdsFile, RowSecurityOrigin, TableName, Uid,
     plan_names::{At, Holder, PlanNames},
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,7 +20,7 @@ pub fn validate(
     if !changes.changes.iter().any(|step| {
         matches!(
             &step.change,
-            Change::CreatePolicy { .. } | Change::SetRowSecurity { .. }
+            Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. }
         ) || if let Change::CreateTable { table, .. } = &step.change {
             table.has_row_security()
         } else if let Change::AttachPartition { shape, .. }
@@ -78,38 +78,55 @@ pub fn validate(
     let names = PlanNames::of(&changes.changes, ids).map_err(AdmissionError::from_error)?;
     let mut policies: BTreeMap<&Uid, BTreeMap<&str, usize>> = BTreeMap::new();
     let mut flags = BTreeSet::new();
-    let owner = |table: &TableName, at: usize| -> Result<&Uid, AdmissionError> {
+    let owner = |table: &TableName,
+                 at: usize,
+                 claimed: Option<RowSecurityOrigin>|
+     -> Result<(&Uid, RowSecurityOrigin), AdmissionError> {
         let Holder::Tracked(uid) = names.holder(table, At::Before(at)) else {
             bail!(
-                "{}: created row-security origin has no preceding table creation",
+                "{}: row-security operation has no tracked table owner",
                 table.shown()
             );
         };
-        let Some((start, _, _)) = created.get(uid) else {
+        if dialect.name() != "postgres" {
             bail!(
-                "{}: standing-table row-security planning arrives with #1173",
-                table.shown()
-            );
-        };
-        if *start >= at {
-            bail!(
-                "{}: row-security operation precedes its table creation",
+                "{}: row-security policies and flags require PostgreSQL",
                 table.shown()
             );
         }
-        Ok(uid)
+        let actual = if let Some((start, _, _)) = created.get(uid) {
+            if *start >= at {
+                bail!(
+                    "{}: row-security operation precedes its table creation",
+                    table.shown()
+                );
+            }
+            RowSecurityOrigin::Created
+        } else {
+            RowSecurityOrigin::Standing
+        };
+        // The payload's claim cannot choose its own risk exemption. Resolve
+        // ownership before consulting it, including across name handovers.
+        if claimed.is_some_and(|claimed| claimed != actual) {
+            bail!(
+                "{}: forged row-security origin does not match the table UID's creation history",
+                table.shown()
+            );
+        }
+        Ok((uid, actual))
     };
     for (at, step) in changes.changes.iter().enumerate() {
         if let Change::CreatePolicy {
             table,
             name,
             policy,
-            ..
+            origin,
         } = &step.change
         {
-            let uid = owner(table, at)?;
-            let (_, _, shape) = created[uid];
-            if dialect.name() != "postgres" || shape.row_policies.get(name) != Some(policy) {
+            let (uid, actual) = owner(table, at, Some(*origin))?;
+            if actual == RowSecurityOrigin::Created
+                && created[uid].2.row_policies.get(name) != Some(policy)
+            {
                 bail!(
                     "{} policy `{}`: created origin or payload does not match CREATE TABLE",
                     table.shown(),
@@ -125,7 +142,10 @@ pub fn validate(
                     problems.join("; ")
                 );
             }
-            if flags.contains(uid) || policies.entry(uid).or_default().insert(name, at).is_some() {
+            if actual == RowSecurityOrigin::Created
+                && (flags.contains(uid)
+                    || policies.entry(uid).or_default().insert(name, at).is_some())
+            {
                 bail!(
                     "{} policy `{}`: duplicate policy or policy after row-security flags",
                     table.shown(),
@@ -137,14 +157,21 @@ pub fn validate(
             table,
             from,
             to,
-            ..
+            origin,
         } = &step.change
         {
-            let actual = owner(table, at)?;
+            let (actual, context) = owner(table, at, Some(*origin))?;
+            if actual != uid {
+                bail!(
+                    "{}: row-security UID does not match its table owner",
+                    table.shown()
+                );
+            }
+            if context == RowSecurityOrigin::Standing {
+                continue;
+            }
             let (_, _, shape) = created[actual];
-            if dialect.name() != "postgres"
-                || actual != uid
-                || !from.is_default()
+            if !from.is_default()
                 || to.is_default()
                 || *to != shape.row_security
                 || !flags.insert(actual)
@@ -156,6 +183,29 @@ pub fn validate(
             }
             if policies.get(actual).map_or(0, BTreeMap::len) != shape.row_policies.len() {
                 bail!("{}: row-security flags precede its policies", table.shown());
+            }
+        } else if let Change::DropPolicy {
+            table,
+            name,
+            policy,
+        } = &step.change
+        {
+            let (_, actual) = owner(table, at, None)?;
+            if actual != RowSecurityOrigin::Standing {
+                bail!(
+                    "{} policy `{}`: a policy drop requires a standing table",
+                    table.shown(),
+                    pbps_model::escape::Escaped(name)
+                );
+            }
+            let problems = policy.problems();
+            if !problems.is_empty() {
+                bail!(
+                    "{} policy `{}`: {}",
+                    table.shown(),
+                    pbps_model::escape::Escaped(name),
+                    problems.join("; ")
+                );
             }
         }
     }

@@ -893,6 +893,7 @@ fn role_of(change: &Change) -> Option<&pbps_model::RoleName> {
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. }
         | Change::SetStorageParameters { .. }
+        | Change::DropPolicy { .. }
         | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -1522,6 +1523,7 @@ pub fn describe(c: &Change) -> String {
             parts.extend(reset.iter().map(|k| format!("{k} reset")));
             format!("~ storage parameters: {}", parts.join(", "))
         }
+        Change::DropPolicy { name, .. } => format!("- drop row policy {name}"),
         Change::CreatePolicy { name, policy, .. } => format!(
             "+ create row policy {name} FOR {} AS {}",
             policy.command.as_str().to_ascii_uppercase(),

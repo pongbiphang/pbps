@@ -517,7 +517,7 @@ pub(super) fn derive(
             }
             // #1172 permits policy predicates with a named #595 coverage
             // limitation. Do not claim a policy binding transition here.
-            Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => continue,
+            Change::DropPolicy { .. } | Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => continue,
             Change::AddCheck { table, name, .. } => (
                 Surface::Check {
                     table: table.clone(),

@@ -469,6 +469,7 @@ impl Build<'_, '_> {
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }

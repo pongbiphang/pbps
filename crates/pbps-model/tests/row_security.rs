@@ -211,7 +211,7 @@ fn policy_creation_records_authored_predicates_without_inventing_missing_ones() 
         },
         {
             let mut v = encoded.clone();
-            v["origin"] = "standing".into();
+            v["origin"] = "forged".into();
             v
         },
         {
@@ -263,4 +263,153 @@ fn written_policy_comparison_keeps_metadata_and_predicate_presence() {
         }
         assert!(!policy.agrees_when_written(&wrong));
     }
+}
+
+#[test]
+fn standing_policy_and_flag_risks_are_intrinsic_even_when_policies_are_latent() {
+    use pbps_model::{Change, RiskClass, RowSecurityOrigin};
+    use std::collections::BTreeSet;
+    let table = TableName::new("app", "docs");
+    let uid: pbps_model::Uid = "t_117300".parse().unwrap();
+    for restrictive in [false, true] {
+        let policy = RowPolicy {
+            restrictive,
+            using: Some("id > 0".into()),
+            ..Default::default()
+        };
+        let create = Change::CreatePolicy {
+            table: table.clone(),
+            name: "p".into(),
+            policy: policy.clone(),
+            origin: RowSecurityOrigin::Standing,
+        };
+        let drop = Change::DropPolicy {
+            table: table.clone(),
+            name: "p".into(),
+            policy,
+        };
+        assert_eq!(
+            create.intrinsic_risks(),
+            [if restrictive {
+                RiskClass::Revoke
+            } else {
+                RiskClass::RowSecurity
+            }]
+            .into()
+        );
+        assert_eq!(
+            drop.intrinsic_risks(),
+            [if restrictive {
+                RiskClass::RowSecurity
+            } else {
+                RiskClass::Revoke
+            }]
+            .into()
+        );
+        let mut created = create;
+        if let Change::CreatePolicy { origin, .. } = &mut created {
+            *origin = RowSecurityOrigin::Created;
+        }
+        assert!(created.intrinsic_risks().is_empty());
+    }
+    let flags = [
+        RowSecurity::default(),
+        RowSecurity {
+            enabled: true,
+            forced: false,
+        },
+        RowSecurity {
+            enabled: false,
+            forced: true,
+        },
+        RowSecurity {
+            enabled: true,
+            forced: true,
+        },
+    ];
+    for from in flags {
+        for to in flags {
+            let change = Change::SetRowSecurity {
+                uid: uid.clone(),
+                table: table.clone(),
+                from,
+                to,
+                origin: RowSecurityOrigin::Standing,
+            };
+            let mut expected = BTreeSet::new();
+            if (!from.enabled && to.enabled) || (!from.forced && to.forced) {
+                expected.insert(RiskClass::Revoke);
+            }
+            if (from.enabled && !to.enabled) || (from.forced && !to.forced) {
+                expected.insert(RiskClass::RowSecurity);
+            }
+            assert_eq!(change.intrinsic_risks(), expected, "{from:?} -> {to:?}");
+            let mut created = change;
+            if let Change::SetRowSecurity { origin, .. } = &mut created {
+                *origin = RowSecurityOrigin::Created;
+            }
+            assert!(created.intrinsic_risks().is_empty());
+        }
+    }
+}
+
+#[test]
+fn dropped_policy_wire_payload_retains_every_field_and_is_strict() {
+    use pbps_model::{Change, RowSecurityOrigin};
+    let table = TableName::new("app", "docs");
+    let policy = RowPolicy {
+        command: PolicyCommand::Update,
+        restrictive: true,
+        to: PolicyRoles::Roles(["app_user".into()].into()),
+        using: Some("id > 0".into()),
+        with_check: Some("id < 100".into()),
+    };
+    let drop = Change::DropPolicy {
+        table: table.clone(),
+        name: "p".into(),
+        policy: policy.clone(),
+    };
+    let value = serde_json::to_value(&drop).unwrap();
+    assert_eq!(
+        serde_json::from_value::<Change>(value.clone()).unwrap(),
+        drop
+    );
+    assert_eq!(value["policy"], serde_json::to_value(&policy).unwrap());
+    for field in ["table", "name", "policy"] {
+        let mut bad = value.clone();
+        bad.as_object_mut().unwrap().remove(field);
+        assert!(serde_json::from_value::<Change>(bad).is_err(), "{field}");
+    }
+    for field in ["origin", "extra"] {
+        let mut bad = value.clone();
+        bad[field] = "standing".into();
+        assert!(serde_json::from_value::<Change>(bad).is_err(), "{field}");
+    }
+    let create = Change::CreatePolicy {
+        table,
+        name: "p".into(),
+        policy,
+        origin: RowSecurityOrigin::Standing,
+    };
+    let value = serde_json::to_value(&create).unwrap();
+    assert_eq!(value["origin"], "standing");
+    assert_eq!(serde_json::from_value::<Change>(value).unwrap(), create);
+}
+
+#[test]
+fn row_security_is_a_distinct_gated_risk_in_wire_and_command_spellings() {
+    use pbps_model::RiskClass;
+    assert!(RiskClass::ALL.contains(&RiskClass::RowSecurity));
+    assert_eq!(
+        "row-security".parse::<RiskClass>().unwrap(),
+        RiskClass::RowSecurity
+    );
+    assert_eq!(
+        serde_json::to_string(&RiskClass::RowSecurity).unwrap(),
+        "\"row-security\""
+    );
+    assert!(RiskClass::RowSecurity.is_gated());
+    assert!(!RiskClass::GrantWiden.is_gated());
+    assert!(!RiskClass::RowSecurity.why().is_empty());
+    assert!("row_security".parse::<RiskClass>().is_err());
 }

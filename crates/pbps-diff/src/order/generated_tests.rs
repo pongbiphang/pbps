@@ -615,6 +615,19 @@ fn every_change_kind_has_its_complete_shape_and_row_write_classification_pinned(
     );
 
     pin(
+        Change::DropPolicy {
+            table: table.clone(),
+            name: "visible".into(),
+            policy: RowPolicy {
+                using: Some("id > 0".into()),
+                ..Default::default()
+            },
+        },
+        vec![],
+        vec![],
+        None,
+    );
+    pin(
         Change::CreatePolicy {
             table: table.clone(),
             name: "visible".into(),
@@ -744,4 +757,126 @@ fn policy_setup_waits_for_complete_generated_columns_without_invalidating_emptin
     assert!(!constraints.iter().any(|e| e.before == 4 && e.after == 3));
     assert_eq!(super::texts(&cs.changes[1].change), vec!["g > 0", "g < 10"]);
     assert!(super::texts(&cs.changes[2].change).is_empty());
+}
+
+#[test]
+fn every_policy_replacement_carries_both_risks_including_mode_flips() {
+    let table = TableName::new("app", "docs");
+    let uid: Uid = "t_117300".parse().unwrap();
+    let mut ids = IdsFile::default();
+    ids.tables.insert(uid, table.clone());
+    for restrictive in [false, true] {
+        let old = RowPolicy {
+            restrictive,
+            using: Some("id > 0".into()),
+            with_check: Some("id < 100".into()),
+            ..Default::default()
+        };
+        for field in 0..6 {
+            let mut new = old.clone();
+            match field {
+                0 => new.command = PolicyCommand::Update,
+                1 => new.restrictive = !restrictive,
+                2 => new.to = PolicyRoles::Roles(["app_user".into()].into()),
+                3 => new.using = Some("id > 5".into()),
+                4 => new.with_check = Some("id < 50".into()),
+                _ => new.using = None,
+            }
+            let cs = ChangeSet {
+                changes: vec![
+                    PlannedChange::new(Change::DropPolicy {
+                        table: table.clone(),
+                        name: "p".into(),
+                        policy: old.clone(),
+                    }),
+                    PlannedChange::new(Change::CreatePolicy {
+                        table: table.clone(),
+                        name: "p".into(),
+                        policy: new,
+                        origin: RowSecurityOrigin::Standing,
+                    }),
+                ],
+            };
+            let both = [RiskClass::Revoke, RiskClass::RowSecurity].into();
+            assert_eq!(
+                super::risks(&cs, &ids, &pbps_dialect::MinimalDialect),
+                vec![both; 2],
+                "{restrictive}, field {field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn policy_replacement_follows_table_uid_across_rename_but_not_name_reuse() {
+    let a = TableName::new("app", "a");
+    let b = TableName::new("app", "b");
+    let old_name = TableName::new("app", "old");
+    let first: Uid = "t_117300".parse().unwrap();
+    let second: Uid = "t_117301".parse().unwrap();
+    let policy = RowPolicy {
+        using: Some("id > 0".into()),
+        ..Default::default()
+    };
+    let drop = Change::DropPolicy {
+        table: a.clone(),
+        name: "p".into(),
+        policy: policy.clone(),
+    };
+    let create = |table, name: &str| Change::CreatePolicy {
+        table,
+        name: name.into(),
+        policy: RowPolicy {
+            restrictive: true,
+            ..policy.clone()
+        },
+        origin: RowSecurityOrigin::Standing,
+    };
+    let pg = pbps_dialect::MinimalDialect;
+    let cs = |changes: Vec<Change>| ChangeSet {
+        changes: changes.into_iter().map(PlannedChange::new).collect(),
+    };
+    let mut ids = IdsFile::default();
+    ids.tables.insert(first.clone(), b.clone());
+    let renamed = cs(vec![
+        drop.clone(),
+        Change::RenameTable {
+            uid: first.clone(),
+            from: a.clone(),
+            to: b.clone(),
+            defaults: vec![],
+        },
+        create(b.clone(), "p"),
+    ]);
+    let risks = super::risks(&renamed, &ids, &pg);
+    let both = [RiskClass::Revoke, RiskClass::RowSecurity].into();
+    assert_eq!(risks[0], both);
+    assert_eq!(risks[2], both);
+    ids.tables.insert(first.clone(), old_name.clone());
+    ids.tables.insert(second.clone(), a.clone());
+    let handed = cs(vec![
+        drop.clone(),
+        Change::RenameTable {
+            uid: first.clone(),
+            from: a.clone(),
+            to: old_name,
+            defaults: vec![],
+        },
+        Change::RenameTable {
+            uid: second.clone(),
+            from: b.clone(),
+            to: a.clone(),
+            defaults: vec![],
+        },
+        create(a.clone(), "p"),
+    ]);
+    let risks = super::risks(&handed, &ids, &pg);
+    assert_eq!(risks[0], [RiskClass::Revoke].into());
+    assert_eq!(risks[3], [RiskClass::Revoke].into());
+    ids.tables.insert(first, a.clone());
+    ids.tables.insert(second, b.clone());
+    for other in [create(b, "p"), create(a, "other")] {
+        let risks = super::risks(&cs(vec![drop.clone(), other]), &ids, &pg);
+        assert_eq!(risks, vec![[RiskClass::Revoke].into(); 2]);
+    }
 }

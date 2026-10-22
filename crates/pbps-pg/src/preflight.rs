@@ -3620,6 +3620,7 @@ fn build<'v, 'p: 'v>(
         | Change::SetPartitionDefault { .. }
         | Change::SetPartitionNotNull { .. }
         | Change::SetStorageParameters { .. }
+        | Change::DropPolicy { .. }
         | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }
@@ -3970,6 +3971,7 @@ pub(crate) fn probes(plan_names: &PlanNames<'_>, partitions: &pbps_model::Partit
             | Change::SetPartitionDefault { .. }
             | Change::SetPartitionNotNull { .. }
             | Change::SetStorageParameters { .. }
+            | Change::DropPolicy { .. }
             | Change::CreatePolicy { .. }
             | Change::SetRowSecurity { .. }
             | Change::SetReplicaIdentity { .. }

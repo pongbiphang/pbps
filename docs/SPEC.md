@@ -1071,9 +1071,19 @@ exists is never consulted, since no plan creates it again.
 | `constraint` | Adding UNIQUE / FK / CHECK, or a **unique index** | Existing rows may not satisfy it |
 | `data-update` | A declared reference row's values are overwritten (4.6) | What is there now is being replaced, and the plan does not record it |
 | `data-delete` | A reference row leaves the table | Rows elsewhere that point at it fail, or lose what they pointed at |
-| `revoke` | A permission is revoked, or a role dropped (4.7) | A running application loses access mid-flight |
+| `revoke` | A permission is revoked, a role dropped (4.7), or standing-table row access is narrowed (DEC-1173.1) | A running application loses access mid-flight |
+| `row-security` | Standing-table row access widens: DISABLE, NO FORCE, create permissive policy, drop restrictive policy, or any policy replacement | Previously hidden or protected rows become accessible; **gated** by `--allow row-security` |
 | `grant-widen` | A permission is granted (4.7) | Access widens. Labelled, **not gated**: the merge request reviews the grant |
 | `numbering` | A PostgreSQL identity put on a column, a `serial` turned into one, or a numbering source taken off (DEC-1889.1); a sequence's bound lowered, or its cycle turned off (DEC-1921.1) | An insert supplying its own value, calling the old sequence by name, or leaving the column to the source now gone fails; or the numbers run out sooner |
+
+On standing tables, ENABLE, FORCE, creating a restrictive policy and dropping a
+permissive policy carry `revoke`. Every policy replacement carries both `revoke`
+and `row-security`, regardless of which definition field changes: predicate
+implication is not inferred. Independent flag changes combine their risks.
+Latent policies on disabled tables are classified as if enabled. Policy and flag
+operations on a table created in the same plan carry neither risk; admission
+verifies that origin by table UID rather than trusting the saved claim
+(DEC-1173.1).
 
 The criterion is **whether this kind of change can fail or change stored values**; data is not read
 to decide whether this particular run happens to be safe. Data-level validation is

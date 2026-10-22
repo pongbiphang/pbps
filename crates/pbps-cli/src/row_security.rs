@@ -457,6 +457,28 @@ mod tests {
                 "case {bad}"
             );
         }
+        let mut dropping_created = good.clone();
+        if let Change::CreatePolicy {
+            table,
+            name,
+            policy,
+            ..
+        } = &good.changes[1].change
+        {
+            dropping_created
+                .changes
+                .push(PlannedChange::new(Change::DropPolicy {
+                    table: table.clone(),
+                    name: name.clone(),
+                    policy: policy.clone(),
+                }));
+        }
+        assert!(
+            validate(&dropping_created, &ids, &pbps_pg::Postgres::new())
+                .unwrap_err()
+                .to_string()
+                .contains("requires a standing table")
+        );
         let mut blank = good.clone();
         blank.changes.truncate(1);
         assert!(
@@ -465,6 +487,238 @@ mod tests {
                 .to_string()
                 .contains("missing explicit operations")
         );
+    }
+
+    #[test]
+    fn forged_policy_origins_are_refused_in_both_directions_by_table_identity() {
+        let pg = pbps_pg::Postgres::new();
+        let (created, ids) = fixture();
+        for at in [1, 2] {
+            let mut forged = created.clone();
+            let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
+                &mut forged.changes[at].change
+            else {
+                unreachable!("fixture contains only policy and flag steps");
+            };
+            *origin = RowSecurityOrigin::Standing;
+            assert!(
+                validate(&forged, &ids, &pg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("forged row-security origin")
+            );
+        }
+        let mut standing = created.clone();
+        standing.changes.remove(0);
+        for step in &mut standing.changes {
+            let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
+                &mut step.change
+            else {
+                unreachable!("fixture contains only policy and flag steps");
+            };
+            *origin = RowSecurityOrigin::Standing;
+        }
+        validate(&standing, &ids, &pg).unwrap();
+        for at in [0, 1] {
+            let mut forged = standing.clone();
+            let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
+                &mut forged.changes[at].change
+            else {
+                unreachable!("fixture contains only policy and flag steps");
+            };
+            *origin = RowSecurityOrigin::Created;
+            assert!(
+                validate(&forged, &ids, &pg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("forged row-security origin")
+            );
+        }
+        if let Change::SetRowSecurity { uid, .. } = &mut standing.changes[1].change {
+            *uid = "t_117301".parse().unwrap();
+        }
+        assert!(validate(&standing, &ids, &pg).is_err());
+    }
+
+    #[test]
+    fn policy_origins_follow_renamed_owners_and_not_reused_table_spellings() {
+        let (mut changes, mut ids) = fixture();
+        let uid = ids.tables.keys().next().unwrap().clone();
+        let old = ids.tables[&uid].clone();
+        let renamed = TableName::new("app", "renamed");
+        changes.changes.insert(
+            1,
+            PlannedChange::new(Change::RenameTable {
+                uid: uid.clone(),
+                from: old.clone(),
+                to: renamed.clone(),
+                defaults: vec![],
+            }),
+        );
+        for step in &mut changes.changes[2..] {
+            let (Change::CreatePolicy { table, .. } | Change::SetRowSecurity { table, .. }) =
+                &mut step.change
+            else {
+                unreachable!("fixture contains only policy and flag steps");
+            };
+            *table = renamed.clone();
+        }
+        ids.tables.insert(uid, renamed);
+        validate(&changes, &ids, &pbps_pg::Postgres::new()).unwrap();
+        let standing_uid: Uid = "t_117301".parse().unwrap();
+        let before = TableName::new("app", "standing");
+        ids.tables.insert(standing_uid.clone(), old.clone());
+        changes.changes.insert(
+            2,
+            PlannedChange::new(Change::RenameTable {
+                uid: standing_uid,
+                from: before,
+                to: old.clone(),
+                defaults: vec![],
+            }),
+        );
+        let mut forged = changes.changes[3].clone();
+        if let Change::CreatePolicy { table, .. } = &mut forged.change {
+            *table = old;
+        }
+        changes.changes.push(forged);
+        assert!(
+            validate(&changes, &ids, &pbps_pg::Postgres::new())
+                .unwrap_err()
+                .to_string()
+                .contains("forged row-security origin")
+        );
+    }
+
+    #[test]
+    fn both_saved_admission_paths_rederive_standing_and_replacement_risks() {
+        use pbps_model::{PlanBaseline, PlanOrigin, RiskClass, SavedPlan};
+        let pg = pbps_pg::Postgres::new();
+        let (mut changes, ids) = fixture();
+        changes.changes.remove(0);
+        for step in &mut changes.changes {
+            let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
+                &mut step.change
+            else {
+                unreachable!("fixture contains only policy and flag steps");
+            };
+            *origin = RowSecurityOrigin::Standing;
+        }
+        let Change::CreatePolicy {
+            table,
+            name,
+            policy,
+            ..
+        } = &changes.changes[0].change
+        else {
+            unreachable!("fixture starts with a policy creation");
+        };
+        let (table, name, policy) = (table.clone(), name.clone(), policy.clone());
+        changes.changes.insert(
+            0,
+            PlannedChange::new(Change::DropPolicy {
+                table,
+                name,
+                policy,
+            }),
+        );
+        let risks = pbps_diff::order::generated::risks(&changes, &ids, &pg);
+        for (step, risks) in changes.changes.iter_mut().zip(risks) {
+            step.risks = risks;
+        }
+        let plan = SavedPlan::new(
+            PlanOrigin::Database,
+            "postgres",
+            "2026-10-22T00:00:00Z",
+            PlanBaseline {
+                description: "test".into(),
+                checksum: "0".repeat(64),
+                time_zone: None,
+                database_collation: None,
+            },
+            changes,
+            ids,
+        );
+        crate::validate_saved_plan(&plan, &pg).unwrap();
+        pbps_diff::order::validate_saved_plan(&plan, &pg).unwrap();
+        for at in 0..3 {
+            let mut bad = plan.clone();
+            bad.changes.changes[at].risks.insert(RiskClass::Destructive);
+            assert!(
+                crate::validate_saved_plan(&bad, &pg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inconsistent risks")
+            );
+            assert!(
+                pbps_diff::order::validate_saved_plan(&bad, &pg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inconsistent risks")
+            );
+        }
+        for risk in [RiskClass::Revoke, RiskClass::RowSecurity] {
+            let mut bad = plan.clone();
+            bad.changes.changes[0].risks.remove(&risk);
+            assert!(
+                crate::validate_saved_plan(&bad, &pg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inconsistent risks")
+            );
+            assert!(
+                pbps_diff::order::validate_saved_plan(&bad, &pg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("inconsistent risks")
+            );
+        }
+    }
+
+    #[test]
+    fn standing_policy_delivery_refuses_while_created_policy_sql_is_unchanged() {
+        use pbps_dialect::Dialect as _;
+        let pg = pbps_pg::Postgres::new();
+        let (created, _) = fixture();
+        for step in &created.changes[1..] {
+            assert!(
+                !pg.emit(&step.change, Default::default())
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut standing = step.change.clone();
+            let (Change::CreatePolicy { origin, .. } | Change::SetRowSecurity { origin, .. }) =
+                &mut standing
+            else {
+                unreachable!("fixture contains only policy and flag steps");
+            };
+            *origin = RowSecurityOrigin::Standing;
+            assert!(
+                pg.emit(&standing, Default::default())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("arrives with later PRs of #1173")
+            );
+            assert!(
+                pbps_mssql::Mssql
+                    .emit(&standing, Default::default())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("PostgreSQL row-security")
+            );
+        }
+        let drop = Change::DropPolicy {
+            table: TableName::new("app", "docs"),
+            name: "p".into(),
+            policy: RowPolicy::default(),
+        };
+        assert!(
+            pg.emit(&drop, Default::default())
+                .unwrap_err()
+                .to_string()
+                .contains("arrives with later PRs of #1173")
+        );
+        assert!(pbps_mssql::Mssql.emit(&drop, Default::default()).is_err());
     }
 }
 

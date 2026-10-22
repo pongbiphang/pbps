@@ -514,7 +514,9 @@ impl Reconstruction {
                 // are not resolver surfaces (#595). Installing them here
                 // would also require recipient roles scratch need not hold.
                 // The typed deployment plan still emits policies and flags.
-                Change::CreatePolicy { .. } | Change::SetRowSecurity { .. } => {}
+                Change::DropPolicy { .. }
+                | Change::CreatePolicy { .. }
+                | Change::SetRowSecurity { .. } => {}
                 // None of these changes what a name resolves to.
                 Change::CreateRole { .. }
                 | Change::Grant { .. }
