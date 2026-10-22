@@ -434,12 +434,23 @@ class WorkflowKeySpellings(unittest.TestCase):
                        # A comment may follow a flow indicator directly.
                        "    env: {# [ text\n      A: value}\n",
                        "    env: { A: x,# [ text\n      B: y }\n",
-                       "    env: { A: [# { text\n      a] }\n"):
+                       "    env: { A: [# { text\n      a] }\n",
+                       # ... or a closing indicator, a closing quote, or a
+                       # value indicator between tokens.
+                       "    env: { A: []# [ text\n      , B: v }\n",
+                       "    env: { A: {}# { text\n      , B: v }\n",
+                       "    env: { A: \"x\"# [ text\n      , B: v }\n",
+                       "    env: { A: 'x'# [ text\n      , B: v }\n",
+                       "    env: { \"A\":# [ text\n      v }\n"):
             with self.subTest(source=source):
                 audit.check_workflow_key_spellings(source, "live")
-        # A separated comment still hides nothing: the key after it is read.
-        with self.assertRaisesRegex(audit.InventoryError, "alternate spelling"):
-            audit.check_workflow_key_spellings("    steps:\n      - { name: a # note\n          , 'if': false }\n", "live")
+        # A separated comment still hides nothing, and a `#` inside a plain
+        # scalar is not one: the key after it is read in both cases.
+        for source in ("    steps:\n      - { name: a # note\n          , 'if': false }\n",
+                       "    steps:\n      - { name: a:#b, 'if': false }\n",
+                       "    steps:\n      - { name: a#b, 'if': false }\n"):
+            with self.subTest(source=source), self.assertRaisesRegex(audit.InventoryError, "alternate spelling"):
+                audit.check_workflow_key_spellings(source, "live")
 
     def test_canonical_and_distinct_quoted_keys_pass_the_spelling_guard(self):
         for position, template in self.positions.items():

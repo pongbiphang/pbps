@@ -1411,3 +1411,12 @@ lexical guard preserves the existing scheduling reader rather than replacing
 it or claiming that unsupported flow scheduling definitions execute. A table
 crosses audited and unrelated paths with quoting, whitespace and hexadecimal
 or Unicode escapes in block and flow forms, including a flow job header.
+
+Skipping an opaque flow value needs only where it ends, so the scanner must
+tell a comment from text by one rule rather than a list of separators: a `#`
+is text only where it continues a plain scalar (`https://x/#frag`, `b:#c`).
+After whitespace, any flow indicator, a closing quote or a quoted key's `:`
+it starts a comment, as PyYAML reads each of these (measured). Reading a text
+`#` as a comment would skip the rest of the line and could hide a key after
+it, so the rule errs toward text and a stray case is refused as an
+unterminated mapping, never accepted.
